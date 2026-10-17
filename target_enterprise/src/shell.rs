@@ -189,6 +189,10 @@ pub struct OsShell {
     pub smp_cpu_ticks: [u64; 4],
     /// Per-CPU parallel job completion counters (`CPU 0..3`).
     pub smp_cpu_jobs: [u64; 4],
+    /// Total hardware interrupt wakeups across Local APIC timer (`0x40`) and Doorbell IPIs (`0x41`).
+    pub smp_irq_wakeups: u64,
+    /// Total Inter-Processor Interrupt (IPI `0x41`) doorbells sent to wake sleeping AP cores from `HLT`.
+    pub smp_ipi_doorbells: u64,
     /// Per-task hardware stack context-switch counters indexed by `pid as usize`.
     pub kthread_switches: [u64; SHELL_MAX_TASKS],
     /// Next PID to assign on `spawn`.
@@ -226,6 +230,8 @@ impl OsShell {
             smp_cpus_online: 4,
             smp_cpu_ticks: [0u64; 4],
             smp_cpu_jobs: [0u64; 4],
+            smp_irq_wakeups: 0,
+            smp_ipi_doorbells: 0,
             kthread_switches: [0u64; SHELL_MAX_TASKS],
             next_pid: 5,
             cmd_seq: 1,
@@ -295,6 +301,8 @@ impl OsShell {
         self.smp_cpus_online = 4;
         self.smp_cpu_ticks = [1, 1, 1, 1];
         self.smp_cpu_jobs = [1, 1, 1, 1];
+        self.smp_irq_wakeups = 4;
+        self.smp_ipi_doorbells = 1;
         self.kthread_switches = [0u64; SHELL_MAX_TASKS];
         self.kthread_switches[1] = 1;
         self.kthread_switches[2] = 1;
@@ -1610,6 +1618,8 @@ impl OsShell {
                 }
                 k += 1;
             }
+            self.smp_ipi_doorbells = self.smp_ipi_doorbells.wrapping_add(1);
+            self.smp_irq_wakeups = self.smp_irq_wakeups.wrapping_add(n_cpus.saturating_sub(1) as u64);
             self.record_audit(30, AuditVerdict::Allowed, b"shell:smp:dispatch");
             let mut total_sw = 0u64;
             let mut s = 0usize;
@@ -1624,6 +1634,8 @@ impl OsShell {
             pos += dec_u64(n_cpus as u64, &mut out[pos..]);
             pos += copy_into(b" cores (ctx_switches=", &mut out[pos..]);
             pos += dec_u64(total_sw, &mut out[pos..]);
+            pos += copy_into(b" ipis=", &mut out[pos..]);
+            pos += dec_u64(self.smp_ipi_doorbells, &mut out[pos..]);
             pos += copy_into(b")\n", &mut out[pos..]);
             return pos;
         }
@@ -1642,6 +1654,10 @@ impl OsShell {
         pos += dec_u64(self.active_task_count() as u64, &mut out[pos..]);
         pos += copy_into(b" ctx_switches=", &mut out[pos..]);
         pos += dec_u64(total_sw, &mut out[pos..]);
+        pos += copy_into(b" idle=hlt-ipi irqs=", &mut out[pos..]);
+        pos += dec_u64(self.smp_irq_wakeups, &mut out[pos..]);
+        pos += copy_into(b" ipis=", &mut out[pos..]);
+        pos += dec_u64(self.smp_ipi_doorbells, &mut out[pos..]);
         pos += copy_into(b"\n", &mut out[pos..]);
 
         let mut c = 0usize;
@@ -1661,7 +1677,14 @@ impl OsShell {
                 pos += copy_into(b"]: ", &mut out[pos..]);
             }
             if c < n_cpus {
-                pos += copy_into(b"online ticks=", &mut out[pos..]);
+                pos += copy_into(
+                    if c == 0 {
+                        b"online (hlt+irq0x40) ticks="
+                    } else {
+                        b"online (hlt+ipi0x41) ticks="
+                    },
+                    &mut out[pos..],
+                );
                 pos += dec_u64(self.smp_cpu_ticks[c], &mut out[pos..]);
                 pos += copy_into(b" jobs=", &mut out[pos..]);
                 pos += dec_u64(self.smp_cpu_jobs[c], &mut out[pos..]);

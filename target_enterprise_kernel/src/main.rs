@@ -833,9 +833,9 @@ pub(crate) fn live_os_console_loop() -> ! {
     let mut net_rx: u64 = 0;
     let mut net_tx: u64 = 0;
     let mut last_sql_tx: u64 = sh.db.tx_seq;
-    let mut spin_ticks: u64 = 0;
 
     smp_hw_tick_and_sync(sh);
+    smp_hw_enable_bsp_timer();
     fb_console_start();
     serial_write_str("Proteus Enterprise OS interactive shell ready.\n");
     serial_write_str("Web UI: http://127.0.0.1:18080/app | SQL: http://127.0.0.1:18080/sql\n");
@@ -846,11 +846,13 @@ pub(crate) fn live_os_console_loop() -> ! {
 
     loop {
         let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+        let mut did_io = false;
 
-        // 0. Poll live VirtIO-Net interface for HTTP (:80), TLS 1.3 (:443), UDP (:8080), ICMP, and ARP.
+        // 0. Drain live VirtIO-Net interface for HTTP (:80), TLS 1.3 (:443), UDP (:8080), ICMP, and ARP.
         if let (Some(vn), Some(svc)) = (vnet_opt.as_mut(), net_svc_opt.as_mut()) {
             let mut f_guard = CONSOLE_NET_FRAME.lock();
-            if let Some((flen, head_id)) = vnet_rx(vn, &mut *f_guard) {
+            while let Some((flen, head_id)) = vnet_rx(vn, &mut *f_guard) {
+                did_io = true;
                 net_rx = net_rx.wrapping_add(1);
                 if flen >= 14 {
                     smp_hw_tick_and_sync(sh);
@@ -936,12 +938,10 @@ pub(crate) fn live_os_console_loop() -> ! {
                     halt_forever();
                 }
             }
-        } else {
-            spin_ticks = spin_ticks.wrapping_add(1);
-            if (spin_ticks & 0x3FFF) == 0 {
-                smp_hw_tick_and_sync(sh);
-            }
-            core::hint::spin_loop();
+        } else if !did_io {
+            // No network frames and no console input on this pass: put CPU 0 into
+            // low-power HLT state until the Local APIC timer (0x40) or IPI (0x41) wakes it.
+            smp_hw_idle_wait();
         }
     }
 }
