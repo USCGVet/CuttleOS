@@ -81,7 +81,7 @@ if not exist "%AHCI_IMG%" fsutil file createnew "%AHCI_IMG%" 1048576 >nul
 if not exist "%NVME_IMG%" fsutil file createnew "%NVME_IMG%" 1048576 >nul
 
 echo.
-echo [3/3] Launching QEMU (1280x720 console + HTTP :18080 / HTTPS :18443 + SQL).
+echo [3/3] Launching QEMU (4x SMP vCPUs + 1280x720 console + HTTP :18080 / HTTPS :18443 + SQL).
 echo        Dashboard:   http://127.0.0.1:18080/app
 echo        SQL Server:  http://127.0.0.1:18080/sql?SELECT+*+FROM+kv
 echo        Serial log:  %SERIAL_LOG%
@@ -89,6 +89,7 @@ echo        Exit:        type 'halt' at proteus^> prompt or close QEMU window
 echo ============================================================================
 "%QEMU%" ^
     -accel tcg ^
+    -smp 4 ^
     -fw_cfg name=opt/proteus_device_key,file="%ROOT%\device_secret_key.bin" ^
     -drive format=raw,file="%BIOS_IMG%",if=ide ^
     -drive if=none,id=vd0,format=raw,file="%VIRTIO_IMG%" ^

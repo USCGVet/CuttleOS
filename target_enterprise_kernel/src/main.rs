@@ -119,16 +119,16 @@ pub(crate) fn set_phys_offset(boot: &BootInfo) {
             continue;
         }
         let aligned = (start + 0xFFF) & !0xFFF;
-        // 192 KiB: virtio queues + AHCI CLB/FB/CTBA + PT scratch + Ring-3 trampoline frames.
-        if aligned >= 0x10_0000 && end.saturating_sub(aligned) >= 0x3_0000 {
+        // 256 KiB: virtio queues + AHCI CLB/FB/CTBA + PT scratch + Ring-3 trampoline frames + SMP PT frames.
+        if aligned >= 0x10_0000 && end.saturating_sub(aligned) >= 0x4_0000 {
             dma = aligned;
             break;
         }
     }
     PHYS_MAP_OFFSET.store(map_off, core::sync::atomic::Ordering::Relaxed);
     DMA_PHYS_BASE.store(dma, core::sync::atomic::Ordering::Relaxed);
-    // 32 KiB page-table frame pool (`0x1_C000 .. 0x2_4000`); `0x2_4000 .. 0x2_B000`
-    // is reserved for the Ring-3 GDT/TSS/IDT/page-table transition frames.
+    // Page-table frame pool (`0x1_C000 .. 0x2_4000` and `0x2_C000 .. 0x4_0000`);
+    // `0x2_4000 .. 0x2_C000` is reserved for the Ring-3 GDT/TSS/IDT/page-table transition frames.
     let pt_next = if dma != 0 { dma + 0x1_C000 } else { 0 };
     PT_ALLOC_NEXT.store(pt_next, core::sync::atomic::Ordering::Relaxed);
 }
@@ -162,8 +162,11 @@ pub(crate) unsafe fn read_cr3() -> u64 {
 // SAFETY: Caller must ensure DMA_PHYS_BASE and PHYS_MAP_OFFSET are initialized from BootInfo.
 pub(crate) unsafe fn alloc_pt_frame() -> u64 {
     let base = dma_phys_base();
-    let next = PT_ALLOC_NEXT.load(core::sync::atomic::Ordering::Relaxed);
-    if base == 0 || next == 0 || next + 0x1000 > base + 0x2_4000 {
+    let mut next = PT_ALLOC_NEXT.load(core::sync::atomic::Ordering::Relaxed);
+    if base != 0 && next == base + 0x2_4000 {
+        next = base + 0x2_C000;
+    }
+    if base == 0 || next == 0 || next + 0x1000 > base + 0x4_0000 {
         panic!("AHCI_HW: PT frame pool exhausted");
     }
     let frame = next;
@@ -548,6 +551,7 @@ mod hw_net_drivers;
 mod hw_storage_drivers;
 mod net_service;
 mod provisioning;
+mod smp_hw;
 
 pub(crate) use banners_arch_platform::*;
 pub(crate) use banners_compose::*;
@@ -559,6 +563,7 @@ pub(crate) use hw_net_drivers::*;
 pub(crate) use hw_storage_drivers::*;
 pub(crate) use net_service::*;
 pub(crate) use provisioning::*;
+pub(crate) use smp_hw::*;
 
 // ============================================================
 // Entry + panic handler + halt
@@ -749,6 +754,8 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     banner_panic_dump();
     // Interactive OS shell + unified VFS/Scheduler/Audit runtime proof.
     banner_shell_compose();
+    // True hardware multi-core SMP AP bringup + multi-stack thread context switching.
+    banner_smp_hw();
 
     // ============================================================
     // RED-TEAM ATTACK HARNESS (deliberate, instrumented vulnerability)
@@ -826,7 +833,9 @@ pub(crate) fn live_os_console_loop() -> ! {
     let mut net_rx: u64 = 0;
     let mut net_tx: u64 = 0;
     let mut last_sql_tx: u64 = sh.db.tx_seq;
+    let mut spin_ticks: u64 = 0;
 
+    smp_hw_tick_and_sync(sh);
     fb_console_start();
     serial_write_str("Proteus Enterprise OS interactive shell ready.\n");
     serial_write_str("Web UI: http://127.0.0.1:18080/app | SQL: http://127.0.0.1:18080/sql\n");
@@ -844,6 +853,7 @@ pub(crate) fn live_os_console_loop() -> ! {
             if let Some((flen, head_id)) = vnet_rx(vn, &mut *f_guard) {
                 net_rx = net_rx.wrapping_add(1);
                 if flen >= 14 {
+                    smp_hw_tick_and_sync(sh);
                     let mut rep_guard = CONSOLE_NET_REPLIES.lock();
                     *rep_guard = target_enterprise::ReplySet::new();
                     svc.handle_frame_with_shell(&f_guard[..flen], boots, sh, &mut *rep_guard);
@@ -893,12 +903,16 @@ pub(crate) fn live_os_console_loop() -> ! {
         }
 
         if let Some(b) = maybe_byte {
+            if b == b'\n' || b == b'\r' {
+                smp_hw_tick_and_sync(sh);
+            }
             let (elen, act) = sh.feed_byte(b, boots, net_rx, net_tx, &mut echo, &mut reply);
             if elen > 0 {
                 serial_write_bytes(&echo[..elen]);
             }
             let rlen = act.bytes_written();
             if rlen > 0 {
+                smp_hw_tick_and_sync(sh);
                 serial_write_bytes(&reply[..rlen]);
                 if reply[..rlen].starts_with(b"sync: ok ") || sh.db.tx_seq != last_sql_tx {
                     last_sql_tx = sh.db.tx_seq;
@@ -923,6 +937,10 @@ pub(crate) fn live_os_console_loop() -> ! {
                 }
             }
         } else {
+            spin_ticks = spin_ticks.wrapping_add(1);
+            if (spin_ticks & 0x3FFF) == 0 {
+                smp_hw_tick_and_sync(sh);
+            }
             core::hint::spin_loop();
         }
     }

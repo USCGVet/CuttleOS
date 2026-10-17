@@ -877,6 +877,8 @@ impl LivedNet {
         // 1. Built-in read-only telemetry endpoints.
         if view.method == HttpMethod::Get {
             let is_shell_endpoint = view.path == b"/ps"
+                || view.path == b"/smp"
+                || view.path == b"/threads"
                 || view.path == b"/ls"
                 || view.path == b"/df"
                 || view.path == b"/audit"
@@ -916,10 +918,10 @@ impl LivedNet {
                     k += 1;
                 }
             }
-            let mut html = [0u8; 1300];
+            let mut html = [0u8; 1310];
             let mut pos = 0usize;
             pos += copy_msg(
-                b"<!doctype html><html><head><meta charset=utf-8><title>Proteus OS</title><style>body{background:#0b1020;color:#e2e8f0;font:14px monospace}h1{color:#38bdf8}p,pre,input,button{background:#1e293b;color:#38bdf8;border:1px solid #475569;padding:5px;margin:2px}button{background:#0284c7;color:#fff;cursor:pointer}</style></head><body><h1>Proteus MTD OS</h1><p>boots=",
+                b"<!doctype html><html><head><meta charset=utf-8><title>Proteus</title><style>body{background:#0b1020;color:#e2e8f0;font:14px monospace}h1{color:#38bdf8}p,pre,input,button{background:#1e293b;color:#38bdf8;border:1px solid #475569;padding:4px}button{background:#0284c7;color:#fff}</style></head><body><h1>Proteus MTD OS</h1><p>boots=",
                 &mut html[pos..],
             );
             pos += dec_u64(boots, &mut html[pos..]);
@@ -942,7 +944,7 @@ impl LivedNet {
             pos += copy_msg(b"<div>SID:<input id=t size=33 value=\"", &mut html[pos..]);
             pos += copy_msg(default_tok, &mut html[pos..]);
             pos += copy_msg(
-                b"\"><br>Sh:<input id=c size=24 value=\"status\"><button onclick=\"S(c.value)\">Run</button><button onclick=\"S('ps')\">ps</button><button onclick=\"S('ls')\">ls</button><button onclick=\"S('audit')\">audit</button><br>SQL:<input id=q size=32 value=\"SELECT * FROM kv\"><button onclick=\"R('/sql?'+encodeURIComponent(q.value))\">Query</button><button onclick=\"P('/sql',q.value)\">Mutate</button><br>ELF:<input id=x size=14 value=\"/bin/fib 10\"><button onclick=\"P('/exec',x.value)\">Exec</button> VFS:<input id=f size=12 value=\"etc/motd\"><button onclick=\"R('/fs/'+f.value)\">Cat</button></div><pre id=o>proteus&gt; ready</pre><script>R=async(u,b)=>{o.textContent=await(await fetch(u,{method:b?'POST':'GET',headers:{'X-Session-Token':t.value},body:b})).text()};P=R;S=x=>P('/sh',x)</script></body></html>\n",
+                b"\"><br>Sh:<input id=c size=22 value=\"status\"><button onclick=\"S(c.value)\">Run</button><button onclick=\"S('smp')\">smp</button><button onclick=\"S('ps')\">ps</button><button onclick=\"S('ls')\">ls</button><button onclick=\"S('audit')\">audit</button><br>SQL:<input id=q size=30 value=\"SELECT * FROM kv\"><button onclick=\"R('/sql?'+encodeURIComponent(q.value))\">Query</button><button onclick=\"P('/sql',q.value)\">Mutate</button><br>ELF:<input id=x size=14 value=\"/bin/fib 10\"><button onclick=\"P('/exec',x.value)\">Exec</button> VFS:<input id=f size=10 value=\"etc/motd\"><button onclick=\"R('/fs/'+f.value)\">Cat</button></div><pre id=o>proteus&gt; ready</pre><script>R=async(u,b)=>{o.textContent=await(await fetch(u,{method:b?'POST':'GET',headers:{'X-Session-Token':t.value},body:b})).text()};P=R;S=x=>P('/sh',x)</script></body></html>\n",
                 &mut html[pos..],
             );
             return HttpImpl::build_response(200, b"text/html", &html[..pos], out).unwrap_or(0);

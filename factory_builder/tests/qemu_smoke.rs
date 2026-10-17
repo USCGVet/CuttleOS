@@ -742,9 +742,10 @@ fn boots_under_qemu_and_emits_banner() {
         "FS partition OK lba=1042..1057 sectors=16 files=1 magic=PRTSFS01",
         "HTTPS+TCP4 compose OK slots=4 port=443 tls13=ok",
         "SHELL compose OK tasks=5 files=5 audit=5",
+        "SMP_HW init OK cpus=4 threads=4 ctx_sw=4",
         "PROTEUS-TE HALT",
     ];
-    eprintln!("smoke: launching QEMU (+virtio-blk +2x net hub +ahci +nvme +fw_cfg device key)...");
+    eprintln!("smoke: launching QEMU (+4x SMP +virtio-blk +2x net hub +ahci +nvme +fw_cfg device key)...");
     let (log_contents, all_seen) =
         vm.boot(&serial_log, |s| required_banners.iter().all(|b| s.contains(b)));
     if !all_seen {
@@ -834,6 +835,8 @@ impl SmokeVm<'_> {
         let mut qproc = Command::new(self.qemu)
             .arg("-accel")
             .arg("tcg")
+            .arg("-smp")
+            .arg("4")
             .arg("-fw_cfg")
             .arg(format!(
                 "name={},file={}",

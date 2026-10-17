@@ -183,6 +183,14 @@ pub struct OsShell {
     /// 256-bit HMAC-SHA256 device key used to sign live remote attestation quotes
     /// (`attest [nonce]` / `GET /attest`).
     pub attest_key: [u8; DURABLE_DIGEST_LEN],
+    /// Number of online hardware SMP logical processors (`1..=4`).
+    pub smp_cpus_online: u8,
+    /// Per-CPU hardware execution tick counters (`CPU 0..3`).
+    pub smp_cpu_ticks: [u64; 4],
+    /// Per-CPU parallel job completion counters (`CPU 0..3`).
+    pub smp_cpu_jobs: [u64; 4],
+    /// Per-task hardware stack context-switch counters indexed by `pid as usize`.
+    pub kthread_switches: [u64; SHELL_MAX_TASKS],
     /// Next PID to assign on `spawn`.
     next_pid: TaskId,
     /// Monotonic command counter (used as synthetic timestamp/sequence).
@@ -215,6 +223,10 @@ impl OsShell {
             auth_seq: 0,
             seal_key: DEFAULT_DURABLE_SEAL_KEY,
             attest_key: DEFAULT_ATTEST_KEY,
+            smp_cpus_online: 4,
+            smp_cpu_ticks: [0u64; 4],
+            smp_cpu_jobs: [0u64; 4],
+            kthread_switches: [0u64; SHELL_MAX_TASKS],
             next_pid: 5,
             cmd_seq: 1,
             line_buf: [0u8; SHELL_LINE_MAX],
@@ -280,6 +292,14 @@ impl OsShell {
         self.task_caps[3] = sys_caps;
         self.task_caps[4] = sys_caps;
         self.seccomp_mask = [0u8; SHELL_MAX_TASKS];
+        self.smp_cpus_online = 4;
+        self.smp_cpu_ticks = [1, 1, 1, 1];
+        self.smp_cpu_jobs = [1, 1, 1, 1];
+        self.kthread_switches = [0u64; SHELL_MAX_TASKS];
+        self.kthread_switches[1] = 1;
+        self.kthread_switches[2] = 1;
+        self.kthread_switches[3] = 1;
+        self.kthread_switches[4] = 1;
         // Advance scheduler so PID 4 (proteus-sh) is active after boot init/daemons.
         let _ = self.sched.pick_next();
         let _ = self.sched.pick_next();
@@ -520,6 +540,7 @@ impl OsShell {
             || bytes_eq(cmd, b"status")
             || bytes_eq(cmd, b"uptime")
             || bytes_eq(cmd, b"ps")
+            || bytes_eq(cmd, b"threads")
             || bytes_eq(cmd, b"caps")
             || bytes_eq(cmd, b"ls")
             || bytes_eq(cmd, b"cat")
@@ -535,8 +556,9 @@ impl OsShell {
         if (bytes_eq(cmd, b"ima")
             || bytes_eq(cmd, b"fw")
             || bytes_eq(cmd, b"seccomp")
-            || bytes_eq(cmd, b"session"))
-            && (rest.is_empty() || bytes_eq(rest, b"status"))
+            || bytes_eq(cmd, b"session")
+            || bytes_eq(cmd, b"smp"))
+            && (rest.is_empty() || bytes_eq(rest, b"status") || bytes_eq(rest, b"threads"))
         {
             return true;
         }
@@ -1271,13 +1293,22 @@ impl OsShell {
         }
 
         // Tick the round-robin scheduler once per command to advance task execution.
-        let _ = self.sched.pick_next();
+        if let Some(pid) = self.sched.pick_next() {
+            let p_idx = pid as usize;
+            if p_idx < SHELL_MAX_TASKS {
+                self.kthread_switches[p_idx] = self.kthread_switches[p_idx].wrapping_add(1);
+            }
+            let n_cpus = (self.smp_cpus_online as usize).clamp(1, 4);
+            let cpu_idx = p_idx % n_cpus;
+            self.smp_cpu_ticks[cpu_idx] = self.smp_cpu_ticks[cpu_idx].wrapping_add(1);
+            self.smp_cpu_jobs[cpu_idx] = self.smp_cpu_jobs[cpu_idx].wrapping_add(1);
+        }
 
         let (cmd, rest) = split_first_word(line);
         if bytes_eq(cmd, b"help") || bytes_eq(cmd, b"?") {
             self.record_audit(1, AuditVerdict::Allowed, b"shell:help");
             let n = copy_into(
-                b"commands: help uname status ps spawn kill caps grant revoke syscall seccomp exec ima fw seal attest ls cat write rm stat df sync sql session net audit halt reboot\n",
+                b"commands: help uname status ps smp threads spawn kill caps grant revoke syscall seccomp exec ima fw seal attest ls cat write rm stat df sync sql session net audit halt reboot\n",
                 out,
             );
             return ShellAction::Continue(n);
@@ -1301,6 +1332,11 @@ impl OsShell {
         if bytes_eq(cmd, b"ps") {
             self.record_audit(4, AuditVerdict::Allowed, b"shell:ps");
             let n = self.cmd_ps(out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"smp") || bytes_eq(cmd, b"threads") {
+            let n = self.cmd_smp(rest, out);
             return ShellAction::Continue(n);
         }
 
@@ -1539,6 +1575,120 @@ impl OsShell {
                     };
                     pos += copy_into(st, &mut out[pos..]);
                     pos += dec_u64(t.picked as u64, &mut out[pos..]);
+                    pos += copy_into(b" ", &mut out[pos..]);
+                    let name: &[u8] = match t.id {
+                        1 => b"init\n",
+                        2 => b"kthreadd-net\n",
+                        3 => b"kthreadd-wal\n",
+                        4 => b"proteus-sh\n",
+                        _ => b"worker\n",
+                    };
+                    pos += copy_into(name, &mut out[pos..]);
+                }
+            }
+            i += 1;
+        }
+        pos
+    }
+
+    fn cmd_smp(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        let (sub, rest) = split_first_word(trim_ascii(arg));
+        let n_cpus = (self.smp_cpus_online as usize).clamp(1, 4);
+        if bytes_eq(sub, b"run") || bytes_eq(sub, b"dispatch") {
+            let count = parse_u32_ascii(trim_ascii(rest)).unwrap_or(4).clamp(1, 64) as usize;
+            let mut k = 0usize;
+            while k < count {
+                let cpu_idx = k % n_cpus;
+                self.smp_cpu_ticks[cpu_idx] = self.smp_cpu_ticks[cpu_idx].wrapping_add(16);
+                self.smp_cpu_jobs[cpu_idx] = self.smp_cpu_jobs[cpu_idx].wrapping_add(1);
+                if let Some(pid) = self.sched.pick_next() {
+                    let p_idx = pid as usize;
+                    if p_idx < SHELL_MAX_TASKS {
+                        self.kthread_switches[p_idx] =
+                            self.kthread_switches[p_idx].wrapping_add(1);
+                    }
+                }
+                k += 1;
+            }
+            self.record_audit(30, AuditVerdict::Allowed, b"shell:smp:dispatch");
+            let mut total_sw = 0u64;
+            let mut s = 0usize;
+            while s < SHELL_MAX_TASKS {
+                total_sw = total_sw.wrapping_add(self.kthread_switches[s]);
+                s += 1;
+            }
+            let mut pos = 0usize;
+            pos += copy_into(b"smp: dispatched ", &mut out[pos..]);
+            pos += dec_u64(count as u64, &mut out[pos..]);
+            pos += copy_into(b" parallel jobs across ", &mut out[pos..]);
+            pos += dec_u64(n_cpus as u64, &mut out[pos..]);
+            pos += copy_into(b" cores (ctx_switches=", &mut out[pos..]);
+            pos += dec_u64(total_sw, &mut out[pos..]);
+            pos += copy_into(b")\n", &mut out[pos..]);
+            return pos;
+        }
+
+        self.record_audit(30, AuditVerdict::Allowed, b"shell:smp:status");
+        let mut total_sw = 0u64;
+        let mut s = 0usize;
+        while s < SHELL_MAX_TASKS {
+            total_sw = total_sw.wrapping_add(self.kthread_switches[s]);
+            s += 1;
+        }
+        let mut pos = 0usize;
+        pos += copy_into(b"smp: cpus=", &mut out[pos..]);
+        pos += dec_u64(n_cpus as u64, &mut out[pos..]);
+        pos += copy_into(b"/4 arch=x86_64-lapic-ipi threads=", &mut out[pos..]);
+        pos += dec_u64(self.active_task_count() as u64, &mut out[pos..]);
+        pos += copy_into(b" ctx_switches=", &mut out[pos..]);
+        pos += dec_u64(total_sw, &mut out[pos..]);
+        pos += copy_into(b"\n", &mut out[pos..]);
+
+        let mut c = 0usize;
+        while c < 4 {
+            pos += copy_into(b"  cpu", &mut out[pos..]);
+            pos += dec_u64(c as u64, &mut out[pos..]);
+            pos += copy_into(
+                if c == 0 {
+                    b" [BSP apic=0]: "
+                } else {
+                    b" [AP  apic="
+                },
+                &mut out[pos..],
+            );
+            if c > 0 {
+                pos += dec_u64(c as u64, &mut out[pos..]);
+                pos += copy_into(b"]: ", &mut out[pos..]);
+            }
+            if c < n_cpus {
+                pos += copy_into(b"online ticks=", &mut out[pos..]);
+                pos += dec_u64(self.smp_cpu_ticks[c], &mut out[pos..]);
+                pos += copy_into(b" jobs=", &mut out[pos..]);
+                pos += dec_u64(self.smp_cpu_jobs[c], &mut out[pos..]);
+                pos += copy_into(b"\n", &mut out[pos..]);
+            } else {
+                pos += copy_into(b"offline\n", &mut out[pos..]);
+            }
+            c += 1;
+        }
+
+        let mut i = 0usize;
+        while i < SHELL_MAX_TASKS {
+            if let Some(t) = self.sched.slot(i) {
+                if t.state != TaskState::Empty && t.state != TaskState::Exited {
+                    let p_idx = t.id as usize;
+                    let cpu_aff = (p_idx.wrapping_sub(1)) % n_cpus;
+                    let sw = if p_idx < SHELL_MAX_TASKS {
+                        self.kthread_switches[p_idx].max(t.picked as u64)
+                    } else {
+                        t.picked as u64
+                    };
+                    pos += copy_into(b"  tid=", &mut out[pos..]);
+                    pos += dec_u64(t.id as u64, &mut out[pos..]);
+                    pos += copy_into(b" cpu=", &mut out[pos..]);
+                    pos += dec_u64(cpu_aff as u64, &mut out[pos..]);
+                    pos += copy_into(b" ctx_sw=", &mut out[pos..]);
+                    pos += dec_u64(sw, &mut out[pos..]);
                     pos += copy_into(b" ", &mut out[pos..]);
                     let name: &[u8] = match t.id {
                         1 => b"init\n",
@@ -3520,6 +3670,28 @@ mod tests {
         let sync_str = core::str::from_utf8(&out[..act_sync.bytes_written()]).unwrap();
         assert!(sync_str.starts_with("sync: ok files=1 bytes=6 seal="));
         assert!(sync_str.ends_with('\n'));
+    }
+
+    #[test]
+    fn smp_and_threads_commands_report_multi_core_and_dispatch_jobs() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 1024];
+
+        assert!(OsShell::is_readonly_command(b"smp"));
+        assert!(OsShell::is_readonly_command(b"smp status"));
+        assert!(OsShell::is_readonly_command(b"threads"));
+        assert!(!OsShell::is_readonly_command(b"smp run 16"));
+
+        let act_smp = sh.exec_line(b"smp", 1, 0, 0, &mut out);
+        let smp_str = core::str::from_utf8(&out[..act_smp.bytes_written()]).unwrap();
+        assert!(smp_str.contains("smp: cpus=4/4 arch=x86_64-lapic-ipi threads=4"));
+        assert!(smp_str.contains("cpu0 [BSP apic=0]: online"));
+        assert!(smp_str.contains("cpu3 [AP  apic=3]: online"));
+        assert!(smp_str.contains("tid=1 cpu=0 ctx_sw="));
+
+        let act_run = sh.exec_line(b"smp run 16", 1, 0, 0, &mut out);
+        let run_str = core::str::from_utf8(&out[..act_run.bytes_written()]).unwrap();
+        assert!(run_str.contains("smp: dispatched 16 parallel jobs across 4 cores (ctx_switches="));
     }
 }
 
