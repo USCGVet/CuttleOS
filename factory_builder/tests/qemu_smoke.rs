@@ -169,7 +169,13 @@ fn boots_under_qemu_and_emits_banner() {
     {
         std::fs::write(&nvme_disk, vec![0u8; 1024 * 1024]).expect("create nvme_hw.img");
     }
-    eprintln!("smoke: launching QEMU (+virtio-blk +2x net hub +ahci +nvme)...");
+    // Provision a 32-byte OS-CSPRNG device secret key outside the kernel
+    // image and outside the AHCI disk, delivered via QEMU fw_cfg.
+    let device_key_path = root.join(factory_builder::DEVICE_SECRET_KEY_FILENAME);
+    factory_builder::ensure_device_secret_key(&device_key_path)
+        .expect("provision 32-byte CSPRNG device_secret_key.bin");
+
+    eprintln!("smoke: launching QEMU (+virtio-blk +2x net hub +ahci +nvme +fw_cfg device key)...");
     // Force TCG. On some Windows hosts the default accelerator
     // (WHPX) accepts the guest but never advances the BIOS past
     // reset — serial stays empty and the 10s banner sweep fails.
@@ -179,6 +185,12 @@ fn boots_under_qemu_and_emits_banner() {
     let mut qproc = Command::new(&qemu)
         .arg("-accel")
         .arg("tcg")
+        .arg("-fw_cfg")
+        .arg(format!(
+            "name={},file={}",
+            factory_builder::FW_CFG_DEVICE_KEY_NAME,
+            device_key_path.display()
+        ))
         .arg("-drive")
         .arg(format!("format=raw,file={},if=ide", bios.display()))
         .arg("-drive")

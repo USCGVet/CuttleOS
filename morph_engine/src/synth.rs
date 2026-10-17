@@ -246,10 +246,13 @@ pub fn read_contracts_source() -> String {
     let files = [
         "lib.rs",
         "core_primitives.rs",
-        "tls_wal_iommu_net.rs",
-        "kpti_virtio_security.rs",
-        "fs_ebpf_smp_pci_x509.rs",
-        "hw_storage_boot.rs",
+        "tls_and_crypto.rs",
+        "net_protocols.rs",
+        "security_and_diag.rs",
+        "mm_and_isolation.rs",
+        "storage_and_fs.rs",
+        "virtio_and_nic.rs",
+        "arch_and_platform.rs",
     ];
     for dir in &dir_candidates {
         let lib_path = dir.join("lib.rs");

@@ -17,7 +17,11 @@ use crate::tls::{hmac_sha256, sha256_into};
 /// Digest / MAC length (SHA-256 / HMAC-SHA256 = 32 bytes).
 pub const DURABLE_DIGEST_LEN: usize = 32;
 
-/// Default 256-bit device seal key used when no hardware/TPM key is injected.
+/// Deterministic 256-bit seal key fixture used only by in-memory unit tests
+/// (`OsShell::empty`). The live kernel (`target_enterprise_kernel`) never
+/// references this constant; it derives `seal_key` from the out-of-band
+/// provisioned secret (`fw_cfg` `opt/proteus_device_key` backed by gitignored
+/// `device_secret_key.bin`, or x86-64 `RDRAND` hardware entropy at boot).
 pub const DEFAULT_DURABLE_SEAL_KEY: [u8; DURABLE_DIGEST_LEN] =
     *b"Proteus-Enterprise-DiskSeal-K001";
 

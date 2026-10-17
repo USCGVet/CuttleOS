@@ -14,8 +14,10 @@ path = "src/lib.rs"
 proteus-contracts = { path = "../contracts" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 # SHA-256 + HMAC for the in-target TLS module. Both are no_std-compatible
-# with default-features off; they do not pull in std or alloc.
-sha2 = { version = "0.10", default-features = false }
+# with default-features off; `force-soft` prevents x86 SHA-NI/SSE2 XMM
+# intrinsics from failing LLVM codegen on soft-float `x86_64-unknown-none`
+# debug builds.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 
 # Integration tests run as std targets and exercise both the contract
 # property-test harness and the no_std skeleton modules (memory bitmap,

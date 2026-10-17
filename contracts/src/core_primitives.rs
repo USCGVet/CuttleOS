@@ -1,7 +1,5 @@
-//! Core cryptographic, capability, syscall, block-device, and allocator contracts.
-/// Cryptographic hash function contract.
-///
-/// Invariants the verifier checks:
+//! Core primitives: hash, AEAD, signature verification, syscalls, capabilities, block device, and allocator.
+
 /// - Determinism: `hash(x) == hash(x)` for all `x`.
 /// - Avalanche: `hash(x) != hash(x')` for `x != x'` with overwhelming
 ///   probability (verified against a fixed adversarial corpus, not a full
@@ -841,4 +839,3 @@ pub mod harness {
         Verdict::Pass
     }
 }
-

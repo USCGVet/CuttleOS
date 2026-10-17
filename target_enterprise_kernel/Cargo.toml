@@ -33,4 +33,6 @@ debug = false
 strip = false
 
 [profile.dev]
+opt-level = 1
 panic = "abort"
+debug = false

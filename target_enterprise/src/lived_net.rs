@@ -39,7 +39,12 @@ pub const MAX_FRAME: usize = 1514;
 pub const MAX_REPLIES: usize = 3;
 /// Scratch for an in-progress HTTP request (one TCB).
 const HTTP_BUF: usize = 1024;
-/// Default 256-bit HMAC-SHA256 control-plane key for authenticated `AUTH <seq> <hmac> <cmd>` datagrams.
+/// Deterministic 256-bit HMAC-SHA256 fixture key used only by in-memory unit
+/// tests (`LivedNet::new`). The live kernel (`target_enterprise_kernel`) never
+/// references this constant; it provisions a 256-bit secret out-of-band via
+/// QEMU `fw_cfg` (`opt/proteus_device_key`, backed by gitignored
+/// `device_secret_key.bin`) or x86-64 hardware `RDRAND` entropy at boot and
+/// constructs `LivedNet::with_auth_key` directly.
 pub const DEFAULT_NET_AUTH_KEY: [u8; 32] = *b"Proteus-Enterprise-NetAuth-Key01";
 
 /// Outgoing Ethernet frames produced by [`LivedNet::handle_frame`].

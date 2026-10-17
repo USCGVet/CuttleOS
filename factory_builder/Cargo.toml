@@ -23,4 +23,5 @@ path = "src/lib.rs"
 # rust-toolchain.toml). This workspace-member crate handles all the
 # CLI / validation / sha256 / morph-engine integration code on stable.
 anyhow = { workspace = true }
+rand = { workspace = true }
 sha2 = { workspace = true }

@@ -35,10 +35,13 @@ locked = [
     # canonical-AST hash drives attestation schema versioning.
     "contracts/src/lib.rs",
     "contracts/src/core_primitives.rs",
-    "contracts/src/tls_wal_iommu_net.rs",
-    "contracts/src/kpti_virtio_security.rs",
-    "contracts/src/fs_ebpf_smp_pci_x509.rs",
-    "contracts/src/hw_storage_boot.rs",
+    "contracts/src/tls_and_crypto.rs",
+    "contracts/src/net_protocols.rs",
+    "contracts/src/security_and_diag.rs",
+    "contracts/src/mm_and_isolation.rs",
+    "contracts/src/storage_and_fs.rs",
+    "contracts/src/virtio_and_nic.rs",
+    "contracts/src/arch_and_platform.rs",
 
     # KPTI port (TASK-017). The trampoline-blob byte sequences and the
     # CR3-swap discipline in build_user_view are LOAD-BEARING. The
@@ -55,10 +58,15 @@ locked = [
     # on). Boot code is by definition the un-morphable seed of the
     # whole system.
     "target_enterprise_kernel/src/main.rs",
-    "target_enterprise_kernel/src/banners_core.rs",
-    "target_enterprise_kernel/src/banners_fs_sys.rs",
-    "target_enterprise_kernel/src/hw_and_net_service.rs",
-    "target_enterprise_kernel/src/banners_compose_os.rs",
+    "target_enterprise_kernel/src/provisioning.rs",
+    "target_enterprise_kernel/src/banners_tls_net.rs",
+    "target_enterprise_kernel/src/banners_storage_fs.rs",
+    "target_enterprise_kernel/src/banners_security_crypto.rs",
+    "target_enterprise_kernel/src/banners_arch_platform.rs",
+    "target_enterprise_kernel/src/banners_compose.rs",
+    "target_enterprise_kernel/src/hw_storage_drivers.rs",
+    "target_enterprise_kernel/src/hw_net_drivers.rs",
+    "target_enterprise_kernel/src/net_service.rs",
 
     # Locked fixtures (Phase C). `kernel_fixtures.rs` declares the
     # `const` inputs and expected outputs that the kernel banner

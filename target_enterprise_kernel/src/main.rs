@@ -226,9 +226,9 @@ pub(crate) unsafe fn ensure_mmio_page(phys: u64) -> *mut u8 {
         // SAFETY: `ent_ptr` is 8-byte aligned and points to a valid page-table entry in mapped physical memory.
         let ent = unsafe { core::ptr::read_volatile(ent_ptr) };
         if ent & PTE_P == 0 {
-            // SAFETY: Allocates a zeroed 4 KiB page-table frame from the reserved DMA pool.
+            // SAFETY: Running at CPL=0 with initialized `PT_ALLOC_NEXT`; returns a 4 KiB-aligned physical address within the reserved DMA/PT pool.
             let new_t = unsafe { alloc_pt_frame() };
-            // SAFETY: Installing a new intermediate page-table entry into `ent_ptr`.
+            // SAFETY: `ent_ptr` is an 8-byte-aligned PTE slot in the mapped parent page table and `new_ent` points to a zeroed 4 KiB frame.
             unsafe {
                 core::ptr::write_volatile(ent_ptr, new_t | PTE_P | PTE_W);
             }
@@ -249,7 +249,7 @@ pub(crate) unsafe fn ensure_mmio_page(phys: u64) -> *mut u8 {
     if ent & PTE_P == 0 || (ent & (PTE_PWT | PTE_PCD)) != (PTE_PWT | PTE_PCD) {
         // Present | Writable | PWT | PCD (uncached MMIO).
         let pte = phys_page | PTE_P | PTE_W | PTE_PWT | PTE_PCD;
-        // SAFETY: Updating the leaf PTE for `va` and flushing its TLB entry via `invlpg`.
+        // SAFETY: `leaf` is an 8-byte-aligned L1 PTE pointer in mapped physical memory and `invlpg` is valid at CPL=0 for any canonical virtual address `va`.
         unsafe {
             core::ptr::write_volatile(leaf, pte);
             asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
@@ -260,11 +260,11 @@ pub(crate) unsafe fn ensure_mmio_page(phys: u64) -> *mut u8 {
 
 // SAFETY: Caller must pass a 4-byte aligned guest-physical MMIO register address.
 pub(crate) unsafe fn mmio_read32(phys: u64) -> u32 {
-    // SAFETY: Ensures the 4 KiB page containing `phys` is mapped uncached in the page tables.
+    // SAFETY: Running at CPL=0; `phys & !0xFFF` is a page-aligned guest-physical MMIO address mapped with `PTE_P | PTE_W | PTE_PWT | PTE_PCD`.
     let page = unsafe { ensure_mmio_page(phys) };
     let off = (phys & 0xFFF) as usize;
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-    // SAFETY: `page.add(off)` points to the mapped 32-bit MMIO register within the 4 KiB page.
+    // SAFETY: `off = (phys & 0xFFF) <= 0xFFC` and caller guarantees 4-byte alignment, so `page.add(off)` is an aligned, mapped 32-bit MMIO register.
     let val = unsafe { core::ptr::read_volatile(page.add(off) as *const u32) };
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     val
@@ -272,11 +272,11 @@ pub(crate) unsafe fn mmio_read32(phys: u64) -> u32 {
 
 // SAFETY: Caller must pass a 4-byte aligned guest-physical MMIO register address.
 pub(crate) unsafe fn mmio_write32(phys: u64, val: u32) {
-    // SAFETY: Ensures the 4 KiB page containing `phys` is mapped uncached in the page tables.
+    // SAFETY: Running at CPL=0; `phys & !0xFFF` is a page-aligned guest-physical MMIO address mapped with `PTE_P | PTE_W | PTE_PWT | PTE_PCD`.
     let page = unsafe { ensure_mmio_page(phys) };
     let off = (phys & 0xFFF) as usize;
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-    // SAFETY: `page.add(off)` points to the mapped 32-bit MMIO register within the 4 KiB page.
+    // SAFETY: `off = (phys & 0xFFF) <= 0xFFC` and caller guarantees 4-byte alignment, so `page.add(off)` is an aligned, mapped 32-bit MMIO register.
     unsafe {
         core::ptr::write_volatile(page.add(off) as *mut u32, val);
     }
@@ -285,16 +285,16 @@ pub(crate) unsafe fn mmio_write32(phys: u64, val: u32) {
 
 // SAFETY: Caller must pass a valid 64-bit MMIO register address supporting two 32-bit reads.
 pub(crate) unsafe fn mmio_read64(phys: u64) -> u64 {
-    // SAFETY: Reading the low 32 bits of the 64-bit MMIO register at `phys`.
+    // SAFETY: Caller guarantees `phys` is an 8-byte-aligned 64-bit MMIO register; reading low dword at `phys` via `mmio_read32` is aligned and mapped.
     let lo = unsafe { mmio_read32(phys) } as u64;
-    // SAFETY: Reading the high 32 bits of the 64-bit MMIO register at `phys + 4`.
+    // SAFETY: Caller guarantees `phys` is an 8-byte-aligned 64-bit MMIO register, so `phys + 4` is 4-byte aligned within the same 4 KiB MMIO page.
     let hi = unsafe { mmio_read32(phys + 4) } as u64;
     lo | (hi << 32)
 }
 
 // SAFETY: Caller must pass a valid 64-bit MMIO register address supporting two 32-bit writes.
 pub(crate) unsafe fn mmio_write64(phys: u64, val: u64) {
-    // SAFETY: Writing low and high 32-bit halves of the 64-bit MMIO register at `phys` and `phys + 4`.
+    // SAFETY: Caller guarantees `phys` is an 8-byte-aligned 64-bit MMIO register, so both `phys` and `phys + 4` are 4-byte aligned within the same page.
     unsafe {
         mmio_write32(phys, val as u32);
         mmio_write32(phys + 4, (val >> 32) as u32);
@@ -387,7 +387,7 @@ impl proteus_contracts::PciConfigBus for RealPciBus {
             | ((addr.device as u32) << 11)
             | ((addr.function as u32) << 8)
             | o;
-        // SAFETY: Writing PCI mechanism #1 address port (0xCF8) and reading data port (0xCFC) in ring 0.
+        // SAFETY: Running at CPL=0; ports 0xCF8 and 0xCFC are the architectural x86 PCI Mechanism #1 config registers and do not alias memory.
         unsafe {
             outl(PCI_CONFIG_ADDR, conf);
             inl(PCI_CONFIG_DATA)
@@ -405,7 +405,7 @@ impl proteus_contracts::PciConfigBus for RealPciBus {
             | ((addr.device as u32) << 11)
             | ((addr.function as u32) << 8)
             | o;
-        // SAFETY: Writing PCI mechanism #1 address port (0xCF8) and data port (0xCFC) in ring 0.
+        // SAFETY: Running at CPL=0; ports 0xCF8 and 0xCFC are the architectural x86 PCI Mechanism #1 config registers and do not alias memory.
         unsafe {
             outl(PCI_CONFIG_ADDR, conf);
             outl(PCI_CONFIG_DATA, value);
@@ -415,7 +415,7 @@ impl proteus_contracts::PciConfigBus for RealPciBus {
 
 pub(crate) fn serial_init() {
     // 16550 init: 38400 baud, 8N1, FIFO enabled.
-    // SAFETY: Programming standard 16550 UART registers at COM1 (0x3F8..0x3FC) in ring 0.
+    // SAFETY: Running at CPL=0; I/O ports `0x3F8..=0x3FC` decode to the architectural COM1 16550 UART registers and do not touch memory.
     unsafe {
         outb(COM1 + 1, 0x00); // disable interrupts
         outb(COM1 + 3, 0x80); // enable DLAB
@@ -428,7 +428,7 @@ pub(crate) fn serial_init() {
 }
 
 pub(crate) fn serial_write_byte(b: u8) {
-    // SAFETY: Polling COM1 LSR (0x3FD) until THRE is set and writing `b` to COM1 THR (0x3F8).
+    // SAFETY: Running at CPL=0 after `serial_init`; port 0x3FD is COM1 LSR and port 0x3F8 is COM1 THR once LSR.THRE confirms FIFO space.
     unsafe {
         while inb(COM1 + 5) & LSR_THRE == 0 {
             core::hint::spin_loop();
@@ -532,15 +532,25 @@ pub(crate) fn assert_eq_bytes(actual: &[u8], expected: &[u8], surface: &'static 
 }
 
 
-mod banners_compose_os;
-mod banners_core;
-mod banners_fs_sys;
-mod hw_and_net_service;
+mod banners_arch_platform;
+mod banners_compose;
+mod banners_security_crypto;
+mod banners_storage_fs;
+mod banners_tls_net;
+mod hw_net_drivers;
+mod hw_storage_drivers;
+mod net_service;
+mod provisioning;
 
-pub(crate) use banners_compose_os::*;
-pub(crate) use banners_core::*;
-pub(crate) use banners_fs_sys::*;
-pub(crate) use hw_and_net_service::*;
+pub(crate) use banners_arch_platform::*;
+pub(crate) use banners_compose::*;
+pub(crate) use banners_security_crypto::*;
+pub(crate) use banners_storage_fs::*;
+pub(crate) use banners_tls_net::*;
+pub(crate) use hw_net_drivers::*;
+pub(crate) use hw_storage_drivers::*;
+pub(crate) use net_service::*;
+pub(crate) use provisioning::*;
 
 // ============================================================
 // Entry + panic handler + halt
@@ -780,13 +790,13 @@ pub(crate) fn live_os_console_loop() -> ! {
         let mut maybe_byte: Option<u8> = None;
 
         // 1. Poll COM1 (16550 UART LSR bit 0 = data ready).
-        // SAFETY: Reading x86 I/O port 0x3FD (COM1 LSR) in ring 0.
+        // SAFETY: Running at CPL=0; port 0x3FD is the read-only COM1 Line Status Register and reading it has no memory side effects.
         if unsafe { inb(COM1 + 5) & 0x01 != 0 } {
             // SAFETY: COM1 LSR bit 0 confirmed a received byte is ready in RBR (0x3F8).
             maybe_byte = Some(unsafe { inb(COM1) });
         } else {
             // 2. Poll PS/2 8042 status port (bit 0 = output buffer full).
-            // SAFETY: Reading x86 I/O port 0x64 (8042 status register) in ring 0.
+            // SAFETY: Running at CPL=0; port 0x64 is the read-only i8042 PS/2 controller status register and reading it has no memory side effects.
             let kbd_ready = unsafe { inb(0x64) & 0x01 != 0 };
             if kbd_ready {
                 // SAFETY: 8042 status bit 0 confirmed a scancode byte is ready at port 0x60.
@@ -820,14 +830,14 @@ pub(crate) fn live_os_console_loop() -> ! {
                 ShellAction::Halt(_) => {
                     let _ = persist_shell_to_ahci(sh, boots);
                     // QEMU/Bochs ACPI PM1a_CNT S5 poweroff (0x604 <- 0x2000).
-                    // SAFETY: Port 0x604 is the ACPI PM1a_CNT register in QEMU/Bochs.
+                    // SAFETY: Running at CPL=0 during shutdown; port 0x604 is the QEMU/Bochs ACPI PM1a_CNT register where writing 0x2000 asserts SLP_TYP=S5 | SLP_EN.
                     unsafe { outw(0x604, 0x2000) };
                     halt_forever();
                 }
                 ShellAction::Reboot(_) => {
                     let _ = persist_shell_to_ahci(sh, boots);
                     // 8042 keyboard controller CPU reset pulse (0x64 <- 0xFE).
-                    // SAFETY: Writing 0xFE to port 0x64 triggers an 8042 CPU reset line pulse.
+                    // SAFETY: Running at CPL=0 during reboot; port 0x64 is the i8042 command register where 0xFE pulses the x86 CPU INIT/reset line.
                     unsafe { outb(0x64, 0xFE) };
                     halt_forever();
                 }
@@ -886,7 +896,7 @@ pub(crate) const ATTACK_READ_LEN: usize = 176;
 /// Blocking read of one byte from COM1 (16550 RBR, polled).
 #[cfg(not(proteus_prod))]
 pub(crate) fn serial_read_byte() -> u8 {
-    // SAFETY: Polling COM1 LSR (0x3FD) and reading COM1 RBR (0x3F8) in ring 0.
+    // SAFETY: Running at CPL=0; polling 0x3FD until bit 0 (DR) is set guarantees a received byte is latched in RBR (0x3F8).
     unsafe {
         while inb(COM1 + 5) & 0x01 == 0 {
             core::hint::spin_loop();
@@ -898,7 +908,7 @@ pub(crate) fn serial_read_byte() -> u8 {
 /// Non-blocking check: is a byte waiting on COM1?
 #[cfg(not(proteus_prod))]
 pub(crate) fn serial_data_ready() -> bool {
-    // SAFETY: Reading COM1 LSR (0x3FD) status register in ring 0.
+    // SAFETY: Running at CPL=0; port 0x3FD is the read-only COM1 Line Status Register and does not alias memory.
     unsafe { inb(COM1 + 5) & 0x01 != 0 }
 }
 
@@ -949,19 +959,16 @@ pub(crate) fn attack_iface_pilot() {
 // The exploit bytes arrive via `-fw_cfg name=opt/attack.bin,file=...`:
 // a real, attacker-controlled input channel that (unlike 16550 RX under
 // TCG) cannot drop bytes. Serial remains the output/verdict channel.
-#[cfg(not(proteus_prod))]
 pub(crate) const FW_CFG_CTL: u16 = 0x510;
-#[cfg(not(proteus_prod))]
 pub(crate) const FW_CFG_DATA: u16 = 0x511;
 
 /// Locate the fw_cfg file named `want` and return its selector. The
 /// fw_cfg file directory (key 0x0019) is a BE u32 count followed by
 /// entries {u32 size, u16 select, u16 reserved, char name[56]}.
-#[cfg(not(proteus_prod))]
 pub(crate) fn fw_cfg_select(want: &str) -> Option<u16> {
-    // SAFETY: Selecting the QEMU fw_cfg file directory (key 0x0019) on port 0x510 in ring 0.
+    // SAFETY: Running at CPL=0; port 0x510 is the QEMU `fw_cfg` selector register and writing 0x0019 selects the read-only directory stream.
     unsafe { outw(FW_CFG_CTL, 0x0019) };
-    // SAFETY: Reading the 4-byte BE file count sequentially from QEMU fw_cfg data port 0x511.
+    // SAFETY: Running at CPL=0 after selecting key 0x0019 on port 0x510; reading port 0x511 streams the 4-byte big-endian directory entry count.
     let count = unsafe {
         u32::from_be_bytes([
             inb(FW_CFG_DATA),
@@ -975,13 +982,13 @@ pub(crate) fn fw_cfg_select(want: &str) -> Option<u16> {
         // Entry: u32 size (BE), u16 select (BE), u16 reserved, name[56].
         let mut hdr = [0u8; 8];
         for b in hdr.iter_mut() {
-            // SAFETY: Reading directory entry header bytes from fw_cfg data port 0x511.
+            // SAFETY: Running at CPL=0 with key 0x0019 active; reading port 0x511 streams the 8-byte `(size, select, reserved)` header of the current entry.
             *b = unsafe { inb(FW_CFG_DATA) };
         }
         let select = u16::from_be_bytes([hdr[4], hdr[5]]);
         let mut name = [0u8; 56];
         for b in name.iter_mut() {
-            // SAFETY: Reading 56-byte NUL-padded file name from fw_cfg data port 0x511.
+            // SAFETY: Running at CPL=0 with key 0x0019 active; reading port 0x511 streams the 56-byte NUL-padded filename of the current directory entry.
             *b = unsafe { inb(FW_CFG_DATA) };
         }
         let end = name.iter().position(|&c| c == 0).unwrap_or(56);
@@ -1010,12 +1017,12 @@ pub(crate) fn attack_vulnerable_service() {
         return;
     };
     // Re-selecting rewinds the data cursor to offset 0.
-    // SAFETY: Re-selecting fw_cfg entry `sel` on port 0x510 to rewind the stream offset to 0.
+    // SAFETY: Running at CPL=0; writing `sel` to port 0x510 latches the `opt/attack.bin` `fw_cfg` blob at stream offset 0.
     unsafe { outw(FW_CFG_CTL, sel) };
     let mut buf = [0u8; 64];
     let dst = buf.as_mut_ptr();
     for i in 0..ATTACK_READ_LEN {
-        // SAFETY: Reading one payload byte from QEMU fw_cfg data port 0x511.
+        // SAFETY: Running at CPL=0 with `sel` latched on port 0x510; reading port 0x511 streams the next byte of the `fw_cfg` payload.
         let b = unsafe { inb(FW_CFG_DATA) };
         // SAFETY: INTENTIONAL RED-TEAM VULNERABILITY — writes `ATTACK_READ_LEN` (176) bytes into a
         // 64-byte stack buffer (`dst`) while remaining within the mapped kernel stack page to test

@@ -1,683 +1,7 @@
-//! TLS 1.3, Write-Ahead Log, IOMMU, and core network protocol contracts.
-use crate::*;
-/// TLS 1.3 server contract — the byte-observable surface of the in-kernel
-/// TLS module. Implementations morph aggressively over **internal**
-/// helpers (key derivation intermediates, parsing utilities, scratch
-/// buffer management) but the wire-format outputs of the methods below
-/// are locked across all morph cycles.
-///
-/// Invariants the verifier checks:
-///
-/// - **Wire equivalence.** Given an identical (`client_hello`,
-///   `server_random`, `server_pubkey`, `selected_alpn`) tuple, every
-///   morph candidate's [`build_server_hello`](Self::build_server_hello)
-///   produces the same bytes byte-for-byte.
-/// - **HKDF KAT compliance.** [`hkdf_extract`](Self::hkdf_extract) and
-///   [`hkdf_expand_label`](Self::hkdf_expand_label) match RFC 5869 +
-///   RFC 8446 §7.1 published vectors byte-for-byte. Tested in
-///   `target_enterprise/tests/tls_kat.rs`.
-/// - **Buffer discipline.** Every method writes only into the caller-
-///   supplied output buffer. Implementations may not heap-allocate
-///   (`target_enterprise` is `no_std` without `alloc`).
-///
-/// The trait is **conservative**: only the minimum surface the morph
-/// engine needs to lock is declared here. Cipher-suite selection logic,
-/// extension parsing internals, and key-schedule chaining live in the
-/// impl crate and are free to morph.
-pub trait Tls13Server {
-    /// Length of the outer TLS record header in bytes: `content_type` (1) +
-    /// `legacy_version` (2) + `length` (2) = 5. Locked across all morph
-    /// cycles per RFC 8446 §5.1.
-    const RECORD_HEADER_LEN: usize = 5;
+//! Network protocol contracts: IPv4, UDP, TCP, HTTP, DNS, DnsName, Ethernet, ARP, DHCP, ICMP, SNTPv4, and TFTP.
 
-    /// Output length of the underlying hash (SHA-256) in bytes. TLS 1.3
-    /// with TLS_AES_128_GCM_SHA256 or TLS_CHACHA20_POLY1305_SHA256 both
-    /// use SHA-256, so this is fixed at 32 for the supported suite set.
-    const HASH_LEN: usize = 32;
+use super::*;
 
-    /// Error type returned by fallible methods on this trait. Typically
-    /// a small enum identifying which parse step or buffer check failed;
-    /// the contract does not lock the discriminants because the verifier
-    /// only inspects success-path outputs.
-    type Error;
-
-    /// Build the handshake-message-encoded ServerHello in response to
-    /// `client_hello`. The output is the Handshake message (type byte +
-    /// uint24 length + body) — the caller is responsible for wrapping
-    /// it in a record header if a wire-level record is needed.
-    ///
-    /// # Preconditions
-    /// - `client_hello` is the handshake-typed payload (no outer record
-    ///   header). Implementations parse it strictly; any malformed input
-    ///   returns `Err`.
-    /// - `server_random` is 32 caller-supplied bytes (typically from a
-    ///   CSPRNG; the trait does not lock the source).
-    /// - `server_pubkey` is a 32-byte X25519 public key matching the
-    ///   ephemeral private key the server holds for this handshake.
-    /// - `selected_alpn`, if `Some`, names an ALPN protocol ID the
-    ///   server selected from the client's offer (e.g. `b"h2"`,
-    ///   `b"http/1.1"`). The encoded length must be 1..=255.
-    /// - `out` must be at least 256 bytes long to hold any legal
-    ///   ServerHello this trait emits. Implementations MAY require less;
-    ///   the verifier asserts byte-exactness only on the prefix.
-    ///
-    /// # Returns
-    /// Number of bytes written to `out`. The valid prefix is
-    /// `out[..returned]`.
-    fn build_server_hello(
-        client_hello: &[u8],
-        server_random: &[u8; 32],
-        server_pubkey: &[u8; 32],
-        selected_alpn: Option<&[u8]>,
-        out: &mut [u8],
-    ) -> Result<usize, Self::Error>;
-
-    /// HKDF-Extract over SHA-256 per RFC 5869 §2.2. Writes 32 bytes to
-    /// `out`. `salt` may be empty (treated as 32 zero bytes per RFC).
-    /// `ikm` is arbitrary-length input keying material.
-    ///
-    /// # Preconditions
-    /// `out` is a fixed `&mut [u8; 32]` so length is statically correct;
-    /// no runtime length check is needed.
-    fn hkdf_extract(salt: &[u8], ikm: &[u8], out: &mut [u8; 32]);
-
-    /// HKDF-Expand-Label per RFC 8446 §7.1. The encoded `HkdfLabel`
-    /// uses the implicit `"tls13 "` prefix so labels derived under
-    /// different protocols can never collide.
-    ///
-    /// # Preconditions
-    /// - `secret` is a 32-byte pseudorandom key (typically the output
-    ///   of `hkdf_extract` or a previous expand-label step).
-    /// - `label.len() + 6` (the `"tls13 "` prefix) must fit in a u8
-    ///   (≤ 255). `context.len()` must fit in a u8.
-    /// - `out.len()` must be ≤ `255 * 32` (the HKDF-Expand cap).
-    ///   Behaviour for over-length `out` is implementation-defined
-    ///   panic; the verifier does not exercise this path.
-    fn hkdf_expand_label(secret: &[u8; 32], label: &[u8], context: &[u8], out: &mut [u8]);
-}
-
-// ============================================================
-// TLS 1.3 client (RFC 8446) — TASK-049
-// ============================================================
-
-/// Parsed view of a TLS 1.3 ServerHello returned by
-/// [`Tls13Client::parse_server_hello`].
-///
-/// The shape is intentionally minimal: only fields needed to drive the
-/// key schedule forward (server_random for transcript binding, the
-/// chosen `cipher_suite`, the server's x25519 ephemeral public key).
-/// Extensions other than `supported_versions` (asserted = 0x0304) and
-/// `key_share` (x25519) are tolerated but discarded.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct ParsedServerHello {
-    /// Server-supplied 32 bytes of randomness (TLS 1.3 §4.1.3). Used
-    /// in the transcript-hash that feeds Derive-Secret.
-    pub server_random: [u8; 32],
-    /// Server's selected cipher suite. The client locks to the offered
-    /// suite set and rejects an unrecognised pick. TASK-049 ships with
-    /// `TLS_AES_128_GCM_SHA256` (0x1301) as the sole accepted value;
-    /// the field is stored verbatim so a future suite addition is a
-    /// pure schema extension.
-    pub cipher_suite: u16,
-    /// Server's ephemeral x25519 public key recovered from the
-    /// `key_share` extension. Combined with the client's ephemeral
-    /// secret (out-of-band) to produce the (EC)DHE shared secret that
-    /// feeds the handshake-secret HKDF-Extract step.
-    pub server_pubkey: [u8; 32],
-}
-
-/// Handshake-layer traffic secrets derived by
-/// [`Tls13Client::derive_handshake_keys`]. RFC 8446 §7.1 ("Key
-/// Schedule").
-///
-/// The three fields are the locked outputs of the schedule:
-///
-/// - `handshake_secret`  = HKDF-Extract(derived_early, shared_secret)
-/// - `client_handshake_traffic_secret`
-///                       = Derive-Secret(HS, "c hs traffic", CH..SH)
-/// - `server_handshake_traffic_secret`
-///                       = Derive-Secret(HS, "s hs traffic", CH..SH)
-///
-/// Each is 32 bytes (SHA-256 output length). The downstream key/iv
-/// derivation (HKDF-Expand-Label with `"key"` / `"iv"`) is performed
-/// out-of-band by the caller — this trait's responsibility is the
-/// schedule prefix that locks every morph cycle to the same bytes.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct HandshakeKeys {
-    /// HKDF-Extract output that anchors every subsequent client/server
-    /// handshake-traffic derivation. 32 bytes (HMAC-SHA-256 output).
-    pub handshake_secret: [u8; 32],
-    /// Client-direction handshake traffic secret. Used by the client
-    /// to encrypt its Finished message and any 0-RTT early-data record
-    /// (early data is out of scope for TASK-049).
-    pub client_handshake_traffic_secret: [u8; 32],
-    /// Server-direction handshake traffic secret. Used by the client
-    /// to decrypt the server's EncryptedExtensions + Certificate +
-    /// CertificateVerify + Finished records.
-    pub server_handshake_traffic_secret: [u8; 32],
-}
-
-/// TLS 1.3 client primitives — the outbound counterpart to
-/// [`Tls13Server`]. **Locked surface** for the morph engine.
-///
-/// The four methods together cover the handshake-message layer of an
-/// outbound TLS 1.3 connection through ClientFinished. AEAD record-
-/// layer encryption + certificate-chain validation + curve25519
-/// scalar-multiplication are out of scope for TASK-049 (and are bound
-/// to the existing [`Aead`] / [`SignatureVerify`] surfaces or are
-/// future tasks).
-///
-/// Invariants the verifier checks:
-///
-/// - **Wire equivalence on ClientHello.** Given an identical
-///   (`client_random`, `client_pubkey`) tuple, every morph candidate's
-///   [`build_client_hello`](Self::build_client_hello) produces the same
-///   bytes byte-for-byte. The cipher_suites list MUST be the singleton
-///   `[TLS_AES_128_GCM_SHA256]`; the extension order MUST be
-///   `[supported_versions, signature_algorithms, key_share]` (RFC 8446
-///   §4.1.2 does not lock extension order on the wire, but the
-///   contract does so morph runs are byte-comparable).
-/// - **Parse correctness on ServerHello.** Given a byte-identical
-///   ServerHello, every candidate's
-///   [`parse_server_hello`](Self::parse_server_hello) returns the same
-///   [`ParsedServerHello`].
-/// - **Key-schedule KAT.** Given an identical
-///   (`shared_secret`, `client_hello`, `server_hello`) tuple,
-///   [`derive_handshake_keys`](Self::derive_handshake_keys) writes the
-///   same [`HandshakeKeys`] bytes. The schedule MUST follow RFC 8446
-///   §7.1 to the letter: early_secret = HKDF-Extract(0, 0); derived =
-///   Derive-Secret(early_secret, "derived", ""); handshake_secret =
-///   HKDF-Extract(derived, shared_secret); the two traffic secrets are
-///   Derive-Secret(HS, "c hs traffic" | "s hs traffic", CH || SH).
-/// - **Finished MAC.** Given an identical
-///   (`client_handshake_traffic_secret`, `transcript_hash`) pair,
-///   [`build_client_finished`](Self::build_client_finished) writes the
-///   same 32-byte HMAC-SHA-256 verify_data per RFC 8446 §4.4.4.
-/// - **Buffer discipline.** Every method writes only into the caller-
-///   supplied output buffer. Implementations may not heap-allocate
-///   (`target_enterprise` is `no_std` without `alloc`).
-pub trait Tls13Client {
-    /// Length of the outer TLS record header in bytes. Locked at 5
-    /// (content_type + legacy_version + length) — same as
-    /// [`Tls13Server::RECORD_HEADER_LEN`].
-    const RECORD_HEADER_LEN: usize = 5;
-
-    /// Output length of the underlying hash (SHA-256). Locked at 32.
-    const HASH_LEN: usize = 32;
-
-    /// Error type returned by fallible methods on this trait.
-    /// Discriminants are not locked by the contract; only the success-
-    /// path output bytes are part of the verifier's wire-equivalence
-    /// check.
-    type Error;
-
-    /// Build the handshake-message-encoded ClientHello into `out`.
-    /// Returns the number of bytes written. The output is the Handshake
-    /// message (`type(1) | length(3) | body`) — the caller wraps it in
-    /// a record header for wire transmission.
-    ///
-    /// # Preconditions
-    /// - `client_random` is 32 caller-supplied bytes (typically from a
-    ///   CSPRNG; the trait does not lock the source).
-    /// - `client_pubkey` is a 32-byte x25519 ephemeral public key. The
-    ///   matching scalar private key lives in the caller for the
-    ///   subsequent (EC)DHE step.
-    /// - `out` must be at least 256 bytes long. The actual emitted
-    ///   length is comfortably under 200 bytes for the locked
-    ///   extension set, but the caller is required to size the buffer
-    ///   so a future ALPN/SNI extension does not require an API break.
-    fn build_client_hello(
-        client_random: &[u8; 32],
-        client_pubkey: &[u8; 32],
-        out: &mut [u8],
-    ) -> Result<usize, Self::Error>;
-
-    /// Parse a Handshake-typed ServerHello payload (no outer record
-    /// header). Strict on every length field; any over-read returns
-    /// `Err`. Returns the locked [`ParsedServerHello`] view.
-    fn parse_server_hello(server_hello: &[u8]) -> Result<ParsedServerHello, Self::Error>;
-
-    /// Run the TLS 1.3 key schedule prefix (RFC 8446 §7.1) through the
-    /// two handshake-traffic secrets. Writes the result into `out`.
-    ///
-    /// `client_hello` and `server_hello` are the Handshake-message
-    /// encodings (the same byte slices the caller passed to / received
-    /// from [`build_client_hello`] / [`parse_server_hello`]). The
-    /// transcript-hash input to the two Derive-Secret calls is
-    /// SHA-256(client_hello || server_hello).
-    fn derive_handshake_keys(
-        shared_secret: &[u8; 32],
-        client_hello: &[u8],
-        server_hello: &[u8],
-        out: &mut HandshakeKeys,
-    );
-
-    /// Compute the client Finished `verify_data` per RFC 8446 §4.4.4:
-    ///
-    /// ```text
-    /// finished_key = HKDF-Expand-Label(client_handshake_traffic_secret,
-    ///                                  "finished", "", 32)
-    /// verify_data  = HMAC-SHA-256(finished_key, transcript_hash)
-    /// ```
-    ///
-    /// `transcript_hash` is SHA-256 over every handshake message from
-    /// ClientHello through the server's Finished (inclusive). The
-    /// caller is responsible for accumulating that hash; the trait
-    /// surface keeps the responsibility separation between the schedule
-    /// (this trait) and the transcript log (caller).
-    fn build_client_finished(
-        client_handshake_traffic_secret: &[u8; 32],
-        transcript_hash: &[u8; 32],
-        out: &mut [u8; 32],
-    );
-}
-
-/// Write-ahead log contract — the locked durability surface for any
-/// persistent kernel state that needs to survive an unclean shutdown.
-///
-/// The contract describes an append-only journal of opaque records
-/// with a *durable cursor* that advances on `flush(proof)`. Replay
-/// after a simulated crash yields exactly the records that were
-/// durably flushed before the crash — never more, never less.
-///
-/// **TASK-161:** `flush` requires a [`CapProof`] minted under
-/// [`caps::DURABLE_WAL_WRITE`] (or a superset). This is the first
-/// durable-write gate: unprivileged code cannot advance
-/// `durable_cursor` without a successful capability check. Residual
-/// remains open for jfs / audit-persist / raw block paths.
-///
-/// Invariants the verifier checks:
-///
-/// - **Length-prefix + CRC32 framing.** Every record on the backing
-///   store is encoded as `[len: u32 LE][crc32: u32 LE][payload...]`.
-///   The CRC is computed over the payload bytes only (the length and
-///   crc fields themselves are excluded so a partial write that tears
-///   the header is naturally detected by short-read).
-/// - **Monotonic LSNs.** `append` returns a strictly increasing log
-///   sequence number, starting at 1 for the first record after a
-///   fresh init. LSNs never wrap and never repeat across replays.
-/// - **Durable-prefix replay.** `replay(cb)` walks the journal from
-///   the start and invokes `cb(lsn, payload)` for every record whose
-///   framing validates AND that lies wholly within the durable
-///   cursor. The first corrupt or truncated record stops the walk;
-///   nothing after it is delivered.
-/// - **No-mock equivalence.** Reconstructing the WAL from its backing
-///   store and calling `replay(cb)` must yield exactly the records
-///   that were durably committed (i.e. `append`'d AND followed by a
-///   successful `flush()`) before the simulated crash. Records that
-///   were `append`'d but never `flush`'d may or may not appear; the
-///   contract permits either, since the durable cursor lagged behind
-///   the write cursor at crash time.
-///
-/// The trait is intentionally object-safe-friendly: no const generics
-/// or associated constants on the trait itself. Concrete impls may
-/// (and the canonical `target_enterprise` impl does) parameterise
-/// their backing-store capacity as a const generic on the impl
-/// struct, not on the trait.
-pub trait WriteAheadLog {
-    /// Error variant returned by fallible methods. Typically a small
-    /// enum identifying which framing or capacity check failed.
-    /// The contract does not lock the discriminants because the
-    /// verifier inspects success-path semantics and the binary
-    /// equivalence of `replay` output, not error taxonomy.
-    type Error;
-
-    /// Append `record` to the in-memory write cursor of the journal.
-    /// Returns the assigned log sequence number on success.
-    ///
-    /// The record is NOT durable until a subsequent successful
-    /// `flush()`. A crash between `append` and `flush` may leave the
-    /// record either fully discarded or fully recovered on replay;
-    /// the contract permits either outcome but forbids partial /
-    /// corrupt visibility of the record.
-    fn append(&mut self, record: &[u8]) -> Result<u64, Self::Error>;
-
-    /// Advance the durable cursor to the current write cursor. After
-    /// this returns `Ok(())`, every record `append`'d before this
-    /// call is guaranteed to be visible to a subsequent `replay`,
-    /// even if the in-memory WAL is dropped and reconstructed from
-    /// the backing store between now and then.
-    ///
-    /// **Capability (TASK-161):** callers must pass a [`CapProof`]
-    /// obtained after a successful check that the task holds
-    /// [`caps::DURABLE_WAL_WRITE`]. The proof is taken by value so
-    /// the compiler refuses calls without a mint; the impl may
-    /// ignore the proof body (marker). Use [`mint_cap_proof`] in
-    /// tests and privileged init paths.
-    fn flush(&mut self, proof: CapProof) -> Result<(), Self::Error>;
-
-    /// Walk the durable prefix of the journal in append order,
-    /// invoking `callback(lsn, payload)` for each record whose
-    /// framing validates. Stops at the first corrupt / short /
-    /// CRC-mismatched record without invoking the callback for it.
-    ///
-    /// `replay` is read-only with respect to the backing store: it
-    /// does not advance any cursor and may be called multiple times
-    /// with idempotent observable behaviour.
-    fn replay(&self, callback: &mut dyn FnMut(u64, &[u8]));
-}
-
-/// Page permission bits for an IOMMU mapping.
-///
-/// Locked across all morph cycles. The bit layout is exposed as a
-/// `Copy` newtype around `u8` so callers can read individual bits
-/// without committing to a specific enum representation that a future
-/// hardware shadow might change.
-///
-/// `READ` and `WRITE` mirror the Intel VT-d second-level page-table
-/// entry permission bits (VT-d §9.7). Implementations that model
-/// AMD-Vi or ARM SMMU may collapse to the same two bits since those
-/// architectures expose at minimum a read/write distinction at the
-/// page-table-entry level.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct PagePerms(pub u8);
-
-impl PagePerms {
-    /// Read permission bit. Set when DMA reads from the page are
-    /// allowed.
-    pub const READ: PagePerms = PagePerms(1 << 0);
-    /// Write permission bit. Set when DMA writes to the page are
-    /// allowed.
-    pub const WRITE: PagePerms = PagePerms(1 << 1);
-    /// Read and write. The common case for streaming DMA buffers.
-    pub const RW: PagePerms = PagePerms(0b11);
-
-    /// `true` iff the read bit is set.
-    pub const fn readable(self) -> bool {
-        (self.0 & Self::READ.0) != 0
-    }
-    /// `true` iff the write bit is set.
-    pub const fn writable(self) -> bool {
-        (self.0 & Self::WRITE.0) != 0
-    }
-}
-
-/// Kind of DMA access being attempted by a device. Inputs to the
-/// `translate` walk so the IOMMU can reject a write to a read-only
-/// mapping (or vice versa) with `PermissionDenied`.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum AccessKind {
-    /// DMA read from the page.
-    Read,
-    /// DMA write to the page.
-    Write,
-}
-
-/// Errors the [`Iommu`] trait surfaces. Discriminants are part of the
-/// locked contract — userspace and the morph verifier observe these
-/// variants by name. Numeric values are not stabilised; only the
-/// variant identities are.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum IommuError {
-    /// The implementation's fixed `MAX_DOMAINS` capacity is exhausted.
-    /// `create_domain` returns this when no free domain slot exists.
-    DomainTableFull,
-    /// The implementation's fixed `MAX_DEVICES` capacity is exhausted.
-    /// `bind_device` returns this when no free device slot exists for
-    /// a previously-unknown BDF.
-    DeviceTableFull,
-    /// The named domain id does not correspond to a live domain.
-    UnknownDomain,
-    /// The device is already bound to a domain. `bind_device` returns
-    /// this rather than silently rebinding so callers must explicitly
-    /// `unbind_device` first — silent rebinding has historically been
-    /// a CVE vector in DMA-protection stacks.
-    DeviceAlreadyBound,
-    /// The device is not bound to any domain. `translate` returns this
-    /// for unbound devices; `unbind_device` returns this when called on
-    /// a device the IOMMU has never seen or has already unbound.
-    DeviceNotBound,
-    /// The DMA address has no mapping in the bound domain's page
-    /// table. The translation is rejected — the donor hardware would
-    /// raise a DMA fault here.
-    Unmapped,
-    /// The DMA address has a mapping but the access kind is not
-    /// permitted by the mapping's [`PagePerms`]. The donor hardware
-    /// would raise a DMA permission fault here.
-    PermissionDenied,
-    /// `map` was called for a DMA address that already has a live
-    /// mapping in the target domain. Implementations MUST NOT silently
-    /// overwrite — silently dropping a mapping has historically been a
-    /// use-after-free vector in DMA-protection stacks.
-    AlreadyMapped,
-    /// The DMA address (or host physical address) is not page-aligned,
-    /// or the DMA address falls outside the implementation's bounded
-    /// per-domain mapping range.
-    BadAddress,
-}
-
-/// IOMMU + DMA protection contract — the locked isolation surface for
-/// any DMA-capable device the kernel hands to a driver.
-///
-/// The contract describes a logical Intel VT-d-style IOMMU with three
-/// nouns and one verb:
-///
-/// 1. **Domain** — an isolation context. Many devices may be bound to
-///    one domain; a domain owns a page table mapping DMA addresses to
-///    host physical frames plus a [`PagePerms`] mask per page.
-/// 2. **Device** — identified by a stable `(segment, bus, dev, func)`
-///    BDF tuple folded into a 32-bit [`Iommu::DeviceId`] by the impl.
-///    Each device is either *unbound* (default = deny all DMA) or
-///    bound to exactly one domain.
-/// 3. **Mapping** — a `(dma_addr → host_phys, perms)` page-table entry
-///    in a specific domain. Inserted by `map`, removed by `unmap`.
-/// 4. **Translate** — the page-table walk verb. Given a DeviceId, a
-///    DMA address, and an [`AccessKind`], either return the host
-///    physical address the DMA would target or reject the access with
-///    a specific [`IommuError`].
-///
-/// Invariants the verifier checks:
-///
-/// - **Default-deny.** `translate` on an unbound device returns
-///   `Err(IommuError::DeviceNotBound)` for every DMA address. There
-///   is no implicit identity mapping; a device must be explicitly
-///   bound to a domain before any DMA can succeed.
-/// - **Domain isolation.** A `map` in domain A is invisible to a
-///   device bound to domain B. `translate` from a device in B for
-///   that DMA address returns `Err(Unmapped)`, never the host physical
-///   from A's table.
-/// - **Permission enforcement.** A `Write` access to a `READ`-only
-///   mapping returns `Err(PermissionDenied)`. The contract does not
-///   require timing-side-channel resistance on this path — the
-///   verifier inspects only the Result discriminant.
-/// - **No silent rebind.** `bind_device` on an already-bound device
-///   returns `Err(DeviceAlreadyBound)` rather than silently moving
-///   the device to the new domain. Callers must `unbind_device` first.
-/// - **No silent remap.** `map` on a DMA address that already has a
-///   live mapping in the target domain returns `Err(AlreadyMapped)`
-///   rather than silently overwriting the existing entry.
-///
-/// The trait is intentionally object-safe-friendly: no const generics
-/// or associated constants on the trait itself. Concrete impls
-/// (notably `target_enterprise::IommuImpl`) parameterise their domain
-/// and device table capacities as const generics on the impl struct,
-/// not on the trait.
-pub trait Iommu {
-    /// Identifier for a domain. Concrete impls use a small integer
-    /// index into a fixed-capacity domain table; the contract leaves
-    /// the width open so a future shadow can use a 64-bit handle if
-    /// MAX_DOMAINS grows past `u32::MAX`.
-    type DomainId: Copy + Eq;
-
-    /// Identifier for a DMA-capable device. Concrete impls pack the
-    /// `(segment, bus, dev, func)` BDF into a `u32` (segment:16,
-    /// bus:8, dev:5, func:3). The contract treats the value as
-    /// opaque.
-    type DeviceId: Copy + Eq;
-
-    /// Construct a fresh, empty domain. The new domain has no
-    /// mappings; any `translate` against a device bound to this
-    /// domain returns `Err(Unmapped)` until `map` is called.
-    ///
-    /// Returns `Err(DomainTableFull)` when the impl's fixed
-    /// `MAX_DOMAINS` capacity is exhausted.
-    fn create_domain(&mut self) -> Result<Self::DomainId, IommuError>;
-
-    /// Bind `device` to `domain`. After a successful bind, DMA
-    /// translations for `device` are resolved against `domain`'s
-    /// page table.
-    ///
-    /// Returns `Err(UnknownDomain)` if `domain` is not live,
-    /// `Err(DeviceAlreadyBound)` if `device` is already bound (use
-    /// `unbind_device` first), or `Err(DeviceTableFull)` if the
-    /// impl's fixed `MAX_DEVICES` capacity is exhausted by this
-    /// previously-unknown device.
-    fn bind_device(
-        &mut self,
-        device: Self::DeviceId,
-        domain: Self::DomainId,
-    ) -> Result<(), IommuError>;
-
-    /// Unbind `device` from its current domain. After unbind, the
-    /// device defaults to deny-all: `translate` returns
-    /// `Err(DeviceNotBound)` for every DMA address.
-    ///
-    /// Returns `Err(DeviceNotBound)` if the device is not currently
-    /// bound.
-    fn unbind_device(&mut self, device: Self::DeviceId) -> Result<(), IommuError>;
-
-    /// Install a page-table entry mapping `dma_addr` to `host_phys`
-    /// with `perms` in `domain`. Both addresses must be page-aligned
-    /// (4 KiB) and `dma_addr` must lie within the impl's bounded
-    /// per-domain mapping range.
-    ///
-    /// Returns `Err(AlreadyMapped)` rather than silently overwriting
-    /// an existing entry. Callers that want to change a mapping must
-    /// `unmap` first.
-    fn map(
-        &mut self,
-        domain: Self::DomainId,
-        dma_addr: u64,
-        host_phys: u64,
-        perms: PagePerms,
-    ) -> Result<(), IommuError>;
-
-    /// Remove the page-table entry for `dma_addr` from `domain`.
-    /// Returns `Err(Unmapped)` if no such entry exists.
-    fn unmap(&mut self, domain: Self::DomainId, dma_addr: u64) -> Result<(), IommuError>;
-
-    /// Walk the page table for the domain that `device` is bound to
-    /// and resolve `dma_addr` for the given `access` kind. Returns
-    /// the host physical address on success.
-    ///
-    /// On failure, returns one of:
-    /// - `Err(DeviceNotBound)` — `device` is not bound to any
-    ///   domain. This is the default-deny outcome for a never-bound
-    ///   or already-unbound device.
-    /// - `Err(Unmapped)` — `device` is bound, but the domain's page
-    ///   table has no entry for the page containing `dma_addr`.
-    /// - `Err(PermissionDenied)` — the entry exists but its
-    ///   [`PagePerms`] does not permit `access`.
-    fn translate(
-        &self,
-        device: Self::DeviceId,
-        dma_addr: u64,
-        access: AccessKind,
-    ) -> Result<u64, IommuError>;
-}
-
-/// Permission bits returned by [`Ipv4HeaderView::flags`] / written into
-/// the IPv4 flags+fragment-offset word. Locked by RFC 791 §3.1.
-///
-/// Bit 0 is reserved and MUST be zero. Bit 1 is the Don't Fragment (DF)
-/// flag. Bit 2 is the More Fragments (MF) flag. The remaining 13 bits
-/// of the word carry the fragment offset (in 8-byte units).
-pub mod ipv4_flags {
-    /// Don't-Fragment flag. Bit 1 of the 3-bit flags field. Set in every
-    /// datagram emitted by [`NetStack::build_udp_datagram`]; any
-    /// received datagram with DF clear AND a non-zero fragment offset
-    /// is rejected by [`NetStack::parse_ipv4_header`] with
-    /// [`NetError::Fragmented`].
-    pub const DF: u8 = 0b010;
-    /// More-Fragments flag. Bit 2 of the 3-bit flags field. Set on every
-    /// fragment of a fragmented datagram except the last. A received
-    /// datagram with MF set is rejected by
-    /// [`NetStack::parse_ipv4_header`] with [`NetError::Fragmented`].
-    pub const MF: u8 = 0b001;
-}
-
-/// IPv4 protocol number for UDP per IANA / RFC 768. Locked across all
-/// morph cycles.
-pub const IP_PROTO_UDP: u8 = 17;
-
-/// Errors surfaced by the [`NetStack`] contract.
-///
-/// Locked discriminants: external callers (and the verifier) match on
-/// these variants by name. Adding a variant is a schema-compatible
-/// extension; renaming or removing one is a schema break that requires
-/// bumping [`CONTRACTS_SCHEMA_VERSION`].
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum NetError {
-    /// The input slice was shorter than the smallest legal header (20
-    /// bytes for IPv4, 8 bytes for UDP, 28 bytes for an IPv4+UDP
-    /// datagram).
-    Truncated,
-    /// The IPv4 version nibble was not 4. Includes the case where the
-    /// caller fed an IPv6 packet (version nibble 6) into the IPv4
-    /// parser.
-    BadVersion,
-    /// The IPv4 IHL field declared a header length under 20 bytes
-    /// (less than 5 four-byte words). RFC 791 §3.1 fixes the minimum
-    /// header length at 5 IHL words.
-    BadHeaderLength,
-    /// The IPv4 header carried options. The locked surface is
-    /// intentionally options-free: IHL is always 5, header length is
-    /// always 20 bytes. Datagrams with IHL > 5 are rejected so the
-    /// morph engine has a single canonical header shape to reason
-    /// about.
-    OptionsPresent,
-    /// The IPv4 total-length field did not match the slice length.
-    /// Implementations are strict: `total_length` must equal the size
-    /// of the slice passed in. This prevents trailing-byte attacks.
-    BadTotalLength,
-    /// The IPv4 header checksum did not validate. The header checksum
-    /// is computed per RFC 1071 (the standard Internet 16-bit one's
-    /// complement of the one's complement sum, with the checksum field
-    /// itself treated as zero during computation).
-    BadIpv4Checksum,
-    /// The IPv4 datagram had the MF flag set OR the fragment offset
-    /// was non-zero. The locked surface rejects fragments — UDP
-    /// datagrams emitted by [`NetStack::build_udp_datagram`] always set
-    /// DF, and inbound fragments are rejected on parse to avoid the
-    /// reassembly complexity in a no-alloc kernel.
-    Fragmented,
-    /// The IPv4 protocol byte was not [`IP_PROTO_UDP`] (17). The UDP
-    /// helpers in [`NetStack`] reject other protocols up front rather
-    /// than silently returning data the caller can't use.
-    NotUdp,
-    /// The IPv4 TTL field reached zero in a received datagram. Routers
-    /// MUST discard TTL=0 datagrams (RFC 791 §3.2 "If this field
-    /// contains the value zero, then the datagram must be destroyed").
-    HopLimitZero,
-    /// The UDP length field did not match the IPv4 payload length, OR
-    /// the UDP length field was less than 8 bytes (the UDP header
-    /// itself). RFC 768 fixes UDP length as "the length in octets of
-    /// this user datagram including this header and the data".
-    BadUdpLength,
-    /// The UDP checksum did not validate. Computed per RFC 768 over
-    /// the pseudo-header (src_ip, dst_ip, 0x00, protocol=17,
-    /// udp_length) concatenated with the UDP segment, padded with a
-    /// trailing zero octet if the total has odd length. A received
-    /// checksum field of `0x0000` is also rejected: IPv4 UDP makes
-    /// the checksum mandatory only when the sender chooses, but the
-    /// locked surface requires it (the builder always emits a non-zero
-    /// checksum; verifier matches that).
-    BadUdpChecksum,
-    /// The payload supplied to [`NetStack::build_udp_datagram`] exceeded
-    /// what fits in a single un-fragmented datagram (max 65515 bytes:
-    /// IPv4 total_length is u16 → 65535, minus 20 IPv4 header, minus
-    /// 8 UDP header). In practice fixed-buffer impls will hit this
-    /// limit much earlier via [`NetError::OutputBufferTooSmall`].
-    PayloadTooLarge,
-    /// The caller-supplied output buffer was too small to hold the
-    /// IPv4+UDP datagram the builder would emit.
-    OutputBufferTooSmall,
-    /// The UDP source or destination port was zero. RFC 768 §"Fields"
-    /// permits zero only when the receiver expects no reply; the
-    /// locked surface rejects it because every emitted datagram is a
-    /// fresh send (no unsolicited zero-source dance).
-    PortZero,
-}
 
 /// Parsed IPv4 header view returned by [`NetStack::parse_ipv4_header`].
 ///
@@ -1963,5 +1287,491 @@ pub trait Icmp {
     /// Parse an ICMP echo message. Validates length, type code, and
     /// checksum. Returns a view borrowing from `bytes`.
     fn parse_echo(bytes: &[u8]) -> Result<IcmpEchoView<'_>, IcmpError>;
+}
+// ============================================================
+// SNTPv4 — RFC 4330 (TASK-053)
+//
+// Stateless wire codec for the Simple Network Time Protocol over
+// UDP/IPv4 port 123. The kernel composes this with the existing
+// [`NetStack`] UDP codec to fetch wall-clock time during boot.
+//
+// The on-wire packet is a 48-byte fixed-layout block (no extensions
+// fields, no MAC). All multi-byte integer fields are big-endian.
+// Timestamps are the NTP 64-bit fixed-point format: 32 high bits =
+// seconds since 1 Jan 1900 UTC, 32 low bits = fractional seconds.
+//
+// The kernel only ever issues mode-3 (client) requests and parses
+// mode-4 (server) replies. The trait deliberately rejects every
+// other mode so a malformed / spoofed packet cannot drift the local
+// clock past the wire-validation gate.
+// ============================================================
+
+/// SNTP packet length on the wire (RFC 4330 §3). The codec rejects any
+/// buffer that isn't exactly this length — extension fields + MAC are
+/// out of scope for the seed.
+pub const SNTP_PACKET_LEN: usize = 48;
+
+/// SNTPv4 protocol version. The client emits this in the VN field; the
+/// reply parser rejects any other version.
+pub const SNTP_VERSION: u8 = 4;
+
+/// SNTP mode — client request. RFC 4330 §3.
+pub const SNTP_MODE_CLIENT: u8 = 3;
+
+/// SNTP mode — server reply. RFC 4330 §3.
+pub const SNTP_MODE_SERVER: u8 = 4;
+
+/// Leap-indicator value reported by an unsynchronised server. The
+/// parser rejects replies carrying this value (RFC 4330 §5: "kiss-o'-
+/// death" or alarm).
+pub const SNTP_LEAP_ALARM: u8 = 3;
+
+/// Maximum acceptable stratum (RFC 4330 §5: stratum 16 is reserved /
+/// unsynchronised). The parser rejects replies with `stratum > 15`.
+pub const SNTP_MAX_STRATUM: u8 = 15;
+
+/// Byte offset of the `transmit_timestamp` field inside the 48-byte
+/// SNTP packet. Locked across morph cycles.
+pub const SNTP_OFFSET_TRANSMIT_TS: usize = 40;
+
+/// Byte offset of the `receive_timestamp` field. Locked.
+pub const SNTP_OFFSET_RECEIVE_TS: usize = 32;
+
+/// Byte offset of the `originate_timestamp` field. Locked.
+pub const SNTP_OFFSET_ORIGIN_TS: usize = 24;
+
+/// Byte offset of the `reference_timestamp` field. Locked.
+pub const SNTP_OFFSET_REFERENCE_TS: usize = 16;
+
+/// Byte offset of the 4-byte `reference_identifier` field. Locked.
+pub const SNTP_OFFSET_REF_ID: usize = 12;
+
+/// 64-bit NTP timestamp — `(seconds_since_1900 << 32) |
+/// fraction_2pow32` in a single `u64`. The kernel keeps timestamps in
+/// this packed form on the read path so the wire layout exactly
+/// matches the in-memory layout for big-endian emission.
+///
+/// The NTP epoch (1 Jan 1900 UTC) is 70 years before the Unix epoch;
+/// callers translating to/from Unix time must offset by
+/// `2_208_988_800` seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NtpTimestamp {
+    /// Raw 64-bit value. Top 32 bits = seconds; bottom 32 bits =
+    /// fractional seconds (2^-32 second units).
+    pub raw: u64,
+}
+
+impl NtpTimestamp {
+    /// Construct a zero timestamp (the "no clock" value the client
+    /// puts in `origin`, `receive`, `reference` fields of a request).
+    pub const fn zero() -> Self {
+        NtpTimestamp { raw: 0 }
+    }
+
+    /// Construct from raw 64-bit value (most callers build from a
+    /// `seconds + fraction` pair via [`NtpTimestamp::from_secs_frac`]).
+    pub const fn from_raw(raw: u64) -> Self {
+        NtpTimestamp { raw }
+    }
+
+    /// Construct from `(seconds_since_1900, fraction_2pow32)`. The
+    /// fraction is in units of `2^-32` seconds — `0x80000000` is half
+    /// a second.
+    pub const fn from_secs_frac(seconds: u32, fraction: u32) -> Self {
+        NtpTimestamp { raw: ((seconds as u64) << 32) | (fraction as u64) }
+    }
+
+    /// Recover the seconds half (top 32 bits).
+    pub const fn seconds(self) -> u32 {
+        (self.raw >> 32) as u32
+    }
+
+    /// Recover the fractional half (bottom 32 bits, units of 2^-32 s).
+    pub const fn fraction(self) -> u32 {
+        self.raw as u32
+    }
+}
+
+/// Server-side timestamps + identifying header fields recovered from a
+/// mode-4 SNTP reply. Borrows nothing — every byte is decoded into
+/// owned scalars so the kernel can drop the on-wire buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NtpReply {
+    /// Leap-indicator (`0..=2`; `3` is rejected by the parser).
+    pub leap_indicator: u8,
+    /// Server protocol version. Must equal [`SNTP_VERSION`].
+    pub version: u8,
+    /// Server stratum (`1..=15`; `0` and `>15` are rejected).
+    pub stratum: u8,
+    /// Reference identifier — for stratum 1, a 4-character ASCII
+    /// source code (e.g. `b"GPS\0"`); for stratum 2+, the IPv4 address
+    /// of the upstream synchronisation source in network byte order.
+    pub ref_id: [u8; 4],
+    /// Reference timestamp — server's last clock-set time.
+    pub reference_timestamp: NtpTimestamp,
+    /// Originate timestamp — copy of the client's transmit timestamp
+    /// (the `t1` correlation token).
+    pub origin_timestamp: NtpTimestamp,
+    /// Receive timestamp — when the server received the request (t2).
+    pub receive_timestamp: NtpTimestamp,
+    /// Transmit timestamp — when the server emitted the reply (t3).
+    pub transmit_timestamp: NtpTimestamp,
+}
+
+/// Offset + round-trip delay derived from the four timestamps
+/// `(t1, t2, t3, t4)`. Units are signed nanoseconds — the kernel
+/// then folds the offset into its monotonic clock through the
+/// rate-limiting smoother (out of scope for this seed; the SNTP
+/// codec just hands the numbers back).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NtpClockSkew {
+    /// Signed offset between the local clock and the server's clock.
+    /// Positive = local clock is ahead of the server.
+    ///
+    /// Formula: `((t2 - t1) + (t3 - t4)) / 2`.
+    pub offset_ns: i64,
+    /// Round-trip delay between the client and the server. Always
+    /// non-negative for honest exchanges; a negative value means the
+    /// server's `(t3 - t2)` exceeded the wall time `(t4 - t1)`,
+    /// which is impossible — the kernel must reject such replies.
+    ///
+    /// Formula: `(t4 - t1) - (t3 - t2)`.
+    pub delay_ns: i64,
+}
+
+/// Errors from the SNTP wire codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SntpError {
+    /// Input or output buffer is not exactly [`SNTP_PACKET_LEN`].
+    Truncated,
+    /// `version` field of the reply does not equal [`SNTP_VERSION`].
+    BadVersion,
+    /// `mode` field of the reply is not [`SNTP_MODE_SERVER`] (e.g.
+    /// the response was actually a client request loopback, or a
+    /// mode-7 NTP private-mode packet).
+    BadMode,
+    /// Server reports `stratum == 0` or `stratum > SNTP_MAX_STRATUM`
+    /// (a "kiss-o'-death" packet or an unsynchronised peer).
+    BadStratum,
+    /// Server reports `leap_indicator == SNTP_LEAP_ALARM` (an
+    /// unsynchronised / alarm state).
+    BadLeapIndicator,
+}
+
+/// SNTPv4 byte-locked wire surface (RFC 4330 §3 + §5).
+///
+/// # Locked invariants the verifier checks
+///
+/// 1. `build_request(client_now, out)` writes exactly
+///    [`SNTP_PACKET_LEN`] bytes. Byte 0 packs LI=0, VN=4, Mode=3 into
+///    `0b00_100_011 = 0x23`. The bytes at
+///    `SNTP_OFFSET_TRANSMIT_TS .. SNTP_OFFSET_TRANSMIT_TS + 8` equal
+///    the big-endian encoding of `client_now.raw`; every other byte
+///    in `out[1..SNTP_OFFSET_TRANSMIT_TS]` is zero.
+/// 2. `parse_reply(bytes)` returns `Ok(reply)` iff `bytes.len() ==
+///    SNTP_PACKET_LEN`, the version is [`SNTP_VERSION`], the mode is
+///    [`SNTP_MODE_SERVER`], the stratum is in `1..=SNTP_MAX_STRATUM`,
+///    and the leap-indicator is not [`SNTP_LEAP_ALARM`]. Every other
+///    case returns an [`SntpError`] without partial state.
+/// 3. `compute_offset_delay(reply, t4)` computes the SNTP formula
+///    `(offset, delay) = (((t2 - t1) + (t3 - t4)) / 2, (t4 - t1) -
+///    (t3 - t2))` against signed nanosecond arithmetic. The
+///    differences fold through the full 64-bit fixed-point timestamp
+///    so a 100-year skew is representable without saturation.
+///
+/// # Not in this contract (intentional)
+///
+/// - The actual UDP transmission: the kernel call site composes with
+///   [`NetStack`]'s UDP path. The codec is byte-in / byte-out.
+/// - NTP authentication MAC (the optional 12- to 24-byte trailer).
+///   SNTPv4 makes it optional; the seed does not parse it.
+/// - Clock smoothing / step-vs-slew policy. Out of scope.
+/// - IPv6 transport. The wire format is identical, but the kernel's
+///   UDP codec is currently v4-only.
+pub trait Sntp {
+    /// Build a 48-byte mode-3 SNTPv4 request with the caller-supplied
+    /// `client_now` planted in the `transmit_timestamp` field (the
+    /// `t1` correlation token). Returns the number of bytes written —
+    /// always exactly [`SNTP_PACKET_LEN`] on success.
+    fn build_request(client_now: NtpTimestamp, out: &mut [u8]) -> Result<usize, SntpError>;
+
+    /// Parse a 48-byte mode-4 SNTPv4 reply. Validates length, version,
+    /// mode, stratum, leap-indicator. Returns an owned [`NtpReply`].
+    fn parse_reply(buf: &[u8]) -> Result<NtpReply, SntpError>;
+
+    /// Compute the offset/delay from the server's view of the
+    /// transaction (`reply.origin_timestamp = t1`,
+    /// `reply.receive_timestamp = t2`,
+    /// `reply.transmit_timestamp = t3`) and the client's wall time
+    /// `t4` at reply arrival. Pure — no clock reads, no allocation.
+    fn compute_offset_delay(reply: &NtpReply, t4: NtpTimestamp) -> NtpClockSkew;
+}
+
+// Two-tier surface:
+// - `Filesystem` is the per-mount trait. A backing filesystem
+//   (ramfs, FAT32, ext2, NFS, …) implements it; the trait is the
+//   locked dispatch boundary the VFS layer holds.
+// - `FsHandle`, `FsError`, `FileStat`, and the `FS_*` constants are
+//   the wire / API surface for callers. Morph cycles may
+//   diversify the path-walk internals, the handle allocator, and
+//   the storage layout, but every byte of these types stays
+//   byte-stable.
+//
+// The path grammar is POSIX-flavoured ASCII: absolute paths
+// (`/etc/hostname`), `/` separator, `.` and `..` components handled
+// during the VFS path-walk (not the per-fs trait — backing fs sees
+// already-normalised paths relative to its mount root).
+// ---------------------------------------------------------------------------
+// Tftp — RFC 1350 / RFC 2347 TFTP client wire codec (TASK-058)
+// ---------------------------------------------------------------------------
+
+/// TFTP opcode constants. RFC 1350 §5 + RFC 2347 §2.
+pub mod tftp_op {
+    /// Read Request.
+    pub const RRQ: u16 = 1;
+    /// Write Request.
+    pub const WRQ: u16 = 2;
+    /// Data packet.
+    pub const DATA: u16 = 3;
+    /// Acknowledgement.
+    pub const ACK: u16 = 4;
+    /// Error packet.
+    pub const ERROR: u16 = 5;
+    /// Option Acknowledgement (RFC 2347 §3).
+    pub const OACK: u16 = 6;
+}
+
+/// Maximum filename length (locked — kernel doesn't need filesystem
+/// paths longer than this for boot-server fetches).
+pub const MAX_TFTP_FILENAME: usize = 256;
+/// Maximum mode-string length per RFC 1350 §2 — `netascii` and
+/// `octet` are the only modes; 16 bytes is comfortable.
+pub const MAX_TFTP_MODE: usize = 16;
+/// Maximum payload bytes per DATA packet per RFC 1350 §2.
+pub const TFTP_BLOCK_SIZE: usize = 512;
+/// Length of the opcode field at the head of every TFTP packet.
+pub const TFTP_OPCODE_LEN: usize = 2;
+/// Length of the block-number field in DATA / ACK packets.
+pub const TFTP_BLOCK_LEN: usize = 2;
+/// Minimum DATA packet length: opcode(2) + block(2) = 4 bytes.
+pub const TFTP_MIN_DATA_LEN: usize = 4;
+/// Minimum ACK packet length: opcode(2) + block(2) = 4 bytes.
+pub const TFTP_MIN_ACK_LEN: usize = 4;
+/// Minimum ERROR packet length: opcode(2) + errcode(2) + NUL(1) = 5 bytes.
+pub const TFTP_MIN_ERROR_LEN: usize = 5;
+
+/// Transfer mode per RFC 1350 §2. The seed only handles the two
+/// modes that real-world implementations use; `mail` was dropped
+/// from later TFTP revisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TftpMode {
+    /// `netascii` — line-ending-normalised text (CRLF on the wire).
+    NetAscii,
+    /// `octet` — raw 8-bit bytes. Used for binary boot images.
+    Octet,
+}
+
+impl TftpMode {
+    /// Wire-form (null-terminated string omitted) of the mode.
+    /// `from_bytes` matches case-insensitively per RFC 1350 §2.
+    pub fn as_bytes(self) -> &'static [u8] {
+        match self {
+            TftpMode::NetAscii => b"netascii",
+            TftpMode::Octet => b"octet",
+        }
+    }
+
+    /// Parse `s` (no NUL terminator). Case-insensitive per RFC 1350.
+    pub fn from_bytes(s: &[u8]) -> Option<TftpMode> {
+        if eq_ignore_ascii_case_static(s, b"netascii") {
+            Some(TftpMode::NetAscii)
+        } else if eq_ignore_ascii_case_static(s, b"octet") {
+            Some(TftpMode::Octet)
+        } else {
+            None
+        }
+    }
+}
+
+#[inline]
+fn eq_ignore_ascii_case_static(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        let ai = a[i];
+        let bi = b[i];
+        let al = if ai.is_ascii_uppercase() { ai + 32 } else { ai };
+        let bl = if bi.is_ascii_uppercase() { bi + 32 } else { bi };
+        if al != bl {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// View into a parsed TFTP packet. Borrows from the input buffer.
+#[derive(Debug, Clone, Copy)]
+pub enum TftpPacket<'a> {
+    /// `DATA` packet — block number + (0..=512) payload bytes.
+    Data {
+        /// Block sequence number (starts at 1).
+        block: u16,
+        /// Payload bytes (empty on the final short DATA per RFC 1350).
+        payload: &'a [u8],
+    },
+    /// `ACK` packet — acknowledges receipt of `block`.
+    Ack {
+        /// Block sequence number being acknowledged.
+        block: u16,
+    },
+    /// `ERROR` packet — server-side or client-side rejection.
+    Error {
+        /// Error code per [`TftpErrorCode`] (0..7).
+        code: u16,
+        /// NUL-terminated message bytes (terminator excluded).
+        msg: &'a [u8],
+    },
+    /// `OACK` (RFC 2347) — server's option acknowledgement, returned
+    /// in response to options in the RRQ/WRQ. Raw bytes of the
+    /// options section (pairs of NUL-terminated strings); caller
+    /// walks them with their own helper if they care.
+    OAck {
+        /// Raw option-pair bytes (excluding the 2-byte opcode).
+        options_raw: &'a [u8],
+    },
+}
+
+/// Errors from the TFTP wire codec. Locked variant set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TftpError {
+    /// Input shorter than the smallest legal packet (4 bytes).
+    Truncated,
+    /// Opcode is not in `[1, 6]`.
+    BadOpcode,
+    /// Transfer mode string isn't `netascii` or `octet`.
+    BadMode,
+    /// Filename byte sequence exceeds [`MAX_TFTP_FILENAME`].
+    FilenameTooLong,
+    /// RRQ/WRQ string slot has no NUL terminator inside its budget
+    /// (RFC 1350 requires every string field to be NUL-terminated).
+    MissingNul,
+    /// Output buffer too small for the requested emission.
+    OutputBufferTooSmall,
+    /// OACK options section contains a malformed pair (odd number
+    /// of NUL-terminated tokens, or a token longer than its slot).
+    BadOption,
+}
+
+/// TFTP error-code constants per RFC 1350 §5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum TftpErrorCode {
+    /// Not defined.
+    NotDefined = 0,
+    /// File not found.
+    NotFound = 1,
+    /// Access violation.
+    AccessViolation = 2,
+    /// Disk full or allocation exceeded.
+    DiskFull = 3,
+    /// Illegal TFTP operation.
+    IllegalOp = 4,
+    /// Unknown transfer ID.
+    UnknownTid = 5,
+    /// File already exists.
+    FileExists = 6,
+    /// No such user.
+    NoSuchUser = 7,
+}
+
+/// TFTP wire codec byte-locked surface (RFC 1350 + RFC 2347).
+///
+/// # Locked invariants the verifier checks
+///
+/// 1. `build_rrq(filename, mode, out)` produces bytes
+///    `opcode(0x0001) || filename || 0x00 || mode || 0x00`.
+/// 2. `build_ack(block, out)` produces 4 bytes
+///    `opcode(0x0004) || block(big-endian u16)`.
+/// 3. `build_error(code, msg, out)` produces bytes
+///    `opcode(0x0005) || code(big-endian u16) || msg || 0x00`.
+/// 4. `parse_packet(buf)` returns the matching `TftpPacket` view
+///    AND every error path is reached on its locked input shape.
+/// 5. Mode parsing is case-insensitive per RFC 1350 §2.
+///
+/// # Not in this contract (intentional)
+///
+/// - Retransmission timer / sliding-window state. The seed is a
+///   stateless wire codec; the caller drives retransmits via the
+///   existing scheduler tick.
+/// - Socket binding / port allocation. The kernel composes this
+///   codec with the existing `NetStack` UDP path.
+/// - Multi-file batch fetch. One file per session.
+pub trait Tftp {
+    /// Build a Read Request packet for `filename` in `mode`. The
+    /// filename must be a non-empty byte sequence ≤
+    /// [`MAX_TFTP_FILENAME`] bytes with no embedded NULs.
+    fn build_rrq(
+        filename: &[u8],
+        mode: TftpMode,
+        out: &mut [u8],
+    ) -> Result<usize, TftpError>;
+
+    /// Build an ACK packet acknowledging `block`.
+    fn build_ack(block: u16, out: &mut [u8]) -> Result<usize, TftpError>;
+
+    /// Build an ERROR packet with code + NUL-terminated message.
+    fn build_error(
+        code: TftpErrorCode,
+        msg: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, TftpError>;
+
+    /// Parse a received TFTP packet into a borrowed view.
+    fn parse_packet(buf: &[u8]) -> Result<TftpPacket<'_>, TftpError>;
+}
+
+// ============================================================
+// DnsName — RFC 1035 labels + compression pointer (TASK-086)
+// ============================================================
+
+/// Max labels in a name.
+pub const DNS_MAX_LABELS: usize = 8;
+/// Max label length.
+pub const DNS_MAX_LABEL_LEN: usize = 63;
+/// Compression pointer high bits.
+pub const DNS_PTR_MASK: u8 = 0xC0;
+
+/// DNS name codec errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsNameError {
+    /// Truncated buffer.
+    Truncated,
+    /// Bad label length / pointer.
+    BadLabel,
+    /// Output too small.
+    BufferTooSmall,
+    /// Too many labels.
+    TooMany,
+}
+
+/// DNS name wire codec (encode labels, decode with optional pointer).
+pub trait DnsName {
+    /// Encode `labels` (slices of ASCII) into wire form ending with 0.
+    /// Returns bytes written.
+    fn encode(labels: &[&[u8]], out: &mut [u8]) -> Result<usize, DnsNameError>;
+    /// Decode name starting at `offset` in `msg` into `out_labels`
+    /// (caller provides storage of up to DNS_MAX_LABELS × 64).
+    /// Returns (label_count, bytes_consumed_from_offset_without_following_ptrs_past_start).
+    fn decode(
+        msg: &[u8],
+        offset: usize,
+        out_labels: &mut [[u8; 64]; DNS_MAX_LABELS],
+        out_lens: &mut [usize; DNS_MAX_LABELS],
+    ) -> Result<(usize, usize), DnsNameError>;
+    /// Build a 2-byte compression pointer to `target_offset`.
+    fn make_pointer(target_offset: u16) -> [u8; 2];
 }
 

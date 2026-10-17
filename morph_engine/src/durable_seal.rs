@@ -205,6 +205,31 @@ pub fn verify_file_keyed(seal_path: &Path, data_path: &Path, key: &[u8; 32]) -> 
     seal.verify_keyed(&bytes, key)
 }
 
+/// Load a 32-byte per-device secret seal key from `key_path` (e.g.
+/// `device_secret_key.bin`, ignored by `.gitignore`), or generate a fresh
+/// 256-bit cryptographically random key via OS CSPRNG (`OsRng`) and persist
+/// it at `key_path` on first setup.
+pub fn load_or_generate_device_seal_key(key_path: &Path) -> Result<[u8; 32]> {
+    use rand::RngCore;
+    if let Ok(bytes) = fs::read(key_path) {
+        if bytes.len() == 32 && bytes.iter().any(|&b| b != 0) {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
+        }
+    }
+    let mut key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    if let Some(parent) = key_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    fs::write(key_path, &key)
+        .with_context(|| format!("write CSPRNG device seal key to {}", key_path.display()))?;
+    Ok(key)
+}
+
 /// Build the attest-entry map form of one or more seals (TASK-140).
 /// Keys = labels; values = sha256 hex. Last seal wins on label clash.
 pub fn seals_map_from(seals: &[DurableSeal]) -> std::collections::BTreeMap<String, String> {

@@ -31,17 +31,23 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
+pub mod arch_and_platform;
 pub mod core_primitives;
-pub mod fs_ebpf_smp_pci_x509;
-pub mod hw_storage_boot;
-pub mod kpti_virtio_security;
-pub mod tls_wal_iommu_net;
+pub mod mm_and_isolation;
+pub mod net_protocols;
+pub mod security_and_diag;
+pub mod storage_and_fs;
+pub mod tls_and_crypto;
+pub mod virtio_and_nic;
 
+pub use arch_and_platform::*;
 pub use core_primitives::*;
-pub use fs_ebpf_smp_pci_x509::*;
-pub use hw_storage_boot::*;
-pub use kpti_virtio_security::*;
-pub use tls_wal_iommu_net::*;
+pub use mm_and_isolation::*;
+pub use net_protocols::*;
+pub use security_and_diag::*;
+pub use storage_and_fs::*;
+pub use tls_and_crypto::*;
+pub use virtio_and_nic::*;
 
 #[cfg(test)]
 mod cap_proof_tests {

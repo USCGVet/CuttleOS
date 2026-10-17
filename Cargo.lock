@@ -344,6 +344,7 @@ name = "factory_builder"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "rand 0.8.6",
  "sha2",
 ]
 

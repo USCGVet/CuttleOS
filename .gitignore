@@ -6,6 +6,8 @@
 
 # Secret keys & signing material (never commit)
 factory_signing_key.bin
+device_secret_key.bin
+*secret_key*.bin
 *.key
 *.pem
 

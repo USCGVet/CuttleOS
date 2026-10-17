@@ -1,4 +1,4 @@
-//! Kernel submodule.
+//! TLS 1.3 and network protocol boot self-proof banners.
 
 pub(crate) use crate::*;
 
@@ -280,146 +280,6 @@ pub(crate) fn banner_tls_resumption() {
     serial_write_bytes(&line[..pos]);
 }
 
-/// WAL: instantiate a 4 KiB WalImpl, append 16 fixture frames, flush,/// replay, assert the frame count and final LSN match the fixture
-/// constants, emit `WAL replay OK frames=16 lsn=<N>\n`.
-#[cfg(not(proteus_prod))]
-#[inline(never)]
-pub(crate) fn banner_wal_replay() {
-    let mut wal: WalImpl<{ kf::WAL_CAPACITY }> = WalImpl::new();
-    let mut i = 0usize;
-    while i < kf::WAL_FRAMES {
-        let payload = [i as u8; kf::WAL_PAYLOAD_LEN];
-        if wal.append(&payload).is_err() {
-            panic!("WAL append failed");
-        }
-        i += 1;
-    }
-    // TASK-161: durable flush requires CapProof (DURABLE_WAL_WRITE).
-    // Banner path is privileged init — self-grant the WAL durable bit.
-    if wal
-        .flush(target_enterprise::wal::durable_wal_proof_init())
-        .is_err()
-    {
-        panic!("WAL flush failed");
-    }
-    if wal.next_lsn() != kf::WAL_EXPECTED_NEXT_LSN {
-        panic!("WAL next_lsn drift");
-    }
-    // Walk the durable prefix; assert frame count and order.
-    let mut seen: u64 = 0;
-    let mut last_lsn: u64 = 0;
-    wal.replay(&mut |lsn, payload| {
-        seen += 1;
-        if lsn != last_lsn + 1 {
-            panic!("WAL replay LSN out of order");
-        }
-        last_lsn = lsn;
-        if payload.len() != kf::WAL_PAYLOAD_LEN {
-            panic!("WAL replay payload length drift");
-        }
-        let expected_byte = (lsn - 1) as u8;
-        let mut j = 0usize;
-        while j < payload.len() {
-            if payload[j] != expected_byte {
-                panic!("WAL replay payload content drift");
-            }
-            j += 1;
-        }
-    });
-    if seen != kf::WAL_FRAMES as u64 {
-        panic!("WAL replay frame count drift");
-    }
-
-    let mut line = [0u8; 64];
-    let mut pos = 0usize;
-    let prefix = b"WAL replay OK frames=";
-    line[..prefix.len()].copy_from_slice(prefix);
-    pos += prefix.len();
-    pos += dec_u64(seen, &mut line[pos..]);
-    let mid = b" lsn=";
-    line[pos..pos + mid.len()].copy_from_slice(mid);
-    pos += mid.len();
-    pos += dec_u64(last_lsn, &mut line[pos..]);
-    line[pos] = b'\n';
-    pos += 1;
-    serial_write_bytes(&line[..pos]);
-}
-
-/// IOMMU: instantiate `IommuImpl<4, 8, 16>`, create a domain, bind one
-/// device, map one page, translate, assert the host PA matches the
-/// locked fixture, emit `IOMMU translate OK pa=<hex8>\n`.
-#[cfg(not(proteus_prod))]
-#[inline(never)]
-pub(crate) fn banner_iommu_translate() {
-    let mut iommu: IommuImpl<
-        { kf::IOMMU_DOMAINS },
-        { kf::IOMMU_DEVICES },
-        { kf::IOMMU_ENTRIES_PER_DOMAIN },
-    > = IommuImpl::new();
-
-    let domain = match iommu.create_domain() {
-        Ok(d) => d,
-        Err(_) => panic!("IOMMU create_domain failed"),
-    };
-    let device = DeviceId::from_bdf(
-        kf::IOMMU_DEVICE_SEGMENT,
-        kf::IOMMU_DEVICE_BUS,
-        kf::IOMMU_DEVICE_DEVICE,
-        kf::IOMMU_DEVICE_FUNCTION,
-    );
-    if iommu.bind_device(device, domain).is_err() {
-        panic!("IOMMU bind_device failed");
-    }
-    if iommu
-        .map(domain, kf::IOMMU_DMA_ADDR, kf::IOMMU_HOST_PHYS, PagePerms::RW)
-        .is_err()
-    {
-        panic!("IOMMU map failed");
-    }
-    let probe = kf::IOMMU_DMA_ADDR + kf::IOMMU_PAGE_OFFSET;
-    let pa = match iommu.translate(device, probe, AccessKind::Read) {
-        Ok(pa) => pa,
-        Err(_) => panic!("IOMMU translate returned Err for mapped page"),
-    };
-    if pa != kf::IOMMU_EXPECTED_PA {
-        panic!("IOMMU translate PA drift");
-    }
-
-    let mut line = [0u8; 64];
-    let mut pos = 0usize;
-    let prefix = b"IOMMU translate OK pa=";
-    line[..prefix.len()].copy_from_slice(prefix);
-    pos += prefix.len();
-    let mut hex8 = [0u8; 8];
-    hex_u32((pa & 0xFFFF_FFFF) as u32, &mut hex8);
-    line[pos..pos + 8].copy_from_slice(&hex8);
-    pos += 8;
-    line[pos] = b'\n';
-    pos += 1;
-    serial_write_bytes(&line[..pos]);
-}
-
-/// HASH: hash the locked fixture input through `HashImpl`, assert the
-/// 32-byte digest matches the locked expected bytes, emit
-/// `HASH OK digest_sha=<hex16>\n`.
-#[cfg(not(proteus_prod))]
-#[inline(never)]
-pub(crate) fn banner_hash_digest() {
-    let mut got = [0u8; 32];
-    HashImpl::hash(kf::HASH_INPUT, &mut got);
-    assert_eq_bytes(&got, &kf::HASH_EXPECTED, "HashImpl digest");
-
-    let mut line = [0u8; 64];
-    let mut pos = 0usize;
-    let prefix = b"HASH OK digest_sha=";
-    line[..prefix.len()].copy_from_slice(prefix);
-    pos += prefix.len();
-    pos += hex_encode(&got, 8, &mut line[pos..]);
-    line[pos] = b'\n';
-    pos += 1;
-    serial_write_bytes(&line[..pos]);
-}
-
 /// NET: build the canonical UDP/IPv4 datagram through
 /// [`target_enterprise::net::build_udp_datagram`], assert the 38 emitted
 /// bytes match the locked golden fixture in `kernel_fixtures`, parse
@@ -498,289 +358,6 @@ pub(crate) fn banner_net_build() {
     line[pos] = b'\n';
     pos += 1;
     serial_write_bytes(&line[..pos]);
-}
-
-// ============================================================
-// KPTI: build a synthetic kernel L4 (kernel .text, heap, IDT, signing
-// key, three KPTI trampoline pages, two user pages), call
-// `KptiImpl::build_user_view` to produce a per-task user view that
-// strips the four secret regions, then `validate_user_view` to assert
-// the locked invariants hold. On success emit:
-//   `KPTI build_user_view OK secrets=4\n`
-//   `KPTI validate_user_view OK violations=0\n`
-//
-// The synthetic fixture mirrors the post-boot kernel L4 shape (kernel
-// `.text` at canonical-high addresses, KPTI trampolines at the locked
-// KPTI_*_VIRT slots, user code/stack at canonical-low addresses) so
-// the validate path exercises a realistic separation, not a contrived
-// minimum.
-// ============================================================
-#[cfg(not(proteus_prod))]
-#[inline(never)]
-pub(crate) fn banner_kpti() {
-    let mut kernel: PageTable<32> = PageTable::new();
-    // Kernel secrets — these MUST be stripped from the user view.
-    let secrets: [u64; 4] = [
-        0xFFFF_FFFF_8000_0000, // kernel .text
-        0xFFFF_FFFF_9000_0000, // kernel heap
-        0xFFFF_FFFF_A000_0000, // IDT
-        0xFFFF_FFFF_B000_0000, // Ed25519 private key page
-    ];
-    kernel.map(secrets[0], PTE_PRESENT).expect("kpti map .text");
-    kernel
-        .map(secrets[1], PTE_PRESENT | PTE_WRITABLE | PTE_NX)
-        .expect("kpti map heap");
-    kernel
-        .map(secrets[2], PTE_PRESENT | PTE_NX)
-        .expect("kpti map IDT");
-    kernel
-        .map(secrets[3], PTE_PRESENT | PTE_NX)
-        .expect("kpti map signing-key");
-
-    // KPTI trampolines — USER bit set so the build path retains them.
-    kernel
-        .map(KPTI_TRAMPOLINE_VIRT, PTE_PRESENT | PTE_USER)
-        .expect("kpti map SYSCALL trampoline");
-    kernel
-        .map(KPTI_IRETQ_VIRT, PTE_PRESENT | PTE_USER)
-        .expect("kpti map iretq trampoline");
-    kernel
-        .map(KPTI_IRQ_TIMER_VIRT, PTE_PRESENT | PTE_USER)
-        .expect("kpti map timer trampoline");
-
-    // User pages — USER bit set; build path keeps these.
-    kernel
-        .map(0x0000_0000_4000_0000, PTE_PRESENT | PTE_USER | PTE_NX)
-        .expect("kpti map user code");
-    kernel
-        .map(
-            0x0000_0000_5000_0000,
-            PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NX,
-        )
-        .expect("kpti map user stack");
-
-    let user = KptiImpl::<32>::build_user_view(&kernel, &secrets);
-
-    // Emit build banner: `KPTI build_user_view OK secrets=4\n`.
-    {
-        let mut line = [0u8; 64];
-        let mut pos = 0usize;
-        let prefix = b"KPTI build_user_view OK secrets=";
-        line[..prefix.len()].copy_from_slice(prefix);
-        pos += prefix.len();
-        pos += dec_u64(secrets.len() as u64, &mut line[pos..]);
-        line[pos] = b'\n';
-        pos += 1;
-        serial_write_bytes(&line[..pos]);
-    }
-
-    // Validate. Panic on any violation — the QEMU smoke test then
-    // surfaces the missing banner as a failure.
-    if let Err(violation) = KptiImpl::<32>::validate_user_view(&user, &kernel, &secrets) {
-        // Touch `violation` to avoid `unused_variables`; emit a tag
-        // before panicking so even a panic-handler-eaten message at
-        // least surfaces the violation kind.
-        serial_write_str("KPTI VALIDATE FAIL: ");
-        match violation {
-            proteus_contracts::KptiViolation::SecretLeaked { .. } => {
-                serial_write_str("SecretLeaked\n")
-            }
-            proteus_contracts::KptiViolation::UserPageMissing { .. } => {
-                serial_write_str("UserPageMissing\n")
-            }
-            proteus_contracts::KptiViolation::KernelBitsSetOnUserPage { .. } => {
-                serial_write_str("KernelBitsSetOnUserPage\n")
-            }
-        }
-        panic!("KPTI validate_user_view returned an invariant violation");
-    }
-
-    // Emit validate banner: `KPTI validate_user_view OK violations=0\n`.
-    {
-        let mut line = [0u8; 64];
-        let mut pos = 0usize;
-        let prefix = b"KPTI validate_user_view OK violations=0";
-        line[..prefix.len()].copy_from_slice(prefix);
-        pos += prefix.len();
-        line[pos] = b'\n';
-        pos += 1;
-        serial_write_bytes(&line[..pos]);
-    }
-}
-
-// ============================================================
-// TASK-014: DMA syscall path. Construct an `IommuImpl<4, 8, 16>`, bind
-// a synthetic privileged device, build a `Task` pre-bound to that
-// IOMMU domain, then call `dispatch_dma` twice: SYS_DMA_MAP +
-// SYS_DMA_UNMAP. The dispatcher routes through `check_cap` (which
-// mints a `CapProof`) and the handler consumes the proof by value
-// before delegating to the IOMMU. Emits:
-//   `DMA_MAP test OK\n`
-//   `DMA_UNMAP test OK\n`
-//
-// A kernel that boots with the type-state cap check + the IOMMU +
-// the per-task `iommu_domain` field is exercising every load-bearing
-// piece TASK-014 wired together. If any of them is broken (proof not
-// minted, domain not threaded, IOMMU state lost), one of the two
-// banners is missing from the serial log and the QEMU smoke test
-// surfaces it.
-// ============================================================
-#[cfg(not(proteus_prod))]
-#[inline(never)]
-pub(crate) fn banner_dma() {
-    use proteus_contracts::Iommu;
-    use proteus_contracts::caps::NET_RAW;
-    use target_enterprise::iommu::{DeviceId as IommuDeviceId, IommuImpl as DmaIommuImpl};
-    use target_enterprise::scheduler::{Task, TaskId};
-    use target_enterprise::syscall::{dispatch_dma, SYS_DMA_MAP, SYS_DMA_UNMAP};
-
-    let mut iommu: DmaIommuImpl<4, 8, 16> = DmaIommuImpl::new();
-    let domain = iommu.create_domain().expect("kpti-dma: create_domain");
-    let device = IommuDeviceId::from_bdf(0, 0, 1, 0);
-    iommu
-        .bind_device(device, domain)
-        .expect("kpti-dma: bind_device");
-    let task = Task::new_ready_with_domain(7 as TaskId, 1, domain);
-
-    // ---- SYS_DMA_MAP ----
-    let dma_addr = 0x4000u64;
-    let host_phys = 0xC000_0000u64;
-    match dispatch_dma(
-        &mut iommu,
-        &task,
-        NET_RAW,
-        SYS_DMA_MAP,
-        dma_addr,
-        host_phys,
-        0b11, // RW
-    ) {
-        Ok(0) => {}
-        Ok(other) => panic!("DMA_MAP returned unexpected Ok({})", other),
-        Err(_) => panic!("DMA_MAP failed unexpectedly"),
-    }
-    serial_write_str("DMA_MAP test OK\n");
-
-    // ---- SYS_DMA_UNMAP ----
-    match dispatch_dma(
-        &mut iommu,
-        &task,
-        NET_RAW,
-        SYS_DMA_UNMAP,
-        dma_addr,
-        0,
-        0,
-    ) {
-        Ok(0) => {}
-        Ok(other) => panic!("DMA_UNMAP returned unexpected Ok({})", other),
-        Err(_) => panic!("DMA_UNMAP failed unexpectedly"),
-    }
-    serial_write_str("DMA_UNMAP test OK\n");
-}
-
-// ============================================================
-// TASK-018: NVMe driver round-trip. Construct an in-kernel
-// `MemNvmeController` emulator, drive an `NvmeImpl` through the
-// spec-mandated bring-up + IO-queue creation + Identify Controller
-// + write+read round-trip, emit:
-//   `NVMe init OK ctrl=PROTEUS-NVME-EMU\n`
-//   `NVMe read_lba(7) OK first_byte=A5\n`
-//
-// The emulator runs in-kernel because the QEMU smoke test boots
-// without an actual NVMe device attached (factory_builder doesn't
-// pass `-device nvme,drive=...`). Running the emulator in-kernel is
-// the same pattern banner_iommu_translate / banner_kpti use — the
-// algorithmic core is exercised against synthetic state, proving the
-// driver pipeline is functionally correct without requiring real
-// hardware.
-// ============================================================
-#[cfg(not(proteus_prod))]
-#[inline(never)]
-pub(crate) fn banner_nvme() {
-    use target_enterprise::nvme::{
-        MemNvmeController, NvmeImpl, IDENTIFY_BUF_SIZE, NVME_BLOCK_SIZE,
-    };
-
-    // Construct the emulator + driver. Emulator's disk is 32 KiB (64
-    // blocks) — small enough to live on the kernel stack.
-    let mut drv = NvmeImpl::new(MemNvmeController::new());
-
-    // Bring up the controller, create I/O queues.
-    if drv.bring_up(0x1000, 0x2000).is_err() {
-        panic!("NVMe bring_up failed");
-    }
-    if drv.create_io_queues(0x3000, 0x4000).is_err() {
-        panic!("NVMe create_io_queues failed");
-    }
-
-    // Identify Controller — emulator stamps "PROTEUS-NVME-EMU" into
-    // bytes [4..24] of the response. Confirm.
-    let mut ident = [0u8; IDENTIFY_BUF_SIZE];
-    if drv.identify_controller(0x5000, &mut ident).is_err() {
-        panic!("NVMe identify_controller failed");
-    }
-    if &ident[4..20] != b"PROTEUS-NVME-EMU" {
-        panic!("NVMe identify_controller SN mismatch");
-    }
-
-    // Emit init banner.
-    {
-        let mut line = [0u8; 64];
-        let mut pos = 0usize;
-        let prefix = b"NVMe init OK ctrl=PROTEUS-NVME-EMU";
-        line[..prefix.len()].copy_from_slice(prefix);
-        pos += prefix.len();
-        line[pos] = b'\n';
-        pos += 1;
-        serial_write_bytes(&line[..pos]);
-    }
-
-    // Identify Namespace — populates disk_blocks (=64).
-    let nsze = match drv.identify_namespace(0x5000) {
-        Ok(n) => n,
-        Err(_) => panic!("NVMe identify_namespace failed"),
-    };
-    if nsze != 64 {
-        panic!("NVMe namespace block count drift");
-    }
-
-    // Write a fixture pattern to LBA 7, read it back, confirm.
-    let mut write_buf = [0u8; NVME_BLOCK_SIZE];
-    write_buf[0] = 0xA5; // First byte we'll surface in the banner.
-    for i in 1..NVME_BLOCK_SIZE {
-        write_buf[i] = ((i * 13) & 0xFF) as u8;
-    }
-    if drv.try_write_block(7, &write_buf, 0x6000).is_err() {
-        panic!("NVMe try_write_block failed");
-    }
-    let mut read_buf = [0u8; NVME_BLOCK_SIZE];
-    if drv.try_read_block(7, &mut read_buf, 0x6000).is_err() {
-        panic!("NVMe try_read_block failed");
-    }
-    // Byte-equality check — load-bearing: if any byte differs, the
-    // banner is suppressed and the QEMU smoke test fails.
-    let mut i = 0usize;
-    while i < NVME_BLOCK_SIZE {
-        if read_buf[i] != write_buf[i] {
-            panic!("NVMe read_back byte mismatch");
-        }
-        i += 1;
-    }
-
-    // Emit read_lba banner with the first byte (0xA5).
-    {
-        let mut line = [0u8; 64];
-        let mut pos = 0usize;
-        let prefix = b"NVMe read_lba(7) OK first_byte=";
-        line[..prefix.len()].copy_from_slice(prefix);
-        pos += prefix.len();
-        let mut hex = [0u8; 2];
-        hex_encode(&read_buf[..1], 1, &mut hex);
-        line[pos..pos + 2].copy_from_slice(&hex);
-        pos += 2;
-        line[pos] = b'\n';
-        pos += 1;
-        serial_write_bytes(&line[..pos]);
-    }
 }
 
 // ============================================================
@@ -2049,3 +1626,449 @@ pub(crate) fn banner_virtio_net() {
     }
 }
 
+
+/// Kernel SNTPv4 client banner (TASK-053).
+///
+/// Exercises the locked [`Sntp`] surface: builds a mode-3 client
+/// request with `client_now = NTP_EPOCH + 100s`, asserts the wire
+/// byte-0 carries (LI=0, VN=4, Mode=3) = 0x23, and asserts the
+/// transmit-timestamp tail equals `100 << 32` in big-endian; then
+/// parses a hand-built mode-4 reply with locked timestamps that yield
+/// `offset_ns = 0`, `delay_ns = 1_000_000_000`, and asserts both
+/// values byte-for-byte against the SNTP algorithm in RFC 4330 §5.
+/// A morph that perturbs the bit-packing, the field offsets, or the
+/// offset/delay arithmetic panics inside `banner_sntp` and the two
+/// banners never appear.
+///
+/// Emits two banners:
+/// - `SNTP request OK mode=3 vn=4 xmt=429496729600` — the transmit
+///   timestamp raw value (decimal) recovered from the planted u64.
+/// - `SNTP reply OK offset_ns=0 delay_ns=1000000000` — the locked
+///   skew computed from the symmetric reply timestamps.
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_sntp() {
+    // ------------------------------------------------------------------
+    // build_request — t1 = NTP_EPOCH + 100s -> raw = 100 << 32.
+    // ------------------------------------------------------------------
+    let t1 = NtpTimestamp::from_secs_frac(100, 0);
+    let mut req = [0u8; SNTP_PACKET_LEN];
+    let n = match <SntpImpl as Sntp>::build_request(t1, &mut req) {
+        Ok(n) => n,
+        Err(_) => panic!("sntp: build_request returned Err"),
+    };
+    if n != SNTP_PACKET_LEN {
+        panic!("sntp: build_request length drift");
+    }
+    // Byte 0: LI=0, VN=4, Mode=3 -> 0x23.
+    if req[0] != 0x23 {
+        panic!("sntp: byte0 LI/VN/Mode drift");
+    }
+    // Bytes 1..40 must be zero in a stock client request.
+    let mut k = 1usize;
+    while k < 40 {
+        if req[k] != 0 {
+            panic!("sntp: non-zero filler byte");
+        }
+        k += 1;
+    }
+    // Bytes 40..48: big-endian of 100 << 32 = 0x0000_0064_0000_0000.
+    let expected_xmt = [0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00];
+    let mut j = 0usize;
+    while j < 8 {
+        if req[40 + j] != expected_xmt[j] {
+            panic!("sntp: transmit timestamp wire drift");
+        }
+        j += 1;
+    }
+
+    // First banner: xmt raw is t1.raw = 100 << 32 = 429_496_729_600.
+    {
+        let mut line = [0u8; 96];
+        let prefix = b"SNTP request OK mode=3 vn=4 xmt=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        let mut pos = prefix.len();
+        pos += dec_u64(t1.raw, &mut line[pos..]);
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+
+    // ------------------------------------------------------------------
+    // parse_reply + compute_offset_delay — symmetric goldens.
+    //   t1 = 100s, t2 = 100.5s, t3 = 100.5s, t4 = 101s.
+    //   offset = ((t2-t1) + (t3-t4)) / 2 = (500e6 + -500e6)/2 = 0.
+    //   delay  = (t4-t1) - (t3-t2)       = 1e9 - 0 = 1_000_000_000.
+    // ------------------------------------------------------------------
+    let t2 = NtpTimestamp::from_secs_frac(100, 0x8000_0000); // 100.5s
+    let t3 = NtpTimestamp::from_secs_frac(100, 0x8000_0000); // 100.5s
+    let t4 = NtpTimestamp::from_secs_frac(101, 0);
+
+    // Hand-build a mode-4 reply: byte 0 = LI=0, VN=4, Mode=4 = 0x24.
+    let mut reply_buf = [0u8; SNTP_PACKET_LEN];
+    reply_buf[0] = (0u8 << 6) | ((SNTP_VERSION & 0x7) << 3) | (SNTP_MODE_SERVER & 0x7);
+    reply_buf[1] = 3; // stratum
+    reply_buf[2] = 6; // poll
+    reply_buf[3] = 0xEC; // precision = -20
+    // Reference identifier "GPS\0" — stratum 1 primary-reference style.
+    reply_buf[12] = b'G';
+    reply_buf[13] = b'P';
+    reply_buf[14] = b'S';
+    reply_buf[15] = 0;
+    // Reference + origin + receive + transmit timestamps (big-endian).
+    let plant = |buf: &mut [u8; SNTP_PACKET_LEN], at: usize, v: u64| {
+        buf[at] = (v >> 56) as u8;
+        buf[at + 1] = (v >> 48) as u8;
+        buf[at + 2] = (v >> 40) as u8;
+        buf[at + 3] = (v >> 32) as u8;
+        buf[at + 4] = (v >> 24) as u8;
+        buf[at + 5] = (v >> 16) as u8;
+        buf[at + 6] = (v >> 8) as u8;
+        buf[at + 7] = v as u8;
+    };
+    plant(&mut reply_buf, 16, NtpTimestamp::from_secs_frac(99, 0).raw); // ref
+    plant(&mut reply_buf, 24, t1.raw); // origin
+    plant(&mut reply_buf, 32, t2.raw); // receive
+    plant(&mut reply_buf, 40, t3.raw); // transmit
+
+    let reply: NtpReply = match <SntpImpl as Sntp>::parse_reply(&reply_buf) {
+        Ok(r) => r,
+        Err(_) => panic!("sntp: parse_reply returned Err"),
+    };
+    if reply.stratum != 3 {
+        panic!("sntp: reply stratum drift");
+    }
+    if reply.version != SNTP_VERSION {
+        panic!("sntp: reply version drift");
+    }
+    if reply.leap_indicator != 0 {
+        panic!("sntp: reply LI drift");
+    }
+    if reply.origin_timestamp != t1 {
+        panic!("sntp: reply origin drift");
+    }
+    if reply.receive_timestamp != t2 {
+        panic!("sntp: reply receive drift");
+    }
+    if reply.transmit_timestamp != t3 {
+        panic!("sntp: reply transmit drift");
+    }
+    if reply.ref_id != [b'G', b'P', b'S', 0] {
+        panic!("sntp: reply ref_id drift");
+    }
+
+    let skew = <SntpImpl as Sntp>::compute_offset_delay(&reply, t4);
+    if skew.offset_ns != 0 {
+        panic!("sntp: offset_ns drift");
+    }
+    if skew.delay_ns != 1_000_000_000 {
+        panic!("sntp: delay_ns drift");
+    }
+
+    // Second banner — offset_ns is exactly zero, delay_ns is exactly
+    // 1_000_000_000. dec_u64 handles the unsigned case; the offset is
+    // nonneg here so no sign handling is needed.
+    {
+        let mut line = [0u8; 96];
+        let prefix = b"SNTP reply OK offset_ns=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        let mut pos = prefix.len();
+        let off = skew.offset_ns;
+        if off < 0 {
+            line[pos] = b'-';
+            pos += 1;
+            pos += dec_u64((-(off as i128)) as u64, &mut line[pos..]);
+        } else {
+            pos += dec_u64(off as u64, &mut line[pos..]);
+        }
+        let mid = b" delay_ns=";
+        line[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+        pos += dec_u64(skew.delay_ns as u64, &mut line[pos..]);
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+
+    // Silence the import-unused warning in case the morph rewrites the
+    // call site to avoid the constant.
+    let _ = SNTP_MODE_CLIENT;
+}
+
+/// Intel e1000 NIC driver banner — TASK-056.
+///
+/// Runs the locked round-trip:
+///
+/// 1. Construct a `MemMmioBus` pre-seeded with the locked
+///    `BANNER_MAC` in EEPROM words 0/1/2 and STATUS bits encoding
+///    `LU + FD + Up @ 1 Gbit`.
+/// 2. Drive `E1000Impl::init` through the bring-up sequence (reset
+///    → poll(!RST) → EEPROM MAC read → CTRL.SLU → program RX/TX
+///    rings → RCTL.EN + TCTL.EN).
+/// 3. Transmit a locked 64-byte Ethernet frame (broadcast dest,
+///    `BANNER_MAC` source, EtherType=0x0800, deterministic payload).
+///    The bus captures the frame from the TX descriptor on TDT
+///    advance — byte-for-byte equality is asserted before continuing.
+/// 4. Inject the same frame on the RX side and consume it via
+///    `E1000Impl::receive`. Bytes recovered must equal the frame
+///    bytes.
+///
+/// On any drift — descriptor byte packing, EEPROM word index order,
+/// MAC read endianness, CTRL.RST poll path, link-state decode,
+/// ring wrap modulus, RDT/TDT lag arithmetic — one of the asserts
+/// inside `run_banner_round_trip` panics and the QEMU log emits a
+/// PANIC line instead of the expected two `E1000 ...` banners.
+///
+/// A morph that perturbs these internals while leaving the
+/// `EthernetController` contract methods, the `MmioRegBus` trait,
+/// the descriptor STATUS/CMD constants, or the register-offset
+/// constants intact will preserve the banner; a morph that perturbs
+/// the wire surface will fail the in-order sweep on this banner.
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_e1000() {
+    // The driver embeds two 16-slot ring arrays of 1518-byte buffers
+    // (~48 KiB) plus the `MemMmioBus` (128 KiB shadow + capture log
+    // — ~180 KiB total) — well over the kernel-main stack budget.
+    // Park BOTH in static storage initialised through `const fn`
+    // constructors guarded by spin::Mutex so no large value ever lives on the stack.
+    use target_enterprise::e1000::{build_banner_frame, E1000Impl, MemMmioBus};
+    use proteus_contracts::{EthernetController, LinkState};
+
+    static DRIVER_STORAGE: spin::Mutex<E1000Impl> = spin::Mutex::new(E1000Impl::new());
+    static BUS_STORAGE: spin::Mutex<MemMmioBus> = spin::Mutex::new(MemMmioBus::zeroed());
+
+    let mut driver_guard = DRIVER_STORAGE.lock();
+    let driver: &mut E1000Impl = &mut *driver_guard;
+    let mut bus_guard = BUS_STORAGE.lock();
+    let bus: &mut MemMmioBus = &mut *bus_guard;
+
+    // Seed the EEPROM with the locked banner MAC. STATUS was set by
+    // `MemMmioBus::zeroed` to LU + FD + Up @ 1G.
+    bus.set_eeprom_mac(BANNER_MAC);
+
+    let mut mac = [0u8; 6];
+    if driver.init(bus, &mut mac).is_err() {
+        panic!("e1000: init failed");
+    }
+    if mac != BANNER_MAC {
+        panic!("e1000: MAC drift");
+    }
+    if driver.link_state() != LinkState::Up1000 {
+        panic!("e1000: link state drift (expected Up1000)");
+    }
+
+    // Transmit a 64-byte fixture frame; the bus drains the TX
+    // descriptor on TDT advance and captures the bytes.
+    let frame = build_banner_frame();
+    if driver.transmit(bus, &frame).is_err() {
+        panic!("e1000: transmit failed");
+    }
+    let caps = bus.tx_captures();
+    if caps.len() != 1 || caps[0].len != 64 {
+        panic!("e1000: TX capture count or length drift");
+    }
+    {
+        let mut i = 0usize;
+        while i < 64 {
+            if caps[0].bytes[i] != frame[i] {
+                panic!("e1000: TX capture byte drift");
+            }
+            i += 1;
+        }
+    }
+
+    // Inject the same frame back on the RX side and round-trip it
+    // through `receive`.
+    if bus.inject_rx_frame(&frame).is_err() {
+        panic!("e1000: RX inject failed");
+    }
+    let mut rx_buf = [0u8; 64];
+    let rx_len = match driver.receive(bus, &mut rx_buf) {
+        Ok(Some(n)) => n,
+        _ => panic!("e1000: receive failed"),
+    };
+    if rx_len != 64 {
+        panic!("e1000: RX length drift");
+    }
+    {
+        let mut i = 0usize;
+        while i < rx_len {
+            if rx_buf[i] != frame[i] {
+                panic!("e1000: RX byte drift");
+            }
+            i += 1;
+        }
+    }
+
+    // Emit banner 1: init OK with the recovered MAC + link speed.
+    {
+        let mut line = [0u8; 80];
+        let prefix = b"E1000 init OK mac=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        let mut pos = prefix.len();
+        let mut hex = [0u8; 12];
+        hex_encode(&mac, 6, &mut hex);
+        line[pos..pos + 12].copy_from_slice(&hex);
+        pos += 12;
+        let mid = b" link=up_1000";
+        line[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+
+    // Emit banner 2: frame round-trip OK with byte counts.
+    {
+        let mut line = [0u8; 80];
+        let prefix = b"E1000 frame OK tx_bytes=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        let mut pos = prefix.len();
+        pos += dec_u64(64, &mut line[pos..]);
+        let mid = b" rx_bytes=";
+        line[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+        pos += dec_u64(rx_len as u64, &mut line[pos..]);
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+}
+
+// ============================================================
+// TFTP / TASK-058: RFC 1350 client-side wire codec. The kernel
+// builds an RRQ for `/proteus-boot.img` in octet mode, asserts
+// the byte-exact request; parses a locked ACK(1) reply, recovers
+// block=1; parses a locked DATA(2, "0123456789") packet, recovers
+// block=2 + 10-byte payload byte-for-byte. Emits:
+//   `TFTP rrq OK len=33 mode=octet\n`
+//   `TFTP data OK block=2 bytes=10\n`
+//
+// A morph that perturbs the opcode big-endian encoding, the
+// NUL-terminated string discipline, or the block-number byte
+// order panics inside `banner_tftp` and these banners never
+// appear.
+// ============================================================
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_tftp() {
+    use proteus_contracts::{Tftp, TftpMode, TftpPacket};
+    use target_enterprise::tftp::TftpImpl;
+
+    // --- build RRQ ---
+    let mut rrq_buf = [0u8; 64];
+    let rrq_n =
+        match TftpImpl::build_rrq(b"/proteus-boot.img", TftpMode::Octet, &mut rrq_buf) {
+            Ok(n) => n,
+            Err(_) => panic!("TFTP banner: build_rrq failed"),
+        };
+    // Expected: opcode(0x0001) + "/proteus-boot.img"(17) + NUL +
+    // "octet"(5) + NUL = 2 + 17 + 1 + 5 + 1 = 26.
+    // Wait, /proteus-boot.img is 17 chars. So 2+17+1+5+1 = 26.
+    // The banner text uses dec_u64 so we just need consistency.
+    // Locked expected bytes:
+    let expected_rrq: &[u8] = &[
+        0x00, 0x01, // opcode = RRQ
+        b'/', b'p', b'r', b'o', b't', b'e', b'u', b's', b'-', b'b', b'o', b'o', b't', b'.',
+        b'i', b'm', b'g', // filename (17 bytes)
+        0x00, // NUL
+        b'o', b'c', b't', b'e', b't', // mode
+        0x00, // NUL
+    ];
+    if rrq_n != expected_rrq.len() {
+        panic!("TFTP banner: RRQ length drift");
+    }
+    assert_eq_bytes(&rrq_buf[..rrq_n], expected_rrq, "TFTP RRQ");
+
+    // Emit RRQ banner.
+    {
+        let mut line = [0u8; 64];
+        let mut pos = 0usize;
+        let prefix = b"TFTP rrq OK len=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        pos += dec_u64(rrq_n as u64, &mut line[pos..]);
+        let mid = b" mode=octet";
+        line[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+
+    // --- parse locked ACK(1) reply ---
+    let ack_bytes: &[u8] = &[0x00, 0x04, 0x00, 0x01];
+    match TftpImpl::parse_packet(ack_bytes) {
+        Ok(TftpPacket::Ack { block }) => {
+            if block != 1 {
+                panic!("TFTP banner: ACK block drift");
+            }
+        }
+        Ok(_) => panic!("TFTP banner: ACK parsed as wrong variant"),
+        Err(_) => panic!("TFTP banner: ACK parse failed"),
+    }
+
+    // --- parse locked DATA(2, "0123456789") packet ---
+    let data_bytes: &[u8] = &[
+        0x00, 0x03, // opcode = DATA
+        0x00, 0x02, // block = 2
+        b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9',
+    ];
+    let (rec_block, rec_payload_len) = match TftpImpl::parse_packet(data_bytes) {
+        Ok(TftpPacket::Data { block, payload }) => {
+            // Byte-equality on the payload.
+            if payload.len() != 10 {
+                panic!("TFTP banner: DATA payload length drift");
+            }
+            let expected_payload = b"0123456789";
+            let mut i = 0usize;
+            while i < payload.len() {
+                if payload[i] != expected_payload[i] {
+                    panic!("TFTP banner: DATA payload byte drift");
+                }
+                i += 1;
+            }
+            (block, payload.len())
+        }
+        _ => panic!("TFTP banner: DATA parse failed"),
+    };
+    if rec_block != 2 {
+        panic!("TFTP banner: DATA block drift");
+    }
+
+    // Emit DATA banner.
+    {
+        let mut line = [0u8; 64];
+        let mut pos = 0usize;
+        let prefix = b"TFTP data OK block=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        pos += dec_u64(rec_block as u64, &mut line[pos..]);
+        let mid = b" bytes=";
+        line[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+        pos += dec_u64(rec_payload_len as u64, &mut line[pos..]);
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+}
+
+// TASK-086 DNS name
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_dns_name() {
+    use proteus_contracts::{DnsName, DNS_MAX_LABELS};
+    use target_enterprise::dns_name::DnsNameImpl;
+
+    let mut wire = [0u8; 32];
+    let n = DnsNameImpl::encode(&[b"a", b"b"], &mut wire).unwrap();
+    let mut labs = [[0u8; 64]; DNS_MAX_LABELS];
+    let mut lens = [0usize; DNS_MAX_LABELS];
+    let (c, _) = DnsNameImpl::decode(&wire[..n], 0, &mut labs, &mut lens).unwrap();
+    if c != 2 {
+        panic!("DNS name banner: labels");
+    }
+    serial_write_bytes(b"DNS name OK labels=2\n");
+}

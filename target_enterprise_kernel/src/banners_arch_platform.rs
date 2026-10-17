@@ -1,0 +1,902 @@
+//! x86_64 architecture, IOMMU, DMA, SMP, PCI, APIC, ACPI, and timer boot banners.
+
+pub(crate) use crate::*;
+
+
+/// IOMMU: instantiate `IommuImpl<4, 8, 16>`, create a domain, bind one
+/// device, map one page, translate, assert the host PA matches the
+/// locked fixture, emit `IOMMU translate OK pa=<hex8>\n`.
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_iommu_translate() {
+    let mut iommu: IommuImpl<
+        { kf::IOMMU_DOMAINS },
+        { kf::IOMMU_DEVICES },
+        { kf::IOMMU_ENTRIES_PER_DOMAIN },
+    > = IommuImpl::new();
+
+    let domain = match iommu.create_domain() {
+        Ok(d) => d,
+        Err(_) => panic!("IOMMU create_domain failed"),
+    };
+    let device = DeviceId::from_bdf(
+        kf::IOMMU_DEVICE_SEGMENT,
+        kf::IOMMU_DEVICE_BUS,
+        kf::IOMMU_DEVICE_DEVICE,
+        kf::IOMMU_DEVICE_FUNCTION,
+    );
+    if iommu.bind_device(device, domain).is_err() {
+        panic!("IOMMU bind_device failed");
+    }
+    if iommu
+        .map(domain, kf::IOMMU_DMA_ADDR, kf::IOMMU_HOST_PHYS, PagePerms::RW)
+        .is_err()
+    {
+        panic!("IOMMU map failed");
+    }
+    let probe = kf::IOMMU_DMA_ADDR + kf::IOMMU_PAGE_OFFSET;
+    let pa = match iommu.translate(device, probe, AccessKind::Read) {
+        Ok(pa) => pa,
+        Err(_) => panic!("IOMMU translate returned Err for mapped page"),
+    };
+    if pa != kf::IOMMU_EXPECTED_PA {
+        panic!("IOMMU translate PA drift");
+    }
+
+    let mut line = [0u8; 64];
+    let mut pos = 0usize;
+    let prefix = b"IOMMU translate OK pa=";
+    line[..prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+    let mut hex8 = [0u8; 8];
+    hex_u32((pa & 0xFFFF_FFFF) as u32, &mut hex8);
+    line[pos..pos + 8].copy_from_slice(&hex8);
+    pos += 8;
+    line[pos] = b'\n';
+    pos += 1;
+    serial_write_bytes(&line[..pos]);
+}
+
+// ============================================================
+// TASK-014: DMA syscall path. Construct an `IommuImpl<4, 8, 16>`, bind
+// a synthetic privileged device, build a `Task` pre-bound to that
+// IOMMU domain, then call `dispatch_dma` twice: SYS_DMA_MAP +
+// SYS_DMA_UNMAP. The dispatcher routes through `check_cap` (which
+// mints a `CapProof`) and the handler consumes the proof by value
+// before delegating to the IOMMU. Emits:
+//   `DMA_MAP test OK\n`
+//   `DMA_UNMAP test OK\n`
+//
+// A kernel that boots with the type-state cap check + the IOMMU +
+// the per-task `iommu_domain` field is exercising every load-bearing
+// piece TASK-014 wired together. If any of them is broken (proof not
+// minted, domain not threaded, IOMMU state lost), one of the two
+// banners is missing from the serial log and the QEMU smoke test
+// surfaces it.
+// ============================================================
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_dma() {
+    use proteus_contracts::Iommu;
+    use proteus_contracts::caps::NET_RAW;
+    use target_enterprise::iommu::{DeviceId as IommuDeviceId, IommuImpl as DmaIommuImpl};
+    use target_enterprise::scheduler::{Task, TaskId};
+    use target_enterprise::syscall::{dispatch_dma, SYS_DMA_MAP, SYS_DMA_UNMAP};
+
+    let mut iommu: DmaIommuImpl<4, 8, 16> = DmaIommuImpl::new();
+    let domain = iommu.create_domain().expect("kpti-dma: create_domain");
+    let device = IommuDeviceId::from_bdf(0, 0, 1, 0);
+    iommu
+        .bind_device(device, domain)
+        .expect("kpti-dma: bind_device");
+    let task = Task::new_ready_with_domain(7 as TaskId, 1, domain);
+
+    // ---- SYS_DMA_MAP ----
+    let dma_addr = 0x4000u64;
+    let host_phys = 0xC000_0000u64;
+    match dispatch_dma(
+        &mut iommu,
+        &task,
+        NET_RAW,
+        SYS_DMA_MAP,
+        dma_addr,
+        host_phys,
+        0b11, // RW
+    ) {
+        Ok(0) => {}
+        Ok(other) => panic!("DMA_MAP returned unexpected Ok({})", other),
+        Err(_) => panic!("DMA_MAP failed unexpectedly"),
+    }
+    serial_write_str("DMA_MAP test OK\n");
+
+    // ---- SYS_DMA_UNMAP ----
+    match dispatch_dma(
+        &mut iommu,
+        &task,
+        NET_RAW,
+        SYS_DMA_UNMAP,
+        dma_addr,
+        0,
+        0,
+    ) {
+        Ok(0) => {}
+        Ok(other) => panic!("DMA_UNMAP returned unexpected Ok({})", other),
+        Err(_) => panic!("DMA_UNMAP failed unexpectedly"),
+    }
+    serial_write_str("DMA_UNMAP test OK\n");
+}
+
+// ============================================================
+// SMP / TASK-057: ACPI MADT parsing + INIT-SIPI-SIPI AP wake
+// sequence. The kernel constructs a 4-CPU fixture MADT
+// (BSP=0, APs=1/2/3, all ENABLED), runs `SmpImpl::discover`
+// to recover the topology, asserts the 9-write ICR sequence
+// emitted by `wake_aps` against a recording harness matches
+// the locked golden (per Intel SDM Vol 3A §10.4.7.1):
+// INIT, SIPI, SIPI per AP × 3 APs = 9 IPIs. Emits:
+//   `SMP discover OK bsp=0 aps=3\n`
+//   `SMP wake OK ipis=9 vec=0x08\n`
+//
+// This is wire-codec-shaped: no AP actually executes. The
+// real-APIC kernel-side ApicWriter + AP-side real-mode
+// trampoline + concurrent AP execution are TASK-057b. A
+// morph that perturbs the ICR field encodings, the SIPI
+// vector arithmetic, or the MADT entry-type walk panics
+// inside `banner_smp` and the trailing banners are
+// suppressed.
+// ============================================================
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_smp() {
+    use proteus_contracts::{smp_consts, ApicWriter, Smp};
+    use target_enterprise::smp::{build_madt_fixture, SmpImpl};
+
+    // 1. Build a 4-CPU MADT in a stack buffer + parse it.
+    let mut madt_buf = [0u8; 128];
+    let madt_len = match build_madt_fixture(4, &mut madt_buf) {
+        Ok(n) => n,
+        Err(_) => panic!("SMP banner: build_madt_fixture failed"),
+    };
+    let topo = match SmpImpl::discover(&madt_buf[..madt_len]) {
+        Ok(t) => t,
+        Err(_) => panic!("SMP banner: discover rejected fixture"),
+    };
+    if topo.bsp != 0 || topo.ap_count != 3 {
+        panic!("SMP banner: topology drift");
+    }
+    if topo.ap_ids() != &[1u8, 2, 3] {
+        panic!("SMP banner: AP order drift");
+    }
+
+    // Emit discover banner.
+    {
+        let mut line = [0u8; 64];
+        let mut pos = 0usize;
+        let prefix = b"SMP discover OK bsp=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        pos += dec_u64(topo.bsp as u64, &mut line[pos..]);
+        let mid = b" aps=";
+        line[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+        pos += dec_u64(topo.ap_count as u64, &mut line[pos..]);
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+
+    // 2. Wake APs through a recording harness — assert the 9-write
+    //    golden + the vector arithmetic.
+    struct RecordingApic {
+        icr_low: [u32; 16],
+        low_count: usize,
+        icr_high: [u32; 16],
+        high_count: usize,
+    }
+    impl ApicWriter for RecordingApic {
+        fn write_icr_low(&mut self, val: u32) {
+            if self.low_count < self.icr_low.len() {
+                self.icr_low[self.low_count] = val;
+                self.low_count += 1;
+            }
+        }
+        fn write_icr_high(&mut self, val: u32) {
+            if self.high_count < self.icr_high.len() {
+                self.icr_high[self.high_count] = val;
+                self.high_count += 1;
+            }
+        }
+        fn read_icr_low(&mut self) -> u32 {
+            0
+        }
+    }
+    let mut apic = RecordingApic {
+        icr_low: [0; 16],
+        low_count: 0,
+        icr_high: [0; 16],
+        high_count: 0,
+    };
+    let mut delay_us_noop = |_us: u32| {};
+    let ipi_count = match SmpImpl::wake_aps(
+        &topo,
+        0x8000,
+        &mut apic,
+        &mut delay_us_noop,
+    ) {
+        Ok(n) => n,
+        Err(_) => panic!("SMP banner: wake_aps failed"),
+    };
+    if ipi_count != 9 {
+        panic!("SMP banner: ipi count drift");
+    }
+    if apic.low_count != 9 || apic.high_count != 9 {
+        panic!("SMP banner: ICR write count drift");
+    }
+    // Assert the SIPI vector encoded in the 2nd and 3rd ICR-low
+    // writes (the SIPIs for AP 1) is 0x08.
+    if apic.icr_low[1] & smp_consts::ICR_VECTOR_MASK != 0x08 {
+        panic!("SMP banner: SIPI vector arithmetic drift");
+    }
+    if apic.icr_low[2] & smp_consts::ICR_VECTOR_MASK != 0x08 {
+        panic!("SMP banner: SIPI redundancy vector drift");
+    }
+    // Assert the INIT IPI delivery-mode bits are set (first ICR-low
+    // of each AP triple).
+    let init_low = smp_consts::ICR_DELIVERY_INIT
+        | smp_consts::ICR_LEVEL_ASSERT
+        | smp_consts::ICR_TRIGGER_LEVEL;
+    if apic.icr_low[0] != init_low
+        || apic.icr_low[3] != init_low
+        || apic.icr_low[6] != init_low
+    {
+        panic!("SMP banner: INIT encoding drift");
+    }
+    // Assert the target APIC IDs in ICR-high progress 1, 2, 3 (with
+    // each one written 3 times for the 3-IPI sequence per AP).
+    if apic.icr_high[0] != 1 << 24
+        || apic.icr_high[3] != 2 << 24
+        || apic.icr_high[6] != 3 << 24
+    {
+        panic!("SMP banner: ICR-high target drift");
+    }
+
+    // Emit wake banner.
+    {
+        let mut line = [0u8; 64];
+        let mut pos = 0usize;
+        let prefix = b"SMP wake OK ipis=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        pos += dec_u64(ipi_count as u64, &mut line[pos..]);
+        let mid = b" vec=0x08";
+        line[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+}
+
+// ============================================================
+// PCI / TASK-059: legacy 0xCF8/0xCFC configuration-space wire codec.
+// The kernel constructs an in-RAM `RecordingBus` populated with two
+// QEMU-canonical devices (Intel 8086:100E e1000 at 00:03.0 + Intel
+// 8086:5845 NVMe at 00:05.0). It runs `PciImpl::enumerate` and
+// asserts both functions are surfaced with byte-exact
+// (vendor, device, class, subclass). It then reads BAR0 on the e1000
+// (port-I/O space at 0xC020) and asserts the decoded
+// `PciBar::Io(0xC020)`. Emits:
+//   `PCI scan OK devices=2 e1000=found nvme=found\n`
+//   `PCI bar OK e1000_io=0xc020\n`
+//
+// Wire-codec-shaped: no real PCI cycle is issued — the recording bus
+// scripts every dword. The real kernel-side 0xCF8/0xCFC port writer
+// is plugged in at the `PciConfigBus` impl boundary, separately. A
+// morph that perturbs the (bus, device, function, offset) encoding,
+// the multi-function bit gating, the BAR low-bit decode, or the
+// vendor-none sentinel panics inside `banner_pci` and these banners
+// never appear.
+// ============================================================
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_pci() {
+    use proteus_contracts::{pci_class, Pci, PciAddress, PciBar};
+    use target_enterprise::pci::{PciImpl, RecordingBus};
+
+    // 1. Build the in-RAM bus with two QEMU-canonical devices +
+    //    the e1000's BAR0 (port-I/O at 0xC020).
+    let mut bus = RecordingBus::new();
+    let e1000 = PciAddress {
+        bus: 0,
+        device: 3,
+        function: 0,
+    };
+    let nvme = PciAddress {
+        bus: 0,
+        device: 5,
+        function: 0,
+    };
+    // e1000: vendor=0x8086, device=0x100E, class=0x02 (Network),
+    //        subclass=0x00 (Ethernet), prog_if=0, revision=0x03,
+    //        header_type=0 (single-function).
+    // Identification dword at 0x00: device_id<<16 | vendor_id.
+    bus.set(e1000, 0x00, (0x100Eu32 << 16) | 0x8086);
+    // Class dword at 0x08: class<<24 | subclass<<16 | prog_if<<8 | rev.
+    bus.set(e1000, 0x08, (0x02u32 << 24) | (0x00 << 16) | (0x00 << 8) | 0x03);
+    // Header dword at 0x0C: header_type in byte 2.
+    bus.set(e1000, 0x0C, 0x0000_0000);
+    // BAR0 at 0x10: port-I/O space at 0xC020 (low bit set).
+    bus.set(e1000, 0x10, 0xC021);
+
+    // nvme: vendor=0x8086, device=0x5845, class=0x01 (Mass Storage),
+    //       subclass=0x08 (NVMe), prog_if=0x02, revision=0,
+    //       header_type=0 (single-function).
+    bus.set(nvme, 0x00, (0x5845u32 << 16) | 0x8086);
+    bus.set(nvme, 0x08, (0x01u32 << 24) | (0x08 << 16) | (0x02 << 8));
+    bus.set(nvme, 0x0C, 0x0000_0000);
+
+    // 2. Enumerate and verify both devices are surfaced byte-exact.
+    let mut e1000_found = false;
+    let mut nvme_found = false;
+    let mut count = 0usize;
+    PciImpl::enumerate(&mut bus, &mut |d| {
+        count += 1;
+        if d.vendor_id == 0x8086
+            && d.device_id == 0x100E
+            && d.class == pci_class::CLASS_NETWORK
+            && d.subclass == pci_class::SUBCLASS_ETHERNET
+        {
+            e1000_found = true;
+        }
+        if d.vendor_id == 0x8086
+            && d.device_id == 0x5845
+            && d.class == pci_class::CLASS_MASS_STORAGE
+            && d.subclass == pci_class::SUBCLASS_NVME
+        {
+            nvme_found = true;
+        }
+    });
+    if count != 2 {
+        panic!("PCI banner: enumerate device count drift");
+    }
+    if !e1000_found {
+        panic!("PCI banner: e1000 not surfaced");
+    }
+    if !nvme_found {
+        panic!("PCI banner: NVMe not surfaced");
+    }
+
+    // 3. Emit the scan banner.
+    {
+        let mut line = [0u8; 64];
+        let mut pos = 0usize;
+        let prefix = b"PCI scan OK devices=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        pos += dec_u64(count as u64, &mut line[pos..]);
+        let mid = b" e1000=found nvme=found";
+        line[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+
+    // 4. Read e1000 BAR0 and assert decoded value byte-exact.
+    let bar = match PciImpl::read_bar(&mut bus, e1000, 0) {
+        Ok(b) => b,
+        Err(_) => panic!("PCI banner: BAR0 read failed"),
+    };
+    let io_port = match bar {
+        PciBar::Io(p) => p,
+        _ => panic!("PCI banner: BAR0 decoded as wrong variant"),
+    };
+    if io_port != 0xC020 {
+        panic!("PCI banner: BAR0 address drift");
+    }
+
+    // 5. Emit the BAR banner.
+    {
+        let mut line = [0u8; 64];
+        let mut pos = 0usize;
+        let prefix = b"PCI bar OK e1000_io=0x";
+        line[..prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        // Lowercase hex of io_port (u32), MSB-first, no leading zeros.
+        let mut nyb = 8i32;
+        while nyb > 0 {
+            let shift = (nyb - 1) * 4;
+            if ((io_port >> shift) & 0xF) != 0 {
+                break;
+            }
+            nyb -= 1;
+        }
+        if nyb == 0 {
+            line[pos] = b'0';
+            pos += 1;
+        } else {
+            let mut nn = nyb;
+            while nn > 0 {
+                nn -= 1;
+                let n = ((io_port >> (nn * 4)) & 0xF) as u8;
+                line[pos] = if n < 10 { b'0' + n } else { b'a' + (n - 10) };
+                pos += 1;
+            }
+        }
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+}
+
+// TASK-062: PIT + CMOS RTC wire codec. The kernel programs the
+// PIT for 1 kHz against a recording IoPort and asserts the exact
+// three-byte sequence (cmd=0x36, divisor lo/hi for 1193), then
+// reads a hardcoded BCD 24-hour RTC fixture (2026-03-15 12:34:56)
+// and recovers the locked Unix epoch. A morph that perturbs the
+// command byte, the divisor arithmetic, the CMOS index/data
+// dance, BCD decode, or Gregorian conversion panics inside
+// `banner_timer` and these banners never appear.
+// ============================================================
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_timer() {
+    use proteus_contracts::{
+        PicTimer, Rtc, PIT_CH0_PORT, PIT_CMD_CH0_LOHI_MODE3_BIN, PIT_CMD_PORT, RTC_REG_DAY,
+        RTC_REG_HOURS, RTC_REG_MINUTES, RTC_REG_MONTH, RTC_REG_SECONDS, RTC_REG_STATUS_A,
+        RTC_REG_STATUS_B, RTC_REG_YEAR, RTC_STATUS_B_24H,
+    };
+    use target_enterprise::timer::{PicTimerImpl, RecordingIoPort, RtcImpl};
+
+    // ---- PIT 1 kHz program sequence ----
+    let mut port = RecordingIoPort::new();
+    let div = match PicTimerImpl::program_hz(&mut port, 1000) {
+        Ok(d) => d,
+        Err(_) => panic!("TIMER banner: program_hz failed"),
+    };
+    // 1_193_182 / 1000 = 1193 = 0x04A9
+    if div != 1193 {
+        panic!("TIMER banner: divisor drift");
+    }
+    if port.write_count() != 3 {
+        panic!("TIMER banner: write count drift");
+    }
+    let w0 = match port.write_at(0) {
+        Some(w) => w,
+        None => panic!("TIMER banner: missing write 0"),
+    };
+    let w1 = match port.write_at(1) {
+        Some(w) => w,
+        None => panic!("TIMER banner: missing write 1"),
+    };
+    let w2 = match port.write_at(2) {
+        Some(w) => w,
+        None => panic!("TIMER banner: missing write 2"),
+    };
+    if w0.port != PIT_CMD_PORT || w0.value != PIT_CMD_CH0_LOHI_MODE3_BIN {
+        panic!("TIMER banner: PIT cmd byte drift");
+    }
+    if w1.port != PIT_CH0_PORT || w1.value != 0xA9 {
+        panic!("TIMER banner: PIT divisor lo drift");
+    }
+    if w2.port != PIT_CH0_PORT || w2.value != 0x04 {
+        panic!("TIMER banner: PIT divisor hi drift");
+    }
+
+    {
+        let mut line = [0u8; 64];
+        let mut pos = 0usize;
+        let prefix = b"PIT program OK hz=1000 div=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        pos += dec_u64(div as u64, &mut line[pos..]);
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+
+    // ---- RTC fixture read ----
+    let mut rtc_port = RecordingIoPort::new();
+    rtc_port.set_cmos(RTC_REG_STATUS_A, 0x00);
+    rtc_port.set_cmos(RTC_REG_STATUS_B, RTC_STATUS_B_24H);
+    rtc_port.set_cmos(RTC_REG_SECONDS, 0x56);
+    rtc_port.set_cmos(RTC_REG_MINUTES, 0x34);
+    rtc_port.set_cmos(RTC_REG_HOURS, 0x12);
+    rtc_port.set_cmos(RTC_REG_DAY, 0x15);
+    rtc_port.set_cmos(RTC_REG_MONTH, 0x03);
+    rtc_port.set_cmos(RTC_REG_YEAR, 0x26);
+
+    let t = match RtcImpl::read_time(&mut rtc_port) {
+        Ok(v) => v,
+        Err(_) => panic!("TIMER banner: RTC read failed"),
+    };
+    if t.year != 2026 || t.month != 3 || t.day != 15 {
+        panic!("TIMER banner: RTC date drift");
+    }
+    if t.hour != 12 || t.minute != 34 || t.second != 56 {
+        panic!("TIMER banner: RTC time drift");
+    }
+    // 2026-03-15 12:34:56 UTC
+    if t.unix != 1_773_578_096 {
+        panic!("TIMER banner: RTC unix drift");
+    }
+
+    {
+        let mut line = [0u8; 80];
+        let mut pos = 0usize;
+        let prefix = b"RTC read OK unix=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        pos += dec_u64(t.unix, &mut line[pos..]);
+        let mid = b" date=2026-03-15";
+        line[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+}
+
+// TASK-089 xHCI No-Op TRB
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_xhci_trb() {
+    use proteus_contracts::{XhciTrb, XHCI_TRB_TYPE_NOOP};
+    use target_enterprise::xhci_trb::XhciTrbImpl;
+
+    let w = XhciTrbImpl::encode_noop(true);
+    if XhciTrbImpl::trb_type(w.d3) != XHCI_TRB_TYPE_NOOP {
+        panic!("XHCI banner: type drift");
+    }
+    serial_write_bytes(b"XHCI trb OK type=noop\n");
+}
+
+// TASK-090 UEFI GOP mode
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_uefi_gop() {
+    use proteus_contracts::UefiGop;
+    use target_enterprise::uefi_gop::UefiGopImpl;
+
+    let m = UefiGopImpl::mode_1280x720();
+    let mut b = [0u8; 40];
+    if UefiGopImpl::encode(&m, &mut b).is_err() {
+        panic!("GOP banner: encode");
+    }
+    let d = match UefiGopImpl::decode(&b) {
+        Ok(d) => d,
+        Err(_) => panic!("GOP banner: decode"),
+    };
+    if d.horizontal != 1280 || d.vertical != 720 {
+        panic!("GOP banner: res drift");
+    }
+    serial_write_bytes(b"GOP mode OK 1280x720\n");
+}
+
+// TASK-083 IOAPIC
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_ioapic() {
+    use proteus_contracts::IoApic;
+    use target_enterprise::ioapic::{banner_entry, IoApicImpl};
+
+    let e = banner_entry();
+    let (lo, hi) = IoApicImpl::encode(&e);
+    let d = IoApicImpl::decode(lo, hi);
+    if d.vector != 0x30 {
+        panic!("IOAPIC banner: vector drift");
+    }
+    serial_write_bytes(b"IOAPIC entry OK vec=0x30\n");
+}
+
+// TASK-084 LAPIC ICR
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_lapic() {
+    use proteus_contracts::{LapicIcr, ICR_DELIVERY_INIT};
+    use target_enterprise::lapic_icr::LapicIcrImpl;
+
+    let c = LapicIcrImpl::init(0);
+    if LapicIcrImpl::delivery_of(c.low) != ICR_DELIVERY_INIT {
+        panic!("LAPIC banner: delivery drift");
+    }
+    serial_write_bytes(b"LAPIC icr OK delivery=init\n");
+}
+
+// TASK-079 Multiboot2
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_mb2() {
+    use proteus_contracts::{Mb2Tag, Multiboot2, MB2_MAX_TAGS};
+    use target_enterprise::multiboot2::{build_banner_fixture, MB2_FIXTURE_LEN, Multiboot2Impl};
+
+    let mut img = [0u8; MB2_FIXTURE_LEN];
+    build_banner_fixture(&mut img).unwrap();
+    let mut out = [Mb2Tag {
+        typ: 0,
+        size: 0,
+        offset: 0,
+    }; MB2_MAX_TAGS];
+    let n = Multiboot2Impl::walk(&img, &mut out).unwrap();
+    if n != 1 {
+        panic!("MB2 banner: tag count");
+    }
+    serial_write_bytes(b"MB2 parse OK tags=1\n");
+}
+
+// TASK-081 RSDP
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_rsdp() {
+    use proteus_contracts::AcpiRsdp;
+    use target_enterprise::acpi_rsdp::{build_banner_fixture, AcpiRsdpImpl};
+
+    let mut b = [0u8; 20];
+    build_banner_fixture(&mut b).unwrap();
+    let r = AcpiRsdpImpl::parse_v1(&b).unwrap();
+    if &r.oem_id != b"BOCHS " {
+        panic!("RSDP banner: oem");
+    }
+    serial_write_bytes(b"RSDP parse OK oem=BOCHS\n");
+}
+
+// TASK-082 frame bitmap
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_frame() {
+    use proteus_contracts::FrameBitmap;
+    use target_enterprise::frame_bitmap::FrameBitmapImpl;
+
+    let mut b = FrameBitmapImpl::new();
+    b.alloc().unwrap();
+    b.alloc().unwrap();
+    if b.free_count() != 4094 {
+        panic!("FRAME banner: free count");
+    }
+    serial_write_bytes(b"FRAME alloc OK free=4094\n");
+}
+
+// TASK-075: 16550 init sequence
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_serial() {
+    use proteus_contracts::{Serial16550, SERIAL_COM1, SERIAL_INIT_WRITES};
+    use target_enterprise::serial16550::{expected_com1_init, RecordingSerialPort, Serial16550Impl};
+
+    let mut p = RecordingSerialPort::new();
+    let n = Serial16550Impl::init(&mut p, SERIAL_COM1);
+    if n != SERIAL_INIT_WRITES || p.write_n() != 7 {
+        panic!("SERIAL banner: write count");
+    }
+    let exp = expected_com1_init();
+    let mut i = 0usize;
+    while i < 7 {
+        if p.write_at(i) != Some(exp[i]) {
+            panic!("SERIAL banner: sequence drift");
+        }
+        i += 1;
+    }
+    serial_write_bytes(b"SERIAL init OK port=0x3f8\n");
+}
+
+// TASK-076: tick source mux
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_tick() {
+    use proteus_contracts::{TickKind, TickSource};
+    use target_enterprise::tick_source::TickSourceImpl;
+
+    let mut t = TickSourceImpl::new();
+    t.select(TickKind::Hpet);
+    if t.kind() != TickKind::Hpet {
+        panic!("TICK banner: kind drift");
+    }
+    t.advance(1);
+    if t.now_ticks() != 1 {
+        panic!("TICK banner: ticks drift");
+    }
+    serial_write_bytes(b"TICK source OK kind=hpet\n");
+}
+
+// TASK-077: virtio pci caps
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_virtio_caps() {
+    use proteus_contracts::{
+        VirtioPciCap, VirtioPciCaps, VIRTIO_PCI_CAP_COMMON_CFG, VIRTIO_PCI_CAP_MAX,
+    };
+    use target_enterprise::virtio_pci_caps::{banner_read_dword, VirtioPciCapsImpl};
+
+    let mut out = [VirtioPciCap {
+        offset: 0,
+        cfg_type: 0,
+        bar: 0,
+        bar_offset: 0,
+        length: 0,
+    }; VIRTIO_PCI_CAP_MAX];
+    let n = match VirtioPciCapsImpl::walk(0x40, &mut banner_read_dword, &mut out) {
+        Ok(n) => n,
+        Err(_) => panic!("VIRTIO caps banner: walk failed"),
+    };
+    if VirtioPciCapsImpl::find(&out[..n], VIRTIO_PCI_CAP_COMMON_CFG).is_none() {
+        panic!("VIRTIO caps banner: common missing");
+    }
+    serial_write_bytes(b"VIRTIO caps OK common=found\n");
+}
+
+// TASK-071: Watchdog arm/pet/fire.
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_watchdog() {
+    use proteus_contracts::{Watchdog, WatchdogError};
+    use target_enterprise::watchdog::{BANNER_DEADLINE, WatchdogImpl};
+
+    let mut w = WatchdogImpl::new();
+    if w.arm(BANNER_DEADLINE).is_err() {
+        panic!("WATCHDOG banner: arm failed");
+    }
+    if w.pet().is_err() {
+        panic!("WATCHDOG banner: pet failed");
+    }
+    {
+        let mut line = [0u8; 48];
+        let mut pos = 0usize;
+        let prefix = b"WATCHDOG pet OK deadline=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        pos += dec_u64(w.deadline() as u64, &mut line[pos..]);
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+    // Fire: re-arm with 2 and tick out
+    let mut w2 = WatchdogImpl::new();
+    w2.arm(2).unwrap();
+    w2.tick().unwrap();
+    match w2.tick() {
+        Err(WatchdogError::Fired) => {}
+        _ => panic!("WATCHDOG banner: fire expected"),
+    }
+    serial_write_bytes(b"WATCHDOG fire OK reason=timeout\n");
+}
+
+// TASK-073: Power S5
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_power() {
+    use proteus_contracts::{Power, SLP_TYP_S5};
+    use target_enterprise::power::PowerImpl;
+
+    let p = PowerImpl::encode_s5(SLP_TYP_S5);
+    if PowerImpl::decode_slp_typ(p) != 5 || !PowerImpl::is_slp_en(p) {
+        panic!("POWER banner: encode drift");
+    }
+    serial_write_bytes(b"POWER s5 OK slp_typ=5\n");
+}
+
+// TASK-074: ELF64
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_elf() {
+    use proteus_contracts::{Elf64, ELF_MAX_PHDRS, ElfPhdr};
+    use target_enterprise::elf64::{
+        build_banner_fixture, ELF_BANNER_ENTRY, ELF_BANNER_PHNUM, ELF_FIXTURE_LEN, Elf64Impl,
+    };
+
+    let mut img = [0u8; ELF_FIXTURE_LEN];
+    if build_banner_fixture(&mut img).is_err() {
+        panic!("ELF banner: fixture failed");
+    }
+    let h = match Elf64Impl::parse_header(&img) {
+        Ok(h) => h,
+        Err(_) => panic!("ELF banner: parse failed"),
+    };
+    if h.phnum != ELF_BANNER_PHNUM || h.entry != ELF_BANNER_ENTRY {
+        panic!("ELF banner: header drift");
+    }
+    let mut ph = [ElfPhdr {
+        ptype: 0,
+        flags: 0,
+        offset: 0,
+        vaddr: 0,
+        filesz: 0,
+        memsz: 0,
+        align: 0,
+    }; ELF_MAX_PHDRS];
+    let n = match Elf64Impl::load_phdrs(&img, &h, &mut ph) {
+        Ok(n) => n,
+        Err(_) => panic!("ELF banner: phdrs failed"),
+    };
+    if n != 1 {
+        panic!("ELF banner: phdr count drift");
+    }
+    {
+        let mut line = [0u8; 48];
+        let mut pos = 0usize;
+        let prefix = b"ELF parse OK phnum=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        pos += dec_u64(h.phnum as u64, &mut line[pos..]);
+        let mid = b" entry=";
+        line[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+        pos += dec_u64(h.entry, &mut line[pos..]);
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+}
+
+// TASK-067: HPET — program 1 ms periodic timer0 against recording bus.
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_hpet() {
+    use proteus_contracts::Hpet;
+    use target_enterprise::hpet::{
+        BANNER_PERIOD_FS, BANNER_PERIOD_MS, HpetImpl, RecordingHpetBus,
+    };
+
+    let mut bus = RecordingHpetBus::new();
+    bus.script_canonical_cap(BANNER_PERIOD_FS, 0x8086, 2);
+    let caps = match HpetImpl::read_caps(&mut bus) {
+        Ok(c) => c,
+        Err(_) => panic!("HPET banner: caps failed"),
+    };
+    if caps.period_fs != BANNER_PERIOD_FS {
+        panic!("HPET banner: period drift");
+    }
+    HpetImpl::enable(&mut bus);
+    let cmp = match HpetImpl::ms_to_ticks(caps.period_fs, BANNER_PERIOD_MS) {
+        Ok(t) => t,
+        Err(_) => panic!("HPET banner: ms_to_ticks failed"),
+    };
+    if cmp != 14318 {
+        panic!("HPET banner: cmp drift");
+    }
+    if HpetImpl::program_timer0_periodic(&mut bus, cmp).is_err() {
+        panic!("HPET banner: program failed");
+    }
+    {
+        let mut line = [0u8; 64];
+        let mut pos = 0usize;
+        let prefix = b"HPET program OK period_fs=";
+        line[..prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        pos += dec_u64(caps.period_fs as u64, &mut line[pos..]);
+        let mid = b" cmp=";
+        line[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+        pos += dec_u64(cmp, &mut line[pos..]);
+        line[pos] = b'\n';
+        pos += 1;
+        serial_write_bytes(&line[..pos]);
+    }
+}
+
+// TASK-069: Keyboard set-1 stream a/b.
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_keyboard() {
+    use proteus_contracts::{KeyCode, Keyboard, KBD_BREAK_A, KBD_BREAK_B, KBD_MAKE_A, KBD_MAKE_B};
+    use target_enterprise::keyboard::KeyboardImpl;
+
+    let mut kbd = KeyboardImpl::new();
+    let stream = [KBD_MAKE_A, KBD_BREAK_A, KBD_MAKE_B, KBD_BREAK_B];
+    let mut keys = 0u32;
+    let mut last = b'\0';
+    let mut i = 0usize;
+    while i < stream.len() {
+        if let Some(ev) = kbd.feed(stream[i]) {
+            if ev.pressed && ev.ascii != 0 {
+                keys += 1;
+                last = ev.ascii;
+                let _ = KeyCode::Letter(b'A'); // keep import used
+            }
+        }
+        i += 1;
+    }
+    if keys != 2 || last != b'b' {
+        panic!("KBD banner: decode drift");
+    }
+    serial_write_bytes(b"KBD decode OK keys=2 last=b\n");
+}

@@ -406,7 +406,6 @@ pub fn build_kernel_with_layout_seed_and_prod(
         rustflags = kernel_diversity_rustflags(&rustflags, seed);
         let llvm_flags = kernel_llvm_codegen_rustflags(seed);
         rustflags = format!("{rustflags} {llvm_flags}").trim().to_string();
-        cmd.env("PROTEUS_VARIANT_SEED", seed.to_string());
         eprintln!(
             "factory_builder: kernel codegen diversity enabled (seed={seed}: layout-randomize + function-shuffle + llvm-codegen [{llvm_flags}])"
         );
@@ -458,6 +457,39 @@ pub fn build_kernel_with_layout_seed_and_prod(
         );
     }
     Ok(fs::canonicalize(elf)?)
+}
+
+/// Default filename for the 32-byte out-of-band per-device secret key
+/// (gitignored alongside `factory_signing_key.bin`, never embedded in
+/// the kernel ELF or stored on the guest AHCI disk).
+pub const DEVICE_SECRET_KEY_FILENAME: &str = "device_secret_key.bin";
+
+/// QEMU `fw_cfg` selector path used to provision the 32-byte device secret
+/// key to the guest kernel out-of-band (`-fw_cfg name=opt/proteus_device_key,file=...`).
+pub const FW_CFG_DEVICE_KEY_NAME: &str = "opt/proteus_device_key";
+
+/// Load an existing 32-byte device secret key from `path`, or generate a
+/// fresh 256-bit cryptographically random key via OS CSPRNG (`OsRng`) and
+/// persist it at `path`.
+pub fn ensure_device_secret_key(path: &Path) -> Result<[u8; 32]> {
+    use rand::RngCore;
+    if let Ok(bytes) = fs::read(path) {
+        if bytes.len() == 32 && bytes.iter().any(|&b| b != 0) {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
+        }
+    }
+    let mut key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    fs::write(path, &key)
+        .with_context(|| format!("write 32-byte CSPRNG device secret key to {}", path.display()))?;
+    Ok(key)
 }
 
 #[cfg(test)]
