@@ -54,6 +54,12 @@ pub const SHELL_LINE_MAX: usize = 256;
 pub const SHELL_FS_INODES: usize = 16;
 /// Byte capacity of the live OS shell RamFs pool.
 pub const SHELL_FS_POOL: usize = 4096;
+/// Number of 512-byte disk sectors in the block-backed filesystem partition (`8 KiB`).
+pub const SHELL_FS_PART_SECTORS: usize = 16;
+/// Total byte size of the 16-sector block-backed filesystem partition (`8192` bytes).
+pub const SHELL_FS_PART_BYTES: usize = SHELL_FS_PART_SECTORS * 512;
+/// 8-byte superblock magic for the block-backed filesystem partition (`PRTSFS01`).
+pub const SHELL_FS_MAGIC: &[u8; 8] = b"PRTSFS01";
 /// Maximum number of tasks in the live OS shell scheduler table.
 pub const SHELL_MAX_TASKS: usize = 16;
 /// Number of audit events retained in the live OS shell audit ring.
@@ -338,6 +344,7 @@ impl OsShell {
             || bytes_eq(cmd, b"ls")
             || bytes_eq(cmd, b"cat")
             || bytes_eq(cmd, b"stat")
+            || bytes_eq(cmd, b"df")
             || bytes_eq(cmd, b"net")
             || bytes_eq(cmd, b"audit")
             || bytes_eq(cmd, b"seal")
@@ -718,6 +725,238 @@ impl OsShell {
         Ok((saved_boots, applied))
     }
 
+    /// Pack all mutable/user files (`!is_default_system_file`) from `self.fs`
+    /// into a 16-sector (`8 KiB`) block-backed filesystem partition image
+    /// (`PRTSFS01` magic + 2-sector inode directory + 8-sector `4 KiB` data pool +
+    /// 5 reserved sectors) sealed with a chained keyed `HMAC-SHA256` (`self.seal_key`).
+    ///
+    /// Returns `Ok((file_count, data_bytes))`.
+    pub fn pack_fs_partition(
+        &mut self,
+        generation: u64,
+        sectors: &mut [[u8; 512]; SHELL_FS_PART_SECTORS],
+    ) -> Result<(usize, usize), WalError> {
+        let proof = match durable_wal_proof(self.task_caps[4]) {
+            Ok(p) => p,
+            Err(_) => {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:fs:no-cap");
+                return Err(WalError::PayloadTooLarge);
+            }
+        };
+        proof.consume();
+
+        let mut s = 0usize;
+        while s < SHELL_FS_PART_SECTORS {
+            sectors[s] = [0u8; 512];
+            s += 1;
+        }
+
+        let mut file_count = 0usize;
+        let mut data_cursor = 0usize;
+        let mut i = 0usize;
+        while i < SHELL_FS_INODES {
+            if let Some((path, data)) = self.fs.inode_data(i) {
+                if !is_default_system_file(path) {
+                    if path.is_empty() || path.len() > 46 {
+                        return Err(WalError::PayloadTooLarge);
+                    }
+                    if data_cursor.saturating_add(data.len()) > SHELL_FS_POOL {
+                        return Err(WalError::OutOfCapacity);
+                    }
+                    let dir_sec = 1 + (file_count / 8);
+                    let dir_off = (file_count % 8) * 64;
+                    let plen_b = (path.len() as u16).to_le_bytes();
+                    let doff_b = (data_cursor as u16).to_le_bytes();
+                    let dlen_b = (data.len() as u32).to_le_bytes();
+                    let mtime_b = 1u64.to_le_bytes();
+                    sectors[dir_sec][dir_off] = plen_b[0];
+                    sectors[dir_sec][dir_off + 1] = plen_b[1];
+                    sectors[dir_sec][dir_off + 2] = doff_b[0];
+                    sectors[dir_sec][dir_off + 3] = doff_b[1];
+                    sectors[dir_sec][dir_off + 4] = dlen_b[0];
+                    sectors[dir_sec][dir_off + 5] = dlen_b[1];
+                    sectors[dir_sec][dir_off + 6] = dlen_b[2];
+                    sectors[dir_sec][dir_off + 7] = dlen_b[3];
+                    let mut p = 0usize;
+                    while p < path.len() {
+                        sectors[dir_sec][dir_off + 8 + p] = path[p];
+                        p += 1;
+                    }
+                    let mut m = 0usize;
+                    while m < 8 {
+                        sectors[dir_sec][dir_off + 56 + m] = mtime_b[m];
+                        m += 1;
+                    }
+
+                    let mut b = 0usize;
+                    while b < data.len() {
+                        let abs = data_cursor + b;
+                        sectors[3 + (abs / 512)][abs % 512] = data[b];
+                        b += 1;
+                    }
+                    data_cursor += data.len();
+                    file_count += 1;
+                }
+            }
+            i += 1;
+        }
+
+        let mut k = 0usize;
+        while k < 8 {
+            sectors[0][k] = SHELL_FS_MAGIC[k];
+            k += 1;
+        }
+        let gen_b = generation.to_le_bytes();
+        let mut g = 0usize;
+        while g < 8 {
+            sectors[0][8 + g] = gen_b[g];
+            g += 1;
+        }
+        let fc_b = (file_count as u32).to_le_bytes();
+        sectors[0][16] = fc_b[0];
+        sectors[0][17] = fc_b[1];
+        sectors[0][18] = fc_b[2];
+        sectors[0][19] = fc_b[3];
+        let db_b = (data_cursor as u32).to_le_bytes();
+        sectors[0][20] = db_b[0];
+        sectors[0][21] = db_b[1];
+        sectors[0][22] = db_b[2];
+        sectors[0][23] = db_b[3];
+
+        let mut seal = [0u8; DURABLE_DIGEST_LEN];
+        compute_fs_partition_seal(&self.seal_key, sectors, &mut seal);
+        let mut h = 0usize;
+        while h < DURABLE_DIGEST_LEN {
+            sectors[0][24 + h] = seal[h];
+            h += 1;
+        }
+        Ok((file_count, data_cursor))
+    }
+
+    /// Verify and unpack a 16-sector (`8 KiB`) block-backed filesystem partition
+    /// written by [`OsShell::pack_fs_partition`].
+    ///
+    /// Verifies the `PRTSFS01` superblock magic and the chained keyed `HMAC-SHA256`
+    /// seal over all 16 sectors in constant time before mounting/restoring files
+    /// (including multi-sector files up to `SHELL_FS_POOL = 4096` bytes).
+    /// Returns `Ok((generation, file_count, data_bytes))`.
+    pub fn unpack_fs_partition(
+        &mut self,
+        sectors: &[[u8; 512]; SHELL_FS_PART_SECTORS],
+    ) -> Result<(u64, usize, usize), WalError> {
+        if !bytes_eq(&sectors[0][0..8], SHELL_FS_MAGIC) {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:fs:magic-corrupt");
+            return Err(WalError::PayloadTooLarge);
+        }
+        let generation = u64::from_le_bytes([
+            sectors[0][8],
+            sectors[0][9],
+            sectors[0][10],
+            sectors[0][11],
+            sectors[0][12],
+            sectors[0][13],
+            sectors[0][14],
+            sectors[0][15],
+        ]);
+        let file_count = u32::from_le_bytes([
+            sectors[0][16],
+            sectors[0][17],
+            sectors[0][18],
+            sectors[0][19],
+        ]) as usize;
+        let data_bytes = u32::from_le_bytes([
+            sectors[0][20],
+            sectors[0][21],
+            sectors[0][22],
+            sectors[0][23],
+        ]) as usize;
+        if file_count > SHELL_FS_INODES || data_bytes > SHELL_FS_POOL {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:fs:bounds-overflow");
+            return Err(WalError::OutOfCapacity);
+        }
+
+        let mut expected_seal = [0u8; DURABLE_DIGEST_LEN];
+        let mut h = 0usize;
+        while h < DURABLE_DIGEST_LEN {
+            expected_seal[h] = sectors[0][24 + h];
+            h += 1;
+        }
+        if !verify_fs_partition_seal(&self.seal_key, sectors, &expected_seal) {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:fs:seal-mismatch");
+            return Err(WalError::PayloadTooLarge);
+        }
+
+        let mut idx = 0usize;
+        while idx < file_count {
+            let dir_sec = 1 + (idx / 8);
+            let dir_off = (idx % 8) * 64;
+            let plen = u16::from_le_bytes([
+                sectors[dir_sec][dir_off],
+                sectors[dir_sec][dir_off + 1],
+            ]) as usize;
+            let doff = u16::from_le_bytes([
+                sectors[dir_sec][dir_off + 2],
+                sectors[dir_sec][dir_off + 3],
+            ]) as usize;
+            let dlen = u32::from_le_bytes([
+                sectors[dir_sec][dir_off + 4],
+                sectors[dir_sec][dir_off + 5],
+                sectors[dir_sec][dir_off + 6],
+                sectors[dir_sec][dir_off + 7],
+            ]) as usize;
+            let mtime = u64::from_le_bytes([
+                sectors[dir_sec][dir_off + 56],
+                sectors[dir_sec][dir_off + 57],
+                sectors[dir_sec][dir_off + 58],
+                sectors[dir_sec][dir_off + 59],
+                sectors[dir_sec][dir_off + 60],
+                sectors[dir_sec][dir_off + 61],
+                sectors[dir_sec][dir_off + 62],
+                sectors[dir_sec][dir_off + 63],
+            ]);
+            if plen == 0 || plen > 46 || doff.saturating_add(dlen) > data_bytes {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:fs:dirent-corrupt");
+                return Err(WalError::PayloadTooLarge);
+            }
+            let path = &sectors[dir_sec][dir_off + 8..dir_off + 8 + plen];
+            let mut chunk = [0u8; 256];
+            if dlen <= 256 {
+                let mut b = 0usize;
+                while b < dlen {
+                    let abs = doff + b;
+                    chunk[b] = sectors[3 + (abs / 512)][abs % 512];
+                    b += 1;
+                }
+                if let Ok(fh) = self.fs.open(path, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC) {
+                    let _ = self.fs.write(fh, 0, &chunk[..dlen]);
+                    let _ = self.fs.close(fh);
+                }
+            } else {
+                let _ = self.fs.unlink(path);
+                if self.fs.seed_file(path, &[], dlen, mtime).is_ok() {
+                    if let Ok(fh) = self.fs.open(path, FS_O_RDWR) {
+                        let mut rel = 0usize;
+                        while rel < dlen {
+                            let rem = dlen - rel;
+                            let step = if rem < 256 { rem } else { 256 };
+                            let mut b = 0usize;
+                            while b < step {
+                                let abs = doff + rel + b;
+                                chunk[b] = sectors[3 + (abs / 512)][abs % 512];
+                                b += 1;
+                            }
+                            let _ = self.fs.write(fh, rel as u64, &chunk[..step]);
+                            rel += step;
+                        }
+                        let _ = self.fs.close(fh);
+                    }
+                }
+            }
+            idx += 1;
+        }
+        Ok((generation, file_count, data_bytes))
+    }
+
     /// Compute a 32-byte SHA-256 cryptographic seal over the live OS state
     /// (mutable files, active tasks, capability masks, firewall rules,
     /// IMA table, anti-replay watermark, and audit watermark).
@@ -852,7 +1091,7 @@ impl OsShell {
         if bytes_eq(cmd, b"help") || bytes_eq(cmd, b"?") {
             self.record_audit(1, AuditVerdict::Allowed, b"shell:help");
             let n = copy_into(
-                b"commands: help uname status ps spawn kill caps grant revoke syscall seccomp exec ima fw seal attest ls cat write rm stat net audit halt reboot\n",
+                b"commands: help uname status ps spawn kill caps grant revoke syscall seccomp exec ima fw seal attest ls cat write rm stat df sync net audit halt reboot\n",
                 out,
             );
             return ShellAction::Continue(n);
@@ -977,6 +1216,16 @@ impl OsShell {
 
         if bytes_eq(cmd, b"stat") {
             let n = self.cmd_stat(rest, out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"df") {
+            let n = self.cmd_df(out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"sync") {
+            let n = self.cmd_sync(out);
             return ShellAction::Continue(n);
         }
 
@@ -1415,13 +1664,13 @@ impl OsShell {
                 return copy_into(b"error: file not found\n", out);
             }
         };
-        let mut buf = [0u8; 512];
-        let n = self.fs.read(h, 0, &mut buf).unwrap_or(0);
+        let n = self.fs.read(h, 0, out).unwrap_or(0);
         let _ = self.fs.close(h);
         self.record_audit(8, AuditVerdict::Allowed, b"shell:cat");
-        let mut pos = copy_into(&buf[..n], out);
-        if n > 0 && buf[n - 1] != b'\n' {
-            pos += copy_into(b"\n", &mut out[pos..]);
+        let mut pos = n;
+        if n > 0 && out[n - 1] != b'\n' && pos < out.len() {
+            out[pos] = b'\n';
+            pos += 1;
         }
         pos
     }
@@ -1518,6 +1767,60 @@ impl OsShell {
                 copy_into(b"error: path not found\n", out)
             }
         }
+    }
+
+    fn cmd_df(&mut self, out: &mut [u8]) -> usize {
+        self.record_audit(28, AuditVerdict::Allowed, b"shell:df");
+        let mut pos = 0usize;
+        pos += copy_into(b"fs: magic=PRTSFS01 inodes=", &mut out[pos..]);
+        pos += dec_u64(self.fs.inode_count() as u64, &mut out[pos..]);
+        pos += copy_into(b"/", &mut out[pos..]);
+        pos += dec_u64(SHELL_FS_INODES as u64, &mut out[pos..]);
+        pos += copy_into(b" pool_bytes=", &mut out[pos..]);
+        pos += dec_u64(self.fs.pool_used() as u64, &mut out[pos..]);
+        pos += copy_into(b"/", &mut out[pos..]);
+        pos += dec_u64(SHELL_FS_POOL as u64, &mut out[pos..]);
+        pos += copy_into(b" part_sectors=", &mut out[pos..]);
+        pos += dec_u64(SHELL_FS_PART_SECTORS as u64, &mut out[pos..]);
+        pos += copy_into(b"\n", &mut out[pos..]);
+        pos
+    }
+
+    fn cmd_sync(&mut self, out: &mut [u8]) -> usize {
+        let proof = match durable_wal_proof(self.task_caps[4]) {
+            Ok(p) => p,
+            Err(_) => {
+                self.record_audit(29, AuditVerdict::Denied, b"shell:sync:no-cap");
+                return copy_into(b"error: permission denied (missing wal capability)\n", out);
+            }
+        };
+        proof.consume();
+        self.record_audit(29, AuditVerdict::Allowed, b"shell:sync");
+        let mut user_files = 0usize;
+        let mut user_bytes = 0usize;
+        let mut i = 0usize;
+        while i < SHELL_FS_INODES {
+            if let Some((path, data)) = self.fs.inode_data(i) {
+                if !is_default_system_file(path) {
+                    user_files += 1;
+                    user_bytes += data.len();
+                }
+            }
+            i += 1;
+        }
+        let mut state_seal = [0u8; DURABLE_DIGEST_LEN];
+        self.compute_state_seal(&mut state_seal);
+        let mut hmac = [0u8; DURABLE_DIGEST_LEN];
+        seal_bytes_keyed(&self.seal_key, &state_seal, &mut hmac);
+        let mut pos = 0usize;
+        pos += copy_into(b"sync: ok files=", &mut out[pos..]);
+        pos += dec_u64(user_files as u64, &mut out[pos..]);
+        pos += copy_into(b" bytes=", &mut out[pos..]);
+        pos += dec_u64(user_bytes as u64, &mut out[pos..]);
+        pos += copy_into(b" seal=", &mut out[pos..]);
+        pos += hex_bytes(&hmac[..8], &mut out[pos..]);
+        pos += copy_into(b"\n", &mut out[pos..]);
+        pos
     }
 
     fn cmd_audit(&self, out: &mut [u8]) -> usize {
@@ -2023,6 +2326,68 @@ fn compute_wal_seal<const C: usize>(
     let mut scratch = [0u8; 1024];
     let len = serialize_wal_for_seal(wal, &mut scratch);
     seal_bytes_keyed(key, &scratch[..len], seal_out);
+}
+
+fn compute_fs_partition_seal(
+    key: &[u8; DURABLE_DIGEST_LEN],
+    sectors: &[[u8; 512]; SHELL_FS_PART_SECTORS],
+    seal_out: &mut [u8; DURABLE_DIGEST_LEN],
+) {
+    let mut chain = [0u8; DURABLE_DIGEST_LEN];
+    seal_bytes_keyed(key, &sectors[0][0..24], &mut chain);
+    let mut buf = [0u8; DURABLE_DIGEST_LEN + 512];
+    let mut sec = 1usize;
+    while sec < SHELL_FS_PART_SECTORS {
+        let mut i = 0usize;
+        while i < DURABLE_DIGEST_LEN {
+            buf[i] = chain[i];
+            i += 1;
+        }
+        let mut j = 0usize;
+        while j < 512 {
+            buf[DURABLE_DIGEST_LEN + j] = sectors[sec][j];
+            j += 1;
+        }
+        seal_bytes_keyed(key, &buf, &mut chain);
+        sec += 1;
+    }
+    *seal_out = chain;
+}
+
+fn verify_fs_partition_seal(
+    key: &[u8; DURABLE_DIGEST_LEN],
+    sectors: &[[u8; 512]; SHELL_FS_PART_SECTORS],
+    expected_seal: &[u8; DURABLE_DIGEST_LEN],
+) -> bool {
+    let mut chain = [0u8; DURABLE_DIGEST_LEN];
+    seal_bytes_keyed(key, &sectors[0][0..24], &mut chain);
+    let mut buf = [0u8; DURABLE_DIGEST_LEN + 512];
+    let mut sec = 1usize;
+    while sec + 1 < SHELL_FS_PART_SECTORS {
+        let mut i = 0usize;
+        while i < DURABLE_DIGEST_LEN {
+            buf[i] = chain[i];
+            i += 1;
+        }
+        let mut j = 0usize;
+        while j < 512 {
+            buf[DURABLE_DIGEST_LEN + j] = sectors[sec][j];
+            j += 1;
+        }
+        seal_bytes_keyed(key, &buf, &mut chain);
+        sec += 1;
+    }
+    let mut i = 0usize;
+    while i < DURABLE_DIGEST_LEN {
+        buf[i] = chain[i];
+        i += 1;
+    }
+    let mut j = 0usize;
+    while j < 512 {
+        buf[DURABLE_DIGEST_LEN + j] = sectors[SHELL_FS_PART_SECTORS - 1][j];
+        j += 1;
+    }
+    seal_matches_keyed(key, &buf, expected_seal)
 }
 
 fn build_elf_ebpf_binary(insns: &[BpfInstr], out: &mut [u8]) -> usize {
@@ -2830,6 +3195,70 @@ mod tests {
         );
         let act = boot2_sh.exec_line(b"syscall 5 open /etc/hostname", 2, 0, 0, &mut out);
         assert_eq!(&out[..act.bytes_written()], b"syscall ok: ret=0\n");
+    }
+
+    #[test]
+    fn fs_partition_packs_multi_sector_files_and_rejects_tampering() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 1024];
+
+        // Write a small file via shell command (`6` bytes) and a multi-sector 768-byte file via VFS.
+        let _ = sh.exec_line(b"write /var/boot.ok ready", 1, 0, 0, &mut out);
+        let mut big = [0u8; 768];
+        for (i, b) in big.iter_mut().enumerate() {
+            *b = b'A' + ((i % 26) as u8);
+        }
+        sh.fs.seed_file(b"/var/blob.bin", &big, 768, 42).unwrap();
+
+        let mut sectors = [[0u8; 512]; SHELL_FS_PART_SECTORS];
+        let (files, bytes) = sh.pack_fs_partition(9, &mut sectors).unwrap();
+        assert_eq!(files, 2);
+        assert_eq!(bytes, 6 + 768);
+        assert_eq!(&sectors[0][0..8], SHELL_FS_MAGIC);
+
+        // Restore into a fresh shell with the same seal_key:
+        let mut sh2 = OsShell::new();
+        let (generation, r_files, r_bytes) = sh2.unpack_fs_partition(&sectors).unwrap();
+        assert_eq!(generation, 9);
+        assert_eq!(r_files, 2);
+        assert_eq!(r_bytes, 774);
+
+        let a1 = sh2.exec_line(b"cat /var/boot.ok", 9, 0, 0, &mut out);
+        assert_eq!(&out[..a1.bytes_written()], b"ready\n");
+
+        let (_, restored_blob) = (0..SHELL_FS_INODES)
+            .filter_map(|i| sh2.fs.inode_data(i))
+            .find(|(p, _)| *p == b"/var/blob.bin")
+            .expect("restored /var/blob.bin");
+        assert_eq!(restored_blob, &big[..]);
+
+        // Tampering with any data sector must fail keyed HMAC-SHA256 verification and log Denied:
+        let mut tampered = sectors;
+        tampered[4][123] ^= 0x80;
+        let mut sh3 = OsShell::new();
+        assert!(sh3.unpack_fs_partition(&tampered).is_err());
+        assert_eq!(sh3.audit.len(), 1);
+    }
+
+    #[test]
+    fn df_and_sync_commands_report_partition_state() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 512];
+
+        assert!(OsShell::is_readonly_command(b"df"));
+        assert!(!OsShell::is_readonly_command(b"sync"));
+
+        let _ = sh.exec_line(b"write /var/boot.ok ready", 1, 0, 0, &mut out);
+        let act_df = sh.exec_line(b"df", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_df.bytes_written()],
+            b"fs: magic=PRTSFS01 inodes=5/16 pool_bytes=704/4096 part_sectors=16\n"
+        );
+
+        let act_sync = sh.exec_line(b"sync", 1, 0, 0, &mut out);
+        let sync_str = core::str::from_utf8(&out[..act_sync.bytes_written()]).unwrap();
+        assert!(sync_str.starts_with("sync: ok files=1 bytes=6 seal="));
+        assert!(sync_str.ends_with('\n'));
     }
 }
 

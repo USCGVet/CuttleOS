@@ -428,6 +428,593 @@ pub fn pcr_bitmap_position(pcr_index: u32) -> (usize, u8) {
 }
 
 // ---------------------------------------------------------------------
+// TCG PC Client PTP TPM 2.0 TIS (TPM Interface Specification) MMIO Driver
+// ---------------------------------------------------------------------
+
+/// Architectural guest-physical base address of TPM 2.0 TIS Locality 0.
+pub const TPM_TIS_BASE_PHYS: u64 = 0xFED4_0000;
+
+/// Locality 0 `TPM_ACCESS_0` 8-bit register offset (`0x0000`).
+pub const TPM_ACCESS_0: usize = 0x0000;
+
+/// Locality 0 `TPM_STS_0` 32-bit register offset (`0x0018`).
+pub const TPM_STS_0: usize = 0x0018;
+
+/// Locality 0 `TPM_DATA_FIFO_0` 8-bit FIFO register offset (`0x0024`).
+pub const TPM_DATA_FIFO_0: usize = 0x0024;
+
+/// Locality 0 `TPM_DID_VID_0` 32-bit Device/Vendor ID register offset (`0x0F00`).
+pub const TPM_DID_VID_0: usize = 0x0F00;
+
+/// Default TCG TPM 2.0 TIS Device/Vendor ID (`0x0001_15D1`, Infineon SLB9670 / QEMU TIS).
+pub const TPM_DEFAULT_DID_VID: u32 = 0x0001_15D1;
+
+/// `TPM_ACCESS_0` bit 7: `tpmRegValidSts` (register contents valid).
+pub const TPM_ACCESS_VALID: u8 = 0x80;
+
+/// `TPM_ACCESS_0` bit 5: `activeLocality` (read: locality active; write 1: relinquish).
+pub const TPM_ACCESS_ACTIVE_LOCALITY: u8 = 0x20;
+
+/// `TPM_ACCESS_0` bit 1: `requestUse` (write 1 to request locality).
+pub const TPM_ACCESS_REQUEST_USE: u8 = 0x02;
+
+/// `TPM_STS_0` bit 7: `stsValid` (`dataAvail` and `expect` bits are valid).
+pub const TPM_STS_VALID: u8 = 0x80;
+
+/// `TPM_STS_0` bit 6: `commandReady` (read: ready for command; write 1: abort/ready).
+pub const TPM_STS_COMMAND_READY: u8 = 0x40;
+
+/// `TPM_STS_0` bit 5: `tpmGo` (write 1 to execute the queued FIFO command).
+pub const TPM_STS_GO: u8 = 0x20;
+
+/// `TPM_STS_0` bit 4: `dataAvail` (response bytes available in `TPM_DATA_FIFO_0`).
+pub const TPM_STS_DATA_AVAIL: u8 = 0x10;
+
+/// `TPM_STS_0` bit 3: `expect` (TPM expects more command bytes in `TPM_DATA_FIFO_0`).
+pub const TPM_STS_EXPECT: u8 = 0x08;
+
+/// Bounded poll limit for TIS status transitions.
+pub const TPM_TIS_MAX_SPINS: usize = 4096;
+
+/// Locked wire length of a `TPM2_PCR_Read` single-PCR SHA-256 response:
+/// Header (10) + `pcrUpdateCounter` (4) + `pcrSelectionOut` (10) + `pcrValues` (4 + 2 + 32) = 62 bytes.
+pub const TPM_PCR_READ_SHA256_RESP_LEN: usize = 62;
+
+/// Compute the FIPS 180-4 SHA-256 PCR extension `SHA256(current_pcr || extend_digest)`.
+pub fn tpm_pcr_extend_sha256_math(current: &[u8; 32], extend_digest: &[u8; 32]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(current);
+    hasher.update(extend_digest);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+/// Hardware or emulator register bus for a TCG PC Client PTP TPM 2.0 TIS locality.
+pub trait TpmTisBus {
+    /// Read an 8-bit register at `offset` relative to the locality base (`0xFED4_0000`).
+    fn read_u8(&mut self, offset: usize) -> u8;
+
+    /// Write an 8-bit register at `offset` relative to the locality base (`0xFED4_0000`).
+    fn write_u8(&mut self, offset: usize, val: u8);
+
+    /// Read a 32-bit little-endian register at `offset` (e.g. `TPM_STS_0`, `TPM_DID_VID_0`).
+    fn read_u32(&mut self, offset: usize) -> u32 {
+        let b0 = self.read_u8(offset) as u32;
+        let b1 = self.read_u8(offset + 1) as u32;
+        let b2 = self.read_u8(offset + 2) as u32;
+        let b3 = self.read_u8(offset + 3) as u32;
+        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+}
+
+/// TCG PC Client PTP TPM 2.0 TIS Locality 0 driver over any [`TpmTisBus`].
+pub struct TpmTisDriver<B: TpmTisBus> {
+    bus: B,
+}
+
+impl<B: TpmTisBus> TpmTisDriver<B> {
+    /// Construct a new TIS driver wrapping `bus`.
+    pub const fn new(bus: B) -> Self {
+        Self { bus }
+    }
+
+    /// Borrow the underlying TIS register bus.
+    pub fn bus(&self) -> &B {
+        &self.bus
+    }
+
+    /// Mutably borrow the underlying TIS register bus.
+    pub fn bus_mut(&mut self) -> &mut B {
+        &mut self.bus
+    }
+
+    /// Probe `TPM_DID_VID_0` (`0x0F00`) and return `Some(did_vid)` if a TPM 2.0 TIS
+    /// controller is present (`did_vid != 0` and `did_vid != 0xFFFF_FFFF`).
+    pub fn probe_did_vid(&mut self) -> Option<u32> {
+        let did_vid = self.bus.read_u32(TPM_DID_VID_0);
+        if did_vid == 0 || did_vid == 0xFFFF_FFFF {
+            None
+        } else {
+            Some(did_vid)
+        }
+    }
+
+    /// Request Locality 0 ownership via `TPM_ACCESS_0` and wait until
+    /// `TPM_ACCESS_VALID | TPM_ACCESS_ACTIVE_LOCALITY` is asserted.
+    pub fn request_locality_0(&mut self) -> Result<(), TpmError> {
+        let mask = TPM_ACCESS_VALID | TPM_ACCESS_ACTIVE_LOCALITY;
+        if (self.bus.read_u8(TPM_ACCESS_0) & mask) == mask {
+            return Ok(());
+        }
+        self.bus.write_u8(TPM_ACCESS_0, TPM_ACCESS_REQUEST_USE);
+        let mut spins = 0usize;
+        while spins < TPM_TIS_MAX_SPINS {
+            if (self.bus.read_u8(TPM_ACCESS_0) & mask) == mask {
+                return Ok(());
+            }
+            spins += 1;
+        }
+        Err(TpmError::Truncated)
+    }
+
+    /// Relinquish Locality 0 ownership by writing `TPM_ACCESS_ACTIVE_LOCALITY` to `TPM_ACCESS_0`.
+    pub fn relinquish_locality_0(&mut self) {
+        self.bus.write_u8(TPM_ACCESS_0, TPM_ACCESS_ACTIVE_LOCALITY);
+    }
+
+    /// Read the 16-bit `burstCount` field (`STS[23:8]`) from `TPM_STS_0`.
+    fn wait_burst_count(&mut self) -> Result<usize, TpmError> {
+        let mut spins = 0usize;
+        while spins < TPM_TIS_MAX_SPINS {
+            let sts32 = self.bus.read_u32(TPM_STS_0);
+            let burst = ((sts32 >> 8) & 0xFFFF) as usize;
+            if burst > 0 {
+                return Ok(burst);
+            }
+            spins += 1;
+        }
+        Err(TpmError::Truncated)
+    }
+
+    /// Transmit a TPM 2.0 command frame over `TPM_DATA_FIFO_0`, trigger execution
+    /// via `TPM_STS_GO`, and read the response frame into `resp_out`.
+    pub fn transceive(&mut self, cmd: &[u8], resp_out: &mut [u8]) -> Result<usize, TpmError> {
+        if cmd.len() < TPM_HEADER_LEN {
+            return Err(TpmError::Truncated);
+        }
+        if resp_out.len() < TPM_HEADER_LEN {
+            return Err(TpmError::BufferTooSmall);
+        }
+        self.request_locality_0()?;
+
+        // Transition to Command Ready state.
+        if (self.bus.read_u8(TPM_STS_0) & TPM_STS_COMMAND_READY) == 0 {
+            self.bus.write_u8(TPM_STS_0, TPM_STS_COMMAND_READY);
+            let mut spins = 0usize;
+            while (self.bus.read_u8(TPM_STS_0) & TPM_STS_COMMAND_READY) == 0 {
+                spins += 1;
+                if spins >= TPM_TIS_MAX_SPINS {
+                    return Err(TpmError::Truncated);
+                }
+            }
+        }
+
+        // Write command bytes to `TPM_DATA_FIFO_0` respecting `burstCount`.
+        let mut written = 0usize;
+        while written < cmd.len() {
+            let burst = self.wait_burst_count()?;
+            let step = (cmd.len() - written).min(burst);
+            let mut i = 0usize;
+            while i < step {
+                self.bus.write_u8(TPM_DATA_FIFO_0, cmd[written + i]);
+                i += 1;
+            }
+            written += step;
+        }
+
+        // Verify `stsValid == 1` and `expect == 0` after the final command byte.
+        let sts_after = self.bus.read_u8(TPM_STS_0);
+        if (sts_after & TPM_STS_VALID) == 0 || (sts_after & TPM_STS_EXPECT) != 0 {
+            return Err(TpmError::BadSizeField);
+        }
+
+        // Trigger command execution.
+        self.bus.write_u8(TPM_STS_0, TPM_STS_GO);
+
+        // Poll until `TPM_STS_VALID | TPM_STS_DATA_AVAIL` is set.
+        let avail_mask = TPM_STS_VALID | TPM_STS_DATA_AVAIL;
+        let mut spins = 0usize;
+        while (self.bus.read_u8(TPM_STS_0) & avail_mask) != avail_mask {
+            spins += 1;
+            if spins >= TPM_TIS_MAX_SPINS {
+                return Err(TpmError::Truncated);
+            }
+        }
+
+        // Read the 10-byte response header first.
+        let mut read_pos = 0usize;
+        while read_pos < TPM_HEADER_LEN {
+            let burst = self.wait_burst_count()?;
+            let step = (TPM_HEADER_LEN - read_pos).min(burst);
+            let mut i = 0usize;
+            while i < step {
+                resp_out[read_pos + i] = self.bus.read_u8(TPM_DATA_FIFO_0);
+                i += 1;
+            }
+            read_pos += step;
+        }
+
+        let total_size = read_u32_be(&resp_out[..TPM_HEADER_LEN], 2) as usize;
+        if total_size < TPM_HEADER_LEN {
+            return Err(TpmError::BadSizeField);
+        }
+        if total_size > resp_out.len() {
+            return Err(TpmError::BufferTooSmall);
+        }
+
+        while read_pos < total_size {
+            let burst = self.wait_burst_count()?;
+            let step = (total_size - read_pos).min(burst);
+            let mut i = 0usize;
+            while i < step {
+                resp_out[read_pos + i] = self.bus.read_u8(TPM_DATA_FIFO_0);
+                i += 1;
+            }
+            read_pos += step;
+        }
+
+        // Return FIFO to Command Ready / Idle.
+        self.bus.write_u8(TPM_STS_0, TPM_STS_COMMAND_READY);
+        Ok(total_size)
+    }
+
+    /// Execute `TPM2_Startup(startup_type)` over the TIS FIFO and verify `TPM_RC_SUCCESS`.
+    pub fn startup(&mut self, startup_type: u16) -> Result<(), TpmError> {
+        let mut cmd = [0u8; TPM_STARTUP_CMD_LEN];
+        let cmd_len = build_startup(&mut cmd, startup_type)?;
+        let mut resp = [0u8; 32];
+        let resp_len = self.transceive(&cmd[..cmd_len], &mut resp)?;
+        let view = parse_response(&resp[..resp_len])?;
+        if view.response_code != proteus_contracts::TPM_RC_SUCCESS {
+            return Err(TpmError::BadTag);
+        }
+        Ok(())
+    }
+
+    /// Execute `TPM2_PCR_Extend` for `pcr_index` in the SHA-256 bank over the TIS FIFO.
+    pub fn pcr_extend_sha256(&mut self, pcr_index: u32, digest: &[u8; 32]) -> Result<(), TpmError> {
+        let mut cmd = [0u8; TPM_PCR_EXTEND_SHA256_CMD_LEN];
+        let cmd_len = build_pcr_extend(&mut cmd, pcr_index, TPM_ALG_SHA256, digest)?;
+        let mut resp = [0u8; 64];
+        let resp_len = self.transceive(&cmd[..cmd_len], &mut resp)?;
+        let view = parse_response(&resp[..resp_len])?;
+        if view.response_code != proteus_contracts::TPM_RC_SUCCESS {
+            return Err(TpmError::BadTag);
+        }
+        Ok(())
+    }
+
+    /// Execute `TPM2_PCR_Read` for `pcr_index` in the SHA-256 bank over the TIS FIFO,
+    /// copy the 32-byte PCR value into `out_digest`, and return `pcrUpdateCounter`.
+    pub fn pcr_read_sha256(
+        &mut self,
+        pcr_index: u32,
+        out_digest: &mut [u8; 32],
+    ) -> Result<u32, TpmError> {
+        let mut cmd = [0u8; TPM_PCR_READ_CMD_LEN];
+        let cmd_len = build_pcr_read(&mut cmd, pcr_index)?;
+        let mut resp = [0u8; 96];
+        let resp_len = self.transceive(&cmd[..cmd_len], &mut resp)?;
+        let view = parse_response(&resp[..resp_len])?;
+        if view.response_code != proteus_contracts::TPM_RC_SUCCESS {
+            return Err(TpmError::BadTag);
+        }
+        // Body layout: pcrUpdateCounter(4) + pcrSelectionOut(10) + count(4) + size(2) + digest(32) = 52 bytes.
+        if view.body.len() < 52 {
+            return Err(TpmError::Truncated);
+        }
+        let update_counter = read_u32_be(view.body, 0);
+        let digest_count = read_u32_be(view.body, 14);
+        let digest_size = read_u16_be(view.body, 18) as usize;
+        if digest_count != 1 || digest_size != TPM_SHA256_DIGEST_LEN {
+            return Err(TpmError::BadDigestLen);
+        }
+        out_digest.copy_from_slice(&view.body[20..52]);
+        Ok(update_counter)
+    }
+
+    /// Execute `TPM2_GetRandom` over the TIS FIFO and fill `out` (up to 32 bytes).
+    pub fn get_random(&mut self, out: &mut [u8]) -> Result<usize, TpmError> {
+        if out.is_empty() || out.len() > 32 {
+            return Err(TpmError::BadByteCount);
+        }
+        let req_len = out.len() as u16;
+        let mut cmd = [0u8; TPM_GET_RANDOM_CMD_LEN];
+        let cmd_len = build_get_random(&mut cmd, req_len)?;
+        let mut resp = [0u8; 64];
+        let resp_len = self.transceive(&cmd[..cmd_len], &mut resp)?;
+        let view = parse_response(&resp[..resp_len])?;
+        if view.response_code != proteus_contracts::TPM_RC_SUCCESS {
+            return Err(TpmError::BadTag);
+        }
+        let rnd = extract_get_random_bytes(view.body)?;
+        if rnd.len() != out.len() {
+            return Err(TpmError::BadSizeField);
+        }
+        out.copy_from_slice(rnd);
+        Ok(rnd.len())
+    }
+}
+
+/// Deterministic in-memory TCG PC Client PTP TPM 2.0 TIS Locality 0 emulator.
+///
+/// Implements the hardware register state machine (`TPM_ACCESS_0`, `TPM_STS_0`,
+/// `TPM_DATA_FIFO_0`, `TPM_DID_VID_0`) and maintains a 24-PCR SHA-256 bank so
+/// [`TpmTisDriver`] executes identical register-level FIFO transfers on hosts
+/// and QEMU guests without an external `swtpm` socket.
+pub struct MemTpmTisBus {
+    did_vid: u32,
+    access: u8,
+    sts: u8,
+    cmd_fifo: [u8; 128],
+    cmd_len: usize,
+    cmd_expected: usize,
+    resp_fifo: [u8; 128],
+    resp_len: usize,
+    resp_pos: usize,
+    started: bool,
+    pcr_update_counter: u32,
+    pcrs_sha256: [[u8; 32]; 24],
+    rng_counter: u64,
+}
+
+impl Default for MemTpmTisBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemTpmTisBus {
+    /// Construct a new in-memory TPM 2.0 TIS locality 0 device with default `DID_VID`.
+    pub const fn new() -> Self {
+        Self {
+            did_vid: TPM_DEFAULT_DID_VID,
+            access: TPM_ACCESS_VALID,
+            sts: TPM_STS_VALID,
+            cmd_fifo: [0u8; 128],
+            cmd_len: 0,
+            cmd_expected: 0,
+            resp_fifo: [0u8; 128],
+            resp_len: 0,
+            resp_pos: 0,
+            started: false,
+            pcr_update_counter: 0,
+            pcrs_sha256: [[0u8; 32]; 24],
+            rng_counter: 1,
+        }
+    }
+
+    /// Inspect a SHA-256 PCR value directly from the emulated bank.
+    pub fn pcr_sha256(&self, index: usize) -> &[u8; 32] {
+        &self.pcrs_sha256[index]
+    }
+
+    /// Execute the command currently buffered in `cmd_fifo[..cmd_len]` and populate `resp_fifo`.
+    fn execute_command(&mut self) {
+        self.resp_pos = 0;
+        self.resp_len = 0;
+        if self.cmd_len < TPM_HEADER_LEN {
+            self.write_error_response(TPM_ST_NO_SESSIONS, 0x0000_0100);
+            return;
+        }
+        let tag = read_u16_be(&self.cmd_fifo, 0);
+        let size = read_u32_be(&self.cmd_fifo, 2) as usize;
+        let cc = read_u32_be(&self.cmd_fifo, 6);
+        if size != self.cmd_len {
+            self.write_error_response(tag, 0x0000_0100);
+            return;
+        }
+
+        match cc {
+            TPM_CC_STARTUP => {
+                if self.cmd_len != TPM_STARTUP_CMD_LEN {
+                    self.write_error_response(TPM_ST_NO_SESSIONS, 0x0000_0100);
+                    return;
+                }
+                let st_type = read_u16_be(&self.cmd_fifo, 10);
+                if st_type == proteus_contracts::TPM_SU_CLEAR {
+                    self.pcrs_sha256 = [[0u8; 32]; 24];
+                    self.pcr_update_counter = 0;
+                }
+                self.started = true;
+                let _ = write_header(
+                    &mut self.resp_fifo,
+                    TPM_ST_NO_SESSIONS,
+                    TPM_HEADER_LEN as u32,
+                    proteus_contracts::TPM_RC_SUCCESS,
+                );
+                self.resp_len = TPM_HEADER_LEN;
+            }
+            TPM_CC_PCR_EXTEND => {
+                if !self.started || self.cmd_len != TPM_PCR_EXTEND_SHA256_CMD_LEN {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_0100);
+                    return;
+                }
+                let pcr_idx = read_u32_be(&self.cmd_fifo, 10) as usize;
+                let alg_off = TPM_HEADER_LEN + 4 + 4 + AUTH_SESSION_LEN + 4;
+                let alg = read_u16_be(&self.cmd_fifo, alg_off);
+                if pcr_idx > TPM_MAX_PCR_INDEX as usize || alg != TPM_ALG_SHA256 {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_0100);
+                    return;
+                }
+                let mut extend_val = [0u8; 32];
+                extend_val.copy_from_slice(&self.cmd_fifo[alg_off + 2..alg_off + 34]);
+                self.pcrs_sha256[pcr_idx] =
+                    tpm_pcr_extend_sha256_math(&self.pcrs_sha256[pcr_idx], &extend_val);
+                self.pcr_update_counter = self.pcr_update_counter.wrapping_add(1);
+
+                // 19-byte TPM_ST_SESSIONS response: header(10) + paramSize(0, 4B) + PWAP auth(5B) = 19B.
+                let mut i = 0usize;
+                while i < 19 {
+                    self.resp_fifo[i] = 0;
+                    i += 1;
+                }
+                let _ = write_header(
+                    &mut self.resp_fifo,
+                    TPM_ST_SESSIONS,
+                    19,
+                    proteus_contracts::TPM_RC_SUCCESS,
+                );
+                self.resp_len = 19;
+            }
+            TPM_CC_PCR_READ => {
+                if !self.started || self.cmd_len != TPM_PCR_READ_CMD_LEN {
+                    self.write_error_response(TPM_ST_NO_SESSIONS, 0x0000_0100);
+                    return;
+                }
+                let b0 = self.cmd_fifo[17];
+                let b1 = self.cmd_fifo[18];
+                let b2 = self.cmd_fifo[19];
+                let mut selected_pcr: Option<usize> = None;
+                let mut idx = 0usize;
+                while idx < 24 {
+                    let byte = match idx / 8 {
+                        0 => b0,
+                        1 => b1,
+                        _ => b2,
+                    };
+                    if (byte & (1u8 << (idx % 8))) != 0 {
+                        selected_pcr = Some(idx);
+                        break;
+                    }
+                    idx += 1;
+                }
+                let Some(pcr_idx) = selected_pcr else {
+                    self.write_error_response(TPM_ST_NO_SESSIONS, 0x0000_0100);
+                    return;
+                };
+                let _ = write_header(
+                    &mut self.resp_fifo,
+                    TPM_ST_NO_SESSIONS,
+                    TPM_PCR_READ_SHA256_RESP_LEN as u32,
+                    proteus_contracts::TPM_RC_SUCCESS,
+                );
+                // pcrUpdateCounter
+                let _ = put_u32_be(&mut self.resp_fifo, 10, self.pcr_update_counter);
+                // pcrSelectionOut (copy 10 bytes from request offset 10..20)
+                self.resp_fifo[14..24].copy_from_slice(&self.cmd_fifo[10..20]);
+                // pcrValues: count = 1, size = 32, digest[32]
+                let _ = put_u32_be(&mut self.resp_fifo, 24, 1);
+                let _ = put_u16_be(&mut self.resp_fifo, 28, TPM_SHA256_DIGEST_LEN as u16);
+                self.resp_fifo[30..62].copy_from_slice(&self.pcrs_sha256[pcr_idx]);
+                self.resp_len = TPM_PCR_READ_SHA256_RESP_LEN;
+            }
+            TPM_CC_GET_RANDOM => {
+                if !self.started || self.cmd_len != TPM_GET_RANDOM_CMD_LEN {
+                    self.write_error_response(TPM_ST_NO_SESSIONS, 0x0000_0100);
+                    return;
+                }
+                let req = (read_u16_be(&self.cmd_fifo, 10) as usize).min(32);
+                let mut seed_block = [0u8; 32];
+                seed_block[0..8].copy_from_slice(&self.rng_counter.to_le_bytes());
+                seed_block[8..12].copy_from_slice(&self.pcr_update_counter.to_le_bytes());
+                self.rng_counter = self.rng_counter.wrapping_add(1);
+                let digest = tpm_pcr_extend_sha256_math(&self.pcrs_sha256[0], &seed_block);
+                let total_len = TPM_HEADER_LEN + 2 + req;
+                let _ = write_header(
+                    &mut self.resp_fifo,
+                    TPM_ST_NO_SESSIONS,
+                    total_len as u32,
+                    proteus_contracts::TPM_RC_SUCCESS,
+                );
+                let _ = put_u16_be(&mut self.resp_fifo, 10, req as u16);
+                self.resp_fifo[12..12 + req].copy_from_slice(&digest[..req]);
+                self.resp_len = total_len;
+            }
+            _ => {
+                self.write_error_response(TPM_ST_NO_SESSIONS, 0x0000_0143);
+            }
+        }
+    }
+
+    fn write_error_response(&mut self, tag: u16, rc: u32) {
+        let _ = write_header(&mut self.resp_fifo, tag, TPM_HEADER_LEN as u32, rc);
+        self.resp_len = TPM_HEADER_LEN;
+        self.resp_pos = 0;
+    }
+}
+
+impl TpmTisBus for MemTpmTisBus {
+    fn read_u8(&mut self, offset: usize) -> u8 {
+        match offset {
+            TPM_ACCESS_0 => self.access,
+            TPM_STS_0 => self.sts,
+            0x0019 => 0x40, // burstCount low byte = 64 bytes
+            0x001A => 0x00, // burstCount high byte = 0
+            0x001B => 0x00,
+            TPM_DATA_FIFO_0 => {
+                if self.resp_pos < self.resp_len {
+                    let b = self.resp_fifo[self.resp_pos];
+                    self.resp_pos += 1;
+                    if self.resp_pos >= self.resp_len {
+                        self.sts &= !TPM_STS_DATA_AVAIL;
+                    }
+                    b
+                } else {
+                    0
+                }
+            }
+            o if (TPM_DID_VID_0..TPM_DID_VID_0 + 4).contains(&o) => {
+                let shift = (o - TPM_DID_VID_0) * 8;
+                ((self.did_vid >> shift) & 0xFF) as u8
+            }
+            _ => 0,
+        }
+    }
+
+    fn write_u8(&mut self, offset: usize, val: u8) {
+        match offset {
+            TPM_ACCESS_0 => {
+                if (val & TPM_ACCESS_REQUEST_USE) != 0 {
+                    self.access = TPM_ACCESS_VALID | TPM_ACCESS_ACTIVE_LOCALITY;
+                } else if (val & TPM_ACCESS_ACTIVE_LOCALITY) != 0 {
+                    self.access = TPM_ACCESS_VALID;
+                }
+            }
+            TPM_STS_0 => {
+                if (val & TPM_STS_COMMAND_READY) != 0 {
+                    self.cmd_len = 0;
+                    self.cmd_expected = 0;
+                    self.resp_len = 0;
+                    self.resp_pos = 0;
+                    self.sts = TPM_STS_VALID | TPM_STS_COMMAND_READY | TPM_STS_EXPECT;
+                } else if (val & TPM_STS_GO) != 0 {
+                    self.execute_command();
+                    self.sts = TPM_STS_VALID | TPM_STS_DATA_AVAIL;
+                }
+            }
+            TPM_DATA_FIFO_0 => {
+                if (self.sts & TPM_STS_EXPECT) != 0 && self.cmd_len < self.cmd_fifo.len() {
+                    self.cmd_fifo[self.cmd_len] = val;
+                    self.cmd_len += 1;
+                    if self.cmd_len == 6 {
+                        let declared = read_u32_be(&self.cmd_fifo, 2) as usize;
+                        self.cmd_expected = declared.min(self.cmd_fifo.len());
+                    }
+                    if self.cmd_expected != 0 && self.cmd_len >= self.cmd_expected {
+                        self.sts &= !TPM_STS_EXPECT;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
 
@@ -986,4 +1573,39 @@ mod tests {
         TpmImpl::build_pcr_extend(&mut buf, 17, TPM_ALG_SHA256, &digest).unwrap();
         assert_eq!(read_u32_be(&buf, 10), 17);
     }
+
+    #[test]
+    fn tpm_tis_driver_startup_extend_read_and_random_round_trip() {
+        let mut drv = TpmTisDriver::new(MemTpmTisBus::new());
+        assert_eq!(drv.probe_did_vid(), Some(TPM_DEFAULT_DID_VID));
+        drv.startup(TPM_SU_CLEAR).unwrap();
+
+        let measurement = [0x42u8; 32];
+        drv.pcr_extend_sha256(10, &measurement).unwrap();
+
+        let mut pcr10 = [0u8; 32];
+        let count = drv.pcr_read_sha256(10, &mut pcr10).unwrap();
+        assert_eq!(count, 1);
+
+        let expected = tpm_pcr_extend_sha256_math(&[0u8; 32], &measurement);
+        assert_eq!(pcr10, expected);
+        assert_eq!(drv.bus().pcr_sha256(10), &expected);
+
+        let mut rnd_a = [0u8; 16];
+        let mut rnd_b = [0u8; 16];
+        assert_eq!(drv.get_random(&mut rnd_a).unwrap(), 16);
+        assert_eq!(drv.get_random(&mut rnd_b).unwrap(), 16);
+        assert_ne!(rnd_a, [0u8; 16]);
+        assert_ne!(rnd_a, rnd_b);
+
+        drv.relinquish_locality_0();
+    }
+
+    #[test]
+    fn tpm_tis_driver_rejects_commands_before_startup() {
+        let mut drv = TpmTisDriver::new(MemTpmTisBus::new());
+        let mut pcr = [0u8; 32];
+        assert!(drv.pcr_read_sha256(0, &mut pcr).is_err());
+    }
 }
+

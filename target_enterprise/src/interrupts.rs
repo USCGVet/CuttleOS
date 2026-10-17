@@ -222,4 +222,44 @@ pub mod vectors {
     pub const MACHINE_CHECK: u8 = 18;
     /// SIMD floating-point exception.
     pub const SIMD_FP: u8 = 19;
+    /// Ring-3 software syscall trap vector (`int 0x80`).
+    pub const SYSCALL_INT: u8 = 0x80;
 }
+
+/// Type byte for a 64-bit trap gate callable from Ring-3 (`P=1, DPL=3, type=0xF`).
+pub const TYPE_TRAP_GATE_DPL3: u8 = 0xEF;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idt_entry_packs_and_roundtrips_64bit_handler_addr() {
+        let addr: u64 = 0xFFFF_8000_0042_1337;
+        let e = IdtEntry::new(addr, 0x08, TYPE_INTERRUPT_GATE_DPL3, 1);
+        assert!(e.is_present());
+        assert_eq!(e.handler_addr(), addr);
+        let sel = e.selector;
+        assert_eq!(sel, 0x08);
+        assert_eq!(e.ist, 1);
+        assert_eq!(e.type_attr, TYPE_INTERRUPT_GATE_DPL3);
+    }
+
+    #[test]
+    fn idt_set_handler_with_attr_encodes_expected_wire_bytes() {
+        let mut idt = Idt::new_empty();
+        let addr: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        idt.set_handler_with_attr(vectors::SYSCALL_INT, addr, TYPE_TRAP_GATE_DPL3, 1);
+        let raw = idt.raw_bytes(vectors::SYSCALL_INT);
+        assert_eq!(u16::from_le_bytes([raw[0], raw[1]]), 0xBABE);
+        assert_eq!(u16::from_le_bytes([raw[2], raw[3]]), 0x0008);
+        assert_eq!(raw[4], 1);
+        assert_eq!(raw[5], TYPE_TRAP_GATE_DPL3);
+        assert_eq!(u16::from_le_bytes([raw[6], raw[7]]), 0xCAFE);
+        assert_eq!(
+            u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
+            0xDEAD_BEEF
+        );
+    }
+}
+

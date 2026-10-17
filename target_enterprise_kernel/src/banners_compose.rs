@@ -580,12 +580,27 @@ pub(crate) static KERNEL_SHELL: spin::Mutex<target_enterprise::OsShell> =
 /// First LBA of the 2-sector (`PRTSSHL1` header + 512-byte WAL) sealed
 /// `OsShell` persistence region on the AHCI disk (`LBA 1040..=1041`).
 pub(crate) const SHELL_DISK_LBA: u64 = 1040;
+/// First LBA of the 16-sector (`8 KiB`, `PRTSFS01` superblock + inode table +
+/// data pool) block-backed filesystem partition on the AHCI disk (`LBA 1042..=1057`).
+pub(crate) const SHELL_FS_DISK_LBA: u64 = 1042;
+
+static FS_PART_SECTORS: spin::Mutex<[[u8; 512]; target_enterprise::shell::SHELL_FS_PART_SECTORS]> =
+    spin::Mutex::new([[0u8; 512]; target_enterprise::shell::SHELL_FS_PART_SECTORS]);
 
 pub(crate) fn persist_shell_to_ahci(sh: &mut target_enterprise::OsShell, boots: u64) -> Option<usize> {
     let mut hdr_sec = [0u8; 512];
     let mut wal_sec = [0u8; 512];
     let count = sh.pack_disk_image(boots, &mut hdr_sec, &mut wal_sec).ok()?;
+    let mut fs_secs = FS_PART_SECTORS.lock();
+    sh.pack_fs_partition(boots, &mut *fs_secs).ok()?;
     let port = AhciHwPort::probe_start();
+    // Write directory + data sectors first, then superblock sector last (crash-atomic).
+    let mut s = 1usize;
+    while s < target_enterprise::shell::SHELL_FS_PART_SECTORS {
+        port.write_sector(SHELL_FS_DISK_LBA + (s as u64), &fs_secs[s]);
+        s += 1;
+    }
+    port.write_sector(SHELL_FS_DISK_LBA, &fs_secs[0]);
     // Write WAL payload sector first, then header sector last (crash-atomic).
     port.write_sector(SHELL_DISK_LBA + 1, &wal_sec);
     port.write_sector(SHELL_DISK_LBA, &hdr_sec);
@@ -608,15 +623,44 @@ pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Op
     if all_zero {
         return None;
     }
-    match sh.unpack_disk_image(&hdr_sec, &wal_sec) {
-        Ok(res) => Some(res),
+    let res = match sh.unpack_disk_image(&hdr_sec, &wal_sec) {
+        Ok(res) => res,
         Err(_) => {
             serial_write_str(
                 "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
             );
-            None
+            return None;
+        }
+    };
+    let sb_sec = port.read_sector(SHELL_FS_DISK_LBA);
+    let mut fs_present = false;
+    let mut j = 0usize;
+    while j < 512 {
+        if sb_sec[j] != 0 {
+            fs_present = true;
+            break;
+        }
+        j += 1;
+    }
+    if fs_present {
+        let mut fs_secs = FS_PART_SECTORS.lock();
+        fs_secs[0] = sb_sec;
+        let mut s = 1usize;
+        while s < target_enterprise::shell::SHELL_FS_PART_SECTORS {
+            fs_secs[s] = port.read_sector(SHELL_FS_DISK_LBA + (s as u64));
+            s += 1;
+        }
+        match sh.unpack_fs_partition(&*fs_secs) {
+            Ok((generation, _, _)) if generation == res.0 => {}
+            _ => {
+                serial_write_str(
+                    "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
+                );
+                return None;
+            }
         }
     }
+    Some(res)
 }
 
 /// Decode the 32-byte MAC from the `hmac=<hex64>` field of an `attest:` quote line.
@@ -790,6 +834,18 @@ pub(crate) fn banner_shell_compose() {
     serial_write_str("ATTEST: OK seed=");
     serial_write_str(option_env!("PROTEUS_VARIANT_SEED").unwrap_or("default-variant"));
     serial_write_str(" quote=verified\n");
+    let av_df = vsh.exec_line(b"df", boots, 0, 0, &mut out);
+    if &out[..av_df.bytes_written()]
+        != b"fs: magic=PRTSFS01 inodes=5/16 pool_bytes=704/4096 part_sectors=16\n"
+    {
+        panic!("SHELL compose: df output drift");
+    }
+    let av_sync = vsh.exec_line(b"sync", boots, 0, 0, &mut out);
+    if !out[..av_sync.bytes_written()].starts_with(b"sync: ok files=1 bytes=6 seal=") {
+        panic!("SHELL compose: sync output drift");
+    }
+    serial_write_str("FS partition OK lba=1042..1057 sectors=16 files=1 magic=PRTSFS01\n");
+    verify_https_and_concurrent_tcp_compose(boots, seal_key);
     let _ = sh.exec_line(b"seccomp clear 5", boots, 0, 0, &mut out);
     let _ = sh.exec_line(b"fw clear", boots, 0, 0, &mut out);
     sh.auth_seq = 0;
@@ -798,5 +854,174 @@ pub(crate) fn banner_shell_compose() {
     if seal_rejected {
         sh.record_net_audit(proteus_contracts::AuditVerdict::Denied, b"shell:wal:seal-mismatch");
     }
+}
+
+#[inline(never)]
+fn verify_https_and_concurrent_tcp_compose(boots: u64, auth_key: [u8; 32]) {
+    use proteus_contracts::{tcp_flags, Aead, Tcp, IP_PROTO_TCP};
+    use target_enterprise::lived_net::{
+        GUEST_IP, HTTPS_PORT, HTTP_PORT, TCP_MAX_SLOTS, TLS_CONTENT_APPLICATION_DATA,
+        TLS_SERVER_PUBKEY,
+    };
+    use target_enterprise::tcp::TcpImpl;
+    use target_enterprise::tls::{
+        build_client_hello, decode_record_header, encode_record_header, parse_server_hello,
+        CONTENT_TYPE_HANDSHAKE, LEGACY_VERSION, RECORD_HEADER_LEN,
+    };
+
+    const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+    const PEER_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+    const PEER_IP: [u8; 4] = [10, 0, 2, 2];
+
+    static COMPOSE_REPLIES: spin::Mutex<target_enterprise::ReplySet> =
+        spin::Mutex::new(target_enterprise::ReplySet::new());
+
+    let mut net = target_enterprise::LivedNet::with_auth_key(MAC, auth_key);
+    let mut tls_server_isn = 0u32;
+
+    let wrap_eth_ip = |tcp_seg: &[u8], frame_out: &mut [u8; 384]| -> usize {
+        let ip_len = 20 + tcp_seg.len();
+        let eth_len = 14 + ip_len;
+        frame_out[..6].copy_from_slice(&MAC);
+        frame_out[6..12].copy_from_slice(&PEER_MAC);
+        frame_out[12] = 0x08;
+        frame_out[13] = 0x00;
+        frame_out[14] = 0x45;
+        frame_out[15] = 0;
+        frame_out[16..18].copy_from_slice(&(ip_len as u16).to_be_bytes());
+        frame_out[18..22].copy_from_slice(&[0, 0, 0x40, 0]);
+        frame_out[22] = 64;
+        frame_out[23] = IP_PROTO_TCP;
+        frame_out[24..26].copy_from_slice(&[0, 0]);
+        frame_out[26..30].copy_from_slice(&PEER_IP);
+        frame_out[30..34].copy_from_slice(&GUEST_IP);
+        let ck = target_enterprise::net::ipv4_header_checksum(&frame_out[14..34]);
+        frame_out[24..26].copy_from_slice(&ck.to_be_bytes());
+        frame_out[34..eth_len].copy_from_slice(tcp_seg);
+        eth_len
+    };
+
+    let mut slot = 0usize;
+    while slot < TCP_MAX_SLOTS {
+        let dst_port = if slot + 1 == TCP_MAX_SLOTS {
+            HTTPS_PORT
+        } else {
+            HTTP_PORT
+        };
+        let cport = 52000 + (slot as u16);
+        let cisn = 0x5000_0000 + ((slot as u32) << 16);
+        let mut syn = [0u8; 40];
+        let n = TcpImpl::build_segment(
+            cport,
+            dst_port,
+            cisn,
+            0,
+            tcp_flags::SYN,
+            65535,
+            b"",
+            PEER_IP,
+            GUEST_IP,
+            &mut syn,
+        )
+        .unwrap();
+        let mut frame = [0u8; 384];
+        let flen = wrap_eth_ip(&syn[..n], &mut frame);
+        let mut rep = COMPOSE_REPLIES.lock();
+        *rep = target_enterprise::ReplySet::new();
+        net.handle_frame(&frame[..flen], boots, &mut *rep);
+        if rep.len() != 1 {
+            panic!("HTTPS+TCP4 compose: expected SYN-ACK");
+        }
+        let sa = TcpImpl::parse_segment(&rep.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        if sa.flags != (tcp_flags::SYN | tcp_flags::ACK) {
+            panic!("HTTPS+TCP4 compose: unexpected SYN-ACK flags");
+        }
+        if dst_port == HTTPS_PORT {
+            tls_server_isn = sa.seq;
+        }
+        slot += 1;
+    }
+
+    if net.active_tcp_slots() != 4 {
+        panic!("HTTPS+TCP4 compose: expected 4 active concurrent TCP slots");
+    }
+
+    let client_random = [0x33u8; 32];
+    let client_pubkey = [0x77u8; 32];
+    let mut ch_msg = [0u8; 256];
+    let ch_len = build_client_hello(&client_random, &client_pubkey, &mut ch_msg).unwrap();
+    let mut tls_rec = [0u8; 264];
+    let _ = encode_record_header(
+        CONTENT_TYPE_HANDSHAKE,
+        LEGACY_VERSION,
+        ch_len as u16,
+        &mut tls_rec,
+    );
+    tls_rec[RECORD_HEADER_LEN..RECORD_HEADER_LEN + ch_len].copy_from_slice(&ch_msg[..ch_len]);
+    let rec_total = RECORD_HEADER_LEN + ch_len;
+
+    let tls_cport = 52000 + ((TCP_MAX_SLOTS - 1) as u16);
+    let tls_cisn = 0x5000_0000 + (((TCP_MAX_SLOTS - 1) as u32) << 16);
+    let mut ch_seg = [0u8; 320];
+    let n = TcpImpl::build_segment(
+        tls_cport,
+        HTTPS_PORT,
+        tls_cisn.wrapping_add(1),
+        tls_server_isn.wrapping_add(1),
+        tcp_flags::ACK | tcp_flags::PSH,
+        65535,
+        &tls_rec[..rec_total],
+        PEER_IP,
+        GUEST_IP,
+        &mut ch_seg,
+    )
+    .unwrap();
+    let mut frame = [0u8; 384];
+    let flen = wrap_eth_ip(&ch_seg[..n], &mut frame);
+    let mut rep = COMPOSE_REPLIES.lock();
+    *rep = target_enterprise::ReplySet::new();
+    net.handle_frame(&frame[..flen], boots, &mut *rep);
+    if rep.len() != 1 {
+        panic!("HTTPS+TCP4 compose: expected TLS 1.3 ServerHello + ApplicationData segment");
+    }
+    let resp_seg = TcpImpl::parse_segment(&rep.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+    let payload = resp_seg.payload;
+    let (r1_type, _, r1_len_u16) = decode_record_header(payload).unwrap();
+    if r1_type != CONTENT_TYPE_HANDSHAKE {
+        panic!("HTTPS+TCP4 compose: expected Handshake record");
+    }
+    let r1_len = r1_len_u16 as usize;
+    let sh_slice = &payload[RECORD_HEADER_LEN..RECORD_HEADER_LEN + r1_len];
+    let parsed_sh = parse_server_hello(sh_slice).unwrap();
+    if parsed_sh.server_pubkey != TLS_SERVER_PUBKEY {
+        panic!("HTTPS+TCP4 compose: ServerHello pubkey mismatch");
+    }
+    let mut record_key = [0u8; 16];
+    let _ = target_enterprise::LivedNet::derive_tls13_record_key(
+        &client_pubkey,
+        &ch_msg[..ch_len],
+        sh_slice,
+        &mut record_key,
+    );
+    let r2_slice = &payload[RECORD_HEADER_LEN + r1_len..];
+    let (r2_type, _, r2_len_u16) = decode_record_header(r2_slice).unwrap();
+    if r2_type != TLS_CONTENT_APPLICATION_DATA {
+        panic!("HTTPS+TCP4 compose: expected ApplicationData record");
+    }
+    let r2_len = r2_len_u16 as usize;
+    let mut plain_status = [0u8; 64];
+    let plen = target_enterprise::AeadImpl::decrypt(
+        &record_key,
+        &[0u8; 8],
+        &r2_slice[RECORD_HEADER_LEN..RECORD_HEADER_LEN + r2_len],
+        &r2_slice[..RECORD_HEADER_LEN],
+        &mut plain_status,
+    )
+    .unwrap();
+    if !plain_status[..plen].starts_with(b"PROTEUS-STATUS boots=") {
+        panic!("HTTPS+TCP4 compose: decrypted TLS 1.3 status payload drift");
+    }
+
+    serial_write_str("HTTPS+TCP4 compose OK slots=4 port=443 tls13=ok\n");
 }
 

@@ -119,15 +119,16 @@ pub(crate) fn set_phys_offset(boot: &BootInfo) {
             continue;
         }
         let aligned = (start + 0xFFF) & !0xFFF;
-        // 128 KiB: virtio queues + AHCI CLB/FB/CTBA + PT scratch.
-        if aligned >= 0x10_0000 && end.saturating_sub(aligned) >= 0x2_0000 {
+        // 192 KiB: virtio queues + AHCI CLB/FB/CTBA + PT scratch + Ring-3 trampoline frames.
+        if aligned >= 0x10_0000 && end.saturating_sub(aligned) >= 0x3_0000 {
             dma = aligned;
             break;
         }
     }
     PHYS_MAP_OFFSET.store(map_off, core::sync::atomic::Ordering::Relaxed);
     DMA_PHYS_BASE.store(dma, core::sync::atomic::Ordering::Relaxed);
-    // Top 16 KiB of the 128 KiB window = page-table frame pool.
+    // 32 KiB page-table frame pool (`0x1_C000 .. 0x2_4000`); `0x2_4000 .. 0x2_B000`
+    // is reserved for the Ring-3 GDT/TSS/IDT/page-table transition frames.
     let pt_next = if dma != 0 { dma + 0x1_C000 } else { 0 };
     PT_ALLOC_NEXT.store(pt_next, core::sync::atomic::Ordering::Relaxed);
 }
@@ -162,7 +163,7 @@ pub(crate) unsafe fn read_cr3() -> u64 {
 pub(crate) unsafe fn alloc_pt_frame() -> u64 {
     let base = dma_phys_base();
     let next = PT_ALLOC_NEXT.load(core::sync::atomic::Ordering::Relaxed);
-    if base == 0 || next == 0 || next + 0x1000 > base + 0x2_0000 {
+    if base == 0 || next == 0 || next + 0x1000 > base + 0x2_4000 {
         panic!("AHCI_HW: PT frame pool exhausted");
     }
     let frame = next;
@@ -235,6 +236,31 @@ pub(crate) unsafe fn ensure_mmio_page(phys: u64) -> *mut u8 {
         }
     }
     va as *mut u8
+}
+
+// SAFETY: Caller must pass a valid guest-physical MMIO register address in ring 0.
+pub(crate) unsafe fn mmio_read8(phys: u64) -> u8 {
+    // SAFETY: Running at CPL=0; `phys & !0xFFF` is a page-aligned guest-physical MMIO address mapped with `PTE_P | PTE_W | PTE_PWT | PTE_PCD`.
+    let page = unsafe { ensure_mmio_page(phys) };
+    let off = (phys & 0xFFF) as usize;
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    // SAFETY: `off = (phys & 0xFFF) <= 0xFFF`, so `page.add(off)` is a mapped 8-bit MMIO register within the 4 KiB page.
+    let val = unsafe { core::ptr::read_volatile(page.add(off)) };
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    val
+}
+
+// SAFETY: Caller must pass a valid guest-physical MMIO register address in ring 0.
+pub(crate) unsafe fn mmio_write8(phys: u64, val: u8) {
+    // SAFETY: Running at CPL=0; `phys & !0xFFF` is a page-aligned guest-physical MMIO address mapped with `PTE_P | PTE_W | PTE_PWT | PTE_PCD`.
+    let page = unsafe { ensure_mmio_page(phys) };
+    let off = (phys & 0xFFF) as usize;
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    // SAFETY: `off = (phys & 0xFFF) <= 0xFFF`, so `page.add(off)` is a mapped 8-bit MMIO register within the 4 KiB page.
+    unsafe {
+        core::ptr::write_volatile(page.add(off), val);
+    }
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 // SAFETY: Caller must pass a 4-byte aligned guest-physical MMIO register address.
@@ -569,6 +595,8 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     banner_kpti();
     #[cfg(not(proteus_prod))]
     banner_dma();
+    #[cfg(not(proteus_prod))]
+    banner_ring3_transition();
     #[cfg(not(proteus_prod))]
     banner_nvme();
     #[cfg(not(proteus_prod))]

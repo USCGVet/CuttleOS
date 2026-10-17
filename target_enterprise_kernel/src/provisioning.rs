@@ -153,6 +153,46 @@ fn read_hw_entropy_u64(round: u64) -> u64 {
         ^ round.wrapping_mul(0xBF58_476D_1CE4_E5B9)
 }
 
+/// Physical MMIO register bus for TCG PC Client PTP TPM 2.0 TIS Locality 0 (`0xFED4_0000`).
+pub(crate) struct HwTpmTisBus {
+    pub(crate) base_phys: u64,
+}
+
+impl target_enterprise::tpm::TpmTisBus for HwTpmTisBus {
+    fn read_u8(&mut self, offset: usize) -> u8 {
+        // SAFETY: Running at CPL=0; `self.base_phys + offset` lies within the 4 KiB
+        // TCG PC Client PTP TPM 2.0 TIS Locality 0 MMIO aperture (`0xFED4_0000..0xFED4_0FFF`).
+        unsafe { mmio_read8(self.base_phys + (offset as u64)) }
+    }
+
+    fn write_u8(&mut self, offset: usize, val: u8) {
+        // SAFETY: Running at CPL=0; `self.base_phys + offset` lies within the 4 KiB
+        // TCG PC Client PTP TPM 2.0 TIS Locality 0 MMIO aperture (`0xFED4_0000..0xFED4_0FFF`).
+        unsafe { mmio_write8(self.base_phys + (offset as u64), val) }
+    }
+
+    fn read_u32(&mut self, offset: usize) -> u32 {
+        // SAFETY: Running at CPL=0; 32-bit TIS registers (`TPM_STS_0 = 0x18`, `TPM_DID_VID_0 = 0xF00`)
+        // are 4-byte aligned within the `0xFED4_0000` MMIO page.
+        unsafe { mmio_read32(self.base_phys + (offset as u64)) }
+    }
+}
+
+/// Probe physical TPM 2.0 TIS Locality 0 (`0xFED4_0000`) and harvest 16 random
+/// bytes via `TPM2_GetRandom` when a hardware or QEMU `swtpm` TIS device is attached.
+pub(crate) fn probe_hw_tpm_random_16() -> Option<(u32, [u8; 16])> {
+    use target_enterprise::tpm::{TpmTisDriver, TPM_TIS_BASE_PHYS};
+    let mut drv = TpmTisDriver::new(HwTpmTisBus {
+        base_phys: TPM_TIS_BASE_PHYS,
+    });
+    let did_vid = drv.probe_did_vid()?;
+    let _ = drv.startup(TPM_SU_CLEAR);
+    let mut rnd = [0u8; 16];
+    drv.get_random(&mut rnd).ok()?;
+    drv.relinquish_locality_0();
+    Some((did_vid, rnd))
+}
+
 /// Generate a 256-bit boot-ephemeral master key from hardware entropy when no
 /// out-of-band `fw_cfg` key was provisioned by the host.
 fn generate_hw_entropy_master_key() -> [u8; 32] {
@@ -170,6 +210,15 @@ fn generate_hw_entropy_master_key() -> [u8; 32] {
     }
     let mut salt = [0u8; 32];
     salt.copy_from_slice(&raw[0..32]);
+    if let Some((did_vid, tpm_rnd)) = probe_hw_tpm_random_16() {
+        let dv = did_vid.to_le_bytes();
+        let mut i = 0usize;
+        while i < 16 {
+            salt[i] ^= tpm_rnd[i];
+            salt[16 + i] ^= tpm_rnd[i] ^ dv[i & 3];
+            i += 1;
+        }
+    }
     let mut out = [0u8; 32];
     target_enterprise::tls::hmac_sha256(&salt, &raw[32..64], &mut out);
     out

@@ -240,6 +240,7 @@ fn boots_under_qemu_and_emits_banner() {
         // produces a missing banner.
         "DMA_MAP test OK",
         "DMA_UNMAP test OK",
+        "RING3 transition OK cpl=3->0 vec=0x80 ist1=ok rsp0=ok syscall=43",
         // TASK-018: NVMe driver round-trip banners. The kernel runs
         // an in-process MemNvmeController emulator + drives the
         // NvmeImpl through bring_up → create_io_queues →
@@ -451,6 +452,7 @@ fn boots_under_qemu_and_emits_banner() {
         "TPM startup OK len=12 tag=8001",
         "TPM getrandom OK len=12 cc=0000017b",
         "TPM parse OK rc=00000000 random_len=16",
+        "TPM2_TIS driver OK did_vid=000115d1 locality=0 pcr10=extended",
         // TASK-052: Kernel audit-log subsystem banners. The first
         // banner proves three events of distinct verdicts
         // (Allowed / Denied / Error) round-trip through the locked
@@ -738,6 +740,8 @@ fn boots_under_qemu_and_emits_banner() {
         "SYMBOL resolve OK kernel_main+0x42 (5 frames)",
         "SECCOMP: OK engine=ebpf filter=enforced",
         "ATTEST: OK seed=",
+        "FS partition OK lba=1042..1057 sectors=16 files=1 magic=PRTSFS01",
+        "HTTPS+TCP4 compose OK slots=4 port=443 tls13=ok",
         "SHELL compose OK tasks=5 files=5 audit=5",
         "PROTEUS-TE HALT",
     ];
@@ -939,7 +943,22 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
     let kernel_crate = root.join("target_enterprise_kernel");
     let pkg_crate = factory_builder::locate_pkg_crate().expect("locate_pkg_crate");
     let elf = factory_builder::build_kernel(&kernel_crate).expect("build_kernel");
-    factory_builder::package_kernel_via_pkg(&pkg_crate, &elf, &bios, None)
+    let morphed_elf = images_dir.join("qemu_tamper_morphed.elf");
+    let bm = Command::new("cargo")
+        .current_dir(&root)
+        .args(["run", "--release", "-p", "proteus-binmorph", "--", "--in"])
+        .arg(&elf)
+        .arg("--out")
+        .arg(&morphed_elf)
+        .args(["--seed", "42"])
+        .output()
+        .expect("run proteus-binmorph");
+    assert!(
+        bm.status.success(),
+        "proteus-binmorph failed: {}",
+        String::from_utf8_lossy(&bm.stderr)
+    );
+    factory_builder::package_kernel_via_pkg(&pkg_crate, &morphed_elf, &bios, None)
         .expect("package_kernel_via_pkg");
 
     // Fresh scratch disks for this test only, so it never shares a disk with
@@ -965,13 +984,22 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
     };
     let tamper_log = images_dir.join("qemu_tamper_serial.log");
 
-    // Boot 1: write valid sealed state (LBA 1024 continuity + LBA 1040..=1041 OsShell WAL).
+    // Boot 1 (7-pass binmorphed kernel): verify milestone banners and write valid sealed state.
     let (log1, _) = vm.boot(&tamper_log, halted);
-    assert!(
-        log1.contains("SHELL compose OK tasks=5 files=5 audit=5"),
-        "tamper test boot 1 did not complete SHELL compose:\n{}",
-        log1
-    );
+    for expected in [
+        "RING3 transition OK cpl=3->0 vec=0x80 ist1=ok rsp0=ok syscall=43",
+        "TPM2_TIS driver OK did_vid=000115d1 locality=0 pcr10=extended",
+        "FS partition OK lba=1042..1057 sectors=16 files=1 magic=PRTSFS01",
+        "HTTPS+TCP4 compose OK slots=4 port=443 tls13=ok",
+        "SHELL compose OK tasks=5 files=5 audit=5",
+    ] {
+        assert!(
+            log1.contains(expected),
+            "binmorphed kernel boot 1 missing '{}'!\nSerial log:\n{}",
+            expected,
+            log1
+        );
+    }
 
     // Tamper with the sealed WAL payload at LBA 1041 (offset 1041 * 512 + 8).
     let mut disk_bytes = std::fs::read(&tampered_disk).expect("read ahci_tamper_test.img");

@@ -2629,10 +2629,10 @@ fn src_reg_is_dead_after(
 }
 
 /// Generate exact-same-length 2-instruction byte sequences for `5`-byte
-/// `mov eax..edi, imm32` (`B8+r imm32`) and `7`-byte `mov r64, imm32`
-/// (`48/49 C7 C0+r imm32`) when `dead_flags == true` and `imm32 as i32` is in
-/// `-127..=127` (`!= 0`), combining `{xor | sub}` self-zeroing with
-/// `{lea | add | sub | or | xor}` `imm8`/`disp8`.
+/// `mov eax..edi, imm32` (`B8+r imm32`), `6`-byte `mov r8d..r15d, imm32`
+/// (`41 B8+r imm32`), and `7`-byte `mov r64, imm32` (`48/49 C7 C0+r imm32`)
+/// when `dead_flags == true`, combining `{xor | sub}` self-zeroing with
+/// `{lea | add | sub | or | xor | mov r8}` `imm8`/`disp8`.
 fn multi_instr_imm_load_alts(instr: &Instruction, dead_flags: bool) -> Vec<Vec<u8>> {
     use iced_x86::Register;
 
@@ -2649,38 +2649,83 @@ fn multi_instr_imm_load_alts(instr: &Instruction, dead_flags: bool) -> Vec<Vec<u
         let Some(r64) = reg32_to_base64_low8(r32) else {
             return out;
         };
-        let imm = instr.immediate32() as i32;
-        if !(-127..=127).contains(&imm) || imm == 0 {
-            return out;
-        }
-        let zeros = [
-            Instruction::with2(Code::Xor_rm32_r32, r32, r32).ok(),
-            Instruction::with2(Code::Sub_rm32_r32, r32, r32).ok(),
-        ];
-        let mem = iced_x86::MemoryOperand::with_base_displ(r64, imm as i64);
-        let ops = [
-            Instruction::with2(Code::Lea_r32_m, r32, mem).ok(),
-            Instruction::with2(Code::Add_rm32_imm8, r32, imm).ok(),
-            Instruction::with2(Code::Sub_rm32_imm8, r32, -imm).ok(),
-            Instruction::with2(Code::Or_rm32_imm8, r32, imm).ok(),
-            Instruction::with2(Code::Xor_rm32_imm8, r32, imm).ok(),
-        ];
-        for z in zeros.iter().flatten() {
-            let mut enc1 = Encoder::new(64);
-            let Ok(l1) = enc1.encode(z, instr.ip()) else {
-                continue;
-            };
-            let b1 = enc1.take_buffer();
-            for op in ops.iter().flatten() {
-                let mut enc2 = Encoder::new(64);
-                let Ok(l2) = enc2.encode(op, instr.ip() + l1 as u64) else {
+        let imm_u32 = instr.immediate32();
+        let imm = imm_u32 as i32;
+        if (-127..=127).contains(&imm) && imm != 0 {
+            let zeros = [
+                Instruction::with2(Code::Xor_rm32_r32, r32, r32).ok(),
+                Instruction::with2(Code::Sub_rm32_r32, r32, r32).ok(),
+            ];
+            let mem = iced_x86::MemoryOperand::with_base_displ(r64, imm as i64);
+            let ops = [
+                Instruction::with2(Code::Lea_r32_m, r32, mem).ok(),
+                Instruction::with2(Code::Add_rm32_imm8, r32, imm).ok(),
+                Instruction::with2(Code::Sub_rm32_imm8, r32, -imm).ok(),
+                Instruction::with2(Code::Or_rm32_imm8, r32, imm).ok(),
+                Instruction::with2(Code::Xor_rm32_imm8, r32, imm).ok(),
+            ];
+            for z in zeros.iter().flatten() {
+                let mut enc1 = Encoder::new(64);
+                let Ok(l1) = enc1.encode(z, instr.ip()) else {
                     continue;
                 };
-                if l1 + l2 == 5 {
-                    let mut combined = Vec::with_capacity(5);
-                    combined.extend_from_slice(&b1);
-                    combined.extend_from_slice(&enc2.take_buffer());
-                    out.push(combined);
+                let b1 = enc1.take_buffer();
+                for op in ops.iter().flatten() {
+                    let mut enc2 = Encoder::new(64);
+                    let Ok(l2) = enc2.encode(op, instr.ip() + l1 as u64) else {
+                        continue;
+                    };
+                    if l1 + l2 == 5 {
+                        let mut combined = Vec::with_capacity(5);
+                        combined.extend_from_slice(&b1);
+                        combined.extend_from_slice(&enc2.take_buffer());
+                        out.push(combined);
+                    }
+                }
+            }
+        }
+        if (1..=255).contains(&imm_u32) {
+            let b = imm_u32 as u8;
+            let neg_b = b.wrapping_neg();
+            match r32 {
+                Register::EAX => {
+                    for z_op in [0x31u8, 0x29u8] {
+                        for alu_op in [0x04u8, 0x0Cu8, 0x34u8] {
+                            out.push(vec![0x48, z_op, 0xC0, alu_op, b]);
+                        }
+                        out.push(vec![0x48, z_op, 0xC0, 0x2C, neg_b]);
+                    }
+                }
+                Register::ECX | Register::EDX | Register::EBX => {
+                    let reg_idx = match r32 {
+                        Register::ECX => 1u8,
+                        Register::EDX => 2u8,
+                        _ => 3u8,
+                    };
+                    let modrm_self = 0xC0 | (reg_idx << 3) | reg_idx;
+                    for z_op in [0x31u8, 0x29u8] {
+                        out.push(vec![z_op, modrm_self, 0x80, 0xC0 | reg_idx, b]);
+                        out.push(vec![z_op, modrm_self, 0x80, 0xC8 | reg_idx, b]);
+                        out.push(vec![z_op, modrm_self, 0x80, 0xF0 | reg_idx, b]);
+                        out.push(vec![z_op, modrm_self, 0x80, 0xE8 | reg_idx, neg_b]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else if instr.code() == Code::Mov_r32_imm32 && instr.len() == 6 {
+        let r32 = instr.op0_register();
+        if let Some(fam) = upper_reg_family(r32) {
+            if r32 == fam.r32 {
+                let imm = instr.immediate32() as i32;
+                let reg_low = (gp_reg_index(r32).unwrap_or(8) & 7) as u8;
+                let modrm_self = 0xC0 | (reg_low << 3) | reg_low;
+                if imm == 1 && reg_low != 2 && reg_low != 3 {
+                    out.push(vec![0x45, 0x31, modrm_self, 0x41, 0xFF, 0xC0 | reg_low]);
+                    out.push(vec![0x45, 0x29, modrm_self, 0x41, 0xFF, 0xC0 | reg_low]);
+                } else if imm == -1 && reg_low != 2 && reg_low != 3 && reg_low != 7 {
+                    out.push(vec![0x45, 0x31, modrm_self, 0x41, 0xFF, 0xC8 | reg_low]);
+                    out.push(vec![0x45, 0x29, modrm_self, 0x41, 0xFF, 0xC8 | reg_low]);
                 }
             }
         }
@@ -2731,6 +2776,508 @@ fn multi_instr_imm_load_alts(instr: &Instruction, dead_flags: bool) -> Vec<Vec<u
         }
     }
     out
+}
+
+/// Try to encode `instr` into a semantically identical sequence that is
+/// exactly `1` byte **shorter** (`instr.len() - 1` bytes) while also flipping
+/// the instruction's mnemonic/opcode class.
+fn try_shrink_by_1(
+    instr: &Instruction,
+    orig_bytes: &[u8],
+    dead_flags: bool,
+    cf_af_dead: bool,
+) -> Option<Vec<u8>> {
+    use iced_x86::Register;
+
+    let target_len = instr.len().checked_sub(1)?;
+    if target_len == 0 {
+        return None;
+    }
+
+    // 1. 64-bit self-zeroing `xor/sub rax..rdi, rax..rdi` (3B) -> opposite-mnemonic `sub/xor eax..edi, eax..edi` (2B).
+    if instr.len() == 3
+        && instr.op_count() == 2
+        && instr.op0_kind() == OpKind::Register
+        && instr.op1_kind() == OpKind::Register
+        && instr.op0_register() == instr.op1_register()
+        && matches!(
+            instr.code(),
+            Code::Xor_rm64_r64 | Code::Xor_r64_rm64 | Code::Sub_rm64_r64 | Code::Sub_r64_rm64
+        )
+    {
+        if let Some(r32) = base64_to_reg32(instr.op0_register()) {
+            let gp = gp_reg_index(r32)?;
+            if gp < 8 && r32 != Register::ESP {
+                let code32 = if instr.mnemonic() == Mnemonic::Xor {
+                    Code::Sub_rm32_r32
+                } else {
+                    Code::Xor_rm32_r32
+                };
+                let alt = Instruction::with2(code32, r32, r32).ok()?;
+                let mut enc = Encoder::new(64);
+                if enc.encode(&alt, instr.ip()).ok() == Some(2) {
+                    let b = enc.take_buffer();
+                    if !has_ret_opcode_byte(&b) {
+                        return Some(b);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. `cmp reg, 0` (3B/4B) -> `test reg, reg` (2B/3B) — 100% flag- and register-identical.
+    if instr.mnemonic() == Mnemonic::Cmp
+        && instr.op_count() == 2
+        && instr.op0_kind() == OpKind::Register
+        && matches!(
+            instr.code(),
+            Code::Cmp_rm8_imm8 | Code::Cmp_rm16_imm8 | Code::Cmp_rm32_imm8 | Code::Cmp_rm64_imm8
+        )
+        && instr.immediate64() == 0
+    {
+        let r = instr.op0_register();
+        let test_code = match instr.code() {
+            Code::Cmp_rm8_imm8 => Code::Test_rm8_r8,
+            Code::Cmp_rm16_imm8 => Code::Test_rm16_r16,
+            Code::Cmp_rm32_imm8 => Code::Test_rm32_r32,
+            Code::Cmp_rm64_imm8 => Code::Test_rm64_r64,
+            _ => return None,
+        };
+        let alt = Instruction::with2(test_code, r, r).ok()?;
+        let mut enc = Encoder::new(64);
+        if enc.encode(&alt, instr.ip()).ok() == Some(target_len) {
+            let b = enc.take_buffer();
+            if !has_ret_opcode_byte(&b) {
+                return Some(b);
+            }
+        }
+    }
+
+    // 3. `movzx rax..rdi, r/m8` or `r/m16` (`48 0F B6/B7 ...`) -> `movzx eax..edi, r/m8` or `r/m16` (`0F B6/B7 ...`).
+    if matches!(instr.code(), Code::Movzx_r64_rm8 | Code::Movzx_r64_rm16)
+        && orig_bytes.len() >= 4
+        && orig_bytes[0] == 0x48
+        && orig_bytes[1] == 0x0F
+    {
+        let stripped = orig_bytes[1..].to_vec();
+        let mut dec = Decoder::with_ip(64, &stripped, instr.ip(), DecoderOptions::NONE);
+        let d_ins = dec.decode();
+        if d_ins.len() == target_len
+            && matches!(d_ins.code(), Code::Movzx_r32_rm8 | Code::Movzx_r32_rm16)
+            && d_ins.op1_kind() == instr.op1_kind()
+            && (d_ins.op1_kind() != OpKind::Register
+                || d_ins.op1_register() == instr.op1_register())
+            && !has_ret_opcode_byte(&stripped)
+        {
+            return Some(stripped);
+        }
+    }
+
+    // 4. `add/sub reg, ±1` -> `inc/dec reg` when `cf_af_dead`.
+    if cf_af_dead
+        && instr.op_count() == 2
+        && instr.op0_kind() == OpKind::Register
+        && matches!(
+            instr.code(),
+            Code::Add_rm32_imm8
+                | Code::Sub_rm32_imm8
+                | Code::Add_rm64_imm8
+                | Code::Sub_rm64_imm8
+        )
+    {
+        let r = instr.op0_register();
+        if r != Register::RSP && r != Register::ESP {
+            let imm = instr.immediate8to64();
+            let is_add = instr.mnemonic() == Mnemonic::Add;
+            let inc_or_dec = match (is_add, imm) {
+                (true, 1) | (false, -1) => Some(true),
+                (false, 1) | (true, -1) => Some(false),
+                _ => None,
+            };
+            if let Some(use_inc) = inc_or_dec {
+                let code = match (
+                    matches!(instr.code(), Code::Add_rm64_imm8 | Code::Sub_rm64_imm8),
+                    use_inc,
+                ) {
+                    (true, true) => Code::Inc_rm64,
+                    (true, false) => Code::Dec_rm64,
+                    (false, true) => Code::Inc_rm32,
+                    (false, false) => Code::Dec_rm32,
+                };
+                if let Ok(alt) = Instruction::with1(code, r) {
+                    let mut enc = Encoder::new(64);
+                    if enc.encode(&alt, instr.ip()).ok() == Some(target_len) {
+                        let b = enc.take_buffer();
+                        if !has_ret_opcode_byte(&b) {
+                            return Some(b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. `lea reg, [reg ± 1]` -> `inc/dec reg` when `dead_flags`.
+    if dead_flags
+        && instr.mnemonic() == Mnemonic::Lea
+        && instr.op_count() == 2
+        && instr.op0_kind() == OpKind::Register
+        && instr.op1_kind() == OpKind::Memory
+        && !instr.is_ip_rel_memory_operand()
+        && instr.memory_index() == Register::None
+        && instr.segment_prefix() == Register::None
+    {
+        let r0 = instr.op0_register();
+        let base = instr.memory_base();
+        let disp = instr.memory_displacement64() as i64;
+        if (disp == 1 || disp == -1) && r0 != Register::RSP && r0 != Register::ESP {
+            let code_opt = if instr.code() == Code::Lea_r64_m && r0 == base {
+                Some(if disp == 1 {
+                    Code::Inc_rm64
+                } else {
+                    Code::Dec_rm64
+                })
+            } else if instr.code() == Code::Lea_r32_m && base64_to_reg32(base) == Some(r0) {
+                Some(if disp == 1 {
+                    Code::Inc_rm32
+                } else {
+                    Code::Dec_rm32
+                })
+            } else {
+                None
+            };
+            if let Some(code) = code_opt {
+                if let Ok(alt) = Instruction::with1(code, r0) {
+                    let mut enc = Encoder::new(64);
+                    if enc.encode(&alt, instr.ip()).ok() == Some(target_len) {
+                        let b = enc.take_buffer();
+                        if !has_ret_opcode_byte(&b) {
+                            return Some(b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. `mov eax, 1..=255` (5B) -> `sub eax, eax; or al, imm8` (4B) when `dead_flags`.
+    if dead_flags && instr.code() == Code::Mov_r32_imm32 && instr.len() == 5 {
+        let r32 = instr.op0_register();
+        let imm_u32 = instr.immediate32();
+        if r32 == Register::EAX && (1..=255).contains(&imm_u32) {
+            let seq = vec![0x29, 0xC0, 0x0C, imm_u32 as u8];
+            if !has_ret_opcode_byte(&seq) {
+                return Some(seq);
+            }
+        }
+    }
+
+    None
+}
+
+/// Try to encode `instr` into a semantically identical sequence that is
+/// exactly `1` byte **wider** (`instr.len() + 1` bytes) while also flipping
+/// the instruction's mnemonic/opcode class.
+fn try_widen_by_1(
+    instr: &Instruction,
+    orig_bytes: &[u8],
+    dead_flags: bool,
+    cf_af_dead: bool,
+) -> Option<Vec<u8>> {
+    use iced_x86::Register;
+
+    let target_len = instr.len() + 1;
+
+    // 1. 32-bit self-zeroing `xor/sub eax..edi, eax..edi` (2B) -> opposite-mnemonic `sub/xor rax..rdi, rax..rdi` (3B).
+    if instr.len() == 2
+        && instr.op_count() == 2
+        && instr.op0_kind() == OpKind::Register
+        && instr.op1_kind() == OpKind::Register
+        && instr.op0_register() == instr.op1_register()
+        && matches!(
+            instr.code(),
+            Code::Xor_rm32_r32 | Code::Xor_r32_rm32 | Code::Sub_rm32_r32 | Code::Sub_r32_rm32
+        )
+    {
+        if let Some(r64) = reg32_to_base64_low8(instr.op0_register()) {
+            let code64 = if instr.mnemonic() == Mnemonic::Xor {
+                Code::Sub_rm64_r64
+            } else {
+                Code::Xor_rm64_r64
+            };
+            let alt = Instruction::with2(code64, r64, r64).ok()?;
+            let mut enc = Encoder::new(64);
+            if enc.encode(&alt, instr.ip()).ok() == Some(3) {
+                let b = enc.take_buffer();
+                if !has_ret_opcode_byte(&b) {
+                    return Some(b);
+                }
+            }
+        }
+    }
+
+    // 2. `mov dst, src` -> SIB-form `lea dst, [src]` (+1 byte, flag-preserving, flips `mov -> lea`).
+    if instr.mnemonic() == Mnemonic::Mov
+        && instr.op_count() == 2
+        && instr.op0_kind() == OpKind::Register
+        && instr.op1_kind() == OpKind::Register
+    {
+        let dst = instr.op0_register();
+        let src = instr.op1_register();
+        if let Some(src64) = lea_compatible_base64(src) {
+            let dst_gp = gp_reg_index(dst)?;
+            let src_gp = gp_reg_index(src64)?;
+            let modrm = ((dst_gp as u8 & 7) << 3) | 0x04;
+            let sib = 0x20 | (src_gp as u8 & 7);
+            let is_64 = matches!(instr.code(), Code::Mov_rm64_r64 | Code::Mov_r64_rm64);
+            let is_32 = matches!(instr.code(), Code::Mov_rm32_r32 | Code::Mov_r32_rm32);
+            if is_64 && instr.len() == 3 {
+                let rex = 0x48
+                    | (if dst_gp >= 8 { 0x04 } else { 0 })
+                    | (if src_gp >= 8 { 0x01 } else { 0 });
+                let seq = vec![rex, 0x8D, modrm, sib];
+                if !has_ret_opcode_byte(&seq) {
+                    return Some(seq);
+                }
+            } else if is_32 && instr.len() == 2 && dst_gp < 8 && src_gp < 8 {
+                let seq = vec![0x8D, modrm, sib];
+                if !has_ret_opcode_byte(&seq) {
+                    return Some(seq);
+                }
+            } else if is_32 && instr.len() == 3 && (dst_gp >= 8 || src_gp >= 8) {
+                let rex = 0x40
+                    | (if dst_gp >= 8 { 0x04 } else { 0 })
+                    | (if src_gp >= 8 { 0x01 } else { 0 });
+                let seq = vec![rex, 0x8D, modrm, sib];
+                if !has_ret_opcode_byte(&seq) {
+                    return Some(seq);
+                }
+            }
+        }
+    }
+
+    // 3. `test reg, reg` (2B/3B) -> `cmp reg, 0` (3B/4B) — 100% flag- and register-identical.
+    if instr.mnemonic() == Mnemonic::Test
+        && instr.op_count() == 2
+        && instr.op0_kind() == OpKind::Register
+        && instr.op1_kind() == OpKind::Register
+        && instr.op0_register() == instr.op1_register()
+    {
+        let r = instr.op0_register();
+        if r != Register::AL && r != Register::AX && r != Register::EAX && r != Register::RAX {
+            let cmp_code = match instr.code() {
+                Code::Test_rm8_r8 => Some(Code::Cmp_rm8_imm8),
+                Code::Test_rm16_r16 => Some(Code::Cmp_rm16_imm8),
+                Code::Test_rm32_r32 => Some(Code::Cmp_rm32_imm8),
+                Code::Test_rm64_r64 => Some(Code::Cmp_rm64_imm8),
+                _ => None,
+            };
+            if let Some(cc) = cmp_code {
+                if let Ok(alt) = Instruction::with2(cc, r, 0i32) {
+                    let mut enc = Encoder::new(64);
+                    if enc.encode(&alt, instr.ip()).ok() == Some(target_len) {
+                        let b = enc.take_buffer();
+                        if !has_ret_opcode_byte(&b) {
+                            return Some(b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. `movzx eax..edi, r/m8` or `r/m16` (`0F B6/B7 ...`) -> `movzx rax..rdi, r/m8` or `r/m16` (`48 0F B6/B7 ...`).
+    if matches!(instr.code(), Code::Movzx_r32_rm8 | Code::Movzx_r32_rm16)
+        && orig_bytes.len() >= 3
+        && orig_bytes[0] == 0x0F
+    {
+        let mut widened = Vec::with_capacity(target_len);
+        widened.push(0x48);
+        widened.extend_from_slice(orig_bytes);
+        let mut dec = Decoder::with_ip(64, &widened, instr.ip(), DecoderOptions::NONE);
+        let d_ins = dec.decode();
+        if d_ins.len() == target_len
+            && matches!(d_ins.code(), Code::Movzx_r64_rm8 | Code::Movzx_r64_rm16)
+            && d_ins.op1_kind() == instr.op1_kind()
+            && (d_ins.op1_kind() != OpKind::Register
+                || d_ins.op1_register() == instr.op1_register())
+            && !has_ret_opcode_byte(&widened)
+        {
+            return Some(widened);
+        }
+    }
+
+    // 5. `inc/dec reg` -> `add/sub reg, 1` when `cf_af_dead` or `lea reg, [reg ± 1]` when `dead_flags`.
+    if (cf_af_dead || dead_flags)
+        && instr.op_count() == 1
+        && instr.op0_kind() == OpKind::Register
+        && matches!(
+            instr.code(),
+            Code::Inc_rm32 | Code::Dec_rm32 | Code::Inc_rm64 | Code::Dec_rm64
+        )
+    {
+        let r = instr.op0_register();
+        let is_inc = instr.mnemonic() == Mnemonic::Inc;
+        let add_sub_code = match (instr.code(), is_inc) {
+            (Code::Inc_rm64, _) => Code::Add_rm64_imm8,
+            (Code::Dec_rm64, _) => Code::Sub_rm64_imm8,
+            (Code::Inc_rm32, _) => Code::Add_rm32_imm8,
+            (Code::Dec_rm32, _) => Code::Sub_rm32_imm8,
+            _ => return None,
+        };
+        if let Ok(alt) = Instruction::with2(add_sub_code, r, 1i32) {
+            let mut enc = Encoder::new(64);
+            if enc.encode(&alt, instr.ip()).ok() == Some(target_len) {
+                let b = enc.take_buffer();
+                if !has_ret_opcode_byte(&b) {
+                    return Some(b);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Cross-width multi-instruction basic-block rewriting pass.
+///
+/// Scans straight-line basic-block windows `i..=j` (`1 <= j - i <= 4`) where
+/// one endpoint shrinks by 1 byte (`L -> L - 1`) and the other endpoint widens
+/// by 1 byte (`L -> L + 1`). This preserves the exact byte length of the
+/// `[i..=j]` window while shifting every internal instruction boundary inside
+/// `[i + 1..=j]` by `±1` byte, displacing interior ROP/JOP gadgets off-boundary.
+fn pass_cross_width_pair_morph(
+    code: &mut [u8],
+    base_ip: u64,
+    prng: &mut Prng,
+    stats: &mut Stats,
+) {
+    use iced_x86::FlowControl;
+
+    let original = code.to_vec();
+    let end_ip = base_ip.saturating_add(original.len() as u64);
+    let mut decoder = Decoder::with_ip(64, &original, base_ip, DecoderOptions::NONE);
+    let mut instrs: Vec<Instruction> = Vec::new();
+    let mut positions: Vec<usize> = Vec::new();
+    let mut branch_targets: Vec<u64> = Vec::new();
+
+    while decoder.can_decode() {
+        let pos = decoder.position();
+        let instr = decoder.decode();
+        if instr.code() == Code::INVALID {
+            return;
+        }
+        match instr.flow_control() {
+            FlowControl::Next
+            | FlowControl::Return
+            | FlowControl::Call
+            | FlowControl::IndirectCall => {}
+            FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
+                match instr.op0_kind() {
+                    OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
+                        let t = instr.near_branch_target();
+                        if t >= base_ip && t < end_ip {
+                            branch_targets.push(t);
+                        } else if instr.flow_control() != FlowControl::UnconditionalBranch {
+                            return;
+                        }
+                    }
+                    _ => return,
+                }
+            }
+            FlowControl::Exception if instr.mnemonic() == Mnemonic::Ud2 => {}
+            _ => return,
+        }
+        positions.push(pos);
+        instrs.push(instr);
+    }
+
+    let mut i = 0usize;
+    while i + 1 < instrs.len() {
+        if instrs[i].flow_control() != FlowControl::Next || instrs[i].is_ip_rel_memory_operand() {
+            i += 1;
+            continue;
+        }
+        let max_j = (i + 4).min(instrs.len() - 1);
+        let mut matched_end: Option<(usize, Vec<u8>)> = None;
+
+        for j in (i + 1)..=max_j {
+            if branch_targets.contains(&instrs[j].ip())
+                || instrs[j].flow_control() != FlowControl::Next
+                || instrs[j].is_ip_rel_memory_operand()
+            {
+                break;
+            }
+            let pos_i = positions[i];
+            let len_i = instrs[i].len();
+            let pos_j = positions[j];
+            let len_j = instrs[j].len();
+            let orig_i = &original[pos_i..pos_i + len_i];
+            let orig_j = &original[pos_j..pos_j + len_j];
+            let mid_slice = &original[pos_i + len_i..pos_j];
+            if has_ret_opcode_byte(mid_slice) {
+                continue;
+            }
+
+            // Flag liveness is allowed at `i` only when all intermediate instructions `i+1..=j`
+            // are flag-neutral and flags are dead after `j`.
+            let mid_and_j_neutral = (i + 1..=j).all(|k| is_flag_neutral_instr(&instrs[k]));
+            let dead_j = flags_are_dead(&instrs, &branch_targets, j);
+            let cf_af_j = dead_j || cf_af_are_dead(&instrs, &branch_targets, j);
+            let dead_i = mid_and_j_neutral && dead_j;
+            let cf_af_i = mid_and_j_neutral && cf_af_j;
+
+            let cand_shrink_widen = try_shrink_by_1(&instrs[i], orig_i, dead_i, cf_af_i)
+                .and_then(|bi| {
+                    try_widen_by_1(&instrs[j], orig_j, dead_j, cf_af_j).map(|bj| (bi, bj))
+                });
+            let cand_widen_shrink = try_widen_by_1(&instrs[i], orig_i, dead_i, cf_af_i)
+                .and_then(|bi| {
+                    try_shrink_by_1(&instrs[j], orig_j, dead_j, cf_af_j).map(|bj| (bi, bj))
+                });
+
+            let pair = match (cand_shrink_widen, cand_widen_shrink) {
+                (Some(a), Some(b)) => {
+                    if prng.coin() {
+                        Some(a)
+                    } else {
+                        Some(b)
+                    }
+                }
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+
+            if let Some((bi, bj)) = pair {
+                let total_len = (pos_j + len_j) - pos_i;
+                if bi.len() + mid_slice.len() + bj.len() == total_len {
+                    let mut combined = Vec::with_capacity(total_len);
+                    combined.extend_from_slice(&bi);
+                    combined.extend_from_slice(mid_slice);
+                    combined.extend_from_slice(&bj);
+                    if !has_ret_opcode_byte(&combined) {
+                        matched_end = Some((j, combined));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some((j, new_window)) = matched_end {
+            let pos_i = positions[i];
+            let total_len = new_window.len();
+            let orig_window = &original[pos_i..pos_i + total_len];
+            if has_ret_opcode_byte(orig_window) || prng.coin() {
+                code[pos_i..pos_i + total_len].copy_from_slice(&new_window);
+                stats.candidates += 1;
+                stats.swapped += 1;
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
 }
 
 /// `true` if `instrs[idx]` is a 32-bit self-test (`test/or/and r32, r32`) and
@@ -2978,7 +3525,7 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
 /// Rewrite one function's code in place. Every edit is size-preserving, so
 /// the buffer length and all external addresses are preserved.
 ///
-/// Runs 6 passes:
+/// Runs 7 passes:
 /// 1. [`pass_callee_saved_reg_swap`] — whole-function callee-saved register
 ///    family permutation across `{R12, R13, R14, R15}` (`64/32/16/8`-bit).
 /// 2. [`pass_leaf_scratch_reg_swap`] — whole-function caller-saved scratch
@@ -2991,6 +3538,8 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
 /// 6. [`pass_reg_reg_morph`] — liveness-guided instruction morphing (`MOV<->LEA`,
 ///    dead-flags `ADD<->SUB<->LEA`, 8/16/32/64-bit `TEST<->OR<->AND`, upper-reg
 ///    32/64-bit zeroing, SIB `scale=1` swap, and return-byte gadget scrubbing).
+/// 7. [`pass_cross_width_pair_morph`] — cross-width basic-block multi-instruction
+///    rewriting (`(L_i ∓ 1) + mid + (L_j ± 1)`), shifting interior instruction boundaries.
 pub fn rewrite_function(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mut Stats) {
     stats.functions += 1;
     pass_callee_saved_reg_swap(code, base_ip, prng, stats);
@@ -2999,6 +3548,7 @@ pub fn rewrite_function(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &
     pass_prologue_epilogue_perm(code, base_ip, prng, stats);
     pass_schedule_commute(code, base_ip, prng, stats);
     pass_reg_reg_morph(code, base_ip, prng, stats);
+    pass_cross_width_pair_morph(code, base_ip, prng, stats);
 }
 
 #[cfg(test)]
@@ -3594,7 +4144,12 @@ mod tests {
             assert!(matches!(i1.mnemonic(), Mnemonic::Xor | Mnemonic::Sub));
             assert!(matches!(
                 i2.mnemonic(),
-                Mnemonic::Lea | Mnemonic::Add | Mnemonic::Sub | Mnemonic::Or | Mnemonic::Xor
+                Mnemonic::Lea
+                    | Mnemonic::Add
+                    | Mnemonic::Sub
+                    | Mnemonic::Or
+                    | Mnemonic::Xor
+                    | Mnemonic::Mov
             ));
         }
 
@@ -3635,4 +4190,39 @@ mod tests {
             "sub rcx, 1 followed by jne (where both paths kill CF/AF) must morph to add rcx, -1"
         );
     }
+
+    #[test]
+    fn cross_width_pair_morph_shifts_interior_instruction_boundaries() {
+        // Window:
+        //   0x1000: xor eax, eax      (31 C0, 2 bytes)      -> widens to `xor rax, rax` (48 31 C0, 3 bytes)
+        //   0x1002: mov rdi, [rsi+8]  (48 8B 7E 08, 4 bytes) -> shifted from 0x1002 to 0x1003!
+        //   0x1006: add rcx, 1        (48 83 C1 01, 4 bytes) -> shrinks to `inc rcx` (48 FF C1, 3 bytes)
+        //   0x100A: ret               (C3, 1 byte — kills flags)
+        let orig = vec![
+            0x31, 0xC0, // xor eax, eax (2B)
+            0x48, 0x8B, 0x7E, 0x08, // mov rdi, [rsi+8] (4B)
+            0x48, 0x83, 0xC1, 0x01, // add rcx, 1 (4B)
+            0xC3, // ret (1B)
+        ];
+        let mut saw_shifted = false;
+        for seed in 0..32u64 {
+            let mut code = orig.clone();
+            let mut prng = Prng::new(seed);
+            let mut stats = Stats::default();
+            pass_cross_width_pair_morph(&mut code, 0x1000, &mut prng, &mut stats);
+            assert_eq!(code.len(), orig.len());
+            if &code[0..3] == &[0x48, 0x29, 0xC0] {
+                assert_eq!(&code[3..7], &[0x48, 0x8B, 0x7E, 0x08]);
+                assert_eq!(&code[7..10], &[0x48, 0xFF, 0xC1]);
+                assert_eq!(code[10], 0xC3);
+                saw_shifted = true;
+                break;
+            }
+        }
+        assert!(
+            saw_shifted,
+            "pass_cross_width_pair_morph must shift interior instruction boundaries by ±1 byte"
+        );
+    }
 }
+

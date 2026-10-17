@@ -12,8 +12,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use proteus_contracts::{
-    icmp_type, AuditVerdict, Http, HttpMethod, Icmp, Ipv4PacketView, PacketFilter, Tcp, Verdict,
-    IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP,
+    icmp_type, tcp_flags, Aead, AuditVerdict, HandshakeKeys, Http, HttpMethod, Icmp,
+    Ipv4PacketView, PacketFilter, Tcp, Verdict, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP,
 };
 
 use crate::firewall::FirewallImpl;
@@ -21,7 +21,11 @@ use crate::http::HttpImpl;
 use crate::icmp::IcmpImpl;
 use crate::net::ipv4_header_checksum;
 use crate::tcp::{close, process_segment, send_payload, Tcb, TcpImpl, TcpState};
-use crate::tls::hmac_sha256;
+use crate::tls::{
+    build_server_hello, decode_record_header, derive_handshake_keys, encode_record_header,
+    hkdf_expand_label, hmac_sha256, parse_client_hello, CONTENT_TYPE_HANDSHAKE, LEGACY_VERSION,
+    MAX_SERVER_HELLO_LEN, RECORD_HEADER_LEN,
+};
 
 /// Guest IPv4 the service claims (QEMU slirp default guest).
 pub const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
@@ -29,6 +33,16 @@ pub const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
 pub const UDP_STATUS_PORT: u16 = 8080;
 /// HTTP status port.
 pub const HTTP_PORT: u16 = 80;
+/// HTTPS / TLS 1.3 port.
+pub const HTTPS_PORT: u16 = 443;
+/// Maximum number of concurrent TCP connections tracked in [`LivedNet`].
+pub const TCP_MAX_SLOTS: usize = 4;
+/// TLS 1.3 content-type byte for encrypted `ApplicationData` records (RFC 8446 §5.1).
+pub const TLS_CONTENT_APPLICATION_DATA: u8 = 23;
+/// Deterministic 32-byte server random used by the in-kernel TLS 1.3 listener on port 443.
+pub const TLS_SERVER_RANDOM: [u8; 32] = [0x53u8; 32];
+/// Deterministic 32-byte server X25519 keyshare public key advertised in `ServerHello`.
+pub const TLS_SERVER_PUBKEY: [u8; 32] = [0xA5u8; 32];
 /// Ethernet II header length.
 pub const ETH_HEADER_LEN: usize = 14;
 /// IPv4 header length (no options).
@@ -37,8 +51,8 @@ pub const IPV4_HEADER_LEN: usize = 20;
 pub const MAX_FRAME: usize = 1514;
 /// Max replies produced from one inbound frame.
 pub const MAX_REPLIES: usize = 3;
-/// Scratch for an in-progress HTTP request (one TCB).
-const HTTP_BUF: usize = 1024;
+/// Per-slot scratch buffer for an in-progress HTTP or TLS 1.3 request.
+const SLOT_BUF: usize = 256;
 /// Deterministic 256-bit HMAC-SHA256 fixture key used only by in-memory unit
 /// tests (`LivedNet::new`). Limited to `#[cfg(test)]` so production and kernel
 /// code can never fall back to a public constant.
@@ -93,7 +107,9 @@ impl ReplySet {
     }
 }
 
-/// One-connection guest network service.
+/// Multi-connection guest network service supporting ARP, ICMP echo,
+/// authenticated UDP control plane (`8080`), HTTP/1.1 (`80`), and
+/// TLS 1.3 (`443`) across a 4-slot concurrent TCP table.
 pub struct LivedNet {
     /// Guest MAC (copied into Ethernet source).
     pub mac: [u8; 6],
@@ -106,11 +122,14 @@ pub struct LivedNet {
     pub auth_enabled: bool,
     /// Highest accepted monotonic sequence number for anti-replay protection.
     pub last_auth_seq: u64,
-    tcb: Tcb,
+    tcbs: [Tcb; TCP_MAX_SLOTS],
+    slot_last_tick: [u32; TCP_MAX_SLOTS],
     ticks: u32,
     ip_ident: u16,
-    http_buf: [u8; HTTP_BUF],
-    http_len: usize,
+    http_bufs: [[u8; SLOT_BUF]; TCP_MAX_SLOTS],
+    http_lens: [usize; TCP_MAX_SLOTS],
+    tls_keys: [[u8; 16]; TCP_MAX_SLOTS],
+    tls_ready: [bool; TCP_MAX_SLOTS],
 }
 
 impl LivedNet {
@@ -128,11 +147,14 @@ impl LivedNet {
             auth_key,
             auth_enabled: true,
             last_auth_seq: 0,
-            tcb: Tcb::listen(GUEST_IP, HTTP_PORT, 65535),
+            tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
+            slot_last_tick: [0u32; TCP_MAX_SLOTS],
             ticks: 1,
             ip_ident: 1,
-            http_buf: [0u8; HTTP_BUF],
-            http_len: 0,
+            http_bufs: [[0u8; SLOT_BUF]; TCP_MAX_SLOTS],
+            http_lens: [0usize; TCP_MAX_SLOTS],
+            tls_keys: [[0u8; 16]; TCP_MAX_SLOTS],
+            tls_ready: [false; TCP_MAX_SLOTS],
         }
     }
 
@@ -145,12 +167,49 @@ impl LivedNet {
             auth_key: [0u8; 32],
             auth_enabled: false,
             last_auth_seq: 0,
-            tcb: Tcb::listen(GUEST_IP, HTTP_PORT, 65535),
+            tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
+            slot_last_tick: [0u32; TCP_MAX_SLOTS],
             ticks: 1,
             ip_ident: 1,
-            http_buf: [0u8; HTTP_BUF],
-            http_len: 0,
+            http_bufs: [[0u8; SLOT_BUF]; TCP_MAX_SLOTS],
+            http_lens: [0usize; TCP_MAX_SLOTS],
+            tls_keys: [[0u8; 16]; TCP_MAX_SLOTS],
+            tls_ready: [false; TCP_MAX_SLOTS],
         }
+    }
+
+    /// Return the number of currently active (non-`Closed`, non-`Listen`) TCP connection slots.
+    pub fn active_tcp_slots(&self) -> usize {
+        let mut count = 0usize;
+        let mut i = 0usize;
+        while i < TCP_MAX_SLOTS {
+            let st = self.tcbs[i].state;
+            if st != TcpState::Closed && st != TcpState::Listen {
+                count += 1;
+            }
+            i += 1;
+        }
+        count
+    }
+
+    /// Derive the 32-byte ECDHE shared secret and 16-byte record AEAD key for a
+    /// TLS 1.3 handshake (`ClientHello` + `ServerHello`) against [`LivedNet`] on port 443.
+    pub fn derive_tls13_record_key(
+        client_pubkey: &[u8; 32],
+        client_hello: &[u8],
+        server_hello: &[u8],
+        key_out: &mut [u8; 16],
+    ) -> HandshakeKeys {
+        let mut shared_secret = [0u8; 32];
+        hmac_sha256(&TLS_SERVER_PUBKEY, client_pubkey, &mut shared_secret);
+        let mut hs = HandshakeKeys {
+            handshake_secret: [0u8; 32],
+            client_handshake_traffic_secret: [0u8; 32],
+            server_handshake_traffic_secret: [0u8; 32],
+        };
+        derive_handshake_keys(&shared_secret, client_hello, server_hello, &mut hs);
+        hkdf_expand_label(&hs.server_handshake_traffic_secret, b"key", b"", key_out);
+        hs
     }
 
     /// Derive a unique per-device 256-bit `HMAC-SHA256` control-plane key from a fleet/factory
@@ -492,6 +551,53 @@ impl LivedNet {
         sh.exec_line(cmd, boots, 0, 0, body).bytes_written()
     }
 
+    fn select_tcp_slot(
+        &mut self,
+        src_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        flags: u8,
+    ) -> Option<usize> {
+        let mut i = 0usize;
+        while i < TCP_MAX_SLOTS {
+            let st = self.tcbs[i].state;
+            if st != TcpState::Closed
+                && st != TcpState::Listen
+                && self.tcbs[i].remote_ip == src_ip
+                && self.tcbs[i].remote_port == src_port
+                && self.tcbs[i].local_port == dst_port
+            {
+                return Some(i);
+            }
+            i += 1;
+        }
+        if (flags & tcp_flags::SYN) == 0 || (flags & tcp_flags::ACK) != 0 {
+            return None;
+        }
+        let mut free_slot: Option<usize> = None;
+        let mut lru_slot = 0usize;
+        let mut lru_tick = u32::MAX;
+        let mut j = 0usize;
+        while j < TCP_MAX_SLOTS {
+            let st = self.tcbs[j].state;
+            if st == TcpState::Closed || st == TcpState::Listen {
+                free_slot = Some(j);
+                break;
+            }
+            if self.slot_last_tick[j] < lru_tick {
+                lru_tick = self.slot_last_tick[j];
+                lru_slot = j;
+            }
+            j += 1;
+        }
+        let idx = free_slot.unwrap_or(lru_slot);
+        self.tcbs[idx] = Tcb::listen(self.ip, dst_port, 65535);
+        self.http_lens[idx] = 0;
+        self.tls_ready[idx] = false;
+        self.tls_keys[idx] = [0u8; 16];
+        Some(idx)
+    }
+
     #[inline(never)]
     fn handle_tcp(
         &mut self,
@@ -503,62 +609,75 @@ impl LivedNet {
         shell: Option<&mut crate::shell::OsShell>,
         out: &mut ReplySet,
     ) {
-        if self.tcb.state == TcpState::Closed {
-            self.tcb = Tcb::listen(self.ip, HTTP_PORT, 65535);
-            self.http_len = 0;
-        }
         let seg = match TcpImpl::parse_segment(tcp, src_ip, self.ip) {
             Ok(s) => s,
             Err(_) => return,
         };
-        if seg.dst_port != HTTP_PORT {
+        if seg.dst_port != HTTP_PORT && seg.dst_port != HTTPS_PORT {
             return;
         }
+        let idx = match self.select_tcp_slot(src_ip, seg.src_port, seg.dst_port, seg.flags) {
+            Some(i) => i,
+            None => return,
+        };
+        self.slot_last_tick[idx] = self.ticks;
         let inbound_payload = seg.payload;
-        let (next, hint) = match process_segment(self.tcb, &seg, self.ticks) {
+        let (next, hint) = match process_segment(self.tcbs[idx], &seg, self.ticks) {
             Ok(t) => t,
             Err(_) => return,
         };
-        self.tcb = next;
-        if self.tcb.remote_ip == [0, 0, 0, 0] {
-            self.tcb.remote_ip = src_ip;
+        self.tcbs[idx] = next;
+        if self.tcbs[idx].remote_ip == [0, 0, 0, 0] {
+            self.tcbs[idx].remote_ip = src_ip;
         }
 
-        if !inbound_payload.is_empty() && self.tcb.state != TcpState::Listen {
-            let room = HTTP_BUF.saturating_sub(self.http_len);
+        if !inbound_payload.is_empty() && self.tcbs[idx].state != TcpState::Listen {
+            let cur = self.http_lens[idx];
+            let room = SLOT_BUF.saturating_sub(cur);
             let n = inbound_payload.len().min(room);
-            self.http_buf[self.http_len..self.http_len + n]
-                .copy_from_slice(&inbound_payload[..n]);
-            self.http_len += n;
+            self.http_bufs[idx][cur..cur + n].copy_from_slice(&inbound_payload[..n]);
+            self.http_lens[idx] = cur + n;
         }
 
-        let mut http_out = [0u8; 512];
-        let mut http_n = 0usize;
-        if self.http_len >= 18 && find_double_crlf(&self.http_buf[..self.http_len]).is_some() {
-            http_n = build_status_http(&self.http_buf[..self.http_len], boots, shell, &mut http_out);
-            self.http_len = 0;
+        let mut app_out = [0u8; 512];
+        let mut app_n = 0usize;
+        if seg.dst_port == HTTP_PORT {
+            let cur = self.http_lens[idx];
+            if cur >= 18 && find_double_crlf(&self.http_bufs[idx][..cur]).is_some() {
+                app_n = build_status_http(&self.http_bufs[idx][..cur], boots, shell, &mut app_out);
+                self.http_lens[idx] = 0;
+            }
+        } else {
+            app_n = self.process_tls13_slot(idx, boots, shell, &mut app_out);
         }
 
-        if http_n > 0
-            && (self.tcb.state == TcpState::Established || self.tcb.state == TcpState::CloseWait)
+        let local_port = self.tcbs[idx].local_port;
+        let remote_port = self.tcbs[idx].remote_port;
+        if app_n > 0
+            && (self.tcbs[idx].state == TcpState::Established
+                || self.tcbs[idx].state == TcpState::CloseWait)
         {
-            if let Ok((next, data_hint)) = send_payload(self.tcb, http_n as u32) {
-                self.tcb = next;
+            if let Ok((next, data_hint)) = send_payload(self.tcbs[idx], app_n as u32) {
+                self.tcbs[idx] = next;
                 if data_hint.present {
                     self.emit_tcp(
+                        local_port,
+                        remote_port,
                         dst_mac,
                         reply_ip,
                         data_hint.seq,
                         data_hint.ack,
                         data_hint.flags,
                         data_hint.window,
-                        &http_out[..http_n],
+                        &app_out[..app_n],
                         out,
                     );
                 }
             }
         } else if hint.present {
             self.emit_tcp(
+                local_port,
+                remote_port,
                 dst_mac,
                 reply_ip,
                 hint.seq,
@@ -570,11 +689,13 @@ impl LivedNet {
             );
         }
 
-        if self.tcb.state == TcpState::CloseWait {
-            if let Ok((next, fin_hint)) = close(self.tcb) {
-                self.tcb = next;
+        if self.tcbs[idx].state == TcpState::CloseWait {
+            if let Ok((next, fin_hint)) = close(self.tcbs[idx]) {
+                self.tcbs[idx] = next;
                 if fin_hint.present {
                     self.emit_tcp(
+                        local_port,
+                        remote_port,
                         dst_mac,
                         reply_ip,
                         fin_hint.seq,
@@ -589,8 +710,145 @@ impl LivedNet {
         }
     }
 
+    #[inline(never)]
+    fn process_tls13_slot(
+        &mut self,
+        idx: usize,
+        boots: u64,
+        shell: Option<&mut crate::shell::OsShell>,
+        out: &mut [u8; 512],
+    ) -> usize {
+        let cur = self.http_lens[idx];
+        if cur < RECORD_HEADER_LEN {
+            return 0;
+        }
+        let Some((ctype, _ver, frag_len_u16)) =
+            decode_record_header(&self.http_bufs[idx][..cur])
+        else {
+            return 0;
+        };
+        let frag_len = frag_len_u16 as usize;
+        let total_rec = RECORD_HEADER_LEN + frag_len;
+        if total_rec > SLOT_BUF {
+            self.http_lens[idx] = 0;
+            return 0;
+        }
+        if cur < total_rec {
+            return 0;
+        }
+
+        if ctype == CONTENT_TYPE_HANDSHAKE {
+            let mut ch_copy = [0u8; SLOT_BUF];
+            ch_copy[..frag_len].copy_from_slice(&self.http_bufs[idx][RECORD_HEADER_LEN..total_rec]);
+            self.http_lens[idx] = 0;
+            let ch_msg = &ch_copy[..frag_len];
+            let Ok(ch_view) = parse_client_hello(ch_msg) else {
+                return 0;
+            };
+            let Some(client_pub) = ch_view.x25519_pub else {
+                return 0;
+            };
+            let mut sh_msg = [0u8; MAX_SERVER_HELLO_LEN];
+            let Ok(sh_len) = build_server_hello(
+                ch_msg,
+                &TLS_SERVER_RANDOM,
+                &TLS_SERVER_PUBKEY,
+                None,
+                &mut sh_msg,
+            ) else {
+                return 0;
+            };
+            let _ = Self::derive_tls13_record_key(
+                &client_pub,
+                ch_msg,
+                &sh_msg[..sh_len],
+                &mut self.tls_keys[idx],
+            );
+            self.tls_ready[idx] = true;
+
+            let mut pos = 0usize;
+            pos += encode_record_header(
+                CONTENT_TYPE_HANDSHAKE,
+                LEGACY_VERSION,
+                sh_len as u16,
+                &mut out[pos..],
+            );
+            out[pos..pos + sh_len].copy_from_slice(&sh_msg[..sh_len]);
+            pos += sh_len;
+
+            let mut plain = [0u8; 48];
+            let plen = status_body(boots, &mut plain);
+            let ctext_len = plen + crate::AeadImpl::TAG_LEN;
+            let mut app_hdr = [0u8; RECORD_HEADER_LEN];
+            let _ = encode_record_header(
+                TLS_CONTENT_APPLICATION_DATA,
+                LEGACY_VERSION,
+                ctext_len as u16,
+                &mut app_hdr,
+            );
+            out[pos..pos + RECORD_HEADER_LEN].copy_from_slice(&app_hdr);
+            pos += RECORD_HEADER_LEN;
+            let written = crate::AeadImpl::encrypt(
+                &self.tls_keys[idx],
+                &[0u8; 8],
+                &plain[..plen],
+                &app_hdr,
+                &mut out[pos..],
+            );
+            pos += written;
+            return pos;
+        }
+
+        if ctype == TLS_CONTENT_APPLICATION_DATA && self.tls_ready[idx] {
+            let mut rec_hdr = [0u8; RECORD_HEADER_LEN];
+            rec_hdr.copy_from_slice(&self.http_bufs[idx][..RECORD_HEADER_LEN]);
+            let mut ctext = [0u8; SLOT_BUF];
+            ctext[..frag_len].copy_from_slice(&self.http_bufs[idx][RECORD_HEADER_LEN..total_rec]);
+            self.http_lens[idx] = 0;
+
+            let mut req_plain = [0u8; SLOT_BUF];
+            let Ok(req_len) = crate::AeadImpl::decrypt(
+                &self.tls_keys[idx],
+                &[1u8; 8],
+                &ctext[..frag_len],
+                &rec_hdr,
+                &mut req_plain,
+            ) else {
+                return 0;
+            };
+            let mut http_resp = [0u8; 480];
+            let resp_len = build_status_http(&req_plain[..req_len], boots, shell, &mut http_resp);
+            if resp_len == 0 {
+                return 0;
+            }
+            let out_ctext_len = resp_len + crate::AeadImpl::TAG_LEN;
+            let mut resp_hdr = [0u8; RECORD_HEADER_LEN];
+            let _ = encode_record_header(
+                TLS_CONTENT_APPLICATION_DATA,
+                LEGACY_VERSION,
+                out_ctext_len as u16,
+                &mut resp_hdr,
+            );
+            out[..RECORD_HEADER_LEN].copy_from_slice(&resp_hdr);
+            let written = crate::AeadImpl::encrypt(
+                &self.tls_keys[idx],
+                &[2u8; 8],
+                &http_resp[..resp_len],
+                &resp_hdr,
+                &mut out[RECORD_HEADER_LEN..],
+            );
+            return RECORD_HEADER_LEN + written;
+        }
+
+        self.http_lens[idx] = 0;
+        0
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn emit_tcp(
         &mut self,
+        src_port: u16,
+        dst_port: u16,
         dst_mac: [u8; 6],
         reply_ip: [u8; 4],
         seq: u32,
@@ -602,8 +860,8 @@ impl LivedNet {
     ) {
         let mut seg = [0u8; 560];
         let n = match TcpImpl::build_segment(
-            HTTP_PORT,
-            self.tcb.remote_port,
+            src_port,
+            dst_port,
             seq,
             ack,
             flags,
@@ -704,6 +962,7 @@ fn build_status_http(
         if let Some(sh) = shell {
             let is_shell_endpoint = view.path == b"/ps"
                 || view.path == b"/ls"
+                || view.path == b"/df"
                 || view.path == b"/audit"
                 || view.path == b"/uname"
                 || view.path == b"/seal"
@@ -1261,5 +1520,253 @@ mod tests {
             &out.get(0).unwrap()[42..],
             b"error: EACCES (device key not provisioned; AUTH disabled)\n"
         );
+    }
+
+    #[test]
+    fn concurrent_four_slot_tcp_connections_and_lru_eviction() {
+        let mut net = LivedNet::new(MAC);
+        let mut server_isns = [0u32; TCP_MAX_SLOTS];
+
+        // Open 4 simultaneous TCP connections on ports 50000..50003 without closing any:
+        for slot in 0..TCP_MAX_SLOTS {
+            let cport = 50000 + (slot as u16);
+            let cisn = 0x1000_0000 + ((slot as u32) << 16);
+            let mut syn = [0u8; 40];
+            let n = TcpImpl::build_segment(
+                cport,
+                HTTP_PORT,
+                cisn,
+                0,
+                tcp_flags::SYN,
+                65535,
+                b"",
+                PEER_IP,
+                GUEST_IP,
+                &mut syn,
+            )
+            .unwrap();
+            let (frame, flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn[..n]);
+            let mut out = ReplySet::new();
+            net.handle_frame(&frame[..flen], 7, &mut out);
+            assert_eq!(out.len(), 1);
+            let sa = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+            assert_eq!(sa.flags, tcp_flags::SYN | tcp_flags::ACK);
+            server_isns[slot] = sa.seq;
+        }
+        assert_eq!(net.active_tcp_slots(), 4);
+
+        // Interleave HTTP GET requests across all 4 established connections:
+        for slot in (0..TCP_MAX_SLOTS).rev() {
+            let cport = 50000 + (slot as u16);
+            let cisn = 0x1000_0000 + ((slot as u32) << 16);
+            let req = b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n";
+            let mut pkt = [0u8; 128];
+            let n = TcpImpl::build_segment(
+                cport,
+                HTTP_PORT,
+                cisn.wrapping_add(1),
+                server_isns[slot].wrapping_add(1),
+                tcp_flags::ACK | tcp_flags::PSH,
+                65535,
+                req,
+                PEER_IP,
+                GUEST_IP,
+                &mut pkt,
+            )
+            .unwrap();
+            let (frame, flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &pkt[..n]);
+            let mut out = ReplySet::new();
+            net.handle_frame(&frame[..flen], 7, &mut out);
+            assert_eq!(out.len(), 1);
+            let seg = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+            assert_eq!(seg.dst_port, cport);
+            let body = core::str::from_utf8(seg.payload).unwrap();
+            assert!(body.contains("PROTEUS-STATUS boots=7"));
+        }
+
+        // Opening a 5th concurrent connection evicts the oldest LRU slot cleanly:
+        let mut syn5 = [0u8; 40];
+        let n = TcpImpl::build_segment(
+            50099,
+            HTTP_PORT,
+            0x9000_0000,
+            0,
+            tcp_flags::SYN,
+            65535,
+            b"",
+            PEER_IP,
+            GUEST_IP,
+            &mut syn5,
+        )
+        .unwrap();
+        let (frame, flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn5[..n]);
+        let mut out = ReplySet::new();
+        net.handle_frame(&frame[..flen], 7, &mut out);
+        assert_eq!(out.len(), 1);
+        let sa5 = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        assert_eq!(sa5.flags, tcp_flags::SYN | tcp_flags::ACK);
+        assert_eq!(sa5.dst_port, 50099);
+        assert_eq!(net.active_tcp_slots(), 4);
+    }
+
+    #[test]
+    fn tls13_port_443_handshake_and_encrypted_application_data_roundtrip() {
+        let mut net = LivedNet::new(MAC);
+        let mut sh = crate::shell::OsShell::new();
+        let client_port: u16 = 54443;
+        let client_isn: u32 = 0x4430_0000;
+
+        // 1. TCP SYN on HTTPS_PORT (443):
+        let mut syn = [0u8; 40];
+        let n = TcpImpl::build_segment(
+            client_port,
+            HTTPS_PORT,
+            client_isn,
+            0,
+            tcp_flags::SYN,
+            65535,
+            b"",
+            PEER_IP,
+            GUEST_IP,
+            &mut syn,
+        )
+        .unwrap();
+        let (frame, flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn[..n]);
+        let mut out = ReplySet::new();
+        net.handle_frame_with_shell(&frame[..flen], 9, &mut sh, &mut out);
+        assert_eq!(out.len(), 1);
+        let sa = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        assert_eq!(sa.flags, tcp_flags::SYN | tcp_flags::ACK);
+        let server_isn = sa.seq;
+
+        // 2. Build a TLS 1.3 ClientHello record and send over TCP/443:
+        let client_random = [0x11u8; 32];
+        let client_pubkey = [0x22u8; 32];
+        let mut ch_msg = [0u8; 256];
+        let ch_len =
+            crate::tls::build_client_hello(&client_random, &client_pubkey, &mut ch_msg).unwrap();
+        let mut tls_rec = [0u8; 264];
+        let _ = encode_record_header(
+            CONTENT_TYPE_HANDSHAKE,
+            LEGACY_VERSION,
+            ch_len as u16,
+            &mut tls_rec,
+        );
+        tls_rec[RECORD_HEADER_LEN..RECORD_HEADER_LEN + ch_len].copy_from_slice(&ch_msg[..ch_len]);
+        let rec_total = RECORD_HEADER_LEN + ch_len;
+
+        let mut ch_seg = [0u8; 320];
+        let n = TcpImpl::build_segment(
+            client_port,
+            HTTPS_PORT,
+            client_isn.wrapping_add(1),
+            server_isn.wrapping_add(1),
+            tcp_flags::ACK | tcp_flags::PSH,
+            65535,
+            &tls_rec[..rec_total],
+            PEER_IP,
+            GUEST_IP,
+            &mut ch_seg,
+        )
+        .unwrap();
+        let (frame, flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &ch_seg[..n]);
+        let mut out = ReplySet::new();
+        net.handle_frame_with_shell(&frame[..flen], 9, &mut sh, &mut out);
+        assert_eq!(out.len(), 1);
+        let resp_seg =
+            TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        let payload = resp_seg.payload;
+
+        // 3. Parse ServerHello record + decrypt ApplicationData status record:
+        let (r1_type, r1_ver, r1_len_u16) = decode_record_header(payload).unwrap();
+        assert_eq!(r1_type, CONTENT_TYPE_HANDSHAKE);
+        assert_eq!(r1_ver, LEGACY_VERSION);
+        let r1_len = r1_len_u16 as usize;
+        let sh_slice = &payload[RECORD_HEADER_LEN..RECORD_HEADER_LEN + r1_len];
+        let parsed_sh = crate::tls::parse_server_hello(sh_slice).unwrap();
+        assert_eq!(parsed_sh.server_pubkey, TLS_SERVER_PUBKEY);
+
+        let mut record_key = [0u8; 16];
+        let _ = LivedNet::derive_tls13_record_key(
+            &client_pubkey,
+            &ch_msg[..ch_len],
+            sh_slice,
+            &mut record_key,
+        );
+
+        let r2_slice = &payload[RECORD_HEADER_LEN + r1_len..];
+        let (r2_type, _r2_ver, r2_len_u16) = decode_record_header(r2_slice).unwrap();
+        assert_eq!(r2_type, TLS_CONTENT_APPLICATION_DATA);
+        let r2_len = r2_len_u16 as usize;
+        let mut plain_status = [0u8; 64];
+        let plen = crate::AeadImpl::decrypt(
+            &record_key,
+            &[0u8; 8],
+            &r2_slice[RECORD_HEADER_LEN..RECORD_HEADER_LEN + r2_len],
+            &r2_slice[..RECORD_HEADER_LEN],
+            &mut plain_status,
+        )
+        .unwrap();
+        assert_eq!(&plain_status[..plen], b"PROTEUS-STATUS boots=9\n");
+
+        // 4. Send an encrypted HTTP GET /uname inside a TLS ApplicationData record:
+        let req_http = b"GET /uname HTTP/1.1\r\nHost: x\r\n\r\n";
+        let req_ctext_len = req_http.len() + crate::AeadImpl::TAG_LEN;
+        let mut req_rec = [0u8; 128];
+        let _ = encode_record_header(
+            TLS_CONTENT_APPLICATION_DATA,
+            LEGACY_VERSION,
+            req_ctext_len as u16,
+            &mut req_rec,
+        );
+        let mut aad_hdr = [0u8; RECORD_HEADER_LEN];
+        aad_hdr.copy_from_slice(&req_rec[..RECORD_HEADER_LEN]);
+        let w = crate::AeadImpl::encrypt(
+            &record_key,
+            &[1u8; 8],
+            req_http,
+            &aad_hdr,
+            &mut req_rec[RECORD_HEADER_LEN..],
+        );
+        let req_rec_total = RECORD_HEADER_LEN + w;
+
+        let next_c_seq = client_isn.wrapping_add(1 + (rec_total as u32));
+        let next_s_seq = server_isn.wrapping_add(1 + (payload.len() as u32));
+        let mut app_seg = [0u8; 192];
+        let n = TcpImpl::build_segment(
+            client_port,
+            HTTPS_PORT,
+            next_c_seq,
+            next_s_seq,
+            tcp_flags::ACK | tcp_flags::PSH,
+            65535,
+            &req_rec[..req_rec_total],
+            PEER_IP,
+            GUEST_IP,
+            &mut app_seg,
+        )
+        .unwrap();
+        let (frame, flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &app_seg[..n]);
+        let mut out = ReplySet::new();
+        net.handle_frame_with_shell(&frame[..flen], 9, &mut sh, &mut out);
+        assert_eq!(out.len(), 1);
+        let app_resp_seg =
+            TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        let r3 = app_resp_seg.payload;
+        let (r3_type, _, r3_len_u16) = decode_record_header(r3).unwrap();
+        assert_eq!(r3_type, TLS_CONTENT_APPLICATION_DATA);
+        let r3_len = r3_len_u16 as usize;
+        let mut dec_http = [0u8; 256];
+        let dlen = crate::AeadImpl::decrypt(
+            &record_key,
+            &[2u8; 8],
+            &r3[RECORD_HEADER_LEN..RECORD_HEADER_LEN + r3_len],
+            &r3[..RECORD_HEADER_LEN],
+            &mut dec_http,
+        )
+        .unwrap();
+        let http_str = core::str::from_utf8(&dec_http[..dlen]).unwrap();
+        assert!(http_str.starts_with("HTTP/1.1 200"));
+        assert!(http_str.contains("Proteus-TE x86_64 1.0-mtd"));
     }
 }

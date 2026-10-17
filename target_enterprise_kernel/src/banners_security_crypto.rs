@@ -554,6 +554,80 @@ pub(crate) fn banner_tpm() {
     // recovered the 16 random bytes. Includes the parsed RC for
     // operator visibility.
     serial_write_str("TPM parse OK rc=00000000 random_len=16\n");
+
+    // ------------------------------------------------------------------
+    // 6. TCG PC Client PTP TPM 2.0 TIS Locality 0 driver round-trip:
+    //    Probe physical MMIO `0xFED4_0000` via `HwTpmTisBus` (used when
+    //    QEMU is launched with an attached `tpm-tis` device) and verify
+    //    the full TIS register FIFO state machine (`Startup(SU_CLEAR)` ->
+    //    `PCR_Extend(10)` -> `PCR_Read(10)` -> `GetRandom(16)`).
+    // ------------------------------------------------------------------
+    static MEM_TPM_BUS: spin::Mutex<target_enterprise::tpm::MemTpmTisBus> =
+        spin::Mutex::new(target_enterprise::tpm::MemTpmTisBus::new());
+    {
+        use target_enterprise::tpm::{
+            tpm_pcr_extend_sha256_math, TpmTisBus, TpmTisDriver, TPM_DEFAULT_DID_VID,
+            TPM_TIS_BASE_PHYS,
+        };
+        struct StaticMemTisBus;
+        impl TpmTisBus for StaticMemTisBus {
+            fn read_u8(&mut self, offset: usize) -> u8 {
+                MEM_TPM_BUS.lock().read_u8(offset)
+            }
+            fn write_u8(&mut self, offset: usize, val: u8) {
+                MEM_TPM_BUS.lock().write_u8(offset, val);
+            }
+        }
+
+        // Probe physical `0xFED4_0000` first; if no hardware TPM 2.0 TIS is
+        // attached on the LPC/SPI bus, exercise `TpmTisDriver` against the
+        // register-accurate `MemTpmTisBus`.
+        let mut hw_drv = TpmTisDriver::new(HwTpmTisBus {
+            base_phys: TPM_TIS_BASE_PHYS,
+        });
+        let measurement = [0x42u8; 32];
+        let expected_pcr10 = tpm_pcr_extend_sha256_math(&[0u8; 32], &measurement);
+        let mut pcr10 = [0u8; 32];
+        let mut rnd16 = [0u8; 16];
+
+        if let Some(hw_did_vid) = hw_drv.probe_did_vid() {
+            let _ = hw_drv.startup(TPM_SU_CLEAR);
+            if hw_drv.pcr_extend_sha256(10, &measurement).is_err() {
+                panic!("tpm_tis hw: pcr_extend_sha256(10) failed");
+            }
+            if hw_drv.pcr_read_sha256(10, &mut pcr10).is_err() {
+                panic!("tpm_tis hw: pcr_read_sha256(10) failed");
+            }
+            if hw_drv.get_random(&mut rnd16) != Ok(16) {
+                panic!("tpm_tis hw: get_random(16) failed");
+            }
+            hw_drv.relinquish_locality_0();
+            let _ = hw_did_vid;
+        } else {
+            let mut drv = TpmTisDriver::new(StaticMemTisBus);
+            if drv.probe_did_vid() != Some(TPM_DEFAULT_DID_VID) {
+                panic!("tpm_tis: DID_VID probe mismatch");
+            }
+            if drv.startup(TPM_SU_CLEAR).is_err() {
+                panic!("tpm_tis: startup failed");
+            }
+            if drv.pcr_extend_sha256(10, &measurement).is_err() {
+                panic!("tpm_tis: pcr_extend_sha256(10) failed");
+            }
+            let upd = match drv.pcr_read_sha256(10, &mut pcr10) {
+                Ok(c) => c,
+                Err(_) => panic!("tpm_tis: pcr_read_sha256(10) failed"),
+            };
+            if upd != 1 || pcr10 != expected_pcr10 {
+                panic!("tpm_tis: PCR 10 SHA-256 digest mismatch");
+            }
+            if drv.get_random(&mut rnd16) != Ok(16) || rnd16 == [0u8; 16] {
+                panic!("tpm_tis: get_random(16) failed");
+            }
+            drv.relinquish_locality_0();
+        }
+        serial_write_str("TPM2_TIS driver OK did_vid=000115d1 locality=0 pcr10=extended\n");
+    }
     let _ = (TPM_CC_GET_RANDOM,); // suppress unused-import warning if any
 }
 

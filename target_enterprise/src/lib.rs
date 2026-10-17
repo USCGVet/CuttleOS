@@ -89,7 +89,9 @@ pub use crate::iommu::{
     MAX_DEVICES, MAX_DOMAINS, PAGE_MASK, PAGE_SHIFT, PAGE_SIZE,
 };
 pub use crate::memory::{BitmapAllocator, FRAME_SIZE};
-pub use crate::lived_net::{LivedNet, ReplySet, GUEST_IP, HTTP_PORT, UDP_STATUS_PORT};
+pub use crate::lived_net::{
+    LivedNet, ReplySet, GUEST_IP, HTTPS_PORT, HTTP_PORT, TCP_MAX_SLOTS, UDP_STATUS_PORT,
+};
 pub use crate::net::{
     build_udp_datagram, ipv4_header_checksum, parse_ipv4_header, parse_udp_datagram, udp_checksum,
     NetStackImpl, IPV4_HEADER_LEN, MAX_UDP_PAYLOAD, MIN_IPV4_UDP_LEN, UDP_HEADER_LEN,

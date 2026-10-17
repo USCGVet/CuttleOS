@@ -126,6 +126,370 @@ pub(crate) fn banner_dma() {
     serial_write_str("DMA_UNMAP test OK\n");
 }
 
+/// Live hardware GDT + 64-bit TSS (`lgdt`/`ltr`), 256-entry IDT (`lidt`),
+/// `IST1` breakpoint exception (`int3`), and Ring-0 -> Ring-3 (`iretq`) ->
+/// Ring-0 (`int 0x80` on `RSP0` + `dispatch_with_cap`) privilege transition proof.
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_ring3_transition() {
+    use target_enterprise::gdt::{
+        Gdt, Tss64, KERNEL_CODE_SEL, KERNEL_DATA_SEL, TSS64_LEN, TSS_SEL, USER_CODE_SEL,
+        USER_DATA_SEL,
+    };
+    use target_enterprise::interrupts::{
+        vectors, Idt, IDT_LEN, TYPE_INTERRUPT_GATE_DPL3, TYPE_TRAP_GATE_DPL0,
+    };
+    use target_enterprise::syscall::{dispatch_with_cap, SYS_GETPID};
+
+    let dma = dma_phys_base();
+    if dma == 0 || phys_map_offset() == 0 {
+        panic!("RING3: DMA window not initialized");
+    }
+
+    // Dedicated physical frames in `dma + 0x2_4000 .. dma + 0x2_B000`:
+    //   +0x2_4000: PDPT for temporary lower-half user mapping
+    //   +0x2_5000: PD
+    //   +0x2_6000: PT (`PT[0]` = Ring-3 code/stack page, `PT[1]` = Ring-0 ISR trampoline page)
+    //   +0x2_7000: Ring-3 user code + stack frame
+    //   +0x2_8000: Ring-0 ISR trampoline + state frame
+    //   +0x2_9000: Live 256-entry IDT (4096 bytes)
+    //   +0x2_A000: Live GDT (`+0x000`), descriptor pointers (`+0x040..+0x080`),
+    //              64-bit TSS (`+0x100`), `RSP0` stack (`+0x200..+0x800`), `IST1` stack (`+0x800..+0x1000`)
+    let pdpt_phys = dma + 0x2_4000;
+    let pd_phys = dma + 0x2_5000;
+    let pt_phys = dma + 0x2_6000;
+    let user_phys = dma + 0x2_7000;
+    let tramp_phys = dma + 0x2_8000;
+    let idt_phys = dma + 0x2_9000;
+    let gdt_phys = dma + 0x2_A000;
+
+    // Zero all 7 scratch frames (`7 * 4096 = 0x7000` bytes).
+    // SAFETY: `pdpt_phys .. pdpt_phys + 0x7000` lies within the reserved 192 KiB DMA window mapped via `pa_to_va`.
+    unsafe {
+        let base_ptr = pa_to_va(pdpt_phys);
+        let mut i = 0usize;
+        while i < 0x7000 {
+            core::ptr::write_volatile(base_ptr.add(i), 0);
+            i += 1;
+        }
+    }
+
+    // Find an unused lower-half PML4 slot (`64..256`).
+    // SAFETY: Running at CPL=0; `read_cr3()` returns the active 4-level PML4 physical address.
+    let pml4_phys = unsafe { read_cr3() } & PTE_ADDR_MASK;
+    let pml4_va = pa_to_va(pml4_phys) as *mut u64;
+    let mut pml4_idx: Option<usize> = None;
+    let mut idx = 64usize;
+    while idx < 256 {
+        // SAFETY: `pml4_va` points to the 512-entry active PML4 table mapped via `pa_to_va`.
+        let entry = unsafe { core::ptr::read_volatile(pml4_va.add(idx)) };
+        if entry == 0 {
+            pml4_idx = Some(idx);
+            break;
+        }
+        idx += 1;
+    }
+    let Some(pml4_slot) = pml4_idx else {
+        panic!("RING3: no free lower-half PML4 slot");
+    };
+
+    let user_va: u64 = (pml4_slot as u64) << 39;
+    let kernel_trampoline_va: u64 = user_va + 0x1000;
+    let tramp_state_va: u64 = kernel_trampoline_va + 0x200;
+    let user_rsp: u64 = user_va + 0xFF0;
+
+    // Install 4-level mapping (`PTE_P | PTE_W | PTE_USER` on `PT[0]`, `PTE_P | PTE_W` on `PT[1]`).
+    const PTE_U: u64 = 1 << 2;
+    // SAFETY: `pdpt_phys`, `pd_phys`, and `pt_phys` are freshly zeroed 4 KiB frames in the reserved DMA pool, and `pml4_slot` was verified empty.
+    unsafe {
+        let pdpt_va = pa_to_va(pdpt_phys) as *mut u64;
+        let pd_va = pa_to_va(pd_phys) as *mut u64;
+        let pt_va = pa_to_va(pt_phys) as *mut u64;
+        core::ptr::write_volatile(pt_va.add(0), user_phys | PTE_P | PTE_W | PTE_U);
+        core::ptr::write_volatile(pt_va.add(1), tramp_phys | PTE_P | PTE_W);
+        core::ptr::write_volatile(pd_va.add(0), pt_phys | PTE_P | PTE_W | PTE_U);
+        core::ptr::write_volatile(pdpt_va.add(0), pd_phys | PTE_P | PTE_W | PTE_U);
+        core::ptr::write_volatile(pml4_va.add(pml4_slot), pdpt_phys | PTE_P | PTE_W | PTE_U);
+        asm!(
+            "invlpg [{}]",
+            "invlpg [{}]",
+            in(reg) user_va,
+            in(reg) kernel_trampoline_va,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    // Write Ring-3 payload into `user_phys`:
+    //   mov eax, cs
+    //   mov rsi, rax
+    //   mov rdi, 2   (SYS_GETPID)
+    //   mov rdx, 42  (arg0)
+    //   int 0x80
+    let ring3_code: [u8; 21] = [
+        0x8C, 0xC8,
+        0x48, 0x89, 0xC6,
+        0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00,
+        0x48, 0xC7, 0xC2, 0x2A, 0x00, 0x00, 0x00,
+        0xCD, 0x80,
+    ];
+    // SAFETY: `user_phys` is a dedicated 4 KiB frame in the reserved DMA window mapped via `pa_to_va`.
+    unsafe {
+        let dst = pa_to_va(user_phys);
+        let mut i = 0usize;
+        while i < ring3_code.len() {
+            core::ptr::write_volatile(dst.add(i), ring3_code[i]);
+            i += 1;
+        }
+    }
+
+    // Write Ring-0 ISR trampolines into `tramp_phys`:
+    // 1) `isr_breakpoint_ist1` at `+0x000` (Vector 3 `#BP`, `IST = 1`)
+    let isr_bp_code: [u8; 18] = [
+        0x50,                                     // push rax
+        0x48, 0x8D, 0x05, 0xF8, 0x01, 0x00, 0x00, // lea rax, [rip + 0x1F8] -> +0x200
+        0x48, 0xFF, 0x00,                         // inc qword ptr [rax]
+        0x48, 0x89, 0x60, 0x08,                   // mov [rax + 0x08], rsp
+        0x58,                                     // pop rax
+        0x48, 0xCF,                               // iretq
+    ];
+    // 2) `isr_syscall_int80` at `+0x080` (Vector 0x80 `SYSCALL_INT`, `DPL = 3`, `IST = 0`)
+    let isr_int80_code: [u8; 53] = [
+        0x48, 0x8D, 0x05, 0x79, 0x01, 0x00, 0x00, // lea rax, [rip + 0x179] -> +0x200
+        0x48, 0x89, 0x70, 0x20,                   // mov [rax + 0x20], rsi
+        0x48, 0x8B, 0x4C, 0x24, 0x08,             // mov rcx, [rsp + 0x08]
+        0x48, 0x89, 0x48, 0x28,                   // mov [rax + 0x28], rcx
+        0x48, 0x8B, 0x4C, 0x24, 0x20,             // mov rcx, [rsp + 0x20]
+        0x48, 0x89, 0x48, 0x30,                   // mov [rax + 0x30], rcx
+        0x48, 0x89, 0x78, 0x38,                   // mov [rax + 0x38], rdi
+        0x48, 0x89, 0x50, 0x40,                   // mov [rax + 0x40], rdx
+        0x48, 0x89, 0x60, 0x48,                   // mov [rax + 0x48], rsp
+        0xB9, 0x10, 0x00, 0x00, 0x00,             // mov ecx, 0x10
+        0x8E, 0xD1,                               // mov ss, cx
+        0x48, 0x8B, 0x60, 0x10,                   // mov rsp, [rax + 0x10]
+        0xC3,                                     // ret
+    ];
+    // SAFETY: `tramp_phys` is a dedicated 4 KiB frame in the reserved DMA window mapped via `pa_to_va`.
+    unsafe {
+        let dst = pa_to_va(tramp_phys);
+        let mut i = 0usize;
+        while i < isr_bp_code.len() {
+            core::ptr::write_volatile(dst.add(i), isr_bp_code[i]);
+            i += 1;
+        }
+        let mut j = 0usize;
+        while j < isr_int80_code.len() {
+            core::ptr::write_volatile(dst.add(0x80 + j), isr_int80_code[j]);
+            j += 1;
+        }
+    }
+
+    // Build GDT, 64-bit TSS, and 256-entry IDT in `gdt_phys` and `idt_phys`.
+    let gdt_frame_va = pa_to_va(gdt_phys) as u64;
+    let gdt_va = gdt_frame_va;
+    let gdtr_new_va = gdt_frame_va + 0x040;
+    let idtr_new_va = gdt_frame_va + 0x050;
+    let gdtr_orig_va = gdt_frame_va + 0x060;
+    let idtr_orig_va = gdt_frame_va + 0x070;
+    let tss_va = gdt_frame_va + 0x100;
+    let rsp0_top = gdt_frame_va + 0x800;
+    let ist1_top = gdt_frame_va + 0x1000;
+    let idt_va = pa_to_va(idt_phys) as u64;
+
+    let tss = Tss64::with_stacks(rsp0_top, ist1_top);
+    let tss_bytes = tss.to_bytes();
+    let gdt = Gdt::new_full(tss_va, (TSS64_LEN - 1) as u32);
+    let gdt_bytes = gdt.to_table_bytes();
+
+    let mut idt = Idt::new_empty();
+    idt.set_handler_with_attr(
+        vectors::BREAKPOINT,
+        kernel_trampoline_va,
+        TYPE_TRAP_GATE_DPL0,
+        1,
+    );
+    idt.set_handler_with_attr(
+        vectors::SYSCALL_INT,
+        kernel_trampoline_va + 0x80,
+        TYPE_INTERRUPT_GATE_DPL3,
+        0,
+    );
+
+    // SAFETY: `gdt_frame_va` and `idt_va` point into dedicated 4 KiB frames in the reserved DMA window.
+    unsafe {
+        let gdt_ptr = gdt_va as *mut u8;
+        let mut i = 0usize;
+        while i < gdt_bytes.len() {
+            core::ptr::write_volatile(gdt_ptr.add(i), gdt_bytes[i]);
+            i += 1;
+        }
+        let tss_ptr = tss_va as *mut u8;
+        let mut j = 0usize;
+        while j < tss_bytes.len() {
+            core::ptr::write_volatile(tss_ptr.add(j), tss_bytes[j]);
+            j += 1;
+        }
+        let idt_ptr = idt_va as *mut u8;
+        let mut v = 0usize;
+        while v < IDT_LEN {
+            let entry_bytes = idt.raw_bytes(v as u8);
+            let mut k = 0usize;
+            while k < 16 {
+                core::ptr::write_volatile(idt_ptr.add(v * 16 + k), entry_bytes[k]);
+                k += 1;
+            }
+            v += 1;
+        }
+
+        // Write 10-byte `[limit: u16, base: u64]` descriptors for `lgdt` and `lidt`.
+        let gdt_limit: u16 = (Gdt::byte_size() - 1) as u16;
+        let idt_limit: u16 = (Idt::byte_size() - 1) as u16;
+        let gdtr_ptr = gdtr_new_va as *mut u8;
+        let gdt_lim_b = gdt_limit.to_le_bytes();
+        let gdt_base_b = gdt_va.to_le_bytes();
+        core::ptr::write_volatile(gdtr_ptr.add(0), gdt_lim_b[0]);
+        core::ptr::write_volatile(gdtr_ptr.add(1), gdt_lim_b[1]);
+        let mut b = 0usize;
+        while b < 8 {
+            core::ptr::write_volatile(gdtr_ptr.add(2 + b), gdt_base_b[b]);
+            b += 1;
+        }
+
+        let idtr_ptr = idtr_new_va as *mut u8;
+        let idt_lim_b = idt_limit.to_le_bytes();
+        let idt_base_b = idt_va.to_le_bytes();
+        core::ptr::write_volatile(idtr_ptr.add(0), idt_lim_b[0]);
+        core::ptr::write_volatile(idtr_ptr.add(1), idt_lim_b[1]);
+        let mut b2 = 0usize;
+        while b2 < 8 {
+            core::ptr::write_volatile(idtr_ptr.add(2 + b2), idt_base_b[b2]);
+            b2 += 1;
+        }
+    }
+
+    // Execute live GDT/TSS/IDT load, `int3` on `IST1`, and Ring-0 -> Ring-3 (`iretq`) -> Ring-0 (`int 0x80`) round-trip.
+    // SAFETY: Running at CPL=0 with interrupts masked (`cli`); `gdtr_new_va`, `idtr_new_va`, `tss_va`,
+    // `user_va`, and `kernel_trampoline_va` are mapped and initialized, and original `GDTR`/`IDTR`/`CS`/`SS`/`RFLAGS`
+    // are saved and restored before returning.
+    unsafe {
+        asm!(
+            "pushfq",
+            "pop r15",
+            "cli",
+            "sgdt [r9]",
+            "sidt [r10]",
+            "mov r13d, cs",
+            "mov r14d, ss",
+            // Load Proteus GDT, reload CS=0x08 and SS/DS/ES=0x10, load TR=0x28, load IDT.
+            "lgdt [r11]",
+            "push {k_cs}",
+            "lea rax, [rip + 2f]",
+            "push rax",
+            "retfq",
+            "2:",
+            "mov eax, {k_ds}",
+            "mov ss, ax",
+            "mov ds, ax",
+            "mov es, ax",
+            "mov eax, {tss_sel}",
+            "ltr ax",
+            "lidt [r12]",
+            // 1. Trigger #BP (vector 3) to verify live IDT + TSS IST1 stack switch.
+            "int3",
+            // 2. Drop to Ring-3 (`CPL=3`) via `iretq` and return via `int 0x80` on `RSP0`.
+            "call 3f",
+            "jmp 4f",
+            "3:",
+            "mov [r8 + 0x10], rsp",
+            "push {u_ss}",
+            "push {u_rsp}",
+            "push 0x2",
+            "push {u_cs}",
+            "push {u_rip}",
+            "iretq",
+            "4:",
+            // Restore bootloader GDTR, CS, SS, IDTR, and RFLAGS.
+            "lgdt [r9]",
+            "push r13",
+            "lea rax, [rip + 5f]",
+            "push rax",
+            "retfq",
+            "5:",
+            "mov ss, r14w",
+            "lidt [r10]",
+            "push r15",
+            "popfq",
+            in("r8") tramp_state_va,
+            in("r9") gdtr_orig_va,
+            in("r10") idtr_orig_va,
+            in("r11") gdtr_new_va,
+            in("r12") idtr_new_va,
+            out("r13") _,
+            out("r14") _,
+            out("r15") _,
+            k_cs = const (KERNEL_CODE_SEL as u64),
+            k_ds = const (KERNEL_DATA_SEL as u32),
+            tss_sel = const (TSS_SEL as u32),
+            u_ss = const (USER_DATA_SEL as u64),
+            u_rsp = in(reg) user_rsp,
+            u_cs = const (USER_CODE_SEL as u64),
+            u_rip = in(reg) user_va,
+            clobber_abi("C"),
+        );
+    }
+
+    // Read back the hardware state captured by `isr_breakpoint_ist1` and `isr_syscall_int80`.
+    // SAFETY: `tramp_state_va` points to the 64-bit state slots at `tramp_phys + 0x200`, and `pml4_va` points to the active PML4.
+    let (bp_count, bp_rsp, r3_cs, frame_cs, frame_ss, sys_nr, sys_arg0, trap_rsp) = unsafe {
+        let st = pa_to_va(tramp_phys + 0x200) as *const u64;
+        let vals = (
+            core::ptr::read_volatile(st.add(0)),
+            core::ptr::read_volatile(st.add(1)),
+            core::ptr::read_volatile(st.add(4)),
+            core::ptr::read_volatile(st.add(5)),
+            core::ptr::read_volatile(st.add(6)),
+            core::ptr::read_volatile(st.add(7)),
+            core::ptr::read_volatile(st.add(8)),
+            core::ptr::read_volatile(st.add(9)),
+        );
+        // Tear down temporary PML4 entry and flush TLB.
+        core::ptr::write_volatile(pml4_va.add(pml4_slot), 0);
+        asm!(
+            "invlpg [{}]",
+            "invlpg [{}]",
+            in(reg) user_va,
+            in(reg) kernel_trampoline_va,
+            options(nostack, preserves_flags)
+        );
+        vals
+    };
+
+    if bp_count != 1 || bp_rsp != ist1_top - 48 {
+        panic!("RING3: IST1 breakpoint stack switch verification failed");
+    }
+    if (r3_cs as u16) != USER_CODE_SEL
+        || (frame_cs as u16) != USER_CODE_SEL
+        || (frame_ss as u16) != USER_DATA_SEL
+    {
+        panic!("RING3: CPL=3 segment selector verification failed");
+    }
+    if trap_rsp != rsp0_top - 40 {
+        panic!("RING3: TSS RSP0 stack switch verification failed");
+    }
+    if sys_nr != SYS_GETPID {
+        panic!("RING3: trapped syscall number mismatch");
+    }
+
+    let pid = match dispatch_with_cap(sys_nr, u64::MAX, sys_arg0, 0, 0, 0, 0, 0) {
+        Ok(v) => v,
+        Err(_) => panic!("RING3: dispatch_with_cap failed for SYS_GETPID"),
+    };
+    if pid != 1 || pid.wrapping_add(sys_arg0) != 43 {
+        panic!("RING3: unexpected SYS_GETPID return value");
+    }
+
+    serial_write_str("RING3 transition OK cpl=3->0 vec=0x80 ist1=ok rsp0=ok syscall=43\n");
+}
+
 // ============================================================
 // SMP / TASK-057: ACPI MADT parsing + INIT-SIPI-SIPI AP wake
 // sequence. The kernel constructs a 4-CPU fixture MADT
