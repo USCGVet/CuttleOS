@@ -694,6 +694,20 @@ pub(crate) fn banner_shell_compose() {
     if &out[..a8.bytes_written()] != b"syscall ok: ret=0\n" {
         panic!("SHELL compose: granted syscall open should succeed");
     }
+    let a_sc_deny = sh.exec_line(b"seccomp deny 5 open", boots, 0, 0, &mut out);
+    if &out[..a_sc_deny.bytes_written()] != b"seccomp: denied open on pid=5 (mask=8)\n" {
+        panic!("SHELL compose: seccomp deny 5 open drift");
+    }
+    let a_sc_blk = sh.exec_line(b"syscall 5 open /var/boot.ok", boots, 0, 0, &mut out);
+    if &out[..a_sc_blk.bytes_written()]
+        != b"syscall denied: EACCES (blocked by eBPF seccomp filter)\n"
+    {
+        panic!("SHELL compose: seccomp filter failed to block open");
+    }
+    let a_sc_ok = sh.exec_line(b"syscall 5 getpid", boots, 0, 0, &mut out);
+    if &out[..a_sc_ok.bytes_written()] != b"syscall ok: ret=1\n" {
+        panic!("SHELL compose: seccomp filter blocked permitted getpid");
+    }
     let a9 = sh.exec_line(b"exec /bin/fib 10", boots, 0, 0, &mut out);
     if &out[..a9.bytes_written()]
         != b"exec: path=/bin/fib entry=4198400 kpti=isolated insns=11 ret=55\n"
@@ -728,13 +742,20 @@ pub(crate) fn banner_shell_compose() {
     if restore_shell_from_ahci(vsh) != Some((boots, 4)) {
         panic!("SHELL compose: AHCI sealed restore failed");
     }
-    if vsh.fw.len() != 1 || vsh.auth_seq != 7 {
-        panic!("SHELL compose: AHCI restored fw/auth_seq drift");
+    if vsh.fw.len() != 1 || vsh.auth_seq != 7 || vsh.seccomp_mask[5] != 8 {
+        panic!("SHELL compose: AHCI restored fw/auth_seq/seccomp drift");
+    }
+    let av_sc = vsh.exec_line(b"syscall 5 open /var/boot.ok", boots, 0, 0, &mut out);
+    if &out[..av_sc.bytes_written()]
+        != b"syscall denied: EACCES (blocked by eBPF seccomp filter)\n"
+    {
+        panic!("SHELL compose: AHCI restored seccomp filter did not enforce");
     }
     let av = vsh.exec_line(b"cat /var/boot.ok", boots, 0, 0, &mut out);
     if &out[..av.bytes_written()] != b"ready\n" {
         panic!("SHELL compose: AHCI restored /var/boot.ok drift");
     }
+    serial_write_str("SECCOMP: OK engine=ebpf filter=enforced\n");
     let mut attest_out = [0u8; 320];
     let aq = vsh.exec_line(b"attest boot-quote", boots, 0, 0, &mut attest_out);
     if !attest_out[..aq.bytes_written()].starts_with(b"attest: v=1 boots=") {
@@ -748,6 +769,7 @@ pub(crate) fn banner_shell_compose() {
     serial_write_str("ATTEST: OK seed=");
     serial_write_str(option_env!("PROTEUS_VARIANT_SEED").unwrap_or("default-variant"));
     serial_write_str(" quote=verified\n");
+    let _ = sh.exec_line(b"seccomp clear 5", boots, 0, 0, &mut out);
     let _ = sh.exec_line(b"fw clear", boots, 0, 0, &mut out);
     sh.auth_seq = 0;
 

@@ -736,6 +736,7 @@ fn boots_under_qemu_and_emits_banner() {
         // containment rule panics here and the banners never appear.
         "CRASH_DUMP wrote 16384 bytes to lba=1024 crc=8fb6eb0e",
         "SYMBOL resolve OK kernel_main+0x42 (5 frames)",
+        "SECCOMP: OK engine=ebpf filter=enforced",
         "ATTEST: OK seed=",
         "SHELL compose OK tasks=5 files=5 audit=5",
         "PROTEUS-TE HALT",

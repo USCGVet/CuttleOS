@@ -536,12 +536,77 @@ fn morph_instr_with_context(
     instr: &Instruction,
     choice: u64,
     dead_flags: bool,
+    cf_af_dead: bool,
     upper32_zero: bool,
+    src_reg_dead: bool,
 ) -> Option<Instruction> {
+    // 0. Dead-source register `mov/lea dst, src <-> xchg dst, src / xchg src, dst`:
+    //    When `src` is provably dead after `instr` (overwritten in the same basic
+    //    block before any read, or caller-saved non-return `{RCX, RSI, RDI, R8..R11}`
+    //    at `ret`), `xchg dst, src` writes `old_src` into `dst`, leaves `RFLAGS`
+    //    untouched, and changes the mnemonic to `xchg` (even for `RBP/R13/R12`!).
+    if src_reg_dead && matches!(choice & 0b111, 4 | 5) {
+        if instr.mnemonic() == Mnemonic::Mov
+            && instr.op_count() == 2
+            && instr.op0_kind() == OpKind::Register
+            && instr.op1_kind() == OpKind::Register
+        {
+            let dst = instr.op0_register();
+            let src = instr.op1_register();
+            if dst != src
+                && gp_reg_index(dst) != Some(4)
+                && gp_reg_index(src) != Some(4)
+            {
+                let xchg_code = match instr.code() {
+                    Code::Mov_rm64_r64 | Code::Mov_r64_rm64 => Some(Code::Xchg_rm64_r64),
+                    Code::Mov_rm32_r32 | Code::Mov_r32_rm32 => Some(Code::Xchg_rm32_r32),
+                    _ => None,
+                };
+                if let Some(xc) = xchg_code {
+                    let (a, b) = if (choice & 1) == 0 { (dst, src) } else { (src, dst) };
+                    if let Ok(xi) = Instruction::with2(xc, a, b) {
+                        return Some(xi);
+                    }
+                }
+            }
+        } else if instr.mnemonic() == Mnemonic::Lea
+            && instr.op_count() == 2
+            && instr.op0_kind() == OpKind::Register
+            && instr.op1_kind() == OpKind::Memory
+            && !instr.is_ip_rel_memory_operand()
+            && instr.memory_index() == iced_x86::Register::None
+            && instr.memory_displacement64() == 0
+            && instr.segment_prefix() == iced_x86::Register::None
+        {
+            let dst = instr.op0_register();
+            let base = instr.memory_base();
+            if gp_reg_index(dst) != gp_reg_index(base)
+                && gp_reg_index(dst) != Some(4)
+                && gp_reg_index(base) != Some(4)
+            {
+                match instr.code() {
+                    Code::Lea_r64_m => {
+                        let (a, b) = if (choice & 1) == 0 { (dst, base) } else { (base, dst) };
+                        if let Ok(xi) = Instruction::with2(Code::Xchg_rm64_r64, a, b) {
+                            return Some(xi);
+                        }
+                    }
+                    Code::Lea_r32_m => {
+                        if let Some(src32) = base64_to_reg32(base) {
+                            let (a, b) = if (choice & 1) == 0 { (dst, src32) } else { (src32, dst) };
+                            if let Ok(xi) = Instruction::with2(Code::Xchg_rm32_r32, a, b) {
+                                return Some(xi);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     // 1. 32-bit self-test `test r32, r32 <-> or r32, r32 <-> and r32, r32` when
-    //    either `upper32_zero` is proven (so zero-extension of `or/and` is a no-op)
-    //    or `instr` is already `or/and r32, r32` (wait: `or/and r32, r32` can
-    //    only become `test r32, r32` if `upper32_zero` is true!).
+    //    `upper32_zero` is proven (so zero-extension of `or/and` is a no-op).
     if upper32_zero
         && instr.op_count() == 2
         && instr.op0_kind() == OpKind::Register
@@ -567,10 +632,12 @@ fn morph_instr_with_context(
         }
     }
 
-    // 2. Dead-flags transformations (`add <-> sub -imm <-> lea [reg + disp8]`):
-    if dead_flags {
-        // 2a. `add/sub r32/64, imm8` (where `imm8 in -127..=127, imm8 != 0`)
-        //     <-> `sub/add r32/64, -imm8` <-> `lea r32/64, [r64 + disp8]`.
+    // 2. Dead-flags / `CF,AF`-dead transformations (`add <-> sub -imm <-> lea [reg + disp]`):
+    //    Note that `ADD r, k` and `SUB r, -k` (for `k != 0, k != MIN`) produce the
+    //    exact same register result AND identical `ZF, SF, OF, PF` flags, differing
+    //    only in `CF` and `AF`. Thus `add <-> sub -imm` is valid whenever `cf_af_dead`
+    //    holds, while `add/sub <-> lea` requires `dead_flags` (all 6 flags dead).
+    if dead_flags || cf_af_dead {
         if instr.op_count() == 2 && instr.op0_kind() == OpKind::Register {
             let r0 = instr.op0_register();
             match instr.code() {
@@ -583,7 +650,7 @@ fn morph_instr_with_context(
                             -(imm as i64)
                         };
                         let neg_imm = (-imm) as i32;
-                        if (choice & 1) == 0 {
+                        if dead_flags && (choice & 1) == 0 {
                             if let Some(base64) = lea_disp_compatible_base64(r0) {
                                 let mem = iced_x86::MemoryOperand::with_base_displ(base64, signed_disp);
                                 if let Ok(lea) = Instruction::with2(Code::Lea_r64_m, r0, mem) {
@@ -608,7 +675,7 @@ fn morph_instr_with_context(
                             -(imm as i64)
                         };
                         let neg_imm = (-imm) as i32;
-                        if (choice & 1) == 0 {
+                        if dead_flags && (choice & 1) == 0 {
                             if let Some(base64) = lea_disp_compatible_base64(r0) {
                                 let mem = iced_x86::MemoryOperand::with_base_displ(base64, signed_disp);
                                 if let Ok(lea) = Instruction::with2(Code::Lea_r32_m, r0, mem) {
@@ -636,7 +703,7 @@ fn morph_instr_with_context(
                         } else {
                             -(imm as i64)
                         };
-                        if (choice & 1) == 0 {
+                        if dead_flags && (choice & 1) == 0 {
                             if let Some(base64) = lea_disp_compatible_base64(r0) {
                                 let mem =
                                     iced_x86::MemoryOperand::with_base_displ(base64, signed_disp);
@@ -665,7 +732,7 @@ fn morph_instr_with_context(
                         } else {
                             -(imm as i64)
                         };
-                        if (choice & 1) == 0 {
+                        if dead_flags && (choice & 1) == 0 {
                             if let Some(base64) = lea_disp_compatible_base64(r0) {
                                 let mem =
                                     iced_x86::MemoryOperand::with_base_displ(base64, signed_disp);
@@ -682,10 +749,42 @@ fn morph_instr_with_context(
                         return Instruction::with2(opp, r0, -imm).ok();
                     }
                 }
+                Code::Add_RAX_imm32 | Code::Sub_RAX_imm32 => {
+                    let imm = instr.immediate32() as i32;
+                    if imm != 0
+                        && imm != i32::MIN
+                        && !(-128..=127).contains(&imm)
+                        && !(-128..=127).contains(&(-imm))
+                    {
+                        let opp = if instr.code() == Code::Add_RAX_imm32 {
+                            Code::Sub_RAX_imm32
+                        } else {
+                            Code::Add_RAX_imm32
+                        };
+                        return Instruction::with2(opp, r0, -imm).ok();
+                    }
+                }
+                Code::Add_EAX_imm32 | Code::Sub_EAX_imm32 => {
+                    let imm = instr.immediate32() as i32;
+                    if imm != 0
+                        && imm != i32::MIN
+                        && !(-128..=127).contains(&imm)
+                        && !(-128..=127).contains(&(-imm))
+                    {
+                        let opp = if instr.code() == Code::Add_EAX_imm32 {
+                            Code::Sub_EAX_imm32
+                        } else {
+                            Code::Add_EAX_imm32
+                        };
+                        return Instruction::with2(opp, r0, -imm).ok();
+                    }
+                }
                 _ => {}
             }
         }
+    }
 
+    if dead_flags {
         // 2b. `lea r32/64, [base64 + disp8/disp32]` (where `dst == base` and
         //     `disp != 0`) -> `add/sub r32/64, imm8/imm32`.
         if instr.mnemonic() == Mnemonic::Lea
@@ -1578,10 +1677,11 @@ fn pass_return_block_scratch_swap(code: &mut [u8], base_ip: u64, prng: &mut Prng
                 match instr.op0_kind() {
                     OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
                         let target = instr.near_branch_target();
-                        if target < base_ip || target >= end_ip {
+                        if target >= base_ip && target < end_ip {
+                            branch_targets.push(target);
+                        } else if instr.flow_control() != FlowControl::UnconditionalBranch {
                             return;
                         }
-                        branch_targets.push(target);
                     }
                     _ => return,
                 }
@@ -2118,10 +2218,11 @@ fn pass_schedule_commute(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: 
                 match instr.op0_kind() {
                     OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
                         let target = instr.near_branch_target();
-                        if target < base_ip || target >= end_ip {
+                        if target >= base_ip && target < end_ip {
+                            branch_targets.push(target);
+                        } else if instr.flow_control() != FlowControl::UnconditionalBranch {
                             return;
                         }
-                        branch_targets.push(target);
                     }
                     _ => return,
                 }
@@ -2218,51 +2319,418 @@ fn try_encode_same_len(alt: &Instruction, instr: &Instruction) -> Option<Vec<u8>
     }
 }
 
-/// `true` if all 6 arithmetic flags (`CF, OF, SF, ZF, PF, AF`) after `instrs[idx]`
-/// are provably overwritten (or killed by `ret`, `call`, or `ud2`) before any
-/// flag read or branch target.
-fn flags_are_dead(instrs: &[Instruction], branch_targets: &[u64], idx: usize) -> bool {
+#[inline]
+fn is_flag_killer_instr(ins: &Instruction, branch_targets: &[u64]) -> bool {
     use iced_x86::FlowControl;
+    if matches!(
+        ins.flow_control(),
+        FlowControl::Return | FlowControl::Call | FlowControl::IndirectCall
+    ) || ins.mnemonic() == Mnemonic::Ud2
+        || (ins.flow_control() == FlowControl::UnconditionalBranch
+            && matches!(
+                ins.op0_kind(),
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+            )
+            && !branch_targets.contains(&ins.near_branch_target()))
+    {
+        return true;
+    }
+    ins.flow_control() == FlowControl::Next
+        && matches!(
+            ins.mnemonic(),
+            Mnemonic::Add
+                | Mnemonic::Sub
+                | Mnemonic::Cmp
+                | Mnemonic::And
+                | Mnemonic::Or
+                | Mnemonic::Xor
+                | Mnemonic::Test
+                | Mnemonic::Neg
+        )
+}
+
+#[inline]
+fn is_flag_neutral_instr(ins: &Instruction) -> bool {
+    ins.flow_control() == iced_x86::FlowControl::Next
+        && matches!(
+            ins.mnemonic(),
+            Mnemonic::Mov
+                | Mnemonic::Movzx
+                | Mnemonic::Movsx
+                | Mnemonic::Movsxd
+                | Mnemonic::Lea
+                | Mnemonic::Push
+                | Mnemonic::Pop
+                | Mnemonic::Xchg
+                | Mnemonic::Nop
+                | Mnemonic::Bswap
+        )
+}
+
+/// `true` if all 6 arithmetic flags (`CF, OF, SF, ZF, PF, AF`) after `instrs[idx]`
+/// are provably overwritten (or killed by `ret`, `call`, tail-call, or `ud2`) before
+/// any flag read or branch target.
+fn flags_are_dead(instrs: &[Instruction], branch_targets: &[u64], idx: usize) -> bool {
+    for ins in &instrs[idx + 1..] {
+        if branch_targets.contains(&ins.ip()) {
+            return false;
+        }
+        if is_flag_killer_instr(ins, branch_targets) {
+            return true;
+        }
+        if is_flag_neutral_instr(ins) {
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+/// `true` if all 6 arithmetic flags entering `instrs[start_idx]` are provably
+/// overwritten before any flag read.
+fn flags_are_dead_at_entry(
+    instrs: &[Instruction],
+    branch_targets: &[u64],
+    start_idx: usize,
+) -> bool {
+    for (j, ins) in instrs[start_idx..].iter().enumerate() {
+        if j > 0 && branch_targets.contains(&ins.ip()) {
+            return false;
+        }
+        if is_flag_killer_instr(ins, branch_targets) {
+            return true;
+        }
+        if is_flag_neutral_instr(ins) {
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+/// `true` if `CF` and `AF` are provably dead after `instrs[idx]`, even if
+/// `{ZF, SF, OF, PF}` are read by `Setcc`/`Cmovcc` or a conditional branch
+/// (`Je/Jne/Js/Jns/Jo/Jno/Jp/Jnp/Jl/Jge/Jle/Jg`) whose fallthrough and target
+/// paths both overwrite all flags before reading `CF` or `AF`.
+fn cf_af_are_dead(instrs: &[Instruction], branch_targets: &[u64], idx: usize) -> bool {
+    use iced_x86::FlowControl;
+
+    for (offset, ins) in instrs[idx + 1..].iter().enumerate() {
+        let cur_idx = idx + 1 + offset;
+        if branch_targets.contains(&ins.ip()) {
+            return false;
+        }
+        if is_flag_killer_instr(ins, branch_targets) {
+            return true;
+        }
+        if is_flag_neutral_instr(ins) {
+            continue;
+        }
+        if ins.flow_control() == FlowControl::Next
+            && matches!(
+                ins.mnemonic(),
+                Mnemonic::Sete
+                    | Mnemonic::Setne
+                    | Mnemonic::Sets
+                    | Mnemonic::Setns
+                    | Mnemonic::Seto
+                    | Mnemonic::Setno
+                    | Mnemonic::Setp
+                    | Mnemonic::Setnp
+                    | Mnemonic::Setl
+                    | Mnemonic::Setge
+                    | Mnemonic::Setle
+                    | Mnemonic::Setg
+                    | Mnemonic::Cmove
+                    | Mnemonic::Cmovne
+                    | Mnemonic::Cmovs
+                    | Mnemonic::Cmovns
+                    | Mnemonic::Cmovo
+                    | Mnemonic::Cmovno
+                    | Mnemonic::Cmovp
+                    | Mnemonic::Cmovnp
+                    | Mnemonic::Cmovl
+                    | Mnemonic::Cmovge
+                    | Mnemonic::Cmovle
+                    | Mnemonic::Cmovg
+            )
+        {
+            continue;
+        }
+        if ins.flow_control() == FlowControl::ConditionalBranch
+            && matches!(
+                ins.mnemonic(),
+                Mnemonic::Je
+                    | Mnemonic::Jne
+                    | Mnemonic::Js
+                    | Mnemonic::Jns
+                    | Mnemonic::Jo
+                    | Mnemonic::Jno
+                    | Mnemonic::Jp
+                    | Mnemonic::Jnp
+                    | Mnemonic::Jl
+                    | Mnemonic::Jge
+                    | Mnemonic::Jle
+                    | Mnemonic::Jg
+            )
+            && matches!(
+                ins.op0_kind(),
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+            )
+        {
+            let target_ip = ins.near_branch_target();
+            let Some(target_idx) = instrs.iter().position(|t| t.ip() == target_ip) else {
+                return false;
+            };
+            return flags_are_dead(instrs, branch_targets, cur_idx)
+                && flags_are_dead_at_entry(instrs, branch_targets, target_idx);
+        }
+        return false;
+    }
+    false
+}
+
+/// `true` if the source GP register of `instrs[idx]` (`mov dst, src` or `lea dst, [src]`)
+/// is provably dead after `instrs[idx]` (unconditionally full-register overwritten in the
+/// same basic block before any read, or caller-saved non-return `{RCX, RSI, RDI, R8..R11}`
+/// reaching `ret` without being read).
+fn src_reg_is_dead_after(
+    instrs: &[Instruction],
+    branch_targets: &[u64],
+    idx: usize,
+) -> bool {
+    use iced_x86::{FlowControl, Register};
+
+    let cur = &instrs[idx];
+    let (dst_reg, src_reg) = if cur.mnemonic() == Mnemonic::Mov
+        && cur.op_count() == 2
+        && cur.op0_kind() == OpKind::Register
+        && cur.op1_kind() == OpKind::Register
+    {
+        (cur.op0_register(), cur.op1_register())
+    } else if cur.mnemonic() == Mnemonic::Lea
+        && cur.op_count() == 2
+        && cur.op0_kind() == OpKind::Register
+        && cur.op1_kind() == OpKind::Memory
+        && !cur.is_ip_rel_memory_operand()
+        && cur.memory_index() == Register::None
+        && cur.memory_displacement64() == 0
+        && cur.segment_prefix() == Register::None
+    {
+        (cur.op0_register(), cur.memory_base())
+    } else {
+        return false;
+    };
+
+    let (Some(dst_gp), Some(src_gp)) = (gp_reg_index(dst_reg), gp_reg_index(src_reg)) else {
+        return false;
+    };
+    if dst_gp == src_gp || dst_gp == 4 || src_gp == 4 {
+        return false;
+    }
 
     for ins in &instrs[idx + 1..] {
         if branch_targets.contains(&ins.ip()) {
             return false;
         }
-        if matches!(
-            ins.flow_control(),
-            FlowControl::Return | FlowControl::Call | FlowControl::IndirectCall
-        ) || ins.mnemonic() == Mnemonic::Ud2
+        if ins.flow_control() == FlowControl::Return
+            && ins.mnemonic() == Mnemonic::Ret
+            && ins.op_count() == 0
         {
-            return true;
+            return matches!(src_gp, 1 | 6 | 7 | 8 | 9 | 10 | 11);
         }
-        if ins.flow_control() != FlowControl::Next {
+        if ins.flow_control() != FlowControl::Next || !is_explicit_reg_only_instr(ins) {
             return false;
         }
-        match ins.mnemonic() {
-            // Pure flag-killers: read zero flags and write all 6 arithmetic flags.
-            Mnemonic::Add
-            | Mnemonic::Sub
-            | Mnemonic::Cmp
-            | Mnemonic::And
-            | Mnemonic::Or
-            | Mnemonic::Xor
-            | Mnemonic::Test
-            | Mnemonic::Neg => return true,
-            // Flag-neutral instructions: neither read nor write any flags.
-            Mnemonic::Mov
-            | Mnemonic::Movzx
-            | Mnemonic::Movsx
-            | Mnemonic::Movsxd
-            | Mnemonic::Lea
-            | Mnemonic::Push
-            | Mnemonic::Pop
-            | Mnemonic::Xchg
-            | Mnemonic::Nop
-            | Mnemonic::Bswap => continue,
-            _ => return false,
+        if gp_reg_index(ins.memory_base()) == Some(src_gp)
+            || gp_reg_index(ins.memory_index()) == Some(src_gp)
+        {
+            return false;
+        }
+        if ins.mnemonic() == Mnemonic::Pop
+            && ins.op_count() == 1
+            && ins.op0_kind() == OpKind::Register
+        {
+            if gp_reg_index(ins.op0_register()) == Some(src_gp) {
+                return true;
+            }
+            continue;
+        }
+        if ins.op_count() == 2
+            && ins.op0_kind() == OpKind::Register
+            && ins.op1_kind() == OpKind::Register
+            && ins.op0_register() == ins.op1_register()
+            && matches!(
+                ins.code(),
+                Code::Xor_rm32_r32
+                    | Code::Xor_r32_rm32
+                    | Code::Xor_rm64_r64
+                    | Code::Xor_r64_rm64
+                    | Code::Sub_rm32_r32
+                    | Code::Sub_r32_rm32
+                    | Code::Sub_rm64_r64
+                    | Code::Sub_r64_rm64
+            )
+        {
+            if gp_reg_index(ins.op0_register()) == Some(src_gp) {
+                return true;
+            }
+            continue;
+        }
+        if matches!(
+            ins.mnemonic(),
+            Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd | Mnemonic::Lea
+        ) && ins.op_count() == 2
+            && ins.op0_kind() == OpKind::Register
+        {
+            if ins.op1_kind() == OpKind::Register
+                && gp_reg_index(ins.op1_register()) == Some(src_gp)
+            {
+                return false;
+            }
+            if gp_reg_index(ins.op0_register()) == Some(src_gp) {
+                // Only treat non-reg-reg moves (immediates, memory loads, non-zero disp LEA)
+                // as unconditional sinks so chained reg-reg moves never interact.
+                let is_reg_copy = (ins.mnemonic() == Mnemonic::Mov
+                    && ins.op1_kind() == OpKind::Register)
+                    || (ins.mnemonic() == Mnemonic::Lea
+                        && !ins.is_ip_rel_memory_operand()
+                        && ins.memory_index() == Register::None
+                        && ins.memory_displacement64() == 0);
+                if is_reg_copy {
+                    return false;
+                }
+                let r0 = ins.op0_register();
+                let is_32_or_64 = reg32_to_base64_low8(r0).is_some()
+                    || upper_reg_family(r0).map_or(false, |f| r0 == f.r64 || r0 == f.r32)
+                    || matches!(
+                        r0,
+                        Register::RAX
+                            | Register::RCX
+                            | Register::RDX
+                            | Register::RBX
+                            | Register::RBP
+                            | Register::RSI
+                            | Register::RDI
+                    );
+                return is_32_or_64;
+            }
+            continue;
+        }
+        for op_i in 0..ins.op_count() {
+            if ins.op_kind(op_i) == OpKind::Register
+                && gp_reg_index(ins.op_register(op_i)) == Some(src_gp)
+            {
+                return false;
+            }
         }
     }
     false
+}
+
+/// Generate exact-same-length 2-instruction byte sequences for `5`-byte
+/// `mov eax..edi, imm32` (`B8+r imm32`) and `7`-byte `mov r64, imm32`
+/// (`48/49 C7 C0+r imm32`) when `dead_flags == true` and `imm32 as i32` is in
+/// `-127..=127` (`!= 0`), combining `{xor | sub}` self-zeroing with
+/// `{lea | add | sub | or | xor}` `imm8`/`disp8`.
+fn multi_instr_imm_load_alts(instr: &Instruction, dead_flags: bool) -> Vec<Vec<u8>> {
+    use iced_x86::Register;
+
+    let mut out = Vec::new();
+    if !dead_flags || instr.op0_kind() != OpKind::Register {
+        return out;
+    }
+
+    if instr.code() == Code::Mov_r32_imm32 && instr.len() == 5 {
+        let r32 = instr.op0_register();
+        if r32 == Register::ESP {
+            return out;
+        }
+        let Some(r64) = reg32_to_base64_low8(r32) else {
+            return out;
+        };
+        let imm = instr.immediate32() as i32;
+        if !(-127..=127).contains(&imm) || imm == 0 {
+            return out;
+        }
+        let zeros = [
+            Instruction::with2(Code::Xor_rm32_r32, r32, r32).ok(),
+            Instruction::with2(Code::Sub_rm32_r32, r32, r32).ok(),
+        ];
+        let mem = iced_x86::MemoryOperand::with_base_displ(r64, imm as i64);
+        let ops = [
+            Instruction::with2(Code::Lea_r32_m, r32, mem).ok(),
+            Instruction::with2(Code::Add_rm32_imm8, r32, imm).ok(),
+            Instruction::with2(Code::Sub_rm32_imm8, r32, -imm).ok(),
+            Instruction::with2(Code::Or_rm32_imm8, r32, imm).ok(),
+            Instruction::with2(Code::Xor_rm32_imm8, r32, imm).ok(),
+        ];
+        for z in zeros.iter().flatten() {
+            let mut enc1 = Encoder::new(64);
+            let Ok(l1) = enc1.encode(z, instr.ip()) else {
+                continue;
+            };
+            let b1 = enc1.take_buffer();
+            for op in ops.iter().flatten() {
+                let mut enc2 = Encoder::new(64);
+                let Ok(l2) = enc2.encode(op, instr.ip() + l1 as u64) else {
+                    continue;
+                };
+                if l1 + l2 == 5 {
+                    let mut combined = Vec::with_capacity(5);
+                    combined.extend_from_slice(&b1);
+                    combined.extend_from_slice(&enc2.take_buffer());
+                    out.push(combined);
+                }
+            }
+        }
+    } else if instr.code() == Code::Mov_rm64_imm32 && instr.len() == 7 {
+        let r64 = instr.op0_register();
+        if r64 == Register::RSP || gp_reg_index(r64).is_none() {
+            return out;
+        }
+        let imm = instr.immediate32() as i32;
+        if !(-127..=127).contains(&imm) || imm == 0 {
+            return out;
+        }
+        let zeros = [
+            Instruction::with2(Code::Xor_rm64_r64, r64, r64).ok(),
+            Instruction::with2(Code::Sub_rm64_r64, r64, r64).ok(),
+        ];
+        let lea_opt = if r64 != Register::R12 {
+            let mem = iced_x86::MemoryOperand::with_base_displ(r64, imm as i64);
+            Instruction::with2(Code::Lea_r64_m, r64, mem).ok()
+        } else {
+            None
+        };
+        let ops = [
+            lea_opt,
+            Instruction::with2(Code::Add_rm64_imm8, r64, imm).ok(),
+            Instruction::with2(Code::Sub_rm64_imm8, r64, -imm).ok(),
+            Instruction::with2(Code::Or_rm64_imm8, r64, imm).ok(),
+            Instruction::with2(Code::Xor_rm64_imm8, r64, imm).ok(),
+        ];
+        for z in zeros.iter().flatten() {
+            let mut enc1 = Encoder::new(64);
+            let Ok(l1) = enc1.encode(z, instr.ip()) else {
+                continue;
+            };
+            let b1 = enc1.take_buffer();
+            for op in ops.iter().flatten() {
+                let mut enc2 = Encoder::new(64);
+                let Ok(l2) = enc2.encode(op, instr.ip() + l1 as u64) else {
+                    continue;
+                };
+                if l1 + l2 == 7 {
+                    let mut combined = Vec::with_capacity(7);
+                    combined.extend_from_slice(&b1);
+                    combined.extend_from_slice(&enc2.take_buffer());
+                    out.push(combined);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `true` if `instrs[idx]` is a 32-bit self-test (`test/or/and r32, r32`) and
@@ -2357,13 +2825,18 @@ fn has_ret_opcode_byte(bytes: &[u8]) -> bool {
     bytes
         .iter()
         .any(|&b| b == 0xC3 || b == 0xC2 || b == 0xCB || b == 0xCA || b == 0xCF)
+        || bytes
+            .windows(2)
+            .any(|w| w[0] == 0xFF && matches!((w[1] >> 3) & 0b111, 2..=5))
 }
 
-/// Per-instruction flag- and register-safe morph pass (`MOV<->LEA`,
+/// Per-instruction flag- and register-safe morph pass (`MOV<->LEA<->XCHG`,
 /// `MOV/ALU/CMP` opposite-direction encoding swaps, self-zeroing `xor<->sub`,
 /// 8/16/32/64-bit self-test `test<->or<->and`, dead-flags `add<->sub<->lea`,
+/// `CF/AF`-dead `add<->sub`, 2-instruction small-immediate load morphs,
 /// commutative distinct-reg `test`/`xchg`, SIB `scale=1` swap, and active
-/// unintended return-byte (`0xC3/0xC2/0xCB/0xCA/0xCF`) gadget scrubbing).
+/// unintended return/indirect-branch (`0xC3/0xC2/0xCB/0xCA/0xCF`, `0xFF /2../5`)
+/// gadget terminator scrubbing).
 fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mut Stats) {
     use iced_x86::FlowControl;
 
@@ -2386,10 +2859,10 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
                 match instr.op0_kind() {
                     OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
                         let t = instr.near_branch_target();
-                        if t < base_ip || t >= end_ip {
-                            allow_liveness = false;
-                        } else {
+                        if t >= base_ip && t < end_ip {
                             branch_targets.push(t);
+                        } else if instr.flow_control() != FlowControl::UnconditionalBranch {
+                            allow_liveness = false;
                         }
                     }
                     _ => allow_liveness = false,
@@ -2407,12 +2880,22 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
         stats.instrs += 1;
         let ilen = instr.len();
         let dead_flags = allow_liveness && flags_are_dead(&instrs, &branch_targets, idx);
+        let cf_af_dead =
+            allow_liveness && (dead_flags || cf_af_are_dead(&instrs, &branch_targets, idx));
         let upper32_zero = allow_liveness && prev_instr_zeroed_upper32(&instrs, &branch_targets, idx);
+        let src_reg_dead = allow_liveness && src_reg_is_dead_after(&instrs, &branch_targets, idx);
 
         let orig_bytes = &original[pos..pos + ilen];
         let mut alts: Vec<(Vec<u8>, bool)> = Vec::new();
         for c in 0..8u64 {
-            if let Some(alt) = morph_instr_with_context(instr, c, dead_flags, upper32_zero) {
+            if let Some(alt) = morph_instr_with_context(
+                instr,
+                c,
+                dead_flags,
+                cf_af_dead,
+                upper32_zero,
+                src_reg_dead,
+            ) {
                 if let Some(bytes) = try_encode_same_len(&alt, instr) {
                     if bytes != orig_bytes && !alts.iter().any(|(b, _)| b == &bytes) {
                         let sem_changed = alt.mnemonic() != instr.mnemonic()
@@ -2423,6 +2906,11 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
                 }
             }
         }
+        for pair_bytes in multi_instr_imm_load_alts(instr, dead_flags) {
+            if pair_bytes != orig_bytes && !alts.iter().any(|(b, _)| b == &pair_bytes) {
+                alts.push((pair_bytes, true));
+            }
+        }
         if alts.is_empty() {
             continue;
         }
@@ -2430,16 +2918,18 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
         let orig_has_ret = has_ret_opcode_byte(orig_bytes);
         let draw = prng.next_u64();
 
-        // Unintended `0xC3/0xC2/0xCB/0xCA/0xCF` (`ret`/`iret`) bytes are free ROP gadgets:
-        // always scrub them (100% probability); otherwise flip on the seeded coin.
+        // Unintended `0xC3/0xC2/0xCB/0xCA/0xCF` (`ret`/`iret`) and `0xFF /2../5`
+        // (`call/jmp r/m64`) bytes are free ROP/JOP gadgets: always scrub them
+        // (100% probability); otherwise flip on the seeded coin.
         if !orig_has_ret && (draw & 1 == 0) {
             continue;
         }
 
         // Prefer encodings that:
-        // 1. Do NOT contain any embedded return opcode byte (`0xC3/0xC2/0xCB/0xCA/0xCF`), AND
-        // 2. Change the disassembled mnemonic or operand order (`mov`↔`lea`, `xor`↔`sub`,
-        //    `test`↔`or`↔`and`, `add`↔`shl`, `add`↔`sub`↔`lea`, `r32`↔`r64`, SIB swap)
+        // 1. Do NOT contain any embedded return or indirect call/jmp byte, AND
+        // 2. Change the disassembled mnemonic or operand order (`mov`↔`lea`↔`xchg`,
+        //    `xor`↔`sub`, `test`↔`or`↔`and`, `add`↔`shl`, `add`↔`sub`↔`lea`,
+        //    `mov imm32`↔`xor/sub+lea/add/sub/or/xor`, `r32`↔`r64`, SIB swap)
         //    rather than merely flipping the direction bit (`89`↔`8B`).
         let sem_clean_count = alts
             .iter()
@@ -3029,14 +3519,14 @@ mod tests {
         // mov rcx, 0x1000 = 48 C7 C1 00 10 00 00 (7 bytes)
         let mov = decode_one(&[0x48, 0xC7, 0xC1, 0x00, 0x10, 0x00, 0x00]);
         assert_eq!(mov.code(), Code::Mov_rm64_imm32);
-        let lea = morph_instr_with_context(&mov, 0, false, false)
+        let lea = morph_instr_with_context(&mov, 0, false, false, false, false)
             .expect("mov rcx, 0x1000 should morph to lea ecx, [0x1000]");
         assert_eq!(lea.code(), Code::Lea_r32_m);
         let lea_bytes = try_encode_same_len(&lea, &mov).expect("both must be 7 bytes");
         assert_eq!(lea_bytes, vec![0x8D, 0x0C, 0x25, 0x00, 0x10, 0x00, 0x00]);
 
         let decoded_lea = decode_one(&lea_bytes);
-        let back_mov = morph_instr_with_context(&decoded_lea, 0, false, false)
+        let back_mov = morph_instr_with_context(&decoded_lea, 0, false, false, false, false)
             .expect("lea ecx, [0x1000] should morph back to mov rcx, 0x1000");
         assert_eq!(back_mov.code(), Code::Mov_rm64_imm32);
         let mov_bytes = try_encode_same_len(&back_mov, &decoded_lea).expect("both must be 7 bytes");
@@ -3047,21 +3537,102 @@ mod tests {
     fn morphs_dead_flags_add_imm32_to_lea_disp32_and_sub_imm32() {
         // add rcx, 0x1000 = 48 81 C1 00 10 00 00 (7 bytes)
         let add = decode_one(&[0x48, 0x81, 0xC1, 0x00, 0x10, 0x00, 0x00]);
-        let lea = morph_instr_with_context(&add, 0, true, false)
+        let lea = morph_instr_with_context(&add, 0, true, true, false, false)
             .expect("dead-flags add rcx, 0x1000 should morph to lea rcx, [rcx + 0x1000]");
         assert_eq!(lea.code(), Code::Lea_r64_m);
         let lea_bytes = try_encode_same_len(&lea, &add).expect("both must be 7 bytes");
         assert_eq!(lea_bytes, vec![0x48, 0x8D, 0x89, 0x00, 0x10, 0x00, 0x00]);
 
-        let sub = morph_instr_with_context(&add, 1, true, false)
+        let sub = morph_instr_with_context(&add, 1, true, true, false, false)
             .expect("dead-flags add rcx, 0x1000 should morph to sub rcx, -0x1000");
         assert_eq!(sub.code(), Code::Sub_rm64_imm32);
         let sub_bytes = try_encode_same_len(&sub, &add).expect("both must be 7 bytes");
         assert_eq!(sub_bytes, vec![0x48, 0x81, 0xE9, 0x00, 0xF0, 0xFF, 0xFF]);
 
         let decoded_lea = decode_one(&lea_bytes);
-        let back_add = morph_instr_with_context(&decoded_lea, 0, true, false)
+        let back_add = morph_instr_with_context(&decoded_lea, 0, true, true, false, false)
             .expect("dead-flags lea rcx, [rcx + 0x1000] should morph back to add rcx, 0x1000");
         assert_eq!(back_add.code(), Code::Add_rm64_imm32);
+    }
+
+    #[test]
+    fn morphs_dead_src_reg_mov_to_xchg() {
+        // mov r14, rsi (49 89 F6) ; mov esi, 8 (BE 08 00 00 00) ; ret (C3)
+        // Because `rsi` is overwritten by `mov esi, 8`, `mov r14, rsi` can morph to `xchg r14, rsi`.
+        let orig = vec![0x49, 0x89, 0xF6, 0xBE, 0x08, 0x00, 0x00, 0x00, 0xC3];
+        let mut saw_xchg = false;
+        for seed in 0..64u64 {
+            let mut code = orig.clone();
+            let mut prng = Prng::new(seed);
+            let mut stats = Stats::default();
+            pass_reg_reg_morph(&mut code, 0x1000, &mut prng, &mut stats);
+            let first = decode_one(&code[0..3]);
+            if first.mnemonic() == Mnemonic::Xchg {
+                saw_xchg = true;
+                break;
+            }
+        }
+        assert!(saw_xchg, "dead-source mov r14, rsi must morph to xchg");
+    }
+
+    #[test]
+    fn morphs_5byte_and_7byte_small_imm_loads_to_multi_instr_pairs() {
+        // mov esi, 0x39 (BE 39 00 00 00, 5 bytes)
+        let mov32 = decode_one(&[0xBE, 0x39, 0x00, 0x00, 0x00]);
+        let alts32 = multi_instr_imm_load_alts(&mov32, true);
+        assert!(
+            alts32.len() >= 8,
+            "expected >= 8 2-instruction 5-byte alternatives for mov esi, 0x39, got {}",
+            alts32.len()
+        );
+        for bytes in &alts32 {
+            assert_eq!(bytes.len(), 5);
+            let mut dec = Decoder::with_ip(64, bytes, 0x1000, DecoderOptions::NONE);
+            let i1 = dec.decode();
+            let i2 = dec.decode();
+            assert!(!dec.can_decode());
+            assert!(matches!(i1.mnemonic(), Mnemonic::Xor | Mnemonic::Sub));
+            assert!(matches!(
+                i2.mnemonic(),
+                Mnemonic::Lea | Mnemonic::Add | Mnemonic::Sub | Mnemonic::Or | Mnemonic::Xor
+            ));
+        }
+
+        // mov r8, -1 (49 C7 C0 FF FF FF FF, 7 bytes)
+        let mov64 = decode_one(&[0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let alts64 = multi_instr_imm_load_alts(&mov64, true);
+        assert!(
+            alts64.len() >= 8,
+            "expected >= 8 2-instruction 7-byte alternatives for mov r8, -1, got {}",
+            alts64.len()
+        );
+        for bytes in &alts64 {
+            assert_eq!(bytes.len(), 7);
+        }
+    }
+
+    #[test]
+    fn morphs_cf_af_dead_loop_counter_across_jne() {
+        // .Lloop (0x1000):
+        //   xor eax, eax    (31 C0, 2 bytes — kills flags at loop entry)
+        //   sub rcx, 1      (48 83 E9 01, 4 bytes)
+        //   jne .Lloop      (75 F8, 2 bytes -> target 0x1000)
+        //   ret             (C3, 1 byte — kills flags on fallthrough)
+        let orig = vec![0x31, 0xC0, 0x48, 0x83, 0xE9, 0x01, 0x75, 0xF8, 0xC3];
+        let mut saw_add_neg1 = false;
+        for seed in 0..32u64 {
+            let mut code = orig.clone();
+            let mut prng = Prng::new(seed);
+            let mut stats = Stats::default();
+            pass_reg_reg_morph(&mut code, 0x1000, &mut prng, &mut stats);
+            if &code[2..6] == &[0x48, 0x83, 0xC1, 0xFF] {
+                saw_add_neg1 = true;
+                break;
+            }
+        }
+        assert!(
+            saw_add_neg1,
+            "sub rcx, 1 followed by jne (where both paths kill CF/AF) must morph to add rcx, -1"
+        );
     }
 }

@@ -66,6 +66,18 @@ pub const SHELL_IMA_CAP: usize = 8;
 /// Interactive console prompt string.
 pub const SHELL_PROMPT: &[u8] = b"proteus> ";
 
+/// Seccomp deny bit for `SYS_GETPID` (`getpid`).
+pub const SECCOMP_DENY_GETPID: u8 = 1 << 0;
+/// Seccomp deny bit for `SYS_YIELD` (`yield`).
+pub const SECCOMP_DENY_YIELD: u8 = 1 << 1;
+/// Seccomp deny bit for `SYS_GETTIME_NS` (`time`).
+pub const SECCOMP_DENY_TIME: u8 = 1 << 2;
+/// Seccomp deny bit for `SYS_OPEN` (`open`).
+pub const SECCOMP_DENY_OPEN: u8 = 1 << 3;
+/// Seccomp deny mask for all user-facing shell syscalls (`getpid|yield|time|open`).
+pub const SECCOMP_DENY_ALL: u8 =
+    SECCOMP_DENY_GETPID | SECCOMP_DENY_YIELD | SECCOMP_DENY_TIME | SECCOMP_DENY_OPEN;
+
 /// System-level action requested by a shell command.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ShellAction {
@@ -87,9 +99,9 @@ impl ShellAction {
 }
 
 /// Live, stateful OS console environment integrating VFS, Scheduler,
-/// Capability Gate, Syscall Dispatcher, IMA Binary Verification, TPM PCR-10
-/// Measurement, Stateless CIDR Firewall, Keyed HMAC-SHA256 WAL Continuity,
-/// Signed Remote Attestation Quotes, and AuditLog.
+/// Capability Gate, Syscall Dispatcher, Per-PID eBPF Seccomp Sandboxing,
+/// IMA Binary Verification, TPM PCR-10 Measurement, Stateless CIDR Firewall,
+/// Keyed HMAC-SHA256 WAL Continuity, Signed Remote Attestation Quotes, and AuditLog.
 pub struct OsShell {
     /// Mounted root in-memory filesystem.
     pub fs: MemRamFs<SHELL_FS_INODES, SHELL_FS_POOL>,
@@ -99,6 +111,9 @@ pub struct OsShell {
     pub audit: AuditLogImpl<SHELL_AUDIT_CAP>,
     /// Per-PID capability bitmask indexed by `pid as usize` (for `pid < SHELL_MAX_TASKS`).
     pub task_caps: [u64; SHELL_MAX_TASKS],
+    /// Per-PID eBPF Seccomp syscall deny bitmask indexed by `pid as usize`
+    /// (`SECCOMP_DENY_GETPID | SECCOMP_DENY_YIELD | SECCOMP_DENY_TIME | SECCOMP_DENY_OPEN`).
+    pub seccomp_mask: [u8; SHELL_MAX_TASKS],
     /// Live stateless IPv4 CIDR packet filter table.
     pub fw: FirewallTable<8>,
     /// IMA trusted binary paths.
@@ -141,6 +156,7 @@ impl OsShell {
             sched: RoundRobin::new(),
             audit: AuditLogImpl::new(),
             task_caps: [0u64; SHELL_MAX_TASKS],
+            seccomp_mask: [0u8; SHELL_MAX_TASKS],
             fw: FirewallTable::new(),
             ima_paths: [[0u8; 32]; SHELL_IMA_CAP],
             ima_path_lens: [0u8; SHELL_IMA_CAP],
@@ -213,6 +229,7 @@ impl OsShell {
         self.task_caps[2] = sys_caps;
         self.task_caps[3] = sys_caps;
         self.task_caps[4] = sys_caps;
+        self.seccomp_mask = [0u8; SHELL_MAX_TASKS];
         // Advance scheduler so PID 4 (proteus-sh) is active after boot init/daemons.
         let _ = self.sched.pick_next();
         let _ = self.sched.pick_next();
@@ -331,16 +348,18 @@ impl OsShell {
         {
             return true;
         }
-        if (bytes_eq(cmd, b"ima") || bytes_eq(cmd, b"fw")) && rest.is_empty() {
+        if (bytes_eq(cmd, b"ima") || bytes_eq(cmd, b"fw") || bytes_eq(cmd, b"seccomp"))
+            && (rest.is_empty() || bytes_eq(rest, b"status"))
+        {
             return true;
         }
         false
     }
 
     /// Checkpoint all user/mutable files, active worker tasks (`pid >= 5`)
-    /// plus their capability masks, stateless firewall CIDR rules (`W`),
-    /// custom enrolled IMA binary digests (`I`), and the monotonic UDP
-    /// anti-replay sequence watermark (`Q`) into `wal`, flushing with a
+    /// plus their capability and eBPF Seccomp masks, stateless firewall CIDR
+    /// rules (`W`), custom enrolled IMA binary digests (`I`), and the monotonic
+    /// UDP anti-replay sequence watermark (`Q`) into `wal`, flushing with a
     /// `DURABLE_WAL_WRITE` [`proteus_contracts::CapProof`].
     ///
     /// Returns the number of WAL records written.
@@ -391,7 +410,8 @@ impl OsShell {
                     rec[3] = pid_b[2];
                     rec[4] = pid_b[3];
                     let cap_mask = if (t.id as usize) < SHELL_MAX_TASKS {
-                        self.task_caps[t.id as usize]
+                        (self.task_caps[t.id as usize] & 0x00FF_FFFF_FFFF_FFFF)
+                            | ((self.seccomp_mask[t.id as usize] as u64) << 56)
                     } else {
                         0
                     };
@@ -474,9 +494,9 @@ impl OsShell {
     }
 
     /// Replay a committed [`WalImpl`] into this shell, restoring all
-    /// persisted files, active worker tasks, per-task capability masks,
-    /// stateless firewall CIDR rules, custom IMA digests, and the anti-replay
-    /// sequence watermark.
+    /// persisted files, active worker tasks, per-task capability and Seccomp
+    /// masks, stateless firewall CIDR rules, custom IMA digests, and the
+    /// anti-replay sequence watermark.
     ///
     /// Returns the number of WAL records applied.
     pub fn restore_wal<const C: usize>(&mut self, wal: &WalImpl<C>) -> usize {
@@ -495,7 +515,7 @@ impl OsShell {
                 }
             } else if payload.len() == 13 && payload[0] == b'T' {
                 let pid = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
-                let cap_mask = u64::from_le_bytes([
+                let packed = u64::from_le_bytes([
                     payload[5],
                     payload[6],
                     payload[7],
@@ -505,10 +525,13 @@ impl OsShell {
                     payload[11],
                     payload[12],
                 ]);
+                let cap_mask = packed & 0x00FF_FFFF_FFFF_FFFF;
+                let seccomp = (packed >> 56) as u8;
                 if pid >= 5 {
                     let _ = self.sched.enqueue_with_priority(pid, 5);
                     if (pid as usize) < SHELL_MAX_TASKS {
                         self.task_caps[pid as usize] = cap_mask;
+                        self.seccomp_mask[pid as usize] = seccomp & SECCOMP_DENY_ALL;
                     }
                     if pid >= self.next_pid {
                         self.next_pid = pid.wrapping_add(1);
@@ -726,7 +749,16 @@ impl OsShell {
                     } else {
                         0
                     };
+                    let sc = if (t.id as usize) < SHELL_MAX_TASKS {
+                        self.seccomp_mask[t.id as usize]
+                    } else {
+                        0
+                    };
                     pos += dec_u64(cap, &mut buf[pos..]);
+                    if sc != 0 {
+                        pos += copy_into(b"/", &mut buf[pos..]);
+                        pos += dec_u64(sc as u64, &mut buf[pos..]);
+                    }
                     pos += copy_into(b";", &mut buf[pos..]);
                 }
             }
@@ -823,7 +855,7 @@ impl OsShell {
         if bytes_eq(cmd, b"help") || bytes_eq(cmd, b"?") {
             self.record_audit(1, AuditVerdict::Allowed, b"shell:help");
             let n = copy_into(
-                b"commands: help uname status ps spawn kill caps grant revoke syscall exec ima fw seal attest ls cat write rm stat net audit halt reboot\n",
+                b"commands: help uname status ps spawn kill caps grant revoke syscall seccomp exec ima fw seal attest ls cat write rm stat net audit halt reboot\n",
                 out,
             );
             return ShellAction::Continue(n);
@@ -855,6 +887,7 @@ impl OsShell {
             if self.sched.enqueue_with_priority(pid, 5) {
                 if (pid as usize) < SHELL_MAX_TASKS {
                     self.task_caps[pid as usize] = 0;
+                    self.seccomp_mask[pid as usize] = 0;
                 }
                 self.next_pid = self.next_pid.wrapping_add(1);
                 self.record_audit(5, AuditVerdict::Allowed, b"shell:spawn");
@@ -891,6 +924,11 @@ impl OsShell {
 
         if bytes_eq(cmd, b"syscall") {
             let n = self.cmd_syscall(rest, out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"seccomp") {
+            let n = self.cmd_seccomp(rest, out);
             return ShellAction::Continue(n);
         }
 
@@ -1089,6 +1127,7 @@ impl OsShell {
             let _ = self.sched.reap(pid);
             if (pid as usize) < SHELL_MAX_TASKS {
                 self.task_caps[pid as usize] = 0;
+                self.seccomp_mask[pid as usize] = 0;
             }
             self.record_audit(6, AuditVerdict::Allowed, b"shell:kill");
             let mut pos = 0usize;
@@ -1131,7 +1170,7 @@ impl OsShell {
         if pid <= 4 && !is_grant {
             self.record_audit(17, AuditVerdict::Denied, b"shell:revoke:protected-task");
             return copy_into(b"error: permission denied (protected system task)\n", out);
-        }
+        };
         if (pid as usize) >= SHELL_MAX_TASKS || self.sched.task(pid).is_none() {
             self.record_audit(17, AuditVerdict::Error, b"shell:cap:no-pid");
             return copy_into(b"error: no such pid\n", out);
@@ -1175,8 +1214,32 @@ impl OsShell {
             self.record_audit(18, AuditVerdict::Error, b"shell:syscall:no-pid");
             return copy_into(b"error: no such pid\n", out);
         }
+        let nr = if bytes_eq(sys_name, b"open") {
+            SYS_OPEN
+        } else if bytes_eq(sys_name, b"getpid") {
+            SYS_GETPID
+        } else if bytes_eq(sys_name, b"yield") {
+            SYS_YIELD
+        } else if bytes_eq(sys_name, b"time") {
+            SYS_GETTIME_NS
+        } else {
+            self.record_audit(18, AuditVerdict::Error, b"shell:syscall:unknown");
+            return copy_into(b"error: unknown syscall (use getpid, yield, time, open)\n", out);
+        };
+
+        // Pre-dispatch eBPF Seccomp-BPF syscall sandboxing gate:
+        // Evaluates the per-PID eBPF filter program in `EBpfImpl` before kernel capability checks.
+        let seccomp = self.seccomp_mask[pid as usize];
+        if seccomp != 0 && !evaluate_seccomp_ebpf(seccomp, nr) {
+            self.record_audit(18, AuditVerdict::Denied, b"shell:syscall:seccomp");
+            return copy_into(
+                b"syscall denied: EACCES (blocked by eBPF seccomp filter)\n",
+                out,
+            );
+        }
+
         let mask = self.task_caps[pid as usize];
-        if bytes_eq(sys_name, b"open") {
+        if nr == SYS_OPEN {
             let path = if sys_arg.is_empty() { b"/etc/hostname" } else { sys_arg };
             // Check FS_BYPASS capability via the locked CapProof mint path.
             let proof = match check_cap(SYS_OPEN, mask) {
@@ -1204,17 +1267,6 @@ impl OsShell {
             }
         }
 
-        let nr = if bytes_eq(sys_name, b"getpid") {
-            SYS_GETPID
-        } else if bytes_eq(sys_name, b"yield") {
-            SYS_YIELD
-        } else if bytes_eq(sys_name, b"time") {
-            SYS_GETTIME_NS
-        } else {
-            self.record_audit(18, AuditVerdict::Error, b"shell:syscall:unknown");
-            return copy_into(b"error: unknown syscall (use getpid, yield, time, open)\n", out);
-        };
-
         match dispatch_with_cap(nr, mask, 0, 0, 0, 0, 0, 0) {
             Ok(ret) => {
                 self.record_audit(18, AuditVerdict::Allowed, b"shell:syscall:ok");
@@ -1233,6 +1285,109 @@ impl OsShell {
                 copy_into(b"syscall error\n", out)
             }
         }
+    }
+
+    fn cmd_seccomp(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        let (sub, rest) = split_first_word(trim_ascii(arg));
+        if sub.is_empty() || bytes_eq(sub, b"status") {
+            self.record_audit(27, AuditVerdict::Allowed, b"shell:seccomp:status");
+            let mut active_filters = 0usize;
+            let mut p = 0usize;
+            while p < SHELL_MAX_TASKS {
+                if self.seccomp_mask[p] != 0 && self.sched.task(p as u32).is_some() {
+                    active_filters += 1;
+                }
+                p += 1;
+            }
+            let mut pos = 0usize;
+            pos += copy_into(b"seccomp: filters=", &mut out[pos..]);
+            pos += dec_u64(active_filters as u64, &mut out[pos..]);
+            pos += copy_into(b" engine=ebpf\n", &mut out[pos..]);
+            let mut pid = 0usize;
+            while pid < SHELL_MAX_TASKS {
+                let m = self.seccomp_mask[pid];
+                if m != 0 && self.sched.task(pid as u32).is_some() {
+                    pos += copy_into(b"  pid=", &mut out[pos..]);
+                    pos += dec_u64(pid as u64, &mut out[pos..]);
+                    pos += copy_into(b" deny_mask=", &mut out[pos..]);
+                    pos += dec_u64(m as u64, &mut out[pos..]);
+                    pos += copy_into(b" (", &mut out[pos..]);
+                    pos += fmt_seccomp_mask(m, &mut out[pos..]);
+                    pos += copy_into(b")\n", &mut out[pos..]);
+                }
+                pid += 1;
+            }
+            return pos;
+        }
+        if bytes_eq(sub, b"clear") {
+            let Some(pid) = parse_u32_ascii(trim_ascii(rest)) else {
+                self.record_audit(27, AuditVerdict::Error, b"shell:seccomp:bad-pid");
+                return copy_into(b"usage: seccomp clear <pid>\n", out);
+            };
+            if (pid as usize) >= SHELL_MAX_TASKS || self.sched.task(pid).is_none() {
+                self.record_audit(27, AuditVerdict::Error, b"shell:seccomp:no-pid");
+                return copy_into(b"error: no such pid\n", out);
+            }
+            self.seccomp_mask[pid as usize] = 0;
+            self.record_audit(27, AuditVerdict::Allowed, b"shell:seccomp:clear");
+            let mut pos = 0usize;
+            pos += copy_into(b"seccomp: cleared filter on pid=", &mut out[pos..]);
+            pos += dec_u64(pid as u64, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            return pos;
+        }
+        if bytes_eq(sub, b"deny") {
+            let (pid_str, sys_name) = split_first_word(trim_ascii(rest));
+            let Some(pid) = parse_u32_ascii(pid_str) else {
+                self.record_audit(27, AuditVerdict::Error, b"shell:seccomp:bad-args");
+                return copy_into(
+                    b"usage: seccomp deny <pid> <getpid|yield|time|open|all>\n",
+                    out,
+                );
+            };
+            if pid <= 4 {
+                self.record_audit(27, AuditVerdict::Denied, b"shell:seccomp:protected-task");
+                return copy_into(b"error: permission denied (protected system task)\n", out);
+            }
+            if (pid as usize) >= SHELL_MAX_TASKS || self.sched.task(pid).is_none() {
+                self.record_audit(27, AuditVerdict::Error, b"shell:seccomp:no-pid");
+                return copy_into(b"error: no such pid\n", out);
+            }
+            let bit = if bytes_eq(sys_name, b"getpid") {
+                SECCOMP_DENY_GETPID
+            } else if bytes_eq(sys_name, b"yield") {
+                SECCOMP_DENY_YIELD
+            } else if bytes_eq(sys_name, b"time") {
+                SECCOMP_DENY_TIME
+            } else if bytes_eq(sys_name, b"open") {
+                SECCOMP_DENY_OPEN
+            } else if bytes_eq(sys_name, b"all") {
+                SECCOMP_DENY_ALL
+            } else {
+                self.record_audit(27, AuditVerdict::Error, b"shell:seccomp:unknown");
+                return copy_into(
+                    b"error: unknown syscall (use getpid, yield, time, open, all)\n",
+                    out,
+                );
+            };
+            self.seccomp_mask[pid as usize] |= bit;
+            let new_mask = self.seccomp_mask[pid as usize];
+            self.record_audit(27, AuditVerdict::Allowed, b"shell:seccomp:deny");
+            let mut pos = 0usize;
+            pos += copy_into(b"seccomp: denied ", &mut out[pos..]);
+            pos += copy_into(sys_name, &mut out[pos..]);
+            pos += copy_into(b" on pid=", &mut out[pos..]);
+            pos += dec_u64(pid as u64, &mut out[pos..]);
+            pos += copy_into(b" (mask=", &mut out[pos..]);
+            pos += dec_u64(new_mask as u64, &mut out[pos..]);
+            pos += copy_into(b")\n", &mut out[pos..]);
+            return pos;
+        }
+        self.record_audit(27, AuditVerdict::Error, b"shell:seccomp:bad-arg");
+        copy_into(
+            b"usage: seccomp [status | deny <pid> <getpid|yield|time|open|all> | clear <pid>]\n",
+            out,
+        )
     }
 
     fn cmd_ls(&self, out: &mut [u8]) -> usize {
@@ -2157,6 +2312,89 @@ fn sanitize_nonce(raw: &[u8]) -> &[u8] {
     }
 }
 
+/// Dynamically compile and evaluate a per-PID Seccomp-BPF filter program
+/// inside the verified [`EBpfImpl`] interpreter (`proteus_contracts::EBpf`).
+///
+/// Filter program layout:
+/// 1. `ST_MEM_DW [r1 + 0], syscall_nr` — writes `seccomp_data.nr` (`u64`) to stack `[0..8]`
+/// 2. `LDX_MEM_DW r2, [r1 + 0]` — loads `seccomp_data.nr` into `r2`
+/// 3. `MOV64_IMM r0, 0` — sets default return value `SECCOMP_RET_DENY` (`0`)
+/// 4. `JMP_JEQ_IMM r2, denied_nr, +jump_to_exit` — for each denied syscall in `seccomp_mask`
+/// 5. `MOV64_IMM r0, 1` — sets `SECCOMP_RET_ALLOW` (`1`) if no rule matched
+/// 6. `BPF_OP_EXIT`
+fn evaluate_seccomp_ebpf(seccomp_mask: u8, syscall_nr: u64) -> bool {
+    if seccomp_mask == 0 {
+        return true;
+    }
+    let mut denied_nrs = [0u64; 4];
+    let mut denied_count = 0usize;
+    if (seccomp_mask & SECCOMP_DENY_GETPID) != 0 {
+        denied_nrs[denied_count] = SYS_GETPID;
+        denied_count += 1;
+    }
+    if (seccomp_mask & SECCOMP_DENY_YIELD) != 0 {
+        denied_nrs[denied_count] = SYS_YIELD;
+        denied_count += 1;
+    }
+    if (seccomp_mask & SECCOMP_DENY_TIME) != 0 {
+        denied_nrs[denied_count] = SYS_GETTIME_NS;
+        denied_count += 1;
+    }
+    if (seccomp_mask & SECCOMP_DENY_OPEN) != 0 {
+        denied_nrs[denied_count] = SYS_OPEN;
+        denied_count += 1;
+    }
+    if denied_count == 0 {
+        return true;
+    }
+
+    let st_dw = bpf_op::BPF_CLASS_ST | bpf_op::BPF_SIZE_DW;
+    let ldx_dw = bpf_op::BPF_CLASS_LDX | bpf_op::BPF_SIZE_DW;
+    let mov64_imm = bpf_op::BPF_CLASS_ALU64 | bpf_op::BPF_OP_MOV;
+    let jeq_imm = bpf_op::BPF_CLASS_JMP | bpf_op::BPF_JMP_JEQ;
+
+    let mut prog = [BpfInstr::new(0, 0, 0, 0, 0); 12];
+    prog[0] = BpfInstr::new(st_dw, 1, 0, 0, syscall_nr as i32);
+    prog[1] = BpfInstr::new(ldx_dw, 2, 1, 0, 0);
+    prog[2] = BpfInstr::new(mov64_imm, 0, 0, 0, 0);
+    let mut j = 0usize;
+    while j < denied_count {
+        let jump_to_exit = (denied_count - j) as i16;
+        prog[3 + j] = BpfInstr::new(jeq_imm, 2, 0, jump_to_exit, denied_nrs[j] as i32);
+        j += 1;
+    }
+    prog[3 + denied_count] = BpfInstr::new(mov64_imm, 0, 0, 0, 1);
+    prog[3 + denied_count + 1] = BpfInstr::new(bpf_op::BPF_OP_EXIT, 0, 0, 0, 0);
+    let total_insns = 3 + denied_count + 2;
+
+    let mut ctx = BpfContext::new();
+    matches!(EBpfImpl::run(&prog[..total_insns], &mut ctx), Ok(1))
+}
+
+fn fmt_seccomp_mask(mask: u8, out: &mut [u8]) -> usize {
+    let mut pos = 0usize;
+    let mut first = true;
+    let entries: &[(u8, &[u8])] = &[
+        (SECCOMP_DENY_GETPID, b"getpid"),
+        (SECCOMP_DENY_YIELD, b"yield"),
+        (SECCOMP_DENY_TIME, b"time"),
+        (SECCOMP_DENY_OPEN, b"open"),
+    ];
+    let mut i = 0usize;
+    while i < entries.len() {
+        let (bit, name) = entries[i];
+        if (mask & bit) != 0 {
+            if !first {
+                pos += copy_into(b",", &mut out[pos..]);
+            }
+            pos += copy_into(name, &mut out[pos..]);
+            first = false;
+        }
+        i += 1;
+    }
+    pos
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2523,6 +2761,78 @@ mod tests {
         let mut bad_mac = mac;
         bad_mac[0] ^= 1;
         assert!(!sh.verify_attestation_mac(3, b"challenge-99", &bad_mac));
+    }
+
+    #[test]
+    fn ebpf_seccomp_syscall_sandboxing_and_wal_persistence_work() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 512];
+
+        assert!(OsShell::is_readonly_command(b"seccomp"));
+        assert!(OsShell::is_readonly_command(b"seccomp status"));
+        assert!(!OsShell::is_readonly_command(b"seccomp deny 5 open"));
+
+        // System tasks (PID 1..4) are protected from Seccomp deny:
+        let act = sh.exec_line(b"seccomp deny 1 open", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"error: permission denied (protected system task)\n"
+        );
+
+        // Spawn worker PID 5 and grant FS_BYPASS:
+        let _ = sh.exec_line(b"spawn", 1, 0, 0, &mut out);
+        let _ = sh.exec_line(b"grant 5 fs", 1, 0, 0, &mut out);
+        let act = sh.exec_line(b"syscall 5 open /etc/hostname", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act.bytes_written()], b"syscall ok: ret=0\n");
+
+        // Attach eBPF Seccomp filter denying `open` on PID 5:
+        let act = sh.exec_line(b"seccomp deny 5 open", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"seccomp: denied open on pid=5 (mask=8)\n"
+        );
+
+        // Even though PID 5 holds FS_BYPASS, the eBPF Seccomp filter blocks `open` with EACCES:
+        let act = sh.exec_line(b"syscall 5 open /etc/hostname", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"syscall denied: EACCES (blocked by eBPF seccomp filter)\n"
+        );
+        // Unfiltered syscalls (`getpid`) continue to succeed:
+        let act = sh.exec_line(b"syscall 5 getpid", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act.bytes_written()], b"syscall ok: ret=1\n");
+
+        // Inspect `seccomp status`:
+        let act = sh.exec_line(b"seccomp", 1, 0, 0, &mut out);
+        let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
+        assert_eq!(
+            s,
+            "seccomp: filters=1 engine=ebpf\n  pid=5 deny_mask=8 (open)\n"
+        );
+
+        // Persist across WAL / disk image and verify Seccomp filter survives morph reboot:
+        let mut hdr_sec = [0u8; 512];
+        let mut wal_sec = [0u8; 512];
+        let count = sh.pack_disk_image(1, &mut hdr_sec, &mut wal_sec).unwrap();
+        assert_eq!(count, 1); // 1 worker task (PID 5) with packed caps + seccomp
+
+        let mut boot2_sh = OsShell::new();
+        let (_, applied) = boot2_sh.unpack_disk_image(&hdr_sec, &wal_sec).unwrap();
+        assert_eq!(applied, 1);
+        let act = boot2_sh.exec_line(b"syscall 5 open /etc/hostname", 2, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"syscall denied: EACCES (blocked by eBPF seccomp filter)\n"
+        );
+
+        // Clearing the filter restores `open` access:
+        let act = boot2_sh.exec_line(b"seccomp clear 5", 2, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"seccomp: cleared filter on pid=5\n"
+        );
+        let act = boot2_sh.exec_line(b"syscall 5 open /etc/hostname", 2, 0, 0, &mut out);
+        assert_eq!(&out[..act.bytes_written()], b"syscall ok: ret=0\n");
     }
 }
 

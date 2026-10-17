@@ -708,6 +708,7 @@ fn build_status_http(
                 || view.path == b"/uname"
                 || view.path == b"/seal"
                 || view.path == b"/attest"
+                || view.path == b"/seccomp"
                 || view.path == b"/ima"
                 || view.path == b"/fw";
             if is_shell_endpoint {
