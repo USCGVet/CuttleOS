@@ -63,8 +63,9 @@ fn read_cmos_and_pit_word(round: u64) -> u64 {
     while i < CMOS_REGS.len() {
         let reg = CMOS_REGS[(i + (round as usize)) % CMOS_REGS.len()];
         // SAFETY: Running at CPL=0; port 0x70 is the standard MC146818 CMOS
-        // index register (bit 7 = 0 preserves NMI state) and port 0x71 is the
-        // read-only RTC data port. Neither aliases memory.
+        // index register (bit 7 = 0 keeps NMIs enabled, which is safe because
+        // the kernel IDT is already installed) and port 0x71 is the read-only
+        // RTC data port. Neither aliases memory.
         let val = unsafe {
             outb(0x70, reg & 0x7F);
             inb(0x71)

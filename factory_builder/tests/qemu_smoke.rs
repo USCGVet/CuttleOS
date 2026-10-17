@@ -854,10 +854,214 @@ fn boots_under_qemu_and_emits_banner() {
             ),
         }
     }
+    if log_contents.contains("SHELL resume REJECTED") {
+        panic!(
+            "QEMU smoke: unexpected SHELL resume REJECTED on clean disk!\nSerial log:\n{}",
+            log_contents
+        );
+    }
+    if log_contents.contains("CONTINUITY resume OK") {
+        assert!(
+            log_contents.contains("SHELL resume OK"),
+            "QEMU smoke: expected SHELL resume OK on boot > 1 (CONTINUITY resume OK present), but it was missing!\nSerial log:\n{}",
+            log_contents
+        );
+    } else if log_contents.contains("CONTINUITY genesis") {
+        // First boot on a freshly initialized ahci_hw.img: boot a second time to
+        // prove cross-boot SHELL resume OK works with the provisioned fw_cfg key.
+        let resume_log_path = images_dir.join("qemu_smoke_resume_serial.log");
+        let resume_log = boot_existing_smoke_image(
+            &qemu,
+            &bios,
+            &virtio_disk,
+            &ahci_disk,
+            &nvme_disk,
+            &device_key_path,
+            &resume_log_path,
+        );
+        assert!(
+            !resume_log.contains("SHELL resume REJECTED"),
+            "QEMU smoke (boot 2): unexpected SHELL resume REJECTED!\nSerial log:\n{}",
+            resume_log
+        );
+        assert!(
+            resume_log.contains("CONTINUITY resume OK") && resume_log.contains("SHELL resume OK"),
+            "QEMU smoke (boot 2): expected CONTINUITY resume OK + SHELL resume OK!\nSerial log:\n{}",
+            resume_log
+        );
+    }
     eprintln!(
-        "smoke: all {} required banners observed in order; QEMU smoke test PASSED",
+        "smoke: all {} required banners + SHELL resume OK verified in order; QEMU smoke test PASSED",
         required_banners.len()
     );
+}
+
+fn boot_existing_smoke_image(
+    qemu: &Path,
+    bios: &Path,
+    virtio_disk: &Path,
+    ahci_disk: &Path,
+    nvme_disk: &Path,
+    device_key_path: &Path,
+    serial_log: &Path,
+) -> String {
+    let _ = std::fs::remove_file(serial_log);
+    let mut qproc = Command::new(qemu)
+        .arg("-accel")
+        .arg("tcg")
+        .arg("-fw_cfg")
+        .arg(format!(
+            "name={},file={}",
+            factory_builder::FW_CFG_DEVICE_KEY_NAME,
+            device_key_path.display()
+        ))
+        .arg("-drive")
+        .arg(format!("format=raw,file={},if=ide", bios.display()))
+        .arg("-drive")
+        .arg(format!(
+            "if=none,id=vd0,format=raw,file={}",
+            virtio_disk.display()
+        ))
+        .arg("-device")
+        .arg("virtio-blk-pci,drive=vd0,disable-legacy=off,disable-modern=on")
+        .arg("-netdev")
+        .arg("hubport,id=n0,hubid=1")
+        .arg("-device")
+        .arg("virtio-net-pci,netdev=n0,disable-legacy=off,disable-modern=on")
+        .arg("-netdev")
+        .arg("hubport,id=n1,hubid=1")
+        .arg("-device")
+        .arg("virtio-net-pci,netdev=n1,disable-legacy=off,disable-modern=on")
+        .arg("-drive")
+        .arg(format!(
+            "if=none,id=ahd0,format=raw,file={}",
+            ahci_disk.display()
+        ))
+        .arg("-device")
+        .arg("ahci,id=ahci0")
+        .arg("-device")
+        .arg("ide-hd,drive=ahd0,bus=ahci0.0")
+        .arg("-netdev")
+        .arg("hubport,id=e0,hubid=2")
+        .arg("-device")
+        .arg("e1000,netdev=e0")
+        .arg("-netdev")
+        .arg("hubport,id=e1,hubid=2")
+        .arg("-device")
+        .arg("e1000,netdev=e1")
+        .arg("-drive")
+        .arg(format!(
+            "if=none,id=nvme0,format=raw,file={}",
+            nvme_disk.display()
+        ))
+        .arg("-device")
+        .arg("nvme,drive=nvme0,serial=PROTEUS-NVME-HW")
+        .arg("-serial")
+        .arg(format!("file:{}", serial_log.display()))
+        .arg("-display")
+        .arg("none")
+        .arg("-no-reboot")
+        .arg("-m")
+        .arg("256M")
+        .arg("-d")
+        .arg("cpu_reset")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn qemu for follow-up boot");
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        if let Ok(s) = std::fs::read_to_string(serial_log) {
+            if s.contains("PROTEUS-TE HALT") {
+                break;
+            }
+        }
+    }
+    let _ = qproc.kill();
+    let _ = qproc.wait();
+    std::fs::read_to_string(serial_log).unwrap_or_default()
+}
+
+#[test]
+#[ignore = "requires nightly rust-src + factory_builder_pkg + qemu-system-x86_64"]
+fn tampered_ahci_seal_is_rejected_under_qemu() {
+    let Some(qemu) = find_qemu() else {
+        panic!("qemu-system-x86_64 not found");
+    };
+    let root = workspace_root();
+    let images_dir = root.join("target").join("proteus_images");
+    std::fs::create_dir_all(&images_dir).expect("create images_dir");
+    let bios = images_dir.join("qemu_smoke_bios.img");
+    if !bios.exists() {
+        let kernel_crate = root.join("target_enterprise_kernel");
+        let pkg_crate = factory_builder::locate_pkg_crate().expect("locate_pkg_crate");
+        let elf = factory_builder::build_kernel(&kernel_crate).expect("build_kernel");
+        factory_builder::package_kernel_via_pkg(&pkg_crate, &elf, &bios, None)
+            .expect("package_kernel_via_pkg");
+    }
+    let virtio_disk = images_dir.join("virtio_hw.img");
+    if !virtio_disk.exists() {
+        std::fs::write(&virtio_disk, vec![0u8; 1024 * 1024]).expect("create virtio_hw.img");
+    }
+    let nvme_disk = images_dir.join("nvme_hw.img");
+    if !nvme_disk.exists() {
+        std::fs::write(&nvme_disk, vec![0u8; 1024 * 1024]).expect("create nvme_hw.img");
+    }
+    let device_key_path = root.join(factory_builder::DEVICE_SECRET_KEY_FILENAME);
+    factory_builder::ensure_device_secret_key(&device_key_path)
+        .expect("provision 32-byte CSPRNG device_secret_key.bin");
+
+    // Work on a dedicated scratch AHCI image so the persistent ahci_hw.img is untouched.
+    let tampered_disk = images_dir.join("ahci_tamper_test.img");
+    std::fs::write(&tampered_disk, vec![0u8; 1024 * 1024]).expect("init ahci_tamper_test.img");
+    let tamper_log = images_dir.join("qemu_tamper_serial.log");
+
+    // Boot 1: write valid sealed state (LBA 1024 continuity + LBA 1040..=1041 OsShell WAL).
+    let log1 = boot_existing_smoke_image(
+        &qemu,
+        &bios,
+        &virtio_disk,
+        &tampered_disk,
+        &nvme_disk,
+        &device_key_path,
+        &tamper_log,
+    );
+    assert!(
+        log1.contains("SHELL compose OK tasks=5 files=5 audit=5"),
+        "tamper test boot 1 did not complete SHELL compose:\n{}",
+        log1
+    );
+
+    // Tamper with the sealed WAL payload at LBA 1041 (offset 1041 * 512 + 8).
+    let mut disk_bytes = std::fs::read(&tampered_disk).expect("read ahci_tamper_test.img");
+    let wal_offset = 1041 * 512 + 8;
+    disk_bytes[wal_offset] ^= 0xFF;
+    std::fs::write(&tampered_disk, &disk_bytes).expect("write tampered ahci_tamper_test.img");
+
+    // Boot 2: the tampered disk must emit SHELL resume REJECTED and must NOT emit SHELL resume OK.
+    let log2 = boot_existing_smoke_image(
+        &qemu,
+        &bios,
+        &virtio_disk,
+        &tampered_disk,
+        &nvme_disk,
+        &device_key_path,
+        &tamper_log,
+    );
+    let _ = std::fs::remove_file(&tampered_disk);
+    assert!(
+        log2.contains("SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)"),
+        "tamper test boot 2 did not emit SHELL resume REJECTED!\nSerial log:\n{}",
+        log2
+    );
+    assert!(
+        !log2.contains("SHELL resume OK"),
+        "tamper test boot 2 unexpectedly emitted SHELL resume OK on a tampered disk!\nSerial log:\n{}",
+        log2
+    );
+    eprintln!("smoke: tampered AHCI seal was rejected as expected; TAMPER TEST PASSED");
 }
 
 #[test]
