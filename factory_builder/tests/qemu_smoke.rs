@@ -157,11 +157,9 @@ fn boots_under_qemu_and_emits_banner() {
         std::fs::write(&virtio_disk, vec![0u8; 1024 * 1024]).expect("create virtio_hw.img");
     }
     // TASK-113: 1 MiB disk on a real AHCI HBA (IDENTIFY → 2048 sectors).
+    // Always start with a clean 1 MiB image so Boot 1 (provision) and Boot 2 (resume) are deterministic.
     let ahci_disk = images_dir.join("ahci_hw.img");
-    if !ahci_disk.exists() || std::fs::metadata(&ahci_disk).map(|m| m.len()).unwrap_or(0) < 1024 * 1024
-    {
-        std::fs::write(&ahci_disk, vec![0u8; 1024 * 1024]).expect("create ahci_hw.img");
-    }
+    std::fs::write(&ahci_disk, vec![0u8; 1024 * 1024]).expect("create ahci_hw.img");
     // TASK-119: 1 MiB NVMe namespace for real admin identify.
     let nvme_disk = images_dir.join("nvme_hw.img");
     if !nvme_disk.exists() || std::fs::metadata(&nvme_disk).map(|m| m.len()).unwrap_or(0) < 1024 * 1024
@@ -738,6 +736,7 @@ fn boots_under_qemu_and_emits_banner() {
         // containment rule panics here and the banners never appear.
         "CRASH_DUMP wrote 16384 bytes to lba=1024 crc=8fb6eb0e",
         "SYMBOL resolve OK kernel_main+0x42 (5 frames)",
+        "WEB+SQL+SESSION compose OK tables=2 rows=6 magic=PRTSSQL1",
         "SECCOMP: OK engine=ebpf filter=enforced",
         "ATTEST: OK seed=",
         "FS partition OK lba=1042..1057 sectors=16 files=1 magic=PRTSFS01",
@@ -989,6 +988,7 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
     for expected in [
         "RING3 transition OK cpl=3->0 vec=0x80 ist1=ok rsp0=ok syscall=43",
         "TPM2_TIS driver OK did_vid=000115d1 locality=0 pcr10=extended",
+        "WEB+SQL+SESSION compose OK tables=2 rows=6 magic=PRTSSQL1",
         "FS partition OK lba=1042..1057 sectors=16 files=1 magic=PRTSFS01",
         "HTTPS+TCP4 compose OK slots=4 port=443 tls13=ok",
         "SHELL compose OK tasks=5 files=5 audit=5",

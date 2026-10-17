@@ -74,6 +74,7 @@ pub mod scheduler;
 pub mod serial16550;
 pub mod shell;
 pub mod sigkat;
+pub mod sql;
 pub mod syscall;
 pub mod tick_source;
 pub mod tls;
@@ -98,6 +99,7 @@ pub use crate::net::{
 };
 pub use crate::scheduler::{RoundRobin, Task, TaskId, TaskState};
 pub use crate::shell::{OsShell, ShellAction, SHELL_PROMPT};
+pub use crate::sql::{SqlDb, SQL_PART_SECTORS};
 pub use crate::syscall::{
     BufferSink, CapTableImpl, Errno, NullSink, SyscallDispatchImpl, WriteSink, CAP_TABLE_TASKS,
     PERMISSIVE_CAP_TABLE, SYS_CAP_CHECK, SYS_CLOSE, SYS_EXIT, SYS_GETPID, SYS_GETTIME_NS, SYS_OPEN,

@@ -583,9 +583,15 @@ pub(crate) const SHELL_DISK_LBA: u64 = 1040;
 /// First LBA of the 16-sector (`8 KiB`, `PRTSFS01` superblock + inode table +
 /// data pool) block-backed filesystem partition on the AHCI disk (`LBA 1042..=1057`).
 pub(crate) const SHELL_FS_DISK_LBA: u64 = 1042;
+/// First LBA of the 8-sector (`4 KiB`, `PRTSSQL1` superblock + relational tables)
+/// embedded SQL database partition on the AHCI disk (`LBA 1058..=1065`).
+pub(crate) const SHELL_SQL_DISK_LBA: u64 = 1058;
 
 static FS_PART_SECTORS: spin::Mutex<[[u8; 512]; target_enterprise::shell::SHELL_FS_PART_SECTORS]> =
     spin::Mutex::new([[0u8; 512]; target_enterprise::shell::SHELL_FS_PART_SECTORS]);
+
+static SQL_PART_SECTORS_BUF: spin::Mutex<[[u8; 512]; target_enterprise::SQL_PART_SECTORS]> =
+    spin::Mutex::new([[0u8; 512]; target_enterprise::SQL_PART_SECTORS]);
 
 pub(crate) fn persist_shell_to_ahci(sh: &mut target_enterprise::OsShell, boots: u64) -> Option<usize> {
     let mut hdr_sec = [0u8; 512];
@@ -593,7 +599,16 @@ pub(crate) fn persist_shell_to_ahci(sh: &mut target_enterprise::OsShell, boots: 
     let count = sh.pack_disk_image(boots, &mut hdr_sec, &mut wal_sec).ok()?;
     let mut fs_secs = FS_PART_SECTORS.lock();
     sh.pack_fs_partition(boots, &mut *fs_secs).ok()?;
+    let mut sql_secs = SQL_PART_SECTORS_BUF.lock();
+    sh.pack_sql_partition(&mut *sql_secs);
     let port = AhciHwPort::probe_start();
+    // Write SQL partition payload sectors first, then SQL superblock sector last (crash-atomic).
+    let mut sq = 1usize;
+    while sq < target_enterprise::SQL_PART_SECTORS {
+        port.write_sector(SHELL_SQL_DISK_LBA + (sq as u64), &sql_secs[sq]);
+        sq += 1;
+    }
+    port.write_sector(SHELL_SQL_DISK_LBA, &sql_secs[0]);
     // Write directory + data sectors first, then superblock sector last (crash-atomic).
     let mut s = 1usize;
     while s < target_enterprise::shell::SHELL_FS_PART_SECTORS {
@@ -660,6 +675,31 @@ pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Op
             }
         }
     }
+    let sql_sb = port.read_sector(SHELL_SQL_DISK_LBA);
+    let mut sql_present = false;
+    let mut k = 0usize;
+    while k < 512 {
+        if sql_sb[k] != 0 {
+            sql_present = true;
+            break;
+        }
+        k += 1;
+    }
+    if sql_present {
+        let mut sql_secs = SQL_PART_SECTORS_BUF.lock();
+        sql_secs[0] = sql_sb;
+        let mut sq = 1usize;
+        while sq < target_enterprise::SQL_PART_SECTORS {
+            sql_secs[sq] = port.read_sector(SHELL_SQL_DISK_LBA + (sq as u64));
+            sq += 1;
+        }
+        if !sh.unpack_sql_partition(&*sql_secs) {
+            serial_write_str(
+                "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
+            );
+            return None;
+        }
+    }
     Some(res)
 }
 
@@ -706,6 +746,14 @@ pub(crate) fn banner_shell_compose() {
             let ar = sh.exec_line(b"cat /var/boot.ok", boots, 0, 0, &mut out);
             if &out[..ar.bytes_written()] != b"ready\n" {
                 panic!("SHELL resume: cross-boot /var/boot.ok drift");
+            }
+            if sh.db.total_rows() > 3 {
+                let sq_n = sh
+                    .db
+                    .exec(b"SELECT v, rev FROM kv WHERE k = 'boot.state'", &mut out);
+                if &out[..sq_n] != b"v|rev\nready|1\n" {
+                    panic!("SHELL resume: cross-boot SQL partition drift");
+                }
             }
             serial_write_str("SHELL resume OK\n");
         } else if sh.audit.len() > 0 {
@@ -782,9 +830,15 @@ pub(crate) fn banner_shell_compose() {
     if &out[..a11.bytes_written()] != b"fw: blocked src=192.168.66.0/24\n" || sh.fw.len() != 1 {
         panic!("SHELL compose: fw block CIDR failed");
     }
+    let sq_ins = sh
+        .db
+        .exec(b"INSERT INTO kv VALUES ('boot.state', 'ready', 1)", &mut out);
+    if &out[..sq_ins] != b"INSERT 1\n" {
+        panic!("SHELL compose: SQL INSERT INTO kv failed");
+    }
     sh.auth_seq = 7;
 
-    // Persist sealed WAL (F + T + W + Q = 4 records) to physical AHCI disk sectors 1040..=1041 and verify round-trip restore:
+    // Persist sealed WAL (F + T + W + Q = 4 records), 16-sector FS partition, and 8-sector SQL partition to physical AHCI disk:
     if persist_shell_to_ahci(sh, boots) != Some(4) {
         panic!("SHELL compose: AHCI persist expected 4 records");
     }
@@ -802,6 +856,23 @@ pub(crate) fn banner_shell_compose() {
     if vsh.fw.len() != 1 || vsh.auth_seq != 7 || vsh.seccomp_mask[5] != 8 {
         panic!("SHELL compose: AHCI restored fw/auth_seq/seccomp drift");
     }
+    let av_sql = vsh.exec_line(
+        b"sql SELECT v, rev FROM kv WHERE k = 'boot.state'",
+        boots,
+        0,
+        0,
+        &mut out,
+    );
+    if &out[..av_sql.bytes_written()] != b"v|rev\nready|1\n" {
+        panic!("SHELL compose: AHCI restored SQL partition drift");
+    }
+    let av_sess = vsh.exec_line(b"session create admin boot", boots, 0, 0, &mut out);
+    if !out[..av_sess.bytes_written()].starts_with(b"session: created user=admin sid=")
+        || vsh.active_session_count() != 1
+    {
+        panic!("SHELL compose: session create drift");
+    }
+    serial_write_str("WEB+SQL+SESSION compose OK tables=2 rows=6 magic=PRTSSQL1\n");
     let av_sc = vsh.exec_line(b"syscall 5 open /var/boot.ok", boots, 0, 0, &mut out);
     if &out[..av_sc.bytes_written()]
         != b"syscall denied: EACCES (blocked by eBPF seccomp filter)\n"
@@ -826,7 +897,7 @@ pub(crate) fn banner_shell_compose() {
     };
     if !vsh.verify_attestation_mac(boots, b"boot-quote", &mac) {
         panic!("SHELL compose: remote attestation MAC verification failed");
-    }
+    };
     // A quote for a different nonce must not verify.
     if vsh.verify_attestation_mac(boots, b"other-quote", &mac) {
         panic!("SHELL compose: remote attestation MAC accepted the wrong nonce");

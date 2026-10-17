@@ -90,4 +90,5 @@ modules = [
     "interrupts",      # x86-64 256-vector IDT gate descriptor codec
     "syscall",         # Capability-gated (`CapProof`) syscall dispatch table
     "shell",           # Interactive OS console shell and subsystem runtime (`OsShell`)
+    "sql",             # Embedded zero-allocation relational SQL engine (`SqlDb`)
 ]

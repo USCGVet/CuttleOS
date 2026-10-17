@@ -13,7 +13,7 @@ Proteus is designed for high-assurance appliances, isolated network gateways, an
 | Crate | Purpose |
 | :--- | :--- |
 | [`contracts`](file:///d:/RustProjects/Proteus/contracts) | Immutable `no_std` trait and wire-format contract definitions (`proteus-contracts`) shared by the kernel and host verifier. Never morphed. |
-| [`target_enterprise`](file:///d:/RustProjects/Proteus/target_enterprise) | Pure `no_std`, zero-allocation OS subsystem implementations (72 modules: TLS 1.3, X.509, TCP/IP, HTTP, DNS, DHCP, ARP, ICMP, VirtIO, NVMe, AHCI, IOMMU, KPTI, VFS, JFS, FAT32, WAL, TPM 2.0, eBPF, Seccomp, AuditLog, and [`OsShell`](file:///d:/RustProjects/Proteus/target_enterprise/src/shell.rs)). |
+| [`target_enterprise`](file:///d:/RustProjects/Proteus/target_enterprise) | Pure `no_std`, zero-allocation OS subsystem implementations (73 modules: TLS 1.3, X.509, TCP/IP, HTTP, DNS, DHCP, ARP, ICMP, VirtIO, NVMe, AHCI, IOMMU, KPTI, VFS, JFS, FAT32, WAL, SQL, TPM 2.0, eBPF, Seccomp, AuditLog, and [`OsShell`](file:///d:/RustProjects/Proteus/target_enterprise/src/shell.rs)). |
 | [`target_enterprise_kernel`](file:///d:/RustProjects/Proteus/target_enterprise_kernel) | Bare-metal `x86_64-unknown-none` bootable unikernel linking `target_enterprise` to physical hardware drivers (16550 UART, PCI, AHCI, NVMe, VirtIO-net/blk, e1000, APIC/IOAPIC, HPET/PIT/RTC). |
 | [`diversifier`](file:///d:/RustProjects/Proteus/diversifier) | Deterministic, seed-driven Rust AST diversifier (`proteus-diversifier`) applying item/statement/match-arm reordering, private symbol/local renaming, arithmetic/branch/loop semantic rewrites, and inline-hint perturbation. |
 | [`binmorph`](file:///d:/RustProjects/Proteus/binmorph) | Post-link, size-preserving x86-64 ELF `.text` binary rewriter (`proteus-binmorph`) performing register permutation, prologue/epilogue stack-slot permutation, basic-block instruction commutation, and opcode-class instruction morphing. |
@@ -26,7 +26,7 @@ Proteus is designed for high-assurance appliances, isolated network gateways, an
 
 ## Diversification Pipeline
 
-Every morph cycle applies three orthogonal diversification layers to the 68 enrolled kernel modules in [`scheduler.toml`](file:///d:/RustProjects/Proteus/scheduler.toml) (while refusing to touch the security-critical files listed in [`locked_modules.toml`](file:///d:/RustProjects/Proteus/locked_modules.toml)):
+Every morph cycle applies three orthogonal diversification layers to the 69 enrolled kernel modules in [`scheduler.toml`](file:///d:/RustProjects/Proteus/scheduler.toml) (while refusing to touch the security-critical files listed in [`locked_modules.toml`](file:///d:/RustProjects/Proteus/locked_modules.toml)):
 
 1. **Source AST Diversification (`proteus-diversifier`)**:
    - Reorders top-level items, independent statements, and literal `match` arms.
@@ -47,33 +47,39 @@ Every morph cycle applies three orthogonal diversification layers to the 68 enro
 
 ---
 
-## OS Runtime & Security Model
+## OS Runtime, Services & Security Model
 
 ### Hardware Privilege Isolation & Interrupt Architecture
 - **Live GDT, 64-bit TSS, and 256-Entry IDT ([`gdt.rs`](file:///d:/RustProjects/Proteus/target_enterprise/src/gdt.rs), [`interrupts.rs`](file:///d:/RustProjects/Proteus/target_enterprise/src/interrupts.rs), [`banners_arch_platform.rs`](file:///d:/RustProjects/Proteus/target_enterprise_kernel/src/banners_arch_platform.rs))**: Loads a 7-entry x86-64 GDT (`KERNEL_CODE=0x08`, `KERNEL_DATA=0x10`, `USER_DATA=0x1B`, `USER_CODE=0x23`, 16-byte `TSS=0x28`), a 104-byte `Tss64` with dedicated `RSP0` and `IST1` stacks (`ltr`), and a 256-entry IDT (`lidt`).
 - **Ring-3 User Execution & Syscall Trap (`int 0x80`)**: Drops from Ring-0 (`CPL=0`) to Ring-3 (`CPL=3`) over a user-mapped page table (`PTE_USER`) via `iretq`, executes user-mode code, and traps back to Ring-0 on `TSS.RSP0` via vector `0x80` (`TYPE_TRAP_GATE_DPL3 = 0xEF`), dispatching through `SyscallDispatchImpl::dispatch_with_cap`.
 
-### Unified Subsystem Shell (`OsShell`)
-[`OsShell`](file:///d:/RustProjects/Proteus/target_enterprise/src/shell.rs) provides the interactive serial console and remote control plane:
-- **Virtual Filesystem & Block-Backed Partition (`MemRamFs`)**: `ls`, `cat`, `write`, `rm`, `stat`, `df`, `sync` (with write/unlink protection on system paths `/etc/*`, `/proc/*`, `/bin/*`). Mutable user files are persisted across reboots in a 16-sector (`8 KiB`) AHCI filesystem partition (`LBA 1042..=1057`, `SHELL_FS_MAGIC = b"PRTSFS01"`) authenticated by a chained keyed `HMAC-SHA256` superblock.
-- **Process Scheduler (`RoundRobin`)**: `ps`, `spawn`, `kill` (with system daemon protection on `PID 1..4`).
-- **Capability-Gated Syscalls (`SyscallTable` + `CapProof`)**: `caps <pid>`, `grant <pid> <fs|net|wal|all>`, `revoke <pid> <fs|net|wal|all>`, `syscall <pid> <getpid|yield|time|open> [path]`.
-- **Per-PID eBPF Seccomp Sandboxing**: `seccomp [status | deny <pid> <getpid|yield|time|open|all> | clear <pid>]` compiles and executes a Seccomp-eBPF filter program inside [`EBpfImpl`](file:///d:/RustProjects/Proteus/target_enterprise/src/ebpf.rs) at syscall entry prior to capability checks.
-- **Measured User Execution & TCG TPM 2.0 TIS Driver (`exec <path> [arg]`, `ima [status | enroll <path>]`)**: Verifies the binary's SHA-256 digest against the IMA trust table, parses ELF64 headers (`Elf64Impl`), verifies an isolated user page table (`KptiImpl`), extends TPM 2.0 `PCR-10` via [`tpm.rs`](file:///d:/RustProjects/Proteus/target_enterprise/src/tpm.rs) (`TpmTisDriver` over physical Locality 0 MMIO `0xFED4_0000` or `MemTpmTisBus`), checks a stack canary (`StackCanaryImpl`), and executes the program in `EBpfImpl`.
-- **Remote Attestation Quotes (`attest [nonce]`)**: Emits `attest: v=1 boots=<N> pcr10=<hex64> ima=<count> seal=<hex64> nonce=<nonce> hmac=<hex64>` signed with a domain-separated 256-bit `HMAC-SHA256` attestation key over the live boot counter, TPM `PCR-10`, IMA table count, live state seal, and caller nonce.
-- **Audit Log (`AuditLogImpl`)**: Records `Allowed`, `Denied`, and `Error` events across all shell, syscall, Seccomp, capability, firewall, attestation, and disk-seal operations (`audit`).
+### Embedded Relational SQL Database (`SqlDb`)
+- **Zero-Allocation SQLite-Compatible Subset ([`sql.rs`](file:///d:/RustProjects/Proteus/target_enterprise/src/sql.rs))**: Supports `CREATE TABLE <name> (<col> <INT|INTEGER|TEXT>, ...)`, `DROP TABLE <name>`, `INSERT INTO <name> VALUES (...)`, `SELECT * | COUNT(*) | <col>, ... FROM <name> [WHERE <col> <op> <val>] [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]`, `UPDATE <name> SET <col> = <val> [WHERE ...]`, `DELETE FROM <name> [WHERE ...]`, `.tables` / `SHOW TABLES`, and `.schema` / `DESCRIBE <name>`.
+- **Authenticated Block Persistence (`PRTSSQL1`)**: Serializes tables and rows into an 8-sector (`4 KiB`) AHCI disk partition (`LBA 1058..=1065`) protected by a constant-time keyed `HMAC-SHA256` tag over all 8 sectors.
+
+### Dynamic Web Application Server, Sessions & Remote Execution (`LivedNet`)
+[`LivedNet`](file:///d:/RustProjects/Proteus/target_enterprise/src/lived_net.rs) serves both HTTP/TCP (`:80`) and TLS 1.3 / HTTPS (`:443`) across a 4-slot concurrent TCP connection table (`[Tcb; 4]`):
+- **Dynamic HTML5 Dashboard (`GET /app`, `GET /dashboard`, `GET /index.html`)**: Renders live kernel boot generation, VFS file count, SQL table/row telemetry, active web session count, and authenticated operator identity.
+- **Cryptographic Web Sessions (`POST /session/login`, `GET /session/whoami`, `POST /session/logout`)**: Authenticates `<user>:<seq>:<hmac_sha256_hex>` against the device's UDP/web auth key and issues a 128-bit `HMAC-SHA256` session token (`Set-Cookie: sid=<32hex>; HttpOnly; Path=/`), accepted on subsequent requests via `Cookie: sid=<32hex>` or `X-Session-Token: <32hex>`.
+- **Networked SQL Database Server (`GET /sql?<query>`, `POST /sql`, `GET /db`, `POST /db`)**: Executes read-only `SELECT`, `.tables`, and `.schema` queries openly and requires a valid session token (`401 Unauthorized` otherwise) for mutating `CREATE`, `DROP`, `INSERT`, `UPDATE`, and `DELETE` statements.
+- **Sandboxed Remote Code Execution (`POST /exec`)**: Requires a valid session token and executes registered user binaries (`exec <path> [arg]`) through the full IMA SHA-256 verification → ELF64 parse → KPTI page-table check → TPM 2.0 `PCR-10` extend → stack canary check → eBPF execution pipeline.
+- **VFS File Server (`GET /fs/<path>`, `PUT /fs/<path>`, `DELETE /fs/<path>`)**: Serves files from `MemRamFs` with automatic `text/html`, `application/json`, and `text/plain` content-type detection; `PUT` and `DELETE` require an authenticated session and enforce system-path protection (`/etc/*`, `/proc/*`, `/bin/*`).
+- **Telemetry & UDP Control Plane**: Serves read-only telemetry (`GET /status`, `/ps`, `/ls`, `/audit`, `/uname`, `/seal`, `/attest`, `/seccomp`, `/ima`, `/fw`), enforces stateless CIDR firewall rules (`fw`), and accepts replay-protected `AUTH <seq> <hmac_sha256_hex> <cmd>` datagrams on UDP `:8080`.
+
+### Unified Subsystem Shell & Continuous OS Event Loop (`OsShell`)
+[`OsShell`](file:///d:/RustProjects/Proteus/target_enterprise/src/shell.rs) and [`live_os_console_loop`](file:///d:/RustProjects/Proteus/target_enterprise_kernel/src/main.rs#L779-L895) multiplex VirtIO-net packet processing, COM1 (`0x3F8`) + PS/2 (`0x60`/`0x64`) interactive console commands, and AHCI disk persistence in a single continuous event loop:
+- **Virtual Filesystem & Block-Backed Partition (`MemRamFs`)**: `ls`, `cat`, `write`, `rm`, `stat`, `df`, `sync` persisted across reboots in a 16-sector (`8 KiB`) AHCI partition (`LBA 1042..=1057`, `PRTSFS01`).
+- **SQL & Session Console Commands**: `sql <statement | .tables | .schema>` and `session [status | login <user> | verify <sid> | logout <sid>]`.
+- **Process Scheduler & Capability-Gated Syscalls**: `ps`, `spawn`, `kill`, `caps`, `grant`, `revoke`, `syscall`.
+- **Per-PID eBPF Seccomp Sandboxing**: `seccomp [status | deny <pid> <getpid|yield|time|open|all> | clear <pid>]`.
+- **Measured User Execution, TPM 2.0 TIS Driver & Remote Attestation**: `exec <path> [arg]`, `ima [status | enroll <path>]`, `attest [nonce]`, and `audit`.
 
 ### Out-of-Band Key Provisioning & State Continuity
 - **Master Key Provisioning ([`provisioning.rs`](file:///d:/RustProjects/Proteus/target_enterprise_kernel/src/provisioning.rs))**: `factory_builder` generates a 32-byte OS-CSPRNG key in `device_secret_key.bin` (gitignored, never stored in source, the kernel ELF, or the guest disk) and passes it to QEMU via `-fw_cfg name=opt/proteus_device_key,file=device_secret_key.bin`. On unprovisioned boots, the kernel harvests hardware entropy from `RDRAND`, `RDTSC`, CMOS RTC, 8254 PIT, and physical TPM 2.0 TIS `GetRandom` (`0xFED4_0000`).
 - **Domain-Separated Runtime Keys**:
-  - **UDP Control-Plane Auth Key**: `HMAC-SHA256(master_key, "proteus-net-auth-v1:" || mac_address)`. On unprovisioned boots (no `fw_cfg` key), `LivedNet` starts in unprovisioned mode and rejects all state-mutating `AUTH` commands.
-  - **Durable Disk Seal Key**: `HMAC-SHA256(master_key, "proteus-durable-seal-v1:" || "ahci0-lba1040")`. Seals and verifies the 2-sector (`LBA 1040..=1041`) AHCI WAL header (`SHELL_DISK_MAGIC = b"PRTSSHL1"`) and the 16-sector (`LBA 1042..=1057`) `PRTSFS01` filesystem partition in constant time across reboots. Tampered disk sectors emit `SHELL resume REJECTED` on COM1 and log an `AuditVerdict::Denied` event.
+  - **UDP & Web Session Auth Key**: `HMAC-SHA256(master_key, "proteus-net-auth-v1:" || mac_address)`. On unprovisioned boots (no `fw_cfg` key), `LivedNet` starts in unprovisioned mode and rejects all state-mutating `AUTH` and `/session/login` requests.
+  - **Durable Disk Seal Key**: `HMAC-SHA256(master_key, "proteus-durable-seal-v1:" || "ahci0-lba1040")`. Seals and verifies the 2-sector (`LBA 1040..=1041`) AHCI WAL header (`PRTSSHL1`), the 16-sector (`LBA 1042..=1057`) `PRTSFS01` filesystem partition, and the 8-sector (`LBA 1058..=1065`) `PRTSSQL1` SQL database partition in constant time across reboots.
   - **Remote Attestation Key**: `HMAC-SHA256(master_key, "proteus-remote-attest-v1:" || seed)`.
-- **Network Control Plane ([`lived_net.rs`](file:///d:/RustProjects/Proteus/target_enterprise/src/lived_net.rs))**:
-  - Enforces stateless CIDR firewall rules (`fw [status | block <cidr> | allow <cidr> | clear]`) at the IPv4 wire boundary.
-  - Maintains a 4-slot concurrent TCP connection table (`[Tcb; 4]`, `TCP_MAX_SLOTS = 4`) with LRU slot eviction.
-  - Serves read-only telemetry over HTTP/TCP port 80 (`GET /status`, `/ps`, `/ls`, `/audit`, `/uname`, `/seal`, `/attest`, `/seccomp`, `/ima`, `/fw`), TLS 1.3 / HTTPS over TCP port 443 (`ClientHello` → `ServerHello` + RFC 8446 §7.1 `HandshakeKeys` derivation + AEAD encrypted `ApplicationData` record termination), and unauthenticated UDP port 8080 `CMD <read-only-cmd>`.
-  - Requires `AUTH <seq> <hmac_sha256_hex> <cmd>` with strictly monotonic anti-replay sequence numbers (`seq`) for any state-mutating command over UDP port 8080.
 
 ---
 

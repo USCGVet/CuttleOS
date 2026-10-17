@@ -66,8 +66,46 @@ pub const SHELL_MAX_TASKS: usize = 16;
 pub const SHELL_AUDIT_CAP: usize = 32;
 /// Maximum number of IMA trusted binary digests.
 pub const SHELL_IMA_CAP: usize = 8;
+/// Maximum number of concurrent authenticated web/control-plane sessions.
+pub const SHELL_MAX_SESSIONS: usize = 4;
 /// Interactive console prompt string.
 pub const SHELL_PROMPT: &[u8] = b"proteus> ";
+
+/// Authenticated dynamic web/control-plane session entry.
+#[derive(Copy, Clone, Debug)]
+pub struct WebSession {
+    /// Whether this session slot is active.
+    pub active: bool,
+    /// 32-character lowercase hex session ID (`sid`) derived via keyed `HMAC-SHA256`.
+    pub token_hex: [u8; 32],
+    /// Principal / username bytes.
+    pub user: [u8; 16],
+    /// Valid length of `user`.
+    pub user_len: u8,
+    /// Monotonic sequence when this session was created.
+    pub created_seq: u64,
+    /// Number of authenticated requests served in this session.
+    pub requests: u32,
+}
+
+impl WebSession {
+    /// Construct an empty inactive session slot.
+    pub const fn empty() -> Self {
+        Self {
+            active: false,
+            token_hex: [0u8; 32],
+            user: [0u8; 16],
+            user_len: 0,
+            created_seq: 0,
+            requests: 0,
+        }
+    }
+
+    /// Principal username slice.
+    pub fn user_bytes(&self) -> &[u8] {
+        &self.user[..self.user_len as usize]
+    }
+}
 
 /// Seccomp deny bit for `SYS_GETPID` (`getpid`).
 pub const SECCOMP_DENY_GETPID: u8 = 1 << 0;
@@ -104,10 +142,15 @@ impl ShellAction {
 /// Live, stateful OS console environment integrating VFS, Scheduler,
 /// Capability Gate, Syscall Dispatcher, Per-PID eBPF Seccomp Sandboxing,
 /// IMA Binary Verification, TPM PCR-10 Measurement, Stateless CIDR Firewall,
+/// Embedded Relational SQL Engine (`SqlDb`), Dynamic Web Session Engine,
 /// Keyed HMAC-SHA256 WAL Continuity, Signed Remote Attestation Quotes, and AuditLog.
 pub struct OsShell {
     /// Mounted root in-memory filesystem.
     pub fs: MemRamFs<SHELL_FS_INODES, SHELL_FS_POOL>,
+    /// Embedded relational SQL database engine (`SqlDb`).
+    pub db: crate::sql::SqlDb,
+    /// Active authenticated dynamic web/control-plane sessions.
+    pub sessions: [WebSession; SHELL_MAX_SESSIONS],
     /// Live round-robin task scheduler.
     pub sched: RoundRobin<SHELL_MAX_TASKS>,
     /// Security audit ring recording all administrative commands.
@@ -156,6 +199,8 @@ impl OsShell {
     pub const fn empty() -> Self {
         Self {
             fs: MemRamFs::new(),
+            db: crate::sql::SqlDb::empty(),
+            sessions: [WebSession::empty(); SHELL_MAX_SESSIONS],
             sched: RoundRobin::new(),
             audit: AuditLogImpl::new(),
             task_caps: [0u64; SHELL_MAX_TASKS],
@@ -199,8 +244,9 @@ impl OsShell {
     }
 
     /// Populate default system files (`/etc/hostname`, `/etc/os-release`,
-    /// `/etc/motd`, `/proc/net`), kernel tasks (`PID 1..4`), and pre-enrolled
-    /// IMA SHA-256 digests for `/bin/fib` and `/bin/sum` in place.
+    /// `/etc/motd`, `/proc/net`), kernel tasks (`PID 1..4`), pre-enrolled
+    /// IMA SHA-256 digests for `/bin/fib` and `/bin/sum`, and default relational
+    /// SQL tables (`services`, `kv`) in place.
     pub fn seed_defaults(&mut self) {
         let _ = self.fs.seed_file(b"/etc/hostname", b"proteus-te\n", 64, 1);
         let _ = self.fs.seed_file(
@@ -221,6 +267,7 @@ impl OsShell {
             128,
             1,
         );
+        self.db.seed_defaults();
 
         let _ = self.sched.enqueue_with_priority(1, 10);
         let _ = self.sched.enqueue_with_priority(2, 5);
@@ -326,6 +373,139 @@ impl OsShell {
         self.record_audit(30, verdict, msg);
     }
 
+    /// Count of currently active authenticated web/control-plane sessions.
+    pub fn active_session_count(&self) -> usize {
+        let mut count = 0usize;
+        let mut i = 0usize;
+        while i < SHELL_MAX_SESSIONS {
+            if self.sessions[i].active {
+                count += 1;
+            }
+            i += 1;
+        }
+        count
+    }
+
+    /// Mint a new 128-bit (`32` hex character) authenticated session token for `user`
+    /// derived via `HMAC-SHA256(self.attest_key, "proteus-session-v1:" || user || seq || challenge)`.
+    pub fn create_session(&mut self, user: &[u8], challenge: &[u8]) -> [u8; 32] {
+        let uname = if user.is_empty() { b"admin" } else { user };
+        let ulen = uname.len().min(16);
+
+        let mut free_slot = None;
+        let mut oldest_slot = 0usize;
+        let mut oldest_seq = u64::MAX;
+        let mut i = 0usize;
+        while i < SHELL_MAX_SESSIONS {
+            if !self.sessions[i].active {
+                free_slot = Some(i);
+                break;
+            }
+            if self.sessions[i].created_seq < oldest_seq {
+                oldest_seq = self.sessions[i].created_seq;
+                oldest_slot = i;
+            }
+            i += 1;
+        }
+        let slot = free_slot.unwrap_or(oldest_slot);
+
+        let mut msg = [0u8; 128];
+        let mut pos = 0usize;
+        pos += copy_into(b"proteus-session-v1:", &mut msg[pos..]);
+        pos += copy_into(&uname[..ulen], &mut msg[pos..]);
+        pos += copy_into(b":", &mut msg[pos..]);
+        pos += dec_u64(self.cmd_seq, &mut msg[pos..]);
+        pos += copy_into(b":", &mut msg[pos..]);
+        let clen = challenge.len().min(32);
+        pos += copy_into(&challenge[..clen], &mut msg[pos..]);
+
+        let mut digest = [0u8; DURABLE_DIGEST_LEN];
+        seal_bytes_keyed(&self.attest_key, &msg[..pos], &mut digest);
+        let mut token_hex = [0u8; 32];
+        let _ = hex_bytes(&digest[..16], &mut token_hex);
+
+        let mut sess = WebSession::empty();
+        sess.active = true;
+        sess.token_hex = token_hex;
+        sess.user[..ulen].copy_from_slice(&uname[..ulen]);
+        sess.user_len = ulen as u8;
+        sess.created_seq = self.cmd_seq;
+        sess.requests = 0;
+        self.sessions[slot] = sess;
+        self.record_audit(32, AuditVerdict::Allowed, b"shell:session:login");
+        token_hex
+    }
+
+    /// Validate a 32-character hex session token in constant time and increment its request counter.
+    /// Returns `Some(slot_index)` if valid.
+    pub fn validate_session(&mut self, token_hex: &[u8]) -> Option<usize> {
+        let tok = trim_ascii(token_hex);
+        if tok.len() != 32 {
+            return None;
+        }
+        let mut matched: Option<usize> = None;
+        let mut i = 0usize;
+        while i < SHELL_MAX_SESSIONS {
+            if self.sessions[i].active {
+                let mut diff = 0u8;
+                let mut k = 0usize;
+                while k < 32 {
+                    diff |= self.sessions[i].token_hex[k] ^ tok[k];
+                    k += 1;
+                }
+                if diff == 0 {
+                    matched = Some(i);
+                }
+            }
+            i += 1;
+        }
+        if let Some(idx) = matched {
+            self.sessions[idx].requests = self.sessions[idx].requests.wrapping_add(1);
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Revoke an active session matching `token_hex` in constant time.
+    pub fn revoke_session(&mut self, token_hex: &[u8]) -> bool {
+        let tok = trim_ascii(token_hex);
+        if tok.len() != 32 {
+            return false;
+        }
+        let mut i = 0usize;
+        while i < SHELL_MAX_SESSIONS {
+            if self.sessions[i].active {
+                let mut diff = 0u8;
+                let mut k = 0usize;
+                while k < 32 {
+                    diff |= self.sessions[i].token_hex[k] ^ tok[k];
+                    k += 1;
+                }
+                if diff == 0 {
+                    self.sessions[i] = WebSession::empty();
+                    self.record_audit(32, AuditVerdict::Allowed, b"shell:session:logout");
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Serialize `self.db` into an 8-sector (`4 KiB`) partition image sealed with `self.seal_key`.
+    pub fn pack_sql_partition(&self, sectors: &mut [[u8; 512]; crate::sql::SQL_PART_SECTORS]) {
+        self.db.save_partition(&self.seal_key, sectors);
+    }
+
+    /// Verify and restore `self.db` from an 8-sector (`4 KiB`) partition image sealed with `self.seal_key`.
+    pub fn unpack_sql_partition(
+        &mut self,
+        sectors: &[[u8; 512]; crate::sql::SQL_PART_SECTORS],
+    ) -> bool {
+        self.db.load_partition(&self.seal_key, sectors)
+    }
+
     /// Returns `true` if `line` is a strictly read-only inspection command
     /// safe for unauthenticated UDP telemetry queries (`CMD <line>`).
     pub fn is_readonly_command(line: &[u8]) -> bool {
@@ -352,10 +532,16 @@ impl OsShell {
         {
             return true;
         }
-        if (bytes_eq(cmd, b"ima") || bytes_eq(cmd, b"fw") || bytes_eq(cmd, b"seccomp"))
+        if (bytes_eq(cmd, b"ima")
+            || bytes_eq(cmd, b"fw")
+            || bytes_eq(cmd, b"seccomp")
+            || bytes_eq(cmd, b"session"))
             && (rest.is_empty() || bytes_eq(rest, b"status"))
         {
             return true;
+        }
+        if bytes_eq(cmd, b"sql") && !rest.is_empty() {
+            return crate::sql::SqlDb::is_readonly_query(rest);
         }
         false
     }
@@ -1091,7 +1277,7 @@ impl OsShell {
         if bytes_eq(cmd, b"help") || bytes_eq(cmd, b"?") {
             self.record_audit(1, AuditVerdict::Allowed, b"shell:help");
             let n = copy_into(
-                b"commands: help uname status ps spawn kill caps grant revoke syscall seccomp exec ima fw seal attest ls cat write rm stat df sync net audit halt reboot\n",
+                b"commands: help uname status ps spawn kill caps grant revoke syscall seccomp exec ima fw seal attest ls cat write rm stat df sync sql session net audit halt reboot\n",
                 out,
             );
             return ShellAction::Continue(n);
@@ -1226,6 +1412,16 @@ impl OsShell {
 
         if bytes_eq(cmd, b"sync") {
             let n = self.cmd_sync(out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"sql") {
+            let n = self.cmd_sql(rest, out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"session") {
+            let n = self.cmd_session(rest, out);
             return ShellAction::Continue(n);
         }
 
@@ -1821,6 +2017,71 @@ impl OsShell {
         pos += hex_bytes(&hmac[..8], &mut out[pos..]);
         pos += copy_into(b"\n", &mut out[pos..]);
         pos
+    }
+
+    fn cmd_sql(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        let q = trim_ascii(arg);
+        if q.is_empty() {
+            self.record_audit(31, AuditVerdict::Error, b"shell:sql:no-arg");
+            return copy_into(
+                b"usage: sql <SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|.tables|.schema>\n",
+                out,
+            );
+        }
+        self.record_audit(31, AuditVerdict::Allowed, b"shell:sql");
+        self.db.exec(q, out)
+    }
+
+    fn cmd_session(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        let (sub, rest) = split_first_word(trim_ascii(arg));
+        if sub.is_empty() || bytes_eq(sub, b"status") {
+            self.record_audit(32, AuditVerdict::Allowed, b"shell:session:status");
+            let mut pos = 0usize;
+            pos += copy_into(b"sessions: active=", &mut out[pos..]);
+            pos += dec_u64(self.active_session_count() as u64, &mut out[pos..]);
+            pos += copy_into(b"/", &mut out[pos..]);
+            pos += dec_u64(SHELL_MAX_SESSIONS as u64, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            let mut i = 0usize;
+            while i < SHELL_MAX_SESSIONS {
+                if self.sessions[i].active {
+                    pos += copy_into(b"  slot=", &mut out[pos..]);
+                    pos += dec_u64(i as u64, &mut out[pos..]);
+                    pos += copy_into(b" user=", &mut out[pos..]);
+                    pos += copy_into(self.sessions[i].user_bytes(), &mut out[pos..]);
+                    pos += copy_into(b" reqs=", &mut out[pos..]);
+                    pos += dec_u64(self.sessions[i].requests as u64, &mut out[pos..]);
+                    pos += copy_into(b" sid=", &mut out[pos..]);
+                    pos += copy_into(&self.sessions[i].token_hex, &mut out[pos..]);
+                    pos += copy_into(b"\n", &mut out[pos..]);
+                }
+                i += 1;
+            }
+            return pos;
+        }
+        if bytes_eq(sub, b"create") {
+            let (user, nonce) = split_first_word(rest);
+            if user.is_empty() {
+                self.record_audit(32, AuditVerdict::Error, b"shell:session:no-user");
+                return copy_into(b"usage: session create <user> [nonce]\n", out);
+            }
+            let sid = self.create_session(user, nonce);
+            let mut pos = 0usize;
+            pos += copy_into(b"session: created user=", &mut out[pos..]);
+            pos += copy_into(&user[..user.len().min(16)], &mut out[pos..]);
+            pos += copy_into(b" sid=", &mut out[pos..]);
+            pos += copy_into(&sid, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            return pos;
+        }
+        if bytes_eq(sub, b"revoke") {
+            if self.revoke_session(rest) {
+                return copy_into(b"session: revoked\n", out);
+            }
+            self.record_audit(32, AuditVerdict::Error, b"shell:session:not-found");
+            return copy_into(b"error: session not found\n", out);
+        }
+        copy_into(b"usage: session [status | create <user> [nonce] | revoke <sid>]\n", out)
     }
 
     fn cmd_audit(&self, out: &mut [u8]) -> usize {

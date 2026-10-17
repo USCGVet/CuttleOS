@@ -768,11 +768,14 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 }
 
 
-/// Interactive OS console loop over COM1 (0x3F8) and PS/2 keyboard (0x60/0x64).
-///
-/// Runs after `PROTEUS-TE HALT` so automated smoke/soak harnesses see the
-/// completion banner immediately, while interactive sessions (`-serial stdio`
-/// or `proteus_prod` builds) stay alive and respond to shell commands.
+static CONSOLE_NET_REPLIES: spin::Mutex<target_enterprise::ReplySet> =
+    spin::Mutex::new(target_enterprise::ReplySet::new());
+static CONSOLE_NET_FRAME: spin::Mutex<[u8; 2048]> = spin::Mutex::new([0u8; 2048]);
+
+/// Unified continuous OS event loop multiplexing:
+/// - VirtIO-Net (`VnetModern`) + [`target_enterprise::LivedNet`] (`HTTP :80`, `TLS 1.3 :443`, `UDP :8080`, `ICMP`, `ARP`)
+/// - Serial console (`COM1` `0x3F8`) and PS/2 keyboard (`0x60`/`0x64`)
+/// - Live AHCI disk persistence (`LBA 1040..=1065`) on `sync`, SQL mutations, `halt`, and `reboot`
 pub(crate) fn live_os_console_loop() -> ! {
     use proteus_contracts::{KeyCode, Keyboard};
     use target_enterprise::keyboard::KeyboardImpl;
@@ -784,6 +787,18 @@ pub(crate) fn live_os_console_loop() -> ! {
     let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
     let mut kbd = KeyboardImpl::new();
 
+    let dma = dma_phys_base();
+    let mut vnet_opt = if dma != 0 { vnet_modern_init(dma) } else { None };
+    let mut net_svc_opt = vnet_opt.as_ref().map(|vn| {
+        match derive_runtime_net_auth_key(vn.mac) {
+            Some(k) => target_enterprise::LivedNet::with_auth_key(vn.mac, k),
+            None => target_enterprise::LivedNet::new_unprovisioned(vn.mac),
+        }
+    });
+    let mut net_rx: u64 = 0;
+    let mut net_tx: u64 = 0;
+    let mut last_sql_tx: u64 = sh.db.tx_seq;
+
     #[cfg(proteus_prod)]
     {
         serial_write_str("Proteus Enterprise OS interactive shell ready.\n");
@@ -794,6 +809,34 @@ pub(crate) fn live_os_console_loop() -> ! {
     let mut reply = [0u8; 512];
 
     loop {
+        let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+
+        // 0. Poll live VirtIO-Net interface for HTTP (:80), TLS 1.3 (:443), UDP (:8080), ICMP, and ARP.
+        if let (Some(vn), Some(svc)) = (vnet_opt.as_mut(), net_svc_opt.as_mut()) {
+            let mut f_guard = CONSOLE_NET_FRAME.lock();
+            if let Some((flen, head_id)) = vnet_rx(vn, &mut *f_guard) {
+                net_rx = net_rx.wrapping_add(1);
+                if flen >= 14 {
+                    let mut rep_guard = CONSOLE_NET_REPLIES.lock();
+                    *rep_guard = target_enterprise::ReplySet::new();
+                    svc.handle_frame_with_shell(&f_guard[..flen], boots, sh, &mut *rep_guard);
+                    let mut ri = 0usize;
+                    while ri < rep_guard.len() {
+                        if let Some(r) = rep_guard.get(ri) {
+                            vnet_tx(vn, r);
+                            net_tx = net_tx.wrapping_add(1);
+                        }
+                        ri += 1;
+                    }
+                }
+                vnet_rx_recycle(vn, head_id);
+                if sh.db.tx_seq != last_sql_tx {
+                    last_sql_tx = sh.db.tx_seq;
+                    let _ = persist_shell_to_ahci(sh, boots);
+                }
+            }
+        }
+
         let mut maybe_byte: Option<u8> = None;
 
         // 1. Poll COM1 (16550 UART LSR bit 0 = data ready).
@@ -823,14 +866,17 @@ pub(crate) fn live_os_console_loop() -> ! {
         }
 
         if let Some(b) = maybe_byte {
-            let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
-            let (elen, act) = sh.feed_byte(b, boots, 0, 0, &mut echo, &mut reply);
+            let (elen, act) = sh.feed_byte(b, boots, net_rx, net_tx, &mut echo, &mut reply);
             if elen > 0 {
                 serial_write_bytes(&echo[..elen]);
             }
             let rlen = act.bytes_written();
             if rlen > 0 {
                 serial_write_bytes(&reply[..rlen]);
+                if reply[..rlen].starts_with(b"sync: ok ") || sh.db.tx_seq != last_sql_tx {
+                    last_sql_tx = sh.db.tx_seq;
+                    let _ = persist_shell_to_ahci(sh, boots);
+                }
             }
             match act {
                 ShellAction::Continue(_) => {}

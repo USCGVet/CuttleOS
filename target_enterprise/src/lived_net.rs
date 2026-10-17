@@ -643,9 +643,11 @@ impl LivedNet {
         let mut app_n = 0usize;
         if seg.dst_port == HTTP_PORT {
             let cur = self.http_lens[idx];
-            if cur >= 18 && find_double_crlf(&self.http_bufs[idx][..cur]).is_some() {
-                app_n = build_status_http(&self.http_bufs[idx][..cur], boots, shell, &mut app_out);
+            if cur >= 18 && http_request_complete(&self.http_bufs[idx][..cur]) {
+                let mut req_copy = [0u8; SLOT_BUF];
+                req_copy[..cur].copy_from_slice(&self.http_bufs[idx][..cur]);
                 self.http_lens[idx] = 0;
+                app_n = self.handle_http_request(&req_copy[..cur], boots, shell, &mut app_out);
             }
         } else {
             app_n = self.process_tls13_slot(idx, boots, shell, &mut app_out);
@@ -817,7 +819,8 @@ impl LivedNet {
                 return 0;
             };
             let mut http_resp = [0u8; 480];
-            let resp_len = build_status_http(&req_plain[..req_len], boots, shell, &mut http_resp);
+            let resp_len =
+                self.handle_http_request(&req_plain[..req_len], boots, shell, &mut http_resp);
             if resp_len == 0 {
                 return 0;
             }
@@ -842,6 +845,386 @@ impl LivedNet {
 
         self.http_lens[idx] = 0;
         0
+    }
+
+    #[inline(never)]
+    fn handle_http_request(
+        &mut self,
+        req: &[u8],
+        boots: u64,
+        shell: Option<&mut crate::shell::OsShell>,
+        out: &mut [u8],
+    ) -> usize {
+        use proteus_contracts::{FS_O_CREATE, FS_O_RDONLY, FS_O_RDWR, FS_O_TRUNC, Filesystem};
+
+        let view = match HttpImpl::parse_request(req) {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let ok_path = view.path == b"/status"
+            || view.path == b"/healthz"
+            || view.path == b"/";
+        if view.method == HttpMethod::Get && ok_path {
+            let mut body = [0u8; 48];
+            let blen = status_body(boots, &mut body);
+            return HttpImpl::build_response(200, b"text/plain", &body[..blen], out).unwrap_or(0);
+        }
+
+        let Some(sh) = shell else {
+            return HttpImpl::build_response(404, b"text/plain", b"not found\n", out).unwrap_or(0);
+        };
+
+        // 1. Built-in read-only telemetry endpoints.
+        if view.method == HttpMethod::Get {
+            let is_shell_endpoint = view.path == b"/ps"
+                || view.path == b"/ls"
+                || view.path == b"/df"
+                || view.path == b"/audit"
+                || view.path == b"/uname"
+                || view.path == b"/seal"
+                || view.path == b"/attest"
+                || view.path == b"/seccomp"
+                || view.path == b"/ima"
+                || view.path == b"/fw"
+                || view.path == b"/session";
+            if is_shell_endpoint {
+                let mut sh_body = [0u8; 384];
+                let slen = sh
+                    .exec_line(&view.path[1..], boots, 0, 0, &mut sh_body)
+                    .bytes_written();
+                return HttpImpl::build_response(200, b"text/plain", &sh_body[..slen], out)
+                    .unwrap_or(0);
+            }
+        }
+
+        // 2. Dynamic HTML5 Web Application Dashboard (`GET /app` or `GET /dashboard`).
+        if view.method == HttpMethod::Get
+            && (view.path == b"/app" || view.path == b"/dashboard")
+        {
+            let sess_idx = extract_session_token(view.headers_raw)
+                .and_then(|tok| sh.validate_session(tok));
+            let mut html = [0u8; 384];
+            let mut pos = 0usize;
+            pos += copy_msg(
+                b"<!doctype html><html><head><title>Proteus OS</title></head><body><h1>Proteus MTD OS</h1><p>boots=",
+                &mut html[pos..],
+            );
+            pos += dec_u64(boots, &mut html[pos..]);
+            pos += copy_msg(b" files=", &mut html[pos..]);
+            pos += dec_u64(sh.fs.inode_count() as u64, &mut html[pos..]);
+            pos += copy_msg(b" sql_tables=", &mut html[pos..]);
+            pos += dec_u64(sh.db.table_count() as u64, &mut html[pos..]);
+            pos += copy_msg(b" sql_rows=", &mut html[pos..]);
+            pos += dec_u64(sh.db.total_rows() as u64, &mut html[pos..]);
+            pos += copy_msg(b" sessions=", &mut html[pos..]);
+            pos += dec_u64(sh.active_session_count() as u64, &mut html[pos..]);
+            pos += copy_msg(b"</p>", &mut html[pos..]);
+            if let Some(s_idx) = sess_idx {
+                pos += copy_msg(b"<p>session_user=", &mut html[pos..]);
+                pos += copy_msg(sh.sessions[s_idx].user_bytes(), &mut html[pos..]);
+                pos += copy_msg(b" reqs=", &mut html[pos..]);
+                pos += dec_u64(sh.sessions[s_idx].requests as u64, &mut html[pos..]);
+                pos += copy_msg(b"</p>", &mut html[pos..]);
+            }
+            pos += copy_msg(b"</body></html>\n", &mut html[pos..]);
+            return HttpImpl::build_response(200, b"text/html", &html[..pos], out).unwrap_or(0);
+        }
+
+        // 3. Dynamic Session Management (`/session/login`, `/session/whoami`, `/session/logout`).
+        if view.method == HttpMethod::Post && view.path == b"/session/login" {
+            if !self.auth_enabled {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:http:unprovisioned");
+                return HttpImpl::build_response(
+                    403,
+                    b"text/plain",
+                    b"error: EACCES (device key not provisioned)\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            let (seq_tok, after_seq) = split_ws(view.body);
+            let (hmac_tok, user_raw) = split_ws(after_seq);
+            let user = trim_ws(user_raw);
+            let Some(seq) = parse_u64_dec(seq_tok) else {
+                sh.record_net_audit(AuditVerdict::Error, b"net:http:login-syntax");
+                return HttpImpl::build_response(
+                    400,
+                    b"text/plain",
+                    b"usage: <seq> <hmac_hex64> <user>\n",
+                    out,
+                )
+                .unwrap_or(0);
+            };
+            if user.is_empty() || hmac_tok.len() != 64 {
+                sh.record_net_audit(AuditVerdict::Error, b"net:http:login-syntax");
+                return HttpImpl::build_response(
+                    400,
+                    b"text/plain",
+                    b"usage: <seq> <hmac_hex64> <user>\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            let watermark = self.last_auth_seq.max(sh.auth_seq);
+            if seq <= watermark {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:http:login-replay");
+                return HttpImpl::build_response(
+                    401,
+                    b"text/plain",
+                    b"error: replay detected\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            let mut provided_mac = [0u8; 32];
+            if !decode_hex_32(hmac_tok, &mut provided_mac) {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:http:login-hex");
+                return HttpImpl::build_response(
+                    401,
+                    b"text/plain",
+                    b"error: invalid hmac hex\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            let mut expected_mac = [0u8; 32];
+            Self::compute_auth_tag(&self.auth_key, seq_tok, user, &mut expected_mac);
+            let mut diff = 0u8;
+            let mut i = 0usize;
+            while i < 32 {
+                diff |= provided_mac[i] ^ expected_mac[i];
+                i += 1;
+            }
+            if diff != 0 {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:http:login-hmac");
+                return HttpImpl::build_response(
+                    401,
+                    b"text/plain",
+                    b"error: hmac verification failed\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            self.last_auth_seq = seq;
+            sh.auth_seq = seq;
+            let sid = sh.create_session(user, seq_tok);
+            let mut body = [0u8; 128];
+            let mut bpos = 0usize;
+            bpos += copy_msg(b"session: ok user=", &mut body[bpos..]);
+            bpos += copy_msg(&user[..user.len().min(16)], &mut body[bpos..]);
+            bpos += copy_msg(b" sid=", &mut body[bpos..]);
+            bpos += copy_msg(&sid, &mut body[bpos..]);
+            bpos += copy_msg(b"\n", &mut body[bpos..]);
+            return build_response_with_cookie(&sid, &body[..bpos], out);
+        }
+
+        if view.method == HttpMethod::Get && view.path == b"/session/whoami" {
+            let Some(tok) = extract_session_token(view.headers_raw) else {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:http:whoami-unauth");
+                return HttpImpl::build_response(
+                    401,
+                    b"text/plain",
+                    b"error: unauthorized\n",
+                    out,
+                )
+                .unwrap_or(0);
+            };
+            let Some(s_idx) = sh.validate_session(tok) else {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:http:whoami-invalid");
+                return HttpImpl::build_response(
+                    401,
+                    b"text/plain",
+                    b"error: unauthorized\n",
+                    out,
+                )
+                .unwrap_or(0);
+            };
+            let mut body = [0u8; 128];
+            let mut bpos = 0usize;
+            bpos += copy_msg(b"whoami: user=", &mut body[bpos..]);
+            bpos += copy_msg(sh.sessions[s_idx].user_bytes(), &mut body[bpos..]);
+            bpos += copy_msg(b" reqs=", &mut body[bpos..]);
+            bpos += dec_u64(sh.sessions[s_idx].requests as u64, &mut body[bpos..]);
+            bpos += copy_msg(b" sid=", &mut body[bpos..]);
+            bpos += copy_msg(&sh.sessions[s_idx].token_hex, &mut body[bpos..]);
+            bpos += copy_msg(b"\n", &mut body[bpos..]);
+            return HttpImpl::build_response(200, b"text/plain", &body[..bpos], out).unwrap_or(0);
+        }
+
+        if view.method == HttpMethod::Post && view.path == b"/session/logout" {
+            let Some(tok) = extract_session_token(view.headers_raw) else {
+                return HttpImpl::build_response(
+                    401,
+                    b"text/plain",
+                    b"error: unauthorized\n",
+                    out,
+                )
+                .unwrap_or(0);
+            };
+            if sh.revoke_session(tok) {
+                return HttpImpl::build_response(
+                    200,
+                    b"text/plain",
+                    b"session: logged out\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            return HttpImpl::build_response(401, b"text/plain", b"error: unauthorized\n", out)
+                .unwrap_or(0);
+        }
+
+        // 4. Embedded Relational SQL Database Server (`GET /sql`, `POST /sql`, `GET /db`, `POST /db`).
+        if view.path == b"/sql" || view.path == b"/db" {
+            if view.method == HttpMethod::Get {
+                let mut body = [0u8; 384];
+                let blen = sh.db.exec(b".tables", &mut body);
+                return HttpImpl::build_response(200, b"text/plain", &body[..blen], out)
+                    .unwrap_or(0);
+            }
+            if view.method == HttpMethod::Post {
+                let is_ro = crate::sql::SqlDb::is_readonly_query(view.body);
+                if !is_ro {
+                    let authed = extract_session_token(view.headers_raw)
+                        .and_then(|tok| sh.validate_session(tok))
+                        .is_some();
+                    if !authed {
+                        sh.record_net_audit(AuditVerdict::Denied, b"net:http:sql-unauth");
+                        return HttpImpl::build_response(
+                            401,
+                            b"text/plain",
+                            b"error: unauthorized (session required for mutating SQL)\n",
+                            out,
+                        )
+                        .unwrap_or(0);
+                    }
+                    sh.record_net_audit(AuditVerdict::Allowed, b"net:http:sql-write");
+                }
+                let mut body = [0u8; 384];
+                let blen = sh.db.exec(view.body, &mut body);
+                return HttpImpl::build_response(200, b"text/plain", &body[..blen], out)
+                    .unwrap_or(0);
+            }
+        }
+
+        // 5. Sandboxed Remote Code Execution (`POST /exec`).
+        if view.method == HttpMethod::Post && view.path == b"/exec" {
+            let authed = extract_session_token(view.headers_raw)
+                .and_then(|tok| sh.validate_session(tok))
+                .is_some();
+            if !authed {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:http:exec-unauth");
+                return HttpImpl::build_response(
+                    401,
+                    b"text/plain",
+                    b"error: unauthorized (session required for code execution)\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            let mut cmd_line = [0u8; 128];
+            let mut cpos = 0usize;
+            cpos += copy_msg(b"exec ", &mut cmd_line[cpos..]);
+            cpos += copy_msg(trim_ws(view.body), &mut cmd_line[cpos..]);
+            let mut sh_body = [0u8; 384];
+            let slen = sh
+                .exec_line(&cmd_line[..cpos], boots, 0, 0, &mut sh_body)
+                .bytes_written();
+            return HttpImpl::build_response(200, b"text/plain", &sh_body[..slen], out)
+                .unwrap_or(0);
+        }
+
+        // 6. VFS Static & Dynamic File Server (`GET /fs/<path>`, `PUT /fs/<path>`, `DELETE /fs/<path>`).
+        if view.path.len() > 4 && view.path.starts_with(b"/fs/") {
+            let vfs_path = &view.path[3..]; // includes leading `/`
+            if view.method == HttpMethod::Get {
+                let Ok(fh) = sh.fs.open(vfs_path, FS_O_RDONLY) else {
+                    return HttpImpl::build_response(404, b"text/plain", b"not found\n", out)
+                        .unwrap_or(0);
+                };
+                let mut fbuf = [0u8; 384];
+                let flen = sh.fs.read(fh, 0, &mut fbuf).unwrap_or(0);
+                let _ = sh.fs.close(fh);
+                let ctype: &[u8] = if vfs_path.ends_with(b".html") {
+                    b"text/html"
+                } else if vfs_path.ends_with(b".json") {
+                    b"application/json"
+                } else {
+                    b"text/plain"
+                };
+                return HttpImpl::build_response(200, ctype, &fbuf[..flen], out).unwrap_or(0);
+            }
+            if view.method == HttpMethod::Put {
+                let authed = extract_session_token(view.headers_raw)
+                    .and_then(|tok| sh.validate_session(tok))
+                    .is_some();
+                if !authed {
+                    sh.record_net_audit(AuditVerdict::Denied, b"net:http:fs-unauth");
+                    return HttpImpl::build_response(
+                        401,
+                        b"text/plain",
+                        b"error: unauthorized\n",
+                        out,
+                    )
+                    .unwrap_or(0);
+                }
+                if vfs_path == b"/etc/os-release" {
+                    sh.record_net_audit(AuditVerdict::Denied, b"net:http:fs-protected");
+                    return HttpImpl::build_response(
+                        403,
+                        b"text/plain",
+                        b"error: immutable system file\n",
+                        out,
+                    )
+                    .unwrap_or(0);
+                }
+                let Ok(fh) = sh.fs.open(vfs_path, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC) else {
+                    return HttpImpl::build_response(
+                        500,
+                        b"text/plain",
+                        b"error: open failed\n",
+                        out,
+                    )
+                    .unwrap_or(0);
+                };
+                let written = sh.fs.write(fh, 0, view.body).unwrap_or(0);
+                let _ = sh.fs.close(fh);
+                sh.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-put");
+                let mut msg = [0u8; 96];
+                let mut mpos = 0usize;
+                mpos += copy_msg(b"wrote ", &mut msg[mpos..]);
+                mpos += dec_u64(written as u64, &mut msg[mpos..]);
+                mpos += copy_msg(b" bytes to ", &mut msg[mpos..]);
+                mpos += copy_msg(vfs_path, &mut msg[mpos..]);
+                mpos += copy_msg(b"\n", &mut msg[mpos..]);
+                return HttpImpl::build_response(201, b"text/plain", &msg[..mpos], out)
+                    .unwrap_or(0);
+            }
+            if view.method == HttpMethod::Delete {
+                let authed = extract_session_token(view.headers_raw)
+                    .and_then(|tok| sh.validate_session(tok))
+                    .is_some();
+                if !authed {
+                    sh.record_net_audit(AuditVerdict::Denied, b"net:http:fs-unauth");
+                    return HttpImpl::build_response(
+                        401,
+                        b"text/plain",
+                        b"error: unauthorized\n",
+                        out,
+                    )
+                    .unwrap_or(0);
+                }
+                if sh.fs.unlink(vfs_path).is_ok() {
+                    sh.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-del");
+                    return HttpImpl::build_response(200, b"text/plain", b"removed\n", out)
+                        .unwrap_or(0);
+                }
+                return HttpImpl::build_response(404, b"text/plain", b"not found\n", out)
+                    .unwrap_or(0);
+            }
+        }
+
+        HttpImpl::build_response(404, b"text/plain", b"not found\n", out).unwrap_or(0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -940,47 +1323,55 @@ fn status_body(boots: u64, out: &mut [u8]) -> usize {
     n + 1
 }
 
-fn build_status_http(
-    req: &[u8],
-    boots: u64,
-    shell: Option<&mut crate::shell::OsShell>,
-    out: &mut [u8],
-) -> usize {
-    let view = match HttpImpl::parse_request(req) {
-        Ok(v) => v,
-        Err(_) => return 0,
+fn http_request_complete(buf: &[u8]) -> bool {
+    let Some(hdr_end) = find_double_crlf(buf) else {
+        return false;
     };
-    let ok_path = view.path == b"/status"
-        || view.path == b"/healthz"
-        || view.path == b"/";
-    if view.method == HttpMethod::Get && ok_path {
-        let mut body = [0u8; 48];
-        let blen = status_body(boots, &mut body);
-        return HttpImpl::build_response(200, b"text/plain", &body[..blen], out).unwrap_or(0);
-    }
-    if view.method == HttpMethod::Get {
-        if let Some(sh) = shell {
-            let is_shell_endpoint = view.path == b"/ps"
-                || view.path == b"/ls"
-                || view.path == b"/df"
-                || view.path == b"/audit"
-                || view.path == b"/uname"
-                || view.path == b"/seal"
-                || view.path == b"/attest"
-                || view.path == b"/seccomp"
-                || view.path == b"/ima"
-                || view.path == b"/fw";
-            if is_shell_endpoint {
-                let mut sh_body = [0u8; 384];
-                let slen = sh
-                    .exec_line(&view.path[1..], boots, 0, 0, &mut sh_body)
-                    .bytes_written();
-                return HttpImpl::build_response(200, b"text/plain", &sh_body[..slen], out)
-                    .unwrap_or(0);
+    let body_start = hdr_end + 4;
+    if let Ok(view) = HttpImpl::parse_request(buf) {
+        if let Some(cl_raw) = HttpImpl::find_header(view.headers_raw, b"Content-Length") {
+            if let Some(cl) = parse_u64_dec(trim_ws(cl_raw)) {
+                return buf.len() >= body_start.saturating_add(cl as usize);
             }
         }
     }
-    HttpImpl::build_response(404, b"text/plain", b"not found\n", out).unwrap_or(0)
+    true
+}
+
+fn extract_session_token(headers_raw: &[u8]) -> Option<&[u8]> {
+    if let Some(tok) = HttpImpl::find_header(headers_raw, b"X-Session-Token") {
+        let tok = trim_ws(tok);
+        if tok.len() == 32 {
+            return Some(tok);
+        }
+    }
+    if let Some(cookie) = HttpImpl::find_header(headers_raw, b"Cookie") {
+        let mut i = 0usize;
+        while i + 4 <= cookie.len() {
+            if &cookie[i..i + 4] == b"sid=" {
+                let start = i + 4;
+                if start + 32 <= cookie.len() {
+                    return Some(&cookie[start..start + 32]);
+                }
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+fn build_response_with_cookie(sid: &[u8; 32], body: &[u8], out: &mut [u8]) -> usize {
+    let mut pos = 0usize;
+    pos += copy_msg(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: sid=",
+        &mut out[pos..],
+    );
+    pos += copy_msg(sid, &mut out[pos..]);
+    pos += copy_msg(b"; HttpOnly; Path=/\r\nContent-Length: ", &mut out[pos..]);
+    pos += dec_u64(body.len() as u64, &mut out[pos..]);
+    pos += copy_msg(b"\r\n\r\n", &mut out[pos..]);
+    pos += copy_msg(body, &mut out[pos..]);
+    pos
 }
 
 fn find_double_crlf(b: &[u8]) -> Option<usize> {
@@ -1768,5 +2159,139 @@ mod tests {
         let http_str = core::str::from_utf8(&dec_http[..dlen]).unwrap();
         assert!(http_str.starts_with("HTTP/1.1 200"));
         assert!(http_str.contains("Proteus-TE x86_64 1.0-mtd"));
+    }
+
+    #[test]
+    fn dynamic_web_sessions_sql_db_exec_and_vfs_server_work() {
+        let mut net = LivedNet::new(MAC);
+        let mut sh = crate::shell::OsShell::new();
+        let mut out = [0u8; 512];
+
+        // 1. Dynamic HTML dashboard before login:
+        let n = net.handle_http_request(
+            b"GET /app HTTP/1.1\r\nHost: x\r\n\r\n",
+            4,
+            Some(&mut sh),
+            &mut out,
+        );
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"));
+        assert!(s.contains("boots=4 files=4 sql_tables=2 sql_rows=5 sessions=0"));
+
+        // 2. Unauthenticated mutating SQL and remote exec are rejected with 401:
+        let n = net.handle_http_request(
+            b"POST /sql HTTP/1.1\r\nHost: x\r\n\r\nINSERT INTO kv VALUES ('x', 'y', 1)",
+            4,
+            Some(&mut sh),
+            &mut out,
+        );
+        assert!(out[..n].starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+
+        let n = net.handle_http_request(
+            b"POST /exec HTTP/1.1\r\nHost: x\r\n\r\n/bin/fib 12",
+            4,
+            Some(&mut sh),
+            &mut out,
+        );
+        assert!(out[..n].starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+
+        // 3. Read-only SQL SELECT succeeds without a session:
+        let n = net.handle_http_request(
+            b"POST /sql HTTP/1.1\r\nHost: x\r\n\r\nSELECT name, port FROM services WHERE id = 2",
+            4,
+            Some(&mut sh),
+            &mut out,
+        );
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(s.ends_with("\r\n\r\nname|port\nhttps-tls13|443\n"));
+
+        // 4. Authenticate and mint a dynamic session via POST /session/login:
+        let mut mac = [0u8; 32];
+        LivedNet::compute_auth_tag(&DEFAULT_NET_AUTH_KEY, b"1", b"admin", &mut mac);
+        let mut hex_mac = [0u8; 64];
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for (i, &b) in mac.iter().enumerate() {
+            hex_mac[i * 2] = HEX[(b >> 4) as usize];
+            hex_mac[i * 2 + 1] = HEX[(b & 0x0F) as usize];
+        }
+        let mut login_req = [0u8; 256];
+        let mut pos = 0usize;
+        pos += copy_msg(b"POST /session/login HTTP/1.1\r\nHost: x\r\n\r\n1 ", &mut login_req[pos..]);
+        pos += copy_msg(&hex_mac, &mut login_req[pos..]);
+        pos += copy_msg(b" admin", &mut login_req[pos..]);
+        let n = net.handle_http_request(&login_req[..pos], 4, Some(&mut sh), &mut out);
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: sid="));
+        let view = HttpImpl::parse_request(
+            b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        ).unwrap();
+        let _ = view;
+        // Extract the 32-char sid from "sid=<32hex>" in body:
+        let sid_pos = s.find("sid=").unwrap() + 4;
+        let mut sid_buf = [0u8; 32];
+        sid_buf.copy_from_slice(&s.as_bytes()[sid_pos..sid_pos + 32]);
+        let sid = &sid_buf;
+
+        // 5. Verify GET /session/whoami using `Cookie: sid=<32hex>`:
+        let mut who_req = [0u8; 256];
+        let mut wpos = 0usize;
+        wpos += copy_msg(b"GET /session/whoami HTTP/1.1\r\nCookie: sid=", &mut who_req[wpos..]);
+        wpos += copy_msg(sid, &mut who_req[wpos..]);
+        wpos += copy_msg(b"\r\n\r\n", &mut who_req[wpos..]);
+        let n = net.handle_http_request(&who_req[..wpos], 4, Some(&mut sh), &mut out);
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.contains("whoami: user=admin reqs=1 sid="));
+
+        // 6. Execute authenticated mutating SQL INSERT + SELECT over HTTP:
+        let mut sql_req = [0u8; 256];
+        let mut spos = 0usize;
+        spos += copy_msg(b"POST /sql HTTP/1.1\r\nCookie: sid=", &mut sql_req[spos..]);
+        spos += copy_msg(sid, &mut sql_req[spos..]);
+        spos += copy_msg(
+            b"\r\n\r\nINSERT INTO kv VALUES ('web.user', 'admin', 3)",
+            &mut sql_req[spos..],
+        );
+        let n = net.handle_http_request(&sql_req[..spos], 4, Some(&mut sh), &mut out);
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.ends_with("\r\n\r\nINSERT 1\n"));
+
+        let n = net.handle_http_request(
+            b"POST /sql HTTP/1.1\r\nHost: x\r\n\r\nSELECT v, rev FROM kv WHERE k = 'web.user'",
+            4,
+            Some(&mut sh),
+            &mut out,
+        );
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.ends_with("\r\n\r\nv|rev\nadmin|3\n"));
+
+        // 7. Execute authenticated sandboxed ELF64/eBPF code via POST /exec:
+        let mut exec_req = [0u8; 256];
+        let mut epos = 0usize;
+        epos += copy_msg(b"POST /exec HTTP/1.1\r\nCookie: sid=", &mut exec_req[epos..]);
+        epos += copy_msg(sid, &mut exec_req[epos..]);
+        epos += copy_msg(b"\r\n\r\n/bin/fib 12", &mut exec_req[epos..]);
+        let n = net.handle_http_request(&exec_req[..epos], 4, Some(&mut sh), &mut out);
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.ends_with("\r\n\r\nexec: path=/bin/fib entry=4198400 kpti=isolated insns=11 ret=144\n"));
+
+        // 8. Author and serve an HTML page from the VFS via PUT/GET /fs/var/index.html:
+        let mut put_req = [0u8; 256];
+        let mut ppos = 0usize;
+        ppos += copy_msg(b"PUT /fs/var/index.html HTTP/1.1\r\nCookie: sid=", &mut put_req[ppos..]);
+        ppos += copy_msg(sid, &mut put_req[ppos..]);
+        ppos += copy_msg(b"\r\n\r\n<h1>Hello Proteus</h1>", &mut put_req[ppos..]);
+        let n = net.handle_http_request(&put_req[..ppos], 4, Some(&mut sh), &mut out);
+        assert!(out[..n].starts_with(b"HTTP/1.1 201 Created\r\n"));
+
+        let n = net.handle_http_request(
+            b"GET /fs/var/index.html HTTP/1.1\r\nHost: x\r\n\r\n",
+            4,
+            Some(&mut sh),
+            &mut out,
+        );
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"));
+        assert!(s.ends_with("\r\n\r\n<h1>Hello Proteus</h1>"));
     }
 }
