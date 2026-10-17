@@ -34,6 +34,11 @@ locked = [
     # "stylistically equivalent" rewrites are forbidden because the
     # canonical-AST hash drives attestation schema versioning.
     "contracts/src/lib.rs",
+    "contracts/src/core_primitives.rs",
+    "contracts/src/tls_wal_iommu_net.rs",
+    "contracts/src/kpti_virtio_security.rs",
+    "contracts/src/fs_ebpf_smp_pci_x509.rs",
+    "contracts/src/hw_storage_boot.rs",
 
     # KPTI port (TASK-017). The trampoline-blob byte sequences and the
     # CR3-swap discipline in build_user_view are LOAD-BEARING. The
@@ -43,12 +48,17 @@ locked = [
     # isolation boundary. Lock it.
     "target_enterprise/src/kpti.rs",
 
-    # The bootable kernel shell. Morphing main.rs would shuffle the
-    # boot-banner sequence (which the QEMU smoke test depends on) and
-    # the proof-banner emission order (which the attestation log
-    # depends on). Boot code is by definition the un-morphable seed of
-    # the whole system.
+    # The bootable kernel shell and its submodules. Morphing main.rs or
+    # its banner/hardware submodules would shuffle the boot-banner
+    # sequence (which the QEMU smoke test depends on) and the
+    # proof-banner emission order (which the attestation log depends
+    # on). Boot code is by definition the un-morphable seed of the
+    # whole system.
     "target_enterprise_kernel/src/main.rs",
+    "target_enterprise_kernel/src/banners_core.rs",
+    "target_enterprise_kernel/src/banners_fs_sys.rs",
+    "target_enterprise_kernel/src/hw_and_net_service.rs",
+    "target_enterprise_kernel/src/banners_compose_os.rs",
 
     # Locked fixtures (Phase C). `kernel_fixtures.rs` declares the
     # `const` inputs and expected outputs that the kernel banner

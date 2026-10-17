@@ -242,13 +242,26 @@ fn format_ratio(r: f32) -> String {
 /// caller's verifier will reject the cycle anyway, and we prefer not to
 /// fail Stage 1 on a missing-input that only PromptOnly cares about.
 pub fn read_contracts_source() -> String {
-    let candidates = [
-        Path::new("contracts/src/lib.rs"),
-        Path::new("../contracts/src/lib.rs"),
+    let dir_candidates = [Path::new("contracts/src"), Path::new("../contracts/src")];
+    let files = [
+        "lib.rs",
+        "core_primitives.rs",
+        "tls_wal_iommu_net.rs",
+        "kpti_virtio_security.rs",
+        "fs_ebpf_smp_pci_x509.rs",
+        "hw_storage_boot.rs",
     ];
-    for c in &candidates {
-        if let Ok(s) = fs::read_to_string(c) {
-            return s;
+    for dir in &dir_candidates {
+        let lib_path = dir.join("lib.rs");
+        if lib_path.is_file() {
+            let mut out = String::new();
+            for f in &files {
+                if let Ok(s) = fs::read_to_string(dir.join(f)) {
+                    out.push_str(&s);
+                    out.push('\n');
+                }
+            }
+            return out;
         }
     }
     String::new()

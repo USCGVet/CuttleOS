@@ -104,6 +104,7 @@ version = "0.0.1"
 dependencies = [
  "bootloader_api",
  "proteus-contracts",
+ "spin",
  "target_enterprise",
 ]
 

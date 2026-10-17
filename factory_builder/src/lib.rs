@@ -406,6 +406,7 @@ pub fn build_kernel_with_layout_seed_and_prod(
         rustflags = kernel_diversity_rustflags(&rustflags, seed);
         let llvm_flags = kernel_llvm_codegen_rustflags(seed);
         rustflags = format!("{rustflags} {llvm_flags}").trim().to_string();
+        cmd.env("PROTEUS_VARIANT_SEED", seed.to_string());
         eprintln!(
             "factory_builder: kernel codegen diversity enabled (seed={seed}: layout-randomize + function-shuffle + llvm-codegen [{llvm_flags}])"
         );

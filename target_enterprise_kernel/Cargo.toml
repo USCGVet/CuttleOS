@@ -11,6 +11,7 @@ description = "Bootable kernel ELF for target_enterprise. Out-of-workspace becau
 
 [dependencies]
 bootloader_api = "0.11"
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 target_enterprise = { path = "../target_enterprise" }
 proteus-contracts = { path = "../contracts" }
 

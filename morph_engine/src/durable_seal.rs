@@ -26,6 +26,41 @@ use std::path::Path;
 /// Current seal file schema version.
 pub const DURABLE_SEAL_SCHEMA: u32 = 1;
 
+/// Compute RFC 2104 `HMAC-SHA256(key, data)` using `sha2::Sha256`.
+pub fn hmac_sha256_host(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..32 {
+        ipad[i] ^= key[i];
+        opad[i] ^= key[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    inner.update(data);
+    let inner_dig = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(&inner_dig);
+    let outer_dig = outer.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&outer_dig);
+    out
+}
+
+fn constant_time_hex_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let mut diff = 0u8;
+    for i in 0..ab.len() {
+        diff |= ab[i] ^ bb[i];
+    }
+    diff == 0
+}
+
 /// On-disk / in-memory seal over a durable blob.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DurableSeal {
@@ -34,12 +69,15 @@ pub struct DurableSeal {
     pub label: String,
     /// Lowercase hex SHA-256 of the sealed bytes.
     pub sha256: String,
+    /// Optional lowercase hex `HMAC-SHA256(device_key, payload)` for tamper-proof verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hmac_sha256: Option<String>,
     /// Byte length of the sealed payload.
     pub len: u64,
 }
 
 impl DurableSeal {
-    /// Hash `payload` and build a seal with the given label.
+    /// Hash `payload` and build an unkeyed drift-detection seal with the given label.
     pub fn seal(label: &str, payload: &[u8]) -> Self {
         let mut h = Sha256::new();
         h.update(payload);
@@ -49,8 +87,17 @@ impl DurableSeal {
             schema: DURABLE_SEAL_SCHEMA,
             label: label.to_string(),
             sha256,
+            hmac_sha256: None,
             len: payload.len() as u64,
         }
+    }
+
+    /// Build a tamper-proof keyed `HMAC-SHA256` seal over `payload` using `key`.
+    pub fn seal_keyed(label: &str, payload: &[u8], key: &[u8; 32]) -> Self {
+        let mut s = Self::seal(label, payload);
+        let mac = hmac_sha256_host(key, payload);
+        s.hmac_sha256 = Some(mac.iter().map(|b| format!("{:02x}", b)).collect());
+        s
     }
 
     /// Verify `payload` matches this seal (label ignored for equality of
@@ -71,12 +118,32 @@ impl DurableSeal {
             );
         }
         let expect = DurableSeal::seal(&self.label, payload);
-        if expect.sha256 != self.sha256 {
+        if !constant_time_hex_eq(&expect.sha256, &self.sha256) {
             bail!(
                 "durable seal sha256 mismatch for label {:?}: seal={} got={}",
                 self.label,
                 self.sha256,
                 expect.sha256
+            );
+        }
+        Ok(())
+    }
+
+    /// Verify `payload` against BOTH the SHA-256 digest and the keyed `HMAC-SHA256` MAC in
+    /// constant time. Rejects unkeyed seals or seals forged by an attacker who recomputed `sha256`
+    /// without `key`.
+    pub fn verify_keyed(&self, payload: &[u8], key: &[u8; 32]) -> Result<()> {
+        self.verify(payload)?;
+        let expected_mac_hex = self
+            .hmac_sha256
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("durable seal {:?} is missing hmac_sha256 tag", self.label))?;
+        let computed = hmac_sha256_host(key, payload);
+        let computed_hex: String = computed.iter().map(|b| format!("{:02x}", b)).collect();
+        if !constant_time_hex_eq(expected_mac_hex, &computed_hex) {
+            bail!(
+                "durable seal hmac_sha256 mismatch for label {:?}: tamper or wrong key",
+                self.label
             );
         }
         Ok(())
@@ -103,6 +170,11 @@ impl DurableSeal {
         if s.sha256.len() != 64 || !s.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
             bail!("seal sha256 not 64 hex chars");
         }
+        if let Some(mac) = &s.hmac_sha256 {
+            if mac.len() != 64 || !mac.chars().all(|c| c.is_ascii_hexdigit()) {
+                bail!("seal hmac_sha256 not 64 hex chars");
+            }
+        }
         Ok(s)
     }
 }
@@ -113,11 +185,24 @@ pub fn seal_file(label: &str, path: &Path) -> Result<DurableSeal> {
     Ok(DurableSeal::seal(label, &bytes))
 }
 
+/// Convenience: seal bytes from a file path with a 256-bit `HMAC-SHA256` key.
+pub fn seal_file_keyed(label: &str, path: &Path, key: &[u8; 32]) -> Result<DurableSeal> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(DurableSeal::seal_keyed(label, &bytes, key))
+}
+
 /// Verify file contents against a seal file.
 pub fn verify_file(seal_path: &Path, data_path: &Path) -> Result<()> {
     let seal = DurableSeal::read_file(seal_path)?;
     let bytes = fs::read(data_path).with_context(|| format!("read {}", data_path.display()))?;
     seal.verify(&bytes)
+}
+
+/// Verify file contents against a keyed `HMAC-SHA256` seal file.
+pub fn verify_file_keyed(seal_path: &Path, data_path: &Path, key: &[u8; 32]) -> Result<()> {
+    let seal = DurableSeal::read_file(seal_path)?;
+    let bytes = fs::read(data_path).with_context(|| format!("read {}", data_path.display()))?;
+    seal.verify_keyed(&bytes, key)
 }
 
 /// Build the attest-entry map form of one or more seals (TASK-140).
