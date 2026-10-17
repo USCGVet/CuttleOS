@@ -49,7 +49,10 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::{extract_gadgets, normalize_gadget, read_text_section, GadgetSet, DEFAULT_MAX_INSTRS};
+use crate::{
+    canonicalize_registers_gadget, extract_gadgets, normalize_gadget, read_text_section, GadgetSet,
+    DEFAULT_MAX_INSTRS,
+};
 
 /// A synthesized exploit chain: offsets of gadgets (within `.text`,
 /// section-relative — exactly what a hardcoded payload commits to after
@@ -122,8 +125,12 @@ pub struct ChainOutcome {
     /// binmorph-sensitive).
     pub byte_hits: usize,
     /// Steps whose normalized gadget kind exists *somewhere* in the
-    /// variant (attacker B's per-step rebuild success).
+    /// variant (attacker B's exact-register per-step rebuild success).
     pub semantic_hits: usize,
+    /// Steps whose register-canonicalized gadget kind exists *somewhere*
+    /// in the variant (attacker B_reg's register-adapting per-step
+    /// rebuild success).
+    pub reg_adapted_hits: usize,
 }
 
 impl ChainOutcome {
@@ -133,9 +140,18 @@ impl ChainOutcome {
     pub fn viable_static(&self, chain_len: usize) -> bool {
         self.positional_hits == chain_len
     }
-    /// Attacker B: the chain can be re-derived against the morphed image.
+    /// Attacker B (exact-register): the chain can be re-derived against
+    /// the morphed image without changing its register assignment.
     pub fn rebuildable(&self, chain_len: usize) -> bool {
         self.semantic_hits == chain_len
+    }
+    /// Attacker B_reg (register-adapting): the chain can be re-derived
+    /// against the morphed image when the attacker also adapts to
+    /// swapped general-purpose registers (e.g. `pop r13; ret` for
+    /// `pop r12; ret`). Fails only when the opcode/mnemonic class of a
+    /// required gadget no longer exists in the variant.
+    pub fn rebuildable_reg_adapted(&self, chain_len: usize) -> bool {
+        self.reg_adapted_hits == chain_len
     }
 }
 
@@ -149,7 +165,16 @@ pub fn evaluate_chain(
     variant_text: &[u8],
 ) -> ChainOutcome {
     let variant_kinds: std::collections::HashSet<String> = variant.distinct_normalized();
-    evaluate_chain_with_kinds(chain, base, variant, &variant_kinds, base_text, variant_text)
+    let variant_reg_kinds: std::collections::HashSet<String> = variant.distinct_reg_canonicalized();
+    evaluate_chain_with_kinds(
+        chain,
+        base,
+        variant,
+        &variant_kinds,
+        &variant_reg_kinds,
+        base_text,
+        variant_text,
+    )
 }
 
 fn evaluate_chain_with_kinds(
@@ -157,6 +182,7 @@ fn evaluate_chain_with_kinds(
     base: &GadgetSet,
     variant: &GadgetSet,
     variant_kinds: &std::collections::HashSet<String>,
+    variant_reg_kinds: &std::collections::HashSet<String>,
     base_text: &[u8],
     variant_text: &[u8],
 ) -> ChainOutcome {
@@ -187,6 +213,10 @@ fn evaluate_chain_with_kinds(
         if variant_kinds.contains(&normalize_gadget(gadget_text)) {
             out.semantic_hits += 1;
         }
+        // Attacker B_reg step: same register-canonicalized kind exists anywhere.
+        if variant_reg_kinds.contains(&canonicalize_registers_gadget(gadget_text)) {
+            out.reg_adapted_hits += 1;
+        }
     }
     out
 }
@@ -205,10 +235,16 @@ pub struct ChainReport {
     pub mean_step_positional_survival: f64,
     /// Byte-exact per-step survival (binmorph-sensitivity probe).
     pub mean_step_byte_survival: f64,
-    /// Attacker B: fraction of chains rebuildable via semantic re-scan.
+    /// Attacker B (exact-register): fraction of chains rebuildable via
+    /// semantic re-scan with fixed register assignments.
     pub rebuildable: usize,
     pub rebuildable_rate: f64,
     pub mean_step_semantic_survival: f64,
+    /// Attacker B_reg (register-adapting): fraction of chains rebuildable
+    /// when the attacker also adapts to swapped general-purpose registers.
+    pub rebuildable_reg_adapted: usize,
+    pub rebuildable_reg_adapted_rate: f64,
+    pub mean_step_reg_adapted_survival: f64,
 }
 
 /// Run the two-attacker experiment: sample `n_chains` chains of
@@ -234,6 +270,7 @@ pub fn run_experiment(
         );
     }
     let variant_kinds = variant.distinct_normalized();
+    let variant_reg_kinds = variant.distinct_reg_canonicalized();
     let mut rng = Prng::new(seed);
     let mut rep = ChainReport {
         variant_label: variant_label.to_string(),
@@ -246,6 +283,9 @@ pub fn run_experiment(
         rebuildable: 0,
         rebuildable_rate: 0.0,
         mean_step_semantic_survival: 0.0,
+        rebuildable_reg_adapted: 0,
+        rebuildable_reg_adapted_rate: 0.0,
+        mean_step_reg_adapted_survival: 0.0,
     };
     for _ in 0..n_chains {
         let chain = synthesize_chain(&base, chain_len, &mut rng)?;
@@ -254,6 +294,7 @@ pub fn run_experiment(
             &base,
             &variant,
             &variant_kinds,
+            &variant_reg_kinds,
             base_text,
             variant_text,
         );
@@ -263,16 +304,22 @@ pub fn run_experiment(
         if oc.rebuildable(chain_len) {
             rep.rebuildable += 1;
         }
+        if oc.rebuildable_reg_adapted(chain_len) {
+            rep.rebuildable_reg_adapted += 1;
+        }
         rep.mean_step_positional_survival += oc.positional_hits as f64 / chain_len as f64;
         rep.mean_step_byte_survival += oc.byte_hits as f64 / chain_len as f64;
         rep.mean_step_semantic_survival += oc.semantic_hits as f64 / chain_len as f64;
+        rep.mean_step_reg_adapted_survival += oc.reg_adapted_hits as f64 / chain_len as f64;
     }
     let n = n_chains as f64;
     rep.static_viable_rate = rep.static_viable as f64 / n;
     rep.rebuildable_rate = rep.rebuildable as f64 / n;
+    rep.rebuildable_reg_adapted_rate = rep.rebuildable_reg_adapted as f64 / n;
     rep.mean_step_positional_survival /= n;
     rep.mean_step_byte_survival /= n;
     rep.mean_step_semantic_survival /= n;
+    rep.mean_step_reg_adapted_survival /= n;
     Ok(rep)
 }
 

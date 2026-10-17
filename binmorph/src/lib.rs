@@ -626,7 +626,25 @@ fn morph_instr_with_context(
                 }
                 Code::Add_rm64_imm32 | Code::Sub_rm64_imm32 => {
                     let imm = instr.immediate32() as i32;
-                    if imm != 0 && imm != i32::MIN && !(-128..=127).contains(&(-imm)) {
+                    if imm != 0
+                        && imm != i32::MIN
+                        && !(-128..=127).contains(&imm)
+                        && !(-128..=127).contains(&(-imm))
+                    {
+                        let signed_disp = if instr.code() == Code::Add_rm64_imm32 {
+                            imm as i64
+                        } else {
+                            -(imm as i64)
+                        };
+                        if (choice & 1) == 0 {
+                            if let Some(base64) = lea_disp_compatible_base64(r0) {
+                                let mem =
+                                    iced_x86::MemoryOperand::with_base_displ(base64, signed_disp);
+                                if let Ok(lea) = Instruction::with2(Code::Lea_r64_m, r0, mem) {
+                                    return Some(lea);
+                                }
+                            }
+                        }
                         let opp = if instr.code() == Code::Add_rm64_imm32 {
                             Code::Sub_rm64_imm32
                         } else {
@@ -637,7 +655,25 @@ fn morph_instr_with_context(
                 }
                 Code::Add_rm32_imm32 | Code::Sub_rm32_imm32 => {
                     let imm = instr.immediate32() as i32;
-                    if imm != 0 && imm != i32::MIN && !(-128..=127).contains(&(-imm)) {
+                    if imm != 0
+                        && imm != i32::MIN
+                        && !(-128..=127).contains(&imm)
+                        && !(-128..=127).contains(&(-imm))
+                    {
+                        let signed_disp = if instr.code() == Code::Add_rm32_imm32 {
+                            imm as i64
+                        } else {
+                            -(imm as i64)
+                        };
+                        if (choice & 1) == 0 {
+                            if let Some(base64) = lea_disp_compatible_base64(r0) {
+                                let mem =
+                                    iced_x86::MemoryOperand::with_base_displ(base64, signed_disp);
+                                if let Ok(lea) = Instruction::with2(Code::Lea_r32_m, r0, mem) {
+                                    return Some(lea);
+                                }
+                            }
+                        }
                         let opp = if instr.code() == Code::Add_rm32_imm32 {
                             Code::Sub_rm32_imm32
                         } else {
@@ -650,8 +686,8 @@ fn morph_instr_with_context(
             }
         }
 
-        // 2b. `lea r32/64, [base64 + disp8]` (where `dst == base` and
-        //     `disp8 in -127..=127, disp8 != 0`) -> `add/sub r32/64, imm8`.
+        // 2b. `lea r32/64, [base64 + disp8/disp32]` (where `dst == base` and
+        //     `disp != 0`) -> `add/sub r32/64, imm8/imm32`.
         if instr.mnemonic() == Mnemonic::Lea
             && instr.op_count() == 2
             && instr.op0_kind() == OpKind::Register
@@ -661,9 +697,9 @@ fn morph_instr_with_context(
             && instr.segment_prefix() == iced_x86::Register::None
         {
             let disp = instr.memory_displacement64() as i64;
+            let dst = instr.op0_register();
+            let base = instr.memory_base();
             if (-127..=127).contains(&disp) && disp != 0 {
-                let dst = instr.op0_register();
-                let base = instr.memory_base();
                 match instr.code() {
                     Code::Lea_r64_m if dst == base => {
                         let (op_code, imm) = if (choice & 1) == 0 {
@@ -683,11 +719,84 @@ fn morph_instr_with_context(
                     }
                     _ => {}
                 }
+            } else if disp >= (i32::MIN as i64) + 1
+                && disp <= i32::MAX as i64
+                && !(-128..=127).contains(&disp)
+                && !(-128..=127).contains(&(-disp))
+            {
+                match instr.code() {
+                    Code::Lea_r64_m if dst == base => {
+                        let (op_code, imm) = if (choice & 1) == 0 {
+                            (Code::Add_rm64_imm32, disp as i32)
+                        } else {
+                            (Code::Sub_rm64_imm32, (-disp) as i32)
+                        };
+                        return Instruction::with2(op_code, dst, imm).ok();
+                    }
+                    Code::Lea_r32_m if base64_to_reg32(base) == Some(dst) => {
+                        let (op_code, imm) = if (choice & 1) == 0 {
+                            (Code::Add_rm32_imm32, disp as i32)
+                        } else {
+                            (Code::Sub_rm32_imm32, (-disp) as i32)
+                        };
+                        return Instruction::with2(op_code, dst, imm).ok();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 3. Flag-independent 7-byte immediate load morph:
+    //    `mov r64, imm32` (`48 C7 C0+r imm32`, 7 bytes, for `RAX..RDI` when `imm32 > 0`)
+    //    <-> `lea r32, [disp32]` (`8D 04+8*r 25 disp32`, 7 bytes, zero-extends to `r64`
+    //    without touching flags or accessing memory).
+    if instr.code() == Code::Mov_rm64_imm32
+        && instr.op0_kind() == OpKind::Register
+        && (instr.immediate32() as i32) > 0
+    {
+        if let Some(dst32) = base64_to_reg32(instr.op0_register()) {
+            let imm = instr.immediate32() as u32 as u64;
+            let mem = iced_x86::MemoryOperand::with_displ(imm, 8);
+            if let Ok(lea) = Instruction::with2(Code::Lea_r32_m, dst32, mem) {
+                return Some(lea);
+            }
+        }
+    }
+    if instr.code() == Code::Lea_r32_m
+        && instr.op0_kind() == OpKind::Register
+        && instr.op1_kind() == OpKind::Memory
+        && !instr.is_ip_rel_memory_operand()
+        && instr.memory_base() == iced_x86::Register::None
+        && instr.memory_index() == iced_x86::Register::None
+        && instr.segment_prefix() == iced_x86::Register::None
+    {
+        let disp = instr.memory_displacement64() as i64;
+        if disp > 0 && disp <= i32::MAX as i64 {
+            if let Some(dst64) = reg32_to_base64_low8(instr.op0_register()) {
+                if let Ok(mov) = Instruction::with2(Code::Mov_rm64_imm32, dst64, disp as i32) {
+                    return Some(mov);
+                }
             }
         }
     }
 
     morph_reg_reg_instr(instr, choice)
+}
+
+fn reg32_to_base64_low8(reg: iced_x86::Register) -> Option<iced_x86::Register> {
+    use iced_x86::Register::*;
+    Some(match reg {
+        EAX => RAX,
+        ECX => RCX,
+        EDX => RDX,
+        EBX => RBX,
+        ESP => RSP,
+        EBP => RBP,
+        ESI => RSI,
+        EDI => RDI,
+        _ => return Option::None,
+    })
 }
 
 /// Map a 32/64-bit register to its 64-bit base register for `lea dst, [base + disp8]`,
@@ -2301,12 +2410,15 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
         let upper32_zero = allow_liveness && prev_instr_zeroed_upper32(&instrs, &branch_targets, idx);
 
         let orig_bytes = &original[pos..pos + ilen];
-        let mut alts: Vec<Vec<u8>> = Vec::new();
+        let mut alts: Vec<(Vec<u8>, bool)> = Vec::new();
         for c in 0..8u64 {
             if let Some(alt) = morph_instr_with_context(instr, c, dead_flags, upper32_zero) {
                 if let Some(bytes) = try_encode_same_len(&alt, instr) {
-                    if bytes != orig_bytes && !alts.contains(&bytes) {
-                        alts.push(bytes);
+                    if bytes != orig_bytes && !alts.iter().any(|(b, _)| b == &bytes) {
+                        let sem_changed = alt.mnemonic() != instr.mnemonic()
+                            || alt.op0_register() != instr.op0_register()
+                            || alt.memory_base() != instr.memory_base();
+                        alts.push((bytes, sem_changed));
                     }
                 }
             }
@@ -2324,24 +2436,48 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
             continue;
         }
 
-        // Prefer encodings that do NOT contain any embedded return opcode byte.
-        let clean_count = alts.iter().filter(|b| !has_ret_opcode_byte(b)).count();
+        // Prefer encodings that:
+        // 1. Do NOT contain any embedded return opcode byte (`0xC3/0xC2/0xCB/0xCA/0xCF`), AND
+        // 2. Change the disassembled mnemonic or operand order (`mov`↔`lea`, `xor`↔`sub`,
+        //    `test`↔`or`↔`and`, `add`↔`shl`, `add`↔`sub`↔`lea`, `r32`↔`r64`, SIB swap)
+        //    rather than merely flipping the direction bit (`89`↔`8B`).
+        let sem_clean_count = alts
+            .iter()
+            .filter(|(b, sem)| *sem && !has_ret_opcode_byte(b))
+            .count();
+        let clean_count = alts
+            .iter()
+            .filter(|(b, _)| !has_ret_opcode_byte(b))
+            .count();
         let pick_idx = (draw >> 1) as usize;
-        let chosen = if clean_count > 0 {
-            let mut k = pick_idx % clean_count;
+        let chosen = if sem_clean_count > 0 {
+            let mut k = pick_idx % sem_clean_count;
             alts.into_iter()
-                .find(|b| {
-                    if !has_ret_opcode_byte(b) {
+                .find_map(|(b, sem)| {
+                    if sem && !has_ret_opcode_byte(&b) {
                         if k == 0 {
-                            return true;
+                            return Some(b);
                         }
                         k -= 1;
                     }
-                    false
+                    None
+                })
+                .unwrap()
+        } else if clean_count > 0 {
+            let mut k = pick_idx % clean_count;
+            alts.into_iter()
+                .find_map(|(b, _)| {
+                    if !has_ret_opcode_byte(&b) {
+                        if k == 0 {
+                            return Some(b);
+                        }
+                        k -= 1;
+                    }
+                    None
                 })
                 .unwrap()
         } else {
-            alts.swap_remove(pick_idx % alts.len())
+            alts.swap_remove(pick_idx % alts.len()).0
         };
 
         code[pos..pos + ilen].copy_from_slice(&chosen);
@@ -2886,5 +3022,46 @@ mod tests {
                 &code[0..3]
             );
         }
+    }
+
+    #[test]
+    fn morphs_7byte_mov_r64_imm32_to_lea_r32_abs_disp32_and_back() {
+        // mov rcx, 0x1000 = 48 C7 C1 00 10 00 00 (7 bytes)
+        let mov = decode_one(&[0x48, 0xC7, 0xC1, 0x00, 0x10, 0x00, 0x00]);
+        assert_eq!(mov.code(), Code::Mov_rm64_imm32);
+        let lea = morph_instr_with_context(&mov, 0, false, false)
+            .expect("mov rcx, 0x1000 should morph to lea ecx, [0x1000]");
+        assert_eq!(lea.code(), Code::Lea_r32_m);
+        let lea_bytes = try_encode_same_len(&lea, &mov).expect("both must be 7 bytes");
+        assert_eq!(lea_bytes, vec![0x8D, 0x0C, 0x25, 0x00, 0x10, 0x00, 0x00]);
+
+        let decoded_lea = decode_one(&lea_bytes);
+        let back_mov = morph_instr_with_context(&decoded_lea, 0, false, false)
+            .expect("lea ecx, [0x1000] should morph back to mov rcx, 0x1000");
+        assert_eq!(back_mov.code(), Code::Mov_rm64_imm32);
+        let mov_bytes = try_encode_same_len(&back_mov, &decoded_lea).expect("both must be 7 bytes");
+        assert_eq!(mov_bytes, vec![0x48, 0xC7, 0xC1, 0x00, 0x10, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn morphs_dead_flags_add_imm32_to_lea_disp32_and_sub_imm32() {
+        // add rcx, 0x1000 = 48 81 C1 00 10 00 00 (7 bytes)
+        let add = decode_one(&[0x48, 0x81, 0xC1, 0x00, 0x10, 0x00, 0x00]);
+        let lea = morph_instr_with_context(&add, 0, true, false)
+            .expect("dead-flags add rcx, 0x1000 should morph to lea rcx, [rcx + 0x1000]");
+        assert_eq!(lea.code(), Code::Lea_r64_m);
+        let lea_bytes = try_encode_same_len(&lea, &add).expect("both must be 7 bytes");
+        assert_eq!(lea_bytes, vec![0x48, 0x8D, 0x89, 0x00, 0x10, 0x00, 0x00]);
+
+        let sub = morph_instr_with_context(&add, 1, true, false)
+            .expect("dead-flags add rcx, 0x1000 should morph to sub rcx, -0x1000");
+        assert_eq!(sub.code(), Code::Sub_rm64_imm32);
+        let sub_bytes = try_encode_same_len(&sub, &add).expect("both must be 7 bytes");
+        assert_eq!(sub_bytes, vec![0x48, 0x81, 0xE9, 0x00, 0xF0, 0xFF, 0xFF]);
+
+        let decoded_lea = decode_one(&lea_bytes);
+        let back_add = morph_instr_with_context(&decoded_lea, 0, true, false)
+            .expect("dead-flags lea rcx, [rcx + 0x1000] should morph back to add rcx, 0x1000");
+        assert_eq!(back_add.code(), Code::Add_rm64_imm32);
     }
 }

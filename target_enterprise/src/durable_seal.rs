@@ -25,6 +25,12 @@ pub const DURABLE_DIGEST_LEN: usize = 32;
 pub const DEFAULT_DURABLE_SEAL_KEY: [u8; DURABLE_DIGEST_LEN] =
     *b"Proteus-Enterprise-DiskSeal-K001";
 
+/// Deterministic 256-bit remote attestation key fixture used only by in-memory
+/// unit tests (`OsShell::empty`). The live kernel derives `attest_key` from the
+/// out-of-band provisioned `fw_cfg` secret via [`derive_attest_key`].
+pub const DEFAULT_ATTEST_KEY: [u8; DURABLE_DIGEST_LEN] =
+    *b"Proteus-Enterprise-Attest-Key001";
+
 /// Derive a per-device 256-bit seal key from a root secret and device/node identifier
 /// via `HMAC-SHA256(root_secret, "proteus-durable-seal-v1:" || node_id)`.
 pub fn derive_seal_key(
@@ -43,6 +49,32 @@ pub fn derive_seal_key(
     let mut j = 0usize;
     while j < node_id.len() && pos < msg.len() {
         msg[pos] = node_id[j];
+        pos += 1;
+        j += 1;
+    }
+    let mut out = [0u8; DURABLE_DIGEST_LEN];
+    hmac_sha256(root_secret, &msg[..pos], &mut out);
+    out
+}
+
+/// Derive a per-device 256-bit remote attestation quote signing key from a root
+/// secret and context label via `HMAC-SHA256(root_secret, "proteus-remote-attest-v1:" || context)`.
+pub fn derive_attest_key(
+    root_secret: &[u8; DURABLE_DIGEST_LEN],
+    context: &[u8],
+) -> [u8; DURABLE_DIGEST_LEN] {
+    const LABEL: &[u8] = b"proteus-remote-attest-v1:";
+    let mut msg = [0u8; 64];
+    let mut pos = 0usize;
+    let mut i = 0usize;
+    while i < LABEL.len() && pos < msg.len() {
+        msg[pos] = LABEL[i];
+        pos += 1;
+        i += 1;
+    }
+    let mut j = 0usize;
+    while j < context.len() && pos < msg.len() {
+        msg[pos] = context[j];
         pos += 1;
         j += 1;
     }

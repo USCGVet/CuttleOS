@@ -26,6 +26,7 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
+#![allow(unused_imports, dead_code, unused_parens, unused_mut)]
 
 pub mod acpi_rsdp;
 pub mod ahci_cmd;

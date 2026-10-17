@@ -33,8 +33,8 @@ use proteus_contracts::{
 
 use crate::audit::AuditLogImpl;
 use crate::durable_seal::{
-    seal_bytes, seal_bytes_keyed, seal_matches, seal_matches_keyed, DEFAULT_DURABLE_SEAL_KEY,
-    DURABLE_DIGEST_LEN,
+    seal_bytes, seal_bytes_keyed, seal_matches, seal_matches_keyed, DEFAULT_ATTEST_KEY,
+    DEFAULT_DURABLE_SEAL_KEY, DURABLE_DIGEST_LEN,
 };
 use crate::ebpf::EBpfImpl;
 use crate::elf64::Elf64Impl;
@@ -88,7 +88,8 @@ impl ShellAction {
 
 /// Live, stateful OS console environment integrating VFS, Scheduler,
 /// Capability Gate, Syscall Dispatcher, IMA Binary Verification, TPM PCR-10
-/// Measurement, Stateless CIDR Firewall, Keyed HMAC-SHA256 WAL Continuity, and AuditLog.
+/// Measurement, Stateless CIDR Firewall, Keyed HMAC-SHA256 WAL Continuity,
+/// Signed Remote Attestation Quotes, and AuditLog.
 pub struct OsShell {
     /// Mounted root in-memory filesystem.
     pub fs: MemRamFs<SHELL_FS_INODES, SHELL_FS_POOL>,
@@ -118,6 +119,9 @@ pub struct OsShell {
     /// 256-bit HMAC-SHA256 device key used to cryptographically seal and verify
     /// WAL/disk persistence checkpoints (`checkpoint_sealed` / `restore_sealed`).
     pub seal_key: [u8; DURABLE_DIGEST_LEN],
+    /// 256-bit HMAC-SHA256 device key used to sign live remote attestation quotes
+    /// (`attest [nonce]` / `GET /attest`).
+    pub attest_key: [u8; DURABLE_DIGEST_LEN],
     /// Next PID to assign on `spawn`.
     next_pid: TaskId,
     /// Monotonic command counter (used as synthetic timestamp/sequence).
@@ -146,6 +150,7 @@ impl OsShell {
             ima_measurements: 0,
             auth_seq: 0,
             seal_key: DEFAULT_DURABLE_SEAL_KEY,
+            attest_key: DEFAULT_ATTEST_KEY,
             next_pid: 5,
             cmd_seq: 1,
             line_buf: [0u8; SHELL_LINE_MAX],
@@ -322,6 +327,7 @@ impl OsShell {
             || bytes_eq(cmd, b"net")
             || bytes_eq(cmd, b"audit")
             || bytes_eq(cmd, b"seal")
+            || bytes_eq(cmd, b"attest")
         {
             return true;
         }
@@ -695,6 +701,7 @@ impl OsShell {
     /// Compute a 32-byte SHA-256 cryptographic seal over the live OS state
     /// (mutable files, active tasks, capability masks, firewall rules,
     /// IMA table, anti-replay watermark, and audit watermark).
+    #[inline(never)]
     pub fn compute_state_seal(&self, out: &mut [u8; DURABLE_DIGEST_LEN]) {
         let mut buf = [0u8; 1024];
         let mut pos = 0usize;
@@ -795,6 +802,7 @@ impl OsShell {
     }
 
     /// Execute one complete command line and write the formatted output into `out`.
+    #[inline(never)]
     pub fn exec_line(
         &mut self,
         raw_line: &[u8],
@@ -815,7 +823,7 @@ impl OsShell {
         if bytes_eq(cmd, b"help") || bytes_eq(cmd, b"?") {
             self.record_audit(1, AuditVerdict::Allowed, b"shell:help");
             let n = copy_into(
-                b"commands: help uname status ps spawn kill caps grant revoke syscall exec ima fw seal ls cat write rm stat net audit halt reboot\n",
+                b"commands: help uname status ps spawn kill caps grant revoke syscall exec ima fw seal attest ls cat write rm stat net audit halt reboot\n",
                 out,
             );
             return ShellAction::Continue(n);
@@ -903,6 +911,11 @@ impl OsShell {
 
         if bytes_eq(cmd, b"seal") {
             let n = self.cmd_seal(out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"attest") {
+            let n = self.cmd_attest(boots, rest, out);
             return ShellAction::Continue(n);
         }
 
@@ -1385,6 +1398,7 @@ impl OsShell {
         pos
     }
 
+    #[inline(never)]
     fn cmd_exec(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
         let (path, arg_str) = split_first_word(trim_ascii(arg));
         if path.is_empty() {
@@ -1737,6 +1751,7 @@ impl OsShell {
         copy_into(b"usage: fw [status | block <ip/prefix> | allow <ip/prefix> | clear]\n", out)
     }
 
+    #[inline(never)]
     fn cmd_seal(&mut self, out: &mut [u8]) -> usize {
         self.record_audit(23, AuditVerdict::Allowed, b"shell:seal");
         let mut dig = [0u8; DURABLE_DIGEST_LEN];
@@ -1750,6 +1765,73 @@ impl OsShell {
         pos += dec_u64(self.active_task_count() as u64, &mut out[pos..]);
         pos += copy_into(b" audit=", &mut out[pos..]);
         pos += dec_u64(self.audit.high_watermark(), &mut out[pos..]);
+        pos += copy_into(b"\n", &mut out[pos..]);
+        pos
+    }
+
+    /// Format the canonical remote attestation payload (`v=1 boots=<boots> pcr10=<hex64> ima=<count> seal=<hex64> nonce=<nonce>`)
+    /// into `out` and return the byte length.
+    fn format_attestation_body(&self, boots: u64, nonce: &[u8], out: &mut [u8]) -> usize {
+        let mut state_seal = [0u8; DURABLE_DIGEST_LEN];
+        self.compute_state_seal(&mut state_seal);
+        let clean_nonce = sanitize_nonce(nonce);
+        let mut pos = 0usize;
+        pos += copy_into(b"v=1 boots=", &mut out[pos..]);
+        pos += dec_u64(boots, &mut out[pos..]);
+        pos += copy_into(b" pcr10=", &mut out[pos..]);
+        pos += hex_bytes(&self.ima_pcr10, &mut out[pos..]);
+        pos += copy_into(b" ima=", &mut out[pos..]);
+        pos += dec_u64(self.ima_measurements, &mut out[pos..]);
+        pos += copy_into(b" seal=", &mut out[pos..]);
+        pos += hex_bytes(&state_seal, &mut out[pos..]);
+        pos += copy_into(b" nonce=", &mut out[pos..]);
+        pos += copy_into(clean_nonce, &mut out[pos..]);
+        pos
+    }
+
+    /// Compute the 32-byte `HMAC-SHA256` remote attestation signature over the
+    /// live kernel state (`boots`, `ima_pcr10`, `ima_measurements`, `state_seal`,
+    /// and caller-supplied challenge `nonce`) using `self.attest_key`.
+    pub fn compute_attestation_mac(
+        &self,
+        boots: u64,
+        nonce: &[u8],
+        mac_out: &mut [u8; DURABLE_DIGEST_LEN],
+    ) {
+        let mut body = [0u8; 256];
+        let blen = self.format_attestation_body(boots, nonce, &mut body);
+        seal_bytes_keyed(&self.attest_key, &body[..blen], mac_out);
+    }
+
+    /// Verify in constant time that `expected_mac` is a valid `HMAC-SHA256`
+    /// remote attestation quote signature for the current live kernel state
+    /// (`boots`, `ima_pcr10`, `ima_measurements`, `state_seal`, and `nonce`).
+    pub fn verify_attestation_mac(
+        &self,
+        boots: u64,
+        nonce: &[u8],
+        expected_mac: &[u8; DURABLE_DIGEST_LEN],
+    ) -> bool {
+        let mut body = [0u8; 256];
+        let blen = self.format_attestation_body(boots, nonce, &mut body);
+        seal_matches_keyed(&self.attest_key, &body[..blen], expected_mac)
+    }
+
+    /// Emit an `HMAC-SHA256` remote attestation quote line (`attest: ... hmac=<hex64>\n`)
+    /// into `out` and return the byte length.
+    #[inline(never)]
+    pub fn cmd_attest(&mut self, boots: u64, arg: &[u8], out: &mut [u8]) -> usize {
+        self.record_audit(26, AuditVerdict::Allowed, b"shell:attest");
+        let nonce = trim_ascii(arg);
+        let mut body = [0u8; 256];
+        let blen = self.format_attestation_body(boots, nonce, &mut body);
+        let mut mac = [0u8; DURABLE_DIGEST_LEN];
+        seal_bytes_keyed(&self.attest_key, &body[..blen], &mut mac);
+        let mut pos = 0usize;
+        pos += copy_into(b"attest: ", &mut out[pos..]);
+        pos += copy_into(&body[..blen], &mut out[pos..]);
+        pos += copy_into(b" hmac=", &mut out[pos..]);
+        pos += hex_bytes(&mac, &mut out[pos..]);
         pos += copy_into(b"\n", &mut out[pos..]);
         pos
     }
@@ -2051,6 +2133,28 @@ fn fmt_ipv4(b: [u8; 4], out: &mut [u8]) -> usize {
     pos += copy_into(b".", &mut out[pos..]);
     pos += dec_u64(b[3] as u64, &mut out[pos..]);
     pos
+}
+
+fn sanitize_nonce(raw: &[u8]) -> &[u8] {
+    let (tok, _) = split_first_word(trim_ascii(raw));
+    if tok.is_empty() {
+        return b"0";
+    }
+    let max_len = if tok.len() > 32 { 32 } else { tok.len() };
+    let mut i = 0usize;
+    while i < max_len {
+        let c = tok[i];
+        let valid = c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'.';
+        if !valid {
+            break;
+        }
+        i += 1;
+    }
+    if i == 0 {
+        b"0"
+    } else {
+        &tok[..i]
+    }
 }
 
 #[cfg(test)]
@@ -2393,6 +2497,32 @@ mod tests {
 
         // Verify anti-replay sequence watermark survived morph reboot:
         assert_eq!(boot2_sh.auth_seq, 42);
+    }
+
+    #[test]
+    fn remote_attestation_quote_and_mac_verification_work() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 512];
+        assert!(OsShell::is_readonly_command(b"attest"));
+        assert!(OsShell::is_readonly_command(b"attest challenge-99"));
+
+        let _ = sh.exec_line(b"exec /bin/fib 10", 3, 0, 0, &mut out);
+        let act = sh.exec_line(b"attest challenge-99", 3, 0, 0, &mut out);
+        let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
+        assert!(s.starts_with("attest: v=1 boots=3 pcr10="));
+        assert!(s.contains(" ima=1 seal="));
+        assert!(s.contains(" nonce=challenge-99 hmac="));
+
+        // Note that `attest` itself records an audit event, advancing the state seal!
+        // Compute and verify the MAC on the post-command state:
+        let mut mac = [0u8; 32];
+        sh.compute_attestation_mac(3, b"challenge-99", &mut mac);
+        assert!(sh.verify_attestation_mac(3, b"challenge-99", &mac));
+        assert!(!sh.verify_attestation_mac(3, b"wrong-nonce", &mac));
+        assert!(!sh.verify_attestation_mac(4, b"challenge-99", &mac));
+        let mut bad_mac = mac;
+        bad_mac[0] ^= 1;
+        assert!(!sh.verify_attestation_mac(3, b"challenge-99", &bad_mac));
     }
 }
 

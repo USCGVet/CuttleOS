@@ -84,6 +84,23 @@ impl GadgetSet {
     pub fn distinct_normalized(&self) -> HashSet<String> {
         self.by_offset.values().map(|g| normalize_gadget(g)).collect()
     }
+
+    /// Distinct gadget kinds with both numeric operands AND general-purpose
+    /// register names canonicalized to their width class (`r64`, `r32`,
+    /// `r16`, `r8`), while keeping architectural stack/instruction pointers
+    /// (`rsp`/`esp`/`sp`/`spl`, `rip`) distinct.
+    ///
+    /// This models **Attacker B_reg** (a leak-and-rebase attacker who also
+    /// adapts to register permutations such as `pop r13; ret` substituting
+    /// for `pop r12; ret`). Driving this metric down requires changing
+    /// instruction mnemonics / opcode classes (`mov`↔`lea`, `xor`↔`sub`,
+    /// `add`↔`lea`, `test`↔`or`↔`and`), not merely renaming registers.
+    pub fn distinct_reg_canonicalized(&self) -> HashSet<String> {
+        self.by_offset
+            .values()
+            .map(|g| canonicalize_registers_gadget(g))
+            .collect()
+    }
 }
 
 /// Mask numeric operands in a formatted gadget so two gadgets that differ
@@ -119,6 +136,52 @@ pub fn normalize_gadget(s: &str) -> String {
         } else {
             out.push(c);
             prev_ident = c.is_ascii_alphanumeric() || c == '_';
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Canonicalize both numeric operands (`N`) and interchangeable general-purpose
+/// registers (`r64`, `r32`, `r16`, `r8`) in a formatted gadget string.
+///
+/// Architectural stack pointers (`rsp`, `esp`, `sp`, `spl`) and instruction
+/// pointers (`rip`, `eip`) are intentionally preserved because a stack-pivot
+/// gadget (`pop rsp; ret`) cannot be replaced by a general-purpose register
+/// pop (`pop r13; ret`).
+pub fn canonicalize_registers_gadget(s: &str) -> String {
+    let norm = normalize_gadget(s);
+    let bytes = norm.as_bytes();
+    let mut out = String::with_capacity(norm.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                let ch = bytes[i] as char;
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let tok = &norm[start..i];
+            let replacement = match tok {
+                "rax" | "rbx" | "rcx" | "rdx" | "rsi" | "rdi" | "rbp" | "r8" | "r9" | "r10"
+                | "r11" | "r12" | "r13" | "r14" | "r15" => "r64",
+                "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "r8d" | "r9d" | "r10d"
+                | "r11d" | "r12d" | "r13d" | "r14d" | "r15d" => "r32",
+                "ax" | "bx" | "cx" | "dx" | "si" | "di" | "bp" | "r8w" | "r9w" | "r10w"
+                | "r11w" | "r12w" | "r13w" | "r14w" | "r15w" => "r16",
+                "al" | "bl" | "cl" | "dl" | "ah" | "bh" | "ch" | "dh" | "sil" | "dil" | "bpl"
+                | "r8b" | "r9b" | "r10b" | "r11b" | "r12b" | "r13b" | "r14b" | "r15b" => "r8",
+                _ => tok,
+            };
+            out.push_str(replacement);
+        } else {
+            out.push(c);
             i += 1;
         }
     }
@@ -197,6 +260,12 @@ pub struct ChurnReport {
     /// inflated by pure relocation.
     pub base_distinct_normalized: usize,
     pub semantic_survivors_normalized: usize,
+    /// Distinct base gadget kinds still present anywhere in the variant
+    /// after masking BOTH numeric operands and interchangeable GP register
+    /// names (`r64`/`r32`/`r16`/`r8`). Models an attacker who adapts to
+    /// register permutations (`Attacker B_reg`).
+    pub base_distinct_reg_canonicalized: usize,
+    pub semantic_survivors_reg_canonicalized: usize,
 }
 
 impl ChurnReport {
@@ -233,6 +302,18 @@ impl ChurnReport {
             self.semantic_survivors_normalized as f64 / self.base_distinct_normalized as f64
         }
     }
+    /// Fraction of base gadget *kinds* (numeric operands AND interchangeable
+    /// GP registers canonicalized) still available anywhere in the variant.
+    /// Isolates mnemonic/opcode-class diversity against an attacker who adapts
+    /// to swapped registers (`Attacker B_reg`).
+    pub fn semantic_survival_reg_canonicalized(&self) -> f64 {
+        if self.base_distinct_reg_canonicalized == 0 {
+            0.0
+        } else {
+            self.semantic_survivors_reg_canonicalized as f64
+                / self.base_distinct_reg_canonicalized as f64
+        }
+    }
 }
 
 /// Compare two gadget sets. Positional survival counts offsets that hold
@@ -259,6 +340,13 @@ pub fn churn(base: &GadgetSet, variant: &GadgetSet) -> ChurnReport {
         .filter(|g| variant_distinct_norm.contains(*g))
         .count();
 
+    let base_distinct_reg = base.distinct_reg_canonicalized();
+    let variant_distinct_reg = variant.distinct_reg_canonicalized();
+    let semantic_survivors_reg_canonicalized = base_distinct_reg
+        .iter()
+        .filter(|g| variant_distinct_reg.contains(*g))
+        .count();
+
     ChurnReport {
         base_gadgets: base.len(),
         variant_gadgets: variant.len(),
@@ -268,6 +356,8 @@ pub fn churn(base: &GadgetSet, variant: &GadgetSet) -> ChurnReport {
         semantic_survivors,
         base_distinct_normalized: base_distinct_norm.len(),
         semantic_survivors_normalized,
+        base_distinct_reg_canonicalized: base_distinct_reg.len(),
+        semantic_survivors_reg_canonicalized,
     }
 }
 
@@ -292,12 +382,19 @@ impl std::fmt::Display for ChurnReport {
             self.base_distinct,
             self.semantic_survival() * 100.0
         )?;
-        write!(
+        writeln!(
             f,
-            "semantic   survival: {}/{} = {:.1}%   (address-masked — TRUE instruction-mix diversity; high = weak)",
+            "semantic   survival: {}/{} = {:.1}%   (address-masked — Attacker B exact-register survival)",
             self.semantic_survivors_normalized,
             self.base_distinct_normalized,
             self.semantic_survival_normalized() * 100.0
+        )?;
+        write!(
+            f,
+            "semantic   survival: {}/{} = {:.1}%   (reg-canonicalized — Attacker B_reg opcode-class survival)",
+            self.semantic_survivors_reg_canonicalized,
+            self.base_distinct_reg_canonicalized,
+            self.semantic_survival_reg_canonicalized() * 100.0
         )
     }
 }
@@ -435,6 +532,9 @@ mod tests {
         let r = churn(&base, &variant);
         // "ret" is shared; "pop rax; ret" is not present in the variant.
         assert!(r.semantic_survival() > 0.0 && r.semantic_survival() < 1.0);
+        // Under register-canonicalized survival (Attacker B_reg), "pop rax; ret"
+        // and "pop rbx; ret" both canonicalize to "pop r64; ret", so survival is 1.0!
+        assert_eq!(r.semantic_survival_reg_canonicalized(), 1.0);
         // The bare "ret" at offset 1 is positionally identical.
         assert_eq!(r.positional_survivors, 1);
     }
@@ -474,6 +574,29 @@ mod tests {
         assert_eq!(a, b);
         // ...but differing registers stay distinct.
         assert_ne!(normalize_gadget("pop rax"), normalize_gadget("pop rbx"));
+    }
+
+    #[test]
+    fn canonicalize_registers_collapses_gp_regs_and_preserves_rsp_and_mnemonics() {
+        assert_eq!(
+            canonicalize_registers_gadget("pop r12; ret"),
+            canonicalize_registers_gadget("pop r13; ret")
+        );
+        assert_eq!(
+            canonicalize_registers_gadget("mov eax,r14d; ret"),
+            "mov r32,r32; ret"
+        );
+        // Stack pointer rsp/esp must NOT collapse to r64/r32 (stack pivot vs GP load).
+        assert_ne!(
+            canonicalize_registers_gadget("pop rsp; ret"),
+            canonicalize_registers_gadget("pop r13; ret")
+        );
+        assert_eq!(canonicalize_registers_gadget("add rsp,28h; ret"), "add rsp,N; ret");
+        // Different mnemonics stay distinct even after register canonicalization.
+        assert_ne!(
+            canonicalize_registers_gadget("mov rax,rcx; ret"),
+            canonicalize_registers_gadget("lea rax,[rcx]; ret")
+        );
     }
 
     #[test]

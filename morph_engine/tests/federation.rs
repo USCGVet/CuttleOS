@@ -10,7 +10,7 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use proteus_morph_engine::attest::{
     self, load_anchors, load_entries, parse_hex32, rebuild_anchors_after_cosign,
     rebuild_chain_after_cosign, verify_chain, verify_chain_with_options, write_attestation,
-    write_chain_atomic, AttestEntryFields, VerifyOptions, ATTEST_DIR_ENV, SCHEMA_VERSION,
+    write_chain_atomic, AttestEntryFields, VerifyOptions, ATTEST_DIR_ENV,
 };
 use proteus_morph_engine::federation::{
     self, load_federation, verify_cosignatures, Cosignature, FederationConfig,

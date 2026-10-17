@@ -629,10 +629,12 @@ pub(crate) fn banner_shell_compose() {
     use target_enterprise::ShellAction;
 
     let seal_key = derive_runtime_seal_key();
+    let attest_key = derive_runtime_attest_key();
     let mut sh_guard = KERNEL_SHELL.lock();
     let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
     *sh = target_enterprise::OsShell::empty();
     sh.seal_key = seal_key;
+    sh.attest_key = attest_key;
     sh.seed_defaults();
 
     let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
@@ -654,6 +656,7 @@ pub(crate) fn banner_shell_compose() {
         }
         *sh = target_enterprise::OsShell::empty();
         sh.seal_key = seal_key;
+        sh.attest_key = attest_key;
         sh.seed_defaults();
     }
 
@@ -720,6 +723,7 @@ pub(crate) fn banner_shell_compose() {
     let vsh: &mut target_enterprise::OsShell = &mut *vsh_guard;
     *vsh = target_enterprise::OsShell::empty();
     vsh.seal_key = seal_key;
+    vsh.attest_key = attest_key;
     vsh.seed_defaults();
     if restore_shell_from_ahci(vsh) != Some((boots, 4)) {
         panic!("SHELL compose: AHCI sealed restore failed");
@@ -731,6 +735,19 @@ pub(crate) fn banner_shell_compose() {
     if &out[..av.bytes_written()] != b"ready\n" {
         panic!("SHELL compose: AHCI restored /var/boot.ok drift");
     }
+    let mut attest_out = [0u8; 320];
+    let aq = vsh.exec_line(b"attest boot-quote", boots, 0, 0, &mut attest_out);
+    if !attest_out[..aq.bytes_written()].starts_with(b"attest: v=1 boots=") {
+        panic!("SHELL compose: remote attestation quote drift");
+    }
+    let mut mac = [0u8; 32];
+    vsh.compute_attestation_mac(boots, b"boot-quote", &mut mac);
+    if !vsh.verify_attestation_mac(boots, b"boot-quote", &mac) {
+        panic!("SHELL compose: remote attestation MAC verification failed");
+    }
+    serial_write_str("ATTEST: OK seed=");
+    serial_write_str(option_env!("PROTEUS_VARIANT_SEED").unwrap_or("default-variant"));
+    serial_write_str(" quote=verified\n");
     let _ = sh.exec_line(b"fw clear", boots, 0, 0, &mut out);
     sh.auth_seq = 0;
 

@@ -502,6 +502,7 @@ pub(crate) fn service_udp_status() {
 }
 
 /// Service loop over the modern virtio-net driver.
+#[inline(never)]
 pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
     let mac = n.mac;
     let mut svc = match derive_runtime_net_auth_key(mac) {
@@ -596,7 +597,7 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
         dns[28] = 0x01;
         let dlen = dns.len();
         let udp_len = (8 + dlen) as u16;
-        let mut uf = [0u8; 2048];
+        let mut uf = [0u8; 128];
         uf[0..2].copy_from_slice(&UDP_SVC_PORT.to_be_bytes());
         uf[2..4].copy_from_slice(&53u16.to_be_bytes());
         uf[4..6].copy_from_slice(&udp_len.to_be_bytes());
@@ -614,7 +615,7 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
         let ic = target_enterprise::net::ipv4_header_checksum(&ip);
         ip[10..12].copy_from_slice(&ic.to_be_bytes());
         let el = 14 + ip_len as usize;
-        let mut eth = [0u8; 2048];
+        let mut eth = [0u8; 128];
         eth[..6].copy_from_slice(&[0x52, 0x55, 0x0a, 0x00, 0x02, 0x03]);
         eth[6..12].copy_from_slice(&mac);
         eth[12] = 0x08;
@@ -735,6 +736,7 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
             let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
             if sh.fs.inode_count() == 0 {
                 sh.seal_key = derive_runtime_seal_key();
+                sh.attest_key = derive_runtime_attest_key();
                 sh.seed_defaults();
                 let _ = restore_shell_from_ahci(sh);
             }
@@ -784,6 +786,7 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
 }
 
 /// Legacy I/O-port path (hub topology only — kept as fallback).
+#[inline(never)]
 pub(crate) fn service_udp_status_legacy() {
     use core::sync::atomic::{fence, Ordering};
     use proteus_contracts::{
@@ -897,7 +900,14 @@ pub(crate) fn service_udp_status_legacy() {
     // Post N_RX_BUFS device-writable RX descriptors.
     let mut i: u16 = 0;
     while i < N_RX_BUFS {
-        write_desc_phys(rx_q, i as u64, rx_bufs_pa + (i as u64) * (RX_BUF_LEN as u64), RX_BUF_LEN, 2, 0);
+        write_desc_phys(
+            rx_q,
+            (i as u64) * 16,
+            rx_bufs_pa + (i as u64) * (RX_BUF_LEN as u64),
+            RX_BUF_LEN,
+            2,
+            0,
+        );
         // SAFETY: `rx_q` is mapped via `pa_to_va` from the 16 KiB RX queue DMA allocation and `i < N_RX_BUFS (8) < VQ_SIZE (256)` is in bounds and 2-byte aligned.
         unsafe {
             core::ptr::write_volatile(rx_q.add(avail_off as usize + 4 + (i as usize) * 2), i as u8);
@@ -972,7 +982,7 @@ pub(crate) fn service_udp_status_legacy() {
         let payload = b"PROTEUS-HELLO\n";
         let plen = payload.len();
         let udp_len = (8 + plen) as u16;
-        let mut udp_full = [0u8; 2048];
+        let mut udp_full = [0u8; 128];
         udp_full[0..2].copy_from_slice(&UDP_SVC_PORT.to_be_bytes());
         udp_full[2..4].copy_from_slice(&UDP_SVC_PORT.to_be_bytes());
         udp_full[4..6].copy_from_slice(&udp_len.to_be_bytes());
@@ -994,7 +1004,7 @@ pub(crate) fn service_udp_status_legacy() {
         let ic = target_enterprise::net::ipv4_header_checksum(&out_ip);
         out_ip[10..12].copy_from_slice(&ic.to_be_bytes());
         let eth_len = 14 + ip_len as usize;
-        let mut eth = [0u8; 2048];
+        let mut eth = [0u8; 128];
         eth[..6].copy_from_slice(&GW_MAC);
         eth[6..12].copy_from_slice(&mac);
         eth[12] = 0x08;
@@ -1050,7 +1060,7 @@ pub(crate) fn service_udp_status_legacy() {
         dns[28] = 0x01; // qclass IN (bytes 27-28 BE: 0x0001)
         let dlen = dns.len();
         let udp_len2 = (8 + dlen) as u16;
-        let mut uf2 = [0u8; 2048];
+        let mut uf2 = [0u8; 128];
         uf2[0..2].copy_from_slice(&UDP_SVC_PORT.to_be_bytes());
         uf2[2..4].copy_from_slice(&53u16.to_be_bytes());
         uf2[4..6].copy_from_slice(&udp_len2.to_be_bytes());
@@ -1068,7 +1078,7 @@ pub(crate) fn service_udp_status_legacy() {
         let ic2 = target_enterprise::net::ipv4_header_checksum(&ip2);
         ip2[10..12].copy_from_slice(&ic2.to_be_bytes());
         let el2 = 14 + ip_len2 as usize;
-        let mut eth2 = [0u8; 2048];
+        let mut eth2 = [0u8; 128];
         eth2[..6].copy_from_slice(&GW_MAC);
         eth2[6..12].copy_from_slice(&mac);
         eth2[12] = 0x08;
@@ -1166,7 +1176,7 @@ pub(crate) fn service_udp_status_legacy() {
         }
 
         // Repost the buffer immediately.
-        write_desc_phys(rx_q, desc_id as u64, buf_pa, RX_BUF_LEN, 2, 0);
+        write_desc_phys(rx_q, (desc_id as u64) * 16, buf_pa, RX_BUF_LEN, 2, 0);
         fence(Ordering::SeqCst);
         // SAFETY: Updating the avail ring slot and notifying legacy virtio-net queue port (base + 16).
         unsafe {
@@ -1213,6 +1223,7 @@ pub(crate) fn service_udp_status_legacy() {
             let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
             if sh.fs.inode_count() == 0 {
                 sh.seal_key = derive_runtime_seal_key();
+                sh.attest_key = derive_runtime_attest_key();
                 sh.seed_defaults();
                 let _ = restore_shell_from_ahci(sh);
             }
@@ -1286,7 +1297,7 @@ pub(crate) fn udp_svc_tx(
         );
     }
     let slot = *avail_idx % VQ_SIZE;
-    write_desc_phys(tx_q, slot as u64, tx_buf_pa, total, 0, 0);
+    write_desc_phys(tx_q, (slot as u64) * 16, tx_buf_pa, total, 0, 0);
     fence(Ordering::SeqCst);
     // SAFETY: `tx_q` lies in the mapped DMA window (`slot < VQ_SIZE`), and `base + 16` is the valid CPL=0 Queue Notify I/O port.
     unsafe {
@@ -1315,7 +1326,7 @@ pub(crate) fn udp_svc_tx(
             break;
         }
         spins = spins.wrapping_add(1);
-        if spins > 20_000_000 {
+        if spins > 200_000 {
             return; // drop; service loop stays alive
         }
         core::hint::spin_loop();

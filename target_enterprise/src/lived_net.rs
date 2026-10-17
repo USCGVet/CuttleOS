@@ -230,6 +230,7 @@ impl LivedNet {
         self.handle_frame_opt(frame, boots, Some(shell), out);
     }
 
+    #[inline(never)]
     fn handle_frame_opt(
         &mut self,
         frame: &[u8],
@@ -372,6 +373,7 @@ impl LivedNet {
         self.emit_ipv4(dst_mac, reply_ip, IP_PROTO_ICMP, &body[..n], out);
     }
 
+    #[inline(never)]
     fn handle_udp(
         &mut self,
         udp: &[u8],
@@ -490,6 +492,7 @@ impl LivedNet {
         sh.exec_line(cmd, boots, 0, 0, body).bytes_written()
     }
 
+    #[inline(never)]
     fn handle_tcp(
         &mut self,
         tcp: &[u8],
@@ -704,6 +707,7 @@ fn build_status_http(
                 || view.path == b"/audit"
                 || view.path == b"/uname"
                 || view.path == b"/seal"
+                || view.path == b"/attest"
                 || view.path == b"/ima"
                 || view.path == b"/fw";
             if is_shell_endpoint {
