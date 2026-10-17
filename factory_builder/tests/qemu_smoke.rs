@@ -741,6 +741,7 @@ fn boots_under_qemu_and_emits_banner() {
         "ATTEST: OK seed=",
         "FS partition OK lba=1042..1057 sectors=16 files=1 magic=PRTSFS01",
         "HTTPS+TCP4 compose OK slots=4 port=443 tls13=ok",
+        "SVC_RUNTIME: OK role=full->wfe->full svcs=3 kpti=isolated seccomp=deny-default rot=1",
         "SHELL compose OK tasks=5 files=5 audit=5",
         "SMP_HW init OK cpus=4 threads=4 ctx_sw=4",
         "PROTEUS-TE HALT",

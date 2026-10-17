@@ -309,10 +309,16 @@ class TriadController:
         while time.time() < deadline:
             with node.line_cond:
                 for ln in node.serial_tail:
-                    if "interactive shell ready" in ln:
-                        return True
-                node.line_cond.wait(timeout=0.2)
-        return False
+                    if "Web UI:" in ln or "interactive shell ready" in ln:
+                        break
+                else:
+                    node.line_cond.wait(timeout=0.2)
+                    continue
+                break
+        else:
+            return False
+        time.sleep(0.08)
+        return True
 
     def send_shell_cmd(self, node: TriadNode, cmd_str: str, timeout: float = 5.0) -> str:
         """Send a single-line command over the node's serial console (paced for the 16-byte 16550 UART FIFO) and capture output."""
@@ -331,23 +337,45 @@ class TriadController:
                     node.proc.stdin.flush()
                     if i + 8 < len(payload):
                         time.sleep(0.015)
+                # Send a second newline after a brief pause so the trailing `proteus> ` prompt
+                # is terminated with `\r\n` and flushed immediately through line-buffered stdout.
+                time.sleep(0.025)
+                node.proc.stdin.write("\n")
+                node.proc.stdin.flush()
             except OSError:
                 return "error: pipe closed"
 
             collected: list[str] = []
             deadline = time.time() + timeout
+            saw_prompt_end = False
             while time.time() < deadline:
                 with node.line_cond:
                     while node.response_lines:
                         ln = node.response_lines.pop(0)
-                        if ln.startswith("proteus> "):
-                            ln = ln[len("proteus> ") :]
+                        while ln.startswith("proteus>"):
+                            rest = ln[len("proteus>") :].lstrip(" ")
+                            if not rest:
+                                if collected:
+                                    saw_prompt_end = True
+                                ln = ""
+                                break
+                            ln = rest
+                        if not ln:
+                            continue
                         if ln.strip() == clean_cmd:
                             continue
+                        if (
+                            ln.startswith("AHCI_HW ")
+                            or ln.startswith("Web UI:")
+                            or "interactive shell ready" in ln
+                        ):
+                            continue
                         collected.append(ln)
-                    if collected and self._response_looks_complete(clean_cmd, collected):
+                    if saw_prompt_end or (
+                        collected and self._response_looks_complete(clean_cmd, collected)
+                    ):
                         break
-                    node.line_cond.wait(timeout=0.08)
+                    node.line_cond.wait(timeout=0.06)
             return "\n".join(collected).strip()
 
     def _response_looks_complete(self, cmd_str: str, lines: list[str]) -> bool:
@@ -355,8 +383,11 @@ class TriadController:
         c = cmd_str.strip()
         if c.startswith("sql "):
             return (
-                "row(s)" in joined
-                or "ok (" in joined
+                "INSERT " in joined
+                or "UPDATE " in joined
+                or "DELETE " in joined
+                or "CREATE TABLE" in joined
+                or "DROP TABLE" in joined
                 or "error:" in joined
                 or "tables:" in joined
             )
@@ -371,12 +402,12 @@ class TriadController:
     def refresh_node_telemetry(self, node: TriadNode):
         if node.state not in ("ONLINE", "CATCHING_UP", "HEALING"):
             return
-        smp_out = self.send_shell_cmd(node, "smp", timeout=2.0)
+        smp_out = self.send_shell_cmd(node, "smp", timeout=3.0)
         if smp_out and "cpus=" in smp_out:
             first_line = smp_out.splitlines()[0]
             node.last_smp = first_line
-        sql_out = self.send_shell_cmd(node, "sql SELECT * FROM kv", timeout=2.0)
-        if sql_out and "row(s)" in sql_out:
+        sql_out = self.send_shell_cmd(node, "sql SELECT * FROM kv", timeout=3.0)
+        if sql_out and "k|v|rev" in sql_out:
             node.last_sql_table = sql_out
 
     def compute_and_verify_raid_parity(self):
@@ -391,12 +422,13 @@ class TriadController:
             # Query live kv table from all online nodes to verify Byzantine 2-of-3 quorum
             outputs = {}
             for n in online_nodes:
-                out = self.send_shell_cmd(n, "sql SELECT * FROM kv", timeout=2.0)
-                n.last_sql_table = out
+                out = self.send_shell_cmd(n, "sql SELECT * FROM kv", timeout=4.0)
+                if out:
+                    n.last_sql_table = out
                 outputs[n.node_id] = out
 
             # Check if any node diverges from the 2-of-3 quorum!
-            if len(online_nodes) == 3:
+            if len(online_nodes) == 3 and all("k|v|rev" in outputs.get(i, "") for i in (1, 2, 3)):
                 o1, o2, o3 = outputs[1], outputs[2], outputs[3]
                 if o1 == o2 == o3:
                     self.parity_syndrome_ok = True

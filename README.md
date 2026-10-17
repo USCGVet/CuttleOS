@@ -4,7 +4,7 @@ Proteus is a Moving Target Defense (MTD) x86-64 unikernel and automated diversif
 
 ## Expected Use Case
 
-Proteus is designed for high-assurance appliances, isolated network gateways, and unikernel workloads where static binary homogeneity enables exploit reuse. By continuously randomizing source-level AST structure, compiler codegen/layout decisions, and post-link x86-64 instruction encodings on every build cycle, Proteus invalidates gadget addresses (`Attacker A`), exact-register gadget sequences (`Attacker B`), and register-agnostic opcode-class gadget templates (`Attacker B_reg`) between builds without changing observable protocol or syscall behavior.
+Proteus is a hardened multi-role network and state appliance OS (and "3-as-1" Byzantine Triad cluster) built for high-assurance edge gateways, zero-trust SQL state appliances, and isolated remote management nodes where static binary homogeneity enables exploit reuse. The Ring-0 kernel is a minimal microkernel keeping only the hardware scheduler, memory/KPTI page tables, device drivers, network/storage primitives, IPC bus, capability gate, eBPF seccomp filter, and TPM/HMAC attestation. All application services — the Web Server & Dashboard (`svc-http`, `/sbin/svc-http`), the Relational SQL Engine (`svc-sql`, `/sbin/svc-sql`), and the Interactive/Exec Shell (`svc-sh`, `/sbin/svc-sh`) — sit behind the Ring-3 hardware, KPTI, capability, and eBPF seccomp isolation layer as independent ELF64 binaries. Under Option 3 role provisioning (`wfe`, `sql`, `shell`, `full`), each node loads only the service ELFs required for its assigned role into memory (leaving unused services unloaded and unmapped) and can independently morph, restart, and attest individual service binaries in place without rebooting the kernel.
 
 ---
 
@@ -70,6 +70,23 @@ Because each 4-core Proteus VM requires only **3.5 MB of disk**, **128 MB of RAM
   - As soon as the rebooted node reaches `SHELL resume OK` (`CATCHING_UP`), the controller replays any missed WAL transactions from its peers before returning the node to `3/3 ONLINE`.
 - **Automatic Byzantine Tamper Self-Healing**:
   - If an unauthorized modification or disk corruption alters state on any single OS, the 2-of-3 quorum and RAID parity check detect the divergence, isolate the compromised node, reconstruct its canonical SQL state from the healthy 2/3 quorum + WAL, and force an immediate emergency binary re-morph.
+
+### Ring-3 Service Isolation, Role Profiles & Standing Credential Matrix ([`svc_runtime.rs`](file:///d:/RustProjects/Proteus/target_enterprise/src/svc_runtime.rs))
+Application services sit behind the Ring-3 isolation boundary as independent ELF64 binaries supervised by [`ServiceSupervisor`](file:///d:/RustProjects/Proteus/target_enterprise/src/svc_runtime.rs):
+- **Option 3 Role-Specific Service Provisioning (`NodeRole`)**:
+  - **`wfe` (Web Front-End Appliance)**: Loads only `/sbin/svc-http` (`0x41_0000`). Neither `svc-sql` nor `svc-sh` is loaded into memory.
+  - **`sql` (SQL RAID Storage Appliance)**: Loads only `/sbin/svc-sql` (`0x42_0000`). Neither `svc-http` nor `svc-sh` is loaded into memory.
+  - **`shell` (Bastion / Exec Appliance)**: Loads only `/sbin/svc-sh` (`0x43_0000`).
+  - **`full` (Unified Standalone Appliance)**: Loads `svc-http`, `svc-sql`, and `svc-sh` in separate KPTI user page tables where no service maps kernel secrets (`0xFFFF_8000_0000_0000`) or another service's code page.
+- **Independent Per-Service Binary Rotation & Attestation**:
+  - `service rotate <svc-http|svc-sql|svc-sh> [seed]` re-morphs and restarts an individual Ring-3 service ELF in place **without rebooting the kernel**, verifies its new IMA SHA-256 digest and KPTI page table, extends TPM 2.0 `PCR-10` (`svc_pcr10`), and binds the updated measurement into `attest` quotes.
+- **Standing Service Policy & Endpoint Credential Matrix**:
+
+| Service / Binary | KPTI User VA | Granted Capabilities (Deny-by-Default) | Allowed Syscalls (eBPF Seccomp) | Endpoints / Operations | Required Credentials |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`svc-http`** (`/sbin/svc-http`) | `0x0041_0000` | `NET_RAW \| SVC_IPC` *(denied direct disk/storage, VFS write, exec)* | `getpid`, `yield`, `time`, `ipc_send`, `net_io` *(denied `open`, `storage_io`, `exec`)* | `GET /status`, `/healthz`, `/app`, `/sql?<SELECT>`, `/fs/<path>`<br>`POST /session/login`<br>`GET /session/whoami`, `POST /session/logout` | Public read-only (`GET`); `POST /session/login` requires keyed `HMAC-SHA256(auth_key, seq \|\| user)` (`401`/`403` otherwise); `whoami`/`logout` require valid 128-bit `sid` (`401` otherwise) |
+| **`svc-sql`** (`/sbin/svc-sql`) | `0x0042_0000` | `DURABLE_WAL_WRITE \| SVC_IPC` *(denied `NET_RAW`, `FS_BYPASS`, `exec`)* | `getpid`, `yield`, `time`, `ipc_send`, `storage_io` *(denied `open`, `net_io`, `exec`)* | `GET /sql?<SELECT>` / `POST /sql` (`SELECT`, `.tables`, `.schema`)<br>`POST /sql` (`CREATE`, `DROP`, `INSERT`, `UPDATE`, `DELETE`) | Read-only queries: public via `svc-http -> svc-sql` IPC; Mutating SQL statements: require verified 128-bit session `sid` (`401 Unauthorized` on `GET` or missing/invalid `sid`) |
+| **`svc-sh`** (`/sbin/svc-sh`) | `0x0043_0000` | `FS_BYPASS \| SVC_IPC \| SVC_EXEC` *(denied `NET_RAW`)* | `getpid`, `yield`, `time`, `open`, `ipc_send`, `exec` *(denied `net_io`)* | `POST /sh`, `POST /exec`, `PUT /fs/<path>`, `DELETE /fs/<path>`<br>UDP `:8080` `AUTH <seq> <hmac> <cmd>` | HTTP endpoints require verified 128-bit session `sid` (`401 Unauthorized` otherwise); UDP mutating commands require replay-protected `HMAC-SHA256` (`EACCES` otherwise) |
 
 ### Embedded Relational SQL Database (`SqlDb`)
 - **Zero-Allocation SQLite-Compatible Subset ([`sql.rs`](file:///d:/RustProjects/Proteus/target_enterprise/src/sql.rs))**: Supports `CREATE TABLE <name> (<col> <INT|INTEGER|TEXT>, ...)`, `DROP TABLE <name>`, `INSERT INTO <name> VALUES (...)`, `SELECT * | COUNT(*) | <col>, ... FROM <name> [WHERE <col> <op> <val>] [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]`, `UPDATE <name> SET <col> = <val> [WHERE ...]`, `DELETE FROM <name> [WHERE ...]`, `.tables` / `SHOW TABLES`, and `.schema` / `DESCRIBE <name>`.

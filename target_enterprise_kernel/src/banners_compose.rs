@@ -919,6 +919,7 @@ pub(crate) fn banner_shell_compose() {
     }
     serial_write_str("FS partition OK lba=1042..1057 sectors=16 files=1 magic=PRTSFS01\n");
     verify_https_and_concurrent_tcp_compose(boots, seal_key);
+    verify_service_runtime_compose(vsh);
     let _ = sh.exec_line(b"seccomp clear 5", boots, 0, 0, &mut out);
     let _ = sh.exec_line(b"fw clear", boots, 0, 0, &mut out);
     sh.auth_seq = 0;
@@ -931,6 +932,65 @@ pub(crate) fn banner_shell_compose() {
     if seal_rejected {
         sh.record_net_audit(proteus_contracts::AuditVerdict::Denied, b"shell:wal:seal-mismatch");
     }
+}
+
+#[inline(never)]
+fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
+    use target_enterprise::svc_runtime::{
+        IpcOp, NodeRole, ServiceError, ServiceId, SvcSyscall,
+    };
+
+    if vsh.svc.running_count() != 3 {
+        panic!("SVC_RUNTIME compose: expected 3 running Ring-3 services");
+    }
+    // 1. Deny-by-default cross-service syscall/capability violations must be refused:
+    if vsh
+        .svc
+        .mediate_syscall(ServiceId::Http, SvcSyscall::StorageIo, &mut vsh.audit)
+        != Err(ServiceError::SeccompDenied)
+        || vsh
+            .svc
+            .mediate_syscall(ServiceId::Sql, SvcSyscall::NetIo, &mut vsh.audit)
+            != Err(ServiceError::SeccompDenied)
+    {
+        panic!("SVC_RUNTIME compose: cross-service seccomp violation not blocked");
+    }
+    // 2. Unauthenticated call to protected endpoint must be refused:
+    if vsh
+        .svc
+        .mediate_endpoint(IpcOp::SqlMutate, true, false, &mut vsh.audit)
+        != Err(ServiceError::Unauthenticated)
+    {
+        panic!("SVC_RUNTIME compose: unauthenticated SqlMutate not refused");
+    }
+    // 3. Independent service rotation mutates ELF SHA-256 and extends svc_pcr10 without reboot:
+    let dig_before = vsh.svc.services[ServiceId::Http.index()].elf_sha256;
+    let pcr_before = vsh.svc.svc_pcr10;
+    let dig_after = vsh
+        .svc
+        .rotate_service(ServiceId::Http, 0x4242, &mut vsh.audit)
+        .expect("SVC_RUNTIME compose: rotate svc-http");
+    if dig_before == dig_after || vsh.svc.svc_pcr10 == pcr_before {
+        panic!("SVC_RUNTIME compose: service rotation did not update digest/PCR-10");
+    }
+    // 4. Role switch to Wfe unloads svc-sql and svc-sh from memory; switching back to Full reloads them:
+    vsh.svc.set_role(NodeRole::Wfe, &mut vsh.audit);
+    if vsh.svc.running_count() != 1
+        || vsh.svc.services[ServiceId::Sql.index()].elf_len != 0
+        || vsh
+            .svc
+            .mediate_endpoint(IpcOp::SqlQuery, true, false, &mut vsh.audit)
+            != Err(ServiceError::RoleDisabled)
+    {
+        panic!("SVC_RUNTIME compose: WFE role failed to unload svc-sql");
+    }
+    vsh.svc.set_role(NodeRole::Full, &mut vsh.audit);
+    if vsh.svc.running_count() != 3 {
+        panic!("SVC_RUNTIME compose: Full role failed to reload all 3 services");
+    }
+    serial_write_str(
+        "SVC_RUNTIME: OK role=full->wfe->full svcs=3 kpti=isolated seccomp=deny-default rot=1\n",
+    );
 }
 
 #[inline(never)]

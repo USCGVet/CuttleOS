@@ -852,9 +852,10 @@ impl LivedNet {
         &mut self,
         req: &[u8],
         boots: u64,
-        shell: Option<&mut crate::shell::OsShell>,
+        mut shell: Option<&mut crate::shell::OsShell>,
         out: &mut [u8],
     ) -> usize {
+        use crate::svc_runtime::IpcOp;
         use proteus_contracts::{FS_O_CREATE, FS_O_RDONLY, FS_O_RDWR, FS_O_TRUNC, Filesystem};
 
         let view = match HttpImpl::parse_request(req) {
@@ -865,6 +866,14 @@ impl LivedNet {
             || view.path == b"/healthz"
             || view.path == b"/";
         if view.method == HttpMethod::Get && ok_path {
+            if let Some(sh) = shell.as_deref_mut() {
+                if let Err(e) = sh
+                    .svc
+                    .mediate_endpoint(IpcOp::HttpGetStatus, true, false, &mut sh.audit)
+                {
+                    return build_service_error_response(e, out);
+                }
+            }
             let mut body = [0u8; 48];
             let blen = status_body(boots, &mut body);
             return HttpImpl::build_response(200, b"text/plain", &body[..blen], out).unwrap_or(0);
@@ -874,11 +883,12 @@ impl LivedNet {
             return HttpImpl::build_response(404, b"text/plain", b"not found\n", out).unwrap_or(0);
         };
 
-        // 1. Built-in read-only telemetry endpoints.
+        // 1. Built-in read-only telemetry endpoints (mediated via `svc-http`).
         if view.method == HttpMethod::Get {
             let is_shell_endpoint = view.path == b"/ps"
                 || view.path == b"/smp"
                 || view.path == b"/threads"
+                || view.path == b"/service"
                 || view.path == b"/ls"
                 || view.path == b"/df"
                 || view.path == b"/audit"
@@ -890,7 +900,15 @@ impl LivedNet {
                 || view.path == b"/fw"
                 || view.path == b"/session";
             if is_shell_endpoint {
-                let mut sh_body = [0u8; 384];
+                if let Err(e) = sh.svc.mediate_endpoint(
+                    IpcOp::HttpGetTelemetry,
+                    true,
+                    false,
+                    &mut sh.audit,
+                ) {
+                    return build_service_error_response(e, out);
+                }
+                let mut sh_body = [0u8; 440];
                 let slen = sh
                     .exec_line(&view.path[1..], boots, 0, 0, &mut sh_body)
                     .bytes_written();
@@ -899,12 +917,20 @@ impl LivedNet {
             }
         }
 
-        // 2. Dynamic HTML5 Web Application Dashboard (`GET /app` or `GET /dashboard`).
+        // 2. Dynamic HTML5 Web Application Dashboard (`GET /app` or `GET /dashboard`, mediated via `svc-http`).
         if view.method == HttpMethod::Get
             && (view.path == b"/app" || view.path == b"/dashboard")
         {
             let sess_idx = extract_session_token(view.headers_raw)
                 .and_then(|tok| sh.validate_session(tok));
+            if let Err(e) = sh.svc.mediate_endpoint(
+                IpcOp::HttpGetDashboard,
+                true,
+                sess_idx.is_some(),
+                &mut sh.audit,
+            ) {
+                return build_service_error_response(e, out);
+            }
             let mut default_tok: &[u8] = b"";
             if let Some(si) = sess_idx {
                 default_tok = &sh.sessions[si].token_hex;
@@ -943,6 +969,12 @@ impl LivedNet {
 
         // 3. Dynamic Session Management (`/session/login`, `/session/whoami`, `/session/logout`).
         if view.method == HttpMethod::Post && view.path == b"/session/login" {
+            if let Err(e) = sh
+                .svc
+                .mediate_endpoint(IpcOp::SessionLogin, true, false, &mut sh.audit)
+            {
+                return build_service_error_response(e, out);
+            }
             if !self.auth_enabled {
                 sh.record_net_audit(AuditVerdict::Denied, b"net:http:unprovisioned");
                 return HttpImpl::build_response(
@@ -1030,26 +1062,17 @@ impl LivedNet {
         }
 
         if view.method == HttpMethod::Get && view.path == b"/session/whoami" {
-            let Some(tok) = extract_session_token(view.headers_raw) else {
-                sh.record_net_audit(AuditVerdict::Denied, b"net:http:whoami-unauth");
-                return HttpImpl::build_response(
-                    401,
-                    b"text/plain",
-                    b"error: unauthorized\n",
-                    out,
-                )
-                .unwrap_or(0);
-            };
-            let Some(s_idx) = sh.validate_session(tok) else {
-                sh.record_net_audit(AuditVerdict::Denied, b"net:http:whoami-invalid");
-                return HttpImpl::build_response(
-                    401,
-                    b"text/plain",
-                    b"error: unauthorized\n",
-                    out,
-                )
-                .unwrap_or(0);
-            };
+            let s_idx = extract_session_token(view.headers_raw)
+                .and_then(|tok| sh.validate_session(tok));
+            if let Err(e) = sh.svc.mediate_endpoint(
+                IpcOp::SessionWhoami,
+                true,
+                s_idx.is_some(),
+                &mut sh.audit,
+            ) {
+                return build_service_error_response(e, out);
+            }
+            let s_idx = s_idx.unwrap();
             let mut body = [0u8; 128];
             let mut bpos = 0usize;
             bpos += copy_msg(b"whoami: user=", &mut body[bpos..]);
@@ -1063,29 +1086,28 @@ impl LivedNet {
         }
 
         if view.method == HttpMethod::Post && view.path == b"/session/logout" {
-            let Some(tok) = extract_session_token(view.headers_raw) else {
-                return HttpImpl::build_response(
-                    401,
-                    b"text/plain",
-                    b"error: unauthorized\n",
-                    out,
-                )
-                .unwrap_or(0);
-            };
-            if sh.revoke_session(tok) {
-                return HttpImpl::build_response(
-                    200,
-                    b"text/plain",
-                    b"session: logged out\n",
-                    out,
-                )
-                .unwrap_or(0);
+            let revoked = extract_session_token(view.headers_raw)
+                .map(|tok| sh.revoke_session(tok))
+                .unwrap_or(false);
+            if let Err(e) = sh.svc.mediate_endpoint(
+                IpcOp::SessionLogout,
+                true,
+                revoked,
+                &mut sh.audit,
+            ) {
+                return build_service_error_response(e, out);
             }
-            return HttpImpl::build_response(401, b"text/plain", b"error: unauthorized\n", out)
-                .unwrap_or(0);
+            return HttpImpl::build_response(
+                200,
+                b"text/plain",
+                b"session: logged out\n",
+                out,
+            )
+            .unwrap_or(0);
         }
 
         // 4. Embedded Relational SQL Database Server (`GET /sql[?<query>]`, `POST /sql`, `GET /db[?<query>]`, `POST /db`).
+        //    Routed from `svc-http` across `IpcBus` to `svc-sql`.
         let is_sql_base = view.path == b"/sql"
             || view.path == b"/db"
             || view.path.starts_with(b"/sql?")
@@ -1129,7 +1151,12 @@ impl LivedNet {
                     }
                     let q_slice = &decoded[..dlen];
                     if !crate::sql::SqlDb::is_readonly_query(q_slice) {
-                        sh.record_net_audit(AuditVerdict::Denied, b"net:http:sql-get-write");
+                        let _ = sh.svc.mediate_endpoint(
+                            IpcOp::SqlMutate,
+                            true,
+                            false,
+                            &mut sh.audit,
+                        );
                         return HttpImpl::build_response(
                             401,
                             b"text/plain",
@@ -1138,9 +1165,23 @@ impl LivedNet {
                         )
                         .unwrap_or(0);
                     }
+                    if let Err(e) = sh.svc.mediate_endpoint(
+                        IpcOp::SqlQuery,
+                        true,
+                        false,
+                        &mut sh.audit,
+                    ) {
+                        return build_service_error_response(e, out);
+                    }
                     let blen = sh.db.exec(q_slice, &mut body);
                     return HttpImpl::build_response(200, b"text/plain", &body[..blen], out)
                         .unwrap_or(0);
+                }
+                if let Err(e) = sh
+                    .svc
+                    .mediate_endpoint(IpcOp::SqlQuery, true, false, &mut sh.audit)
+                {
+                    return build_service_error_response(e, out);
                 }
                 let blen = sh.db.exec(b".tables", &mut body);
                 return HttpImpl::build_response(200, b"text/plain", &body[..blen], out)
@@ -1148,19 +1189,26 @@ impl LivedNet {
             }
             if view.method == HttpMethod::Post {
                 let is_ro = crate::sql::SqlDb::is_readonly_query(view.body);
-                if !is_ro {
+                if is_ro {
+                    if let Err(e) = sh.svc.mediate_endpoint(
+                        IpcOp::SqlQuery,
+                        true,
+                        false,
+                        &mut sh.audit,
+                    ) {
+                        return build_service_error_response(e, out);
+                    }
+                } else {
                     let authed = extract_session_token(view.headers_raw)
                         .and_then(|tok| sh.validate_session(tok))
                         .is_some();
-                    if !authed {
-                        sh.record_net_audit(AuditVerdict::Denied, b"net:http:sql-unauth");
-                        return HttpImpl::build_response(
-                            401,
-                            b"text/plain",
-                            b"error: unauthorized (session required for mutating SQL)\n",
-                            out,
-                        )
-                        .unwrap_or(0);
+                    if let Err(e) = sh.svc.mediate_endpoint(
+                        IpcOp::SqlMutate,
+                        true,
+                        authed,
+                        &mut sh.audit,
+                    ) {
+                        return build_service_error_response(e, out);
                     }
                     sh.record_net_audit(AuditVerdict::Allowed, b"net:http:sql-write");
                 }
@@ -1171,20 +1219,16 @@ impl LivedNet {
             }
         }
 
-        // 5a. Interactive Web Shell Console (`POST /sh`).
+        // 5a. Interactive Web Shell Console (`POST /sh`, routed `svc-http -> svc-sh`).
         if view.method == HttpMethod::Post && view.path == b"/sh" {
             let authed = extract_session_token(view.headers_raw)
                 .and_then(|tok| sh.validate_session(tok))
                 .is_some();
-            if !authed {
-                sh.record_net_audit(AuditVerdict::Denied, b"net:http:sh-unauth");
-                return HttpImpl::build_response(
-                    401,
-                    b"text/plain",
-                    b"error: unauthorized (session required for shell)\n",
-                    out,
-                )
-                .unwrap_or(0);
+            if let Err(e) = sh
+                .svc
+                .mediate_endpoint(IpcOp::ShellExec, true, authed, &mut sh.audit)
+            {
+                return build_service_error_response(e, out);
             }
             let mut sh_body = [0u8; 768];
             let slen = sh
@@ -1194,20 +1238,16 @@ impl LivedNet {
                 .unwrap_or(0);
         }
 
-        // 5. Sandboxed Remote Code Execution (`POST /exec`).
+        // 5. Sandboxed Remote Code Execution (`POST /exec`, routed `svc-http -> svc-sh`).
         if view.method == HttpMethod::Post && view.path == b"/exec" {
             let authed = extract_session_token(view.headers_raw)
                 .and_then(|tok| sh.validate_session(tok))
                 .is_some();
-            if !authed {
-                sh.record_net_audit(AuditVerdict::Denied, b"net:http:exec-unauth");
-                return HttpImpl::build_response(
-                    401,
-                    b"text/plain",
-                    b"error: unauthorized (session required for code execution)\n",
-                    out,
-                )
-                .unwrap_or(0);
+            if let Err(e) = sh
+                .svc
+                .mediate_endpoint(IpcOp::UserElfExec, true, authed, &mut sh.audit)
+            {
+                return build_service_error_response(e, out);
             }
             let mut cmd_line = [0u8; 128];
             let mut cpos = 0usize;
@@ -1225,6 +1265,12 @@ impl LivedNet {
         if view.path.len() > 4 && view.path.starts_with(b"/fs/") {
             let vfs_path = &view.path[3..]; // includes leading `/`
             if view.method == HttpMethod::Get {
+                if let Err(e) = sh
+                    .svc
+                    .mediate_endpoint(IpcOp::VfsRead, true, false, &mut sh.audit)
+                {
+                    return build_service_error_response(e, out);
+                }
                 let Ok(fh) = sh.fs.open(vfs_path, FS_O_RDONLY) else {
                     return HttpImpl::build_response(404, b"text/plain", b"not found\n", out)
                         .unwrap_or(0);
@@ -1245,15 +1291,11 @@ impl LivedNet {
                 let authed = extract_session_token(view.headers_raw)
                     .and_then(|tok| sh.validate_session(tok))
                     .is_some();
-                if !authed {
-                    sh.record_net_audit(AuditVerdict::Denied, b"net:http:fs-unauth");
-                    return HttpImpl::build_response(
-                        401,
-                        b"text/plain",
-                        b"error: unauthorized\n",
-                        out,
-                    )
-                    .unwrap_or(0);
+                if let Err(e) = sh
+                    .svc
+                    .mediate_endpoint(IpcOp::VfsWrite, true, authed, &mut sh.audit)
+                {
+                    return build_service_error_response(e, out);
                 }
                 if vfs_path == b"/etc/os-release" {
                     sh.record_net_audit(AuditVerdict::Denied, b"net:http:fs-protected");
@@ -1291,15 +1333,11 @@ impl LivedNet {
                 let authed = extract_session_token(view.headers_raw)
                     .and_then(|tok| sh.validate_session(tok))
                     .is_some();
-                if !authed {
-                    sh.record_net_audit(AuditVerdict::Denied, b"net:http:fs-unauth");
-                    return HttpImpl::build_response(
-                        401,
-                        b"text/plain",
-                        b"error: unauthorized\n",
-                        out,
-                    )
-                    .unwrap_or(0);
+                if let Err(e) = sh
+                    .svc
+                    .mediate_endpoint(IpcOp::VfsDelete, true, authed, &mut sh.audit)
+                {
+                    return build_service_error_response(e, out);
                 }
                 if sh.fs.unlink(vfs_path).is_ok() {
                     sh.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-del");
@@ -1408,6 +1446,33 @@ fn status_body(boots: u64, out: &mut [u8]) -> usize {
     n += dec_u64(boots, &mut out[n..]);
     out[n] = b'\n';
     n + 1
+}
+
+fn build_service_error_response(err: crate::svc_runtime::ServiceError, out: &mut [u8]) -> usize {
+    use crate::svc_runtime::ServiceError;
+    match err {
+        ServiceError::Unauthenticated => {
+            HttpImpl::build_response(401, b"text/plain", b"error: unauthorized\n", out).unwrap_or(0)
+        }
+        ServiceError::RoleDisabled => HttpImpl::build_response(
+            503,
+            b"text/plain",
+            b"error: EACCES (service disabled by node role policy)\n",
+            out,
+        )
+        .unwrap_or(0),
+        ServiceError::CapabilityDenied
+        | ServiceError::SeccompDenied
+        | ServiceError::ImaVerificationFailed
+        | ServiceError::KptiIsolationFailed
+        | ServiceError::SandboxTrap => HttpImpl::build_response(
+            403,
+            b"text/plain",
+            b"error: EPERM (service isolation policy violation)\n",
+            out,
+        )
+        .unwrap_or(0),
+    }
 }
 
 fn http_request_complete(buf: &[u8]) -> bool {
@@ -2416,5 +2481,79 @@ mod tests {
         let s = core::str::from_utf8(&out[..n]).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"));
         assert!(s.ends_with("\r\n\r\n<h1>Hello Proteus</h1>"));
+    }
+
+    #[test]
+    fn every_endpoint_without_credentials_and_role_isolated_services_are_refused() {
+        let mut net = LivedNet::new(MAC);
+        let mut sh = crate::shell::OsShell::new();
+        let mut out = [0u8; 1380];
+
+        // 1. Standing Rule (Step 6): Call EVERY credentialed endpoint with NO credentials and with FORGED credentials;
+        //    every single one must be refused with 401 Unauthorized.
+        let unauthed_requests: &[&[u8]] = &[
+            b"GET /session/whoami HTTP/1.1\r\nHost: x\r\n\r\n",
+            b"GET /session/whoami HTTP/1.1\r\nCookie: sid=00000000000000000000000000000000\r\n\r\n",
+            b"POST /session/logout HTTP/1.1\r\nHost: x\r\n\r\n",
+            b"POST /session/logout HTTP/1.1\r\nX-Session-Token: deadbeefdeadbeefdeadbeefdeadbeef\r\n\r\n",
+            b"POST /session/login HTTP/1.1\r\nHost: x\r\n\r\n1 0000000000000000000000000000000000000000000000000000000000000000 admin",
+            b"GET /sql?DELETE+FROM+kv HTTP/1.1\r\nHost: x\r\n\r\n",
+            b"GET /db?DROP+TABLE+kv HTTP/1.1\r\nHost: x\r\n\r\n",
+            b"POST /sql HTTP/1.1\r\nHost: x\r\n\r\nINSERT INTO kv VALUES ('pwn', '1', 1)",
+            b"POST /db HTTP/1.1\r\nHost: x\r\n\r\nDELETE FROM kv",
+            b"POST /sh HTTP/1.1\r\nHost: x\r\n\r\nstatus",
+            b"POST /sh HTTP/1.1\r\nX-Session-Token: 11111111111111111111111111111111\r\n\r\nwrite /var/x 1",
+            b"POST /exec HTTP/1.1\r\nHost: x\r\n\r\n/bin/fib 10",
+            b"PUT /fs/var/pwn.txt HTTP/1.1\r\nHost: x\r\n\r\npwned",
+            b"DELETE /fs/etc/hostname HTTP/1.1\r\nHost: x\r\n\r\n",
+        ];
+        for req in unauthed_requests {
+            let n = net.handle_http_request(req, 1, Some(&mut sh), &mut out);
+            assert!(
+                out[..n].starts_with(b"HTTP/1.1 401 Unauthorized\r\n"),
+                "endpoint {:?} must return 401 Unauthorized when called without valid credentials, got: {:?}",
+                core::str::from_utf8(req).unwrap(),
+                core::str::from_utf8(&out[..n]).unwrap()
+            );
+        }
+
+        // 2. Role Isolation (`NodeRole::Wfe`): only `svc-http` is loaded in memory (`svc-sql` and `svc-sh` unloaded).
+        let sid = sh.create_session(b"admin", b"role-test");
+        sh.svc.set_role(crate::svc_runtime::NodeRole::Wfe, &mut sh.audit);
+        // `svc-http` endpoints (`GET /status`, `GET /app`) remain 200 OK:
+        let n_ok = net.handle_http_request(
+            b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n",
+            1,
+            Some(&mut sh),
+            &mut out,
+        );
+        assert!(out[..n_ok].starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+        // `svc-sql` and `svc-sh` endpoints are refused with 503 Service Unavailable even with a valid session!
+        let n_sql = net.handle_http_request(
+            b"GET /sql?SELECT+*+FROM+kv HTTP/1.1\r\nHost: x\r\n\r\n",
+            1,
+            Some(&mut sh),
+            &mut out,
+        );
+        assert!(out[..n_sql].starts_with(b"HTTP/1.1 503 "));
+
+        let mut sh_req = [0u8; 256];
+        let mut p = 0usize;
+        p += copy_msg(b"POST /sh HTTP/1.1\r\nCookie: sid=", &mut sh_req[p..]);
+        p += copy_msg(&sid, &mut sh_req[p..]);
+        p += copy_msg(b"\r\n\r\nstatus", &mut sh_req[p..]);
+        let n_sh = net.handle_http_request(&sh_req[..p], 1, Some(&mut sh), &mut out);
+        assert!(out[..n_sh].starts_with(b"HTTP/1.1 503 "));
+
+        // 3. Role Isolation (`NodeRole::Sql`): `svc-http` is unloaded, so HTTP requests are refused at the gateway.
+        sh.svc.set_role(crate::svc_runtime::NodeRole::Sql, &mut sh.audit);
+        let n_http_off = net.handle_http_request(
+            b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n",
+            1,
+            Some(&mut sh),
+            &mut out,
+        );
+        assert!(out[..n_http_off].starts_with(b"HTTP/1.1 503 "));
     }
 }

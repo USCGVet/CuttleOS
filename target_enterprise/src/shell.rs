@@ -195,6 +195,9 @@ pub struct OsShell {
     pub smp_ipi_doorbells: u64,
     /// Per-task hardware stack context-switch counters indexed by `pid as usize`.
     pub kthread_switches: [u64; SHELL_MAX_TASKS],
+    /// Ring-3 user-space service supervisor (`svc-http`, `svc-sql`, `svc-sh`),
+    /// role-specific ELF64 loader, KPTI isolator, and IPC/Seccomp policy enforcer.
+    pub svc: crate::svc_runtime::ServiceSupervisor,
     /// Next PID to assign on `spawn`.
     next_pid: TaskId,
     /// Monotonic command counter (used as synthetic timestamp/sequence).
@@ -233,6 +236,7 @@ impl OsShell {
             smp_irq_wakeups: 0,
             smp_ipi_doorbells: 0,
             kthread_switches: [0u64; SHELL_MAX_TASKS],
+            svc: crate::svc_runtime::ServiceSupervisor::empty(),
             next_pid: 5,
             cmd_seq: 1,
             line_buf: [0u8; SHELL_LINE_MAX],
@@ -326,6 +330,10 @@ impl OsShell {
         let mut sum_dig = [0u8; DURABLE_DIGEST_LEN];
         seal_bytes(&bin_buf[..sum_n], &mut sum_dig);
         let _ = self.enroll_ima_digest(b"/bin/sum", &sum_dig);
+
+        // Initialize Ring-3 isolated service runtime (`svc-http`, `svc-sql`, `svc-sh`).
+        self.svc = crate::svc_runtime::ServiceSupervisor::empty();
+        self.svc.init_role(crate::svc_runtime::NodeRole::Full, 1);
     }
 
     /// Seed standard user-space ELF64 executables (`/bin/fib` and `/bin/sum`)
@@ -565,7 +573,8 @@ impl OsShell {
             || bytes_eq(cmd, b"fw")
             || bytes_eq(cmd, b"seccomp")
             || bytes_eq(cmd, b"session")
-            || bytes_eq(cmd, b"smp"))
+            || bytes_eq(cmd, b"smp")
+            || bytes_eq(cmd, b"service"))
             && (rest.is_empty() || bytes_eq(rest, b"status") || bytes_eq(rest, b"threads"))
         {
             return true;
@@ -1223,6 +1232,10 @@ impl OsShell {
         pos += dec_u64(self.auth_seq, &mut buf[pos..]);
         pos += copy_into(b":", &mut buf[pos..]);
         pos += dec_u64(self.audit.high_watermark(), &mut buf[pos..]);
+        pos += copy_into(b":", &mut buf[pos..]);
+        pos += copy_into(self.svc.role.as_bytes(), &mut buf[pos..]);
+        pos += copy_into(b":", &mut buf[pos..]);
+        pos += copy_into(&self.svc.svc_pcr10, &mut buf[pos..]);
         seal_bytes(&buf[..pos], out);
     }
 
@@ -1316,7 +1329,7 @@ impl OsShell {
         if bytes_eq(cmd, b"help") || bytes_eq(cmd, b"?") {
             self.record_audit(1, AuditVerdict::Allowed, b"shell:help");
             let n = copy_into(
-                b"commands: help uname status ps smp threads spawn kill caps grant revoke syscall seccomp exec ima fw seal attest ls cat write rm stat df sync sql session net audit halt reboot\n",
+                b"commands: help uname status ps smp threads service spawn kill caps grant revoke syscall seccomp exec ima fw seal attest ls cat write rm stat df sync sql session net audit halt reboot\n",
                 out,
             );
             return ShellAction::Continue(n);
@@ -1466,6 +1479,11 @@ impl OsShell {
 
         if bytes_eq(cmd, b"session") {
             let n = self.cmd_session(rest, out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"service") || bytes_eq(cmd, b"svc") {
+            let n = self.cmd_service(rest, out);
             return ShellAction::Continue(n);
         }
 
@@ -2201,8 +2219,188 @@ impl OsShell {
                 out,
             );
         }
+        let is_ro = crate::sql::SqlDb::is_readonly_query(q);
+        let op = if is_ro {
+            crate::svc_runtime::IpcOp::SqlQuery
+        } else {
+            crate::svc_runtime::IpcOp::SqlMutate
+        };
+        if self
+            .svc
+            .mediate_endpoint(op, false, true, &mut self.audit)
+            .is_err()
+        {
+            return copy_into(
+                b"error: EACCES (svc-sql disabled by node role or policy)\n",
+                out,
+            );
+        }
         self.record_audit(31, AuditVerdict::Allowed, b"shell:sql");
         self.db.exec(q, out)
+    }
+
+    #[inline(never)]
+    fn cmd_service(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        use crate::svc_runtime::{NodeRole, ServiceId, SERVICE_COUNT};
+
+        let (sub, rest) = split_first_word(trim_ascii(arg));
+        if sub.is_empty() || bytes_eq(sub, b"status") {
+            self.record_audit(33, AuditVerdict::Allowed, b"shell:service:status");
+            let mut pos = 0usize;
+            pos += copy_into(b"service: role=", &mut out[pos..]);
+            pos += copy_into(self.svc.role.as_bytes(), &mut out[pos..]);
+            pos += copy_into(b" running=", &mut out[pos..]);
+            pos += dec_u64(self.svc.running_count() as u64, &mut out[pos..]);
+            pos += copy_into(b"/3 ipc_msgs=", &mut out[pos..]);
+            pos += dec_u64(self.svc.ipc_total, &mut out[pos..]);
+            pos += copy_into(b" svc_pcr10=", &mut out[pos..]);
+            pos += hex_bytes(&self.svc.svc_pcr10[..8], &mut out[pos..]);
+            pos += copy_into(b"...\n", &mut out[pos..]);
+            let mut i = 0usize;
+            while i < SERVICE_COUNT {
+                let s = &self.svc.services[i];
+                pos += copy_into(b"  ", &mut out[pos..]);
+                pos += copy_into(s.id.name(), &mut out[pos..]);
+                pos += copy_into(b" path=", &mut out[pos..]);
+                pos += copy_into(s.id.elf_path(), &mut out[pos..]);
+                pos += copy_into(b" state=", &mut out[pos..]);
+                pos += copy_into(s.state.as_bytes(), &mut out[pos..]);
+                pos += copy_into(b" va=", &mut out[pos..]);
+                pos += dec_u64(s.policy.user_va_base, &mut out[pos..]);
+                pos += copy_into(
+                    if s.kpti_isolated {
+                        b" kpti=isolated caps="
+                    } else {
+                        b" kpti=unmapped caps="
+                    },
+                    &mut out[pos..],
+                );
+                pos += dec_u64(s.policy.cap_mask, &mut out[pos..]);
+                pos += copy_into(b" seccomp=", &mut out[pos..]);
+                pos += dec_u64(s.policy.seccomp_allow_mask as u64, &mut out[pos..]);
+                pos += copy_into(b" rot=", &mut out[pos..]);
+                pos += dec_u64(s.rotations, &mut out[pos..]);
+                pos += copy_into(b" restarts=", &mut out[pos..]);
+                pos += dec_u64(s.restarts, &mut out[pos..]);
+                pos += copy_into(b" reqs=", &mut out[pos..]);
+                pos += dec_u64(s.requests_served, &mut out[pos..]);
+                pos += copy_into(b" denials=", &mut out[pos..]);
+                pos += dec_u64(s.policy_denials, &mut out[pos..]);
+                pos += copy_into(b" sha256=", &mut out[pos..]);
+                pos += hex_bytes(&s.elf_sha256[..8], &mut out[pos..]);
+                pos += copy_into(b"...\n", &mut out[pos..]);
+                i += 1;
+            }
+            return pos;
+        }
+
+        if bytes_eq(sub, b"role") {
+            let role_tok = trim_ascii(rest);
+            let Some(role) = NodeRole::from_bytes(role_tok) else {
+                self.record_audit(33, AuditVerdict::Error, b"shell:service:bad-role");
+                return copy_into(b"usage: service role <wfe|sql|shell|full>\n", out);
+            };
+            self.svc.set_role(role, &mut self.audit);
+            // Unlink any disabled service ELF binaries from the VFS so they do not reside in RAM.
+            let mut i = 0usize;
+            while i < SERVICE_COUNT {
+                let svc = ServiceId::ALL[i];
+                if !role.allows(svc) {
+                    let _ = self.fs.unlink(svc.elf_path());
+                }
+                i += 1;
+            }
+            let mut pos = 0usize;
+            pos += copy_into(b"service: role=", &mut out[pos..]);
+            pos += copy_into(role.as_bytes(), &mut out[pos..]);
+            pos += copy_into(b" running=", &mut out[pos..]);
+            pos += dec_u64(self.svc.running_count() as u64, &mut out[pos..]);
+            pos += copy_into(b"/3 svc_pcr10=", &mut out[pos..]);
+            pos += hex_bytes(&self.svc.svc_pcr10[..8], &mut out[pos..]);
+            pos += copy_into(b"...\n", &mut out[pos..]);
+            return pos;
+        }
+
+        if bytes_eq(sub, b"rotate") || bytes_eq(sub, b"morph") {
+            let (svc_tok, seed_tok) = split_first_word(trim_ascii(rest));
+            let Some(svc) = ServiceId::from_bytes(svc_tok) else {
+                self.record_audit(33, AuditVerdict::Error, b"shell:service:bad-name");
+                return copy_into(
+                    b"usage: service rotate <svc-http|svc-sql|svc-sh> [seed]\n",
+                    out,
+                );
+            };
+            let seed = parse_u32_ascii(trim_ascii(seed_tok))
+                .map(|v| v as u64)
+                .unwrap_or_else(|| self.cmd_seq.wrapping_mul(0x9E37_79B9) ^ 0x5A5A);
+            let Ok(new_dig) = self.svc.rotate_service(svc, seed, &mut self.audit) else {
+                return copy_into(
+                    b"error: EACCES (service disabled by current node role)\n",
+                    out,
+                );
+            };
+            // If materialized in VFS, refresh the on-VFS ELF binary and IMA digest in place.
+            if self.fs.stat(svc.elf_path()).is_ok() {
+                let _ = self.fs.unlink(svc.elf_path());
+                let slot = &self.svc.services[svc.index()];
+                let _ = self.fs.seed_file(
+                    svc.elf_path(),
+                    &slot.elf_image[..slot.elf_len],
+                    256,
+                    1,
+                );
+                let _ = self.enroll_ima_digest(svc.elf_path(), &new_dig);
+            }
+            let slot = &self.svc.services[svc.index()];
+            let mut pos = 0usize;
+            pos += copy_into(b"service: rotated ", &mut out[pos..]);
+            pos += copy_into(svc.name(), &mut out[pos..]);
+            pos += copy_into(b" rot=", &mut out[pos..]);
+            pos += dec_u64(slot.rotations, &mut out[pos..]);
+            pos += copy_into(b" seed=", &mut out[pos..]);
+            pos += dec_u64(slot.variant_seed, &mut out[pos..]);
+            pos += copy_into(b" sha256=", &mut out[pos..]);
+            pos += hex_bytes(&new_dig[..8], &mut out[pos..]);
+            pos += copy_into(b"... svc_pcr10=", &mut out[pos..]);
+            pos += hex_bytes(&self.svc.svc_pcr10[..8], &mut out[pos..]);
+            pos += copy_into(b"...\n", &mut out[pos..]);
+            return pos;
+        }
+
+        if bytes_eq(sub, b"crash") || bytes_eq(sub, b"fault") {
+            let Some(svc) = ServiceId::from_bytes(trim_ascii(rest)) else {
+                return copy_into(b"usage: service crash <svc-http|svc-sql|svc-sh>\n", out);
+            };
+            if self.svc.simulate_crash(svc, &mut self.audit).is_err() {
+                return copy_into(b"error: service unloaded for current role\n", out);
+            }
+            let mut pos = 0usize;
+            pos += copy_into(b"service: faulted ", &mut out[pos..]);
+            pos += copy_into(svc.name(), &mut out[pos..]);
+            pos += copy_into(b" (supervisor will auto-restart)\n", &mut out[pos..]);
+            return pos;
+        }
+
+        if bytes_eq(sub, b"restart") {
+            let Some(svc) = ServiceId::from_bytes(trim_ascii(rest)) else {
+                return copy_into(b"usage: service restart <svc-http|svc-sql|svc-sh>\n", out);
+            };
+            if self.svc.ensure_running(svc, &mut self.audit).is_err() {
+                return copy_into(b"error: service unloaded for current role\n", out);
+            }
+            let mut pos = 0usize;
+            pos += copy_into(b"service: restarted ", &mut out[pos..]);
+            pos += copy_into(svc.name(), &mut out[pos..]);
+            pos += copy_into(b" state=running restarts=", &mut out[pos..]);
+            pos += dec_u64(self.svc.services[svc.index()].restarts, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            return pos;
+        }
+
+        copy_into(
+            b"usage: service [status | role <wfe|sql|shell|full> | rotate <name> [seed] | crash <name> | restart <name>]\n",
+            out,
+        )
     }
 
     fn cmd_session(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
@@ -2295,11 +2493,44 @@ impl OsShell {
             return copy_into(b"usage: exec <path> [arg]\n", out);
         }
 
+        // Gate user ELF execution through `svc-sh` (`IpcOp::UserElfExec`).
+        if self
+            .svc
+            .mediate_endpoint(
+                crate::svc_runtime::IpcOp::UserElfExec,
+                false,
+                true,
+                &mut self.audit,
+            )
+            .is_err()
+        {
+            return copy_into(
+                b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                out,
+            );
+        }
+
         // Materialize built-in user-space ELF64 programs (/bin/fib, /bin/sum) on demand.
         if (bytes_eq(path, b"/bin/fib") || bytes_eq(path, b"/bin/sum"))
             && self.fs.stat(path).is_err()
         {
             self.install_user_bins();
+        }
+        // Materialize role-enabled Ring-3 service ELF64 binaries (/sbin/svc-*) on demand.
+        if let Some(svc) = crate::svc_runtime::ServiceId::from_bytes(path) {
+            if self.svc.role.allows(svc) && self.fs.stat(svc.elf_path()).is_err() {
+                let slot = &self.svc.services[svc.index()];
+                if slot.elf_len > 0 {
+                    let dig = slot.elf_sha256;
+                    let _ = self.fs.seed_file(
+                        svc.elf_path(),
+                        &slot.elf_image[..slot.elf_len],
+                        256,
+                        1,
+                    );
+                    let _ = self.enroll_ima_digest(svc.elf_path(), &dig);
+                }
+            }
         }
 
         let h = match self.fs.open(path, FS_O_RDONLY) {
@@ -2658,7 +2889,7 @@ impl OsShell {
         pos
     }
 
-    /// Format the canonical remote attestation payload (`v=1 boots=<boots> pcr10=<hex64> ima=<count> seal=<hex64> nonce=<nonce>`)
+    /// Format the canonical remote attestation payload (`v=1 boots=<boots> pcr10=<hex64> svc_pcr10=<hex16> role=<role> ima=<count> seal=<hex64> nonce=<nonce>`)
     /// into `out` and return the byte length.
     fn format_attestation_body(&self, boots: u64, nonce: &[u8], out: &mut [u8]) -> usize {
         let mut state_seal = [0u8; DURABLE_DIGEST_LEN];
@@ -2669,6 +2900,10 @@ impl OsShell {
         pos += dec_u64(boots, &mut out[pos..]);
         pos += copy_into(b" pcr10=", &mut out[pos..]);
         pos += hex_bytes(&self.ima_pcr10, &mut out[pos..]);
+        pos += copy_into(b" svc_pcr10=", &mut out[pos..]);
+        pos += hex_bytes(&self.svc.svc_pcr10[..8], &mut out[pos..]);
+        pos += copy_into(b" role=", &mut out[pos..]);
+        pos += copy_into(self.svc.role.as_bytes(), &mut out[pos..]);
         pos += copy_into(b" ima=", &mut out[pos..]);
         pos += dec_u64(self.ima_measurements, &mut out[pos..]);
         pos += copy_into(b" seal=", &mut out[pos..]);
@@ -2687,7 +2922,7 @@ impl OsShell {
         nonce: &[u8],
         mac_out: &mut [u8; DURABLE_DIGEST_LEN],
     ) {
-        let mut body = [0u8; 256];
+        let mut body = [0u8; 320];
         let blen = self.format_attestation_body(boots, nonce, &mut body);
         seal_bytes_keyed(&self.attest_key, &body[..blen], mac_out);
     }
@@ -2701,7 +2936,7 @@ impl OsShell {
         nonce: &[u8],
         expected_mac: &[u8; DURABLE_DIGEST_LEN],
     ) -> bool {
-        let mut body = [0u8; 256];
+        let mut body = [0u8; 320];
         let blen = self.format_attestation_body(boots, nonce, &mut body);
         seal_matches_keyed(&self.attest_key, &body[..blen], expected_mac)
     }
@@ -2712,7 +2947,7 @@ impl OsShell {
     pub fn cmd_attest(&mut self, boots: u64, arg: &[u8], out: &mut [u8]) -> usize {
         self.record_audit(26, AuditVerdict::Allowed, b"shell:attest");
         let nonce = trim_ascii(arg);
-        let mut body = [0u8; 256];
+        let mut body = [0u8; 320];
         let blen = self.format_attestation_body(boots, nonce, &mut body);
         let mut mac = [0u8; DURABLE_DIGEST_LEN];
         seal_bytes_keyed(&self.attest_key, &body[..blen], &mut mac);
@@ -2739,6 +2974,9 @@ fn is_default_system_file(path: &[u8]) -> bool {
         || bytes_eq(path, b"/proc/net")
         || bytes_eq(path, b"/bin/fib")
         || bytes_eq(path, b"/bin/sum")
+        || bytes_eq(path, b"/sbin/svc-http")
+        || bytes_eq(path, b"/sbin/svc-sql")
+        || bytes_eq(path, b"/sbin/svc-sh")
 }
 
 fn serialize_wal_for_seal<const C: usize>(wal: &WalImpl<C>, out: &mut [u8]) -> usize {
@@ -3732,6 +3970,63 @@ mod tests {
         assert!(
             !status_str.contains(full_sid_str),
             "session status must never leak the full 32-hex bearer token"
+        );
+    }
+
+    #[test]
+    fn service_supervisor_role_isolation_rotation_and_attestation_work() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 768];
+
+        assert!(OsShell::is_readonly_command(b"service"));
+        assert!(OsShell::is_readonly_command(b"service status"));
+        assert!(!OsShell::is_readonly_command(b"service rotate svc-http 42"));
+        assert!(!OsShell::is_readonly_command(b"service role wfe"));
+
+        // 1. Default role is `full` with all 3 Ring-3 services KPTI-isolated.
+        let act = sh.exec_line(b"service status", 1, 0, 0, &mut out);
+        let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
+        assert!(s.contains("service: role=full running=3/3"));
+        assert!(s.contains("svc-http path=/sbin/svc-http state=running va=4259840 kpti=isolated"));
+        assert!(s.contains("svc-sql path=/sbin/svc-sql state=running va=4325376 kpti=isolated"));
+        assert!(s.contains("svc-sh path=/sbin/svc-sh state=running va=4390912 kpti=isolated"));
+
+        // 2. Materialize and execute `/sbin/svc-http` in its KPTI-isolated sandbox (`va=4259840`).
+        let act = sh.exec_line(b"exec /sbin/svc-http 1", 1, 0, 0, &mut out);
+        let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
+        assert!(s.starts_with("exec: path=/sbin/svc-http entry=4259840 kpti=isolated insns=10 ret="));
+
+        // 3. Rotate `svc-http` independently without rebooting and verify PCR-10 + attestation quote update.
+        let mut mac_before = [0u8; 32];
+        sh.compute_attestation_mac(1, b"svc-nonce", &mut mac_before);
+        let act = sh.exec_line(b"service rotate svc-http 777", 1, 0, 0, &mut out);
+        let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
+        assert!(s.starts_with("service: rotated svc-http rot=1 seed=777 sha256="));
+        let mut mac_after = [0u8; 32];
+        sh.compute_attestation_mac(1, b"svc-nonce", &mut mac_after);
+        assert_ne!(mac_before, mac_after, "rotating a service must update the attestation quote");
+
+        // 4. Simulate a crash in `svc-sql` and verify the supervisor automatically restarts it on the next SQL query.
+        let act = sh.exec_line(b"service crash svc-sql", 1, 0, 0, &mut out);
+        let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
+        assert!(s.contains("service: faulted svc-sql"));
+        let act = sh.exec_line(b"sql SELECT COUNT(*) FROM kv", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act.bytes_written()], b"count\n2\n");
+        assert_eq!(sh.svc.services[1].restarts, 1);
+
+        // 5. Switch node role to `wfe`: `svc-sql` and `svc-sh` are unloaded from memory and refused.
+        let act = sh.exec_line(b"service role wfe", 1, 0, 0, &mut out);
+        let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
+        assert!(s.starts_with("service: role=wfe running=1/3"));
+        let act_sql = sh.exec_line(b"sql SELECT * FROM kv", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_sql.bytes_written()],
+            b"error: EACCES (svc-sql disabled by node role or policy)\n"
+        );
+        let act_exec = sh.exec_line(b"exec /bin/fib 10", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_exec.bytes_written()],
+            b"error: EACCES (svc-sh disabled by node role or policy)\n"
         );
     }
 }
