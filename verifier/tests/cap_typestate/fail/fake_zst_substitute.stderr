@@ -13,7 +13,7 @@ note: `CapProof` is defined in the current crate
 12 | struct CapProof;
    | ^^^^^^^^^^^^^^^
 note: `proteus_contracts::CapProof` is defined in crate `proteus_contracts`
-  --> $WORKSPACE/contracts/src/lib.rs
+  --> $WORKSPACE/contracts/src/core_primitives.rs
    |
    | pub struct CapProof {
    | ^^^^^^^^^^^^^^^^^^^

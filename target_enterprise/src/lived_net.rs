@@ -908,15 +908,6 @@ impl LivedNet {
             let mut default_tok: &[u8] = b"";
             if let Some(si) = sess_idx {
                 default_tok = &sh.sessions[si].token_hex;
-            } else {
-                let mut k = 0usize;
-                while k < crate::shell::SHELL_MAX_SESSIONS {
-                    if sh.sessions[k].active {
-                        default_tok = &sh.sessions[k].token_hex;
-                        break;
-                    }
-                    k += 1;
-                }
             }
             let mut html = [0u8; 1310];
             let mut pos = 0usize;
@@ -2340,7 +2331,21 @@ mod tests {
         let s = core::str::from_utf8(&out[..n]).unwrap();
         assert!(s.contains("whoami: user=admin reqs=1 sid="));
 
-        // 5b. Verify GET /app with active session ends with complete script tag, and POST /sh works:
+        // 5b. Verify unauthenticated GET /app does NOT leak the active session token,
+        // while authenticated GET /app with Cookie: sid=<32hex> populates session_user:
+        let n_unauth = net.handle_http_request(
+            b"GET /app HTTP/1.1\r\nHost: x\r\n\r\n",
+            4,
+            Some(&mut sh),
+            &mut out,
+        );
+        let s_unauth = core::str::from_utf8(&out[..n_unauth]).unwrap();
+        let sid_str = core::str::from_utf8(sid).unwrap();
+        assert!(
+            !s_unauth.contains(sid_str),
+            "unauthenticated GET /app must never leak an active session token"
+        );
+
         let mut app_req = [0u8; 256];
         let mut apos = 0usize;
         apos += copy_msg(b"GET /app HTTP/1.1\r\nCookie: sid=", &mut app_req[apos..]);

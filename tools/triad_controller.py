@@ -315,13 +315,16 @@ class TriadController:
         return False
 
     def send_shell_cmd(self, node: TriadNode, cmd_str: str, timeout: float = 5.0) -> str:
-        """Send a command over the node's serial console (paced for the 16-byte 16550 UART FIFO) and capture output."""
+        """Send a single-line command over the node's serial console (paced for the 16-byte 16550 UART FIFO) and capture output."""
+        clean_cmd = cmd_str.replace("\r", " ").replace("\n", " ").strip()
+        if not clean_cmd:
+            return ""
         with node.cmd_lock:
             if not node.proc or node.proc.poll() is not None:
                 return "error: node offline"
             with node.line_cond:
                 node.response_lines.clear()
-            payload = cmd_str.strip() + "\n"
+            payload = clean_cmd + "\n"
             try:
                 for i in range(0, len(payload), 8):
                     node.proc.stdin.write(payload[i : i + 8])
@@ -339,10 +342,10 @@ class TriadController:
                         ln = node.response_lines.pop(0)
                         if ln.startswith("proteus> "):
                             ln = ln[len("proteus> ") :]
-                        if ln.strip() == cmd_str.strip():
+                        if ln.strip() == clean_cmd:
                             continue
                         collected.append(ln)
-                    if collected and self._response_looks_complete(cmd_str, collected):
+                    if collected and self._response_looks_complete(clean_cmd, collected):
                         break
                     node.line_cond.wait(timeout=0.08)
             return "\n".join(collected).strip()
@@ -980,7 +983,20 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/sql"):
             q = "SELECT * FROM kv"
             if "?" in self.path:
-                q = urllib.parse.unquote_plus(self.path.split("?", 1)[1])
+                q = urllib.parse.unquote_plus(self.path.split("?", 1)[1]).strip()
+            up = q.upper()
+            if not (
+                up.startswith("SELECT")
+                or up.startswith(".TABLES")
+                or up.startswith("SHOW")
+                or up.startswith(".SCHEMA")
+                or up.startswith("DESCRIBE")
+            ):
+                return self._send_text(
+                    401,
+                    "text/plain; charset=utf-8",
+                    "error: unauthorized (use POST /sql for mutations)\n",
+                )
             res = self.ctrl.execute_triad_sql(q)
             return self._send_text(200, "text/plain; charset=utf-8", res.get("output", "") + "\n")
 
@@ -995,6 +1011,12 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
             return self._send_json(200, res)
 
         if self.path == "/api/sh":
+            first_word = body.split()[0].lower() if body.split() else ""
+            if first_word in ("halt", "reboot"):
+                return self._send_json(
+                    403,
+                    {"ok": False, "error": "Use the Hypervisor Morph controls to bounce nodes safely."},
+                )
             per_node = {}
             for n in self.ctrl.nodes:
                 if n.state == "ONLINE":

@@ -827,9 +827,6 @@ pub(crate) fn live_os_console_loop() -> ! {
             None => target_enterprise::LivedNet::new_unprovisioned(vn.mac),
         }
     });
-    if sh.active_session_count() == 0 {
-        let _ = sh.create_session(b"operator", b"console");
-    }
     let mut net_rx: u64 = 0;
     let mut net_tx: u64 = 0;
     let mut last_sql_tx: u64 = sh.db.tx_seq;

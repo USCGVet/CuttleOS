@@ -2225,8 +2225,8 @@ impl OsShell {
                     pos += copy_into(b" reqs=", &mut out[pos..]);
                     pos += dec_u64(self.sessions[i].requests as u64, &mut out[pos..]);
                     pos += copy_into(b" sid=", &mut out[pos..]);
-                    pos += copy_into(&self.sessions[i].token_hex, &mut out[pos..]);
-                    pos += copy_into(b"\n", &mut out[pos..]);
+                    pos += copy_into(&self.sessions[i].token_hex[..8], &mut out[pos..]);
+                    pos += copy_into(b"...\n", &mut out[pos..]);
                 }
                 i += 1;
             }
@@ -3716,7 +3716,22 @@ mod tests {
         let run_str = core::str::from_utf8(&out[..act_run.bytes_written()]).unwrap();
         assert!(run_str.contains("smp: dispatched 16 parallel jobs across 4 cores (ctx_switches="));
     }
+
+    #[test]
+    fn session_status_redacts_full_bearer_tokens() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 512];
+        let sid = sh.create_session(b"alice", b"nonce1");
+        let full_sid_str = core::str::from_utf8(&sid).unwrap();
+        let prefix_str = core::str::from_utf8(&sid[..8]).unwrap();
+
+        let act = sh.exec_line(b"session status", 1, 0, 0, &mut out);
+        let status_str = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
+        assert!(status_str.contains(prefix_str));
+        assert!(status_str.contains("..."));
+        assert!(
+            !status_str.contains(full_sid_str),
+            "session status must never leak the full 32-hex bearer token"
+        );
+    }
 }
-
-
-
