@@ -779,9 +779,7 @@ static CONSOLE_NET_FRAME: spin::Mutex<[u8; 2048]> = spin::Mutex::new([0u8; 2048]
 pub(crate) fn live_os_console_loop() -> ! {
     use proteus_contracts::{KeyCode, Keyboard};
     use target_enterprise::keyboard::KeyboardImpl;
-    use target_enterprise::ShellAction;
-    #[cfg(proteus_prod)]
-    use target_enterprise::SHELL_PROMPT;
+    use target_enterprise::{ShellAction, SHELL_PROMPT};
 
     let mut sh_guard = KERNEL_SHELL.lock();
     let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
@@ -789,6 +787,29 @@ pub(crate) fn live_os_console_loop() -> ! {
 
     let dma = dma_phys_base();
     let mut vnet_opt = if dma != 0 { vnet_modern_init(dma) } else { None };
+    if let Some(vn) = vnet_opt.as_mut() {
+        let mut garp = [0u8; 42];
+        garp[..6].copy_from_slice(&[0xffu8; 6]);
+        garp[6..12].copy_from_slice(&vn.mac);
+        garp[12] = 0x08;
+        garp[13] = 0x06;
+        garp[14] = 0;
+        garp[15] = 1;
+        garp[16] = 0x08;
+        garp[17] = 0;
+        garp[18] = 6;
+        garp[19] = 4;
+        garp[20] = 0;
+        garp[21] = 1;
+        garp[22..28].copy_from_slice(&vn.mac);
+        garp[28..32].copy_from_slice(&UDP_SVC_IP);
+        garp[32..38].copy_from_slice(&[0u8; 6]);
+        garp[38..42].copy_from_slice(&UDP_SVC_IP);
+        vnet_tx(vn, &garp);
+        let mut gw = garp;
+        gw[38..42].copy_from_slice(&[10, 0, 2, 2]);
+        vnet_tx(vn, &gw);
+    }
     let mut net_svc_opt = vnet_opt.as_ref().map(|vn| {
         match derive_runtime_net_auth_key(vn.mac) {
             Some(k) => target_enterprise::LivedNet::with_auth_key(vn.mac, k),
@@ -799,14 +820,11 @@ pub(crate) fn live_os_console_loop() -> ! {
     let mut net_tx: u64 = 0;
     let mut last_sql_tx: u64 = sh.db.tx_seq;
 
-    #[cfg(proteus_prod)]
-    {
-        serial_write_str("Proteus Enterprise OS interactive shell ready.\n");
-        serial_write_bytes(SHELL_PROMPT);
-    }
+    serial_write_str("Proteus Enterprise OS interactive shell ready.\n");
+    serial_write_bytes(SHELL_PROMPT);
 
     let mut echo = [0u8; 32];
-    let mut reply = [0u8; 512];
+    let mut reply = [0u8; 1024];
 
     loop {
         let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);

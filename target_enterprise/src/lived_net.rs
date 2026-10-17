@@ -1074,10 +1074,63 @@ impl LivedNet {
                 .unwrap_or(0);
         }
 
-        // 4. Embedded Relational SQL Database Server (`GET /sql`, `POST /sql`, `GET /db`, `POST /db`).
-        if view.path == b"/sql" || view.path == b"/db" {
+        // 4. Embedded Relational SQL Database Server (`GET /sql[?<query>]`, `POST /sql`, `GET /db[?<query>]`, `POST /db`).
+        let is_sql_base = view.path == b"/sql"
+            || view.path == b"/db"
+            || view.path.starts_with(b"/sql?")
+            || view.path.starts_with(b"/db?");
+        if is_sql_base {
             if view.method == HttpMethod::Get {
                 let mut body = [0u8; 384];
+                let q_opt = if view.path.starts_with(b"/sql?") {
+                    Some(&view.path[5..])
+                } else if view.path.starts_with(b"/db?") {
+                    Some(&view.path[4..])
+                } else {
+                    None
+                };
+                if let Some(raw_q) = q_opt {
+                    let mut decoded = [0u8; 192];
+                    let mut dlen = 0usize;
+                    let mut qi = 0usize;
+                    while qi < raw_q.len() && dlen < decoded.len() {
+                        if raw_q[qi] == b'+' {
+                            decoded[dlen] = b' ';
+                            dlen += 1;
+                            qi += 1;
+                        } else if raw_q[qi] == b'%' && qi + 2 < raw_q.len() {
+                            if let (Some(hi), Some(lo)) =
+                                (hex_nibble(raw_q[qi + 1]), hex_nibble(raw_q[qi + 2]))
+                            {
+                                decoded[dlen] = (hi << 4) | lo;
+                                dlen += 1;
+                                qi += 3;
+                            } else {
+                                decoded[dlen] = raw_q[qi];
+                                dlen += 1;
+                                qi += 1;
+                            }
+                        } else {
+                            decoded[dlen] = raw_q[qi];
+                            dlen += 1;
+                            qi += 1;
+                        }
+                    }
+                    let q_slice = &decoded[..dlen];
+                    if !crate::sql::SqlDb::is_readonly_query(q_slice) {
+                        sh.record_net_audit(AuditVerdict::Denied, b"net:http:sql-get-write");
+                        return HttpImpl::build_response(
+                            401,
+                            b"text/plain",
+                            b"error: unauthorized (use authenticated POST /sql for mutations)\n",
+                            out,
+                        )
+                        .unwrap_or(0);
+                    }
+                    let blen = sh.db.exec(q_slice, &mut body);
+                    return HttpImpl::build_response(200, b"text/plain", &body[..blen], out)
+                        .unwrap_or(0);
+                }
                 let blen = sh.db.exec(b".tables", &mut body);
                 return HttpImpl::build_response(200, b"text/plain", &body[..blen], out)
                     .unwrap_or(0);

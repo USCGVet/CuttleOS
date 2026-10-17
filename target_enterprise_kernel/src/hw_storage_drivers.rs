@@ -372,7 +372,7 @@ impl AhciHwPort {
         };
         let pbase = abar + 0x100 + (port as u64) * 0x80;
 
-        let dma = dma_phys_base();
+        let dma = dma_phys_base() + 0x1_0000;
         let clb_pa = dma; // 1 KiB aligned
         let fb_pa = dma + 0x0400; // 256 B aligned
         let ctba_pa = dma + 0x0800; // 128 B aligned

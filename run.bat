@@ -72,29 +72,42 @@ if not "%PKG_RC%"=="0" goto :pkg_failed
 echo     BIOS image: %BIOS_IMG%
 
 REM ----- 3/3 launch QEMU ----------------------------------------------------
-REM
-REM Headed mode: drop `-display none` so the graphical QEMU window opens
-REM (matches RustOSa's run.bat UX). Serial banners stream to BOTH this cmd
-REM window AND a log file under target/proteus_images/ so the operator can
-REM review them after exit.
-REM
-REM Note: Proteus's kernel only emits to COM1 serial -- it does NOT paint
-REM the framebuffer. So the QEMU window will show SeaBIOS + the bootloader
-REM splash, then go blank / cursor-only while the kernel runs through its
-REM banner sequence on COM1. All the boot proof lives in this cmd window
-REM and in the serial log. Painting the framebuffer is a future surface.
-REM
-REM Exit: close the QEMU window OR press Ctrl+C in this cmd window.
 set "SERIAL_LOG=%IMAGES_DIR%\run_serial.log"
+set "VIRTIO_IMG=%IMAGES_DIR%\virtio_hw.img"
+set "AHCI_IMG=%IMAGES_DIR%\ahci_hw.img"
+set "NVME_IMG=%IMAGES_DIR%\nvme_hw.img"
+if not exist "%VIRTIO_IMG%" fsutil file createnew "%VIRTIO_IMG%" 1048576 >nul
+if not exist "%AHCI_IMG%" fsutil file createnew "%AHCI_IMG%" 1048576 >nul
+if not exist "%NVME_IMG%" fsutil file createnew "%NVME_IMG%" 1048576 >nul
+
 echo.
-echo [3/3] Launching QEMU. Kernel boot banners stream below.
-echo        QEMU window: graphical default backend
+echo [3/3] Launching QEMU (1280x720 console + HTTP :18080 / HTTPS :18443 + SQL).
+echo        Dashboard:   http://127.0.0.1:18080/app
+echo        SQL Server:  http://127.0.0.1:18080/sql?SELECT+*+FROM+kv
 echo        Serial log:  %SERIAL_LOG%
-echo        Exit:        close the QEMU window or Ctrl+C in this cmd
+echo        Exit:        type 'halt' at proteus^> prompt or close QEMU window
 echo ============================================================================
 "%QEMU%" ^
-    -drive format=raw,file="%BIOS_IMG%" ^
+    -accel tcg ^
     -fw_cfg name=opt/proteus_device_key,file="%ROOT%\device_secret_key.bin" ^
+    -drive format=raw,file="%BIOS_IMG%",if=ide ^
+    -drive if=none,id=vd0,format=raw,file="%VIRTIO_IMG%" ^
+    -device virtio-blk-pci,drive=vd0,disable-legacy=off,disable-modern=on ^
+    -netdev hubport,id=n0,hubid=1 ^
+    -device virtio-net-pci,netdev=n0,disable-legacy=off,disable-modern=on ^
+    -netdev hubport,id=n1,hubid=1 ^
+    -device virtio-net-pci,netdev=n1,disable-legacy=off,disable-modern=on ^
+    -netdev user,id=usernet0,hostfwd=tcp:127.0.0.1:18080-10.0.2.15:80,hostfwd=tcp:127.0.0.1:18443-10.0.2.15:443,hostfwd=udp:127.0.0.1:18080-10.0.2.15:8080 ^
+    -device virtio-net-pci,netdev=usernet0,mac=52:54:00:12:34:56,disable-legacy=on,disable-modern=off ^
+    -drive if=none,id=ahd0,format=raw,file="%AHCI_IMG%" ^
+    -device ahci,id=ahci0 ^
+    -device ide-hd,drive=ahd0,bus=ahci0.0 ^
+    -netdev hubport,id=e0,hubid=2 ^
+    -device e1000,netdev=e0 ^
+    -netdev hubport,id=e1,hubid=2 ^
+    -device e1000,netdev=e1 ^
+    -drive if=none,id=nvme0,format=raw,file="%NVME_IMG%" ^
+    -device nvme,drive=nvme0,serial=PROTEUS-NVME-HW ^
     -chardev stdio,id=ch0,logfile="%SERIAL_LOG%" ^
     -serial chardev:ch0 ^
     -no-reboot ^

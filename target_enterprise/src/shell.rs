@@ -2059,7 +2059,7 @@ impl OsShell {
             }
             return pos;
         }
-        if bytes_eq(sub, b"create") {
+        if bytes_eq(sub, b"create") || bytes_eq(sub, b"login") {
             let (user, nonce) = split_first_word(rest);
             if user.is_empty() {
                 self.record_audit(32, AuditVerdict::Error, b"shell:session:no-user");
@@ -2074,7 +2074,7 @@ impl OsShell {
             pos += copy_into(b"\n", &mut out[pos..]);
             return pos;
         }
-        if bytes_eq(sub, b"revoke") {
+        if bytes_eq(sub, b"revoke") || bytes_eq(sub, b"logout") {
             if self.revoke_session(rest) {
                 return copy_into(b"session: revoked\n", out);
             }

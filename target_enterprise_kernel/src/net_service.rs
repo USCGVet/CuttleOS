@@ -679,7 +679,7 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
     loop {
         let Some((flen, head_id)) = vnet_rx(n, &mut frame) else {
             idle += 1;
-            let max_idle: u64 = if rx_count == 0 { 2_000_000 } else { 200_000_000 };
+            let max_idle: u64 = 2_000_000;
             if idle > max_idle {
                 break;
             }
