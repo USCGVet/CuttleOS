@@ -5,6 +5,13 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+/// Horizontal advance per character cell in pixels (7 glyph columns * 2px = 14px).
+const CHAR_W: usize = 14;
+/// Vertical line pitch per character row in pixels (8 glyph rows * 2px + 3px line gap = 19px).
+const CHAR_H: usize = 19;
+/// Top margin where scrollable terminal text begins (below the two header bars).
+const TERM_TOP_Y: usize = 68;
+
 static FB_PTR: AtomicU64 = AtomicU64::new(0);
 static FB_LEN: AtomicUsize = AtomicUsize::new(0);
 static FB_WIDTH: AtomicUsize = AtomicUsize::new(0);
@@ -12,8 +19,8 @@ static FB_HEIGHT: AtomicUsize = AtomicUsize::new(0);
 static FB_STRIDE: AtomicUsize = AtomicUsize::new(0);
 static FB_BPP: AtomicUsize = AtomicUsize::new(0);
 static FB_ACTIVE: AtomicBool = AtomicBool::new(false);
-static FB_COL: AtomicUsize = AtomicUsize::new(2);
-static FB_ROW: AtomicUsize = AtomicUsize::new(3);
+static FB_COL: AtomicUsize = AtomicUsize::new(1);
+static FB_ROW: AtomicUsize = AtomicUsize::new(4);
 
 /// Record the hardware linear framebuffer parameters from `BootInfo`.
 pub(crate) fn fb_register(boot: &mut bootloader_api::BootInfo) {
@@ -39,30 +46,30 @@ pub(crate) fn fb_console_start() {
         return;
     }
 
-    // 1. Clear background to deep navy (R=11, G=16, B=32 -> BGR = 0x20, 0x10, 0x0B).
+    // 1. Clear background to deep navy (R=11, G=16, B=32).
     fill_rect(0, 0, w, h, (11, 16, 32));
-    // 2. Top status header bar (y = 0..36, sky blue R=2, G=132, B=199).
-    fill_rect(0, 0, w, 36, (2, 132, 199));
-    // 3. Sub-header telemetry bar (y = 36..60, slate R=30, G=41, B=59).
-    fill_rect(0, 36, w, 24, (30, 41, 59));
+    // 2. Top status header bar (y = 0..34, sky blue R=2, G=132, B=199).
+    fill_rect(0, 0, w, 34, (2, 132, 199));
+    // 3. Sub-header telemetry bar (y = 34..62, slate R=30, G=41, B=59).
+    fill_rect(0, 34, w, 28, (30, 41, 59));
 
     draw_str_at(
-        16,
-        10,
-        b"PROTEUS ENTERPRISE MTD OS // x86-64 RING-0/3 // WEB :80/:443 + SQL PRTSSQL1",
+        14,
+        9,
+        b"PROTEUS ENTERPRISE MTD OS  //  x86-64 RING-0/3  //  WEB :18080 + SQL",
         (255, 255, 255),
         (2, 132, 199),
     );
     draw_str_at(
-        16,
+        14,
         40,
-        b"STATUS: ONLINE | IP: 10.0.2.15 (HOST :18080) | VFS: PRTSFS01 | DB: PRTSSQL1 | TPM2: PCR-10 OK",
+        b"ONLINE | IP 10.0.2.15 (:18080/app) | VFS PRTSFS01 | DB PRTSSQL1 | TPM2 OK",
         (56, 189, 248),
         (30, 41, 59),
     );
 
-    FB_COL.store(2, Ordering::Relaxed);
-    FB_ROW.store(5, Ordering::Relaxed);
+    FB_COL.store(1, Ordering::Relaxed);
+    FB_ROW.store(4, Ordering::Relaxed);
     FB_ACTIVE.store(true, Ordering::Relaxed);
 }
 
@@ -76,40 +83,52 @@ pub(crate) fn fb_write_byte(b: u8) {
     if w < 64 || h < 96 {
         return;
     }
-    let max_cols = (w / 8).saturating_sub(2);
-    let max_rows = (h / 16).saturating_sub(1);
+    let max_cols = (w / CHAR_W).saturating_sub(1);
+    let max_rows = (h / CHAR_H).saturating_sub(1);
 
     let mut col = FB_COL.load(Ordering::Relaxed);
     let mut row = FB_ROW.load(Ordering::Relaxed);
 
     match b {
         b'\r' => {
-            col = 2;
+            col = 1;
         }
         b'\n' => {
-            col = 2;
+            col = 1;
             row += 1;
             if row >= max_rows {
-                fill_rect(0, 64, w, h.saturating_sub(64), (11, 16, 32));
-                row = 5;
+                fill_rect(0, TERM_TOP_Y, w, h.saturating_sub(TERM_TOP_Y), (11, 16, 32));
+                row = 4;
             }
         }
         0x08 => {
-            if col > 2 {
+            if col > 1 {
                 col -= 1;
-                draw_glyph_at(col * 8, row * 16, b' ', (226, 232, 240), (11, 16, 32));
+                draw_glyph_at(
+                    col * CHAR_W,
+                    row * CHAR_H,
+                    b' ',
+                    (226, 232, 240),
+                    (11, 16, 32),
+                );
             }
         }
         c => {
             if col >= max_cols {
-                col = 2;
+                col = 1;
                 row += 1;
                 if row >= max_rows {
-                    fill_rect(0, 64, w, h.saturating_sub(64), (11, 16, 32));
-                    row = 5;
+                    fill_rect(0, TERM_TOP_Y, w, h.saturating_sub(TERM_TOP_Y), (11, 16, 32));
+                    row = 4;
                 }
             }
-            draw_glyph_at(col * 8, row * 16, c, (226, 232, 240), (11, 16, 32));
+            draw_glyph_at(
+                col * CHAR_W,
+                row * CHAR_H,
+                c,
+                (226, 232, 240),
+                (11, 16, 32),
+            );
             col += 1;
         }
     }
@@ -153,10 +172,13 @@ fn draw_str_at(x0: usize, y0: usize, s: &[u8], fg: (u8, u8, u8), bg: (u8, u8, u8
     let mut x = x0;
     for &b in s {
         draw_glyph_at(x, y0, b, fg, bg);
-        x += 8;
+        x += CHAR_W;
     }
 }
 
+/// Render an 8x8 glyph scaled 2x horizontally and 2x vertically (14x16 cell
+/// with 3px vertical line spacing = 14x19 cell) so horizontal and vertical
+/// strokes have uniform 2px thickness and natural monospace proportions.
 fn draw_glyph_at(x0: usize, y0: usize, ch: u8, fg: (u8, u8, u8), bg: (u8, u8, u8)) {
     let ptr = FB_PTR.load(Ordering::Relaxed) as *mut u8;
     let len = FB_LEN.load(Ordering::Relaxed);
@@ -173,18 +195,23 @@ fn draw_glyph_at(x0: usize, y0: usize, ch: u8, fg: (u8, u8, u8), bg: (u8, u8, u8
         while sy < 2 {
             let py = y0 + gy * 2 + sy;
             let mut gx = 0usize;
-            while gx < 8 {
+            // Render the 7 active columns (bits 7..=1) at 2x horizontal width = 14px.
+            while gx < 7 {
                 let on = (row_bits & (0x80 >> gx)) != 0;
                 let c = if on { fg } else { bg };
-                let px = x0 + gx;
-                let off = (py * stride + px) * bpp;
-                if off + 2 < len {
-                    // SAFETY: `off + 2 < len` guarantees the pixel offset lies within the mapped hardware framebuffer slice.
-                    unsafe {
-                        core::ptr::write_volatile(ptr.add(off), c.2);
-                        core::ptr::write_volatile(ptr.add(off + 1), c.1);
-                        core::ptr::write_volatile(ptr.add(off + 2), c.0);
+                let mut sx = 0usize;
+                while sx < 2 {
+                    let px = x0 + gx * 2 + sx;
+                    let off = (py * stride + px) * bpp;
+                    if off + 2 < len {
+                        // SAFETY: `off + 2 < len` guarantees the pixel offset lies within the mapped hardware framebuffer slice.
+                        unsafe {
+                            core::ptr::write_volatile(ptr.add(off), c.2);
+                            core::ptr::write_volatile(ptr.add(off + 1), c.1);
+                            core::ptr::write_volatile(ptr.add(off + 2), c.0);
+                        }
                     }
+                    sx += 1;
                 }
                 gx += 1;
             }
@@ -194,22 +221,21 @@ fn draw_glyph_at(x0: usize, y0: usize, ch: u8, fg: (u8, u8, u8), bg: (u8, u8, u8
     }
 }
 
-/// Compact 8x8 bitmap font covering printable ASCII (`0x20..=0x7E`).
+/// Complete 8x8 bitmap font covering printable ASCII (`0x20..=0x7E`),
+/// including distinct uppercase (`A..Z`) and lowercase (`a..z`) glyphs.
 fn glyph_8x8(ch: u8) -> [u8; 8] {
-    let c = if ch.is_ascii_lowercase() {
-        ch - 32
-    } else {
-        ch
-    };
-    match c {
+    match ch {
         b' ' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         b'!' => [0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x00],
         b'"' => [0x66, 0x66, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00],
-        b'#' => [0x36, 0x36, 0x7F, 0x36, 0x7F, 0x36, 0x36, 0x00],
+        b'#' => [0x6C, 0x6C, 0xFE, 0x6C, 0xFE, 0x6C, 0x6C, 0x00],
+        b'$' => [0x18, 0x3E, 0x60, 0x3C, 0x06, 0x7C, 0x18, 0x00],
+        b'%' => [0x62, 0x66, 0x0C, 0x18, 0x30, 0x66, 0x46, 0x00],
+        b'&' => [0x38, 0x6C, 0x38, 0x76, 0xDC, 0xCC, 0x76, 0x00],
         b'\'' => [0x18, 0x18, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00],
         b'(' => [0x0C, 0x18, 0x30, 0x30, 0x30, 0x18, 0x0C, 0x00],
         b')' => [0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x18, 0x30, 0x00],
-        b'*' => [0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00],
+        b'*' => [0x00, 0x66, 0x3C, 0xFE, 0x3C, 0x66, 0x00, 0x00],
         b'+' => [0x00, 0x18, 0x18, 0x7E, 0x18, 0x18, 0x00, 0x00],
         b',' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30],
         b'-' => [0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00],
@@ -231,6 +257,7 @@ fn glyph_8x8(ch: u8) -> [u8; 8] {
         b'=' => [0x00, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00, 0x00],
         b'>' => [0x30, 0x18, 0x0C, 0x06, 0x0C, 0x18, 0x30, 0x00],
         b'?' => [0x3C, 0x66, 0x06, 0x1C, 0x18, 0x00, 0x18, 0x00],
+        b'@' => [0x3C, 0x66, 0x6E, 0x6E, 0x60, 0x62, 0x3C, 0x00],
         b'A' => [0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00],
         b'B' => [0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00],
         b'C' => [0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0x00],
@@ -257,8 +284,42 @@ fn glyph_8x8(ch: u8) -> [u8; 8] {
         b'X' => [0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00],
         b'Y' => [0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00],
         b'Z' => [0x7E, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x7E, 0x00],
+        b'[' => [0x3C, 0x30, 0x30, 0x30, 0x30, 0x30, 0x3C, 0x00],
+        b'\\' => [0xC0, 0x60, 0x30, 0x18, 0x0C, 0x06, 0x02, 0x00],
+        b']' => [0x3C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x3C, 0x00],
+        b'^' => [0x10, 0x38, 0x6C, 0xC6, 0x00, 0x00, 0x00, 0x00],
         b'_' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00],
+        b'`' => [0x30, 0x18, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00],
+        b'a' => [0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E, 0x00],
+        b'b' => [0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00],
+        b'c' => [0x00, 0x00, 0x3C, 0x66, 0x60, 0x66, 0x3C, 0x00],
+        b'd' => [0x06, 0x06, 0x3E, 0x66, 0x66, 0x66, 0x3E, 0x00],
+        b'e' => [0x00, 0x00, 0x3C, 0x66, 0x7E, 0x60, 0x3C, 0x00],
+        b'f' => [0x1C, 0x30, 0x7C, 0x30, 0x30, 0x30, 0x30, 0x00],
+        b'g' => [0x00, 0x00, 0x3E, 0x66, 0x66, 0x3E, 0x06, 0x3C],
+        b'h' => [0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x00],
+        b'i' => [0x18, 0x00, 0x38, 0x18, 0x18, 0x18, 0x3C, 0x00],
+        b'j' => [0x0C, 0x00, 0x1C, 0x0C, 0x0C, 0x0C, 0x6C, 0x38],
+        b'k' => [0x60, 0x60, 0x66, 0x6C, 0x78, 0x6C, 0x66, 0x00],
+        b'l' => [0x38, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00],
+        b'm' => [0x00, 0x00, 0xEC, 0xFE, 0xD6, 0xC6, 0xC6, 0x00],
+        b'n' => [0x00, 0x00, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x00],
+        b'o' => [0x00, 0x00, 0x3C, 0x66, 0x66, 0x66, 0x3C, 0x00],
+        b'p' => [0x00, 0x00, 0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60],
+        b'q' => [0x00, 0x00, 0x3E, 0x66, 0x66, 0x3E, 0x06, 0x06],
+        b'r' => [0x00, 0x00, 0x7C, 0x66, 0x60, 0x60, 0x60, 0x00],
+        b's' => [0x00, 0x00, 0x3E, 0x60, 0x3C, 0x06, 0x7C, 0x00],
+        b't' => [0x30, 0x30, 0x7C, 0x30, 0x30, 0x36, 0x1C, 0x00],
+        b'u' => [0x00, 0x00, 0x66, 0x66, 0x66, 0x66, 0x3E, 0x00],
+        b'v' => [0x00, 0x00, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x00],
+        b'w' => [0x00, 0x00, 0xC6, 0xC6, 0xD6, 0xFE, 0x6C, 0x00],
+        b'x' => [0x00, 0x00, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x00],
+        b'y' => [0x00, 0x00, 0x66, 0x66, 0x66, 0x3E, 0x06, 0x3C],
+        b'z' => [0x00, 0x00, 0x7E, 0x0C, 0x18, 0x30, 0x7E, 0x00],
+        b'{' => [0x0E, 0x18, 0x18, 0x70, 0x18, 0x18, 0x0E, 0x00],
         b'|' => [0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00],
+        b'}' => [0x70, 0x18, 0x18, 0x0E, 0x18, 0x18, 0x70, 0x00],
+        b'~' => [0x76, 0xDC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         _ => [0x3C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00],
     }
 }
