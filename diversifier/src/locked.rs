@@ -1,41 +1,11 @@
-//! Locked-modules enforcement — TASK-017 prerequisite.
+//! Locked-module policy enforcement (`locked_modules.toml`).
 //!
-//! # Why this exists
-//!
-//! Some source files in the workspace MUST NOT be morphed. The
-//! canonical example is the KPTI port (`target_enterprise/src/kpti.rs`,
-//! landing in this iteration): its trampoline-blob byte sequences and
-//! the CR3-swap-before-register-save discipline in `build_user_view`
-//! are load-bearing security boundaries. A diversifier statement-reorder
-//! that swaps CR3 with a register save would silently break the kernel
-//! ↔ user isolation guarantee. The contract surface itself
-//! (`contracts/src/lib.rs`) is locked for the same reason — every
-//! `target_*` crate's API depends on its bit-stability.
-//!
-//! # Mechanism
-//!
-//! A single workspace-rooted file `locked_modules.toml` lists the
-//! workspace-relative paths the diversifier must refuse to morph.
-//! [`diversify_path`] reads it at call time, canonicalises both the
-//! lock-list and the candidate path, and returns
-//! [`DiversifyError::LockedModule`] on a match.
-//!
-//! Callers MUST use [`diversify_path`] rather than the lower-level
-//! [`super::diversify`] when the morph target is on disk — bypassing
-//! the lock check is a security violation, not a convenience option.
-//!
-//! # Missing file = fatal
-//!
-//! If `locked_modules.toml` doesn't exist, [`diversify_path`] returns
-//! [`DiversifyError::MissingLockedModulesFile`]. "Silently default to
-//! the empty lock set" would let an attacker disable the protection by
-//! deleting one file. No silent fallback.
-//!
-//! # Workspace-root discovery
-//!
-//! Walk up from the candidate file's directory until we find a file
-//! named `locked_modules.toml`. That directory is the workspace root.
-//! All lock-list paths are interpreted relative to it.
+//! [`diversify_path`] locates the workspace-root `locked_modules.toml` by
+//! walking up from the candidate file's directory, canonicalizes both the lock
+//! list and the candidate path, and returns [`DiversifyError::LockedModule`]
+//! if the candidate matches a locked entry. If `locked_modules.toml` is
+//! missing, [`DiversifyError::MissingLockedModulesFile`] is returned (no
+//! fallback to an empty lock set).
 
 use std::fs;
 use std::path::{Path, PathBuf};

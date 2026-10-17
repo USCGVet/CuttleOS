@@ -4,8 +4,10 @@
 
 #![allow(missing_docs)]
 
+#[cfg(test)]
+use proteus_contracts::SLP_TYP_S5;
 use proteus_contracts::{
-    Power, Pm1Control, PM1A_CNT_PORT, PM1_SLP_EN, PM1_SLP_TYP_MASK, PM1_SLP_TYP_SHIFT, SLP_TYP_S5,
+    Pm1Control, Power, PM1A_CNT_PORT, PM1_SLP_EN, PM1_SLP_TYP_MASK, PM1_SLP_TYP_SHIFT,
 };
 
 /// Stateless power codec.

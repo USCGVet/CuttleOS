@@ -1,22 +1,8 @@
-# TASK-022 — operator-curated set of acceptable factory binary
-# fingerprints. Every accepted attestation entry minted under
-# `morph run --strict-factory` (or audited via `morph verify-attest
-# --strict-factory`) must declare a `factory_binaries` map that is a
-# subset of the values listed here.
+# Expected factory binary SHA-256 fingerprints enforced under `--strict-factory`.
 #
-# Each component has a list of acceptable hashes so the operator can
-# stage transitions (build a new rustc, add its hash, run a cycle,
-# verify the new entries pass, then prune the old hash).
-#
-# Regenerate the starter block at any time with:
-#     morph factory-fingerprint --toml
-#
-# Bootstrap values below: sha256 of the workspace's `target/debug/`
-# binaries as built on the iteration-22 morph host. These are NOT
-# stable across cargo builds (incremental compilation changes the
-# bytes); production deployments should pin the release-profile
-# hashes. The hash recorded for `rustc` is sha256 of `rustc -vV`
-# output, which IS stable for a given installed toolchain.
+# Each component lists the acceptable SHA-256 digests (or `rustc -vV` digest)
+# for `morph run --strict-factory` and `morph verify-attest --strict-factory`.
+# Regenerate with: `morph factory-fingerprint --toml`
 
 required = ["diversify", "morph", "rustc", "verify"]
 

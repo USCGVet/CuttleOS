@@ -1,53 +1,19 @@
-//! `verify` CLI — runs the contract invariant battery against a candidate
-//! source file. The morph engine invokes this binary during Stage 3 of the
-//! factory pipeline.
+//! `verify` CLI — candidate verification gate for the Proteus morph pipeline.
 //!
-//! Today's skeleton runs **static** checks (parse, public-symbol
-//! preservation, canonical-hash dedup, locked-surface scan). The full
-//! property-test harness for trait implementations is gated behind a
-//! `compile-and-link` step that requires a `cargo` toolchain on the host;
-//! that step is stubbed here and noted as Phase-1 work.
+//! Runs static and dynamic checks against a candidate Rust source file:
+//! 1. **Syntax & public surface**: Parses the candidate AST, verifies that all
+//!    manifest-locked public symbols and trait implementations are preserved,
+//!    and checks that the canonical AST hash differs from the previous cycle.
+//! 2. **Compile & test suite**: Compiles the target crate with the candidate
+//!    staged in place and runs its unit, KAT, and property test suites.
+//! 3. **Performance-envelope gate**: Compares per-function execution times
+//!    against the rolling median of the last `--perf-window` (default: 10)
+//!    accepted entries in `perf.jsonl`, rejecting candidates that regress
+//!    beyond `--perf-threshold` (default: ratio `1.2` / `+20%`). On the first
+//!    cycle (when `perf.jsonl` does not yet exist), the accepted candidate
+//!    establishes the initial baseline.
 //!
-//! Exit code 0 = accept candidate. Exit code 1 = reject. The morph engine
-//! depends on this exit-code contract.
-//!
-//! # Performance-envelope gating (TASK-005)
-//!
-//! After the golden test passes, the verifier measures per-function cost
-//! and compares it against the **per-field median of the last N accepted
-//! cycles** of `perf.jsonl` (N defaults to 10, configurable via
-//! `--perf-window`). If any `*_ns` field in the candidate measurement
-//! exceeds the median baseline by more than `--perf-threshold` percent
-//! (default: 20% / ratio 1.2), the candidate is **REJECTED** and no
-//! line is appended to `perf.jsonl`. Only accepted candidates produce a
-//! perf log entry.
-//!
-//! `--perf-threshold` accepts two forms:
-//!   * **Ratio form** (TASK-005 spec): a decimal `> 1.0`. `1.2` =
-//!     "+20%". Detected when the value contains `.` or its magnitude
-//!     is `< 10`.
-//!   * **Legacy percent form**: an integer `>= 10`. `50` = "+50%".
-//!
-//! The threshold check now hard-rejects on regression. Infrastructure
-//! errors during the check (file unreadable, etc.) still downgrade to
-//! a warning + accept, since perf measurement infra failure is not
-//! evidence of a candidate regression.
-//!
-//! # Bootstrap convention (important for the morph engine)
-//!
-//! On the very first cycle there is no `perf.jsonl`. The verifier handles
-//! this by emitting a warning to stderr (`verify: no perf baseline
-//! available; skipping perf gating`) and accepting on the perf axis. The
-//! morph engine therefore does NOT need to know about the bootstrap edge
-//! case — it always invokes `verify` the same way. An empty or missing
-//! `perf.jsonl` means "no baseline yet"; the first successful accept
-//! writes the seed line, and subsequent cycles enforce regression against
-//! it.
-//!
-//! The threshold check also gracefully skips functions that exist in the
-//! candidate measurement but not the baseline (e.g., a future Track 2
-//! `demosignatureverify_ns` field added before its first baseline line is
-//! written). This makes schema growth safe for downstream consumers.
+//! Exit code `0` accepts the candidate; exit code `1` rejects it.
 
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;

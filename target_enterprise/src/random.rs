@@ -6,7 +6,9 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{Random, RandomError, RANDOM_BLOCK_LEN, RANDOM_SEED_LEN};
+#[cfg(test)]
+use proteus_contracts::RANDOM_BLOCK_LEN;
+use proteus_contracts::{Random, RandomError, RANDOM_SEED_LEN};
 
 /// Mixer state.
 pub struct RandomImpl {

@@ -3,8 +3,11 @@
 #![allow(missing_docs)]
 
 use proteus_contracts::{
-    VirtioPciCap, VirtioPciCapError, VirtioPciCaps, VIRTIO_PCI_CAP_COMMON_CFG,
-    VIRTIO_PCI_CAP_DEVICE_CFG, VIRTIO_PCI_CAP_ID, VIRTIO_PCI_CAP_ISR_CFG, VIRTIO_PCI_CAP_MAX,
+    VirtioPciCap, VirtioPciCapError, VirtioPciCaps, VIRTIO_PCI_CAP_ID, VIRTIO_PCI_CAP_MAX,
+};
+#[cfg(test)]
+use proteus_contracts::{
+    VIRTIO_PCI_CAP_COMMON_CFG, VIRTIO_PCI_CAP_DEVICE_CFG, VIRTIO_PCI_CAP_ISR_CFG,
     VIRTIO_PCI_CAP_NOTIFY_CFG, VIRTIO_PCI_CAP_PCI_CFG,
 };
 

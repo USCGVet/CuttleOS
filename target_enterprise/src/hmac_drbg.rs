@@ -4,7 +4,9 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{HmacDrbg, DRBG_OUT_LEN, DRBG_SEED_LEN};
+#[cfg(test)]
+use proteus_contracts::DRBG_OUT_LEN;
+use proteus_contracts::{HmacDrbg, DRBG_SEED_LEN};
 
 use crate::tls::hmac_sha256;
 

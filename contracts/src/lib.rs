@@ -1,31 +1,28 @@
-//! Proteus contracts — the immutable kernel API surface.
+//! Proteus contracts — the immutable kernel API and wire-format surface.
 //!
-//! Every morph candidate produced by the factory must satisfy every trait
-//! in this crate. The verifier treats these trait signatures and their
-//! documented invariants as ground truth.
-//!
-//! **This crate does not morph.** It is the architectural anchor of the
-//! system. Changes to this crate require human review, are tracked in the
-//! attestation log as schema-version transitions, and trigger a fleet-wide
-//! coordinated upgrade — not a routine morph cycle.
+//! Every morph candidate produced by the factory must satisfy the traits and
+//! invariants defined in this crate. This crate is locked by
+//! `locked_modules.toml` and is never modified by the diversifier.
 //!
 //! ## Module Layout
+//! - [`arch_and_platform`]: `Smp`, `ApicWriter`, `Pci`, `PciConfigBus`, `XhciTrb`,
+//!   `UefiGop`, `IoApic`, `LapicIcr`, `Multiboot2`, `AcpiRsdp`, `Serial16550`,
+//!   `TickSource`, `Watchdog`, `Power`, `Elf64`, `Hpet`, `Keyboard`, `IoPort`,
+//!   `PicTimer`, `Rtc`, and `CONTRACTS_SCHEMA_VERSION`.
 //! - [`core_primitives`]: `Hash`, `Aead`, `SignatureVerify`, `SyscallDispatch`,
 //!   `SyscallCapTable`, `CapProof`, `caps`, `BlockDevice`, `Allocator`, and
 //!   `property_tests`.
-//! - [`tls_wal_iommu_net`]: `Tls13Server`, `Tls13Client`, `WriteAheadLog`,
-//!   `Iommu`, `NetStack`, `Tcp`, `Http`, `Dns`, `Eth`, `Arp`, `Dhcp`, `Icmp`.
-//! - [`kpti_virtio_security`]: `Kpti`, `CrashDump`, `SymbolResolve`, `MmioBus`,
-//!   `NetDevice`, `BlockDeviceVirtio`, `PacketFilter`, `Tpm`, `AuditLog`, `Sntp`.
-//! - [`fs_ebpf_smp_pci_x509`]: `Filesystem`, `Vfs`, `EBpf`, `MmioRegBus`,
-//!   `EthernetController`, `Tftp`, `ApicWriter`, `Smp`, `PciConfigBus`, `Pci`,
-//!   `X509`, `CONTRACTS_SCHEMA_VERSION`.
-//! - [`hw_storage_boot`]: `Gpt`, `DnsName`, `HmacDrbg`, `AhciFis`, `XhciTrb`,
-//!   `UefiGop`, `AttestTlv`, `Base64`, `AhciCmd`, `IoApic`, `LapicIcr`,
-//!   `Multiboot2`, `Crc32c`, `AcpiRsdp`, `FrameBitmap`, `Serial16550`,
-//!   `TickSource`, `VirtioPciCaps`, `SigKat`, `Watchdog`, `Random`, `Power`,
-//!   `Elf64`, `Hpet`, `StackCanary`, `Keyboard`, `Fat32`, `Quota`, `GdbStub`,
-//!   `JournalFs`, `KatRunner`, `IoPort`, `PicTimer`, `Rtc`.
+//! - [`mm_and_isolation`]: `Iommu`, `Kpti`, and `FrameBitmap`.
+//! - [`net_protocols`]: `NetStack`, `Tcp`, `Http`, `Dns`, `DnsName`, `Eth`,
+//!   `Arp`, `Dhcp`, `Icmp`, `Sntp`, and `Tftp`.
+//! - [`security_and_diag`]: `PacketFilter`, `Tpm`, `AuditLog`, `EBpf`,
+//!   `StackCanary`, `CrashDump`, `SymbolResolve`, and `GdbStub`.
+//! - [`storage_and_fs`]: `WriteAheadLog`, `Filesystem`, `Vfs`, `JournalFs`,
+//!   `Fat32`, `Quota`, `Gpt`, `AhciFis`, and `AhciCmd`.
+//! - [`tls_and_crypto`]: `Tls13Server`, `Tls13Client`, `X509`, `HmacDrbg`,
+//!   `KatRunner`, `SigKat`, `Random`, `AttestTlv`, `Base64`, and `Crc32c`.
+//! - [`virtio_and_nic`]: `MmioBus`, `NetDevice`, `BlockDeviceVirtio`,
+//!   `VirtioPciCaps`, `MmioRegBus`, and `EthernetController`.
 
 #![cfg_attr(not(feature = "property_tests"), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]

@@ -2,9 +2,11 @@
 
 #![allow(missing_docs)]
 
+#[cfg(test)]
+use proteus_contracts::ICR_DELIVERY_FIXED;
 use proteus_contracts::{
-    IcrCommand, LapicIcr, ICR_DELIVERY_FIXED, ICR_DELIVERY_INIT, ICR_DELIVERY_SIPI,
-    ICR_DEST_NONE, ICR_HIGH_DEST_SHIFT, ICR_LEVEL_ASSERT, ICR_LEVEL_DEASSERT, ICR_TRIGGER_LEVEL,
+    IcrCommand, LapicIcr, ICR_DELIVERY_INIT, ICR_DELIVERY_SIPI, ICR_DEST_NONE, ICR_HIGH_DEST_SHIFT,
+    ICR_LEVEL_ASSERT, ICR_LEVEL_DEASSERT, ICR_TRIGGER_LEVEL,
 };
 
 pub struct LapicIcrImpl;

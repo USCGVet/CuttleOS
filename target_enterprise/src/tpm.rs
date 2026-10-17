@@ -435,8 +435,8 @@ pub fn pcr_bitmap_position(pcr_index: u32) -> (usize, u8) {
 mod tests {
     use super::*;
     use proteus_contracts::{
-        Tpm, TpmError, TpmResponseView, TPM_RC_SUCCESS, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS,
-        TPM_SU_CLEAR, TPM_SU_STATE,
+        Tpm, TpmError, TPM_RC_SUCCESS, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_SU_CLEAR,
+        TPM_SU_STATE,
     };
 
     /// Golden bytes for `TPM2_Startup(SU_CLEAR)`.

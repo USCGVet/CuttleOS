@@ -409,9 +409,15 @@ pub fn build_kernel_with_layout_seed_and_prod(
         rustflags = kernel_diversity_rustflags(&rustflags, seed);
         let llvm_flags = kernel_llvm_codegen_rustflags(seed);
         rustflags = format!("{rustflags} {llvm_flags}").trim().to_string();
+        // Public variant label only (the kernel's `ATTEST: OK seed=` banner);
+        // no key material is derived from it.
+        cmd.env("PROTEUS_VARIANT_SEED", seed.to_string());
         eprintln!(
             "factory_builder: kernel codegen diversity enabled (seed={seed}: layout-randomize + function-shuffle + llvm-codegen [{llvm_flags}])"
         );
+    } else {
+        // Don't let an inherited value mislabel an unseeded build.
+        cmd.env_remove("PROTEUS_VARIANT_SEED");
     }
     if prod {
         rustflags = format!("{rustflags} --cfg proteus_prod").trim().to_string();

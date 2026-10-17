@@ -1,99 +1,15 @@
-//! Stack-frame padding pass — TASK-029.
+//! Optional per-function stack-frame padding pass.
 //!
-//! # Why this exists
+//! When enabled via [`crate::DiversifyOptions::with_stack_pad`], injects a
+//! `core::hint::black_box([0u8; N])` stack allocation (`N ∈ [32, 224)`) at the
+//! start of eligible functions (`Item::Fn` and `ImplItem::Fn`), derived
+//! deterministically from `SHA-256(HASH_TAG, seed, ":", fn_name)`.
 //!
-//! Iteration 16 (TASK-025) made the chain-survival probe meaningful for
-//! the first time, and the result was bad: across 20 morph cycles of
-//! `target_enterprise/src/tls.rs` the diversifier produced only **4
-//! distinct (symbol, offset) layouts** (multiplicities 8, 6, 4, 2).
-//! Byte content varied (~30% bit Hamming, 17/20 distinct `.text` sha256)
-//! but function offsets did not move. A ROP chain anchored to cycle 0's
-//! `hkdf_expand_label` offset survived **all 19** subsequent cycles.
-//! That is, the project's headline thesis — "metamorphism breaks
-//! exploit amortisation by moving offsets" — was not supported by the
-//! empirical data.
-//!
-//! Diagnosis: the AST passes in `lib.rs` and the inline-hint perturbation
-//! in `codegen_perturb.rs` produce a different *MIR* and a different
-//! sequence of *bytes*, but they do not reliably change function *size*.
-//! Two morphs of the same module compile to different machine code at
-//! the byte level, but the function boundaries (and therefore the
-//! offsets of every function after them in `.text`) align identically.
-//! An exploit gadget at `0x141B` in cycle 0 is at `0x141B` in cycle 19.
-//!
-//! Fix: this pass injects an opaque `[u8; N]` pad at the top of every
-//! morphable function body, where `N` is derived deterministically
-//! from `(seed, fn_name)` and lives in the range `[32, 223]` bytes.
-//! The pad is anchored with `::core::hint::black_box` so the compiler
-//! cannot dead-code-eliminate it. Each function now emits a different
-//! prologue (`sub rsp, N`) and a different black-box materialization
-//! per cycle, so the function's machine-code size differs per cycle,
-//! and every function emitted after it in `.text` is at a different
-//! offset.
-//!
-//! # Production status (post layout-seed)
-//!
-//! Phase-1 layout seeding (`-Zrandomize-layout` + lld section shuffle)
-//! later achieved 0% synthetic chain survival *without* this pass, while
-//! stack pads were measured to inflate gadget count by ~33%. The pass
-//! remains available and tested, but the default
-//! [`crate::DiversifyOptions`] leaves `stack_pad = false`. Enable via
-//! [`crate::DiversifyOptions::with_stack_pad`] only for A/B measurement
-//! or deliberate pad-pass experiments.
-//!
-//! # What we change (and what we don't)
-//!
-//! - **Affected**: `Item::Fn` (free fns at file level) and `ImplItem::Fn`
-//!   (methods inside `impl` blocks) — covers the donor surface in
-//!   `target_enterprise/src/tls.rs` etc.
-//! - **Skipped**: `unsafe fn` bodies (we cannot reason about their stack
-//!   discipline), `const fn` (cannot use `core::hint::black_box` —
-//!   it isn't const), `main` (magic name), `#[no_mangle]` /
-//!   `#[export_name]` / `#[naked]` (ABI-locked, can't perturb the
-//!   prologue). Trait-required signature methods with empty bodies
-//!   (rare; would need a body to inject into).
-//! - **Behaviour-preserving**: the injected pad is purely additive. It
-//!   does not affect the function's return value, observable side
-//!   effects, panic behaviour, or any wire-protocol bytes. Locked-surface
-//!   tests (`tls_kat.rs`, `target_enterprise/tests/contract_surface.rs`,
-//!   golden-byte ServerHello, etc.) must continue to pass after this
-//!   pass runs.
-//!
-//! # Determinism
-//!
-//! Per the project's reproducibility contract — every morph cycle is
-//! reconstructible from its recorded seed — the pad size per function
-//! is deterministic in `(seed, fn_name)`. We hash a domain-separated
-//! tag `(b"proteus-stack-pad-v1", seed, ":", fn_name)` and take the
-//! low 16 bits modulo `PAD_RANGE_BYTES`. We do NOT consume from the
-//! shared rng used by upstream AST passes — that would couple our
-//! decision to the order in which the upstream passes draw bytes.
-//!
-//! # Pad-size distribution
-//!
-//! Uniform over `[MIN_PAD_BYTES, MIN_PAD_BYTES + PAD_RANGE_BYTES)`.
-//! Today: `[32, 224)` bytes. Range chosen empirically:
-//! - Below 32 bytes: too small to reliably change the prologue's
-//!   `sub rsp` byte encoding (often folded into existing alignment).
-//! - Above ~256 bytes: starts to bloat `.text` measurably; stack
-//!   usage may exceed kernel stack guard pages on deep call chains.
-//! The range can be widened in a future revision if 192 buckets prove
-//! insufficient (which they won't — 4 distinct layouts pre-fix should
-//! become well past 15 distinct layouts post-fix).
-//!
-//! # What we deliberately do NOT do
-//!
-//! - We do NOT shuffle stack frame layout (would require asm-level
-//!   intervention; this pass is pure AST).
-//! - We do NOT insert NOP sleds (would inflate `.text` without
-//!   semantic value).
-//! - We do NOT pad ALL functions every cycle — `decide_pad_bytes` is
-//!   deterministic but produces a different value per (seed, fn_name)
-//!   pair, so each function's size varies independently per cycle.
-//!   That's the property that breaks offset coalescence: even if two
-//!   seeds happen to produce identical padding for function A, they
-//!   will almost certainly differ on function B, and the cumulative
-//!   `.text` layout still differs.
+//! Skips `unsafe fn`, `const fn`, `main`, and ABI-pinned functions
+//! (`#[no_mangle]`, `#[export_name]`, `#[naked]`). Disabled by default in
+//! [`crate::DiversifyOptions`] because compiler layout randomization and
+//! linker section shuffling already randomize function offsets without adding
+//! stack-pad instructions.
 
 use sha2::{Digest, Sha256};
 use syn::{Attribute, Block, Expr, File, ImplItem, Item, ItemImpl, Signature, Stmt};

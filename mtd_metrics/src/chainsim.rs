@@ -1,50 +1,22 @@
-//! ROP/JOP chain exploit simulator — the red-team instrument for the
-//! core Proteus thesis.
+//! Multi-step ROP/JOP chain exploit simulator.
 //!
-//! The thesis under test: *a layout-dependent exploit built against
-//! morph cycle N fails against cycle N+1.* The churn metrics in
-//! [`crate`] measure gadget *survival rates*; this module measures the
-//! quantity an attacker actually cares about — **chain viability**. A
-//! chain is a sequence of gadgets that must ALL land for the exploit to
-//! work, so survival compounds: 5% per-gadget positional survival means
-//! a 10-gadget chain survives at ~0.05^10 ≈ 1e-13. Rates can look
-//! modest while viability is annihilated — or the reverse. This module
-//! settles which.
+//! Evaluates multi-gadget chain survival across two compiled ELF binaries
+//! under four attacker models:
 //!
-//! # Attacker models
-//!
-//! * **A — Static chain (stockpiled exploit).** The attacker developed
-//!   a chain against the base image (hardcoded gadget offsets, as every
-//!   real ROP payload does) and fires it unchanged at a morphed
-//!   instance. A chain step survives iff the variant has *the identical
-//!   gadget text at the identical `.text` offset*. Chain viability =
-//!   all steps survive.
-//!
-//! * **B — Leak-and-rebase (weaponized, per-target).** The attacker has
-//!   a runtime disclosure and re-derives gadget addresses against the
-//!   *current* image. Modeled as: for each base gadget, does a gadget
-//!   with the same address-independent (normalized) semantics exist
-//!   *anywhere* in the variant? If yes at every step, the chain is
-//!   rebuildable. This attacker is NOT defeated by layout churn alone —
-//!   measuring rebuild rate honestly shows the limit of what morphing
-//!   buys without cadence.
-//!
-//! * **C — Cadence-bounded re-derivation.** Attacker B's re-derivation
-//!   takes wall-clock time (disclosure, scan, chain assembly, delivery).
-//!   [`cadence_break_even`] computes the probability that no morph
-//!   occurs inside the attack window as a function of window/period —
-//!   the curve that shows when morphing starts to beat even attacker B.
-//!
-//! # Byte-level note (binmorph honesty)
-//!
-//! [`ChainReport`] also reports *byte-exact* positional survival: the
-//! fraction of chain steps where the variant's raw `.text` bytes at the
-//! step offset equal the base's. Post-link rewriters like `binmorph`
-//! re-encode instructions (MOV 89↔8B) without moving addresses or
-//! changing disassembly — so they drive byte-exact survival down while
-//! leaving attacker-A viability at 100%. That is the empirical proof
-//! that byte-level morphing alone does NOT break ROP: execution, not
-//! bytes, is what the chain depends on.
+//! * **Attacker A — Static chain**: Stockpiled exploit with hardcoded `.text`
+//!   offsets from the base build fired unchanged at the variant build. A chain
+//!   survives iff every step lands on the identical gadget at the identical
+//!   offset.
+//! * **Attacker B — Exact-register relocation**: Attacker with a full `.text`
+//!   disclosure of the variant who relocates each step to any offset containing
+//!   an address-normalized gadget with the same registers.
+//! * **Attacker B_reg — Register-adapting relocation**: Attacker with a full
+//!   `.text` disclosure of the variant who can both relocate gadgets and
+//!   substitute any general-purpose register of the same width (`r64`/`r32`/
+//!   `r16`/`r8`) at each step.
+//! * **Attacker C — Cadence-bounded re-derivation**: Models the probability
+//!   that a morph cycle completes before an attacker's disclosure-and-assembly
+//!   window finishes ([`cadence_break_even`]).
 
 use anyhow::{Context, Result};
 use serde::Serialize;

@@ -1,55 +1,29 @@
-//! Proteus diversifier — AST-level transformations that produce functionally
-//! equivalent but syntactically diverse Rust source.
+//! Deterministic, seed-driven Rust AST diversifier (`proteus-diversifier`).
 //!
-//! This crate does not invoke an LLM. It is the deterministic post-pass
-//! that follows synthesis (whether that synthesis is LLM-driven or a
-//! no-op pass-through). Its job is to strip stylistic fingerprints from
-//! the input source by re-rolling entropy from a CSPRNG seed.
+//! Applies semantics-preserving source transformations to Rust modules keyed
+//! by a 256-bit [`Seed`]:
 //!
-//! # Safety discipline
+//! 1. **Top-level item reordering**: Permutes `fn`, `struct`, `enum`, `const`,
+//!    and `static` items while keeping `use`, `mod`, and macro definitions
+//!    in place.
+//! 2. **Private function renaming**: Consistently renames non-`pub` free
+//!    functions at their definition and all call sites.
+//! 3. **Lexical local-variable renaming**: Renames local `let` bindings with
+//!    scope-aware shadowing support.
+//! 4. **Conservative statement reordering**: Swaps adjacent statements whose
+//!    read/write identifier sets are disjoint and contain no calls, macros,
+//!    control flow, or `unsafe` blocks.
+//! 5. **Literal `match`-arm reordering**: Permutes guard-free literal pattern
+//!    arms (`Int`, `Bool`, `Char`, `Byte`).
+//! 6. **`if` ↔ `match` boolean rewrites**: Converts `if cond { a } else { b }`
+//!    to `match cond { true => a, false => b }` and vice versa.
+//! 7. **Semantic & codegen perturbations**: Invokes [`semantic_perturb`]
+//!    (multiply/shift, branch polarity, and `for`/`while` loop rewrites) and
+//!    [`codegen_perturb`] (`#[inline(never)]` / `#[inline(always)]` hints).
 //!
-//! Every transformation must be **provably semantic-preserving** at the
-//! source level. The verifier downstream is the safety net for synthesis
-//! mistakes; it is not a safety net for the diversifier. A diversifier
-//! that produces semantically broken output is a bug in this crate, not
-//! a verifier responsibility.
-//!
-//! Today's transformation set:
-//!
-//! 1. **Top-level item reordering.** `Item::Fn`, `Item::Struct`,
-//!    `Item::Enum`, `Item::Const`, and `Item::Static` can always be
-//!    safely reordered at the file level in Rust — items are not
-//!    order-dependent. We do not move `Item::Use` (visibility scoping),
-//!    `Item::Mod` (macro hygiene), or `Item::Macro` (expansion order).
-//! 2. **Private function renaming.** A non-`pub` `fn` defined in this
-//!    file can only be referenced from inside this file. We rename it
-//!    consistently at the definition site and at every call site,
-//!    skipping macro bodies (which are not Rust until expansion).
-//! 3. **Local-variable renaming with proper scope tracking.** Locals
-//!    introduced by `let pat = ...;` are renamed with a per-function
-//!    suffix and lexical scope. Shadowing is handled: each `let`
-//!    creates a fresh binding that shadows any earlier name in scope.
-//!    Function arguments and identifiers prefixed with `_` are skipped.
-//! 4. **Statement reordering with a conservative data-flow check.**
-//!    Adjacent statements in a block are swapped iff neither contains
-//!    a call/macro/control-flow/unsafe construct and their read/write
-//!    name sets are disjoint in both directions.
-//! 5. **Match-arm reordering for literal patterns.** A match expression
-//!    whose arms are all literal patterns (Int, Bool, Char, Byte) with
-//!    no guards has its arms shuffled. Patterns that destructure or
-//!    overlap are left alone.
-//! 6. **`if` ↔ `match` substitution for plausibly-boolean conditions.**
-//!    `if cond { a } else { b }` may be rewritten to
-//!    `match cond { true => a, false => b }`. We do not have full type
-//!    info; we apply a syntactic guard that excludes obvious non-bool
-//!    forms (`let`-chains, assignments).
-//!
-//! # `unsafe` is off-limits
-//!
-//! Any function containing an `unsafe` block or marked `unsafe fn` is
-//! skipped wholesale by the per-function transforms (local rename,
-//! statement reorder, match reorder, if/match substitution). The
-//! verifier cannot prove equivalence under `unsafe` and we do not try.
+//! Functions marked `unsafe fn` or containing `unsafe` blocks are skipped by
+//! per-function structural passes. Files listed in `locked_modules.toml` are
+//! refused by [`diversify_path`].
 
 use anyhow::{Context, Result};
 use proc_macro2::Span;

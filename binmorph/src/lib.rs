@@ -1,34 +1,34 @@
-//! Post-link instruction-level diversifier (Phase 1b / Tier 2).
+//! Post-link size-preserving x86-64 binary rewriter (`proteus-binmorph`).
 //!
-//! The cheap codegen levers (`-Zrandomize-layout`, `--shuffle-sections`)
-//! churn gadget *addresses* but leave the gadget *vocabulary* ~80–90%
-//! intact (measured: `mtd_metrics`). A leak-anchored attacker keeps their
-//! gadgets. To churn the vocabulary we must change the actual instruction
-//! bytes inside functions — without breaking the binary.
+//! Rewrites compiled ELF `.text` functions in place using a deterministic
+//! seed while preserving exact instruction-window byte lengths and execution
+//! semantics. Because no byte offsets shift, all relative branches, calls,
+//! RIP-relative displacements, and symbol table boundaries remain valid
+//! without re-linking.
 //!
-//! # The correctness principle: size-preserving in-place rewriting
+//! # Rewriting Pipeline (`rewrite_function`)
 //!
-//! Inserting or removing a single byte would shift every downstream
-//! address and break every relative jump/call, RIP-relative load, and
-//! relocation — i.e. require a full re-link (BOLT territory). We avoid all
-//! of that by only ever replacing an instruction with a **different
-//! encoding of the exact same length and identical semantics**. The byte
-//! window an instruction occupies never moves, so no address anywhere
-//! changes; the binary stays valid by construction.
-//!
-//! # Primitive #1: reg-reg `MOV` encoding swap
-//!
-//! `mov dst, src` between two registers has two encodings:
-//!   * `MOV r/m, r` (opcode 88/89) — e.g. `mov rax,rbx` = `48 89 D8`
-//!   * `MOV r, r/m` (opcode 8A/8B) — e.g. `mov rax,rbx` = `48 8B C3`
-//! Same length, identical effect, and `MOV` touches no flags — so the swap
-//! is unconditionally safe (no liveness analysis needed). Reg-reg movs are
-//! ubiquitous in compiled code, so swapping a seeded subset of them churns
-//! a meaningful share of gadget kinds at zero correctness risk.
-//!
-//! Further primitives (independent-instruction reordering, flag-safe
-//! substitution with liveness, register reassignment) layer on later; each
-//! must preserve the size-and-semantics invariant.
+//! 1. **Callee-saved register permutation**: Permutes `{R12, R13, R14, R15}`
+//!    (`r64`/`r32`/`r16`/`r8`) across the function body when matching
+//!    prologue `push` and epilogue `pop` pairs are verified.
+//! 2. **Leaf caller-saved scratch permutation**: Permutes `{R8, R9, R10, R11}`
+//!    across leaf functions.
+//! 3. **Return-block & tail-call scratch renaming**: Permutes caller-saved
+//!    scratch registers (`{R8..R11}` and `{RCX, RSI, RDI}`) inside return
+//!    basic blocks and before external tail jumps.
+//! 4. **Prologue/epilogue stack-slot permutation**: Permutes adjacent
+//!    callee-saved `push` order in the prologue and applies the exact reverse
+//!    `pop` order in every epilogue.
+//! 5. **Basic-block instruction commutation**: Applies seeded Fisher-Yates
+//!    permutation over windows of up to 6 independent instructions, adjusting
+//!    `[rip + disp32]` displacements when RIP-relative instructions move.
+//! 6. **Opcode-class, multi-instruction & encoding morphing**: Rewrites
+//!    instructions into equal-length semantic equivalents (`mov` ↔ `or`/`and`/`lea`/`xchg`,
+//!    `add`/`sub` ↔ `lea`, `cmp`/`sub` ↔ `test`, cross-branch `CF/AF`-dead
+//!    `add ↔ sub (-imm)`, 2-instruction small-immediate load decomposition,
+//!    and ModR/M direction swaps) while scrubbing unintended `ret`
+//!    (`0xC3/0xC2/0xCB/0xCA/0xCF`) and indirect `call/jmp` (`0xFF /2..5`)
+//!    bytes from immediate and displacement fields.
 
 use iced_x86::{Code, Decoder, DecoderOptions, Encoder, Instruction, Mnemonic, OpKind};
 

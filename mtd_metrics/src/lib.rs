@@ -1,45 +1,18 @@
-//! Moving-target-defense measurement core (Phase 0 — the chronograph).
+//! Moving Target Defense (MTD) binary gadget analyzer and ROP/JOP chain simulator.
 //!
-//! The Proteus thesis is that morphing a kernel's internals destroys the
-//! layout assumptions a memory-corruption / ROP exploit depends on. That
-//! claim has, until now, been *asserted* — there was no number attached
-//! to it. This module produces the number.
+//! Extracts unaligned x86-64 gadget sequences ending in `ret`, indirect `jmp`,
+//! or indirect `call` from the `.text` section of two compiled ELF binaries
+//! (*base* and *variant*) and computes three gadget survival rates:
 //!
-//! # What it measures
-//!
-//! Given the compiled `.text` of two morph cycles (call them *base* and
-//! *variant*), we enumerate the **gadget set** of each — every short
-//! linear instruction sequence ending in a `ret`, indirect `jmp`, or
-//! indirect `call` (the raw material of ROP / JOP / COP chains) — and
-//! report two distinct survival rates:
-//!
-//! * **Positional survival** — the fraction of base gadgets that appear
-//!   in the variant *at the same offset with identical semantics*. This
-//!   is the number that matters most: it is exactly "does an exploit that
-//!   hardcoded gadget addresses against the base cycle still work against
-//!   the variant?" A strong diversifier drives this toward **0**.
-//!
-//! * **Semantic survival** — the fraction of base gadget *kinds* (ignoring
-//!   address) still present *somewhere* in the variant. This models a
-//!   stronger attacker who re-scans for gadgets each cycle. Driving this
-//!   down requires changing *which* gadgets exist (instruction selection,
-//!   register allocation), not merely *where* they sit. It is the harder
-//!   bar and is not expected to move under offset-only diversification.
-//!
-//! The gap between the two is itself diagnostic: a diversifier that only
-//! shifts code (e.g. stack padding) collapses positional survival while
-//! leaving semantic survival near 1.0; one that rewrites code lowers both.
-//!
-//! # Scope of v0
-//!
-//! Gadgets are scanned with the standard unaligned-x86 method (try a
-//! decode starting at every byte offset). The gadget identity is its
-//! NASM-formatted instruction text, so `pop rax; ret` and `pop rbx; ret`
-//! are correctly distinct. We do not yet model gadget *usefulness*
-//! (Turing-complete gadget catalogues, register-class coverage) — that is
-//! a Phase-0.2 refinement. Positional survival is meaningful on its own:
-//! it is a direct, conservative proxy for "fraction of a fixed ROP chain
-//! that still lands."
+//! * **Positional survival**: Fraction of base gadgets present in the variant
+//!   at the exact same `.text` offset with identical disassembly.
+//! * **Address-masked semantic survival (`Attacker B`)**: Fraction of distinct
+//!   address-normalized base gadgets (`call`/`jmp`/`[rip+...]` targets masked
+//!   to `<addr>`) present anywhere in the variant with identical registers.
+//! * **Register-canonicalized opcode-class survival (`Attacker B_reg`)**:
+//!   Fraction of distinct register-canonicalized gadget templates (where any
+//!   general-purpose register is canonicalized to its width class
+//!   `r64`/`r32`/`r16`/`r8`) present anywhere in the variant.
 
 use std::collections::{BTreeMap, HashSet};
 

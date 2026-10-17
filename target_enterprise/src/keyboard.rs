@@ -5,10 +5,11 @@
 #![allow(missing_docs)]
 #![allow(clippy::needless_range_loop)]
 
+use proteus_contracts::{KeyCode, KeyEvent, Keyboard, KBD_PREFIX_E0, KBD_PREFIX_E1};
+#[cfg(test)]
 use proteus_contracts::{
-    KeyCode, KeyEvent, Keyboard, KBD_BREAK_A, KBD_BREAK_B, KBD_BREAK_LSHIFT, KBD_MAKE_A,
-    KBD_MAKE_B, KBD_MAKE_BACKSPACE, KBD_MAKE_ENTER, KBD_MAKE_ESC, KBD_MAKE_LSHIFT, KBD_PREFIX_E0,
-    KBD_PREFIX_E1,
+    KBD_BREAK_A, KBD_BREAK_B, KBD_BREAK_LSHIFT, KBD_MAKE_A, KBD_MAKE_B, KBD_MAKE_BACKSPACE,
+    KBD_MAKE_ENTER, KBD_MAKE_ESC, KBD_MAKE_LSHIFT,
 };
 
 /// Stateful set-1 decoder.

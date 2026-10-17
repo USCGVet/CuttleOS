@@ -619,6 +619,19 @@ pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Op
     }
 }
 
+/// Decode the 32-byte MAC from the `hmac=<hex64>` field of an `attest:` quote line.
+fn quote_hmac(quote: &[u8]) -> Option<[u8; 32]> {
+    const KEY: &[u8] = b" hmac=";
+    let start = quote.windows(KEY.len()).position(|w| w == KEY)? + KEY.len();
+    let hex = quote.get(start..start + 64)?;
+    let nibble = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut mac = [0u8; 32];
+    for (i, byte) in mac.iter_mut().enumerate() {
+        *byte = (nibble(hex[2 * i])? << 4) | nibble(hex[2 * i + 1])?;
+    }
+    Some(mac)
+}
+
 /// Live composition proof for `OsShell`: seeds the BSS shell, writes and
 /// reads back `/var/boot.ok`, spawns PID 5, verifies capability-gated
 /// `SYS_OPEN` (`EPERM` before `grant 5 fs`, `ret=0` after), executes user
@@ -758,13 +771,21 @@ pub(crate) fn banner_shell_compose() {
     serial_write_str("SECCOMP: OK engine=ebpf filter=enforced\n");
     let mut attest_out = [0u8; 320];
     let aq = vsh.exec_line(b"attest boot-quote", boots, 0, 0, &mut attest_out);
-    if !attest_out[..aq.bytes_written()].starts_with(b"attest: v=1 boots=") {
+    let quote = &attest_out[..aq.bytes_written()];
+    if !quote.starts_with(b"attest: v=1 boots=") {
         panic!("SHELL compose: remote attestation quote drift");
     }
-    let mut mac = [0u8; 32];
-    vsh.compute_attestation_mac(boots, b"boot-quote", &mut mac);
+    // Verify the MAC the shell actually printed, as a remote verifier would,
+    // rather than one recomputed here (which would always match).
+    let Some(mac) = quote_hmac(quote) else {
+        panic!("SHELL compose: remote attestation quote has no hmac field");
+    };
     if !vsh.verify_attestation_mac(boots, b"boot-quote", &mac) {
         panic!("SHELL compose: remote attestation MAC verification failed");
+    }
+    // A quote for a different nonce must not verify.
+    if vsh.verify_attestation_mac(boots, b"other-quote", &mac) {
+        panic!("SHELL compose: remote attestation MAC accepted the wrong nonce");
     }
     serial_write_str("ATTEST: OK seed=");
     serial_write_str(option_env!("PROTEUS_VARIANT_SEED").unwrap_or("default-variant"));

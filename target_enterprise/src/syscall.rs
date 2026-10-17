@@ -918,7 +918,7 @@ mod tests {
 
     use crate::iommu::{DeviceId, IommuImpl};
     use crate::scheduler::{Task, TaskId};
-    use proteus_contracts::{AccessKind, Iommu, PagePerms};
+    use proteus_contracts::{AccessKind, Iommu};
 
     /// Build a 4-domain / 8-device / 16-entry IOMMU and a privileged
     /// task pre-bound to a freshly-created domain. The bound device is

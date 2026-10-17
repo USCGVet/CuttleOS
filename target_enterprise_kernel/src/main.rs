@@ -1,39 +1,18 @@
-//! Bootable kernel ELF for `target_enterprise`.
+//! Bare-metal `x86_64-unknown-none` unikernel entry point (`target_enterprise_kernel`).
 //!
-//! This kernel is the load-bearing artefact for the project's
-//! diversity-empirical claim. TASK-023 rewrote it because the prior
-//! banner-only kernel never referenced the morphed surfaces in
-//! `target_enterprise`: the linker dead-code-eliminated `tls.rs`,
-//! `wal.rs`, `iommu.rs`, and the `HashImpl` chain construction. As a
-//! result, source-level diversification did not reach the binary
-//! (iteration 12: 1/19 distinct kernel ELF `.text` SHA-256s across 19
-//! accepted morph cycles).
+//! Links the verified `target_enterprise` subsystems to physical x86-64
+//! hardware (16550 UART on `COM1`, PCI, AHCI, NVMe, VirtIO-net/blk, Intel
+//! e1000, APIC/IOAPIC, HPET/PIT/RTC, and QEMU `fw_cfg` provisioning).
 //!
-//! Build:  `cargo build --release` from inside this crate
-//!         (nightly + rust-src; see `rust-toolchain.toml`).
+//! Build via `factory_builder`:
+//! `cargo run -p factory_builder -- build-kernel --kernel-crate <path-to-target_enterprise_kernel>`
 //!
-//! Per-feature proof sequence emitted to COM1 16550 UART (I/O 0x3F8):
-//!
-//!   PROTEUS-TE OK\n                              boot banner
-//!   TLS hkdf OK prk_sha=<hex16>\n                HKDF-Extract RFC 5869 §A.1
-//!                                                + HKDF-Expand-Label proof
-//!   TLS server_hello OK len=<N>\n                build_server_hello golden bytes
-//!   WAL replay OK frames=16 lsn=<N>\n            WAL append+flush+replay
-//!   IOMMU translate OK pa=<hex8>\n               IOMMU map + translate walk
-//!   HASH OK digest_sha=<hex16>\n                 HashImpl over a locked fixture
-//!   PROTEUS-TE HALT\n                            clean exit
-//!
-//! Each banner is preceded by the kernel asserting the operation's
-//! output against the locked `kernel_fixtures::EXPECTED_*` constants.
-//! On mismatch the kernel panics, the `panic_handler` emits
-//! `PROTEUS-TE PANIC: <file>\n`, and the QEMU smoke test fails because
-//! the trailing banner is absent. The host-side
-//! `target_enterprise/tests/kernel_fixtures_check.rs` runs the same
-//! sequence on every `cargo test` to catch drift between the algorithm
-//! and the embedded expected bytes before the kernel even boots.
-//!
-//! No allocator. No `extern crate alloc`. Every scratch buffer is a
-//! stack array sized at compile time from a `kernel_fixtures` constant.
+//! In default builds, the kernel executes the deterministic subsystem proof
+//! sequence against `kernel_fixtures` on `COM1`, restores sealed `OsShell`
+//! state from AHCI `LBA 1040..=1041`, services the network control plane, and
+//! enters the interactive console shell. In production builds (`--prod` /
+//! `--cfg proteus_prod`), self-test banners and the red-team harness are
+//! compiled out.
 
 #![no_std]
 #![no_main]

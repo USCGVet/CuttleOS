@@ -337,7 +337,6 @@ fn write_u32_le(b: &mut [u8], v: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::WriteAheadLog as _;
 
     fn proof() -> CapProof {
         durable_wal_proof_init()

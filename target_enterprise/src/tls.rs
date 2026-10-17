@@ -1815,7 +1815,6 @@ mod tests {
     #[ignore]
     fn __dump_golden_bytes() {
         extern crate std;
-        use std::{eprint, eprintln};
         let mut ch = [0u8; 256];
         let ch_len =
             build_client_hello(&TEST_CLIENT_RANDOM, &TEST_CLIENT_PUBKEY, &mut ch).unwrap();

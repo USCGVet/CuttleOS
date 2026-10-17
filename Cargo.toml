@@ -39,20 +39,9 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-# Property-based input generation for the per-function perf harness
-# (TASK-021). Pulled as a dev-dep by `target_minimal`, `target_enterprise`,
-# and `verifier` to drive each benchmarked function through 32 random
-# inputs per cycle and report the p95-across-inputs ns/call so a candidate
-# that runs fast on one fixed input but degrades on adversarial inputs is
-# caught by the perf gate.
+# Property-based testing harness used by target crates and the verifier.
 proptest = { version = "1" }
 
-# Cryptographically signed morph candidates use the same primitives as the
-# target kernel they regenerate. Reusing the crate set means we can later
-# share trait implementations between Proteus and the target.
-
-# Keep backtraces working while avoiding ~90 MB .pdb files per test binary
-# across the workspace's 50+ integration test targets (~4 GB of PDB bloat).
+# Emit line tables only in dev builds to keep test binary debug symbols compact.
 [profile.dev]
 debug = "line-tables-only"
-

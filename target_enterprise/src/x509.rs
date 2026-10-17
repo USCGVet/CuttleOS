@@ -1502,7 +1502,7 @@ mod tests {
         let bad_key: Vec<u8> = {
             let mut s = Vec::new();
             s.push(0x07); // 7 unused bits — invalid for SPKI
-            s.extend((0u8..32u8));
+            s.extend(0u8..32u8);
             s
         };
         let bad_bit_string = tlv(X509_TAG_BIT_STRING, &bad_key);

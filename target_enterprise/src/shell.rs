@@ -1,24 +1,21 @@
-//! Interactive OS console shell & unified subsystem runtime (`OsShell`).
+//! Interactive OS console shell and unified subsystem runtime (`OsShell`).
 //!
-//! Pure `no_std`, zero-allocation command processor and interactive line
-//! discipline that binds Proteus's verified subsystems into a single live
-//! operator/control-plane environment:
+//! Pure `no_std`, zero-allocation command processor and control-plane runtime:
 //!
-//! - **Virtual Filesystem ([`MemRamFs`])**: `ls`, `cat <path>`,
-//!   `write <path> <text>`, `rm <path>`, `stat <path>`
-//! - **Task Scheduler ([`RoundRobin`])**: `ps`, `spawn`, `kill <pid>`
-//! - **Capability Gate & Syscalls ([`check_cap`], [`dispatch_with_cap`])**:
-//!   `caps <pid>`, `grant <pid> <fs|net|wal|all>`, `revoke <pid> <fs|net|wal|all>`,
-//!   `syscall <pid> <getpid|yield|time|open> [arg]`
-//! - **Cross-Morph Durable WAL Continuity ([`WalImpl`])**:
-//!   [`OsShell::checkpoint_wal`] and [`OsShell::restore_wal`] persist and
-//!   recover live `/var` files, active worker tasks, and per-task capability
-//!   masks across morph reboots
-//! - **Security Audit Ring ([`AuditLogImpl`])**: every shell command and
-//!   syscall/capability decision records an [`AuditEvent`] (`Allowed`,
-//!   `Denied`, or `Error`) inspectable via `audit`
-//! - **Live Network & Continuity Telemetry**: `status`, `uname`, `net`
-//! - **Power / Lifecycle Control**: `halt`, `poweroff`, `reboot`
+//! - **Virtual Filesystem ([`MemRamFs`])**: `ls`, `cat`, `write`, `rm`, `stat`
+//! - **Task Scheduler ([`RoundRobin`])**: `ps`, `spawn`, `kill`
+//! - **Capability-Gated Syscalls ([`check_cap`], [`dispatch_with_cap`])**:
+//!   `caps`, `grant`, `revoke`, `syscall <pid> <getpid|yield|time|open> [arg]`
+//! - **Per-PID eBPF Seccomp Sandboxing**: `seccomp [status | deny <pid> <op> | clear <pid>]`
+//! - **Measured User Execution**: `exec <path> [arg]` and `ima [status | enroll <path>]`
+//!   (IMA SHA-256 verification, ELF64 load, KPTI page-table check, TPM 2.0 `PCR-10`
+//!   extend, stack canary check, and eBPF execution)
+//! - **Wire-Boundary CIDR Firewall**: `fw [status | block <cidr> | allow <cidr> | clear]`
+//! - **Keyed HMAC-SHA256 WAL & Disk Continuity**: `seal`, [`OsShell::checkpoint_sealed`],
+//!   [`OsShell::restore_sealed`], [`OsShell::pack_disk_image`], [`OsShell::unpack_disk_image`]
+//! - **Remote Attestation Quotes**: `attest [nonce]`
+//! - **Tamper-Evident Audit Ring ([`AuditLogImpl`])**: `audit`
+//! - **System Telemetry & Power Control**: `status`, `uname`, `net`, `halt`, `poweroff`, `reboot`
 
 #![allow(clippy::needless_range_loop)]
 

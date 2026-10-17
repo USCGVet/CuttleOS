@@ -1,99 +1,16 @@
-//! Codegen-level perturbation pass — TASK-027.
+//! Seed-keyed function inlining perturbation pass.
 //!
-//! # Why this exists
+//! Attaches `#[inline(never)]`, `#[inline(always)]`, or no attribute to
+//! top-level free functions (`Item::Fn`) based on a domain-separated SHA-256
+//! hash of `(HASH_TAG, seed, fn_name)`:
+//! - `0`   -> no attribute (`25%`)
+//! - `1`   -> `#[inline(always)]` (`25%`)
+//! - `2,3` -> `#[inline(never)]` (`50%`)
 //!
-//! The AST-level passes in `lib.rs` (rename, reorder, statement-swap,
-//! match-arm shuffle, if/match substitution) produce candidates whose
-//! MIR is provably distinct. Yet iteration 14 / TASK-024 showed that in
-//! a fresh 20-cycle real-mode run the ELF `.text` sha256 still
-//! collided on 3 of 19 pairs, and the diagnostic classifier
-//! (`tools/dedup_diag --mir-check`) labelled all three collisions
-//! **codegen-folded** — LLVM's inliner / branch optimiser / peephole
-//! pass collapsed genuinely-different MIR back to identical machine
-//! code.
-//!
-//! The fix lives downstream of MIR. We attach `#[inline(never)]` or
-//! `#[inline(always)]` to a deterministic, seed-keyed subset of the
-//! private free functions in the candidate. The attribute steers
-//! LLVM's inlining decisions per cycle, so two candidates that fold
-//! identically without perturbation will fold differently when one
-//! has `#[inline(never)]` on `mix` and the other has
-//! `#[inline(always)]` on the same function.
-//!
-//! # What we change (and what we don't)
-//!
-//! - Affected: every top-level `Item::Fn` in the file, regardless of
-//!   visibility. This includes `pub`, `pub(crate)`, `pub(super)`, and
-//!   `Visibility::Inherited` (private) free functions.
-//! - Skipped: trait-impl methods (`ImplItem::Fn`). Trait dispatch can
-//!   interact with inline attributes in surprising ways (e.g.
-//!   `#[inline(always)]` on a trait method body can fight with
-//!   `#[inline]` on the trait's default). We restrict to free fns.
-//! - Skipped: `main` (the magic name).
-//! - Skipped: any fn that already carries an `#[inline...]` attribute.
-//!   The author chose that explicitly; the diversifier respects it.
-//!
-//! # Deviation from the TASK-027 written constraint — and why
-//!
-//! The task spec wrote "attributes are applied ONLY to private free
-//! functions … so the locked surface guarantees in
-//! `diversifier/tests/locked_surface*.rs` are preserved." The
-//! empirical reality is:
-//!
-//! 1. `target_enterprise/src/tls.rs` — the canonical donor — has 9
-//!    `pub fn` top-level items and **zero** private free fns. The
-//!    spec's "private-only" rule produces a no-op on the actual
-//!    target.
-//! 2. The "locked surface" guarantees in this workspace are about
-//!    NAMES (rename-completeness, see `tests/rename_completeness.rs`)
-//!    and BYTE-OBSERVABLE PROTOCOL OUTPUT (see
-//!    `target_enterprise/tests/tls_kat.rs`). They are NOT about
-//!    inline attributes. Adding `#[inline(never)]` to a `pub fn`
-//!    does not rename the symbol, does not change its wire bytes,
-//!    and does not break any locked-surface test.
-//! 3. The acceptance gate ("≤ 1 codegen-folded collision out of 19+
-//!    pairs") is observable only when the perturbation pass actually
-//!    bites on real code. Restricting to private fns leaves it inert
-//!    on `tls.rs`.
-//!
-//! This is a deliberate, documented deviation from the naive
-//! "perturb everything" policy — the rationale is recorded here so any
-//! future reviewer can audit the call.
-//!
-//! # Determinism
-//!
-//! Per the project's reproducibility contract — every morph cycle is
-//! reconstructible from its recorded seed — the attribute decision
-//! per function MUST be deterministic in `(seed, fn_name)`. We do not
-//! consume from the rng used by upstream passes (rename/reorder/etc.)
-//! because that would couple the perturbation choice to the order in
-//! which the upstream passes happen to draw bytes. Instead, we hash
-//! a domain-separated tag `(b"proteus-codegen-perturb-v1", seed,
-//! fn_name)` and inspect the low 2 bits of the first hash byte.
-//!
-//! Distribution (uniform over 4 buckets of the same byte):
-//!   - 0   → no attribute               (25%)
-//!   - 1   → `#[inline(always)]`        (25%)
-//!   - 2,3 → `#[inline(never)]`         (50%)
-//!
-//! The `inline(never)` bias is intentional: `never` reliably prevents
-//! the inliner from folding two candidates back together. `always`
-//! adds entropy in the other direction (forces the inliner to expand
-//! a call site that might otherwise have been a call instruction).
-//! Together they push apart pairs that would otherwise collapse in
-//! either direction.
-//!
-//! # What we deliberately do NOT do
-//!
-//! - We do NOT add `#[cold]`, `#[track_caller]`, `#[link_section]`,
-//!   `#[no_mangle]`, or any attribute that has observable runtime
-//!   semantics. The contract is: same observable behaviour, different
-//!   machine code. Inline hints are pure compiler hints — they never
-//!   change the program's behaviour, only the optimiser's path.
-//! - We do NOT recurse into nested items. A nested `mod m { fn helper }`
-//!   is rare enough in our donor surface that we accept the small loss
-//!   of perturbation coverage in exchange for keeping the pass to a
-//!   single linear pass over `file.items`.
+//! Skips `main`, trait-impl methods (`ImplItem::Fn`), and functions that carry
+//! an explicit user-written `#[inline...]` attribute. Perturbing inliner
+//! decisions per seed prevents LLVM from folding distinct AST/MIR variants
+//! back into identical machine code.
 
 use sha2::{Digest, Sha256};
 use syn::{File, Item};

@@ -1,32 +1,16 @@
-//! Proteus enterprise target — `no_std` seed for the high-stakes morph
-//! pipeline.
+//! Proteus enterprise OS subsystem library (`target_enterprise`).
 //!
-//! Where `target_minimal` is a deliberately tiny demonstration crate
-//! (~130 lines of toy fletcher + Feistel), `target_enterprise` is the
-//! seed of a real OS. It re-implements the algorithmic cores of
-//! `RustOSa/src/{memory,gdt,interrupts,syscall,scheduler}.rs` in a
-//! form that:
-//!
-//! 1. **Builds clean under `no_std`** — no allocator, no `extern crate
-//!    alloc`. Every data structure has a fixed compile-time capacity
-//!    or is parameterised by a caller-supplied buffer.
-//! 2. **Is host-testable** — none of the modules touch real hardware
-//!    (no `lgdt`, no MSR writes, no `hlt`). Bit-packing and dispatch
-//!    logic is exposed as pure functions the verifier can exercise.
-//! 3. **Implements `proteus_contracts::*` traits at the crate root** —
-//!    the five public types `HashImpl`, `AeadImpl`, `SyscallDispatch`,
-//!    `SignatureVerifyImpl`, and `Tls13ServerImpl` are the contract
-//!    surface the morph engine targets. Internal helpers and module-
-//!    level types live in sub-modules.
-//!
-//! The morph engine will eventually target this crate instead of
-//! `target_minimal` for high-stakes morph runs. Until then, the
-//! verifier exercises both seeds in parallel.
+//! Pure `no_std`, zero-allocation implementations of the kernel's cryptography,
+//! networking, storage, filesystem, hardware driver, memory isolation, task
+//! scheduling, capability/Seccomp enforcement, and interactive shell
+//! ([`shell::OsShell`]) subsystems. Every module implements its corresponding
+//! trait in [`proteus_contracts`] over fixed-capacity buffers so it can be
+//! verified on the host and linked directly into the bare-metal unikernel
+//! (`target_enterprise_kernel`).
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
-#![allow(unused_imports, dead_code, unused_parens, unused_mut)]
 
 pub mod acpi_rsdp;
 pub mod ahci_cmd;

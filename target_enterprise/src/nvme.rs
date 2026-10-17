@@ -975,8 +975,8 @@ mod tests {
     #[test]
     fn write_to_different_lbas_does_not_alias() {
         let mut drv = ready_driver();
-        let mut a = [0xAAu8; NVME_BLOCK_SIZE];
-        let mut b = [0xBBu8; NVME_BLOCK_SIZE];
+        let a = [0xAAu8; NVME_BLOCK_SIZE];
+        let b = [0xBBu8; NVME_BLOCK_SIZE];
         drv.try_write_block(10, &a, 0x6000).unwrap();
         drv.try_write_block(20, &b, 0x6000).unwrap();
         let mut got = [0u8; NVME_BLOCK_SIZE];

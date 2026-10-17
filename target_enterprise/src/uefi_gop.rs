@@ -2,10 +2,9 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
-    GopError, GopModeInfo, UefiGop, GOP_MODE_INFO_LEN, GOP_PIXEL_BGR, GOP_PIXEL_BITMASK,
-    GOP_PIXEL_BLT_ONLY, GOP_PIXEL_RGB,
-};
+use proteus_contracts::{GopError, GopModeInfo, UefiGop, GOP_MODE_INFO_LEN, GOP_PIXEL_BGR};
+#[cfg(test)]
+use proteus_contracts::{GOP_PIXEL_BITMASK, GOP_PIXEL_BLT_ONLY, GOP_PIXEL_RGB};
 
 pub struct UefiGopImpl;
 

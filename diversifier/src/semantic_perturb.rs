@@ -1,73 +1,17 @@
-//! Semantic-level perturbation pass — "Rung 1" semantic diversity.
+//! Seed-keyed expression and control-flow semantic perturbation pass.
 //!
-//! # Why this exists
+//! Applies three reversible, value-preserving AST rewrites to induce distinct
+//! LLVM instruction selection and basic-block layout per seed:
+//! 1. **Strength-reduction inversion**: `x * {2,4,8,16}` ↔ `x << {1,2,3,4}`.
+//! 2. **Branch polarity inversion**: `if c { A } else { B }` ↔ `if !c { B } else { A }`
+//!    for side-effect-free comparisons, boolean literals, and identifiers.
+//! 3. **Loop-form rewrite**: `for i in 0..n { body }` ↔
+//!    `{ let mut i = 0; while i < n { body; i += 1; } }` when unlabelled and
+//!    free of `break`/`continue`.
 //!
-//! The pre-existing passes (rename, reorder, stack pad, inline hints)
-//! change *where* code sits and *whether* it inlines, but leave the
-//! instruction *mix* alone. Measured with `mtd specimen` /
-//! `mtd churn`, that cosmetic diversity leaves ~73% semantic-normalized
-//! ROP-gadget survival: an adapting attacker who re-derives gadgets
-//! from the morphed binary recovers most of the chain. This pass
-//! changes the *shape* of the source so LLVM emits genuinely different
-//! instruction sequences, not just relocated ones.
-//!
-//! # Transforms (all semantics-preserving by construction)
-//!
-//! a. **Strength-reduction inversion.** `x * 8` ↔ `x << 3` for the
-//!    power-of-two constants {2,4,8,16} ↔ shift amounts {1,2,3,4}.
-//!    Both directions are bit-identical for wrapping machine integers;
-//!    LLVM's instruction selection frequently picks different
-//!    encodings (imul vs shl/lea) depending on the source form.
-//!
-//! b. **Branch polarity inversion.** `if c { A } else { B }` becomes
-//!    `if !c { B } else { A }` when `c` is trivially invertible
-//!    without side effects: a comparison (`==`↔`!=`, `<`↔`>=`,
-//!    `<=`↔`>`, and mirror images), a plain identifier, a `!ident`,
-//!    or a boolean literal. Swapping branch polarity changes LLVM's
-//!    basic-block layout order, which changes gadget bytes.
-//!
-//! c. **Loop-form rewrite.** `for i in 0..n { body }` ↔
-//!    `{ let mut i = 0; while i < n { body; i += 1; } }`. Only when
-//!    the induction variable is a plain identifier, the range is a
-//!    half-open `0..EXPR`, the loop is unlabelled, and the body
-//!    contains no `break`/`continue`. The reverse direction fires only
-//!    on the exact canonical shape (adjacent `let mut i = 0;` +
-//!    `while i < n { ..; i += 1; }`) and only when `i` is not read
-//!    after the loop.
-//!
-//! # Eligibility
-//!
-//! Follows the conservative style of `codegen_perturb`: skipped are
-//! `main`, `#[test]` / `#[cfg(test)]` functions and `extern`-abi
-//! functions. Trait-impl methods are not visited (single linear pass
-//! over `file.items`, same trade-off as `codegen_perturb`).
-//!
-//! Eligibility v2 (position-level, not function-level): the three
-//! transforms operate on individual safe expressions/statements, none
-//! of which requires the enclosing function to be safe. `unsafe fn`
-//! bodies are rewritten at their *safe* statements — an `unsafe fn`
-//! is merely callable only from unsafe contexts; its safe statements
-//! obey normal semantics. What the pass refuses, at the position
-//! level, is:
-//!   - expressions inside `unsafe { }` blocks (raw-pointer arithmetic
-//!     would still be value-identical under these rewrites, but we are
-//!     deliberately conservative and skip),
-//!   - expressions inside macro invocations (macro bodies are opaque
-//!     token streams to `syn`, so they are unreachable by
-//!     construction).
-//!
-//! Public API signatures are never touched — the transforms only
-//! rewrite expression shapes inside bodies, and every rewrite is
-//! value-identical for wrapping machine integers.
-//!
-//! # Determinism
-//!
-//! Per the reproducibility contract, the per-function coin flips are
-//! derived from `sha256(tag, seed, fn_name)` — the shared pipeline rng
-//! is NOT consumed, so this pass is stable regardless of upstream pass
-//! ordering. Three independent bytes of the hash gate the three
-//! transforms. Each byte fires when `byte < fire_rate*256/100`, so
-//! `fire_rate_percent = 100` always fires and `0` never fires.
+//! Skips `main`, `#[test]` / `#[cfg(test)]` functions, `extern` functions, and
+//! expressions inside `unsafe { ... }` blocks. Decisions are derived
+//! deterministically from `SHA-256(HASH_TAG, seed, fn_name)`.
 
 use proc_macro2::Span;
 use sha2::{Digest, Sha256};

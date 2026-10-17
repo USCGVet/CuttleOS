@@ -17,6 +17,7 @@ impl Gpt for GptImpl {
     }
 }
 
+#[cfg(test)]
 fn le16(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
 }
@@ -28,6 +29,7 @@ fn le64(b: &[u8], o: usize) -> u64 {
     a.copy_from_slice(&b[o..o + 8]);
     u64::from_le_bytes(a)
 }
+#[cfg(test)]
 fn put16(b: &mut [u8], o: usize, v: u16) {
     b[o..o + 2].copy_from_slice(&v.to_le_bytes());
 }

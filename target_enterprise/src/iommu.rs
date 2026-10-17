@@ -1,4 +1,4 @@
-﻿//! IOMMU + DMA-protection skeleton â€” `no_std`, fixed-capacity, allocation-free.
+//! IOMMU + DMA-protection skeleton â€” `no_std`, fixed-capacity, allocation-free.
 //!
 //! Adapted from `RustOSa/src/iommu.rs`. The donor is a thin Intel
 //! VT-d DMAR walker: it parses the ACPI DMAR table, records each
@@ -732,7 +732,6 @@ pub mod dmar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::Iommu as _;
 
     /// Convenience: spawn a default-sized IOMMU for terse tests.
     fn fresh_iommu() -> IommuImpl<MAX_DOMAINS, MAX_DEVICES, ENTRIES_PER_DOMAIN> {

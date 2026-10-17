@@ -5,7 +5,9 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{Watchdog, WatchdogError, WATCHDOG_DEFAULT_DEADLINE_TICKS};
+#[cfg(test)]
+use proteus_contracts::WATCHDOG_DEFAULT_DEADLINE_TICKS;
+use proteus_contracts::{Watchdog, WatchdogError};
 
 /// Software watchdog state.
 pub struct WatchdogImpl {

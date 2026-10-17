@@ -4,8 +4,10 @@
 
 use proteus_contracts::{
     Mb2Error, Mb2Tag, Multiboot2, MB2_HEADER_LEN, MB2_MAX_TAGS, MB2_TAG_BASIC_MEMINFO,
-    MB2_TAG_END, MB2_TAG_FRAMEBUFFER, MB2_TAG_HDR_LEN, MB2_TAG_MMAP,
+    MB2_TAG_END, MB2_TAG_HDR_LEN,
 };
+#[cfg(test)]
+use proteus_contracts::{MB2_TAG_FRAMEBUFFER, MB2_TAG_MMAP};
 
 pub struct Multiboot2Impl;
 
