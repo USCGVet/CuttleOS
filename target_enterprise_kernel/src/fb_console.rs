@@ -1,0 +1,264 @@
+//! 1280x720 VESA/GOP Graphical Framebuffer Console (`fb_console`).
+//!
+//! Renders the live Proteus Enterprise OS status bar and interactive terminal
+//! (`proteus>`) onto the hardware linear framebuffer mapped by `bootloader_api`.
+
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+static FB_PTR: AtomicU64 = AtomicU64::new(0);
+static FB_LEN: AtomicUsize = AtomicUsize::new(0);
+static FB_WIDTH: AtomicUsize = AtomicUsize::new(0);
+static FB_HEIGHT: AtomicUsize = AtomicUsize::new(0);
+static FB_STRIDE: AtomicUsize = AtomicUsize::new(0);
+static FB_BPP: AtomicUsize = AtomicUsize::new(0);
+static FB_ACTIVE: AtomicBool = AtomicBool::new(false);
+static FB_COL: AtomicUsize = AtomicUsize::new(2);
+static FB_ROW: AtomicUsize = AtomicUsize::new(3);
+
+/// Record the hardware linear framebuffer parameters from `BootInfo`.
+pub(crate) fn fb_register(boot: &mut bootloader_api::BootInfo) {
+    if let Some(fb) = boot.framebuffer.as_mut() {
+        let info = fb.info();
+        let buf = fb.buffer_mut();
+        FB_PTR.store(buf.as_mut_ptr() as u64, Ordering::Relaxed);
+        FB_LEN.store(buf.len(), Ordering::Relaxed);
+        FB_WIDTH.store(info.width, Ordering::Relaxed);
+        FB_HEIGHT.store(info.height, Ordering::Relaxed);
+        FB_STRIDE.store(info.stride, Ordering::Relaxed);
+        FB_BPP.store(info.bytes_per_pixel, Ordering::Relaxed);
+    }
+}
+
+/// Paint the initial 1280x720 graphical console frame and enable live character mirroring.
+pub(crate) fn fb_console_start() {
+    let ptr = FB_PTR.load(Ordering::Relaxed);
+    let w = FB_WIDTH.load(Ordering::Relaxed);
+    let h = FB_HEIGHT.load(Ordering::Relaxed);
+    let bpp = FB_BPP.load(Ordering::Relaxed);
+    if ptr == 0 || w == 0 || h == 0 || bpp < 3 {
+        return;
+    }
+
+    // 1. Clear background to deep navy (R=11, G=16, B=32 -> BGR = 0x20, 0x10, 0x0B).
+    fill_rect(0, 0, w, h, (11, 16, 32));
+    // 2. Top status header bar (y = 0..36, sky blue R=2, G=132, B=199).
+    fill_rect(0, 0, w, 36, (2, 132, 199));
+    // 3. Sub-header telemetry bar (y = 36..60, slate R=30, G=41, B=59).
+    fill_rect(0, 36, w, 24, (30, 41, 59));
+
+    draw_str_at(
+        16,
+        10,
+        b"PROTEUS ENTERPRISE MTD OS // x86-64 RING-0/3 // WEB :80/:443 + SQL PRTSSQL1",
+        (255, 255, 255),
+        (2, 132, 199),
+    );
+    draw_str_at(
+        16,
+        40,
+        b"STATUS: ONLINE | IP: 10.0.2.15 (HOST :18080) | VFS: PRTSFS01 | DB: PRTSSQL1 | TPM2: PCR-10 OK",
+        (56, 189, 248),
+        (30, 41, 59),
+    );
+
+    FB_COL.store(2, Ordering::Relaxed);
+    FB_ROW.store(5, Ordering::Relaxed);
+    FB_ACTIVE.store(true, Ordering::Relaxed);
+}
+
+/// Mirror a console byte to the graphical framebuffer if active.
+pub(crate) fn fb_write_byte(b: u8) {
+    if !FB_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    let w = FB_WIDTH.load(Ordering::Relaxed);
+    let h = FB_HEIGHT.load(Ordering::Relaxed);
+    if w < 64 || h < 96 {
+        return;
+    }
+    let max_cols = (w / 8).saturating_sub(2);
+    let max_rows = (h / 16).saturating_sub(1);
+
+    let mut col = FB_COL.load(Ordering::Relaxed);
+    let mut row = FB_ROW.load(Ordering::Relaxed);
+
+    match b {
+        b'\r' => {
+            col = 2;
+        }
+        b'\n' => {
+            col = 2;
+            row += 1;
+            if row >= max_rows {
+                fill_rect(0, 64, w, h.saturating_sub(64), (11, 16, 32));
+                row = 5;
+            }
+        }
+        0x08 => {
+            if col > 2 {
+                col -= 1;
+                draw_glyph_at(col * 8, row * 16, b' ', (226, 232, 240), (11, 16, 32));
+            }
+        }
+        c => {
+            if col >= max_cols {
+                col = 2;
+                row += 1;
+                if row >= max_rows {
+                    fill_rect(0, 64, w, h.saturating_sub(64), (11, 16, 32));
+                    row = 5;
+                }
+            }
+            draw_glyph_at(col * 8, row * 16, c, (226, 232, 240), (11, 16, 32));
+            col += 1;
+        }
+    }
+
+    FB_COL.store(col, Ordering::Relaxed);
+    FB_ROW.store(row, Ordering::Relaxed);
+}
+
+fn fill_rect(x0: usize, y0: usize, rw: usize, rh: usize, rgb: (u8, u8, u8)) {
+    let ptr = FB_PTR.load(Ordering::Relaxed) as *mut u8;
+    let len = FB_LEN.load(Ordering::Relaxed);
+    let w = FB_WIDTH.load(Ordering::Relaxed);
+    let h = FB_HEIGHT.load(Ordering::Relaxed);
+    let stride = FB_STRIDE.load(Ordering::Relaxed);
+    let bpp = FB_BPP.load(Ordering::Relaxed);
+    if ptr.is_null() || bpp < 3 {
+        return;
+    }
+    let y_end = (y0 + rh).min(h);
+    let x_end = (x0 + rw).min(w);
+    let mut y = y0;
+    while y < y_end {
+        let mut x = x0;
+        while x < x_end {
+            let off = (y * stride + x) * bpp;
+            if off + 2 < len {
+                // SAFETY: `off + 2 < len` guarantees the pixel offset lies within the bootloader-mapped framebuffer slice.
+                unsafe {
+                    core::ptr::write_volatile(ptr.add(off), rgb.2);
+                    core::ptr::write_volatile(ptr.add(off + 1), rgb.1);
+                    core::ptr::write_volatile(ptr.add(off + 2), rgb.0);
+                }
+            }
+            x += 1;
+        }
+        y += 1;
+    }
+}
+
+fn draw_str_at(x0: usize, y0: usize, s: &[u8], fg: (u8, u8, u8), bg: (u8, u8, u8)) {
+    let mut x = x0;
+    for &b in s {
+        draw_glyph_at(x, y0, b, fg, bg);
+        x += 8;
+    }
+}
+
+fn draw_glyph_at(x0: usize, y0: usize, ch: u8, fg: (u8, u8, u8), bg: (u8, u8, u8)) {
+    let ptr = FB_PTR.load(Ordering::Relaxed) as *mut u8;
+    let len = FB_LEN.load(Ordering::Relaxed);
+    let stride = FB_STRIDE.load(Ordering::Relaxed);
+    let bpp = FB_BPP.load(Ordering::Relaxed);
+    if ptr.is_null() || bpp < 3 {
+        return;
+    }
+    let glyph = glyph_8x8(ch);
+    let mut gy = 0usize;
+    while gy < 8 {
+        let row_bits = glyph[gy];
+        let mut sy = 0usize;
+        while sy < 2 {
+            let py = y0 + gy * 2 + sy;
+            let mut gx = 0usize;
+            while gx < 8 {
+                let on = (row_bits & (0x80 >> gx)) != 0;
+                let c = if on { fg } else { bg };
+                let px = x0 + gx;
+                let off = (py * stride + px) * bpp;
+                if off + 2 < len {
+                    // SAFETY: `off + 2 < len` guarantees the pixel offset lies within the mapped hardware framebuffer slice.
+                    unsafe {
+                        core::ptr::write_volatile(ptr.add(off), c.2);
+                        core::ptr::write_volatile(ptr.add(off + 1), c.1);
+                        core::ptr::write_volatile(ptr.add(off + 2), c.0);
+                    }
+                }
+                gx += 1;
+            }
+            sy += 1;
+        }
+        gy += 1;
+    }
+}
+
+/// Compact 8x8 bitmap font covering printable ASCII (`0x20..=0x7E`).
+fn glyph_8x8(ch: u8) -> [u8; 8] {
+    let c = if ch.is_ascii_lowercase() {
+        ch - 32
+    } else {
+        ch
+    };
+    match c {
+        b' ' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        b'!' => [0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x00],
+        b'"' => [0x66, 0x66, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00],
+        b'#' => [0x36, 0x36, 0x7F, 0x36, 0x7F, 0x36, 0x36, 0x00],
+        b'\'' => [0x18, 0x18, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00],
+        b'(' => [0x0C, 0x18, 0x30, 0x30, 0x30, 0x18, 0x0C, 0x00],
+        b')' => [0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x18, 0x30, 0x00],
+        b'*' => [0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00],
+        b'+' => [0x00, 0x18, 0x18, 0x7E, 0x18, 0x18, 0x00, 0x00],
+        b',' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30],
+        b'-' => [0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00],
+        b'.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00],
+        b'/' => [0x06, 0x0C, 0x18, 0x30, 0x60, 0xC0, 0x80, 0x00],
+        b'0' => [0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0x00],
+        b'1' => [0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00],
+        b'2' => [0x3C, 0x66, 0x06, 0x1C, 0x30, 0x66, 0x7E, 0x00],
+        b'3' => [0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0x00],
+        b'4' => [0x0C, 0x1C, 0x3C, 0x6C, 0x7E, 0x0C, 0x0C, 0x00],
+        b'5' => [0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00],
+        b'6' => [0x1C, 0x30, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00],
+        b'7' => [0x7E, 0x66, 0x06, 0x0C, 0x18, 0x18, 0x18, 0x00],
+        b'8' => [0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00],
+        b'9' => [0x3C, 0x66, 0x66, 0x3E, 0x06, 0x0C, 0x38, 0x00],
+        b':' => [0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00],
+        b';' => [0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x30, 0x00],
+        b'<' => [0x0C, 0x18, 0x30, 0x60, 0x30, 0x18, 0x0C, 0x00],
+        b'=' => [0x00, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00, 0x00],
+        b'>' => [0x30, 0x18, 0x0C, 0x06, 0x0C, 0x18, 0x30, 0x00],
+        b'?' => [0x3C, 0x66, 0x06, 0x1C, 0x18, 0x00, 0x18, 0x00],
+        b'A' => [0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00],
+        b'B' => [0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00],
+        b'C' => [0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0x00],
+        b'D' => [0x78, 0x6C, 0x66, 0x66, 0x66, 0x6C, 0x78, 0x00],
+        b'E' => [0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x7E, 0x00],
+        b'F' => [0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00],
+        b'G' => [0x3C, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3E, 0x00],
+        b'H' => [0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00],
+        b'I' => [0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00],
+        b'J' => [0x1E, 0x0C, 0x0C, 0x0C, 0x6C, 0x6C, 0x38, 0x00],
+        b'K' => [0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00],
+        b'L' => [0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0x00],
+        b'M' => [0xC6, 0xEE, 0xFE, 0xD6, 0xC6, 0xC6, 0xC6, 0x00],
+        b'N' => [0x66, 0x76, 0x7E, 0x7E, 0x6E, 0x66, 0x66, 0x00],
+        b'O' => [0x3C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00],
+        b'P' => [0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00],
+        b'Q' => [0x3C, 0x66, 0x66, 0x66, 0x6E, 0x3C, 0x0E, 0x00],
+        b'R' => [0x7C, 0x66, 0x66, 0x7C, 0x6C, 0x66, 0x66, 0x00],
+        b'S' => [0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00],
+        b'T' => [0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00],
+        b'U' => [0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00],
+        b'V' => [0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x00],
+        b'W' => [0xC6, 0xC6, 0xC6, 0xD6, 0xFE, 0xEE, 0xC6, 0x00],
+        b'X' => [0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00],
+        b'Y' => [0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00],
+        b'Z' => [0x7E, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x7E, 0x00],
+        b'_' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00],
+        b'|' => [0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00],
+        _ => [0x3C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00],
+    }
+}

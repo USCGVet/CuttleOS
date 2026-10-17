@@ -52,7 +52,7 @@ pub const MAX_FRAME: usize = 1514;
 /// Max replies produced from one inbound frame.
 pub const MAX_REPLIES: usize = 3;
 /// Per-slot scratch buffer for an in-progress HTTP or TLS 1.3 request.
-const SLOT_BUF: usize = 256;
+const SLOT_BUF: usize = 1024;
 /// Deterministic 256-bit HMAC-SHA256 fixture key used only by in-memory unit
 /// tests (`LivedNet::new`). Limited to `#[cfg(test)]` so production and kernel
 /// code can never fall back to a public constant.
@@ -639,7 +639,7 @@ impl LivedNet {
             self.http_lens[idx] = cur + n;
         }
 
-        let mut app_out = [0u8; 512];
+        let mut app_out = [0u8; 1380];
         let mut app_n = 0usize;
         if seg.dst_port == HTTP_PORT {
             let cur = self.http_lens[idx];
@@ -718,7 +718,7 @@ impl LivedNet {
         idx: usize,
         boots: u64,
         shell: Option<&mut crate::shell::OsShell>,
-        out: &mut [u8; 512],
+        out: &mut [u8],
     ) -> usize {
         let cur = self.http_lens[idx];
         if cur < RECORD_HEADER_LEN {
@@ -903,10 +903,23 @@ impl LivedNet {
         {
             let sess_idx = extract_session_token(view.headers_raw)
                 .and_then(|tok| sh.validate_session(tok));
-            let mut html = [0u8; 384];
+            let mut default_tok: &[u8] = b"";
+            if let Some(si) = sess_idx {
+                default_tok = &sh.sessions[si].token_hex;
+            } else {
+                let mut k = 0usize;
+                while k < crate::shell::SHELL_MAX_SESSIONS {
+                    if sh.sessions[k].active {
+                        default_tok = &sh.sessions[k].token_hex;
+                        break;
+                    }
+                    k += 1;
+                }
+            }
+            let mut html = [0u8; 1300];
             let mut pos = 0usize;
             pos += copy_msg(
-                b"<!doctype html><html><head><title>Proteus OS</title></head><body><h1>Proteus MTD OS</h1><p>boots=",
+                b"<!doctype html><html><head><meta charset=utf-8><title>Proteus OS</title><style>body{background:#0b1020;color:#e2e8f0;font:14px monospace}h1{color:#38bdf8}p,pre,input,button{background:#1e293b;color:#38bdf8;border:1px solid #475569;padding:5px;margin:2px}button{background:#0284c7;color:#fff;cursor:pointer}</style></head><body><h1>Proteus MTD OS</h1><p>boots=",
                 &mut html[pos..],
             );
             pos += dec_u64(boots, &mut html[pos..]);
@@ -926,7 +939,12 @@ impl LivedNet {
                 pos += dec_u64(sh.sessions[s_idx].requests as u64, &mut html[pos..]);
                 pos += copy_msg(b"</p>", &mut html[pos..]);
             }
-            pos += copy_msg(b"</body></html>\n", &mut html[pos..]);
+            pos += copy_msg(b"<div>SID:<input id=t size=33 value=\"", &mut html[pos..]);
+            pos += copy_msg(default_tok, &mut html[pos..]);
+            pos += copy_msg(
+                b"\"><br>Sh:<input id=c size=24 value=\"status\"><button onclick=\"S(c.value)\">Run</button><button onclick=\"S('ps')\">ps</button><button onclick=\"S('ls')\">ls</button><button onclick=\"S('audit')\">audit</button><br>SQL:<input id=q size=32 value=\"SELECT * FROM kv\"><button onclick=\"R('/sql?'+encodeURIComponent(q.value))\">Query</button><button onclick=\"P('/sql',q.value)\">Mutate</button><br>ELF:<input id=x size=14 value=\"/bin/fib 10\"><button onclick=\"P('/exec',x.value)\">Exec</button> VFS:<input id=f size=12 value=\"etc/motd\"><button onclick=\"R('/fs/'+f.value)\">Cat</button></div><pre id=o>proteus&gt; ready</pre><script>R=async(u,b)=>{o.textContent=await(await fetch(u,{method:b?'POST':'GET',headers:{'X-Session-Token':t.value},body:b})).text()};P=R;S=x=>P('/sh',x)</script></body></html>\n",
+                &mut html[pos..],
+            );
             return HttpImpl::build_response(200, b"text/html", &html[..pos], out).unwrap_or(0);
         }
 
@@ -1160,6 +1178,29 @@ impl LivedNet {
             }
         }
 
+        // 5a. Interactive Web Shell Console (`POST /sh`).
+        if view.method == HttpMethod::Post && view.path == b"/sh" {
+            let authed = extract_session_token(view.headers_raw)
+                .and_then(|tok| sh.validate_session(tok))
+                .is_some();
+            if !authed {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:http:sh-unauth");
+                return HttpImpl::build_response(
+                    401,
+                    b"text/plain",
+                    b"error: unauthorized (session required for shell)\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            let mut sh_body = [0u8; 768];
+            let slen = sh
+                .exec_line(trim_ws(view.body), boots, 0, 0, &mut sh_body)
+                .bytes_written();
+            return HttpImpl::build_response(200, b"text/plain", &sh_body[..slen], out)
+                .unwrap_or(0);
+        }
+
         // 5. Sandboxed Remote Code Execution (`POST /exec`).
         if view.method == HttpMethod::Post && view.path == b"/exec" {
             let authed = extract_session_token(view.headers_raw)
@@ -1294,7 +1335,7 @@ impl LivedNet {
         payload: &[u8],
         out: &mut ReplySet,
     ) {
-        let mut seg = [0u8; 560];
+        let mut seg = [0u8; 1440];
         let n = match TcpImpl::build_segment(
             src_port,
             dst_port,
@@ -2218,7 +2259,7 @@ mod tests {
     fn dynamic_web_sessions_sql_db_exec_and_vfs_server_work() {
         let mut net = LivedNet::new(MAC);
         let mut sh = crate::shell::OsShell::new();
-        let mut out = [0u8; 512];
+        let mut out = [0u8; 1380];
 
         // 1. Dynamic HTML dashboard before login:
         let n = net.handle_http_request(
@@ -2230,6 +2271,7 @@ mod tests {
         let s = core::str::from_utf8(&out[..n]).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"));
         assert!(s.contains("boots=4 files=4 sql_tables=2 sql_rows=5 sessions=0"));
+        assert!(s.ends_with("</script></body></html>\n"));
 
         // 2. Unauthenticated mutating SQL and remote exec are rejected with 401:
         let n = net.handle_http_request(
@@ -2295,6 +2337,27 @@ mod tests {
         let n = net.handle_http_request(&who_req[..wpos], 4, Some(&mut sh), &mut out);
         let s = core::str::from_utf8(&out[..n]).unwrap();
         assert!(s.contains("whoami: user=admin reqs=1 sid="));
+
+        // 5b. Verify GET /app with active session ends with complete script tag, and POST /sh works:
+        let mut app_req = [0u8; 256];
+        let mut apos = 0usize;
+        apos += copy_msg(b"GET /app HTTP/1.1\r\nCookie: sid=", &mut app_req[apos..]);
+        apos += copy_msg(sid, &mut app_req[apos..]);
+        apos += copy_msg(b"\r\n\r\n", &mut app_req[apos..]);
+        let n = net.handle_http_request(&app_req[..apos], 4, Some(&mut sh), &mut out);
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.contains("session_user=admin"));
+        assert!(s.ends_with("</script></body></html>\n"));
+
+        let mut sh_req = [0u8; 256];
+        let mut shpos = 0usize;
+        shpos += copy_msg(b"POST /sh HTTP/1.1\r\nX-Session-Token: ", &mut sh_req[shpos..]);
+        shpos += copy_msg(sid, &mut sh_req[shpos..]);
+        shpos += copy_msg(b"\r\n\r\nstatus", &mut sh_req[shpos..]);
+        let n = net.handle_http_request(&sh_req[..shpos], 4, Some(&mut sh), &mut out);
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(s.contains("boots=4"));
 
         // 6. Execute authenticated mutating SQL INSERT + SELECT over HTTP:
         let mut sql_req = [0u8; 256];

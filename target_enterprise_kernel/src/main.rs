@@ -440,6 +440,7 @@ pub(crate) fn serial_write_byte(b: u8) {
         }
         outb(COM1, b);
     }
+    fb_write_byte(b);
 }
 
 pub(crate) fn serial_write_str(s: &str) {
@@ -542,6 +543,7 @@ mod banners_compose;
 mod banners_security_crypto;
 mod banners_storage_fs;
 mod banners_tls_net;
+mod fb_console;
 mod hw_net_drivers;
 mod hw_storage_drivers;
 mod net_service;
@@ -552,6 +554,7 @@ pub(crate) use banners_compose::*;
 pub(crate) use banners_security_crypto::*;
 pub(crate) use banners_storage_fs::*;
 pub(crate) use banners_tls_net::*;
+pub(crate) use fb_console::*;
 pub(crate) use hw_net_drivers::*;
 pub(crate) use hw_storage_drivers::*;
 pub(crate) use net_service::*;
@@ -563,6 +566,7 @@ pub(crate) use provisioning::*;
 
 pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     set_phys_offset(boot_info);
+    fb_register(boot_info);
     serial_init();
     serial_write_str("PROTEUS-TE OK\n");
     // Distinguishes production boots externally; absent in banner builds.
@@ -816,11 +820,16 @@ pub(crate) fn live_os_console_loop() -> ! {
             None => target_enterprise::LivedNet::new_unprovisioned(vn.mac),
         }
     });
+    if sh.active_session_count() == 0 {
+        let _ = sh.create_session(b"operator", b"console");
+    }
     let mut net_rx: u64 = 0;
     let mut net_tx: u64 = 0;
     let mut last_sql_tx: u64 = sh.db.tx_seq;
 
+    fb_console_start();
     serial_write_str("Proteus Enterprise OS interactive shell ready.\n");
+    serial_write_str("Web UI: http://127.0.0.1:18080/app | SQL: http://127.0.0.1:18080/sql\n");
     serial_write_bytes(SHELL_PROMPT);
 
     let mut echo = [0u8; 32];
