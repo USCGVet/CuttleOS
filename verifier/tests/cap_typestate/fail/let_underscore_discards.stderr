@@ -1,0 +1,15 @@
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+  --> tests/cap_typestate/fail/let_underscore_discards.rs:29:13
+   |
+29 |     let _ = privileged_action(42);
+   |             ^^^^^^^^^^^^^^^^^ -- argument #1 of type `CapProof` is missing
+   |
+note: function defined here
+  --> tests/cap_typestate/fail/let_underscore_discards.rs:20:4
+   |
+20 | fn privileged_action(_proof: CapProof, input: u64) -> u64 {
+   |    ^^^^^^^^^^^^^^^^^ ----------------
+help: provide the argument
+   |
+29 |     let _ = privileged_action(/* CapProof */, 42);
+   |                               +++++++++++++++

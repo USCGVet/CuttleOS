@@ -1,0 +1,7 @@
+[toolchain]
+# Bare-metal kernel target: nightly + rust-src is required for
+# `unstable.build-std`. The .cargo/config.toml in this crate sets
+# build.target = "x86_64-unknown-none" so all cargo invocations here
+# build for the kernel target without needing --target on the CLI.
+channel = "nightly"
+components = ["rust-src", "llvm-tools-preview"]

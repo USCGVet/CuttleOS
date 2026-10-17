@@ -1,0 +1,35 @@
+# Rust / Cargo build artifacts
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Secret keys & signing material (never commit)
+factory_signing_key.bin
+*.key
+*.pem
+
+# Disk images, kernel images, and temporary build outputs
+*.img
+*.iso
+*.bin.tmp
+
+# Runtime logs, scratch directories, and transient cycle outputs
+*.log
+*.bak
+*.soak_samples
+/scratch/
+/seals/
+/prompts_out/
+/experiments/cycle_durable_seals/
+/experiments/scorecard_logs/
+/experiments/redteam/work/
+/experiments/soak_short/results/
+attest.log.jsonl
+attest.merkle_root
+merkle_anchors.jsonl
+perf.jsonl
+
+# OS / Editor files
+.DS_Store
+Thumbs.db

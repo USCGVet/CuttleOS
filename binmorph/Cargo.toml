@@ -1,0 +1,22 @@
+[package]
+name = "proteus-binmorph"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Post-link instruction-level diversifier. Applies seeded, size-preserving, semantics-preserving rewrites to a compiled .text so successive morph cycles churn ROP/JOP gadget *kinds*, not just their addresses."
+
+[[bin]]
+name = "binmorph"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+# Decode + re-encode x86-64. Same crate the mtd_metrics chronograph uses,
+# so gadget identity and rewriting share one instruction model.
+iced-x86 = "1"
+# Parse the ELF, locate `.text` and the function symbol table.
+object = "0.36"

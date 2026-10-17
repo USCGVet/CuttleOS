@@ -1,0 +1,30 @@
+[package]
+name = "target_enterprise"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Enterprise-grade no_std target seed. Every public symbol is an implementation of a proteus-contracts trait (or a deliberate extension). The morph engine targets this crate for high-stakes morph runs."
+
+[lib]
+name = "target_enterprise"
+path = "src/lib.rs"
+
+[dependencies]
+proteus-contracts = { path = "../contracts" }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+# SHA-256 + HMAC for the in-target TLS module. Both are no_std-compatible
+# with default-features off; they do not pull in std or alloc.
+sha2 = { version = "0.10", default-features = false }
+
+# Integration tests run as std targets and exercise both the contract
+# property-test harness and the no_std skeleton modules (memory bitmap,
+# scheduler, etc.). Dev-deps do NOT leak std into the library build.
+[dev-dependencies]
+proteus-contracts = { path = "../contracts", features = ["property_tests"] }
+# TASK-021: same proptest-driven 32-input p95 perf methodology as
+# target_minimal. Lands here so the net-stack work in TASK-011 inherits
+# adversarial-input-aware perf coverage from day one rather than needing
+# a retrofit.
+proptest = { workspace = true }
+proteus-verifier = { path = "../verifier" }

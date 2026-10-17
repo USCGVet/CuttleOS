@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "contracts",
+    "diversifier",
+    "verifier",
+    "morph_engine",
+    "target_minimal",
+    "target_enterprise",
+    "factory_builder",
+    "experiments/diversity_demo",
+    "tools/dedup_diag",
+    "mtd_metrics",
+    "binmorph",
+]
+# Out-of-workspace crates:
+#
+# - `target_enterprise_kernel/` builds against the bare-metal
+#   `x86_64-unknown-none` target via `unstable.build-std`. Requires a
+#   nightly toolchain + `rust-src` component. NOT part of the default
+#   `cargo build --workspace` invocation. Driven on demand by
+#   `factory_builder build-kernel --kernel-crate ...`.
+exclude = ["target_enterprise_kernel", "factory_builder_pkg"]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.1"
+authors = ["Proteus Research"]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+syn = { version = "2", features = ["full", "extra-traits", "visit", "visit-mut", "parsing", "printing"] }
+quote = "1"
+proc-macro2 = "1"
+rand = "0.8"
+rand_chacha = "0.3"
+anyhow = "1"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+# Property-based input generation for the per-function perf harness
+# (TASK-021). Pulled as a dev-dep by `target_minimal`, `target_enterprise`,
+# and `verifier` to drive each benchmarked function through 32 random
+# inputs per cycle and report the p95-across-inputs ns/call so a candidate
+# that runs fast on one fixed input but degrades on adversarial inputs is
+# caught by the perf gate.
+proptest = { version = "1" }
+
+# Cryptographically signed morph candidates use the same primitives as the
+# target kernel they regenerate. Reusing the crate set means we can later
+# share trait implementations between Proteus and the target.
+
+# Keep backtraces working while avoiding ~90 MB .pdb files per test binary
+# across the workspace's 50+ integration test targets (~4 GB of PDB bloat).
+[profile.dev]
+debug = "line-tables-only"
+

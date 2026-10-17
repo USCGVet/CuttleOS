@@ -1,0 +1,18 @@
+error[E0382]: use of moved value: `proof`
+  --> tests/cap_typestate/fail/moves_to_discard.rs:29:31
+   |
+26 |     let proof = table.check(0, u64::MAX, 0).expect("Ok");
+   |         ----- move occurs because `proof` has type `CapProof`, which does not implement the `Copy` trait
+27 |     discard_silently(proof);
+   |                      ----- value moved here
+28 |     // Proof is gone; this must fail to compile.
+29 |     let _ = privileged_action(proof, 42);
+   |                               ^^^^^ value used here after move
+   |
+note: consider changing this parameter type in function `discard_silently` to borrow instead if owning the value isn't necessary
+  --> tests/cap_typestate/fail/moves_to_discard.rs:22:25
+   |
+22 | fn discard_silently(_p: CapProof) {}
+   |    ----------------     ^^^^^^^^ this parameter takes ownership of the value
+   |    |
+   |    in this function

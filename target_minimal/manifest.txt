@@ -1,0 +1,12 @@
+# Locked public symbols of proteus-target-minimal.
+# The verifier rejects any morph candidate that fails to expose all of
+# these as `pub` items. Production manifests are auto-generated from the
+# contracts crate's trait bounds, not hand-written like this skeleton.
+fletcher32
+feistel_mix
+derive_byte
+DemoHash
+DemoAead
+DemoSignatureVerify
+DemoSyscallDispatch
+DemoErrno

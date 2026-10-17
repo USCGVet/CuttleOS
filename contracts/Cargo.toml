@@ -1,0 +1,19 @@
+[package]
+name = "proteus-contracts"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Immutable kernel API surface. Every morph candidate MUST preserve these traits."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Without `std`, this crate is no_std-clean so the target kernel can depend
+# on it directly. With `std`, the property-test harness is exposed for use
+# from the verifier.
+default = []
+property_tests = []
+
+[dependencies]

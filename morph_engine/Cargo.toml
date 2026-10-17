@@ -1,0 +1,53 @@
+[package]
+name = "proteus-morph-engine"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Factory orchestrator. Cycle loop: synthesize -> diversify -> verify -> sign -> deploy."
+
+[lib]
+name = "proteus_morph_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "morph"
+path = "src/main.rs"
+
+[dependencies]
+proteus-diversifier = { path = "../diversifier" }
+# Host-side use of contract-locked TLV + Base64 codecs (TASK-102).
+# The factory embeds extension fields built by the same pure codecs
+# the enterprise target proves under morph — one wire surface.
+proteus-contracts = { path = "../contracts" }
+target_enterprise = { path = "../target_enterprise" }
+# TASK-124: gadget churn measurement for diversity evidence on attest entries.
+proteus-mtd-metrics = { path = "../mtd_metrics" }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# Blocking HTTP client for the AnthropicSynth Stage 1 backend. We pick `ureq`
+# over `reqwest` to avoid pulling in an async runtime (tokio): the morph
+# engine is a single-threaded host orchestrator and a blocking call is
+# exactly what we want at the synthesis stage. The `tls-native` feature
+# uses the OS's TLS stack (schannel on Windows, SecureTransport on macOS,
+# OpenSSL on Linux) which dodges the `rustls` build cost on this workspace.
+ureq = { version = "2", features = ["json", "tls"] }
+# Terminal UI for `morph tui`. Blocking event loop (no async runtime).
+# `ratatui` is the maintained fork of the original `tui` crate; `crossterm`
+# is its preferred backend on Windows + Unix. Versions pinned to the
+# current stable line as of 2026-05.
+ratatui = "0.29"
+crossterm = "0.28"
+
+[dev-dependencies]
+# Bundle-soak-then-QEMU proof (tests/bundle_soak_boot.rs) builds a
+# layout-seeded kernel and packages it for QEMU. Production morph
+# binary does not depend on factory_builder (deploy image emission
+# shells out to the factory_builder binary when --emit-image is set).
+factory_builder = { path = "../factory_builder" }

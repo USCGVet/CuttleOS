@@ -1,0 +1,35 @@
+[package]
+name = "proteus-verifier"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Runs the contract-trait invariant battery against a morph candidate. Accepts or rejects."
+
+[lib]
+name = "proteus_verifier"
+path = "src/lib.rs"
+
+[[bin]]
+name = "verify"
+path = "src/main.rs"
+
+[dependencies]
+proteus-contracts = { path = "../contracts", features = ["property_tests"] }
+proteus-diversifier = { path = "../diversifier" }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+syn = { workspace = true }
+quote = { workspace = true }
+
+[dev-dependencies]
+# trybuild drives the TASK-020 type-state proof tests under
+# `tests/cap_typestate/`. Each fixture is a standalone Rust file the
+# harness invokes rustc on; pass-fixtures must compile, fail-fixtures
+# must NOT compile (with the expected diagnostic). This is the
+# closest Rust gets to compile-time property tests.
+trybuild = "1"
+# TASK-021 hermetic perf-gate fixtures use proptest-style synthetic
+# samples to demonstrate that the p95-across-inputs methodology REJECTS
+# pathological-input candidates that single-shot measurement accepts.
+proptest = { workspace = true }

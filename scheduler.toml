@@ -1,0 +1,129 @@
+# Proteus factory scheduler configuration.
+#
+# Two declarable kinds of work:
+#
+# - [modules.NAME] — one module morphed per cycle. The legacy path,
+#   used for target_minimal-style single-source-file demos.
+# - [bundle.NAME] — N modules morphed atomically per cycle from the
+#   same workspace crate. Whole-kernel scramble lives here.
+#
+# Both compete in the same scheduler pool. The "due" formula:
+#
+#     (now - last_morph_unix) * priority >= max_age_secs
+#
+# A higher `priority` makes the entry become due sooner. With
+# max_age_secs = 3600:
+#
+#     priority = 1   → due after 3600 s
+#     priority = 10  → due after  360 s
+#     priority = 100 → due after   36 s
+#
+# Among all due entries, highest priority wins; ties break to oldest
+# last_morph_unix so a chronically-starved entry eventually runs.
+
+# -----------------------------------------------------------------------
+# Legacy single-module entry. Kept for the target_minimal demo path
+# (small, fast, exercised by the `morph tick` → `run_cycle` test surface).
+# -----------------------------------------------------------------------
+[modules.lib]
+priority = 10
+max_age_secs = 3600
+target_dir = "target_minimal/src"
+manifest = "target_minimal/manifest.txt"
+
+# -----------------------------------------------------------------------
+# Whole-kernel atomic bundle (TASK-036 Phase C — 2026-05-16).
+#
+# Five members, each with:
+#   - a contract-locked public surface in `proteus_contracts`
+#   - existing round-trip tests proving internals are diversifiable
+#     without breaking byte-observable semantics
+#   - kernel banner exercises in `target_enterprise_kernel/src/main.rs`
+#     that assert against locked fixtures
+#
+# Atomicity: if any of the five fails verify, the entire bundle is
+# rejected and zero source files on disk change. One signature per
+# cycle covers all five (the bundle hash = sorted-concat of per-member
+# canonical hashes). One attestation entry, one new kernel ELF.
+#
+# **Not in the bundle today**:
+#   - `lib.rs` — crate root module declarations (`pub mod ...`)
+#
+# **Locked (never morph)**: see `locked_modules.toml` — `kpti.rs`,
+# `kernel_fixtures.rs`, the kernel boot shell, and the contracts
+# surface.
+# -----------------------------------------------------------------------
+[bundle.kernel]
+priority = 10
+max_age_secs = 3600
+workspace = "target_enterprise"
+modules = [
+    "tls",      # TASK-007: Tls13Server contract + ServerHello golden bytes
+    "wal",      # TASK-008: WriteAheadLog contract + 100-seed crash recovery
+    "iommu",    # TASK-010: Iommu contract + 28 invariant tests
+    "net",      # TASK-011: NetStack contract + UDP/IPv4 wire-equivalence
+    "nvme",     # TASK-018: BlockDevice contract + 15 round-trip tests
+    "tcp",      # TASK-041: Tcp contract + RFC 793 server-side state machine + 14 tests
+    "http",     # TASK-042: Http contract + RFC 7230/7231 request parser + response builder + 17 tests
+    "dns",      # TASK-043: Dns contract + RFC 1035 query/response wire codec + 19 tests
+    "icmp",     # TASK-044: Icmp contract + RFC 792 echo + RFC 1071 checksum + 10 tests
+    "ethernet", # TASK-045: Eth contract + IEEE 802.3 frame + 802.1Q VLAN + 14 tests
+    "arp",      # TASK-046: Arp contract + RFC 826 IPv4-over-Ethernet 28-byte packet + ArpCache + 24 tests
+    "dhcp",     # TASK-047: Dhcp contract + RFC 2131/2132 BOOTP/DHCP wire codec + DhcpClient state machine + 36 tests
+    "virtio_net", # TASK-048: NetDevice + MmioBus contracts + VirtIO 1.0 driver + MemVirtioBus harness + 41 tests
+    "virtio_blk", # TASK-061: BlockDeviceVirtio + VirtBlkRequest contracts + VirtIO 1.0 block driver + MemVirtioBlkBus harness + 46 tests
+    "e1000",      # TASK-056: EthernetController + MmioRegBus contracts + Intel 82540EM driver + MemMmioBus harness + 46 tests
+    "firewall",   # TASK-050: PacketFilter contract + FirewallImpl + FirewallTable + CIDR/port-range/5-tuple match + 32 tests
+    "tpm",        # TASK-051: Tpm contract + TpmImpl + TCG-spec command builders (Startup/GetRandom/PCR_Read/PCR_Extend) + response parser + 44 tests
+    "audit",      # TASK-052: AuditLog contract + AuditLogImpl ring + monotonic event_id + byte-exact snapshot layout + 29 tests
+    "sntp",       # TASK-053: Sntp contract + SntpImpl RFC 4330 SNTPv4 wire codec + offset/delay arithmetic + 24 tests
+    "vfs",        # TASK-054: Filesystem + Vfs contracts + VfsImpl<N> mount-table dispatcher + MemRamFs<I, P> reference fs + 43 tests
+    "ebpf",       # TASK-055: EBpf contract + EBpfImpl bounded 64-bit register interpreter + ALU/JMP/LDX/ST/STX/LD_IMM64 dispatch + 46 tests
+    "smp",        # TASK-057: Smp + ApicWriter contracts + SmpImpl MADT parser + INIT-SIPI-SIPI 9-IPI sequence + PerCpu storage + 24 tests
+    "tftp",       # TASK-058: Tftp contract + TftpImpl RFC 1350 wire codec + RFC 2347 OACK parser + 24 tests
+    "pci",        # TASK-059: Pci + PciConfigBus contracts + PciImpl mechanism-#1 enumerator + BAR/MSI-X decoder + RecordingBus harness + 35 tests
+    "x509",       # TASK-060: X509 contract + X509Impl no-alloc strict-DER v3 parser + Ed25519/ECDSA-P256/RSA SPKI + 49 tests
+    "timer",      # TASK-062: PicTimer + Rtc contracts + PIT 8253/8254 + MC146818 CMOS RTC wire codec + RecordingIoPort harness + 30 tests
+    "kat",        # TASK-063: KatRunner contract + FIPS 180-4 / RFC 4231 / RFC 5869 known-answer suite (9 vectors) + 28 tests
+    "jfs",        # TASK-064: JournalFs contract + JFS2 superblock/inode/dirent walker + banner fixture + 35 tests
+    "gdbstub",    # TASK-065: GdbStub contract + GDB RSP framing/checksum/classify/canned replies + 35 tests
+    "quota",      # TASK-066: Quota contract + 32-byte per-uid disk-quota records + scan/lookup/check_write + 35 tests
+    "hpet",       # TASK-067: Hpet contract + CAP/config/counter/timer0 periodic program + RecordingHpetBus
+    "stack_canary", # TASK-068: StackCanary mint/verify/fail_fingerprint
+    "keyboard",   # TASK-069: Keyboard set-1 scancode decoder
+    "fat32",      # TASK-070: Fat32 BPB + root dir walker + HELLO.TXT fixture
+    "watchdog",   # TASK-071: Watchdog arm/pet/tick/check
+    "random",     # TASK-072: Random seed mixer KAT
+    "power",      # TASK-073: ACPI PM1a S5 encode
+    "elf64",      # TASK-074: ELF64 Ehdr + PT_LOAD walker
+    "serial16550", # TASK-075: 16550 UART init/TX codec
+    "tick_source", # TASK-076: PIT/HPET tick mux
+    "virtio_pci_caps", # TASK-077: VirtIO PCI capability walker
+    "sigkat",     # TASK-078: Ed25519 RFC 8032 KAT harness
+    "multiboot2", # TASK-079: Multiboot2 info tag walker
+    "crc32c",     # TASK-080: CRC32-C Castagnoli
+    "acpi_rsdp",  # TASK-081: ACPI RSDP v1 parse
+    "frame_bitmap", # TASK-082: bitmap frame allocator codec
+    "ioapic",     # TASK-083: IOAPIC redtable encode
+    "lapic_icr",  # TASK-084: LAPIC ICR INIT/SIPI builder
+    "gpt",        # TASK-085: GPT header + partition entry
+    "dns_name",   # TASK-086: DNS label + compression pointer
+    "hmac_drbg",  # TASK-087: HMAC-SHA256 DRBG expand KAT
+    "ahci_fis",   # TASK-088: AhciFis Register H2D encode for ATA IDENTIFY / READ DMA
+    "xhci_trb",   # TASK-089: XhciTrb No-Op + Link TRB encode
+    "uefi_gop",   # TASK-090: UefiGop mode info pack/unpack
+    "attest_tlv", # TASK-091: AttestTlv JSON-free type-length-value fields
+    "base64",     # TASK-092: Base64 RFC 4648 codec
+    "ahci_cmd",   # TASK-093: AhciCmd command header + PRDT entry
+    "panic_dump", # TASK-019: CrashDump contract + 16 KiB fixed-layout post-mortem + CRC32-C + 20 tests
+    "symbols",    # TASK-019: SymbolResolve contract + O(log n) binary-search resolver + ELF parser + 26 tests
+    "lived_net",  # Lived guest network service demux (ARP + ICMP + UDP/8080 + HTTP/TCP/80)
+    "durable_seal", # TASK-142: Guest-side SHA-256 durable state sealing
+    "scheduler",  # Round-robin task scheduler over fixed-capacity [Task; N] pool
+    "memory",     # Physical-frame 4 KiB bitmap allocator
+    "gdt",        # x86_64 long-mode Global Descriptor Table + 16-byte TSS encoding
+    "interrupts", # x86_64 256-vector 16-byte IDT gate descriptor encoding
+    "syscall",    # Capability-gated (CapProof) syscall dispatch table
+    "shell",      # Interactive OS console shell + VFS/Scheduler/Audit unified runtime
+]
+

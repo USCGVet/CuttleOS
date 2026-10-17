@@ -1,0 +1,34 @@
+[package]
+name = "proteus-target-minimal"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Minimal no_std demonstration target. Implements a subset of the proteus-contracts traits in a form the morph engine can transform."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+proteus-contracts = { path = "../contracts" }
+
+# Integration tests run as std targets and exercise the contracts crate's
+# property-test harness against the locked DemoHash impl. Enabling the
+# `property_tests` feature here does NOT leak std into the library build —
+# dev-deps only affect test/bench/example builds.
+[dev-dependencies]
+proteus-contracts = { path = "../contracts", features = ["property_tests"] }
+# TASK-021: integration tests use proptest to drive each benchmarked
+# function through 32 random inputs per cycle. The per-cycle perf metric
+# emitted to stdout is the p95 across those inputs, not a single-shot
+# measurement of one fixed buffer. This defends against algorithmic-
+# complexity attacks where a candidate runs fast on the test fixture but
+# slow on adversarial inputs. Dev-dep only — does not leak into the
+# no_std library build.
+proptest = { workspace = true }
+# We also lift in `proteus-verifier` purely as a dev-dep so the perf test
+# can reuse the same `p95_u64` helper the verifier uses internally;
+# keeping the percentile math in one place means a future change to the
+# percentile formula propagates to both the measurement side and the
+# (synthetic) hermetic gate tests without drift.
+proteus-verifier = { path = "../verifier" }

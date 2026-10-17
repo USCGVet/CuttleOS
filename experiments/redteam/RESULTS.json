@@ -1,0 +1,139 @@
+{
+  "experiment": "core-theory red-team: does a developed ROP/JOP chain survive a morph cycle?",
+  "date": "2026-07-27",
+  "instrument": "mtd chainsim (mtd_metrics/src/chainsim.rs), gadgets via unaligned iced-x86 decode, chains sampled uniformly from base gadget set",
+  "images": {
+    "base": "base_9001.elf (target_enterprise_kernel, -Zrandomize-layout -Zlayout-seed=9001, LLD --shuffle-sections seed=9001, .text 789600-byte ELF, 45213 gadgets)",
+    "variant": "variant_9002.elf (identical sources, layout seed 9002, 45292 gadgets)",
+    "binmorph_only": "binmorph_9001.elf (base rewritten in place: 2150/4248 reg-reg MOV encodings swapped, zero address movement)"
+  },
+  "control": {
+    "base_vs_self": { "static_viable_rate": 1.0, "rebuildable_rate": 1.0, "chains": 500, "len": 8 }
+  },
+  "attacker_A_static_chain": {
+    "model": "hardcoded gadget offsets from cycle N fired unchanged at cycle N+1; viable iff ALL steps land at same offset with identical gadget text",
+    "layout_shuffle_len8": { "chains": 5000, "static_viable": 0, "static_viable_rate": 0.0, "mean_step_positional_survival": 0.000025 },
+    "layout_shuffle_len16": { "chains": 2000, "static_viable": 0, "static_viable_rate": 0.0, "mean_step_positional_survival": 0.000094 },
+    "binmorph_only_len8": { "chains": 1000, "static_viable": 725, "static_viable_rate": 0.725, "mean_step_byte_survival": 0.745 },
+    "verdict": "layout-shuffle morph annihilates stockpiled/developed chains (0/7000 across lengths); byte-level morph alone is insufficient (72.5% survive)"
+  },
+  "attacker_B_leak_and_rebase": {
+    "model": "runtime disclosure; re-derives each gadget by normalized semantic kind anywhere in the morphed image",
+    "layout_shuffle_len8": { "rebuildable": 1722, "chains": 5000, "rebuildable_rate": 0.344, "mean_step_semantic_survival": 0.876 },
+    "layout_shuffle_len16": { "rebuildable": 226, "chains": 2000, "rebuildable_rate": 0.113 },
+    "verdict": "layout churn alone does NOT defeat per-target weaponized attackers: ~1/3 of short chains rebuildable. Cadence (attacker C) is the load-bearing variable against this class."
+  },
+  "attacker_C_cadence_breakeven": {
+    "model": "P(success) = max(0, 1 - window/period), periodic morph, uniformly random attack phase",
+    "curve": [[0.01, 0.99], [0.1, 0.90], [0.25, 0.75], [0.5, 0.50], [0.75, 0.25], [1.0, 0.0], [2.0, 0.0]],
+    "verdict": "morph defeats re-derivation only when the full attack window (disclose -> scan -> assemble -> deliver) approaches the morph period. Hourly cadence defeats >= hour-scale weaponization; seconds-scale automated attacks require seconds-scale cadence."
+  },
+  "direct_attack_2026_07_27": {
+    "note": "NOT a simulation. A real ROP chain (ret-sled + attack_win) was built from base-ELF address intelligence, delivered via QEMU fw_cfg to a live kernel's planted stack-overflow serial/fw_cfg surface (attack_vulnerable_service), and executed under TCG. Verdicts are from serial logs; crashes corroborated by QEMU exception dumps.",
+    "harness": "target_enterprise_kernel/src/main.rs (attack_iface_pilot / attack_vulnerable_service / attack_win); driver: mtd_metrics/examples/redteam_attack.rs",
+    "intelligence_required": "attack_win symbol + one 0xC3 gadget byte + boot relocation base 0x10000000000",
+    "results": [
+      { "target": "base_9001.elf", "verdict": "PWNED", "meaning": "exploit works on the kernel it was built against — primitive is real" },
+      { "target": "variant_9002.elf (layout-shuffled)", "verdict": "CRASH (page fault, no PWNED)", "meaning": "same exploit bytes die against the morphed kernel — BLUE WINS" },
+      { "target": "binmorph_9001.elf (byte-morph only)", "verdict": "PWNED", "meaning": "byte-level morphing does NOT stop the chain — binmorph alone is cosmetic, proven at execution level" }
+    ],
+    "logs": "run_base/, run_variant/, run_binmorph/ (attack_serial.log + int.log per target)"
+  },
+  "continuity_classA_2026_07_27": {
+    "experiment": "cross-morph durable-state continuity: real WAL replay + persist on real AHCI disk across alternating morphed kernel images",
+    "harness": "banner_continuity() in target_enterprise_kernel (9-sector WAL region at LBA 1024: header magic/boots/cursor/crc + 8 WalImpl backing sectors); images base (sha 79edc74d…) and variant (sha 7cd3b2b7…, layout seed 9001→9002)",
+    "chain": [
+      { "boot": 1, "image": "base", "banner": "CONTINUITY genesis boots=0 frames=0 lsn=0", "cursor": 24 },
+      { "boot": 2, "image": "variant (MORPHED)", "banner": "CONTINUITY resume OK boots=1 frames=1 lsn=1", "cursor": 48 },
+      { "boot": 3, "image": "base", "banner": "CONTINUITY resume OK boots=2 frames=2 lsn=2", "cursor": 72 }
+    ],
+    "verdict": "PROVEN: durable state (real WAL, real disk DMA) survives a layout-morph reboot with monotonic LSN/cursor and byte-identical replay semantics. Class A of state continuity closed. Class B (live sessions) remains open."
+  },
+  "program_2026_07_27_late": {
+    "semantic_diversity_rung1": {
+      "what": "diversifier semantic_perturb pass (strength-reduction inversion, branch-polarity inversion, loop-form rewrite), seeded, DiversifyOptions-gated (default off), decisions logged into attestation DiversifierLog",
+      "measurement": "mtd specimen --semantic: 100.0% → 87.4% semantic-normalized survival (−12.6pp, per-pair floor 73.2% when coins fire)",
+      "verdict": "REAL instruction-mix change at the object level; bounded by per-fn coin flips. Instruction-mix diversity is now a diversify-first capability, no LLM required."
+    },
+    "factory_tcb_split": {
+      "what": "morph propose (untrusted proposer: stages 1–3, writes Proposal JSON, NO signing key) + morph attest-proposal (verifier role: re-hashes candidate, RE-RUNS verifier independently, deploys with TOCTOU re-hash, signs v11 entry)",
+      "live_run": "proposal accepted+attested; verify-attest: 1 entries OK (v11 sig verified)",
+      "tamper_run": "proposal with forged hash rejected: 'proposer tamper: candidate on disk hashes to … but proposal records …'",
+      "verdict": "a fully compromised proposer degrades to DoS, never code execution. Signing key is only needed in the verifier role."
+    },
+    "continuity_classB": {
+      "what": "RFC 8446 §4.6.1 resumption: derive_resumption_master_secret / derive_resumption_psk / early_secret_from_psk + sealed 76-byte PSK blob (magic+nonce+psk+crc32) in target_enterprise::tls; kernel banner TLS RESUME OK",
+      "tests": "4 new (roundtrip byte-identity, golden-pinned derivation, corruption fail-closed, nonce separation); QEMU boot: TLS RESUME OK psk=b1a8464a",
+      "verdict": "resumption early secret from RELOADED durable PSK is byte-identical to continuous-process value — the crypto half of Class B proven. NewSessionTicket/binder handshake wiring remains follow-on."
+    }
+  },
+  "phase1_diversify_first_lived_2026_07_28": {
+    "what": "Phase 1 diversify-first cadence run end-to-end on real artifacts: cycles 100+101 (9 kernel modules each, Rung-1 semantic_perturb ON in production cycles), verifier ACCEPT x2, v11 attestations, chain verifies (29 entries incl. historical)",
+    "measurements": {
+      "positional_gadget_survival": "14/46960 = 0.0% (stockpiled exploits dead)",
+      "semantic_survival_address_masked": "14497/18153 = 79.9% (Rung-1 barely dents real-kernel instruction mix; Rung 2 LLM needed)"
+    },
+    "boot": "147 banner lines, TLS RESUME OK, CONTINUITY resume OK boots=4 frames=4 lsn=4 across differently-morphed images, clean HALT",
+    "remaining_phase1_gap": "cadence proven but not scheduled (unattended daemon); semantic diversity weak on real kernel (Rung 2); Class B handshake wiring open"
+  },
+  "coverage_enlargement_2026_07_28": {
+    "semantic_eligibility_v2": "unsafe-fn bodies now perturbable at safe positions (unsafe-block contents never); fire_rate option, production cycles at 100%",
+    "rung1_kernel_verdict": "81.1% address-masked semantic survival (vs 79.9% before) — Rung-1 source rewrites remain NOISE-LEVEL at kernel scale. Honest conclusion: layout shuffle is the positional lever (0.0%); semantic survival below ~70% requires Rung 2 (LLM rewriter) or Rung 3 (backend gadget elimination)",
+    "prod_build": {
+      "what": "factory_builder build-kernel --prod: cfg-gates 74 banner fns + attack harness OUT; keeps PROTEUS-TE OK/HALT + PROD marker + banner_continuity + banner_durable_seal",
+      "text_size": "180,530 B → 19,090 B (−89.4%) — deployed image is ~10x smaller, ~10x less gadget material",
+      "boot": "PROTEUS-TE PROD, CONTINUITY resume OK boots=5 frames=5 lsn=5, HALT clean (layout seed 9002)"
+    },
+    "enrollment": "scheduler [bundle.kernel] already enrolls ~60 modules (was never the bottleneck)"
+  },
+  "phase2_lived_2026_07_28": {
+    "what": "phase2_daemon: unattended cadence loop on one node. Per cycle: atomic bundle morph (9 modules, Rung-1 on, verifier ACCEPT, v11-signed) → prod kernel build (fresh layout seed) → QEMU boot rotation against persistent continuity disk → scorecard verdict",
+    "cycles": [
+      {"cycle": 1, "total_secs": 42.5, "continuity": "boots=4 frames=4 lsn=4", "prod": true, "halt": true},
+      {"cycle": 2, "total_secs": 38.9, "continuity": "boots=5 frames=5 lsn=5", "prod": true, "halt": true},
+      {"cycle": 3, "total_secs": 38.1, "continuity": "boots=6 frames=6 lsn=6", "prod": true, "halt": true}
+    ],
+    "cadence_cost": "morph ~6.8s + prod build ~29s + boot ~4.2s = ~40s/cycle — SUB-MINUTE cadence achievable on this host (prod slimming is what makes it cheap)",
+    "attestation": "3 entries OK, chain verifies, v11 signatures",
+    "verdict": "PHASE 2 LIVED (single-node): unattended sub-minute morph→build→boot cycles with durable-state continuity across every boundary and full attestation. Remaining Phase-2 gaps: multi-node federation ops, Class B handshake wiring, soak duration (3 cycles, not hours)."
+  },
+  "rung2_llm_pilot_2026_07_28": {
+    "what": "function-scoped LLM rewriter pilot (Fireworks gpt-oss-20b, ~$0.002/call, reasoning_effort=low): rewrite fletcher32 with identical semantics, different structure; verified through the production verifier",
+    "attempts": [
+      {"n": 1, "outcome": "REJECT", "detail": "plausible-looking chunks_exact rewrite with a subtle even-length double-count bug; golden corpus caught it: 'line 17 fletcher32(0102) mismatch'. Independently confirmed by direct rustc check (two=04040302 != golden 01020102)."},
+      {"n": 2, "outcome": "ACCEPT", "detail": "prompt hardened with the even-length warning; while-loop rewrite passed golden + perf + static gates. Structurally different from previous (loop form + index arithmetic)"}
+    ],
+    "verdict": "Rung-2 pipeline VALIDATED END-TO-END: LLM proposes, verification disposes. Integration work done: FireworksSynth backend in morph_engine (system-as-message, reasoning_effort, raw-dump debugging, slim context). Also found+fixed: stale verify.exe lock masked real results during the pilot.",
+    "midrange_120b_2026_07_28": {
+      "function_scope": "gpt-oss-120b (2s latency, 2k tokens, ~$0.01/call): REJECT — the canonical Fletcher-32 implementation mistake (% 0xFFFF replaced with & 0xFFFF, wrong at the 0xFFFF boundary). Golden corpus caught it on 'abcde'. Even mid-range models make textbook subtle slips; the gate catches all of them.",
+      "whole_module": "120b produced a COMPLETE compilable 46KB module on first try (20b couldn't); golden REJECT on subtle semantic slip. Retry attempt contaminated by soak race (workspace builds interleaved) — retry after soak completes.",
+      "economics": "cost per accepted function ≈ 2-3 calls ≈ $0.01-0.03 (function scope); whole-module needs a retry loop (est. 2-5 calls ≈ $0.10-0.25/module/cycle at mid-range prices — the exact 'tomorrow's cheap models' trajectory the design predicts)"
+    },
+    "next": "wire function-scoped rewriting into production cycles (whole-module prompts are too lossy for cheap models); chainsim measurement of gadget-mix delta on accepted rewrites"
+  },
+  "soak_scaling_finding_2026_07_29": {
+    "run": "1000-cycle duration soak: 243 consecutive ACCEPTED cycles (zero rejects, continuity boots=249, WAL checkpoint rotation fired live at ~boot 170 as designed) before the environment broke",
+    "finding": "UNBOUNDED SOURCE BLOAT: stack pads were injected per cycle but never stripped. Sources grew ~27x in 243 cycles (dns.rs 22KB→609KB, tls.rs 71KB→1.9MB). Past the threshold, syn's recursive AST visitors overflowed the default 8MB stack — the daemon died deterministically at cycle ~244 ('main has overflowed its stack'), and after restart every verify rejected (verifier subprocess also 8MB-limited). 757 consecutive REJECTED cycles followed, all from tooling choking on bloat, not from semantic failures.",
+    "fixes": [
+      "diversifier stack_pad: strip-then-inject (strip_old_pads removes prior __proteus_stack_pad_* before injecting fresh) + regression test: 50 apply cycles produce byte-identical size to 1 cycle",
+      "phase2_daemon: soak loop runs in a 256MB-stack thread (defense in depth for deep AST recursion)"
+    ],
+    "verdict": "the soak did its job: found a scaling limit no short test could. Morph cycles are now provably size-bounded; the 243-cycle clean run + checkpoint rotation + this bug is the full duration-soak harvest. Moral for the paper: MTD factories need bounded-output invariants per cycle, not just correctness invariants."
+  },
+  "real_workload_2026_07_30": {
+    "what": "first real network service on the kernel: UDP status responder (service_udp_status_modern) in prod builds. Static guest 10.0.2.15 on QEMU user-mode networking, hostfwd udp::8080. Payload 'PROTEUS-STATUS boots=N' = live continuity counter over the wire",
+    "driver": "modern virtio 1.x driver ported from RustOSa (MMIO common-config, FEATURES_OK handshake, 2-desc RX chains, notify-cap kicks) — legacy I/O-port path proven deaf on slirp (hub-only) and kept as fallback",
+    "acceptance": "HOST RECEIVED: PROTEUS-STATUS boots=279 — host PowerShell UdpClient → hostfwd → guest RX → reply → host. Serial: 'UDP SVC got flen=60 dport=8080 sport=63915' + rx/tx counters",
+    "bugs_fixed_on_the_way": [
+      "legacy virtio-net RX: never kicked after posting buffers (device never started); modern path chosen instead",
+      "feature negotiation: F_MAC+F_STATUS required or unicast RX filtered",
+      "service replied to slirp's DNS answer (port 53) → infinite ping-pong; guard src_port>=1024",
+      "slirp bounced the service's own replies back → echo-signature guard",
+      "slirp sources hostfwd UDP from internal addr 10.0.2.3; replies must target gateway 10.0.2.2 to NAT back (root cause of the long host-timeout chain)"
+    ]
+  },
+  "blue_side": {
+    "semantic_equivalence": "1647 contract KAT/unit tests green; verifier 23/23; kernel churn gate 4/4",
+    "instrument_validation": "base-vs-self control = 100% viable on both attacker models"
+  }
+}

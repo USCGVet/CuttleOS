@@ -1,0 +1,22 @@
+[package]
+name = "dedup_diag"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "TASK-024 — diagnose ELF .text dedup in diversity_demo runs. Classifies collision clusters into AST-equivalent vs codegen-folded buckets by re-running rustc --emit=mir on saved candidate sources."
+
+[lib]
+name = "dedup_diag"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dedup_diag"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+diversity_demo = { path = "../../experiments/diversity_demo" }

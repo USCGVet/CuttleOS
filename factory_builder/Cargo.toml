@@ -1,0 +1,26 @@
+[package]
+name = "factory_builder"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Host-side packager. Takes a verified kernel ELF and emits BIOS + UEFI disk images via the bootloader-0.11 crate. Invoked from the morph engine's deploy stage when --emit-image is set."
+
+[[bin]]
+name = "factory_builder"
+path = "src/main.rs"
+
+[lib]
+name = "factory_builder"
+path = "src/lib.rs"
+
+[dependencies]
+# NOTE: we deliberately do NOT depend on `bootloader = "0.11"` here.
+# Its build.rs spawns nested cargo invocations with `-Z` flags that
+# require nightly, which would break the workspace `cargo build` on
+# stable. Instead the heavy packaging step lives in the out-of-workspace
+# sibling `factory_builder_pkg/` (nightly-pinned via its own
+# rust-toolchain.toml). This workspace-member crate handles all the
+# CLI / validation / sha256 / morph-engine integration code on stable.
+anyhow = { workspace = true }
+sha2 = { workspace = true }

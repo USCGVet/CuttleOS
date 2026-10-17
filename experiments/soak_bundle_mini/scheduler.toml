@@ -1,0 +1,14 @@
+# Mini-bundle soak — production-shaped atomic morph of three enterprise
+# modules that also have QEMU proof banners (tls / wal / net).
+#
+# max_age_secs = 0 → due every tick. No other modules/bundles declared
+# so the daemon cannot pick the full kernel bundle by accident.
+#
+# Paths are workspace-relative; run from Proteus root with
+# --root experiments/soak_bundle_mini.
+
+[bundle.kernel_mini]
+priority = 1000
+max_age_secs = 0
+workspace = "target_enterprise"
+modules = ["tls", "wal", "net"]

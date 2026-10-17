@@ -1,0 +1,31 @@
+# Proteus federation keyset. M-of-N threshold scheme. Bootstrap config:
+# M=2, N=3.
+#
+# Entry 0 ("primary") is the REAL factory key, derived from
+# `factory_signing_key.bin` at the workspace root (rotated 2026-07-27 as
+# part of the v11 entry-signature fix: verify-attest now authenticates
+# every v11+ entry against this pubkey, so it MUST match the key file —
+# a placeholder here makes every legitimately-minted entry fail
+# verification).
+#
+# Slots a/b remain TEST-ONLY seeds whose *private* halves are checked
+# into `morph_engine/tests/fixtures/federation/` so federation tests can
+# produce signatures deterministically.
+#
+# WARNING: NEVER use the placeholder seeds for production signing. If
+# `factory_signing_key.bin` is ever regenerated, update `primary` here
+# in lockstep.
+
+threshold = 2
+
+[[signers]]
+id = "primary"
+pubkey_hex = "90d8794cb0bf462c7fc422c8936cc6f133becddef71883794fb4931865da30df"
+
+[[signers]]
+id = "placeholder-a"
+pubkey_hex = "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+
+[[signers]]
+id = "placeholder-b"
+pubkey_hex = "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"

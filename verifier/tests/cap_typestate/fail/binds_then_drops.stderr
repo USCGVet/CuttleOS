@@ -1,0 +1,10 @@
+error[E0382]: use of moved value: `proof`
+  --> tests/cap_typestate/fail/binds_then_drops.rs:27:31
+   |
+23 |     let proof = table.check(0, u64::MAX, 0).expect("Ok");
+   |         ----- move occurs because `proof` has type `CapProof`, which does not implement the `Copy` trait
+...
+26 |     drop(proof);
+   |          ----- value moved here
+27 |     let _ = privileged_action(proof, 42);
+   |                               ^^^^^ value used here after move

@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/cap_typestate/fail/unit_in_place_of_proof.rs:15:31
+   |
+15 |     let _ = privileged_action((), 42);
+   |             ----------------- ^^ expected `CapProof`, found `()`
+   |             |
+   |             arguments to this function are incorrect
+   |
+note: function defined here
+  --> tests/cap_typestate/fail/unit_in_place_of_proof.rs:7:4
+   |
+ 7 | fn privileged_action(_proof: CapProof, input: u64) -> u64 {
+   |    ^^^^^^^^^^^^^^^^^ ----------------

@@ -1,0 +1,17 @@
+# Short soak scheduler — only target_minimal `lib`.
+#
+# Designed for unattended multi-cycle proof of the daemon loop:
+#   synthesise (passthrough) → diversify → verify → sign → deploy → attest
+#
+# max_age_secs = 0 makes every tick due immediately (weighted age
+# comparison is always satisfied). priority is high so this entry wins
+# if an operator accidentally points the daemon at a fuller config.
+#
+# Paths are workspace-relative; run `morph daemon` from the Proteus root
+# with `--root experiments/soak_short`.
+
+[modules.lib]
+priority = 1000
+max_age_secs = 0
+target_dir = "target_minimal/src"
+manifest = "target_minimal/manifest.txt"

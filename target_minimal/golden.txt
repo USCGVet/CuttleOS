@@ -1,0 +1,122 @@
+# Golden output corpus for proteus-target-minimal.
+#
+# Locked semantics. Every morph candidate must reproduce this corpus
+# byte-for-byte. Generated once against the unmodified target_minimal
+# source — the verifier rejects any candidate that deviates.
+#
+# Format: <fn-name> <hex-input> <hex-expected-output>
+# Comment lines start with '#'. '-' denotes empty bytes.
+# All multi-byte integers are big-endian. For derive_byte, the input is
+# encoded as seed_u8 || rounds_u32_be (5 bytes total).
+
+# --- fletcher32 ----------------------------------------------------
+# Pure byte-string in, u32 out (4 bytes big-endian).
+fletcher32 - 00000000
+fletcher32 00 00000000
+fletcher32 ff ff00ff00
+fletcher32 0102 01020102
+fletcher32 010203 05040402
+fletcher32 6162636465 4ff029c7
+fletcher32 61626364656667 e183912d
+fletcher32 ffffffffffffffff 00000000
+
+# --- DemoHash::hash (via the proteus_contracts::Hash trait) --------
+# Same inputs as fletcher32; verifies the trait wiring matches.
+DemoHash::hash - 00000000
+DemoHash::hash 00 00000000
+DemoHash::hash ff ff00ff00
+DemoHash::hash 0102 01020102
+DemoHash::hash 010203 05040402
+DemoHash::hash 6162636465 4ff029c7
+DemoHash::hash 61626364656667 e183912d
+DemoHash::hash ffffffffffffffff 00000000
+
+# --- feistel_mix ---------------------------------------------------
+# 8-byte big-endian u64 state in, 8-byte big-endian u64 out.
+feistel_mix 0000000000000000 0f6ae1e2c21329cb
+feistel_mix 0000000000000001 58afa882c402ee7c
+feistel_mix ffffffffffffffff d43aff991bcfb772
+feistel_mix 0123456789abcdef 056e345ffe37a953
+feistel_mix deadbeefcafebabe 62f055d688d1e980
+
+# --- derive_byte ---------------------------------------------------
+# 5 bytes in: seed (1) || rounds_be (4). One byte out.
+derive_byte 0000000000 00
+derive_byte 0000000001 29
+derive_byte 4200000001 3a
+derive_byte 4200000002 28
+derive_byte ff00000004 24
+derive_byte 5500000008 44
+
+# --- DemoAead (encrypt) -------------------------------------------
+# Format: demo_aead_encrypt <key-hex> <nonce-hex> <plaintext-hex> <aad-hex> <expected-ciphertext-hex>
+# Empty/non-empty AAD and plaintext both covered. Key is the ASCII
+# "YELLOW SUBMARINE" (16 bytes); nonce is ASCII "NONCE_08".
+demo_aead_encrypt 59454c4c4f57205355424d4152494e45 4e4f4e43455f3038 - - 8d91584e
+demo_aead_encrypt 59454c4c4f57205355424d4152494e45 4e4f4e43455f3038 41 - 75b0e7c358
+demo_aead_encrypt 59454c4c4f57205355424d4152494e45 4e4f4e43455f3038 4142434445464748494a4b4c4d4e4f50 61642d41 7510403120068a15f09ddbf7ac2bd0bae7268fcd
+demo_aead_encrypt 59454c4c4f57205355424d4152494e45 4e4f4e43455f3038 74686520717569636b2062726f776e20666f78206a756d7073206f766572 61642d32 403a66551435a43ed2f7f2c98e12f1ca2552ee05100efb8fe58b88250576e34f1da5
+demo_aead_encrypt 59454c4c4f57205355424d4152494e45 4e4f4e43455f3038 50726f74657573206d6f72706873206576657279206379636c653b2074686520636f6e74726163742073757276697665732e2d2d454e44 66696e616c2d616164 64206c010035be7dd4b8e2cb8916bf8f3558e45c5a18ef9cfacedc73146c1c4412acb1d436bd5826649e5437fef8843bacf2102173052013018c39
+
+# --- DemoAead (round-trip) ----------------------------------------
+# Format: demo_aead_decrypt_roundtrip <key-hex> <nonce-hex> <plaintext-hex> <aad-hex>
+# Verifies that encrypt-then-decrypt recovers the plaintext for
+# arbitrary inputs. The driver runs encrypt, runs decrypt on the
+# result, and asserts the recovered plaintext matches the input.
+demo_aead_decrypt_roundtrip 59454c4c4f57205355424d4152494e45 4e4f4e43455f3038 - -
+demo_aead_decrypt_roundtrip 59454c4c4f57205355424d4152494e45 4e4f4e43455f3038 41 -
+demo_aead_decrypt_roundtrip 59454c4c4f57205355424d4152494e45 4e4f4e43455f3038 4142434445464748494a4b4c4d4e4f50 61642d41
+demo_aead_decrypt_roundtrip 59454c4c4f57205355424d4152494e45 4e4f4e43455f3038 74686520717569636b2062726f776e20666f78206a756d7073206f766572 61642d32
+demo_aead_decrypt_roundtrip 59454c4c4f57205355424d4152494e45 4e4f4e43455f3038 50726f74657573206d6f72706873206576657279206379636c653b2074686520636f6e74726163742073757276697665732e2d2d454e44 66696e616c2d616164
+
+# --- DemoAead (tampered → reject) ---------------------------------
+# Format: demo_aead_decrypt_tampered <key-hex> <nonce-hex> <ct-hex> <aad-hex>
+# Each row's decrypt MUST return Err. Four rejection vectors:
+# body-tamper, tag-tamper, wrong-aad, wrong-key.
+demo_aead_decrypt_tampered 59454c4c4f57205355424d4152494e45 4e4f4e43455f3038 413a66551435a43ed2f7f2c98e12f1ca2552ee05100efb8fe58b88250576e34f1da5 61642d32
+demo_aead_decrypt_tampered 59454c4c4f57205355424d4152494e45 4e4f4e43455f3038 403a66551435a43ed2f7f2c98e12f1ca2552ee05100efb8fe58b88250576e34f1d25 61642d32
+demo_aead_decrypt_tampered 59454c4c4f57205355424d4152494e45 4e4f4e43455f3038 403a66551435a43ed2f7f2c98e12f1ca2552ee05100efb8fe58b88250576e34f1da5 61642d582d77726f6e67
+demo_aead_decrypt_tampered 79656c6c6f77207375626d6172696e65 4e4f4e43455f3038 403a66551435a43ed2f7f2c98e12f1ca2552ee05100efb8fe58b88250576e34f1da5 61642d32
+
+# --- DemoSignatureVerify ------------------------------------------
+# Format (all four variants are 4 tokens):
+#   demo_sigverify_accept              <pubkey-hex> <message-hex> <signature-hex>
+#   demo_sigverify_reject_tampered_sig <pubkey-hex> <message-hex> <tampered-sig-hex>
+#   demo_sigverify_reject_wrong_msg    <pubkey-hex> <wrong-msg-hex> <signature-hex>
+#   demo_sigverify_reject_wrong_pubkey <wrong-pk-hex> <message-hex> <signature-hex>
+# Accept lines must verify true; all reject lines must verify false.
+# Pubkey is the byte sequence 00..1F; wrong-pubkey flips bit 0 of byte 0.
+# Generated via `cargo run --example gen_sigverify_goldens` against the
+# unmodified DemoSignatureVerify construction (fletcher_pair-based).
+demo_sigverify_accept 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f - 46def10047def20048def30049def4004adef5004bdef6004cdef7004ddef80046def10047def20048def30049def4004adef5004bdef6004cdef7004ddef800
+demo_sigverify_accept 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 41 87de320187df320287e0320387e1320487e2320587e3320687e4320787e532082f4a41f12f4b41f22f4c41f32f4d41f42f4e41f52f4f41f62f5041f72f5141f8
+demo_sigverify_accept 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 70726f746575732d7369677665726966792d64656d6f 80719e4581719f458271a0458371a1458471a2458571a3458671a4458771a545f9b19e45fab19f45fbb1a045fcb1a145fdb1a245feb1a345ffb1a44500b2a545
+demo_sigverify_accept 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 50726f74657573206d6f72706873206576657279206379636c653b2074686520636f6e74726163742073757276697665732e2d2d454e44 9de04a029de14a039de24a049de34a059de44a069de54a079de64a089de74a095a4459f25a4559f35a4659f45a4759f55a4859f65a4959f75a4a59f85a4b59f9
+demo_sigverify_reject_tampered_sig 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 70726f746575732d7369677665726966792d64656d6f 80719e4581719f458271a0458371a1458471a245c571a3458671a4458771a545f9b19e45fab19f45fbb1a045fcb1a145fdb1a245feb1a345ffb1a44500b2a545
+demo_sigverify_reject_tampered_sig 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 70726f746575732d7369677665726966792d64656d6f 80719e4581719f458271a0458371a1458471a2458571a3458671a4458771a545f9b19e45fab19f45fbb1a045fcb1a145fdb1a245feb1a345ffb1a44500b2a544
+demo_sigverify_reject_wrong_msg 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 71726f746575732d7369677665726966792d64656d6f 80719e4581719f458271a0458371a1458471a2458571a3458671a4458771a545f9b19e45fab19f45fbb1a045fcb1a145fdb1a245feb1a345ffb1a44500b2a545
+demo_sigverify_reject_wrong_pubkey 010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 70726f746575732d7369677665726966792d64656d6f 80719e4581719f458271a0458371a1458471a2458571a3458671a4458771a545f9b19e45fab19f45fbb1a045fcb1a145fdb1a245feb1a345ffb1a44500b2a545
+
+# --- DemoSyscallDispatch ------------------------------------------
+# Format: demo_syscall <nr-decimal> <a0-hex> <a1-hex> <a2-hex> <a3-hex> <a4-hex> <a5-hex> <expected-result>
+# All <ai-hex> are exactly 16 hex digits (u64, big-endian-printed
+# textual hex; the dispatch table itself is locked but the printable
+# form is endian-neutral). <expected-result> is one of:
+#   Ok=<u64-hex>        Success, with the 16-hex-digit Ok payload.
+#   Err=ENOSYS          Unrecognised syscall number.
+#   Err=EINVAL          Bad argument (sys_capability_check failure).
+#   Err=EFAULT          Bad pointer (sys_hash with a3 != 0).
+# Generated via `cargo run --example gen_syscall_goldens` against the
+# unmodified DemoSyscallDispatch table.
+demo_syscall 0 0000000000000000 0000000000000000 0000000000000000 0000000000000000 0000000000000000 0000000000000000 Ok=0000000000000000
+demo_syscall 1 deadbeefcafebabe 0000000000000000 0000000000000000 0000000000000000 0000000000000000 0000000000000000 Ok=deadbeefcafebabe
+demo_syscall 2 0000000000000001 0000000000000002 0000000000000000 0000000000000000 0000000000000000 0000000000000000 Ok=0000000000000003
+demo_syscall 2 ffffffffffffffff 0000000000000001 0000000000000000 0000000000000000 0000000000000000 0000000000000000 Ok=0000000000000000
+demo_syscall 3 0000000000000007 0000000000000006 0000000000000000 0000000000000000 0000000000000000 0000000000000000 Ok=000000000000002a
+demo_syscall 3 ffffffffffffffff 0000000000000002 0000000000000000 0000000000000000 0000000000000000 0000000000000000 Ok=fffffffffffffffe
+demo_syscall 4 0123456789abcdef fedcba9876543210 aaaabbbbccccdddd 0000000000000000 0000000000000000 0000000000000000 Ok=0000000096781111
+demo_syscall 4 0000000000000000 0000000000000000 0000000000000000 0000000000000001 0000000000000000 0000000000000000 Err=EFAULT
+demo_syscall 5 1111111111111111 2222222222222222 4444444444444444 8888888888888888 ffff0000ffff0000 0000ffff0000ffff Ok=0000000000000000
+demo_syscall 6 0000000000000006 00000000000000ff 0000000000000000 0000000000000000 0000000000000000 0000000000000000 Ok=0000000000000001
+demo_syscall 6 0000000000000080 0000000000000001 0000000000000000 0000000000000000 0000000000000000 0000000000000000 Err=EINVAL
+demo_syscall 999999 0000000000000001 0000000000000002 0000000000000003 0000000000000004 0000000000000005 0000000000000006 Err=ENOSYS
