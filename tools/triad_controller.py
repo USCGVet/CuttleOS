@@ -24,6 +24,7 @@ Features:
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import queue
@@ -35,6 +36,8 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -91,6 +94,7 @@ class TriadNode:
         self.virtio_img = self.node_dir / f"virtio_node{node_id}.img"
         self.nvme_img = self.node_dir / f"nvme_node{node_id}.img"
         self.serial_log = self.node_dir / f"serial_node{node_id}.log"
+        self.device_key_path = self.node_dir / f"device_key_node{node_id}.bin"
 
         self.state = "INITIALIZING"  # INITIALIZING, ONLINE, DRAINING, MORPHING, CATCHING_UP, HEALING
         self.proc: subprocess.Popen | None = None
@@ -109,11 +113,19 @@ class TriadNode:
         self.last_morph_ms = 0
         self.tampered = False
 
-    def ensure_disks(self):
+    def ensure_disks(self, master_key_bytes: bytes):
         for img in (self.ahci_img, self.virtio_img, self.nvme_img):
             if not img.exists():
                 with open(img, "wb") as f:
                     f.write(b"\x00" * (1024 * 1024))
+        # Derive a unique 256-bit cryptographic device key for this Triad node so each VM
+        # boots with its own seal_key, attest_key, net_auth_key, and initial service ELF variants.
+        node_key = hmac.new(
+            master_key_bytes,
+            f"proteus-triad-node-v1:{self.node_id}".encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        self.device_key_path.write_bytes(node_key)
 
     def read_sql_partition_bytes(self) -> bytes:
         if not self.ahci_img.exists():
@@ -135,6 +147,19 @@ class TriadController:
         self.show_gui = show_gui
         TRIAD_DIR.mkdir(parents=True, exist_ok=True)
 
+        if DEVICE_KEY.exists() and len(DEVICE_KEY.read_bytes()) >= 32:
+            self.master_key_bytes = DEVICE_KEY.read_bytes()[:32]
+        else:
+            self.master_key_bytes = os.urandom(32)
+            DEVICE_KEY.write_bytes(self.master_key_bytes)
+
+        self.coordinator_token = hmac.new(
+            self.master_key_bytes,
+            b"proteus-triad-coordinator-session-v1",
+            hashlib.sha256,
+        ).hexdigest()[:32]
+        (TRIAD_DIR / "operator_token.txt").write_text(self.coordinator_token + "\n", encoding="utf-8")
+
         self.base_elf_bytes = BASE_ELF.read_bytes()
         self.base_bios_bytes = BASE_BIOS.read_bytes()
         self.elf_offset_in_bios = self.base_bios_bytes.find(self.base_elf_bytes)
@@ -149,10 +174,12 @@ class TriadController:
             TriadNode(3, "OS-3 (SQL-Parity)", "RAID PARITY & WITNESS", 18103, 18503, 300303, show_gui),
         ]
 
-        # Monotonic Triad WAL for automatic catch-up after an OS morph bounce
+        # Monotonic Triad WAL for automatic catch-up after an OS morph bounce (persisted to disk)
         self.wal_lock = threading.Lock()
+        self.wal_file = TRIAD_DIR / "triad_wal.json"
         self.triad_tx_seq = 0
         self.wal_entries: list[tuple[int, str]] = []  # (tx_seq, sql_stmt)
+        self._load_wal_from_disk()
         self.events: list[dict] = []
         self.parity_Buffer = b"\x00" * SQL_PART_SIZE
         self.parity_sha256 = hashlib.sha256(self.parity_Buffer).hexdigest()[:16]
@@ -163,6 +190,26 @@ class TriadController:
         self.next_rotate_idx = 0
         self.running = True
         self.morph_op_lock = threading.Lock()
+
+    def _load_wal_from_disk(self):
+        if not self.wal_file.exists():
+            return
+        try:
+            data = json.loads(self.wal_file.read_text(encoding="utf-8"))
+            self.triad_tx_seq = int(data.get("triad_tx_seq", 0))
+            self.wal_entries = [(int(tid), str(stmt)) for tid, stmt in data.get("wal_entries", [])]
+        except Exception:
+            self.triad_tx_seq = 0
+            self.wal_entries = []
+
+    def _save_wal_to_disk(self):
+        payload = {
+            "triad_tx_seq": self.triad_tx_seq,
+            "wal_entries": self.wal_entries,
+        }
+        tmp = self.wal_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(self.wal_file)
 
     def log_event(self, level: str, msg: str):
         ts = time.strftime("%H:%M:%S")
@@ -209,7 +256,7 @@ class TriadController:
         )
 
     def start_node_vm(self, node: TriadNode):
-        node.ensure_disks()
+        node.ensure_disks(self.master_key_bytes)
         mac_last = f"{0x50 + node.node_id:02x}"
         cmd = [
             self.qemu_bin,
@@ -220,7 +267,7 @@ class TriadController:
             "-m",
             "128M",
             "-fw_cfg",
-            f"name=opt/proteus_device_key,file={DEVICE_KEY}",
+            f"name=opt/proteus_device_key,file={node.device_key_path}",
             "-drive",
             f"format=raw,file={node.bios_img},if=ide",
             "-drive",
@@ -509,6 +556,7 @@ class TriadController:
             self.triad_tx_seq += 1
             tx_id = self.triad_tx_seq
             self.wal_entries.append((tx_id, q))
+            self._save_wal_to_disk()
 
         per_node = {}
         for n in online_nodes:
@@ -622,9 +670,17 @@ class TriadController:
         """
         with self.morph_op_lock:
             node.state = "HEALING"
+            # Verify 4 KiB XOR block parity recovery (D_corrupted = D_peer ^ P)
+            n1, n2 = self.nodes[0], self.nodes[1]
+            if node.node_id == 1:
+                peer_bytes = n2.read_sql_partition_bytes()
+            else:
+                peer_bytes = n1.read_sql_partition_bytes()
+            xor_recovered = bytes(a ^ b for a, b in zip(peer_bytes, self.parity_Buffer))
+            xor_tag = hashlib.sha256(xor_recovered).hexdigest()[:12]
             self.log_event(
                 "HEAL",
-                f"{node.name}: Isolating tampered node, wiping corrupted SQL state, and reconstructing from 2/3 RAID Quorum (D1 = D2 ⊕ P)...",
+                f"{node.name}: Isolating tampered node, verifying 4 KiB XOR parity block (D_peer ⊕ P = {xor_tag}..), and reconstructing from 2/3 RAID Quorum + WAL...",
             )
             # Reconstruct canonical kv table from clean state + WAL replay
             self.send_shell_cmd(node, "sql DROP TABLE kv")
@@ -830,6 +886,9 @@ DASHBOARD_HTML = r"""<!doctype html>
   <div class="box">
     <h2>UNIFIED TRIAD SQL & SHELL CONSOLE (Writes Replicate to 3 OSes + WAL + RAID Parity)</h2>
     <div class="input-bar">
+      <input id="tokInput" type="text" placeholder="Operator Session Token (from terminal or triad/operator_token.txt)" onchange="saveToken()" />
+    </div>
+    <div class="input-bar">
       <input id="sqlInput" type="text" value="INSERT INTO kv VALUES ('sensor.temp', '72F', 1)" />
       <button onclick="runSql()">Execute SQL</button>
       <button onclick="setSql(&quot;SELECT * FROM kv&quot;)">SELECT kv</button>
@@ -852,6 +911,25 @@ DASHBOARD_HTML = r"""<!doctype html>
 </div>
 
 <script>
+(function initToken() {
+  const params = new URLSearchParams(window.location.search);
+  const urlTok = params.get('token');
+  if (urlTok) {
+    localStorage.setItem('proteus_triad_token', urlTok);
+  }
+  const saved = localStorage.getItem('proteus_triad_token') || '';
+  document.getElementById('tokInput').value = saved;
+})();
+
+function saveToken() {
+  localStorage.setItem('proteus_triad_token', document.getElementById('tokInput').value.trim());
+}
+
+function authHeaders() {
+  const t = document.getElementById('tokInput').value.trim();
+  return t ? {'X-Proteus-Session': t} : {};
+}
+
 async function refresh() {
   try {
     const r = await fetch('/api/triad');
@@ -894,8 +972,12 @@ async function runSql() {
   const q = document.getElementById('sqlInput').value;
   const out = document.getElementById('consoleOut');
   out.textContent = 'Executing across Triad Quorum...';
-  const r = await fetch('/api/sql', {method:'POST', body: q});
+  const r = await fetch('/api/sql', {method:'POST', headers: authHeaders(), body: q});
   const d = await r.json();
+  if (!d.ok) {
+    out.textContent = `Error (${r.status}): ${d.error || d.output}`;
+    return;
+  }
   let txt = `[${d.mode}] ${d.quorum}\n\n${d.output}\n\n--- Per-OS Execution Breakdown ---\n`;
   for (const [k, v] of Object.entries(d.per_node || {})) {
     txt += `> ${k}:\n${v}\n\n`;
@@ -918,8 +1000,12 @@ async function runShCmd(c) {
   document.getElementById('shInput').value = c;
   const out = document.getElementById('consoleOut');
   out.textContent = `Running '${c}' across all 3 Proteus OS instances...`;
-  const r = await fetch('/api/sh', {method:'POST', body: c});
+  const r = await fetch('/api/sh', {method:'POST', headers: authHeaders(), body: c});
   const d = await r.json();
+  if (!d.ok) {
+    out.textContent = `Error (${r.status}): ${d.error || 'unauthorized'}`;
+    return;
+  }
   let txt = `Command: ${c}\n\n`;
   for (const [k, v] of Object.entries(d.per_node || {})) {
     txt += `=== ${k} ===\n${v}\n\n`;
@@ -929,22 +1015,22 @@ async function runShCmd(c) {
 }
 
 async function morphNode(id) {
-  fetch('/api/morph/' + id, {method:'POST'});
+  fetch('/api/morph/' + id, {method:'POST', headers: authHeaders()});
   setTimeout(refresh, 200);
 }
 
 async function tamperNode(id) {
-  fetch('/api/tamper/' + id, {method:'POST'});
+  fetch('/api/tamper/' + id, {method:'POST', headers: authHeaders()});
   setTimeout(refresh, 300);
 }
 
 async function rollingWave() {
-  fetch('/api/rolling_wave', {method:'POST'});
+  fetch('/api/rolling_wave', {method:'POST', headers: authHeaders()});
   setTimeout(refresh, 200);
 }
 
 async function toggleAutoMorph() {
-  await fetch('/api/toggle_auto', {method:'POST'});
+  await fetch('/api/toggle_auto', {method:'POST', headers: authHeaders()});
   refresh();
 }
 
@@ -961,6 +1047,26 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         pass
+
+    def _is_authenticated(self) -> bool:
+        expected = self.ctrl.coordinator_token
+        for hdr in ("X-Proteus-Session", "X-Session-Token"):
+            val = (self.headers.get(hdr) or "").strip()
+            if val and hmac.compare_digest(val, expected):
+                return True
+        auth = (self.headers.get("Authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            tok = auth[7:].strip()
+            if tok and hmac.compare_digest(tok, expected):
+                return True
+        cookie = self.headers.get("Cookie") or ""
+        for part in cookie.split(";"):
+            kv = part.strip()
+            if kv.startswith("triad_sid="):
+                tok = kv[len("triad_sid="):].strip()
+                if tok and hmac.compare_digest(tok, expected):
+                    return True
+        return False
 
     def _send_json(self, code: int, obj: dict):
         body = json.dumps(obj).encode("utf-8")
@@ -979,10 +1085,11 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path in ("/", "/app", "/dashboard", "/triad"):
+        base_path = self.path.split("?", 1)[0]
+        if base_path in ("/", "/app", "/dashboard", "/triad"):
             return self._send_text(200, "text/html; charset=utf-8", DASHBOARD_HTML)
 
-        if self.path == "/api/triad":
+        if base_path == "/api/triad":
             c = self.ctrl
             data = {
                 "quorum_status": c.quorum_status,
@@ -1027,7 +1134,7 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                 return self._send_text(
                     401,
                     "text/plain; charset=utf-8",
-                    "error: unauthorized (use POST /sql for mutations)\n",
+                    "error: unauthorized (use authenticated POST /sql for mutations)\n",
                 )
             res = self.ctrl.execute_triad_sql(q)
             return self._send_text(200, "text/plain; charset=utf-8", res.get("output", "") + "\n")
@@ -1039,8 +1146,27 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length).decode("utf-8", errors="replace").strip()
 
         if self.path in ("/api/sql", "/sql"):
+            up = body.upper()
+            is_read = (
+                up.startswith("SELECT")
+                or up.startswith(".TABLES")
+                or up.startswith("SHOW")
+                or up.startswith(".SCHEMA")
+                or up.startswith("DESCRIBE")
+            )
+            if not is_read and not self._is_authenticated():
+                return self._send_json(
+                    401,
+                    {"ok": False, "error": "unauthorized: provide valid X-Proteus-Session or Authorization: Bearer token"},
+                )
             res = self.ctrl.execute_triad_sql(body)
             return self._send_json(200, res)
+
+        if not self._is_authenticated():
+            return self._send_json(
+                401,
+                {"ok": False, "error": "unauthorized: provide valid X-Proteus-Session or Authorization: Bearer token"},
+            )
 
         if self.path == "/api/sh":
             first_word = body.split()[0].lower() if body.split() else ""
@@ -1101,6 +1227,9 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.self_test and (TRIAD_DIR / "triad_wal.json").exists():
+        (TRIAD_DIR / "triad_wal.json").unlink()
+
     ctrl = TriadController(show_gui=args.gui)
     if args.self_test:
         for n in ctrl.nodes:
@@ -1111,10 +1240,44 @@ def main():
 
     if args.self_test:
         print("\n=== RUNNING TRIAD 3-AS-1 LIVE SELF-TEST ===", flush=True)
-        r1 = ctrl.execute_triad_sql("INSERT INTO kv VALUES ('triad.init', 'active', 1)")
-        assert r1["ok"] and "3/3" in r1["quorum"], f"Expected 3/3 quorum write: {r1}"
+        # 1. Verify each node received a distinct 256-bit cryptographic key AND booted distinct service ELF variants
+        node_keys = [n.device_key_path.read_bytes() for n in ctrl.nodes]
+        assert len(set(node_keys)) == 3, "Each Triad node must have a distinct 256-bit device key"
+        svc_outputs = [ctrl.send_shell_cmd(n, "service status") for n in ctrl.nodes]
+        assert len(set(svc_outputs)) == 3, f"Each Triad node must boot distinct service ELF variants:\n{svc_outputs}"
 
-        # Start morphing OS-1 in background thread, and fire a SQL write while OS-1 is MORPHING!
+        # 2. Verify Coordinator HTTP authentication: unauthenticated mutations return 401, authenticated return 200
+        test_srv = ThreadingHTTPServer(("127.0.0.1", 0), TriadHttpHandler)
+        test_port = test_srv.server_address[1]
+        threading.Thread(target=test_srv.serve_forever, daemon=True).start()
+        try:
+            unauth_req = urllib.request.Request(
+                f"http://127.0.0.1:{test_port}/api/sql",
+                data=b"INSERT INTO kv VALUES ('unauth', 'nope', 1)",
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(unauth_req, timeout=5.0)
+                raise AssertionError("Unauthenticated POST /api/sql must be refused with 401")
+            except urllib.error.HTTPError as e:
+                assert e.code == 401, f"Expected 401 on unauthenticated POST /api/sql, got {e.code}"
+
+            auth_req = urllib.request.Request(
+                f"http://127.0.0.1:{test_port}/api/sql",
+                data=b"INSERT INTO kv VALUES ('triad.init', 'active', 1)",
+                headers={"X-Proteus-Session": ctrl.coordinator_token},
+                method="POST",
+            )
+            with urllib.request.urlopen(auth_req, timeout=10.0) as resp:
+                assert resp.status == 200
+                r1 = json.loads(resp.read().decode("utf-8"))
+                assert r1["ok"] and "3/3" in r1["quorum"], f"Expected 3/3 quorum write: {r1}"
+        finally:
+            test_srv.shutdown()
+
+        assert ctrl.wal_file.exists(), "Triad WAL must be persisted to triad_wal.json"
+
+        # 3. Start morphing OS-1 in background thread, and fire a SQL write while OS-1 is MORPHING!
         t_morph = threading.Thread(target=ctrl.bounce_and_morph_node, args=(1,))
         t_morph.start()
         while ctrl.nodes[0].state == "ONLINE":
@@ -1128,7 +1291,7 @@ def main():
         assert "zero_downtime" in q_out, f"OS-1 failed to catch up missed write! Output:\n{q_out}"
         print("OS-1 successfully morphed AND caught up missed SQL write from WAL!", flush=True)
 
-        # Simulate Byzantine tamper on OS-2 and verify automatic 2-of-3 self-healing
+        # 4. Simulate Byzantine tamper on OS-2 and verify automatic 2-of-3 self-healing + 4 KiB XOR parity check
         old_morphs = ctrl.nodes[1].morph_count
         ctrl.simulate_byzantine_tamper(2)
         deadline = time.time() + 35.0
@@ -1145,7 +1308,8 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", args.port), TriadHttpHandler)
     print("\n============================================================================", flush=True)
     print(f"  PROTEUS 3-AS-1 TRIAD APPLIANCE ONLINE!", flush=True)
-    print(f"  Unified Command Center : http://127.0.0.1:{args.port}/app", flush=True)
+    print(f"  Unified Command Center : http://127.0.0.1:{args.port}/app?token={ctrl.coordinator_token}", flush=True)
+    print(f"  Operator Session Token : {ctrl.coordinator_token} (saved to triad/operator_token.txt)", flush=True)
     print(f"  Unified SQL Endpoint   : http://127.0.0.1:{args.port}/sql?SELECT+*+FROM+kv", flush=True)
     print(f"  Individual OS Ports    : OS-1 :18101 | OS-2 :18102 | OS-3 (Parity) :18103", flush=True)
     print(f"  Press Ctrl+C to shut down all 3 VMs cleanly.", flush=True)

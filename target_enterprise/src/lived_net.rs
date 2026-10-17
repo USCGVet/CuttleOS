@@ -985,6 +985,16 @@ impl LivedNet {
                 )
                 .unwrap_or(0);
             }
+            if sh.is_login_rate_limited() {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:http:login-ratelimit");
+                return HttpImpl::build_response(
+                    429,
+                    b"text/plain",
+                    b"error: EAGAIN (too many failed login attempts)\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
             let (seq_tok, after_seq) = split_ws(view.body);
             let (hmac_tok, user_raw) = split_ws(after_seq);
             let user = trim_ws(user_raw);
@@ -1021,6 +1031,7 @@ impl LivedNet {
             }
             let mut provided_mac = [0u8; 32];
             if !decode_hex_32(hmac_tok, &mut provided_mac) {
+                sh.record_login_failure();
                 sh.record_net_audit(AuditVerdict::Denied, b"net:http:login-hex");
                 return HttpImpl::build_response(
                     401,
@@ -1039,6 +1050,7 @@ impl LivedNet {
                 i += 1;
             }
             if diff != 0 {
+                sh.record_login_failure();
                 sh.record_net_audit(AuditVerdict::Denied, b"net:http:login-hmac");
                 return HttpImpl::build_response(
                     401,
@@ -1072,7 +1084,15 @@ impl LivedNet {
             ) {
                 return build_service_error_response(e, out);
             }
-            let s_idx = s_idx.unwrap();
+            let Some(s_idx) = s_idx else {
+                return HttpImpl::build_response(
+                    401,
+                    b"text/plain",
+                    b"error: unauthorized\n",
+                    out,
+                )
+                .unwrap_or(0);
+            };
             let mut body = [0u8; 128];
             let mut bpos = 0usize;
             bpos += copy_msg(b"whoami: user=", &mut body[bpos..]);
@@ -1086,16 +1106,20 @@ impl LivedNet {
         }
 
         if view.method == HttpMethod::Post && view.path == b"/session/logout" {
-            let revoked = extract_session_token(view.headers_raw)
-                .map(|tok| sh.revoke_session(tok))
-                .unwrap_or(false);
+            let tok_opt = extract_session_token(view.headers_raw);
+            let has_valid = tok_opt
+                .and_then(|tok| sh.validate_session(tok))
+                .is_some();
             if let Err(e) = sh.svc.mediate_endpoint(
                 IpcOp::SessionLogout,
                 true,
-                revoked,
+                has_valid,
                 &mut sh.audit,
             ) {
                 return build_service_error_response(e, out);
+            }
+            if let Some(tok) = tok_opt {
+                let _ = sh.revoke_session(tok);
             }
             return HttpImpl::build_response(
                 200,
@@ -1151,12 +1175,16 @@ impl LivedNet {
                     }
                     let q_slice = &decoded[..dlen];
                     if !crate::sql::SqlDb::is_readonly_query(q_slice) {
-                        let _ = sh.svc.mediate_endpoint(
+                        if let Err(e) = sh.svc.mediate_endpoint(
                             IpcOp::SqlMutate,
                             true,
                             false,
                             &mut sh.audit,
-                        );
+                        ) {
+                            if e != crate::svc_runtime::ServiceError::Unauthenticated {
+                                return build_service_error_response(e, out);
+                            }
+                        }
                         return HttpImpl::build_response(
                             401,
                             b"text/plain",
@@ -2529,15 +2557,35 @@ mod tests {
         );
         assert!(out[..n_ok].starts_with(b"HTTP/1.1 200 OK\r\n"));
 
-        // `svc-sql` and `svc-sh` endpoints are refused with 503 Service Unavailable even with a valid session!
-        let n_sql = net.handle_http_request(
-            b"GET /sql?SELECT+*+FROM+kv HTTP/1.1\r\nHost: x\r\n\r\n",
+        // Unauthenticated `svc-http` credentialed endpoints (`GET /session/whoami`, `POST /session/logout`) still return 401 on `Wfe`:
+        let n_wfe_401 = net.handle_http_request(
+            b"GET /session/whoami HTTP/1.1\r\nHost: x\r\n\r\n",
             1,
             Some(&mut sh),
             &mut out,
         );
-        assert!(out[..n_sql].starts_with(b"HTTP/1.1 503 "));
+        assert!(out[..n_wfe_401].starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
 
+        // Unauthenticated `svc-sql` and `svc-sh` endpoints on `Wfe` return 503 Service Unavailable (role disabled precedes 401):
+        for wfe_disabled_req in &[
+            &b"GET /sql?SELECT+*+FROM+kv HTTP/1.1\r\nHost: x\r\n\r\n"[..],
+            &b"GET /sql?DELETE+FROM+kv HTTP/1.1\r\nHost: x\r\n\r\n"[..],
+            &b"POST /sql HTTP/1.1\r\nHost: x\r\n\r\nINSERT INTO kv VALUES ('pwn', '1', 1)"[..],
+            &b"POST /sh HTTP/1.1\r\nHost: x\r\n\r\nstatus"[..],
+            &b"POST /exec HTTP/1.1\r\nHost: x\r\n\r\n/bin/fib 10"[..],
+            &b"PUT /fs/var/pwn.txt HTTP/1.1\r\nHost: x\r\n\r\npwned"[..],
+            &b"DELETE /fs/etc/hostname HTTP/1.1\r\nHost: x\r\n\r\n"[..],
+        ] {
+            let n_dis = net.handle_http_request(wfe_disabled_req, 1, Some(&mut sh), &mut out);
+            assert!(
+                out[..n_dis].starts_with(b"HTTP/1.1 503 "),
+                "Wfe disabled endpoint {:?} must return 503, got {:?}",
+                core::str::from_utf8(wfe_disabled_req).unwrap(),
+                core::str::from_utf8(&out[..n_dis]).unwrap()
+            );
+        }
+
+        // Authenticated `svc-sh` request on `Wfe` is also refused with 503:
         let mut sh_req = [0u8; 256];
         let mut p = 0usize;
         p += copy_msg(b"POST /sh HTTP/1.1\r\nCookie: sid=", &mut sh_req[p..]);
@@ -2546,14 +2594,53 @@ mod tests {
         let n_sh = net.handle_http_request(&sh_req[..p], 1, Some(&mut sh), &mut out);
         assert!(out[..n_sh].starts_with(b"HTTP/1.1 503 "));
 
-        // 3. Role Isolation (`NodeRole::Sql`): `svc-http` is unloaded, so HTTP requests are refused at the gateway.
-        sh.svc.set_role(crate::svc_runtime::NodeRole::Sql, &mut sh.audit);
-        let n_http_off = net.handle_http_request(
-            b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n",
+        // 3. Role Isolation (`NodeRole::Sql` and `NodeRole::Shell`): `svc-http` is unloaded, so all HTTP endpoints return 503.
+        //    Verify that `POST /session/logout` on a `Sql` node returns 503 WITHOUT revoking the active session!
+        for role in [crate::svc_runtime::NodeRole::Sql, crate::svc_runtime::NodeRole::Shell] {
+            sh.svc.set_role(role, &mut sh.audit);
+            let n_http_off = net.handle_http_request(
+                b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n",
+                1,
+                Some(&mut sh),
+                &mut out,
+            );
+            assert!(out[..n_http_off].starts_with(b"HTTP/1.1 503 "));
+
+            let mut logout_req = [0u8; 256];
+            let mut lp = 0usize;
+            lp += copy_msg(b"POST /session/logout HTTP/1.1\r\nCookie: sid=", &mut logout_req[lp..]);
+            lp += copy_msg(&sid, &mut logout_req[lp..]);
+            lp += copy_msg(b"\r\n\r\n", &mut logout_req[lp..]);
+            let n_logout = net.handle_http_request(&logout_req[..lp], 1, Some(&mut sh), &mut out);
+            assert!(out[..n_logout].starts_with(b"HTTP/1.1 503 "));
+            assert!(
+                sh.validate_session(&sid).is_some(),
+                "session must not be revoked when POST /session/logout is refused by role policy"
+            );
+        }
+
+        // 4. Brute-force login rate limiting: 5 consecutive failed logins trigger 429 Too Many Requests.
+        sh.svc.set_role(crate::svc_runtime::NodeRole::Full, &mut sh.audit);
+        // Note: `sh.create_session` above reset `failed_login_streak` to 0, so run 5 failed attempts:
+        for seq in 2..=6 {
+            let mut bad_login = [0u8; 160];
+            let mut bp = 0usize;
+            bp += copy_msg(b"POST /session/login HTTP/1.1\r\nHost: x\r\n\r\n", &mut bad_login[bp..]);
+            bp += dec_u64(seq, &mut bad_login[bp..]);
+            bp += copy_msg(
+                b" 0000000000000000000000000000000000000000000000000000000000000000 admin",
+                &mut bad_login[bp..],
+            );
+            let n_bad = net.handle_http_request(&bad_login[..bp], 1, Some(&mut sh), &mut out);
+            assert!(out[..n_bad].starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+        }
+        assert!(sh.is_login_rate_limited());
+        let n_ratelimited = net.handle_http_request(
+            b"POST /session/login HTTP/1.1\r\nHost: x\r\n\r\n99 0000000000000000000000000000000000000000000000000000000000000000 admin",
             1,
             Some(&mut sh),
             &mut out,
         );
-        assert!(out[..n_http_off].starts_with(b"HTTP/1.1 503 "));
+        assert!(out[..n_ratelimited].starts_with(b"HTTP/1.1 429 Too Many Requests\r\n"));
     }
 }

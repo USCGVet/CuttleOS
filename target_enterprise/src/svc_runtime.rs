@@ -30,7 +30,7 @@ use proteus_contracts::{
 };
 
 use crate::audit::AuditLogImpl;
-use crate::durable_seal::{seal_bytes, seal_matches, DURABLE_DIGEST_LEN};
+use crate::durable_seal::{seal_bytes, seal_bytes_keyed, seal_matches, DURABLE_DIGEST_LEN};
 use crate::ebpf::EBpfImpl;
 use crate::elf64::Elf64Impl;
 use crate::kpti::{
@@ -460,6 +460,8 @@ pub struct ServiceSlot {
     pub policy_denials: u64,
     /// Whether KPTI user page table isolation is currently verified for this service.
     pub kpti_isolated: bool,
+    /// Live per-service KPTI user page table (`UserL4`) isolating this service's address space.
+    pub user_l4: PageTable<8>,
     /// SHA-256 digest of the currently loaded ELF64 binary (`[0; 32]` when `Unloaded`).
     pub elf_sha256: [u8; DURABLE_DIGEST_LEN],
     /// Valid byte length of `elf_image` (`0` when `Unloaded`).
@@ -481,10 +483,26 @@ impl ServiceSlot {
             requests_served: 0,
             policy_denials: 0,
             kpti_isolated: false,
+            user_l4: PageTable::new(),
             elf_sha256: [0u8; DURABLE_DIGEST_LEN],
             elf_len: 0,
             elf_image: [0u8; SVC_ELF_CAP],
         }
+    }
+}
+
+/// Derive a deterministic per-node 64-bit base seed from a 256-bit `seal_key` so
+/// nodes with distinct device keys boot with distinct service variants (`svc-http`, `svc-sql`, `svc-sh`).
+pub fn derive_service_base_seed(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> u64 {
+    let mut dig = [0u8; DURABLE_DIGEST_LEN];
+    seal_bytes_keyed(seal_key, b"proteus-svc-variant-seed-v1", &mut dig);
+    let raw = u64::from_le_bytes([
+        dig[0], dig[1], dig[2], dig[3], dig[4], dig[5], dig[6], dig[7],
+    ]);
+    if raw == 0 {
+        1
+    } else {
+        raw
     }
 }
 
@@ -493,6 +511,8 @@ impl ServiceSlot {
 pub struct ServiceSupervisor {
     /// Active appliance role profile (`Wfe`, `Sql`, `Shell`, or `Full`).
     pub role: NodeRole,
+    /// Per-node base seed used to derive per-service variant seeds when booting or enabling services.
+    pub base_seed: u64,
     /// Per-service runtime slots (`svc-http`, `svc-sql`, `svc-sh`).
     pub services: [ServiceSlot; SERVICE_COUNT],
     /// Rolling TPM 2.0 `PCR-10` service measurement register (`SHA256(svc_pcr10 || elf_sha256)`).
@@ -512,6 +532,7 @@ impl ServiceSupervisor {
     pub const fn empty() -> Self {
         Self {
             role: NodeRole::Full,
+            base_seed: 1,
             services: [
                 ServiceSlot::empty(ServiceId::Http),
                 ServiceSlot::empty(ServiceId::Sql),
@@ -525,14 +546,30 @@ impl ServiceSupervisor {
         }
     }
 
+    /// Derive a per-service variant seed from the node's `base_seed` and `svc`.
+    #[inline]
+    pub const fn derive_slot_seed(&self, svc: ServiceId) -> u64 {
+        let idx = (svc.index() as u64) + 1;
+        let mixed = self
+            .base_seed
+            .wrapping_add(idx.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            ^ idx.wrapping_mul(0x517C_C1B7_2722_0A95);
+        if mixed == 0 {
+            idx
+        } else {
+            mixed
+        }
+    }
+
     /// Initialize and start all services permitted by `role` with initial `base_seed`.
     pub fn init_role(&mut self, role: NodeRole, base_seed: u64) {
         self.role = role;
+        self.base_seed = if base_seed == 0 { 1 } else { base_seed };
         let mut i = 0usize;
         while i < SERVICE_COUNT {
             let svc = ServiceId::ALL[i];
             if role.allows(svc) {
-                let seed = base_seed.wrapping_add(((i as u64) + 1).wrapping_mul(0x9E37_79B9));
+                let seed = self.derive_slot_seed(svc);
                 let _ = self.load_and_verify_service(svc, seed, false);
             } else {
                 self.unload_service(svc);
@@ -542,7 +579,8 @@ impl ServiceSupervisor {
     }
 
     /// Switch the node's role profile at runtime, immediately unloading any disallowed
-    /// service ELFs (zeroing their memory pages) and loading any newly enabled service ELFs.
+    /// service ELFs (zeroing their memory pages and KPTI mappings) and loading any newly
+    /// enabled service ELFs using the node's per-service seed.
     pub fn set_role<const N: usize>(&mut self, role: NodeRole, audit: &mut AuditLogImpl<N>) {
         self.role = role;
         let mut i = 0usize;
@@ -551,7 +589,7 @@ impl ServiceSupervisor {
             if role.allows(svc) {
                 if self.services[i].state != ServiceState::Running {
                     let seed = if self.services[i].variant_seed == 0 {
-                        0x1000_u64.wrapping_add((i as u64) * 0x1111)
+                        self.derive_slot_seed(svc)
                     } else {
                         self.services[i].variant_seed
                     };
@@ -565,11 +603,12 @@ impl ServiceSupervisor {
         record_svc_audit(audit, 40, AuditVerdict::Allowed, b"svc:role:updated");
     }
 
-    /// Unload a service from memory and clear its ELF image and KPTI mapping.
+    /// Unload a service from memory and clear its ELF image and live KPTI page table.
     fn unload_service(&mut self, svc: ServiceId) {
         let idx = svc.index();
         self.services[idx].state = ServiceState::Unloaded;
         self.services[idx].kpti_isolated = false;
+        self.services[idx].user_l4 = PageTable::new();
         self.services[idx].elf_sha256 = [0u8; DURABLE_DIGEST_LEN];
         self.services[idx].elf_len = 0;
         self.services[idx].elf_image = [0u8; SVC_ELF_CAP];
@@ -618,10 +657,11 @@ impl ServiceSupervisor {
             return Err(ServiceError::KptiIsolationFailed);
         }
 
-        // 3. Build and validate KPTI isolated user page table view:
+        // 3. Build and validate the service's live KPTI user page table (`user_l4`):
         //    - Maps KPTI_TRAMPOLINE_VIRT and ONLY this service's user_va_base.
         //    - Excludes KERNEL_SECRET_VA AND excludes all peer services' virtual addresses!
-        if !verify_service_kpti_isolation(svc) {
+        let user_l4 = build_service_user_l4(svc);
+        if !verify_service_kpti_isolation(&user_l4, svc) {
             return Err(ServiceError::KptiIsolationFailed);
         }
 
@@ -640,7 +680,7 @@ impl ServiceSupervisor {
         self.svc_pcr10 = next_pcr;
         self.svc_measurements = self.svc_measurements.wrapping_add(1);
 
-        // 5. Commit verified service binary into the supervisor slot.
+        // 5. Commit verified service binary and live user_l4 page table into the supervisor slot.
         let slot = &mut self.services[idx];
         slot.state = ServiceState::Running;
         slot.policy = svc.policy();
@@ -648,6 +688,7 @@ impl ServiceSupervisor {
         if is_rotation {
             slot.rotations = slot.rotations.wrapping_add(1);
         }
+        slot.user_l4 = user_l4;
         slot.kpti_isolated = true;
         slot.elf_sha256 = bin_dig;
         slot.elf_len = elf_len;
@@ -723,7 +764,7 @@ impl ServiceSupervisor {
     }
 
     /// Mediate a direct syscall from `svc`, enforcing its deny-by-default capability mask,
-    /// eBPF Seccomp syscall allowlist, IMA binary integrity, and KPTI address-space isolation.
+    /// eBPF Seccomp syscall allowlist, IMA binary integrity, and live KPTI `user_l4` isolation.
     pub fn mediate_syscall<const N: usize>(
         &mut self,
         svc: ServiceId,
@@ -765,24 +806,32 @@ impl ServiceSupervisor {
             return Err(ServiceError::ImaVerificationFailed);
         }
 
-        if !self.services[idx].kpti_isolated {
+        // 4. Validate the service's actual live `user_l4` page table against KPTI invariants.
+        if !self.services[idx].kpti_isolated
+            || !verify_service_kpti_isolation(&self.services[idx].user_l4, svc)
+        {
+            self.services[idx].kpti_isolated = false;
+            self.services[idx].policy_denials =
+                self.services[idx].policy_denials.wrapping_add(1);
+            record_svc_audit(audit, 44, AuditVerdict::Denied, b"svc:kpti:violation");
             return Err(ServiceError::KptiIsolationFailed);
         }
         Ok(())
     }
 
     /// Gate and dispatch a high-level service endpoint / IPC operation (`op`) across the
-    /// Ring-3 isolation layer:
+    /// service policy & isolation boundary:
     ///
     /// 1. Verifies that the entry service (`svc-http` for network requests) and target service
-    ///    (`svc-http`, `svc-sql`, or `svc-sh`) are loaded under the current [`NodeRole`]
-    ///    (auto-restarting any crashed service via [`ServiceSupervisor::ensure_running`]).
-    /// 2. Enforces the standing endpoint credential gate (`op.requires_session() => session_verified`).
+    ///    (`svc-http`, `svc-sql`, or `svc-sh`) are provisioned under the current [`NodeRole`]
+    ///    (returning [`ServiceError::RoleDisabled`] -> `503` if disabled by role).
+    /// 2. Enforces the standing endpoint credential gate (`op.requires_session() => session_verified`,
+    ///    returning [`ServiceError::Unauthenticated`] -> `401` if missing).
     /// 3. If `target != ServiceId::Http`, mediates an authenticated inter-service [`IpcMessage`]
     ///    from `svc-http` to `target` over [`IpcBus`] (checking `SvcSyscall::IpcSend` + `SVC_CAP_IPC`).
     /// 4. Mediates the target service's required syscall and capability (`NetIo`, `StorageIo`,
-    ///    `Exec`, or `Open`) and executes the target service's Ring-3 eBPF ELF64 handler with
-    ///    a [`StackCanaryImpl`] stack guard.
+    ///    `Exec`, or `Open`) and executes the target service's ELF64 eBPF policy program with
+    ///    an in-stack [`StackCanaryImpl`] guard.
     pub fn mediate_endpoint<const N: usize>(
         &mut self,
         op: IpcOp,
@@ -790,18 +839,38 @@ impl ServiceSupervisor {
         session_verified: bool,
         audit: &mut AuditLogImpl<N>,
     ) -> Result<u64, ServiceError> {
-        // 1. Standing Rule (Step 6): Refuse unauthenticated calls to credentialed endpoints BEFORE touching service state.
+        let target = op.target_service();
+
+        // 1. Check role availability first so requests to services disabled by the node's role
+        //    always return `RoleDisabled` (503) rather than misleading `Unauthenticated` (401).
+        if via_http_gateway {
+            let http_idx = ServiceId::Http.index();
+            if !self.role.allows(ServiceId::Http)
+                || self.services[http_idx].state == ServiceState::Unloaded
+            {
+                self.services[http_idx].policy_denials =
+                    self.services[http_idx].policy_denials.wrapping_add(1);
+                record_svc_audit(audit, 43, AuditVerdict::Denied, b"svc:error:role-unloaded");
+                return Err(ServiceError::RoleDisabled);
+            }
+        }
+        let target_idx = target.index();
+        if !self.role.allows(target) || self.services[target_idx].state == ServiceState::Unloaded {
+            self.services[target_idx].policy_denials =
+                self.services[target_idx].policy_denials.wrapping_add(1);
+            record_svc_audit(audit, 43, AuditVerdict::Denied, b"svc:error:role-unloaded");
+            return Err(ServiceError::RoleDisabled);
+        }
+
+        // 2. Standing Rule (Step 6): Refuse unauthenticated calls to credentialed endpoints BEFORE touching service state.
         if op.requires_session() && !session_verified {
-            let target_idx = op.target_service().index();
             self.services[target_idx].policy_denials =
                 self.services[target_idx].policy_denials.wrapping_add(1);
             record_svc_audit(audit, 45, AuditVerdict::Denied, b"svc:auth:unauthenticated");
             return Err(ServiceError::Unauthenticated);
         }
 
-        let target = op.target_service();
-
-        // 2. When arriving over HTTP/HTTPS, `svc-http` must be loaded and allowed `NetIo`.
+        // 3. When arriving over HTTP/HTTPS, `svc-http` must be loaded and allowed `NetIo`.
         if via_http_gateway {
             self.mediate_syscall(ServiceId::Http, SvcSyscall::NetIo, audit)?;
             if target != ServiceId::Http {
@@ -825,18 +894,21 @@ impl ServiceSupervisor {
             }
         }
 
-        // 3. Mediate the target service's syscall & capability policy.
+        // 4. Mediate the target service's syscall & capability policy.
         let sys = op.target_syscall();
         self.mediate_syscall(target, sys, audit)?;
 
-        // 4. Execute the target service's loaded ELF64 eBPF handler inside a stack-canary frame.
+        // 5. Execute the target service's loaded ELF64 eBPF handler inside an in-stack canary frame.
         let ret = self.execute_service_elf(target, op as u64)?;
-        self.services[target.index()].requests_served =
-            self.services[target.index()].requests_served.wrapping_add(1);
+        self.services[target_idx].requests_served =
+            self.services[target_idx].requests_served.wrapping_add(1);
         Ok(ret)
     }
 
-    /// Execute the eBPF instruction stream inside `svc`'s loaded ELF64 `PT_LOAD` segment.
+    /// Execute the eBPF instruction stream inside `svc`'s loaded ELF64 `PT_LOAD` segment,
+    /// planting the [`StackCanaryImpl`] token directly at `[r10 - 8 .. r10]` inside `ctx.stack`
+    /// via a 2-instruction prologue and verifying post-run that the executed program did not
+    /// corrupt the canary slot.
     fn execute_service_elf(&self, svc: ServiceId, arg_op: u64) -> Result<u64, ServiceError> {
         let slot = &self.services[svc.index()];
         let header_len = ELF_EHDR_LEN + ELF_PHDR_LEN;
@@ -848,7 +920,29 @@ impl ServiceSupervisor {
         if insn_count == 0 || insn_count > 16 {
             return Err(ServiceError::ImaVerificationFailed);
         }
-        let mut prog = [BpfInstr::new(0, 0, 0, 0, 0); 16];
+
+        let seed_bytes = (slot.variant_seed ^ 0x55AA_55AA_55AA_55AA).to_le_bytes();
+        let canary: CanaryToken =
+            StackCanaryImpl::mint(&seed_bytes).map_err(|_| ServiceError::SandboxTrap)?;
+        let canary_lo = i32::from_le_bytes([
+            canary.bytes[0],
+            canary.bytes[1],
+            canary.bytes[2],
+            canary.bytes[3],
+        ]);
+        let canary_hi = i32::from_le_bytes([
+            canary.bytes[4],
+            canary.bytes[5],
+            canary.bytes[6],
+            canary.bytes[7],
+        ]);
+
+        let st_mem_w = bpf_op::BPF_CLASS_ST | bpf_op::BPF_SIZE_W;
+        let mut prog = [BpfInstr::new(0, 0, 0, 0, 0); 18];
+        // Prologue: plant 8-byte stack canary at [r10 - 8 .. r10] inside ctx.stack.
+        prog[0] = BpfInstr::new(st_mem_w, 10, 0, -8, canary_lo);
+        prog[1] = BpfInstr::new(st_mem_w, 10, 0, -4, canary_hi);
+
         let mut i = 0usize;
         while i < insn_count {
             let base = header_len + i * 8;
@@ -861,7 +955,7 @@ impl ServiceSupervisor {
                 slot.elf_image[base + 6],
                 slot.elf_image[base + 7],
             ]);
-            prog[i] = BpfInstr {
+            prog[2 + i] = BpfInstr {
                 opcode: op,
                 regs,
                 offset: off,
@@ -869,27 +963,21 @@ impl ServiceSupervisor {
             };
             i += 1;
         }
-        if prog[0].opcode == (bpf_op::BPF_CLASS_ALU64 | bpf_op::BPF_OP_MOV) {
-            prog[0].imm = arg_op as i32;
+        if prog[2].opcode == (bpf_op::BPF_CLASS_ALU64 | bpf_op::BPF_OP_MOV) {
+            prog[2].imm = arg_op as i32;
         }
 
-        let seed_bytes = (slot.variant_seed ^ 0x55AA_55AA_55AA_55AA).to_le_bytes();
-        let canary: CanaryToken =
-            StackCanaryImpl::mint(&seed_bytes).map_err(|_| ServiceError::SandboxTrap)?;
-        let frame_canary = CanaryToken {
-            bytes: core::hint::black_box(canary.bytes),
-        };
         let mut ctx = BpfContext::new();
-        let ret = EBpfImpl::run(&prog[..insn_count], &mut ctx)
+        let ret = EBpfImpl::run(&prog[..2 + insn_count], &mut ctx)
             .map_err(|_| ServiceError::SandboxTrap)?;
-        let redzone_off = BPF_STACK_SIZE - STACK_CANARY_LEN;
-        let mut dirty = 0u8;
-        let mut r = redzone_off;
-        while r < BPF_STACK_SIZE {
-            dirty |= ctx.stack[r];
-            r += 1;
-        }
-        if StackCanaryImpl::verify(&canary, &frame_canary).is_err() || dirty != 0 {
+
+        let canary_off = BPF_STACK_SIZE - STACK_CANARY_LEN;
+        let mut observed_bytes = [0u8; STACK_CANARY_LEN];
+        observed_bytes.copy_from_slice(&ctx.stack[canary_off..BPF_STACK_SIZE]);
+        let observed = CanaryToken {
+            bytes: observed_bytes,
+        };
+        if StackCanaryImpl::verify(&canary, &observed).is_err() {
             return Err(ServiceError::SandboxTrap);
         }
         Ok(ret)
@@ -907,18 +995,33 @@ impl ServiceSupervisor {
         }
         c
     }
+
+    /// Verify live KPTI page table isolation across all currently running services.
+    pub fn verify_all_kpti_isolated(&self) -> bool {
+        let mut i = 0usize;
+        while i < SERVICE_COUNT {
+            let svc = ServiceId::ALL[i];
+            if self.services[i].state == ServiceState::Running {
+                if !verify_service_kpti_isolation(&self.services[i].user_l4, svc) {
+                    return false;
+                }
+            } else if self.services[i].user_l4.len() != 0 {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
 }
 
-/// Verify that `svc`'s KPTI user page table maps `svc.user_va_base()` and `KPTI_TRAMPOLINE_VIRT`
-/// while leaving `KERNEL_SECRET_VA` and every other service's `user_va_base()` unmapped.
-pub fn verify_service_kpti_isolation(svc: ServiceId) -> bool {
+/// Build the reference kernel page table and peer secret list for `svc`.
+fn build_service_kernel_reference(svc: ServiceId) -> (PageTable<8>, [u64; 3]) {
     let own_va = svc.user_va_base() & PAGE_MASK;
     let mut kernel_l4: PageTable<8> = PageTable::new();
     let _ = kernel_l4.map(KERNEL_SECRET_VA, PTE_PRESENT | PTE_WRITABLE);
     let _ = kernel_l4.map(KPTI_TRAMPOLINE_VIRT, PTE_PRESENT | PTE_USER);
     let _ = kernel_l4.map(own_va, PTE_PRESENT | PTE_USER);
 
-    // Other services' code pages are kernel-protected from this service's user view.
     let mut peer_secrets = [KERNEL_SECRET_VA; 3];
     let mut s_idx = 1usize;
     let mut i = 0usize;
@@ -934,12 +1037,28 @@ pub fn verify_service_kpti_isolation(svc: ServiceId) -> bool {
         }
         i += 1;
     }
+    (kernel_l4, peer_secrets)
+}
 
-    let user_l4 = KptiImpl::<8>::build_user_view(&kernel_l4, &peer_secrets);
-    if KptiImpl::<8>::validate_user_view(&user_l4, &kernel_l4, &peer_secrets).is_err() {
+/// Construct the isolated KPTI user page table (`UserL4`) for `svc`.
+pub fn build_service_user_l4(svc: ServiceId) -> PageTable<8> {
+    let (kernel_l4, peer_secrets) = build_service_kernel_reference(svc);
+    KptiImpl::<8>::build_user_view(&kernel_l4, &peer_secrets)
+}
+
+/// Verify that a service's live `user_l4` KPTI page table maps `svc.user_va_base()` and
+/// `KPTI_TRAMPOLINE_VIRT` while leaving `KERNEL_SECRET_VA` and every other service's
+/// `user_va_base()` unmapped.
+pub fn verify_service_kpti_isolation(user_l4: &PageTable<8>, svc: ServiceId) -> bool {
+    let own_va = svc.user_va_base() & PAGE_MASK;
+    let (kernel_l4, peer_secrets) = build_service_kernel_reference(svc);
+    if KptiImpl::<8>::validate_user_view(user_l4, &kernel_l4, &peer_secrets).is_err() {
         return false;
     }
-    if !user_l4.is_mapped(own_va) || user_l4.is_mapped(KERNEL_SECRET_VA) {
+    if !user_l4.is_mapped(own_va)
+        || !user_l4.is_mapped(KPTI_TRAMPOLINE_VIRT)
+        || user_l4.is_mapped(KERNEL_SECRET_VA)
+    {
         return false;
     }
     let mut k = 0usize;
@@ -1281,5 +1400,94 @@ mod tests {
             ServiceState::Running
         );
         assert_eq!(sup.services[ServiceId::Sql.index()].restarts, 1);
+    }
+
+    #[test]
+    fn distinct_device_keys_boot_distinct_service_variants_and_live_kpti_catches_corruption() {
+        let mut audit: AuditLogImpl<16> = AuditLogImpl::new();
+        let key_a = [0x11u8; DURABLE_DIGEST_LEN];
+        let key_b = [0x22u8; DURABLE_DIGEST_LEN];
+        let seed_a = derive_service_base_seed(&key_a);
+        let seed_b = derive_service_base_seed(&key_b);
+        assert_ne!(seed_a, seed_b);
+
+        let mut sup_a = ServiceSupervisor::empty();
+        let mut sup_b = ServiceSupervisor::empty();
+        sup_a.init_role(NodeRole::Full, seed_a);
+        sup_b.init_role(NodeRole::Full, seed_b);
+
+        for i in 0..SERVICE_COUNT {
+            assert_ne!(
+                sup_a.services[i].elf_sha256, sup_b.services[i].elf_sha256,
+                "nodes with distinct device keys must boot distinct service ELF variants"
+            );
+        }
+
+        // Verify that corrupting a service's live `user_l4` page table (mapping KERNEL_SECRET_VA
+        // or a peer service's VA) is immediately caught by `verify_all_kpti_isolated` and `mediate_syscall`:
+        assert!(sup_a.verify_all_kpti_isolated());
+        let _ = sup_a.services[ServiceId::Http.index()]
+            .user_l4
+            .map(KERNEL_SECRET_VA, PTE_PRESENT | PTE_USER);
+        assert!(!sup_a.verify_all_kpti_isolated());
+        assert_eq!(
+            sup_a.mediate_syscall(ServiceId::Http, SvcSyscall::NetIo, &mut audit),
+            Err(ServiceError::KptiIsolationFailed)
+        );
+
+        // Verify that an eBPF instruction that clobbers the stack canary slot `[r10 - 8]` inside `ctx.stack`
+        // is caught by `StackCanaryImpl::verify` with `Err(ServiceError::SandboxTrap)`:
+        let sql_idx = ServiceId::Sql.index();
+        let header_len = ELF_EHDR_LEN + ELF_PHDR_LEN;
+        let smash_insn = BpfInstr::new(bpf_op::BPF_CLASS_ST | bpf_op::BPF_SIZE_W, 10, 0, -8, 0x1337);
+        let off = header_len + 3 * 8;
+        sup_b.services[sql_idx].elf_image[off] = smash_insn.opcode;
+        sup_b.services[sql_idx].elf_image[off + 1] = smash_insn.regs;
+        sup_b.services[sql_idx].elf_image[off + 2..off + 4]
+            .copy_from_slice(&smash_insn.offset.to_le_bytes());
+        sup_b.services[sql_idx].elf_image[off + 4..off + 8]
+            .copy_from_slice(&smash_insn.imm.to_le_bytes());
+        let elf_len = sup_b.services[sql_idx].elf_len;
+        let mut new_dig = [0u8; DURABLE_DIGEST_LEN];
+        seal_bytes(&sup_b.services[sql_idx].elf_image[..elf_len], &mut new_dig);
+        sup_b.services[sql_idx].elf_sha256 = new_dig;
+        assert_eq!(
+            sup_b.mediate_endpoint(IpcOp::SqlQuery, true, false, &mut audit),
+            Err(ServiceError::SandboxTrap)
+        );
+    }
+
+    #[test]
+    fn role_disabled_refusal_precedes_unauthenticated_across_all_roles() {
+        let mut sup = ServiceSupervisor::empty();
+        let mut audit: AuditLogImpl<32> = AuditLogImpl::new();
+
+        // On a WFE node, unauthenticated calls to SQL or Shell return RoleDisabled (503),
+        // while unauthenticated calls to protected HTTP session ops return Unauthenticated (401).
+        sup.init_role(NodeRole::Wfe, 500);
+        assert_eq!(
+            sup.mediate_endpoint(IpcOp::SqlMutate, true, false, &mut audit),
+            Err(ServiceError::RoleDisabled)
+        );
+        assert_eq!(
+            sup.mediate_endpoint(IpcOp::ShellExec, true, false, &mut audit),
+            Err(ServiceError::RoleDisabled)
+        );
+        assert_eq!(
+            sup.mediate_endpoint(IpcOp::SessionWhoami, true, false, &mut audit),
+            Err(ServiceError::Unauthenticated)
+        );
+
+        // On a SQL node, any HTTP gateway call returns RoleDisabled (503), and direct
+        // unauthenticated SQL mutations return Unauthenticated (401).
+        sup.set_role(NodeRole::Sql, &mut audit);
+        assert_eq!(
+            sup.mediate_endpoint(IpcOp::ShellExec, true, false, &mut audit),
+            Err(ServiceError::RoleDisabled)
+        );
+        assert_eq!(
+            sup.mediate_endpoint(IpcOp::SqlMutate, false, false, &mut audit),
+            Err(ServiceError::Unauthenticated)
+        );
     }
 }

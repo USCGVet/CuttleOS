@@ -215,8 +215,19 @@ pub(crate) struct AhciHwPort {
 
 impl AhciHwPort {
     /// PCI scan for the AHCI HBA, enable MMIO + bus mastering, start the
-    /// port command engine on the first port with a device present.
+    /// port command engine on the first port with a device present, and emit
+    /// the boot-time `AHCI_HW probe OK` serial banner.
     pub(crate) fn probe_start() -> Self {
+        Self::probe_start_inner(true)
+    }
+
+    /// Quiet variant of [`Self::probe_start`] for runtime persistence (`persist_shell_to_ahci`
+    /// and `restore_shell_from_ahci`) so every SQL/VFS disk commit does not spam `COM1`.
+    pub(crate) fn probe_start_quiet() -> Self {
+        Self::probe_start_inner(false)
+    }
+
+    fn probe_start_inner(emit_banner: bool) -> Self {
         use proteus_contracts::{
             pci_class, Pci, PciAddress, PciBar, PciConfigBus, PCI_CFG_OFFSET_CLASS_REVISION,
             PCI_CFG_OFFSET_COMMAND_STATUS, PCI_CFG_OFFSET_VENDOR_DEVICE, PCI_COMMAND_BUS_MASTER,
@@ -324,7 +335,7 @@ impl AhciHwPort {
         if vs == 0 {
             panic!("AHCI_HW: version register zero");
         }
-        {
+        if emit_banner {
             let mut line = [0u8; 80];
             let mut pos = 0usize;
             let prefix = b"AHCI_HW probe OK slot=";

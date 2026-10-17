@@ -198,6 +198,8 @@ pub struct OsShell {
     /// Ring-3 user-space service supervisor (`svc-http`, `svc-sql`, `svc-sh`),
     /// role-specific ELF64 loader, KPTI isolator, and IPC/Seccomp policy enforcer.
     pub svc: crate::svc_runtime::ServiceSupervisor,
+    /// Consecutive failed authentication attempts for brute-force rate limiting.
+    pub failed_login_streak: u32,
     /// Next PID to assign on `spawn`.
     next_pid: TaskId,
     /// Monotonic command counter (used as synthetic timestamp/sequence).
@@ -237,6 +239,7 @@ impl OsShell {
             smp_ipi_doorbells: 0,
             kthread_switches: [0u64; SHELL_MAX_TASKS],
             svc: crate::svc_runtime::ServiceSupervisor::empty(),
+            failed_login_streak: 0,
             next_pid: 5,
             cmd_seq: 1,
             line_buf: [0u8; SHELL_LINE_MAX],
@@ -260,8 +263,9 @@ impl OsShell {
 
     /// Construct a fresh seeded shell bound to an explicit per-device 256-bit `seal_key`.
     pub fn with_seal_key(seal_key: [u8; DURABLE_DIGEST_LEN]) -> Self {
-        let mut s = Self::new();
+        let mut s = Self::empty();
         s.seal_key = seal_key;
+        s.seed_defaults();
         s
     }
 
@@ -331,9 +335,13 @@ impl OsShell {
         seal_bytes(&bin_buf[..sum_n], &mut sum_dig);
         let _ = self.enroll_ima_digest(b"/bin/sum", &sum_dig);
 
-        // Initialize Ring-3 isolated service runtime (`svc-http`, `svc-sql`, `svc-sh`).
+        // Initialize Ring-3 isolated service runtime (`svc-http`, `svc-sql`, `svc-sh`)
+        // with a per-node base seed derived from `self.seal_key`.
+        self.failed_login_streak = 0;
         self.svc = crate::svc_runtime::ServiceSupervisor::empty();
-        self.svc.init_role(crate::svc_runtime::NodeRole::Full, 1);
+        let base_seed = crate::svc_runtime::derive_service_base_seed(&self.seal_key);
+        self.svc
+            .init_role(crate::svc_runtime::NodeRole::Full, base_seed);
     }
 
     /// Seed standard user-space ELF64 executables (`/bin/fib` and `/bin/sum`)
@@ -422,9 +430,26 @@ impl OsShell {
         count
     }
 
+    /// Returns `true` if login attempts are currently rate-limited due to repeated failures (`>= 5`).
+    #[inline]
+    pub const fn is_login_rate_limited(&self) -> bool {
+        self.failed_login_streak >= 5
+    }
+
+    /// Record a failed login attempt, incrementing `failed_login_streak` and logging to the audit ring.
+    pub fn record_login_failure(&mut self) {
+        self.failed_login_streak = self.failed_login_streak.saturating_add(1);
+        if self.failed_login_streak >= 5 {
+            self.record_audit(32, AuditVerdict::Denied, b"shell:session:rate-limit");
+        } else {
+            self.record_audit(32, AuditVerdict::Denied, b"shell:session:bad-auth");
+        }
+    }
+
     /// Mint a new 128-bit (`32` hex character) authenticated session token for `user`
     /// derived via `HMAC-SHA256(self.attest_key, "proteus-session-v1:" || user || seq || challenge)`.
     pub fn create_session(&mut self, user: &[u8], challenge: &[u8]) -> [u8; 32] {
+        self.failed_login_streak = 0;
         let uname = if user.is_empty() { b"admin" } else { user };
         let ulen = uname.len().min(16);
 
@@ -1362,6 +1387,22 @@ impl OsShell {
         }
 
         if bytes_eq(cmd, b"spawn") {
+            if self
+                .svc
+                .mediate_endpoint(
+                    crate::svc_runtime::IpcOp::ShellExec,
+                    false,
+                    true,
+                    &mut self.audit,
+                )
+                .is_err()
+            {
+                let n = copy_into(
+                    b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                    out,
+                );
+                return ShellAction::Continue(n);
+            }
             let pid = self.next_pid;
             if self.sched.enqueue_with_priority(pid, 5) {
                 if (pid as usize) < SHELL_MAX_TASKS {
@@ -1747,6 +1788,21 @@ impl OsShell {
     }
 
     fn cmd_kill(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        if self
+            .svc
+            .mediate_endpoint(
+                crate::svc_runtime::IpcOp::ShellExec,
+                false,
+                true,
+                &mut self.audit,
+            )
+            .is_err()
+        {
+            return copy_into(
+                b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                out,
+            );
+        }
         let target = trim_ascii(arg);
         let Some(pid) = parse_u32_ascii(target) else {
             self.record_audit(6, AuditVerdict::Error, b"shell:kill:bad-pid");
@@ -2063,6 +2119,21 @@ impl OsShell {
     }
 
     fn cmd_write(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        if self
+            .svc
+            .mediate_endpoint(
+                crate::svc_runtime::IpcOp::VfsWrite,
+                false,
+                true,
+                &mut self.audit,
+            )
+            .is_err()
+        {
+            return copy_into(
+                b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                out,
+            );
+        }
         let (path, content) = split_first_word(trim_ascii(arg));
         if path.is_empty() || content.is_empty() {
             self.record_audit(9, AuditVerdict::Error, b"shell:write:bad-args");
@@ -2105,6 +2176,21 @@ impl OsShell {
     }
 
     fn cmd_rm(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        if self
+            .svc
+            .mediate_endpoint(
+                crate::svc_runtime::IpcOp::VfsDelete,
+                false,
+                true,
+                &mut self.audit,
+            )
+            .is_err()
+        {
+            return copy_into(
+                b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                out,
+            );
+        }
         let path = trim_ascii(arg);
         if path.is_empty() {
             self.record_audit(10, AuditVerdict::Error, b"shell:rm:no-arg");
@@ -2330,9 +2416,17 @@ impl OsShell {
                     out,
                 );
             };
-            let seed = parse_u32_ascii(trim_ascii(seed_tok))
-                .map(|v| v as u64)
-                .unwrap_or_else(|| self.cmd_seq.wrapping_mul(0x9E37_79B9) ^ 0x5A5A);
+            let seed = parse_u64_ascii(trim_ascii(seed_tok)).unwrap_or_else(|| {
+                let mut entropy_buf = [0u8; 48];
+                entropy_buf[..32].copy_from_slice(&self.svc.svc_pcr10);
+                entropy_buf[32..40].copy_from_slice(&self.cmd_seq.to_le_bytes());
+                entropy_buf[40..48].copy_from_slice(&self.svc.base_seed.to_le_bytes());
+                let mut dig = [0u8; DURABLE_DIGEST_LEN];
+                seal_bytes_keyed(&self.seal_key, &entropy_buf, &mut dig);
+                u64::from_le_bytes([
+                    dig[0], dig[1], dig[2], dig[3], dig[4], dig[5], dig[6], dig[7],
+                ])
+            });
             let Ok(new_dig) = self.svc.rotate_service(svc, seed, &mut self.audit) else {
                 return copy_into(
                     b"error: EACCES (service disabled by current node role)\n",
@@ -3240,6 +3334,23 @@ fn parse_u32_ascii(s: &[u8]) -> Option<u32> {
     Some(acc)
 }
 
+fn parse_u64_ascii(s: &[u8]) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut acc: u64 = 0;
+    let mut i = 0usize;
+    while i < s.len() {
+        let c = s[i];
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add((c - b'0') as u64)?;
+        i += 1;
+    }
+    Some(acc)
+}
+
 fn dec_u64(mut v: u64, out: &mut [u8]) -> usize {
     if out.is_empty() {
         return 0;
@@ -3996,12 +4107,13 @@ mod tests {
         let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
         assert!(s.starts_with("exec: path=/sbin/svc-http entry=4259840 kpti=isolated insns=10 ret="));
 
-        // 3. Rotate `svc-http` independently without rebooting and verify PCR-10 + attestation quote update.
+        // 3. Rotate `svc-http` independently (with a full 64-bit seed > u32::MAX) without rebooting
+        //    and verify PCR-10 + attestation quote update.
         let mut mac_before = [0u8; 32];
         sh.compute_attestation_mac(1, b"svc-nonce", &mut mac_before);
-        let act = sh.exec_line(b"service rotate svc-http 777", 1, 0, 0, &mut out);
+        let act = sh.exec_line(b"service rotate svc-http 1099511627777", 1, 0, 0, &mut out);
         let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
-        assert!(s.starts_with("service: rotated svc-http rot=1 seed=777 sha256="));
+        assert!(s.starts_with("service: rotated svc-http rot=1 seed=1099511627777 sha256="));
         let mut mac_after = [0u8; 32];
         sh.compute_attestation_mac(1, b"svc-nonce", &mut mac_after);
         assert_ne!(mac_before, mac_after, "rotating a service must update the attestation quote");
@@ -4014,7 +4126,8 @@ mod tests {
         assert_eq!(&out[..act.bytes_written()], b"count\n2\n");
         assert_eq!(sh.svc.services[1].restarts, 1);
 
-        // 5. Switch node role to `wfe`: `svc-sql` and `svc-sh` are unloaded from memory and refused.
+        // 5. Switch node role to `wfe`: `svc-sql` and `svc-sh` are unloaded from memory and refused
+        //    across ALL shell commands (`sql`, `exec`, `write`, `rm`, `spawn`, `kill`).
         let act = sh.exec_line(b"service role wfe", 1, 0, 0, &mut out);
         let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
         assert!(s.starts_with("service: role=wfe running=1/3"));
@@ -4023,10 +4136,18 @@ mod tests {
             &out[..act_sql.bytes_written()],
             b"error: EACCES (svc-sql disabled by node role or policy)\n"
         );
-        let act_exec = sh.exec_line(b"exec /bin/fib 10", 1, 0, 0, &mut out);
-        assert_eq!(
-            &out[..act_exec.bytes_written()],
-            b"error: EACCES (svc-sh disabled by node role or policy)\n"
-        );
+        for cmd in [
+            b"exec /bin/fib 10".as_slice(),
+            b"write /var/test.txt hi".as_slice(),
+            b"rm /var/test.txt".as_slice(),
+            b"spawn".as_slice(),
+            b"kill 5".as_slice(),
+        ] {
+            let act_sh = sh.exec_line(cmd, 1, 0, 0, &mut out);
+            assert_eq!(
+                &out[..act_sh.bytes_written()],
+                b"error: EACCES (svc-sh disabled by node role or policy)\n"
+            );
+        }
     }
 }

@@ -601,7 +601,7 @@ pub(crate) fn persist_shell_to_ahci(sh: &mut target_enterprise::OsShell, boots: 
     sh.pack_fs_partition(boots, &mut *fs_secs).ok()?;
     let mut sql_secs = SQL_PART_SECTORS_BUF.lock();
     sh.pack_sql_partition(&mut *sql_secs);
-    let port = AhciHwPort::probe_start();
+    let port = AhciHwPort::probe_start_quiet();
     // Write SQL partition payload sectors first, then SQL superblock sector last (crash-atomic).
     let mut sq = 1usize;
     while sq < target_enterprise::SQL_PART_SECTORS {
@@ -623,7 +623,7 @@ pub(crate) fn persist_shell_to_ahci(sh: &mut target_enterprise::OsShell, boots: 
 }
 
 pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Option<(u64, usize)> {
-    let port = AhciHwPort::probe_start();
+    let port = AhciHwPort::probe_start_quiet();
     let hdr_sec = port.read_sector(SHELL_DISK_LBA);
     let wal_sec = port.read_sector(SHELL_DISK_LBA + 1);
     let mut all_zero = true;
