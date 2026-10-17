@@ -738,6 +738,7 @@ pub(crate) fn banner_shell_compose() {
     let mut out = [0u8; 256];
     let mut seal_rejected = false;
 
+    let mut resumed_db: Option<target_enterprise::sql::SqlDb> = None;
     if boots > 1 {
         if let Some((prev_boots, applied)) = restore_shell_from_ahci(sh) {
             if prev_boots + 1 != boots || applied < 2 {
@@ -755,6 +756,7 @@ pub(crate) fn banner_shell_compose() {
                     panic!("SHELL resume: cross-boot SQL partition drift");
                 }
             }
+            resumed_db = Some(sh.db);
             serial_write_str("SHELL resume OK\n");
         } else if sh.audit.len() > 0 {
             seal_rejected = true;
@@ -920,6 +922,10 @@ pub(crate) fn banner_shell_compose() {
     let _ = sh.exec_line(b"seccomp clear 5", boots, 0, 0, &mut out);
     let _ = sh.exec_line(b"fw clear", boots, 0, 0, &mut out);
     sh.auth_seq = 0;
+    if let Some(db) = resumed_db {
+        sh.db = db;
+        let _ = persist_shell_to_ahci(sh, boots);
+    }
 
     serial_write_str("SHELL compose OK tasks=5 files=5 audit=5\n");
     if seal_rejected {
