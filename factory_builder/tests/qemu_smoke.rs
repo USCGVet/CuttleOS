@@ -148,7 +148,6 @@ fn boots_under_qemu_and_emits_banner() {
 
     // 3) Boot in QEMU with a serial-file log, watch for the banner.
     let serial_log = images_dir.join("qemu_smoke_serial.log");
-    let _ = std::fs::remove_file(&serial_log);
     // TASK-104: real virtio-blk-pci disk (not MemBus). Kernel
     // `banner_virtio_hw` probes it via 0xCF8/0xCFC config I/O.
     let virtio_disk = images_dir.join("virtio_hw.img");
@@ -175,83 +174,14 @@ fn boots_under_qemu_and_emits_banner() {
     factory_builder::ensure_device_secret_key(&device_key_path)
         .expect("provision 32-byte CSPRNG device_secret_key.bin");
 
-    eprintln!("smoke: launching QEMU (+virtio-blk +2x net hub +ahci +nvme +fw_cfg device key)...");
-    // Force TCG. On some Windows hosts the default accelerator
-    // (WHPX) accepts the guest but never advances the BIOS past
-    // reset — serial stays empty and the 10s banner sweep fails.
-    // TCG is slower but deterministic for smoke.
-    // Boot image on IDE so virtio-blk-pci is a *second* disk the
-    // kernel can discover without fighting the bootloader drive.
-    let mut qproc = Command::new(&qemu)
-        .arg("-accel")
-        .arg("tcg")
-        .arg("-fw_cfg")
-        .arg(format!(
-            "name={},file={}",
-            factory_builder::FW_CFG_DEVICE_KEY_NAME,
-            device_key_path.display()
-        ))
-        .arg("-drive")
-        .arg(format!("format=raw,file={},if=ide", bios.display()))
-        .arg("-drive")
-        .arg(format!(
-            "if=none,id=vd0,format=raw,file={}",
-            virtio_disk.display()
-        ))
-        .arg("-device")
-        // Force legacy virtio-pci (QUEUE_PFN + I/O BAR) so the kernel
-        // hardware path can drive a real virtqueue without modern caps.
-        .arg("virtio-blk-pci,drive=vd0,disable-legacy=off,disable-modern=on")
-        // TASK-111: two hubport NICs so guest TX on peer B is delivered
-        // as RX on peer A (in-guest loopback; no host inject race).
-        .arg("-netdev")
-        .arg("hubport,id=n0,hubid=1")
-        .arg("-device")
-        .arg("virtio-net-pci,netdev=n0,disable-legacy=off,disable-modern=on")
-        .arg("-netdev")
-        .arg("hubport,id=n1,hubid=1")
-        .arg("-device")
-        .arg("virtio-net-pci,netdev=n1,disable-legacy=off,disable-modern=on")
-        // TASK-113: real AHCI HBA + ide-hd for ATA IDENTIFY / sector DMA.
-        .arg("-drive")
-        .arg(format!(
-            "if=none,id=ahd0,format=raw,file={}",
-            ahci_disk.display()
-        ))
-        .arg("-device")
-        .arg("ahci,id=ahci0")
-        .arg("-device")
-        .arg("ide-hd,drive=ahd0,bus=ahci0.0")
-        // TASK-116/120/132: dual e1000 on hub for TX + RX hardware-truth.
-        .arg("-netdev")
-        .arg("hubport,id=e0,hubid=2")
-        .arg("-device")
-        .arg("e1000,netdev=e0")
-        .arg("-netdev")
-        .arg("hubport,id=e1,hubid=2")
-        .arg("-device")
-        .arg("e1000,netdev=e1")
-        // TASK-119: real NVMe controller + namespace for admin identify.
-        .arg("-drive")
-        .arg(format!(
-            "if=none,id=nvme0,format=raw,file={}",
-            nvme_disk.display()
-        ))
-        .arg("-device")
-        .arg("nvme,drive=nvme0,serial=PROTEUS-NVME-HW")
-        .arg("-serial")
-        .arg(format!("file:{}", serial_log.display()))
-        .arg("-display")
-        .arg("none")
-        .arg("-no-reboot")
-        .arg("-m")
-        .arg("256M")
-        .arg("-d")
-        .arg("cpu_reset")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn qemu");
+    let vm = SmokeVm {
+        qemu: &qemu,
+        bios: &bios,
+        virtio_disk: &virtio_disk,
+        ahci_disk: &ahci_disk,
+        nvme_disk: &nvme_disk,
+        device_key: &device_key_path,
+    };
 
     // TASK-023: the kernel now exercises every morphed surface
     // (TLS hkdf, TLS ServerHello, WAL replay, IOMMU translate,
@@ -809,25 +739,9 @@ fn boots_under_qemu_and_emits_banner() {
         "SHELL compose OK tasks=5 files=5 audit=5",
         "PROTEUS-TE HALT",
     ];
-    // TCG needs more wall-clock than WHPX; 45s covers a full banner
-    // sweep on a cold cache. Exit early as soon as every required
-    // banner is present.
-    let deadline = Instant::now() + Duration::from_secs(45);
-    let mut all_seen = false;
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(250));
-        if let Ok(s) = std::fs::read_to_string(&serial_log) {
-            if required_banners.iter().all(|b| s.contains(b)) {
-                all_seen = true;
-                break;
-            }
-        }
-    }
-    // Kill QEMU regardless of outcome.
-    let _ = qproc.kill();
-    let _ = qproc.wait();
-
-    let log_contents = std::fs::read_to_string(&serial_log).unwrap_or_default();
+    eprintln!("smoke: launching QEMU (+virtio-blk +2x net hub +ahci +nvme +fw_cfg device key)...");
+    let (log_contents, all_seen) =
+        vm.boot(&serial_log, |s| required_banners.iter().all(|b| s.contains(b)));
     if !all_seen {
         // Report which banners are present vs missing so the failure is
         // actionable.
@@ -870,15 +784,7 @@ fn boots_under_qemu_and_emits_banner() {
         // First boot on a freshly initialized ahci_hw.img: boot a second time to
         // prove cross-boot SHELL resume OK works with the provisioned fw_cfg key.
         let resume_log_path = images_dir.join("qemu_smoke_resume_serial.log");
-        let resume_log = boot_existing_smoke_image(
-            &qemu,
-            &bios,
-            &virtio_disk,
-            &ahci_disk,
-            &nvme_disk,
-            &device_key_path,
-            &resume_log_path,
-        );
+        let (resume_log, _) = vm.boot(&resume_log_path, halted);
         assert!(
             !resume_log.contains("SHELL resume REJECTED"),
             "QEMU smoke (boot 2): unexpected SHELL resume REJECTED!\nSerial log:\n{}",
@@ -896,92 +802,123 @@ fn boots_under_qemu_and_emits_banner() {
     );
 }
 
-fn boot_existing_smoke_image(
-    qemu: &Path,
-    bios: &Path,
-    virtio_disk: &Path,
-    ahci_disk: &Path,
-    nvme_disk: &Path,
-    device_key_path: &Path,
-    serial_log: &Path,
-) -> String {
-    let _ = std::fs::remove_file(serial_log);
-    let mut qproc = Command::new(qemu)
-        .arg("-accel")
-        .arg("tcg")
-        .arg("-fw_cfg")
-        .arg(format!(
-            "name={},file={}",
-            factory_builder::FW_CFG_DEVICE_KEY_NAME,
-            device_key_path.display()
-        ))
-        .arg("-drive")
-        .arg(format!("format=raw,file={},if=ide", bios.display()))
-        .arg("-drive")
-        .arg(format!(
-            "if=none,id=vd0,format=raw,file={}",
-            virtio_disk.display()
-        ))
-        .arg("-device")
-        .arg("virtio-blk-pci,drive=vd0,disable-legacy=off,disable-modern=on")
-        .arg("-netdev")
-        .arg("hubport,id=n0,hubid=1")
-        .arg("-device")
-        .arg("virtio-net-pci,netdev=n0,disable-legacy=off,disable-modern=on")
-        .arg("-netdev")
-        .arg("hubport,id=n1,hubid=1")
-        .arg("-device")
-        .arg("virtio-net-pci,netdev=n1,disable-legacy=off,disable-modern=on")
-        .arg("-drive")
-        .arg(format!(
-            "if=none,id=ahd0,format=raw,file={}",
-            ahci_disk.display()
-        ))
-        .arg("-device")
-        .arg("ahci,id=ahci0")
-        .arg("-device")
-        .arg("ide-hd,drive=ahd0,bus=ahci0.0")
-        .arg("-netdev")
-        .arg("hubport,id=e0,hubid=2")
-        .arg("-device")
-        .arg("e1000,netdev=e0")
-        .arg("-netdev")
-        .arg("hubport,id=e1,hubid=2")
-        .arg("-device")
-        .arg("e1000,netdev=e1")
-        .arg("-drive")
-        .arg(format!(
-            "if=none,id=nvme0,format=raw,file={}",
-            nvme_disk.display()
-        ))
-        .arg("-device")
-        .arg("nvme,drive=nvme0,serial=PROTEUS-NVME-HW")
-        .arg("-serial")
-        .arg(format!("file:{}", serial_log.display()))
-        .arg("-display")
-        .arg("none")
-        .arg("-no-reboot")
-        .arg("-m")
-        .arg("256M")
-        .arg("-d")
-        .arg("cpu_reset")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn qemu for follow-up boot");
+/// Host-side files attached to QEMU for one smoke boot. The smoke test and
+/// the tamper test each point this at their own boot image and disks, so
+/// the two can run in parallel without sharing a file.
+struct SmokeVm<'a> {
+    qemu: &'a Path,
+    bios: &'a Path,
+    virtio_disk: &'a Path,
+    ahci_disk: &'a Path,
+    nvme_disk: &'a Path,
+    device_key: &'a Path,
+}
 
-    let deadline = Instant::now() + Duration::from_secs(45);
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(250));
-        if let Ok(s) = std::fs::read_to_string(serial_log) {
-            if s.contains("PROTEUS-TE HALT") {
-                break;
+impl SmokeVm<'_> {
+    /// Boot once with serial output in `serial_log`, polling until
+    /// `done(log)` holds or 45s pass, then kill QEMU. Returns the final
+    /// log and whether `done` was reached.
+    fn boot(&self, serial_log: &Path, done: impl Fn(&str) -> bool) -> (String, bool) {
+        let _ = std::fs::remove_file(serial_log);
+        // Force TCG. On some Windows hosts the default accelerator
+        // (WHPX) accepts the guest but never advances the BIOS past
+        // reset — serial stays empty and the 10s banner sweep fails.
+        // TCG is slower but deterministic for smoke.
+        // Boot image on IDE so virtio-blk-pci is a *second* disk the
+        // kernel can discover without fighting the bootloader drive.
+        let mut qproc = Command::new(self.qemu)
+            .arg("-accel")
+            .arg("tcg")
+            .arg("-fw_cfg")
+            .arg(format!(
+                "name={},file={}",
+                factory_builder::FW_CFG_DEVICE_KEY_NAME,
+                self.device_key.display()
+            ))
+            .arg("-drive")
+            .arg(format!("format=raw,file={},if=ide", self.bios.display()))
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=vd0,format=raw,file={}",
+                self.virtio_disk.display()
+            ))
+            .arg("-device")
+            // Force legacy virtio-pci (QUEUE_PFN + I/O BAR) so the kernel
+            // hardware path can drive a real virtqueue without modern caps.
+            .arg("virtio-blk-pci,drive=vd0,disable-legacy=off,disable-modern=on")
+            // TASK-111: two hubport NICs so guest TX on peer B is delivered
+            // as RX on peer A (in-guest loopback; no host inject race).
+            .arg("-netdev")
+            .arg("hubport,id=n0,hubid=1")
+            .arg("-device")
+            .arg("virtio-net-pci,netdev=n0,disable-legacy=off,disable-modern=on")
+            .arg("-netdev")
+            .arg("hubport,id=n1,hubid=1")
+            .arg("-device")
+            .arg("virtio-net-pci,netdev=n1,disable-legacy=off,disable-modern=on")
+            // TASK-113: real AHCI HBA + ide-hd for ATA IDENTIFY / sector DMA.
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=ahd0,format=raw,file={}",
+                self.ahci_disk.display()
+            ))
+            .arg("-device")
+            .arg("ahci,id=ahci0")
+            .arg("-device")
+            .arg("ide-hd,drive=ahd0,bus=ahci0.0")
+            // TASK-116/120/132: dual e1000 on hub for TX + RX hardware-truth.
+            .arg("-netdev")
+            .arg("hubport,id=e0,hubid=2")
+            .arg("-device")
+            .arg("e1000,netdev=e0")
+            .arg("-netdev")
+            .arg("hubport,id=e1,hubid=2")
+            .arg("-device")
+            .arg("e1000,netdev=e1")
+            // TASK-119: real NVMe controller + namespace for admin identify.
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=nvme0,format=raw,file={}",
+                self.nvme_disk.display()
+            ))
+            .arg("-device")
+            .arg("nvme,drive=nvme0,serial=PROTEUS-NVME-HW")
+            .arg("-serial")
+            .arg(format!("file:{}", serial_log.display()))
+            .arg("-display")
+            .arg("none")
+            .arg("-no-reboot")
+            .arg("-m")
+            .arg("256M")
+            .arg("-d")
+            .arg("cpu_reset")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn qemu");
+
+        // TCG needs more wall-clock than WHPX; 45s covers a full banner
+        // sweep on a cold cache. Exit early as soon as `done` holds.
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut reached = false;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+            if let Ok(s) = std::fs::read_to_string(serial_log) {
+                if done(&s) {
+                    reached = true;
+                    break;
+                }
             }
         }
+        // Kill QEMU regardless of outcome.
+        let _ = qproc.kill();
+        let _ = qproc.wait();
+        (std::fs::read_to_string(serial_log).unwrap_or_default(), reached)
     }
-    let _ = qproc.kill();
-    let _ = qproc.wait();
-    std::fs::read_to_string(serial_log).unwrap_or_default()
+}
+
+fn halted(log: &str) -> bool {
+    log.contains("PROTEUS-TE HALT")
 }
 
 #[test]
@@ -993,41 +930,41 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
     let root = workspace_root();
     let images_dir = root.join("target").join("proteus_images");
     std::fs::create_dir_all(&images_dir).expect("create images_dir");
-    let bios = images_dir.join("qemu_smoke_bios.img");
-    if !bios.exists() {
-        let kernel_crate = root.join("target_enterprise_kernel");
-        let pkg_crate = factory_builder::locate_pkg_crate().expect("locate_pkg_crate");
-        let elf = factory_builder::build_kernel(&kernel_crate).expect("build_kernel");
-        factory_builder::package_kernel_via_pkg(&pkg_crate, &elf, &bios, None)
-            .expect("package_kernel_via_pkg");
-    }
-    let virtio_disk = images_dir.join("virtio_hw.img");
-    if !virtio_disk.exists() {
-        std::fs::write(&virtio_disk, vec![0u8; 1024 * 1024]).expect("create virtio_hw.img");
-    }
-    let nvme_disk = images_dir.join("nvme_hw.img");
-    if !nvme_disk.exists() {
-        std::fs::write(&nvme_disk, vec![0u8; 1024 * 1024]).expect("create nvme_hw.img");
+    // Build a dedicated boot image from the current source on every run.
+    // Reusing qemu_smoke_bios.img would boot whatever kernel the last smoke
+    // run left behind, and race the smoke test rewriting it in parallel.
+    let bios = images_dir.join("qemu_tamper_bios.img");
+    let kernel_crate = root.join("target_enterprise_kernel");
+    let pkg_crate = factory_builder::locate_pkg_crate().expect("locate_pkg_crate");
+    let elf = factory_builder::build_kernel(&kernel_crate).expect("build_kernel");
+    factory_builder::package_kernel_via_pkg(&pkg_crate, &elf, &bios, None)
+        .expect("package_kernel_via_pkg");
+
+    // Fresh scratch disks for this test only, so it never shares a disk with
+    // the smoke test or touches its persistent *_hw.img images.
+    let virtio_disk = images_dir.join("virtio_tamper_test.img");
+    let tampered_disk = images_dir.join("ahci_tamper_test.img");
+    let nvme_disk = images_dir.join("nvme_tamper_test.img");
+    let scratch_disks = [&virtio_disk, &tampered_disk, &nvme_disk];
+    for disk in scratch_disks {
+        std::fs::write(disk, vec![0u8; 1024 * 1024]).expect("init tamper-test scratch disk");
     }
     let device_key_path = root.join(factory_builder::DEVICE_SECRET_KEY_FILENAME);
     factory_builder::ensure_device_secret_key(&device_key_path)
         .expect("provision 32-byte CSPRNG device_secret_key.bin");
 
-    // Work on a dedicated scratch AHCI image so the persistent ahci_hw.img is untouched.
-    let tampered_disk = images_dir.join("ahci_tamper_test.img");
-    std::fs::write(&tampered_disk, vec![0u8; 1024 * 1024]).expect("init ahci_tamper_test.img");
+    let vm = SmokeVm {
+        qemu: &qemu,
+        bios: &bios,
+        virtio_disk: &virtio_disk,
+        ahci_disk: &tampered_disk,
+        nvme_disk: &nvme_disk,
+        device_key: &device_key_path,
+    };
     let tamper_log = images_dir.join("qemu_tamper_serial.log");
 
     // Boot 1: write valid sealed state (LBA 1024 continuity + LBA 1040..=1041 OsShell WAL).
-    let log1 = boot_existing_smoke_image(
-        &qemu,
-        &bios,
-        &virtio_disk,
-        &tampered_disk,
-        &nvme_disk,
-        &device_key_path,
-        &tamper_log,
-    );
+    let (log1, _) = vm.boot(&tamper_log, halted);
     assert!(
         log1.contains("SHELL compose OK tasks=5 files=5 audit=5"),
         "tamper test boot 1 did not complete SHELL compose:\n{}",
@@ -1041,16 +978,10 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
     std::fs::write(&tampered_disk, &disk_bytes).expect("write tampered ahci_tamper_test.img");
 
     // Boot 2: the tampered disk must emit SHELL resume REJECTED and must NOT emit SHELL resume OK.
-    let log2 = boot_existing_smoke_image(
-        &qemu,
-        &bios,
-        &virtio_disk,
-        &tampered_disk,
-        &nvme_disk,
-        &device_key_path,
-        &tamper_log,
-    );
-    let _ = std::fs::remove_file(&tampered_disk);
+    let (log2, _) = vm.boot(&tamper_log, halted);
+    for disk in scratch_disks {
+        let _ = std::fs::remove_file(disk);
+    }
     assert!(
         log2.contains("SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)"),
         "tamper test boot 2 did not emit SHELL resume REJECTED!\nSerial log:\n{}",
