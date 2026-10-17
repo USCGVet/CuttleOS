@@ -137,9 +137,19 @@ fn boot_kernel(elf: &Path, results_dir: &Path, cycle: u64) -> Result<PathBuf, St
     factory_builder::package_kernel_via_pkg(&pkg, elf, &bios, None)
         .map_err(|e| format!("package: {:#}", e))?;
 
+    let device_key_file = results_dir.join(factory_builder::DEVICE_SECRET_KEY_FILENAME);
+    let _ = factory_builder::ensure_device_secret_key(&device_key_file)
+        .map_err(|e| format!("{:#}", e))?;
+
     let mut qproc = Command::new(&qemu)
         .arg("-drive")
         .arg(format!("format=raw,file={}", bios.display()))
+        .arg("-fw_cfg")
+        .arg(format!(
+            "name={},file={}",
+            factory_builder::FW_CFG_DEVICE_KEY_NAME,
+            device_key_file.display()
+        ))
         .arg("-serial")
         .arg(format!("file:{}", serial.display()))
         .arg("-display")

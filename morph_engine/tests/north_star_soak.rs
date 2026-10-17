@@ -165,6 +165,10 @@ fn boot_kernel(elf: &Path, results_dir: &Path, cycle: u64) -> Result<PathBuf, St
         fs::write(&nvme_disk, vec![0u8; 1024 * 1024]).map_err(|e| e.to_string())?;
     }
 
+    let device_key_file = results_dir.join(factory_builder::DEVICE_SECRET_KEY_FILENAME);
+    let _ = factory_builder::ensure_device_secret_key(&device_key_file)
+        .map_err(|e| format!("{:#}", e))?;
+
     // Force TCG — WHPX on some Windows hosts never advances BIOS.
     // Boot BIOS on IDE; virtio-blk is a second disk for hardware-truth.
     let mut qproc = Command::new(&qemu)
@@ -211,6 +215,12 @@ fn boot_kernel(elf: &Path, results_dir: &Path, cycle: u64) -> Result<PathBuf, St
         ))
         .arg("-device")
         .arg("nvme,drive=nvme0,serial=PROTEUS-NVME-HW")
+        .arg("-fw_cfg")
+        .arg(format!(
+            "name={},file={}",
+            factory_builder::FW_CFG_DEVICE_KEY_NAME,
+            device_key_file.display()
+        ))
         .arg("-serial")
         .arg(format!("file:{}", serial.display()))
         .arg("-display")

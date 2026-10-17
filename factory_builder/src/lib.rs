@@ -374,6 +374,9 @@ pub fn build_kernel_with_layout_seed_and_prod(
             manifest.display()
         );
     }
+    if let Some(ws_root) = kernel_crate_dir.parent() {
+        let _ = ensure_device_secret_key(&ws_root.join(DEVICE_SECRET_KEY_FILENAME));
+    }
     eprintln!(
         "factory_builder: building kernel crate at {}",
         manifest.display()

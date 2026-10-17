@@ -504,7 +504,10 @@ pub(crate) fn service_udp_status() {
 /// Service loop over the modern virtio-net driver.
 pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
     let mac = n.mac;
-    let mut svc = target_enterprise::LivedNet::with_auth_key(mac, derive_runtime_net_auth_key(mac));
+    let mut svc = match derive_runtime_net_auth_key(mac) {
+        Some(k) => target_enterprise::LivedNet::with_auth_key(mac, k),
+        None => target_enterprise::LivedNet::new_unprovisioned(mac),
+    };
     serial_write_str("UDP SVC UP modern ip=10.0.2.15 port=8080\n");
     serial_write_str("NET SVC UP ip=10.0.2.15 udp=8080 tcp=80 icmp=echo\n");
     {
@@ -1088,7 +1091,10 @@ pub(crate) fn service_udp_status_legacy() {
         serial_write_str("NET SVC UP ip=10.0.2.15 udp=8080 tcp=80 icmp=echo\n");
     }
 
-    let mut svc = target_enterprise::LivedNet::with_auth_key(mac, derive_runtime_net_auth_key(mac));
+    let mut svc = match derive_runtime_net_auth_key(mac) {
+        Some(k) => target_enterprise::LivedNet::with_auth_key(mac, k),
+        None => target_enterprise::LivedNet::new_unprovisioned(mac),
+    };
 
     // Bounded service window.
     {

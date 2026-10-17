@@ -658,6 +658,7 @@ impl OsShell {
         wal_sector: &[u8; 512],
     ) -> Result<(u64, usize), WalError> {
         if !bytes_eq(&hdr_sector[0..8], b"PRTSSHL1") {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:wal:header-corrupt");
             return Err(WalError::PayloadTooLarge);
         }
         let saved_boots = u64::from_le_bytes([
@@ -677,6 +678,7 @@ impl OsShell {
             hdr_sector[19],
         ]) as usize;
         if cursor > 512 {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:wal:cursor-overflow");
             return Err(WalError::OutOfCapacity);
         }
         let mut expected_seal = [0u8; DURABLE_DIGEST_LEN];

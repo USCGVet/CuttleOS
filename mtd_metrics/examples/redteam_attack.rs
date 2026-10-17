@@ -179,6 +179,14 @@ fn main() -> Result<()> {
         }
     }
 
+    let device_key_path = work_path.join("device_secret_key.bin");
+    if !device_key_path.exists() {
+        use rand::RngCore;
+        let mut key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        std::fs::write(&device_key_path, key)?;
+    }
+
     let qemu = r"C:\Program Files\qemu\qemu-system-x86_64.exe";
     let qemu = if Path::new(qemu).exists() {
         qemu.to_string()
@@ -203,6 +211,7 @@ fn main() -> Result<()> {
         .arg("-device").arg("e1000,netdev=e1")
         .arg("-drive").arg(format!("if=none,id=nvme0,format=raw,file={}", nvm.display()))
         .arg("-device").arg("nvme,drive=nvme0,serial=PROTEUS-NVME-HW")
+        .arg("-fw_cfg").arg(format!("name=opt/proteus_device_key,file={}", device_key_path.display()))
         .arg("-fw_cfg").arg(format!("name=opt/attack.bin,file={}", payload_path.display()))
         .arg("-serial").arg(format!("tcp:127.0.0.1:{},server=on,wait=off", port))
         .arg("-monitor").arg(format!("tcp:127.0.0.1:{},server=on,wait=off", port + 100))

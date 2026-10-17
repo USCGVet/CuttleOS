@@ -595,11 +595,28 @@ pub(crate) fn persist_shell_to_ahci(sh: &mut target_enterprise::OsShell, boots: 
 pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Option<(u64, usize)> {
     let port = AhciHwPort::probe_start();
     let hdr_sec = port.read_sector(SHELL_DISK_LBA);
-    if &hdr_sec[0..8] != b"PRTSSHL1" {
+    let wal_sec = port.read_sector(SHELL_DISK_LBA + 1);
+    let mut all_zero = true;
+    let mut i = 0usize;
+    while i < 512 {
+        if hdr_sec[i] != 0 || wal_sec[i] != 0 {
+            all_zero = false;
+            break;
+        }
+        i += 1;
+    }
+    if all_zero {
         return None;
     }
-    let wal_sec = port.read_sector(SHELL_DISK_LBA + 1);
-    sh.unpack_disk_image(&hdr_sec, &wal_sec).ok()
+    match sh.unpack_disk_image(&hdr_sec, &wal_sec) {
+        Ok(res) => Some(res),
+        Err(_) => {
+            serial_write_str(
+                "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
+            );
+            None
+        }
+    }
 }
 
 /// Live composition proof for `OsShell`: seeds the BSS shell, writes and
@@ -620,6 +637,7 @@ pub(crate) fn banner_shell_compose() {
 
     let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
     let mut out = [0u8; 256];
+    let mut seal_rejected = false;
 
     if boots > 1 {
         if let Some((prev_boots, applied)) = restore_shell_from_ahci(sh) {
@@ -631,6 +649,8 @@ pub(crate) fn banner_shell_compose() {
                 panic!("SHELL resume: cross-boot /var/boot.ok drift");
             }
             serial_write_str("SHELL resume OK\n");
+        } else if sh.audit.len() > 0 {
+            seal_rejected = true;
         }
         *sh = target_enterprise::OsShell::empty();
         sh.seal_key = seal_key;
@@ -715,5 +735,8 @@ pub(crate) fn banner_shell_compose() {
     sh.auth_seq = 0;
 
     serial_write_str("SHELL compose OK tasks=5 files=5 audit=5\n");
+    if seal_rejected {
+        sh.record_net_audit(proteus_contracts::AuditVerdict::Denied, b"shell:wal:seal-mismatch");
+    }
 }
 

@@ -917,6 +917,7 @@ dependencies = [
  "iced-x86",
  "object",
  "proteus-diversifier",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2",

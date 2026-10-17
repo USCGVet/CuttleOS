@@ -137,6 +137,9 @@ pub fn boot_and_capture(
         std::fs::write(&nvme_disk, vec![0u8; 1024 * 1024])
             .context("create nvme_hw.img for NVMe hardware-truth")?;
     }
+    let device_key_file = results_dir.join(factory_builder::DEVICE_SECRET_KEY_FILENAME);
+    let _ = factory_builder::ensure_device_secret_key(&device_key_file)
+        .context("ensure 32-byte CSPRNG device secret key for diversity_demo")?;
     let mut qproc = Command::new(&qemu)
         .arg("-accel")
         .arg("tcg")
@@ -185,6 +188,12 @@ pub fn boot_and_capture(
         ))
         .arg("-device")
         .arg("nvme,drive=nvme0,serial=PROTEUS-NVME-HW")
+        .arg("-fw_cfg")
+        .arg(format!(
+            "name={},file={}",
+            factory_builder::FW_CFG_DEVICE_KEY_NAME,
+            device_key_file.display()
+        ))
         .arg("-serial")
         .arg(format!("file:{}", serial_log.display()))
         .arg("-display")

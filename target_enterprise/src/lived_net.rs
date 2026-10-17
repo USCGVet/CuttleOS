@@ -40,11 +40,9 @@ pub const MAX_REPLIES: usize = 3;
 /// Scratch for an in-progress HTTP request (one TCB).
 const HTTP_BUF: usize = 1024;
 /// Deterministic 256-bit HMAC-SHA256 fixture key used only by in-memory unit
-/// tests (`LivedNet::new`). The live kernel (`target_enterprise_kernel`) never
-/// references this constant; it provisions a 256-bit secret out-of-band via
-/// QEMU `fw_cfg` (`opt/proteus_device_key`, backed by gitignored
-/// `device_secret_key.bin`) or x86-64 hardware `RDRAND` entropy at boot and
-/// constructs `LivedNet::with_auth_key` directly.
+/// tests (`LivedNet::new`). Limited to `#[cfg(test)]` so production and kernel
+/// code can never fall back to a public constant.
+#[cfg(test)]
 pub const DEFAULT_NET_AUTH_KEY: [u8; 32] = *b"Proteus-Enterprise-NetAuth-Key01";
 
 /// Outgoing Ethernet frames produced by [`LivedNet::handle_frame`].
@@ -103,6 +101,9 @@ pub struct LivedNet {
     pub ip: [u8; 4],
     /// Shared 256-bit HMAC-SHA256 key for authenticated UDP control-plane commands.
     pub auth_key: [u8; 32],
+    /// Whether an out-of-band device secret was provisioned; when `false`, all
+    /// `AUTH` commands are refused unconditionally.
+    pub auth_enabled: bool,
     /// Highest accepted monotonic sequence number for anti-replay protection.
     pub last_auth_seq: u64,
     tcb: Tcb,
@@ -113,7 +114,8 @@ pub struct LivedNet {
 }
 
 impl LivedNet {
-    /// Bind `mac` / `GUEST_IP` and listen on [`HTTP_PORT`].
+    /// Test-only constructor binding `mac` / `GUEST_IP` with [`DEFAULT_NET_AUTH_KEY`].
+    #[cfg(test)]
     pub fn new(mac: [u8; 6]) -> Self {
         Self::with_auth_key(mac, DEFAULT_NET_AUTH_KEY)
     }
@@ -124,6 +126,24 @@ impl LivedNet {
             mac,
             ip: GUEST_IP,
             auth_key,
+            auth_enabled: true,
+            last_auth_seq: 0,
+            tcb: Tcb::listen(GUEST_IP, HTTP_PORT, 65535),
+            ticks: 1,
+            ip_ident: 1,
+            http_buf: [0u8; HTTP_BUF],
+            http_len: 0,
+        }
+    }
+
+    /// Bind `mac` / `GUEST_IP` when no out-of-band device secret key was
+    /// provisioned (`auth_enabled = false`), refusing all `AUTH` commands.
+    pub fn new_unprovisioned(mac: [u8; 6]) -> Self {
+        Self {
+            mac,
+            ip: GUEST_IP,
+            auth_key: [0u8; 32],
+            auth_enabled: false,
             last_auth_seq: 0,
             tcb: Tcb::listen(GUEST_IP, HTTP_PORT, 65535),
             ticks: 1,
@@ -422,6 +442,13 @@ impl LivedNet {
         sh: &mut crate::shell::OsShell,
         body: &mut [u8],
     ) -> usize {
+        if !self.auth_enabled {
+            sh.record_net_audit(AuditVerdict::Denied, b"net:udp:unprovisioned");
+            return copy_msg(
+                b"error: EACCES (device key not provisioned; AUTH disabled)\n",
+                body,
+            );
+        }
         let (seq_tok, after_seq) = split_ws(rest);
         let (hmac_tok, cmd_raw) = split_ws(after_seq);
         let cmd = trim_ws(cmd_raw);
@@ -1192,5 +1219,42 @@ mod tests {
         // Blocked CIDR 192.168.99.0/24 remains blocked at the wire boundary on Boot 2!
         let blocked_out2 = send_udp(&mut net2, &mut sh2, [192, 168, 99, 42], b"CMD uname");
         assert_eq!(blocked_out2.len(), 0);
+    }
+
+    #[test]
+    fn unprovisioned_lived_net_refuses_all_auth_commands() {
+        let mut net = LivedNet::new_unprovisioned(MAC);
+        let mut sh = crate::shell::OsShell::new();
+        let cmd = b"write /var/pwned no";
+        let mut tag = [0u8; 32];
+        LivedNet::compute_auth_tag(&[0u8; 32], b"1", cmd, &mut tag);
+        let mut auth_pkt = [0u8; 160];
+        let mut pos = 0usize;
+        pos += copy_msg(b"AUTH 1 ", &mut auth_pkt[pos..]);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for &b in &tag {
+            auth_pkt[pos] = HEX[(b >> 4) as usize];
+            auth_pkt[pos + 1] = HEX[(b & 0x0F) as usize];
+            pos += 2;
+        }
+        pos += copy_msg(b" ", &mut auth_pkt[pos..]);
+        pos += copy_msg(cmd, &mut auth_pkt[pos..]);
+
+        let udp_len = 8 + pos;
+        let mut udp = [0u8; 256];
+        udp[0..2].copy_from_slice(&40000u16.to_be_bytes());
+        udp[2..4].copy_from_slice(&UDP_STATUS_PORT.to_be_bytes());
+        udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        udp[8..udp_len].copy_from_slice(&auth_pkt[..pos]);
+        let uc = crate::net::udp_checksum(PEER_IP, GUEST_IP, &udp[..udp_len]);
+        udp[6..8].copy_from_slice(&uc.to_be_bytes());
+        let (frame, flen) = eth_ip(IP_PROTO_UDP, PEER_IP, GUEST_IP, &udp[..udp_len]);
+        let mut out = ReplySet::new();
+        net.handle_frame_with_shell(&frame[..flen], 5, &mut sh, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            &out.get(0).unwrap()[42..],
+            b"error: EACCES (device key not provisioned; AUTH disabled)\n"
+        );
     }
 }

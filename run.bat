@@ -94,6 +94,7 @@ echo        Exit:        close the QEMU window or Ctrl+C in this cmd
 echo ============================================================================
 "%QEMU%" ^
     -drive format=raw,file="%BIOS_IMG%" ^
+    -fw_cfg name=opt/proteus_device_key,file="%ROOT%\device_secret_key.bin" ^
     -chardev stdio,id=ch0,logfile="%SERIAL_LOG%" ^
     -serial chardev:ch0 ^
     -no-reboot ^

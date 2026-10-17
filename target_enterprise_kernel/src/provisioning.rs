@@ -20,8 +20,8 @@ pub(crate) use crate::*;
 /// QEMU `fw_cfg` selector path carrying the 32-byte CSPRNG device master key.
 pub(crate) const FW_CFG_DEVICE_KEY_PATH: &str = "opt/proteus_device_key";
 
-/// Cached 256-bit device master key resolved once on first use during boot.
-static PROVISIONED_MASTER_KEY: spin::Mutex<Option<[u8; 32]>> = spin::Mutex::new(None);
+/// Cached `(master_key, is_fw_cfg_provisioned)` resolved once on first use during boot.
+static PROVISIONED_MASTER_KEY: spin::Mutex<Option<([u8; 32], bool)>> = spin::Mutex::new(None);
 
 /// Attempt to read a 32-byte out-of-band device secret key from QEMU `fw_cfg`
 /// (`opt/proteus_device_key`). Returns `None` if the entry is absent, shorter
@@ -54,16 +54,45 @@ fn read_fw_cfg_device_key() -> Option<[u8; 32]> {
     }
 }
 
+/// Read CMOS RTC registers (seconds, minutes, hours, day, month, year) via
+/// ports `0x70`/`0x71` and the 8254 PIT channel-0 counter via ports `0x43`/`0x40`.
+fn read_cmos_and_pit_word(round: u64) -> u64 {
+    const CMOS_REGS: [u8; 6] = [0x00, 0x02, 0x04, 0x07, 0x08, 0x09];
+    let mut acc: u64 = 0;
+    let mut i = 0usize;
+    while i < CMOS_REGS.len() {
+        let reg = CMOS_REGS[(i + (round as usize)) % CMOS_REGS.len()];
+        // SAFETY: Running at CPL=0; port 0x70 is the standard MC146818 CMOS
+        // index register (bit 7 = 0 preserves NMI state) and port 0x71 is the
+        // read-only RTC data port. Neither aliases memory.
+        let val = unsafe {
+            outb(0x70, reg & 0x7F);
+            inb(0x71)
+        };
+        acc = (acc << 8) | (val as u64);
+        i += 1;
+    }
+    // SAFETY: Running at CPL=0; writing 0x00 to PIT command port 0x43 latches
+    // channel 0's current 16-bit down-counter without altering its mode, and
+    // two sequential reads from port 0x40 read low/high counter bytes.
+    let pit: u16 = unsafe {
+        outb(0x43, 0x00);
+        let lo = inb(0x40) as u16;
+        let hi = inb(0x40) as u16;
+        (hi << 8) | lo
+    };
+    (acc << 16) ^ (pit as u64)
+}
+
 /// Read a 64-bit hardware random word via `rdrand` if CPUID.01H:ECX[30]
-/// advertises `RDRAND` support, falling back to `rdtsc` mixed with CMOS/PIT
-/// jitter if the CPU/emulator does not implement `rdrand`.
+/// advertises `RDRAND` support, falling back to `rdtsc` mixed with CMOS RTC
+/// registers and the 8254 PIT counter if the CPU/emulator does not implement `rdrand`.
 fn read_hw_entropy_u64(round: u64) -> u64 {
     let has_rdrand: bool = {
         let ecx: u32;
         // SAFETY: `cpuid` with leaf EAX=1 is unconditionally supported on all
-        // x86_64 processors; `rbx` is preserved by LLVM when not named as an
-        // output operand, and `nomem, nostack` holds because `cpuid` only
-        // mutates general-purpose registers EAX/EBX/ECX/EDX.
+        // x86_64 processors; `rbx` is preserved by push/pop inside the block,
+        // and `nomem` holds because only general-purpose registers are mutated.
         unsafe {
             core::arch::asm!(
                 "push rbx",
@@ -103,6 +132,7 @@ fn read_hw_entropy_u64(round: u64) -> u64 {
         }
     }
 
+    let cmos_pit = read_cmos_and_pit_word(round);
     let tsc_lo: u32;
     let tsc_hi: u32;
     // SAFETY: `rdtsc` is always permitted in ring 0 (CR4.TSD is irrelevant at
@@ -118,6 +148,7 @@ fn read_hw_entropy_u64(round: u64) -> u64 {
     }
     let tsc = ((tsc_hi as u64) << 32) | (tsc_lo as u64);
     tsc.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ cmos_pit.wrapping_mul(0xD6E8_FEB8_6659_FD93)
         ^ round.wrapping_mul(0xBF58_476D_1CE4_E5B9)
 }
 
@@ -143,33 +174,37 @@ fn generate_hw_entropy_master_key() -> [u8; 32] {
     out
 }
 
-/// Return the 256-bit per-device master secret key, reading it once from the
-/// out-of-band QEMU `fw_cfg` provisioning channel (`opt/proteus_device_key`)
-/// or minting a hardware-entropy key via `RDRAND`/`RDTSC` on unprovisioned
-/// boots.
-pub(crate) fn device_master_key() -> [u8; 32] {
+/// Resolve and return `(master_key, is_fw_cfg_provisioned)`.
+fn device_master_key_state() -> ([u8; 32], bool) {
     let mut guard = PROVISIONED_MASTER_KEY.lock();
-    if let Some(k) = *guard {
-        return k;
+    if let Some(state) = *guard {
+        return state;
     }
-    let k = match read_fw_cfg_device_key() {
-        Some(provisioned) => provisioned,
-        None => generate_hw_entropy_master_key(),
+    let state = match read_fw_cfg_device_key() {
+        Some(provisioned) => (provisioned, true),
+        None => (generate_hw_entropy_master_key(), false),
     };
-    *guard = Some(k);
-    k
+    *guard = Some(state);
+    state
 }
 
 /// Derive the 256-bit `HMAC-SHA256` network control-plane key for `mac` from
-/// the out-of-band provisioned device master key.
-pub(crate) fn derive_runtime_net_auth_key(mac: [u8; 6]) -> [u8; 32] {
-    let master = device_master_key();
-    target_enterprise::lived_net::LivedNet::derive_node_key(&master, mac)
+/// the out-of-band provisioned `fw_cfg` device master key. Returns `None` when
+/// no key was provisioned via `fw_cfg` so the network service refuses
+/// authenticated commands entirely on unprovisioned boots.
+pub(crate) fn derive_runtime_net_auth_key(mac: [u8; 6]) -> Option<[u8; 32]> {
+    let (master, provisioned) = device_master_key_state();
+    if provisioned {
+        Some(target_enterprise::lived_net::LivedNet::derive_node_key(&master, mac))
+    } else {
+        None
+    }
 }
 
 /// Derive the 256-bit `HMAC-SHA256` durable-state seal key from the
-/// out-of-band provisioned device master key.
+/// out-of-band provisioned device master key (or the boot-ephemeral hardware
+/// key on unprovisioned boots).
 pub(crate) fn derive_runtime_seal_key() -> [u8; 32] {
-    let master = device_master_key();
+    let (master, _) = device_master_key_state();
     target_enterprise::durable_seal::derive_seal_key(&master, b"proteus-ahci-wal-seal-v1")
 }

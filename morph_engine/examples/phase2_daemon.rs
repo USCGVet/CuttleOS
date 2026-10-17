@@ -61,6 +61,8 @@ fn spawn_qemu(img: &Path, work: &Path, serial_log: &Path) -> Result<std::process
     if !ahd.exists() {
         fs::write(&ahd, vec![0u8; 1 << 20])?;
     }
+    let key_path = work.join("device_secret_key.bin");
+    let _ = proteus_morph_engine::durable_seal::load_or_generate_device_seal_key(&key_path)?;
     let qemu = r"C:\Program Files\qemu\qemu-system-x86_64.exe";
     let qemu = if Path::new(qemu).exists() { qemu.to_string() } else { "qemu-system-x86_64".to_string() };
     let child = Command::new(&qemu)
@@ -81,6 +83,7 @@ fn spawn_qemu(img: &Path, work: &Path, serial_log: &Path) -> Result<std::process
         .arg("-device").arg("e1000,netdev=e1")
         .arg("-drive").arg(format!("if=none,id=nvme0,format=raw,file={}", work.join("nvme0.img").display()))
         .arg("-device").arg("nvme,drive=nvme0,serial=PROTEUS-NVME-HW")
+        .arg("-fw_cfg").arg(format!("name=opt/proteus_device_key,file={}", key_path.display()))
         .arg("-serial").arg(format!("file:{}", serial_log.display()))
         .arg("-display").arg("none")
         .arg("-no-reboot")
