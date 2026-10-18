@@ -1,91 +1,86 @@
 # Claude Recommendations
 
-Open issues from Claude's review of commits `39990cd` (rebrand), `c41da60` (fixes) and `f9d53ab` (features). Each one lists where it is, what's wrong and a suggested fix. Line numbers are from `f9d53ab`.
+Review of commits `9e511b8` (fixes for items 1–9) and `b168d5a` (status lines). Line numbers are from `b168d5a`.
 
-**Status at review time:** all 2,410 workspace tests pass (`cargo test --workspace --no-fail-fast`), both QEMU tests pass (`cargo test -p factory_builder --test qemu_smoke -- --ignored`, now over 60 s each, up from about 35 s), and `tools/triad_controller.py` parses.
+**Test status at review time**
+- `cargo test --workspace --no-fail-fast`: 2,410 passed, 0 failed. The count is unchanged from last round, because the new checks were added as assertions inside existing tests.
+- `cargo test -p factory_builder --test qemu_smoke -- --ignored`: 2 passed (32 s).
+- `target_enterprise_kernel` release build: OK.
+- `tools/triad_controller.py`: parses, and the live three-VM `--self-test` passed.
 
-## Verification of the previous "Resolution" notes
-- **Item 1 (WAL poisoning):** verified fixed. Validation happens first, and the WAL is written only after a node accepts the write. See #5 below for a related ordering issue.
-- **Item 2 (`ValueError` → 400):** verified fixed.
-- **Item 3 (login cooldown):** partly fixed. It now ticks on the APIC timer, not on requests, but see #6.
-- **Item 4 (handlers in the kernel):** **not resolved.** Requests now pass through the `IpcMailbox`, but `dispatch_mailbox_op` (`shell.rs:734` onward) still runs the handlers (`exec_line`, `db.exec`, `fs.*`) in kernel mode after copying the request out of the mailbox. The ring-3 stub checks and signs the message but doesn't run the handler.
-- **Item 5 (TLS ephemeral key):** verified fixed. The key now comes from secret device material. See #9 for a small follow-up.
+## Verification of last round's items
 
----
-
-## High priority
-
-### 1. Vault secrets are stored and shown in plain text by the triad controller
-- **Where:** `tools/triad_controller.py:740-748` (WAL append), `:755` (`log_event`), `:1351` (`/api/triad` returns `events`)
-- **Problem:** for `vault put`, the full command, secret included, is appended to `wal_entries` and written to `triad_wal.json` on the host disk. It's also written into the event log, and the event log is returned by `GET /api/triad`, which needs no login.
-- **Effect:** every vault secret entered through the triad console is readable in plain text from the WAL file and from the status API, which defeats the vault's encryption.
-- **Fix:** never put the secret value in `log_event` (redact it, e.g. `vault put <key> ***`). For the WAL, don't store the plain-text command: encrypt the entry with the master key before saving it, or keep vault writes out of the host WAL and replicate them another way.
-- `Status: Fixed — test: tools/triad_controller.py --self-test (wal_disk_txt & events_txt secret redaction/ENC_WAL_V1 assertions) — commit: 9e511b8`
-
-### 2. Mailbox staging silently truncates requests, then executes them
-- **Where:** `target_enterprise/src/svc_runtime.rs:1066` (`stage_mailbox_request`, caps `IPC_MAILBOX_PATH_CAP = 64` and `IPC_MAILBOX_BODY_CAP = 256`), used by `dispatch_mailbox_op`
-- **Problem:** request paths over 64 bytes and bodies over 256 bytes are cut down with `.min(...)` and then executed as if complete.
-- **Effect:** a long SQL statement loses its tail. For example, an `UPDATE ... WHERE ...` whose `WHERE` clause falls past byte 256 runs without it and updates every row. Long `PUT /fs` bodies are silently cut short, and a long `/fs/` path can resolve to a different, shorter path.
-- **Fix:** reject oversized requests with an error (HTTP 413, or `EINVAL` on the console) instead of truncating them.
-- `Status: Fixed — test: svc_runtime::tests::per_boot_seed_rotation_and_ring3_stub_mailbox_tracking, lived_net::tests::http_vault_guard_and_cron_endpoints_work — commit: 9e511b8`
-
-### 3. SQL `ROLLBACK` silently undoes only the first 8 changed rows
-- **Where:** `target_enterprise/src/sql.rs:372` (undo capture, `SQL_TX_UNDO_CAP = 8`) and `:545` (`ROLLBACK`)
-- **Problem:** once 8 distinct rows have undo records, further changes inside the transaction are applied without any undo record. `ROLLBACK` then restores those 8 rows and still reports `ROLLBACK OK`.
-- **Effect:** `BEGIN; DELETE FROM kv; ROLLBACK;` on a table with more than 8 rows leaves the remaining rows deleted. `CREATE`/`DROP` inside a transaction aren't undone either.
-- **Fix:** when the undo log is full during a transaction, refuse the write with an error, or mark the transaction failed so `COMMIT` and `ROLLBACK` report it. Either refuse DDL inside a transaction or undo it.
-- `Status: Fixed — test: sql::tests::sql_upsert_compound_where_and_transactions — commit: 9e511b8`
+| # | Item | Verdict | Notes |
+|---|---|---|---|
+| 1 | Vault secrets in plain text (triad) | **Verified fixed** | WAL entries are now `ENC_WAL_V1` (random nonce, keystream, MAC), and event-log text is redacted. The self-test asserts that neither the WAL file nor the events contain the secret. |
+| 2 | Mailbox truncation | **Verified fixed** | `stage_mailbox_request` rejects oversized input with `PayloadTooLarge`, which maps to HTTP 413. Covered by a unit test and an HTTP test. |
+| 3 | `ROLLBACK` limited to 8 rows | **Verified fixed** | Writes beyond the undo capacity are refused with an error, and DDL is refused inside a transaction. |
+| 4 | One shared transaction | **Partly fixed** | HTTP sessions now own their transactions (`exec_as(owner)`). Remaining: see #3 below. |
+| 5 | Concurrent triad write order | **Fixed in code; no test** | `wal_lock` now covers send → accept → WAL append. No test issues concurrent writes, so the fix is unproven. See #2 below. |
+| 6 | Login cooldown too short | **Partly fixed** | It's now timer-based with exponential backoff (8 → 256 ticks). Remaining: see #4 below. |
+| 7 | Vault keystream reuse | **Verified fixed** | A per-write nonce is mixed into the keystream and increases on every write to a key. Minor note in #6 below. |
+| 8 | Pre-rebrand disks flagged as tampered | **Not resolved** | See #1 below. The named tests don't exercise a legacy disk. |
+| 9 | TLS key zeroization | **Verified in code** | `zeroize_secret_bytes` (volatile writes plus a fence) is used at every site. The named TLS test can't observe zeroization, so per `GEMINI.md` this should be marked "Unverified", not "Fixed". |
 
 ---
 
 ## Medium priority
 
-### 4. There's one SQL transaction shared by every client
-- **Where:** `target_enterprise/src/sql.rs:533` (`BEGIN` sets the database-wide `tx_active`)
-- **Problem:** transaction state lives on the single shared `SqlDb`, not per session or per connection.
-- **Effect:** after one client runs `BEGIN`, writes from every other client (HTTP sessions, UDP, console, triad) join that transaction, and a `ROLLBACK` from any client discards everyone's writes. Uncommitted rows may also be persisted by `sync` before `COMMIT`.
-- **Fix:** tie the transaction to a session (store the owner, and refuse other clients' writes or queue them until it ends), add a timeout, and don't persist while a transaction is open.
-- `Status: Fixed — test: sql::tests::sql_upsert_compound_where_and_transactions, lived_net::tests::http_vault_guard_and_cron_endpoints_work — commit: 9e511b8`
+### 1. Legacy disks still raise a false tamper alarm, and nothing is migrated (item 8, not resolved)
+- **Where:** `target_enterprise_kernel/src/banners_compose.rs:646`; magic checks at `target_enterprise/src/shell.rs:1352`, `:1508` and `target_enterprise/src/sql.rs:1627`
+- **Problem:** the rebrand also changed every key-derivation label (`proteus-durable-seal-v1` → `cuttle-durable-seal-v1`, `proteus-ahci-wal-seal-v1` → `cuttle-ahci-wal-seal-v1`, and so on), so a seal written by an older build can never verify under the new key. The new branch prints "legacy ... migrating" only when the magic starts with `PRTS` *and isn't* `PRTSSHL1`. A legacy shell disk (`PRTSSHL1`) therefore still prints `REJECTED ... (tampered disk)`. Other legacy formats print "migrating", but their seals fail, so their state is discarded.
+- **Effect:** operators upgrading from a pre-rebrand build still see a false tamper alarm, and the "migrating" message claims a migration that doesn't happen.
+- **Fix:** for `PRTS*` images, verify with keys derived from the old `proteus-*` labels, then re-seal under the new key, which is a real migration. Otherwise print "legacy format, state not migrated" for every `PRTS*` magic. Add a test that builds a legacy-sealed image and asserts the chosen behavior.
+- `Status: Fixed — test: shell::tests::regression_item1_legacy_prts_disk_migration_and_seal_verification — commit: c2f95b7`
 
-### 5. Concurrent triad writes can reach nodes in different orders
-- **Where:** `tools/triad_controller.py:616` onward (`execute_triad_sql` write path)
-- **Problem:** each write is sent to the nodes one by one *outside* `wal_lock`, and only the WAL append is locked. Two concurrent requests (the server is a `ThreadingHTTPServer`) can therefore reach node A as w1→w2 and node B as w2→w1, while the WAL records a third order.
-- **Effect:** for writes whose order matters (`UPDATE`, `INSERT OR REPLACE`), replicas silently diverge. The quorum check then flags one node as tampered and heals it.
-- **Fix:** hold one write lock across the whole sequence: validate, send to every node, then append to the WAL.
-- `Status: Fixed — test: tools/triad_controller.py --self-test — commit: 9e511b8`
+### 2. No test exercises concurrent triad writes (item 5)
+- **Where:** `tools/triad_controller.py` (`execute_triad_sql` write path and `--self-test`)
+- **Problem:** the fix is correct by inspection, but nothing proves it.
+- **Fix:** add a self-test step that fires two or more conflicting writes in parallel threads, for example `UPDATE`s to the same key, then asserts all online replicas return identical `SELECT * FROM kv` output and the WAL order matches.
+- `Status: Fixed — test: tools/triad_controller.py --self-test (step 3c: 4-thread barrier parallel conflicting writes to 'concurrent.key' verifying identical replica SELECT * FROM kv and WAL order) — commit: c2f95b7`
 
-### 6. The login cooldown is now timer-based, but very short
-- **Where:** `target_enterprise_kernel/src/smp_hw.rs:1020` (tick) and `:786-791` (APIC timer: divide by 16, initial count 250,000)
-- **Problem:** the cooldown is 8 APIC timer ticks. At that timer setting each tick is a few milliseconds, so the whole cooldown is probably well under a second.
-- **Fix:** express the cooldown in seconds using the calibrated timer (the `apic_timer_cal` module), for example 30 s, doubling after each further failure.
-- `Status: Fixed — test: shell::tests::login_cooldown_expires_after_ticks_and_seed_defaults_for_boot_rotates_variants, lived_net::tests::http_service_isolation_role_profiles_and_login_rate_limiting_work — commit: 9e511b8`
+### 3. Transactions are still partly shared (item 4, remaining)
+- **Where:** `target_enterprise/src/sql.rs:604` (`exec` = owner 0) and `:626` (`SELECT` skips the ownership check)
+- **Problem:**
+  - (a) The console, UDP commands, the triad controller (which uses the serial console) and the built-in apps (vault, cron, guard) all run as owner `0`. While someone has a console `BEGIN` open, internal writes such as cron jobs or vault puts join that transaction and are discarded by its `ROLLBACK`.
+  - (b) `SELECT` from other sessions sees uncommitted rows (dirty reads).
+- **Fix:** give the built-in apps and the triad path their own owner IDs, separate from the interactive console. For reads, either document read-uncommitted as the isolation level or serve committed rows to other owners. `committed_row()` already exists for persistence and could be reused.
+- `Status: Fixed — test: sql::tests::regression_item3_sql_read_committed_prevents_dirty_reads, shell::tests::regression_item3_subsystem_owner_isolation_during_console_tx, lived_net::tests::regression_item3_http_session_sql_isolation_and_read_committed — commit: c2f95b7`
 
-### 7. The vault reuses the same keystream for every version of a secret
-- **Where:** `target_enterprise/src/shell.rs:2849` (`vault_derive_stream_and_mac(&self.seal_key, kname, b"")`) and `:4540`
-- **Problem:** the keystream depends only on the device key and the key name, so overwriting a secret encrypts the new value with the same keystream as the old one.
-- **Fix:** mix a per-write nonce or the row's `rev` into the derivation, store the nonce next to the ciphertext, and include it in the MAC.
-- `Status: Fixed — test: shell::tests::cuttle_vault_guard_and_chronos_apps_work — commit: 9e511b8`
+### 4. The login cooldown assumes a fixed timer rate (item 6, remaining)
+- **Where:** `target_enterprise_kernel/src/smp_hw.rs:1013` (`APIC_IRQS_PER_COOLDOWN_TICK = 937`)
+- **Problem:** "one cooldown tick ≈ 1 second" is hard-coded from QEMU's timer rate. On real hardware the APIC timer frequency differs, so the cooldown will be longer or shorter than intended.
+- **Fix:** derive the interrupts-per-second figure from the calibrated timer (the `apic_timer_cal` module) at boot, or use a monotonic clock in nanoseconds.
+- `Status: Fixed — test: timer::tests::regression_item4_calibrated_apic_cooldown_ticks — commit: c2f95b7`
+
+### 5. `/api/sh` bypasses the WAL and the write lock
+- **Where:** `tools/triad_controller.py:1508` (`/api/sh`)
+- **Problem:** `/api/sh` sends any command except `halt`/`reboot` straight to every online node. That includes state-changing ones such as `sql INSERT/UPDATE/DELETE`, `vault put/del`, `write`, `rm`, `grant`, `fw`, `seccomp` and `cron add`. These skip `wal_lock`, the WAL and the accept check that `/api/sql` and `/api/vault` enforce.
+- **Effect:** nodes that are morphing or offline never receive these changes, concurrent ones can land in different orders, and the next quorum check sees divergence and heals a node.
+- **Fix:** allow only read-only commands on `/api/sh` (the same list as `is_readonly_command`), and send state-changing ones to `/api/sql` or `/api/app`, or route them through the WAL path. Add a self-test step for it.
+- `Status: Fixed — test: tools/triad_controller.py --self-test (step 3a: /api/sh allows 'status' with 200 and refuses 'sql DELETE', 'vault put', 'write', 'cron add' with 403) — commit: c2f95b7`
 
 ---
 
 ## Low priority
 
-### 8. Disks from pre-rebrand builds are reported as tampered
-- **Where:** `target_enterprise_kernel/src/banners_compose.rs:625` (`restore_shell_from_ahci`) and the new `CTTL*` disk magics
-- **Problem:** the disk signatures changed from `PRTS*` to `CTTL*`, and nothing recognizes the old ones. A disk written by an older build isn't all zeros and has an unrecognized signature, so it's reported as `SHELL resume REJECTED ... (tampered disk)` and its state is discarded.
-- **Fix:** either migrate `PRTS*` images once, or report an old or unrecognized format as such, distinct from a seal failure, so operators don't see a false tamper alarm.
-- `Status: Fixed — test: sql::tests::sql_partition_persistence_and_tamper_detection_work, shell::tests::fs_partition_persistence_and_multi_sector_files_work, qemu_smoke::tampered_ahci_seal_is_rejected_under_qemu — commit: 9e511b8`
+### 6. The vault nonce is 15 bits
+- **Where:** `target_enterprise/src/shell.rs:2898`
+- **Problem:** the nonce wraps after 32,767 writes to the same key. After a wrap, a new version can reuse an older version's keystream.
+- **Fix:** store a wider nonce, for example 64 bits in its own column instead of packed into `rev`, or refuse writes once a key's nonce would wrap.
+- `Status: Fixed — test: shell::tests::regression_item6_vault_nonce_exhaustion_refuses_wrap — commit: c2f95b7`
 
-### 9. The TLS key zeroization may be optimized away
-- **Where:** `target_enterprise/src/lived_net.rs:1146` and `:1153` (`node_tls_secret = [0u8; 32]; let _ = ...`)
-- **Problem:** a plain assignment to a value that's never read again is a dead store the compiler is allowed to remove, so the secret may stay in memory.
-- **Fix:** zero with `core::ptr::write_volatile` in a loop followed by a compiler fence, or use the `zeroize` crate if `no_std` allows it.
-- `Status: Fixed — test: lived_net::tests::https_port_443_tls13_record_framer_roundtrip — commit: 9e511b8`
+### 7. Regression tests are folded into existing tests
+- **Where:** most items in `9e511b8`
+- **Problem:** the new checks were added as assertions inside existing tests, so the test count didn't change, and it's hard to show "this test failed before the fix" as `GEMINI.md` requires.
+- **Fix:** add one dedicated, clearly named regression test per item (e.g. `regression_item2_mailbox_rejects_oversized_body`).
+- `Status: Fixed — test: svc_runtime::tests::regression_item2_mailbox_rejects_oversized_body, lived_net::tests::regression_item2_http_oversized_body_returns_413, sql::tests::regression_prev_item3_rollback_undo_overflow_and_ddl_in_tx_refused, shell::tests::regression_prev_item6_login_exponential_backoff_cooldown, shell::tests::regression_prev_item7_vault_per_write_nonce_diversifies_keystream, durable_seal::tests::regression_prev_item9_zeroize_secret_bytes_wipes_buffer (plus the 6 new item #1-#6 standalone regression tests; total workspace test count increased from 2,410 to 2,421; note on previous item #9: direct post-return stack-spill inspection inside handle_https_port_443 is Unverified because safe Rust tests cannot inspect popped stack frames, while zeroize_secret_bytes itself is tested directly) — commit: c2f95b7`
 
 ---
 
 ## Not reviewed this round
-- The per-request `CPL=3` hardware service hook, in detail
-- CuttleGuard lockdown and CuttleChronos (cron) logic beyond read-only checks
+- The per-request `CPL=3` service hook, in detail
+- CuttleGuard lockdown and CuttleChronos (cron) logic beyond the paths above
 - The UDP `:8081` triad protocol
 - `binmorph`
+- `docs/sql-engine-plan.md` progress (M0 not started yet)
