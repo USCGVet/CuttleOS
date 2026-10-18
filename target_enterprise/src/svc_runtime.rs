@@ -442,6 +442,10 @@ impl IpcMessage {
 /// Byte length of each service's diversified x86-64 `CPL=3` machine-code stub
 /// (`mov eax, cs; mov rsi, rax; mov rax, [rsp-0x20]; mov rdx, rax; xor rdx, salt32; mov [rsp-0x18], rdx; mov edi, 2; int 0x80`).
 pub const SVC_RING3_STUB_LEN: usize = 32;
+/// Maximum byte length of a staged request path inside [`IpcMailbox`].
+pub const IPC_MAILBOX_PATH_CAP: usize = 64;
+/// Maximum byte length of a staged request body inside [`IpcMailbox`].
+pub const IPC_MAILBOX_BODY_CAP: usize = 256;
 
 /// Per-service IPC & hardware execution mailbox.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -450,6 +454,10 @@ pub struct IpcMailbox {
     pub req_seq: u64,
     /// Last [`IpcOp`] discriminant delivered to this service (`0` when idle).
     pub last_op: u8,
+    /// Last HTTP/IPC status code produced by this service's mailbox handler (`200`, `201`, `403`, `404`, `500`).
+    pub last_status: u16,
+    /// Last response payload byte length produced by this service's mailbox handler.
+    pub last_resp_len: u16,
     /// Per-service 32-bit mailbox canary verified across hardware `CPL=3` mailbox transitions.
     pub canary: u32,
     /// Last 64-bit response tag returned by this service's ELF64 handler.
@@ -458,6 +466,14 @@ pub struct IpcMailbox {
     pub pml4_entries: usize,
     /// Count of hardware Ring-3 (`CPL=3`, `CS=0x23`) executions completed via `iretq` -> `int 0x80`.
     pub cpl3_runs: u64,
+    /// Staged request path byte length (`0..=IPC_MAILBOX_PATH_CAP`).
+    pub req_path_len: u8,
+    /// Staged request body byte length (`0..=IPC_MAILBOX_BODY_CAP`).
+    pub req_body_len: u16,
+    /// Staged request path buffer delivered into this service's mailbox.
+    pub req_path: [u8; IPC_MAILBOX_PATH_CAP],
+    /// Staged request body buffer delivered into this service's mailbox.
+    pub req_body: [u8; IPC_MAILBOX_BODY_CAP],
 }
 
 impl IpcMailbox {
@@ -466,10 +482,16 @@ impl IpcMailbox {
         Self {
             req_seq: 0,
             last_op: 0,
+            last_status: 0,
+            last_resp_len: 0,
             canary: 0,
             resp_tag: 0,
             pml4_entries: 0,
             cpl3_runs: 0,
+            req_path_len: 0,
+            req_body_len: 0,
+            req_path: [0u8; IPC_MAILBOX_PATH_CAP],
+            req_body: [0u8; IPC_MAILBOX_BODY_CAP],
         }
     }
 }
@@ -977,6 +999,29 @@ impl ServiceSupervisor {
         Ok(ret)
     }
 
+    /// Stage an incoming request path and body into `svc`'s [`IpcMailbox`] prior to
+    /// or immediately after endpoint mediation so the target service handler reads
+    /// exclusively from its isolated mailbox buffer.
+    pub fn stage_mailbox_request(&mut self, svc: ServiceId, path: &[u8], body: &[u8]) {
+        let mb = &mut self.services[svc.index()].mailbox;
+        let plen = path.len().min(IPC_MAILBOX_PATH_CAP);
+        let blen = body.len().min(IPC_MAILBOX_BODY_CAP);
+        mb.req_path = [0u8; IPC_MAILBOX_PATH_CAP];
+        mb.req_body = [0u8; IPC_MAILBOX_BODY_CAP];
+        mb.req_path[..plen].copy_from_slice(&path[..plen]);
+        mb.req_body[..blen].copy_from_slice(&body[..blen]);
+        mb.req_path_len = plen as u8;
+        mb.req_body_len = blen as u16;
+    }
+
+    /// Record the HTTP/IPC status code and response byte length produced by `svc`'s
+    /// mailbox handler upon completing a dispatched request.
+    pub fn complete_mailbox_response(&mut self, svc: ServiceId, status_code: u16, resp_len: usize) {
+        let mb = &mut self.services[svc.index()].mailbox;
+        mb.last_status = status_code;
+        mb.last_resp_len = resp_len.min(u16::MAX as usize) as u16;
+    }
+
     /// Execute the eBPF instruction stream inside `svc`'s loaded ELF64 `PT_LOAD` segment,
     /// planting the [`StackCanaryImpl`] token directly at `[r10 - 8 .. r10]` inside `ctx.stack`
     /// via a 2-instruction prologue and verifying post-run that the executed program did not
@@ -1040,6 +1085,7 @@ impl ServiceSupervisor {
         }
 
         let mut ctx = BpfContext::new();
+        ctx.regs[1] = slot.mailbox.req_body_len as u64;
         let ret = EBpfImpl::run(&prog[..2 + insn_count], &mut ctx)
             .map_err(|_| ServiceError::SandboxTrap)?;
 

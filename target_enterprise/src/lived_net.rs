@@ -695,19 +695,22 @@ impl LivedNet {
                 sh.record_net_audit(AuditVerdict::Error, b"net:triad:ro-sql");
                 return copy_msg(b"error: EINVAL (TRIAD_PREPARE requires mutating SQL)\n", body);
             }
-            if sh
-                .svc
-                .mediate_endpoint(IpcOp::SqlMutate, true, true, &mut sh.audit)
-                .is_err()
-            {
+            let mut sql_out = [0u8; 192];
+            let Ok((_, slen)) = sh.dispatch_mailbox_op(
+                IpcOp::SqlMutate,
+                false,
+                true,
+                1,
+                b"/triad/prepare",
+                sql,
+                &mut sql_out,
+            ) else {
                 sh.record_net_audit(AuditVerdict::Denied, b"net:triad:role-denied");
                 return copy_msg(
                     b"error: EACCES (svc-sql disabled by node role or policy)\n",
                     body,
                 );
-            }
-            let mut sql_out = [0u8; 192];
-            let slen = sh.db.exec(sql, &mut sql_out);
+            };
             if sql_out[..slen].starts_with(b"error:") {
                 sh.record_net_audit(AuditVerdict::Error, b"net:triad:sql-err");
                 return copy_msg(&sql_out[..slen], body);
@@ -1115,23 +1118,47 @@ impl LivedNet {
             let Some(client_pub) = ch_view.x25519_pub else {
                 return 0;
             };
-            // Derive a fresh per-handshake ephemeral server_random, ephemeral X25519 scalar,
-            // Curve25519 public key (`x25519_basepoint`), and ECDHE shared secret (`x25519_scalarmult`).
+            // Derive a fresh per-handshake secret PRK (`conn_prk`) keyed by the node's private
+            // `self.auth_key` mixed with `sh.seal_key` (never from public constants!), and expand
+            // `ephemeral_random` (`ServerHello.random`) and `ephemeral_scalar` (server X25519 private key)
+            // via domain-separated HKDF labels (`"cuttle-srv-rand"` vs `"cuttle-x25519-sk"`) so
+            // observing `ServerHello.random` on the wire leaks zero bits of `ephemeral_scalar`.
             self.tls_handshake_seq = self.tls_handshake_seq.wrapping_add(1);
-            let mut seed_buf = [0u8; 48];
-            seed_buf[..32].copy_from_slice(&client_pub);
-            seed_buf[32..40].copy_from_slice(&self.tls_handshake_seq.to_le_bytes());
-            seed_buf[40..46].copy_from_slice(&self.mac);
-            seed_buf[46] = idx as u8;
-            seed_buf[47] = (self.ticks & 0xFF) as u8;
+            let seal_material: [u8; 32] = match shell.as_deref() {
+                Some(sh) => sh.seal_key,
+                None => TLS_SERVER_RANDOM,
+            };
+            let mut node_tls_secret = [0u8; 32];
+            hmac_sha256(&self.auth_key, &seal_material, &mut node_tls_secret);
+            let mut ctx_buf = [0u8; 96];
+            ctx_buf[..32].copy_from_slice(&client_pub);
+            if ch_msg.len() >= 38 {
+                ctx_buf[32..64].copy_from_slice(&ch_msg[6..38]);
+            }
+            ctx_buf[64..72].copy_from_slice(&self.tls_handshake_seq.to_le_bytes());
+            ctx_buf[72..80].copy_from_slice(&(self.ticks as u64).to_le_bytes());
+            ctx_buf[80..88].copy_from_slice(&boots.to_le_bytes());
+            ctx_buf[88..94].copy_from_slice(&self.mac);
+            ctx_buf[94] = idx as u8;
+            ctx_buf[95] = if self.auth_enabled { 1 } else { 0 };
+            let mut conn_prk = [0u8; 32];
+            hmac_sha256(&node_tls_secret, &ctx_buf, &mut conn_prk);
+            node_tls_secret = [0u8; 32];
+            let _ = node_tls_secret;
+
             let mut ephemeral_random = [0u8; 32];
-            hmac_sha256(&TLS_SERVER_RANDOM, &seed_buf, &mut ephemeral_random);
+            hkdf_expand_label(&conn_prk, b"cuttle-srv-rand", &client_pub, &mut ephemeral_random);
             let mut ephemeral_scalar = [0u8; 32];
-            hmac_sha256(&TLS_SERVER_PUBKEY, &ephemeral_random, &mut ephemeral_scalar);
+            hkdf_expand_label(&conn_prk, b"cuttle-x25519-sk", &client_pub, &mut ephemeral_scalar);
+            conn_prk = [0u8; 32];
+            let _ = conn_prk;
             let ephemeral_pubkey = x25519_basepoint(&ephemeral_scalar);
 
             let mut shared_secret = [0u8; 32];
-            if !x25519_scalarmult(&ephemeral_scalar, &client_pub, &mut shared_secret) {
+            let ok_ecdh = x25519_scalarmult(&ephemeral_scalar, &client_pub, &mut shared_secret);
+            ephemeral_scalar = [0u8; 32];
+            let _ = ephemeral_scalar;
+            if !ok_ecdh {
                 if let Some(sh) = shell.as_deref_mut() {
                     sh.record_net_audit(AuditVerdict::Denied, b"net:tls:low-order-pub");
                 }
@@ -1250,31 +1277,33 @@ impl LivedNet {
         out: &mut [u8],
     ) -> usize {
         use crate::svc_runtime::IpcOp;
-        use cuttle_contracts::{FS_O_CREATE, FS_O_RDONLY, FS_O_RDWR, FS_O_TRUNC, Filesystem};
 
         let view = match HttpImpl::parse_request(req) {
             Ok(v) => v,
             Err(_) => return 0,
         };
-        let is_login_req = view.method == HttpMethod::Post && view.path == b"/session/login";
-        if !is_login_req {
-            if let Some(sh) = shell.as_deref_mut() {
-                sh.tick_login_cooldown();
-            }
-        }
         let ok_path = view.path == b"/status"
             || view.path == b"/healthz"
             || view.path == b"/";
         if view.method == HttpMethod::Get && ok_path {
+            let mut body = [0u8; 48];
             if let Some(sh) = shell.as_deref_mut() {
-                if let Err(e) = sh
-                    .svc
-                    .mediate_endpoint(IpcOp::HttpGetStatus, true, false, &mut sh.audit)
-                {
-                    return build_service_error_response(e, out);
+                match sh.dispatch_mailbox_op(
+                    IpcOp::HttpGetStatus,
+                    true,
+                    false,
+                    boots,
+                    view.path,
+                    b"",
+                    &mut body,
+                ) {
+                    Ok((status, blen)) => {
+                        return HttpImpl::build_response(status, b"text/plain", &body[..blen], out)
+                            .unwrap_or(0);
+                    }
+                    Err(e) => return build_service_error_response(e, out),
                 }
             }
-            let mut body = [0u8; 48];
             let blen = status_body(boots, &mut body);
             return HttpImpl::build_response(200, b"text/plain", &body[..blen], out).unwrap_or(0);
         }
@@ -1283,7 +1312,7 @@ impl LivedNet {
             return HttpImpl::build_response(404, b"text/plain", b"not found\n", out).unwrap_or(0);
         };
 
-        // 1. Built-in read-only telemetry endpoints (mediated via `svc-http`).
+        // 1. Built-in read-only telemetry endpoints (dispatched via `svc-http` mailbox).
         if view.method == HttpMethod::Get {
             let is_shell_endpoint = view.path == b"/ps"
                 || view.path == b"/smp"
@@ -1301,79 +1330,60 @@ impl LivedNet {
                 || view.path == b"/session"
                 || view.path == b"/triad";
             if is_shell_endpoint {
-                if let Err(e) = sh.svc.mediate_endpoint(
+                let mut sh_body = [0u8; 440];
+                return match sh.dispatch_mailbox_op(
                     IpcOp::HttpGetTelemetry,
                     true,
                     false,
-                    &mut sh.audit,
+                    boots,
+                    view.path,
+                    &view.path[1..],
+                    &mut sh_body,
                 ) {
-                    return build_service_error_response(e, out);
-                }
-                let mut sh_body = [0u8; 440];
-                let slen = sh
-                    .exec_line(&view.path[1..], boots, 0, 0, &mut sh_body)
-                    .bytes_written();
-                return HttpImpl::build_response(200, b"text/plain", &sh_body[..slen], out)
-                    .unwrap_or(0);
+                    Ok((status, slen)) => {
+                        HttpImpl::build_response(status, b"text/plain", &sh_body[..slen], out)
+                            .unwrap_or(0)
+                    }
+                    Err(e) => build_service_error_response(e, out),
+                };
             }
         }
 
-        // 2. Dynamic HTML5 Web Application Dashboard (`GET /app` or `GET /dashboard`, mediated via `svc-http`).
+        // 2. Dynamic HTML5 Web Application Dashboard (`GET /app` or `GET /dashboard`, dispatched via `svc-http` mailbox).
         if view.method == HttpMethod::Get
             && (view.path == b"/app" || view.path == b"/dashboard")
         {
-            let sess_idx = extract_session_token(view.headers_raw)
-                .and_then(|tok| sh.validate_session(tok));
-            if let Err(e) = sh.svc.mediate_endpoint(
+            let tok = extract_session_token(view.headers_raw).unwrap_or(b"");
+            let sess_idx = sh.validate_session(tok);
+            let mut html = [0u8; 1310];
+            return match sh.dispatch_mailbox_op(
                 IpcOp::HttpGetDashboard,
                 true,
                 sess_idx.is_some(),
-                &mut sh.audit,
+                boots,
+                view.path,
+                if sess_idx.is_some() { tok } else { b"" },
+                &mut html,
             ) {
-                return build_service_error_response(e, out);
-            }
-            let mut default_tok: &[u8] = b"";
-            if let Some(si) = sess_idx {
-                default_tok = &sh.sessions[si].token_hex;
-            }
-            let mut html = [0u8; 1310];
-            let mut pos = 0usize;
-            pos += copy_msg(
-                b"<!doctype html><html><head><meta charset=utf-8><title>Cuttle</title><style>body{background:#0b1020;color:#e2e8f0;font:14px monospace}h1{color:#38bdf8}p,pre,input,button{background:#1e293b;color:#38bdf8;border:1px solid #475569;padding:4px}button{background:#0284c7;color:#fff}</style></head><body><h1>Cuttle MTD OS</h1><p>boots=",
-                &mut html[pos..],
-            );
-            pos += dec_u64(boots, &mut html[pos..]);
-            pos += copy_msg(b" files=", &mut html[pos..]);
-            pos += dec_u64(sh.fs.inode_count() as u64, &mut html[pos..]);
-            pos += copy_msg(b" sql_tables=", &mut html[pos..]);
-            pos += dec_u64(sh.db.table_count() as u64, &mut html[pos..]);
-            pos += copy_msg(b" sql_rows=", &mut html[pos..]);
-            pos += dec_u64(sh.db.total_rows() as u64, &mut html[pos..]);
-            pos += copy_msg(b" sessions=", &mut html[pos..]);
-            pos += dec_u64(sh.active_session_count() as u64, &mut html[pos..]);
-            pos += copy_msg(b"</p>", &mut html[pos..]);
-            if let Some(s_idx) = sess_idx {
-                pos += copy_msg(b"<p>session_user=", &mut html[pos..]);
-                pos += copy_msg(sh.sessions[s_idx].user_bytes(), &mut html[pos..]);
-                pos += copy_msg(b" reqs=", &mut html[pos..]);
-                pos += dec_u64(sh.sessions[s_idx].requests as u64, &mut html[pos..]);
-                pos += copy_msg(b"</p>", &mut html[pos..]);
-            }
-            pos += copy_msg(b"<div>SID:<input id=t size=33 value=\"", &mut html[pos..]);
-            pos += copy_msg(default_tok, &mut html[pos..]);
-            pos += copy_msg(
-                b"\"><br>Sh:<input id=c size=22 value=\"status\"><button onclick=\"S(c.value)\">Run</button><button onclick=\"S('smp')\">smp</button><button onclick=\"S('ps')\">ps</button><button onclick=\"S('ls')\">ls</button><button onclick=\"S('audit')\">audit</button><br>SQL:<input id=q size=30 value=\"SELECT * FROM kv\"><button onclick=\"R('/sql?'+encodeURIComponent(q.value))\">Query</button><button onclick=\"P('/sql',q.value)\">Mutate</button><br>ELF:<input id=x size=14 value=\"/bin/fib 10\"><button onclick=\"P('/exec',x.value)\">Exec</button> VFS:<input id=f size=10 value=\"etc/motd\"><button onclick=\"R('/fs/'+f.value)\">Cat</button></div><pre id=o>cuttle&gt; ready</pre><script>R=async(u,b)=>{o.textContent=await(await fetch(u,{method:b?'POST':'GET',headers:{'X-Session-Token':t.value},body:b})).text()};P=R;S=x=>P('/sh',x)</script></body></html>\n",
-                &mut html[pos..],
-            );
-            return HttpImpl::build_response(200, b"text/html", &html[..pos], out).unwrap_or(0);
+                Ok((status, pos)) => {
+                    HttpImpl::build_response(status, b"text/html", &html[..pos], out).unwrap_or(0)
+                }
+                Err(e) => build_service_error_response(e, out),
+            };
         }
 
         // 3. Dynamic Session Management (`/session/login`, `/session/whoami`, `/session/logout`).
         if view.method == HttpMethod::Post && view.path == b"/session/login" {
-            if let Err(e) = sh
-                .svc
-                .mediate_endpoint(IpcOp::SessionLogin, true, false, &mut sh.audit)
-            {
+            let mut login_mb = [0u8; 8];
+            if let Err(e) = sh.dispatch_mailbox_op(
+                IpcOp::SessionLogin,
+                true,
+                false,
+                boots,
+                view.path,
+                b"",
+                &mut login_mb,
+            ) {
                 return build_service_error_response(e, out);
             }
             if !self.auth_enabled {
@@ -1388,7 +1398,6 @@ impl LivedNet {
             }
             if sh.is_login_rate_limited() {
                 sh.record_net_audit(AuditVerdict::Denied, b"net:http:login-ratelimit");
-                sh.tick_login_cooldown();
                 return HttpImpl::build_response(
                     429,
                     b"text/plain",
@@ -1476,64 +1485,47 @@ impl LivedNet {
         }
 
         if view.method == HttpMethod::Get && view.path == b"/session/whoami" {
-            let s_idx = extract_session_token(view.headers_raw)
-                .and_then(|tok| sh.validate_session(tok));
-            if let Err(e) = sh.svc.mediate_endpoint(
+            let tok = extract_session_token(view.headers_raw).unwrap_or(b"");
+            let s_idx = sh.validate_session(tok);
+            let mut body = [0u8; 128];
+            return match sh.dispatch_mailbox_op(
                 IpcOp::SessionWhoami,
                 true,
                 s_idx.is_some(),
-                &mut sh.audit,
+                boots,
+                view.path,
+                tok,
+                &mut body,
             ) {
-                return build_service_error_response(e, out);
-            }
-            let Some(s_idx) = s_idx else {
-                return HttpImpl::build_response(
-                    401,
-                    b"text/plain",
-                    b"error: unauthorized\n",
-                    out,
-                )
-                .unwrap_or(0);
+                Ok((status, bpos)) => {
+                    HttpImpl::build_response(status, b"text/plain", &body[..bpos], out).unwrap_or(0)
+                }
+                Err(e) => build_service_error_response(e, out),
             };
-            let mut body = [0u8; 128];
-            let mut bpos = 0usize;
-            bpos += copy_msg(b"whoami: user=", &mut body[bpos..]);
-            bpos += copy_msg(sh.sessions[s_idx].user_bytes(), &mut body[bpos..]);
-            bpos += copy_msg(b" reqs=", &mut body[bpos..]);
-            bpos += dec_u64(sh.sessions[s_idx].requests as u64, &mut body[bpos..]);
-            bpos += copy_msg(b" sid=", &mut body[bpos..]);
-            bpos += copy_msg(&sh.sessions[s_idx].token_hex, &mut body[bpos..]);
-            bpos += copy_msg(b"\n", &mut body[bpos..]);
-            return HttpImpl::build_response(200, b"text/plain", &body[..bpos], out).unwrap_or(0);
         }
 
         if view.method == HttpMethod::Post && view.path == b"/session/logout" {
-            let tok_opt = extract_session_token(view.headers_raw);
-            let has_valid = tok_opt
-                .and_then(|tok| sh.validate_session(tok))
-                .is_some();
-            if let Err(e) = sh.svc.mediate_endpoint(
+            let tok = extract_session_token(view.headers_raw).unwrap_or(b"");
+            let has_valid = sh.validate_session(tok).is_some();
+            let mut body = [0u8; 64];
+            return match sh.dispatch_mailbox_op(
                 IpcOp::SessionLogout,
                 true,
                 has_valid,
-                &mut sh.audit,
+                boots,
+                view.path,
+                tok,
+                &mut body,
             ) {
-                return build_service_error_response(e, out);
-            }
-            if let Some(tok) = tok_opt {
-                let _ = sh.revoke_session(tok);
-            }
-            return HttpImpl::build_response(
-                200,
-                b"text/plain",
-                b"session: logged out\n",
-                out,
-            )
-            .unwrap_or(0);
+                Ok((status, bpos)) => {
+                    HttpImpl::build_response(status, b"text/plain", &body[..bpos], out).unwrap_or(0)
+                }
+                Err(e) => build_service_error_response(e, out),
+            };
         }
 
         // 4. Embedded Relational SQL Database Server (`GET /sql[?<query>]`, `POST /sql`, `GET /db[?<query>]`, `POST /db`).
-        //    Routed from `svc-http` across `IpcBus` to `svc-sql`.
+        //    Routed from `svc-http` across `IpcBus` to `svc-sql`'s mailbox.
         let is_sql_base = view.path == b"/sql"
             || view.path == b"/db"
             || view.path.starts_with(b"/sql?")
@@ -1577,11 +1569,14 @@ impl LivedNet {
                     }
                     let q_slice = &decoded[..dlen];
                     if !crate::sql::SqlDb::is_readonly_query(q_slice) {
-                        if let Err(e) = sh.svc.mediate_endpoint(
+                        if let Err(e) = sh.dispatch_mailbox_op(
                             IpcOp::SqlMutate,
                             true,
                             false,
-                            &mut sh.audit,
+                            boots,
+                            view.path,
+                            q_slice,
+                            &mut body,
                         ) {
                             if e != crate::svc_runtime::ServiceError::Unauthenticated {
                                 return build_service_error_response(e, out);
@@ -1595,187 +1590,185 @@ impl LivedNet {
                         )
                         .unwrap_or(0);
                     }
-                    if let Err(e) = sh.svc.mediate_endpoint(
+                    return match sh.dispatch_mailbox_op(
                         IpcOp::SqlQuery,
                         true,
                         false,
-                        &mut sh.audit,
+                        boots,
+                        view.path,
+                        q_slice,
+                        &mut body,
                     ) {
-                        return build_service_error_response(e, out);
+                        Ok((status, blen)) => {
+                            HttpImpl::build_response(status, b"text/plain", &body[..blen], out)
+                                .unwrap_or(0)
+                        }
+                        Err(e) => build_service_error_response(e, out),
+                    };
+                }
+                return match sh.dispatch_mailbox_op(
+                    IpcOp::SqlQuery,
+                    true,
+                    false,
+                    boots,
+                    view.path,
+                    b".tables",
+                    &mut body,
+                ) {
+                    Ok((status, blen)) => {
+                        HttpImpl::build_response(status, b"text/plain", &body[..blen], out)
+                            .unwrap_or(0)
                     }
-                    let blen = sh.db.exec(q_slice, &mut body);
-                    return HttpImpl::build_response(200, b"text/plain", &body[..blen], out)
-                        .unwrap_or(0);
-                }
-                if let Err(e) = sh
-                    .svc
-                    .mediate_endpoint(IpcOp::SqlQuery, true, false, &mut sh.audit)
-                {
-                    return build_service_error_response(e, out);
-                }
-                let blen = sh.db.exec(b".tables", &mut body);
-                return HttpImpl::build_response(200, b"text/plain", &body[..blen], out)
-                    .unwrap_or(0);
+                    Err(e) => build_service_error_response(e, out),
+                };
             }
             if view.method == HttpMethod::Post {
                 let is_ro = crate::sql::SqlDb::is_readonly_query(view.body);
-                if is_ro {
-                    if let Err(e) = sh.svc.mediate_endpoint(
-                        IpcOp::SqlQuery,
-                        true,
-                        false,
-                        &mut sh.audit,
-                    ) {
-                        return build_service_error_response(e, out);
-                    }
+                let (op, authed) = if is_ro {
+                    (IpcOp::SqlQuery, false)
                 } else {
-                    let authed = extract_session_token(view.headers_raw)
+                    let ok = extract_session_token(view.headers_raw)
                         .and_then(|tok| sh.validate_session(tok))
                         .is_some();
-                    if let Err(e) = sh.svc.mediate_endpoint(
-                        IpcOp::SqlMutate,
-                        true,
-                        authed,
-                        &mut sh.audit,
-                    ) {
-                        return build_service_error_response(e, out);
-                    }
-                    sh.record_net_audit(AuditVerdict::Allowed, b"net:http:sql-write");
-                }
+                    (IpcOp::SqlMutate, ok)
+                };
                 let mut body = [0u8; 384];
-                let blen = sh.db.exec(view.body, &mut body);
-                return HttpImpl::build_response(200, b"text/plain", &body[..blen], out)
-                    .unwrap_or(0);
+                return match sh.dispatch_mailbox_op(
+                    op,
+                    true,
+                    authed,
+                    boots,
+                    view.path,
+                    view.body,
+                    &mut body,
+                ) {
+                    Ok((status, blen)) => {
+                        HttpImpl::build_response(status, b"text/plain", &body[..blen], out)
+                            .unwrap_or(0)
+                    }
+                    Err(e) => build_service_error_response(e, out),
+                };
             }
         }
 
-        // 5a. Interactive Web Shell Console (`POST /sh`, routed `svc-http -> svc-sh`).
+        // 5a. Interactive Web Shell Console (`POST /sh`, routed `svc-http -> svc-sh` mailbox).
         if view.method == HttpMethod::Post && view.path == b"/sh" {
             let authed = extract_session_token(view.headers_raw)
                 .and_then(|tok| sh.validate_session(tok))
                 .is_some();
-            if let Err(e) = sh
-                .svc
-                .mediate_endpoint(IpcOp::ShellExec, true, authed, &mut sh.audit)
-            {
-                return build_service_error_response(e, out);
-            }
             let mut sh_body = [0u8; 768];
-            let slen = sh
-                .exec_line(trim_ws(view.body), boots, 0, 0, &mut sh_body)
-                .bytes_written();
-            return HttpImpl::build_response(200, b"text/plain", &sh_body[..slen], out)
-                .unwrap_or(0);
+            return match sh.dispatch_mailbox_op(
+                IpcOp::ShellExec,
+                true,
+                authed,
+                boots,
+                view.path,
+                trim_ws(view.body),
+                &mut sh_body,
+            ) {
+                Ok((status, slen)) => {
+                    HttpImpl::build_response(status, b"text/plain", &sh_body[..slen], out)
+                        .unwrap_or(0)
+                }
+                Err(e) => build_service_error_response(e, out),
+            };
         }
 
-        // 5. Sandboxed Remote Code Execution (`POST /exec`, routed `svc-http -> svc-sh`).
+        // 5. Sandboxed Remote Code Execution (`POST /exec`, routed `svc-http -> svc-sh` mailbox).
         if view.method == HttpMethod::Post && view.path == b"/exec" {
             let authed = extract_session_token(view.headers_raw)
                 .and_then(|tok| sh.validate_session(tok))
                 .is_some();
-            if let Err(e) = sh
-                .svc
-                .mediate_endpoint(IpcOp::UserElfExec, true, authed, &mut sh.audit)
-            {
-                return build_service_error_response(e, out);
-            }
-            let mut cmd_line = [0u8; 128];
-            let mut cpos = 0usize;
-            cpos += copy_msg(b"exec ", &mut cmd_line[cpos..]);
-            cpos += copy_msg(trim_ws(view.body), &mut cmd_line[cpos..]);
             let mut sh_body = [0u8; 384];
-            let slen = sh
-                .exec_line(&cmd_line[..cpos], boots, 0, 0, &mut sh_body)
-                .bytes_written();
-            return HttpImpl::build_response(200, b"text/plain", &sh_body[..slen], out)
-                .unwrap_or(0);
+            return match sh.dispatch_mailbox_op(
+                IpcOp::UserElfExec,
+                true,
+                authed,
+                boots,
+                view.path,
+                trim_ws(view.body),
+                &mut sh_body,
+            ) {
+                Ok((status, slen)) => {
+                    HttpImpl::build_response(status, b"text/plain", &sh_body[..slen], out)
+                        .unwrap_or(0)
+                }
+                Err(e) => build_service_error_response(e, out),
+            };
         }
 
         // 6. VFS Static & Dynamic File Server (`GET /fs/<path>`, `PUT /fs/<path>`, `DELETE /fs/<path>`).
         if view.path.len() > 4 && view.path.starts_with(b"/fs/") {
             let vfs_path = &view.path[3..]; // includes leading `/`
             if view.method == HttpMethod::Get {
-                if let Err(e) = sh
-                    .svc
-                    .mediate_endpoint(IpcOp::VfsRead, true, false, &mut sh.audit)
-                {
-                    return build_service_error_response(e, out);
-                }
-                let Ok(fh) = sh.fs.open(vfs_path, FS_O_RDONLY) else {
-                    return HttpImpl::build_response(404, b"text/plain", b"not found\n", out)
-                        .unwrap_or(0);
-                };
                 let mut fbuf = [0u8; 384];
-                let flen = sh.fs.read(fh, 0, &mut fbuf).unwrap_or(0);
-                let _ = sh.fs.close(fh);
-                let ctype: &[u8] = if vfs_path.ends_with(b".html") {
-                    b"text/html"
-                } else if vfs_path.ends_with(b".json") {
-                    b"application/json"
-                } else {
-                    b"text/plain"
+                return match sh.dispatch_mailbox_op(
+                    IpcOp::VfsRead,
+                    true,
+                    false,
+                    boots,
+                    vfs_path,
+                    b"",
+                    &mut fbuf,
+                ) {
+                    Ok((200, flen)) => {
+                        let ctype: &[u8] = if vfs_path.ends_with(b".html") {
+                            b"text/html"
+                        } else if vfs_path.ends_with(b".json") {
+                            b"application/json"
+                        } else {
+                            b"text/plain"
+                        };
+                        HttpImpl::build_response(200, ctype, &fbuf[..flen], out).unwrap_or(0)
+                    }
+                    Ok((status, flen)) => {
+                        HttpImpl::build_response(status, b"text/plain", &fbuf[..flen], out)
+                            .unwrap_or(0)
+                    }
+                    Err(e) => build_service_error_response(e, out),
                 };
-                return HttpImpl::build_response(200, ctype, &fbuf[..flen], out).unwrap_or(0);
             }
             if view.method == HttpMethod::Put {
                 let authed = extract_session_token(view.headers_raw)
                     .and_then(|tok| sh.validate_session(tok))
                     .is_some();
-                if let Err(e) = sh
-                    .svc
-                    .mediate_endpoint(IpcOp::VfsWrite, true, authed, &mut sh.audit)
-                {
-                    return build_service_error_response(e, out);
-                }
-                if vfs_path == b"/etc/os-release" {
-                    sh.record_net_audit(AuditVerdict::Denied, b"net:http:fs-protected");
-                    return HttpImpl::build_response(
-                        403,
-                        b"text/plain",
-                        b"error: immutable system file\n",
-                        out,
-                    )
-                    .unwrap_or(0);
-                }
-                let Ok(fh) = sh.fs.open(vfs_path, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC) else {
-                    return HttpImpl::build_response(
-                        500,
-                        b"text/plain",
-                        b"error: open failed\n",
-                        out,
-                    )
-                    .unwrap_or(0);
-                };
-                let written = sh.fs.write(fh, 0, view.body).unwrap_or(0);
-                let _ = sh.fs.close(fh);
-                sh.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-put");
                 let mut msg = [0u8; 96];
-                let mut mpos = 0usize;
-                mpos += copy_msg(b"wrote ", &mut msg[mpos..]);
-                mpos += dec_u64(written as u64, &mut msg[mpos..]);
-                mpos += copy_msg(b" bytes to ", &mut msg[mpos..]);
-                mpos += copy_msg(vfs_path, &mut msg[mpos..]);
-                mpos += copy_msg(b"\n", &mut msg[mpos..]);
-                return HttpImpl::build_response(201, b"text/plain", &msg[..mpos], out)
-                    .unwrap_or(0);
+                return match sh.dispatch_mailbox_op(
+                    IpcOp::VfsWrite,
+                    true,
+                    authed,
+                    boots,
+                    vfs_path,
+                    view.body,
+                    &mut msg,
+                ) {
+                    Ok((status, mpos)) => {
+                        HttpImpl::build_response(status, b"text/plain", &msg[..mpos], out)
+                            .unwrap_or(0)
+                    }
+                    Err(e) => build_service_error_response(e, out),
+                };
             }
             if view.method == HttpMethod::Delete {
                 let authed = extract_session_token(view.headers_raw)
                     .and_then(|tok| sh.validate_session(tok))
                     .is_some();
-                if let Err(e) = sh
-                    .svc
-                    .mediate_endpoint(IpcOp::VfsDelete, true, authed, &mut sh.audit)
-                {
-                    return build_service_error_response(e, out);
-                }
-                if sh.fs.unlink(vfs_path).is_ok() {
-                    sh.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-del");
-                    return HttpImpl::build_response(200, b"text/plain", b"removed\n", out)
-                        .unwrap_or(0);
-                }
-                return HttpImpl::build_response(404, b"text/plain", b"not found\n", out)
-                    .unwrap_or(0);
+                let mut msg = [0u8; 32];
+                return match sh.dispatch_mailbox_op(
+                    IpcOp::VfsDelete,
+                    true,
+                    authed,
+                    boots,
+                    vfs_path,
+                    b"",
+                    &mut msg,
+                ) {
+                    Ok((status, mpos)) => {
+                        HttpImpl::build_response(status, b"text/plain", &msg[..mpos], out)
+                            .unwrap_or(0)
+                    }
+                    Err(e) => build_service_error_response(e, out),
+                };
             }
         }
 
@@ -2880,6 +2873,17 @@ mod tests {
             &mut record_key2,
         );
         assert_ne!(record_key2, record_key);
+
+        // 6. Red Team Cryptographic Check: verify that a passive eavesdropper who observes
+        //    `ServerHello.random` (`parsed_sh.server_random`) on the wire cannot derive the
+        //    server's private X25519 scalar from `TLS_SERVER_PUBKEY` or any public constant!
+        let mut guessed_scalar = [0u8; 32];
+        hmac_sha256(&TLS_SERVER_PUBKEY, &parsed_sh.server_random, &mut guessed_scalar);
+        let guessed_pubkey = x25519_basepoint(&guessed_scalar);
+        assert_ne!(
+            guessed_pubkey, parsed_sh.server_pubkey,
+            "server ephemeral X25519 private scalar must never be derivable from ServerHello.random and public constants"
+        );
     }
 
     #[test]
@@ -3127,6 +3131,14 @@ mod tests {
         let n = net.handle_http_request(&sql_req[..spos], 4, Some(&mut sh), &mut out);
         let s = core::str::from_utf8(&out[..n]).unwrap();
         assert!(s.ends_with("\r\n\r\nINSERT 1\n"));
+        // Verify that `svc-sql`'s mailbox staged and executed the exact SQL mutation:
+        let sql_mb = &sh.svc.services[crate::svc_runtime::ServiceId::Sql.index()].mailbox;
+        assert_eq!(sql_mb.last_op, crate::svc_runtime::IpcOp::SqlMutate as u8);
+        assert_eq!(sql_mb.last_status, 200);
+        assert_eq!(
+            &sql_mb.req_body[..sql_mb.req_body_len as usize],
+            b"INSERT INTO kv VALUES ('web.user', 'admin', 3)"
+        );
 
         let n = net.handle_http_request(
             b"POST /sql HTTP/1.1\r\nHost: x\r\n\r\nSELECT v, rev FROM kv WHERE k = 'web.user'",
@@ -3155,6 +3167,12 @@ mod tests {
         ppos += copy_msg(b"\r\n\r\n<h1>Hello Cuttle</h1>", &mut put_req[ppos..]);
         let n = net.handle_http_request(&put_req[..ppos], 4, Some(&mut sh), &mut out);
         assert!(out[..n].starts_with(b"HTTP/1.1 201 Created\r\n"));
+        // Verify `svc-sh`'s mailbox staged the VFS path and body and recorded status 201:
+        let sh_mb = &sh.svc.services[crate::svc_runtime::ServiceId::Shell.index()].mailbox;
+        assert_eq!(sh_mb.last_op, crate::svc_runtime::IpcOp::VfsWrite as u8);
+        assert_eq!(sh_mb.last_status, 201);
+        assert_eq!(&sh_mb.req_path[..sh_mb.req_path_len as usize], b"/var/index.html");
+        assert_eq!(&sh_mb.req_body[..sh_mb.req_body_len as usize], b"<h1>Hello Cuttle</h1>");
 
         let n = net.handle_http_request(
             b"GET /fs/var/index.html HTTP/1.1\r\nHost: x\r\n\r\n",
@@ -3275,8 +3293,10 @@ mod tests {
             );
         }
 
-        // 4. Brute-force login rate limiting: 5 consecutive failed logins trigger a bounded 429 cooldown
-        //    that automatically expires after 8 ticks/requests so a legitimate login succeeds!
+        // 4. Brute-force login rate limiting (Red Team timer-vs-request test):
+        //    5 consecutive failed logins trigger an 8-tick hardware timer cooldown (429).
+        //    Verify that flooding 32 HTTP `GET /healthz` / `GET /status` requests does NOT
+        //    advance or clear the cooldown — only hardware timer ticks (`sh.tick_login_cooldown()`) do!
         sh.svc.set_role(crate::svc_runtime::NodeRole::Full, &mut sh.audit);
         for seq in 2..=6 {
             let mut bad_login = [0u8; 160];
@@ -3291,6 +3311,24 @@ mod tests {
             assert!(out[..n_bad].starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
         }
         assert!(sh.is_login_rate_limited());
+        assert_eq!(sh.login_cooldown_ticks, 8);
+
+        // Red Team: Flood 32 fast `GET /healthz` and `GET /status` requests and verify
+        // that `login_cooldown_ticks` remains pinned at 8!
+        for _ in 0..32 {
+            let _ = net.handle_http_request(
+                b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n",
+                1,
+                Some(&mut sh),
+                &mut out,
+            );
+        }
+        assert!(sh.is_login_rate_limited());
+        assert_eq!(
+            sh.login_cooldown_ticks, 8,
+            "non-login HTTP requests must never advance or clear the login brute-force cooldown"
+        );
+
         let n_ratelimited = net.handle_http_request(
             b"POST /session/login HTTP/1.1\r\nHost: x\r\n\r\n99 0000000000000000000000000000000000000000000000000000000000000000 admin",
             1,
@@ -3298,14 +3336,14 @@ mod tests {
             &mut out,
         );
         assert!(out[..n_ratelimited].starts_with(b"HTTP/1.1 429 Too Many Requests\r\n"));
-        // The 429 request above ticked cooldown from 8 -> 7; send 7 GET /status requests to expire the cooldown:
-        for _ in 0..7 {
-            let _ = net.handle_http_request(
-                b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n",
-                1,
-                Some(&mut sh),
-                &mut out,
-            );
+        assert_eq!(
+            sh.login_cooldown_ticks, 8,
+            "rate-limited POST /session/login must not advance the login cooldown either"
+        );
+
+        // Now advance the timer 8 ticks (driven in the kernel by Local APIC timer IRQs):
+        for _ in 0..8 {
+            sh.tick_login_cooldown();
         }
         assert!(!sh.is_login_rate_limited());
         let mut mac_ok = [0u8; 32];

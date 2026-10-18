@@ -473,9 +473,9 @@ impl OsShell {
         self.login_cooldown_ticks > 0
     }
 
-    /// Advance the decaying login brute-force cooldown timer by one tick/request; when
+    /// Advance the decaying login brute-force cooldown timer by one hardware timer tick; when
     /// `login_cooldown_ticks` reaches `0`, resets `failed_login_streak` so legitimate
-    /// operators can authenticate again.
+    /// operators can authenticate again. Never called from HTTP request handlers.
     pub fn tick_login_cooldown(&mut self) {
         if self.login_cooldown_ticks > 0 {
             self.login_cooldown_ticks -= 1;
@@ -549,9 +549,9 @@ impl OsShell {
         token_hex
     }
 
-    /// Validate a 32-character hex session token in constant time and increment its request counter.
-    /// Returns `Some(slot_index)` if valid.
-    pub fn validate_session(&mut self, token_hex: &[u8]) -> Option<usize> {
+    /// Look up an active session matching `token_hex` in constant time without incrementing
+    /// its `requests` counter.
+    pub fn find_session(&self, token_hex: &[u8]) -> Option<usize> {
         let tok = trim_ascii(token_hex);
         if tok.len() != 32 {
             return None;
@@ -572,7 +572,13 @@ impl OsShell {
             }
             i += 1;
         }
-        if let Some(idx) = matched {
+        matched
+    }
+
+    /// Validate a 32-character hex session token in constant time and increment its request counter.
+    /// Returns `Some(slot_index)` if valid.
+    pub fn validate_session(&mut self, token_hex: &[u8]) -> Option<usize> {
+        if let Some(idx) = self.find_session(token_hex) {
             self.sessions[idx].requests = self.sessions[idx].requests.wrapping_add(1);
             Some(idx)
         } else {
@@ -582,28 +588,223 @@ impl OsShell {
 
     /// Revoke an active session matching `token_hex` in constant time.
     pub fn revoke_session(&mut self, token_hex: &[u8]) -> bool {
-        let tok = trim_ascii(token_hex);
-        if tok.len() != 32 {
-            return false;
+        if let Some(idx) = self.find_session(token_hex) {
+            self.sessions[idx] = WebSession::empty();
+            self.record_audit(32, AuditVerdict::Allowed, b"shell:session:logout");
+            true
+        } else {
+            false
         }
-        let mut i = 0usize;
-        while i < SHELL_MAX_SESSIONS {
-            if self.sessions[i].active {
-                let mut diff = 0u8;
-                let mut k = 0usize;
-                while k < 32 {
-                    diff |= self.sessions[i].token_hex[k] ^ tok[k];
-                    k += 1;
+    }
+
+    /// Stage a service request into the target service's [`crate::svc_runtime::IpcMailbox`],
+    /// mediate the endpoint across the [`crate::svc_runtime::ServiceSupervisor`] KPTI/Seccomp/IPC
+    /// boundary, and execute the service handler (`svc-http`, `svc-sql`, or `svc-sh`) strictly
+    /// from the target service's mailbox buffer.
+    ///
+    /// Returns `Ok((http_status_code, bytes_written_to_resp_out))` or `Err(ServiceError)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_mailbox_op(
+        &mut self,
+        op: crate::svc_runtime::IpcOp,
+        via_http_gateway: bool,
+        session_verified: bool,
+        boots: u64,
+        req_path: &[u8],
+        req_body: &[u8],
+        resp_out: &mut [u8],
+    ) -> Result<(u16, usize), crate::svc_runtime::ServiceError> {
+        use crate::svc_runtime::{
+            IpcOp, ServiceError, IPC_MAILBOX_BODY_CAP, IPC_MAILBOX_PATH_CAP,
+        };
+        use cuttle_contracts::{FS_O_CREATE, FS_O_RDONLY, FS_O_RDWR, FS_O_TRUNC};
+
+        let target = op.target_service();
+        let prev_seq = self.svc.services[target.index()].mailbox.req_seq;
+        // 1. Mediate role availability, session requirement, IPC bus routing (`svc-http -> target`),
+        //    and target service Seccomp/Capability/IMA/KPTI invariants BEFORE staging mailbox state.
+        let resp_tag =
+            self.svc
+                .mediate_endpoint(op, via_http_gateway, session_verified, &mut self.audit)?;
+
+        // 2. Stage request path & body into the target service's isolated IpcMailbox and verify
+        //    that `mediate_endpoint` advanced `req_seq`, recorded `last_op`, and left `canary != 0`.
+        self.svc.stage_mailbox_request(target, req_path, req_body);
+        let mb = &self.svc.services[target.index()].mailbox;
+        if mb.req_seq != prev_seq.wrapping_add(1)
+            || mb.last_op != (op as u8)
+            || mb.resp_tag != resp_tag
+            || mb.canary == 0
+        {
+            return Err(ServiceError::SandboxTrap);
+        }
+
+        // 3. Copy the request out of the target service's mailbox so the service handler
+        //    operates exclusively on the mailbox message.
+        let path_len = (mb.req_path_len as usize).min(IPC_MAILBOX_PATH_CAP);
+        let body_len = (mb.req_body_len as usize).min(IPC_MAILBOX_BODY_CAP);
+        let mut path_buf = [0u8; IPC_MAILBOX_PATH_CAP];
+        let mut body_buf = [0u8; IPC_MAILBOX_BODY_CAP];
+        path_buf[..path_len].copy_from_slice(&mb.req_path[..path_len]);
+        body_buf[..body_len].copy_from_slice(&mb.req_body[..body_len]);
+        let mb_path = &path_buf[..path_len];
+        let mb_body = &body_buf[..body_len];
+
+        let (status_code, resp_len) = match op {
+            IpcOp::HttpGetStatus => {
+                let mut pos = 0usize;
+                pos += copy_into(b"CUTTLE-STATUS boots=", &mut resp_out[pos..]);
+                pos += dec_u64(boots, &mut resp_out[pos..]);
+                pos += copy_into(b"\n", &mut resp_out[pos..]);
+                (200u16, pos)
+            }
+            IpcOp::HttpGetTelemetry => {
+                let n = self
+                    .exec_line(mb_body, boots, 0, 0, resp_out)
+                    .bytes_written();
+                (200u16, n)
+            }
+            IpcOp::HttpGetDashboard => {
+                let sess_idx = if session_verified {
+                    self.find_session(mb_body)
+                } else {
+                    None
+                };
+                let default_tok: &[u8] = if let Some(si) = sess_idx {
+                    &self.sessions[si].token_hex
+                } else {
+                    b""
+                };
+                let mut pos = 0usize;
+                pos += copy_into(
+                    b"<!doctype html><html><head><meta charset=utf-8><title>Cuttle</title><style>body{background:#0b1020;color:#e2e8f0;font:14px monospace}h1{color:#38bdf8}p,pre,input,button{background:#1e293b;color:#38bdf8;border:1px solid #475569;padding:4px}button{background:#0284c7;color:#fff}</style></head><body><h1>Cuttle MTD OS</h1><p>boots=",
+                    &mut resp_out[pos..],
+                );
+                pos += dec_u64(boots, &mut resp_out[pos..]);
+                pos += copy_into(b" files=", &mut resp_out[pos..]);
+                pos += dec_u64(self.fs.inode_count() as u64, &mut resp_out[pos..]);
+                pos += copy_into(b" sql_tables=", &mut resp_out[pos..]);
+                pos += dec_u64(self.db.table_count() as u64, &mut resp_out[pos..]);
+                pos += copy_into(b" sql_rows=", &mut resp_out[pos..]);
+                pos += dec_u64(self.db.total_rows() as u64, &mut resp_out[pos..]);
+                pos += copy_into(b" sessions=", &mut resp_out[pos..]);
+                pos += dec_u64(self.active_session_count() as u64, &mut resp_out[pos..]);
+                pos += copy_into(b"</p>", &mut resp_out[pos..]);
+                if let Some(s_idx) = sess_idx {
+                    pos += copy_into(b"<p>session_user=", &mut resp_out[pos..]);
+                    pos += copy_into(self.sessions[s_idx].user_bytes(), &mut resp_out[pos..]);
+                    pos += copy_into(b" reqs=", &mut resp_out[pos..]);
+                    pos += dec_u64(self.sessions[s_idx].requests as u64, &mut resp_out[pos..]);
+                    pos += copy_into(b"</p>", &mut resp_out[pos..]);
                 }
-                if diff == 0 {
-                    self.sessions[i] = WebSession::empty();
-                    self.record_audit(32, AuditVerdict::Allowed, b"shell:session:logout");
-                    return true;
+                pos += copy_into(b"<div>SID:<input id=t size=33 value=\"", &mut resp_out[pos..]);
+                pos += copy_into(default_tok, &mut resp_out[pos..]);
+                pos += copy_into(
+                    b"\"><br>Sh:<input id=c size=22 value=\"status\"><button onclick=\"S(c.value)\">Run</button><button onclick=\"S('smp')\">smp</button><button onclick=\"S('ps')\">ps</button><button onclick=\"S('ls')\">ls</button><button onclick=\"S('audit')\">audit</button><br>SQL:<input id=q size=30 value=\"SELECT * FROM kv\"><button onclick=\"R('/sql?'+encodeURIComponent(q.value))\">Query</button><button onclick=\"P('/sql',q.value)\">Mutate</button><br>ELF:<input id=x size=14 value=\"/bin/fib 10\"><button onclick=\"P('/exec',x.value)\">Exec</button> VFS:<input id=f size=10 value=\"etc/motd\"><button onclick=\"R('/fs/'+f.value)\">Cat</button></div><pre id=o>cuttle&gt; ready</pre><script>R=async(u,b)=>{o.textContent=await(await fetch(u,{method:b?'POST':'GET',headers:{'X-Session-Token':t.value},body:b})).text()};P=R;S=x=>P('/sh',x)</script></body></html>\n",
+                    &mut resp_out[pos..],
+                );
+                (200u16, pos)
+            }
+            IpcOp::SessionLogin => (200u16, 0),
+            IpcOp::SessionWhoami => {
+                let Some(s_idx) = self.find_session(mb_body) else {
+                    return Err(ServiceError::Unauthenticated);
+                };
+                let mut bpos = 0usize;
+                bpos += copy_into(b"whoami: user=", &mut resp_out[bpos..]);
+                bpos += copy_into(self.sessions[s_idx].user_bytes(), &mut resp_out[bpos..]);
+                bpos += copy_into(b" reqs=", &mut resp_out[bpos..]);
+                bpos += dec_u64(self.sessions[s_idx].requests as u64, &mut resp_out[bpos..]);
+                bpos += copy_into(b" sid=", &mut resp_out[bpos..]);
+                bpos += copy_into(&self.sessions[s_idx].token_hex, &mut resp_out[bpos..]);
+                bpos += copy_into(b"\n", &mut resp_out[bpos..]);
+                (200u16, bpos)
+            }
+            IpcOp::SessionLogout => {
+                let _ = self.revoke_session(mb_body);
+                let n = copy_into(b"session: logged out\n", resp_out);
+                (200u16, n)
+            }
+            IpcOp::SqlQuery => {
+                let query = if mb_body.is_empty() {
+                    &b".tables"[..]
+                } else {
+                    mb_body
+                };
+                let n = self.db.exec(query, resp_out);
+                (200u16, n)
+            }
+            IpcOp::SqlMutate => {
+                if via_http_gateway {
+                    self.record_net_audit(AuditVerdict::Allowed, b"net:http:sql-write");
+                }
+                let n = self.db.exec(mb_body, resp_out);
+                (200u16, n)
+            }
+            IpcOp::ShellExec => {
+                let n = self
+                    .exec_line(mb_body, boots, 0, 0, resp_out)
+                    .bytes_written();
+                (200u16, n)
+            }
+            IpcOp::UserElfExec => {
+                let mut cmd_line = [0u8; 128];
+                let mut cpos = 0usize;
+                cpos += copy_into(b"exec ", &mut cmd_line[cpos..]);
+                cpos += copy_into(trim_ascii(mb_body), &mut cmd_line[cpos..]);
+                let n = self
+                    .exec_line(&cmd_line[..cpos], boots, 0, 0, resp_out)
+                    .bytes_written();
+                (200u16, n)
+            }
+            IpcOp::VfsRead => {
+                if let Ok(fh) = self.fs.open(mb_path, FS_O_RDONLY) {
+                    let flen = self.fs.read(fh, 0, resp_out).unwrap_or(0);
+                    let _ = self.fs.close(fh);
+                    (200u16, flen)
+                } else {
+                    let n = copy_into(b"not found\n", resp_out);
+                    (404u16, n)
                 }
             }
-            i += 1;
-        }
-        false
+            IpcOp::VfsWrite => {
+                if bytes_eq(mb_path, b"/etc/os-release") {
+                    self.record_net_audit(AuditVerdict::Denied, b"net:http:fs-protected");
+                    let n = copy_into(b"error: immutable system file\n", resp_out);
+                    (403u16, n)
+                } else if let Ok(fh) =
+                    self.fs.open(mb_path, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC)
+                {
+                    let written = self.fs.write(fh, 0, mb_body).unwrap_or(0);
+                    let _ = self.fs.close(fh);
+                    self.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-put");
+                    let mut mpos = 0usize;
+                    mpos += copy_into(b"wrote ", &mut resp_out[mpos..]);
+                    mpos += dec_u64(written as u64, &mut resp_out[mpos..]);
+                    mpos += copy_into(b" bytes to ", &mut resp_out[mpos..]);
+                    mpos += copy_into(mb_path, &mut resp_out[mpos..]);
+                    mpos += copy_into(b"\n", &mut resp_out[mpos..]);
+                    (201u16, mpos)
+                } else {
+                    let n = copy_into(b"error: open failed\n", resp_out);
+                    (500u16, n)
+                }
+            }
+            IpcOp::VfsDelete => {
+                if self.fs.unlink(mb_path).is_ok() {
+                    self.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-del");
+                    let n = copy_into(b"removed\n", resp_out);
+                    (200u16, n)
+                } else {
+                    let n = copy_into(b"not found\n", resp_out);
+                    (404u16, n)
+                }
+            }
+        };
+
+        self.svc
+            .complete_mailbox_response(target, status_code, resp_len);
+        Ok((status_code, resp_len))
     }
 
     /// Serialize `self.db` into an 8-sector (`4 KiB`) partition image sealed with `self.seal_key`.

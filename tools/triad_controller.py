@@ -392,21 +392,22 @@ class TriadController:
                 node.response_lines.clear()
             payload = clean_cmd + "\n"
             try:
-                for i in range(0, len(payload), 8):
-                    node.proc.stdin.write(payload[i : i + 8])
+                for i in range(0, len(payload), 6):
+                    node.proc.stdin.write(payload[i : i + 6])
                     node.proc.stdin.flush()
-                    if i + 8 < len(payload):
-                        time.sleep(0.015)
+                    if i + 6 < len(payload):
+                        time.sleep(0.025)
                 # Send a second newline after a brief pause so the trailing `cuttle> ` prompt
                 # is terminated with `\r\n` and flushed immediately through line-buffered stdout.
-                time.sleep(0.025)
+                time.sleep(0.030)
                 node.proc.stdin.write("\n")
                 node.proc.stdin.flush()
             except OSError:
                 return "error: pipe closed"
 
             collected: list[str] = []
-            deadline = time.time() + timeout
+            sent_at = time.time()
+            deadline = sent_at + timeout
             saw_prompt_end = False
             while time.time() < deadline:
                 with node.line_cond:
@@ -424,6 +425,8 @@ class TriadController:
                             continue
                         if ln.strip() == clean_cmd:
                             continue
+                        if clean_cmd.startswith("sql ") and ln.strip().startswith("sql "):
+                            continue
                         if (
                             ln.startswith("AHCI_HW ")
                             or ln.startswith("Web UI:")
@@ -432,7 +435,9 @@ class TriadController:
                             continue
                         collected.append(ln)
                     if saw_prompt_end or (
-                        collected and self._response_looks_complete(clean_cmd, collected)
+                        collected
+                        and (time.time() - sent_at) >= 0.30
+                        and self._response_looks_complete(clean_cmd, collected)
                     ):
                         break
                     node.line_cond.wait(timeout=0.06)
@@ -457,6 +462,8 @@ class TriadController:
             return "smp: dispatched" in joined
         if c == "sync":
             return "sync:" in joined
+        if c == "service status":
+            return "svc-sh" in joined
         return len(lines) >= 1
 
     def refresh_node_telemetry(self, node: TriadNode):
@@ -535,12 +542,7 @@ class TriadController:
           Any node currently `MORPHING` automatically replays the missed WAL entries during `CATCHING_UP`.
         """
         if not is_printable_ascii_command(sql_query):
-            return {
-                "ok": False,
-                "error": "rejected: query contains non-printable or control characters",
-                "output": "error: non-printable characters rejected",
-                "quorum": "0/3",
-            }
+            raise ValueError("query contains non-printable or control characters")
         q = sql_query.strip()
         if not q:
             return {"ok": False, "error": "empty SQL query", "output": "error: empty SQL query", "quorum": "0/3"}
@@ -560,7 +562,15 @@ class TriadController:
         if is_read:
             results = {}
             for n in online_nodes:
-                results[n.name] = self.send_shell_cmd(n, f"sql {q}")
+                try:
+                    results[n.name] = self.send_shell_cmd(n, f"sql {q}")
+                except ValueError as e:
+                    return {
+                        "ok": False,
+                        "error": f"rejected: {e}",
+                        "output": f"error: {e}",
+                        "quorum": "0/3",
+                    }
             # Perform majority vote across online nodes
             vals = list(results.values())
             chosen = max(set(vals), key=vals.count)
@@ -574,19 +584,49 @@ class TriadController:
                 "per_node": results,
             }
 
-        # Mutating SQL write: record in WAL and replicate across all ONLINE nodes
+        # Mutating SQL write: execute across ONLINE nodes FIRST, and only append to the
+        # persistent Triad WAL if at least one online node accepted the statement without error.
+        per_node = {}
+        accepted_nodes = []
+        for n in online_nodes:
+            try:
+                out = self.send_shell_cmd(n, f"sql {q}")
+            except ValueError as e:
+                return {
+                    "ok": False,
+                    "error": f"rejected: {e}",
+                    "output": f"error: {e}",
+                    "quorum": "0/3",
+                }
+            per_node[n.name] = out
+            low_out = out.strip().lower()
+            if (
+                low_out
+                and "error:" not in low_out
+                and "unknown command" not in low_out
+                and "usage:" not in low_out
+            ):
+                accepted_nodes.append(n)
+
+        primary_out = next(iter(per_node.values()), "")
+        if not accepted_nodes:
+            return {
+                "ok": False,
+                "error": primary_out or "error: SQL statement rejected by online nodes",
+                "output": primary_out,
+                "quorum": f"0/{len(online_nodes)} online nodes accepted",
+                "per_node": per_node,
+            }
+
         with self.wal_lock:
             self.triad_tx_seq += 1
             tx_id = self.triad_tx_seq
             self.wal_entries.append((tx_id, q))
             self._save_wal_to_disk()
 
-        per_node = {}
-        for n in online_nodes:
-            out = self.send_shell_cmd(n, f"sql {q}")
+        for n in accepted_nodes:
             self.send_shell_cmd(n, "sync")
             n.tx_seq = tx_id
-            per_node[n.name] = out
 
         for n in self.nodes:
             if n.state != "ONLINE":
@@ -594,14 +634,13 @@ class TriadController:
 
         self.log_event(
             "SQL-RAID",
-            f"Committed tx #{tx_id} ({q}) to {len(online_nodes)}/3 online nodes; RAID parity updated.",
+            f"Committed tx #{tx_id} ({q}) to {len(accepted_nodes)}/3 online nodes; RAID parity updated.",
         )
         self.compute_and_verify_raid_parity()
-        primary_out = next(iter(per_node.values()), "")
         return {
             "ok": True,
             "mode": "WRITE (Parallel RAID + WAL)",
-            "quorum": f"Committed on {len(online_nodes)}/3 online nodes (tx_seq={tx_id})",
+            "quorum": f"Committed on {len(accepted_nodes)}/3 online nodes (tx_seq={tx_id})",
             "tx_seq": tx_id,
             "output": primary_out,
             "per_node": per_node,
@@ -670,7 +709,14 @@ class TriadController:
                     f"Replaying {len(missed)} missed WAL transaction(s) from twin/parity majority...",
                 )
                 for tid, stmt in missed:
-                    self.send_shell_cmd(node, f"sql {stmt}")
+                    if not is_printable_ascii_command(stmt):
+                        self.log_event("WARN", f"{node.name}: Skipping non-printable WAL entry #{tid}")
+                        node.tx_seq = tid
+                        continue
+                    try:
+                        self.send_shell_cmd(node, f"sql {stmt}")
+                    except Exception as e:
+                        self.log_event("WARN", f"{node.name}: Error replaying WAL entry #{tid}: {e}")
                     node.tx_seq = tid
                 self.send_shell_cmd(node, "sync")
             else:
@@ -720,7 +766,13 @@ class TriadController:
             with self.wal_lock:
                 entries = list(self.wal_entries)
             for tid, stmt in entries:
-                self.send_shell_cmd(node, f"sql {stmt}")
+                if not is_printable_ascii_command(stmt):
+                    node.tx_seq = tid
+                    continue
+                try:
+                    self.send_shell_cmd(node, f"sql {stmt}")
+                except Exception as e:
+                    self.log_event("WARN", f"{node.name}: Error replaying WAL entry #{tid} during heal: {e}")
                 node.tx_seq = tid
             self.send_shell_cmd(node, "sync")
             node.tampered = False
@@ -1172,7 +1224,14 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                     "text/plain; charset=utf-8",
                     "error: unauthorized (use authenticated POST /sql for mutations)\n",
                 )
-            res = self.ctrl.execute_triad_sql(q)
+            try:
+                res = self.ctrl.execute_triad_sql(q)
+            except ValueError as e:
+                return self._send_text(
+                    400,
+                    "text/plain; charset=utf-8",
+                    f"error: {e}\n",
+                )
             return self._send_text(200, "text/plain; charset=utf-8", res.get("output", "") + "\n")
 
         return self._send_text(404, "text/plain", "not found\n")
@@ -1193,7 +1252,10 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                     400,
                     {"ok": False, "error": "rejected: query contains non-printable or control characters"},
                 )
-            res = self.ctrl.execute_triad_sql(body)
+            try:
+                res = self.ctrl.execute_triad_sql(body)
+            except ValueError as e:
+                return self._send_json(400, {"ok": False, "error": f"rejected: {e}"})
             return self._send_json(200 if res.get("ok") else 400, res)
 
         if self.path == "/api/sh":
@@ -1209,13 +1271,16 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                     {"ok": False, "error": "Use the Hypervisor Morph controls to bounce nodes safely."},
                 )
             per_node = {}
-            for n in self.ctrl.nodes:
-                if n.state == "ONLINE":
-                    per_node[n.name] = self.ctrl.send_shell_cmd(n, body)
-                    if body.startswith("smp"):
-                        self.ctrl.refresh_node_telemetry(n)
-                else:
-                    per_node[n.name] = f"[{n.state}]"
+            try:
+                for n in self.ctrl.nodes:
+                    if n.state == "ONLINE":
+                        per_node[n.name] = self.ctrl.send_shell_cmd(n, body)
+                        if body.startswith("smp"):
+                            self.ctrl.refresh_node_telemetry(n)
+                    else:
+                        per_node[n.name] = f"[{n.state}]"
+            except ValueError as e:
+                return self._send_json(400, {"ok": False, "error": f"rejected: {e}"})
             return self._send_json(200, {"ok": True, "per_node": per_node})
 
         if self.path.startswith("/api/morph/"):
@@ -1345,6 +1410,16 @@ def main():
                 test_srv.shutdown()
 
             assert ctrl.wal_file.exists(), "Triad WAL must be persisted to triad_wal.json"
+            wal_len_before = len(ctrl.wal_entries)
+            try:
+                ctrl.execute_triad_sql("INSERT INTO kv VALUES ('bad\x08key', 'val', 1)")
+                raise AssertionError("Control-character SQL write must raise ValueError before WAL append")
+            except ValueError:
+                pass
+            assert len(ctrl.wal_entries) == wal_len_before, "Control-character SQL write must not append to WAL"
+            bad_sql_res = ctrl.execute_triad_sql("INSERT INTO nonexistent_table VALUES ('a', 'b', 1)")
+            assert not bad_sql_res["ok"], "Invalid SQL table write must return ok=False"
+            assert len(ctrl.wal_entries) == wal_len_before, "Failed SQL write must not poison the Triad WAL"
 
             # 4. Start morphing OS-1 in background thread, and fire a SQL write while OS-1 is MORPHING!
             t_morph = threading.Thread(target=ctrl.bounce_and_morph_node, args=(1,))

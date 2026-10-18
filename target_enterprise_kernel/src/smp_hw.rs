@@ -1013,7 +1013,13 @@ pub(crate) fn smp_hw_tick_and_sync(sh: &mut target_enterprise::OsShell) {
     let hw_irqs = read_hw_irq_wakeups();
     let hw_ipis = HW_IPI_DOORBELLS.load(Ordering::Relaxed);
     if hw_irqs > sh.smp_irq_wakeups {
+        let delta = (hw_irqs - sh.smp_irq_wakeups).min(8);
         sh.smp_irq_wakeups = hw_irqs;
+        let mut d = 0u64;
+        while d < delta {
+            sh.tick_login_cooldown();
+            d += 1;
+        }
     }
     if hw_ipis > sh.smp_ipi_doorbells {
         sh.smp_ipi_doorbells = hw_ipis;
