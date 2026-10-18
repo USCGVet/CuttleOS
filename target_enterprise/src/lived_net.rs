@@ -1489,7 +1489,15 @@ impl LivedNet {
             }
             self.last_auth_seq = seq;
             sh.auth_seq = seq;
-            let sid = sh.create_session(user, seq_tok);
+            let Some(sid) = sh.try_create_session(user, seq_tok) else {
+                return HttpImpl::build_response(
+                    503,
+                    b"text/plain",
+                    b"error: session key not provisioned\n",
+                    out,
+                )
+                .unwrap_or(0);
+            };
             let mut body = [0u8; 128];
             let mut bpos = 0usize;
             bpos += copy_msg(b"session: ok user=", &mut body[bpos..]);

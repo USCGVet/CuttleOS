@@ -611,9 +611,14 @@ impl OsShell {
         }
     }
 
-    /// Mint a new 128-bit (`32` hex character) authenticated session token for `user`
+    /// Attempt to mint a new 128-bit (`32` hex character) authenticated session token for `user`
     /// derived via `HMAC-SHA256(self.attest_key, "cuttle-session-v1:" || user || seq || challenge)`.
-    pub fn create_session(&mut self, user: &[u8], challenge: &[u8]) -> [u8; 32] {
+    /// Refuses and logs an audit denial if `self.attest_key` is unset (`[0u8; 32]`).
+    pub fn try_create_session(&mut self, user: &[u8], challenge: &[u8]) -> Option<[u8; 32]> {
+        if !is_seal_key_set(&self.attest_key) {
+            self.record_audit(32, AuditVerdict::Denied, b"shell:session:key-unset");
+            return None;
+        }
         self.failed_login_streak = 0;
         self.login_backoff_level = 0;
         self.login_cooldown_ticks = 0;
@@ -661,7 +666,15 @@ impl OsShell {
         sess.requests = 0;
         self.sessions[slot] = sess;
         self.record_audit(32, AuditVerdict::Allowed, b"shell:session:login");
-        token_hex
+        Some(token_hex)
+    }
+
+    /// Mint a new 128-bit (`32` hex character) authenticated session token for `user`
+    /// derived via `HMAC-SHA256(self.attest_key, "cuttle-session-v1:" || user || seq || challenge)`.
+    /// If `self.attest_key` is unset (`[0u8; 32]`), logs an audit denial and returns `[0u8; 32]`
+    /// without activating any session slot.
+    pub fn create_session(&mut self, user: &[u8], challenge: &[u8]) -> [u8; 32] {
+        self.try_create_session(user, challenge).unwrap_or([0u8; 32])
     }
 
     /// Look up an active session matching `token_hex` in constant time without incrementing
@@ -3858,7 +3871,12 @@ impl OsShell {
                 self.record_audit(32, AuditVerdict::Error, b"shell:session:no-user");
                 return copy_into(b"usage: session create <user> [nonce]\n", out);
             }
-            let sid = self.create_session(user, nonce);
+            let Some(sid) = self.try_create_session(user, nonce) else {
+                return copy_into(
+                    b"error: EPERM (session/attestation key not provisioned)\n",
+                    out,
+                );
+            };
             let mut pos = 0usize;
             pos += copy_into(b"session: created user=", &mut out[pos..]);
             pos += copy_into(&user[..user.len().min(16)], &mut out[pos..]);
@@ -4374,15 +4392,21 @@ impl OsShell {
     /// Compute the 32-byte `HMAC-SHA256` remote attestation signature over the
     /// live kernel state (`boots`, `ima_pcr10`, `ima_measurements`, `state_seal`,
     /// and caller-supplied challenge `nonce`) using `self.attest_key`.
+    /// Returns `false` and zeroes `mac_out` if `self.attest_key` is unset (`[0u8; 32]`).
     pub fn compute_attestation_mac(
         &self,
         boots: u64,
         nonce: &[u8],
         mac_out: &mut [u8; DURABLE_DIGEST_LEN],
-    ) {
+    ) -> bool {
+        if !is_seal_key_set(&self.attest_key) {
+            *mac_out = [0u8; DURABLE_DIGEST_LEN];
+            return false;
+        }
         let mut body = [0u8; 320];
         let blen = self.format_attestation_body(boots, nonce, &mut body);
         seal_bytes_keyed(&self.attest_key, &body[..blen], mac_out);
+        true
     }
 
     /// Verify in constant time that `expected_mac` is a valid `HMAC-SHA256`
@@ -4403,9 +4427,14 @@ impl OsShell {
     }
 
     /// Emit an `HMAC-SHA256` remote attestation quote line (`attest: ... hmac=<hex64>\n`)
-    /// into `out` and return the byte length.
+    /// into `out` and return the byte length. Refuses and logs an audit denial if
+    /// `self.attest_key` is unset (`[0u8; 32]`).
     #[inline(never)]
     pub fn cmd_attest(&mut self, boots: u64, arg: &[u8], out: &mut [u8]) -> usize {
+        if !is_seal_key_set(&self.attest_key) {
+            self.record_audit(26, AuditVerdict::Denied, b"shell:attest:key-unset");
+            return copy_into(b"error: EPERM (attestation key not provisioned)\n", out);
+        }
         self.record_audit(26, AuditVerdict::Allowed, b"shell:attest");
         let nonce = trim_ascii(arg);
         let mut body = [0u8; 320];
@@ -5650,7 +5679,8 @@ mod tests {
         assert_eq!(sh1.login_cooldown_ticks, 16);
         assert_eq!(sh1.login_backoff_level, 2);
 
-        // Successful session creation resets streak, cooldown, and backoff level.
+        // Successful session creation (once `attest_key` is provisioned) resets streak, cooldown, and backoff level.
+        sh1.attest_key = DEFAULT_ATTEST_KEY;
         let _ = sh1.create_session(b"admin", b"nonce");
         assert!(!sh1.is_login_rate_limited());
         assert_eq!(sh1.failed_login_streak, 0);
@@ -6057,9 +6087,47 @@ mod tests {
         compute_wal_seal(&[0u8; DURABLE_DIGEST_LEN], &forged_wal, &mut forged_seal);
         assert!(unprov.restore_sealed(&forged_wal, &forged_seal).is_err());
 
-        // 3. Attestation MAC verification must refuse while `attest_key` is unset.
+        // 3. Attestation MAC computation and verification must refuse while `attest_key` is unset.
         let mut mac = [0u8; DURABLE_DIGEST_LEN];
-        unprov.compute_attestation_mac(1, b"nonce", &mut mac);
+        assert!(!unprov.compute_attestation_mac(1, b"nonce", &mut mac));
         assert!(!unprov.verify_attestation_mac(1, b"nonce", &mac));
+    }
+
+    #[test]
+    fn regression_round4_item1_unset_attest_key_refuses_session_and_quote() {
+        let mut unprov = OsShell::empty();
+        unprov.seed_defaults();
+        assert!(!is_seal_key_set(&unprov.attest_key));
+
+        // 1. `try_create_session`, `create_session`, and `session create` must refuse while `attest_key` is unset,
+        //    leave active session count at 0, and record a Denied audit entry.
+        let audit_before = unprov.audit.len();
+        assert!(unprov.try_create_session(b"admin", b"nonce").is_none());
+        assert_eq!(unprov.active_session_count(), 0);
+        assert!(unprov.audit.len() > audit_before);
+
+        let tok = unprov.create_session(b"admin", b"nonce");
+        assert_eq!(tok, [0u8; 32]);
+        assert_eq!(unprov.active_session_count(), 0);
+        assert!(unprov.find_session(&tok).is_none());
+
+        let mut out = [0u8; 256];
+        let act_sess = unprov.exec_line(b"session create admin boot", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_sess.bytes_written()],
+            b"error: EPERM (session/attestation key not provisioned)\n"
+        );
+        assert_eq!(unprov.active_session_count(), 0);
+
+        // 2. `compute_attestation_mac` and `cmd_attest` (`attest`) must refuse while `attest_key` is unset.
+        let mut mac = [0xAAu8; DURABLE_DIGEST_LEN];
+        assert!(!unprov.compute_attestation_mac(1, b"boot-quote", &mut mac));
+        assert_eq!(mac, [0u8; DURABLE_DIGEST_LEN]);
+
+        let act_att = unprov.exec_line(b"attest boot-quote", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_att.bytes_written()],
+            b"error: EPERM (attestation key not provisioned)\n"
+        );
     }
 }
