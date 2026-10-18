@@ -20,8 +20,8 @@ use crate::durable_seal::{seal_bytes_keyed, DURABLE_DIGEST_LEN};
 pub const SQL_MAX_TABLES: usize = 4;
 /// Maximum number of columns per table.
 pub const SQL_MAX_COLS: usize = 4;
-/// Maximum number of rows per table (`128` total rows across [`SQL_MAX_TABLES`]).
-pub const SQL_MAX_ROWS: usize = 32;
+/// Maximum number of rows per table (`256` total rows across [`SQL_MAX_TABLES`]).
+pub const SQL_MAX_ROWS: usize = 64;
 /// Maximum byte length of a table or column identifier.
 pub const SQL_IDENT_LEN: usize = 16;
 /// Maximum byte length of a `TEXT` cell value.
@@ -30,6 +30,8 @@ pub const SQL_TEXT_LEN: usize = 24;
 pub const SQL_PART_SECTORS: usize = 8;
 /// 8-byte superblock magic for the persistent SQL partition (`PRTSSQL1`).
 pub const SQL_PART_MAGIC: &[u8; 8] = b"PRTSSQL1";
+/// Sentinel value for [`SqlTable::indexed_col`] when no secondary index is defined.
+pub const SQL_NO_INDEX: u8 = 0xFF;
 
 /// Column data type in [`SqlDb`].
 #[repr(u8)]
@@ -78,10 +80,14 @@ impl SqlVal {
                 CmpOp::Gt => *a > *b,
                 CmpOp::Le => *a <= *b,
                 CmpOp::Ge => *a >= *b,
+                CmpOp::Like => false,
             },
             (SqlVal::Text(ab, al), SqlVal::Text(bb, bl)) => {
                 let a = &ab[..*al as usize];
                 let b = &bb[..*bl as usize];
+                if op == CmpOp::Like {
+                    return sql_like_match(a, b);
+                }
                 let ord = cmp_bytes(a, b);
                 match op {
                     CmpOp::Eq => ord == 0,
@@ -90,6 +96,7 @@ impl SqlVal {
                     CmpOp::Gt => ord > 0,
                     CmpOp::Le => ord <= 0,
                     CmpOp::Ge => ord >= 0,
+                    CmpOp::Like => false,
                 }
             }
             _ => false,
@@ -112,6 +119,17 @@ pub enum CmpOp {
     Le,
     /// `>=`
     Ge,
+    /// `LIKE` (`%` and `_` pattern matching)
+    Like,
+}
+
+/// Aggregate function kind in `SELECT <agg>(<col>)`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum AggKind {
+    Sum,
+    Min,
+    Max,
+    Avg,
 }
 
 /// Column definition inside a [`SqlTable`].
@@ -160,7 +178,41 @@ impl SqlRow {
     }
 }
 
-/// Fixed-capacity relational table.
+/// Compute a non-zero 64-bit FNV-1a hash fingerprint for a [`SqlVal`] cell.
+pub fn hash_sql_val(val: &SqlVal) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    match val {
+        SqlVal::Int(v) => {
+            h ^= 1u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+            let b = v.to_le_bytes();
+            let mut i = 0usize;
+            while i < 8 {
+                h ^= b[i] as u64;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+                i += 1;
+            }
+        }
+        SqlVal::Text(buf, len) => {
+            h ^= 2u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+            let l = (*len as usize).min(SQL_TEXT_LEN);
+            let mut i = 0usize;
+            while i < l {
+                h ^= buf[i] as u64;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+                i += 1;
+            }
+        }
+    }
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
+/// Fixed-capacity relational table with optional secondary hash index.
 #[derive(Copy, Clone, Debug)]
 pub struct SqlTable {
     /// Whether this table slot is occupied.
@@ -173,8 +225,16 @@ pub struct SqlTable {
     pub col_count: u8,
     /// Column schemas.
     pub cols: [SqlColumn; SQL_MAX_COLS],
-    /// Fixed-capacity row storage.
+    /// Fixed-capacity row storage (`64` rows per table).
     pub rows: [SqlRow; SQL_MAX_ROWS],
+    /// Indexed column index (`0..col_count`), or [`SQL_NO_INDEX`] (`0xFF`) when unindexed.
+    pub indexed_col: u8,
+    /// Secondary index identifier bytes.
+    pub index_name: [u8; SQL_IDENT_LEN],
+    /// Valid length of `index_name`.
+    pub index_name_len: u8,
+    /// Per-row 64-bit FNV-1a hash fingerprint for `cells[indexed_col]`.
+    pub index_hashes: [u64; SQL_MAX_ROWS],
 }
 
 impl SqlTable {
@@ -187,12 +247,21 @@ impl SqlTable {
             col_count: 0,
             cols: [SqlColumn::empty(); SQL_MAX_COLS],
             rows: [SqlRow::empty(); SQL_MAX_ROWS],
+            indexed_col: SQL_NO_INDEX,
+            index_name: [0u8; SQL_IDENT_LEN],
+            index_name_len: 0,
+            index_hashes: [0u64; SQL_MAX_ROWS],
         }
     }
 
     /// Table name slice.
     pub fn name_bytes(&self) -> &[u8] {
         &self.name[..self.name_len as usize]
+    }
+
+    /// Secondary index name slice (empty if unindexed).
+    pub fn index_name_bytes(&self) -> &[u8] {
+        &self.index_name[..self.index_name_len as usize]
     }
 
     /// Count of occupied rows in this table.
@@ -219,6 +288,24 @@ impl SqlTable {
         }
         None
     }
+
+    /// Rebuild `index_hashes` for all occupied rows when `indexed_col` is active.
+    pub fn rebuild_index(&mut self) {
+        let c = self.indexed_col as usize;
+        if c >= self.col_count as usize {
+            self.index_hashes = [0u64; SQL_MAX_ROWS];
+            return;
+        }
+        let mut r = 0usize;
+        while r < SQL_MAX_ROWS {
+            if self.rows[r].used {
+                self.index_hashes[r] = hash_sql_val(&self.rows[r].cells[c]);
+            } else {
+                self.index_hashes[r] = 0;
+            }
+            r += 1;
+        }
+    }
 }
 
 /// Embedded zero-allocation SQL database engine.
@@ -228,6 +315,8 @@ pub struct SqlDb {
     pub tables: [SqlTable; SQL_MAX_TABLES],
     /// Monotonic counter of mutating SQL statements executed.
     pub tx_seq: u64,
+    /// Monotonic counter of secondary-index-accelerated `WHERE <col> = <val>` lookups.
+    pub idx_hits: u64,
 }
 
 impl Default for SqlDb {
@@ -242,6 +331,7 @@ impl SqlDb {
         Self {
             tables: [SqlTable::empty(); SQL_MAX_TABLES],
             tx_seq: 0,
+            idx_hits: 0,
         }
     }
 
@@ -312,6 +402,60 @@ impl SqlDb {
             i += 1;
         }
         n
+    }
+
+    /// Compute a deterministic 64-bit FNV-1a cryptographic state fingerprint across all
+    /// active tables, columns, secondary indexes, and live rows for 2-of-3 Triad TMR voting.
+    pub fn state_hash(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mix_byte = |acc: u64, b: u8| -> u64 { (acc ^ (b as u64)).wrapping_mul(0x0100_0000_01b3) };
+        let mut t_idx = 0usize;
+        while t_idx < SQL_MAX_TABLES {
+            let tbl = &self.tables[t_idx];
+            if tbl.used {
+                h = mix_byte(h, 0xA5);
+                let mut i = 0usize;
+                while i < (tbl.name_len as usize) {
+                    h = mix_byte(h, tbl.name[i]);
+                    i += 1;
+                }
+                h = mix_byte(h, tbl.col_count);
+                let mut r_idx = 0usize;
+                while r_idx < SQL_MAX_ROWS {
+                    let row = &tbl.rows[r_idx];
+                    if row.used {
+                        h = mix_byte(h, 0x5A);
+                        let mut c_idx = 0usize;
+                        while c_idx < (tbl.col_count as usize) {
+                            match &row.cells[c_idx] {
+                                SqlVal::Int(iv) => {
+                                    h = mix_byte(h, 1);
+                                    let bytes = iv.to_le_bytes();
+                                    let mut bi = 0usize;
+                                    while bi < 8 {
+                                        h = mix_byte(h, bytes[bi]);
+                                        bi += 1;
+                                    }
+                                }
+                                SqlVal::Text(tb, tl) => {
+                                    h = mix_byte(h, 2);
+                                    h = mix_byte(h, *tl);
+                                    let mut ti = 0usize;
+                                    while ti < (*tl as usize) {
+                                        h = mix_byte(h, tb[ti]);
+                                        ti += 1;
+                                    }
+                                }
+                            }
+                            c_idx += 1;
+                        }
+                    }
+                    r_idx += 1;
+                }
+            }
+            t_idx += 1;
+        }
+        h
     }
 
     /// Return `true` if `query` is strictly read-only (`SELECT`, `.tables`, `.schema`, `SHOW`, `DESCRIBE`).
@@ -418,6 +562,15 @@ impl SqlDb {
                     c += 1;
                 }
                 pos += append_bytes(out, pos, b");\n");
+                if t.index_name_len > 0 && (t.indexed_col as usize) < (t.col_count as usize) {
+                    pos += append_bytes(out, pos, b"CREATE INDEX ");
+                    pos += append_bytes(out, pos, t.index_name_bytes());
+                    pos += append_bytes(out, pos, b" ON ");
+                    pos += append_bytes(out, pos, t.name_bytes());
+                    pos += append_bytes(out, pos, b" (");
+                    pos += append_bytes(out, pos, t.cols[t.indexed_col as usize].name_bytes());
+                    pos += append_bytes(out, pos, b");\n");
+                }
             }
             i += 1;
         }
@@ -428,11 +581,14 @@ impl SqlDb {
     }
 
     fn exec_create(&mut self, rest: &[u8], out: &mut [u8]) -> usize {
-        let (kw_table, after_table) = next_token(rest);
-        if !eq_ignore_ascii_case(kw_table, b"TABLE") {
+        let (kw_kind, after_kind) = next_token(rest);
+        if eq_ignore_ascii_case(kw_kind, b"INDEX") {
+            return self.exec_create_index(after_kind, out);
+        }
+        if !eq_ignore_ascii_case(kw_kind, b"TABLE") {
             return copy_str(b"error: expected CREATE TABLE <name> (...)\n", out);
         }
-        let after_table = trim_sql(after_table);
+        let after_table = trim_sql(after_kind);
         let Some(lparen) = find_byte(after_table, b'(') else {
             return copy_str(b"error: missing '(' in CREATE TABLE\n", out);
         };
@@ -513,12 +669,75 @@ impl SqlDb {
         pos
     }
 
+    fn exec_create_index(&mut self, rest: &[u8], out: &mut [u8]) -> usize {
+        let (idx_name, after_idx) = next_token(rest);
+        if !is_valid_ident(idx_name) {
+            return copy_str(b"error: invalid index name\n", out);
+        }
+        let (kw_on, after_on) = next_token(after_idx);
+        if !eq_ignore_ascii_case(kw_on, b"ON") {
+            return copy_str(b"error: expected CREATE INDEX <name> ON <table> (<col>)\n", out);
+        }
+        let after_on = trim_sql(after_on);
+        let Some(lparen) = find_byte(after_on, b'(') else {
+            return copy_str(b"error: missing '(' in CREATE INDEX\n", out);
+        };
+        let Some(rparen) = rfind_byte(after_on, b')') else {
+            return copy_str(b"error: missing ')' in CREATE INDEX\n", out);
+        };
+        if rparen <= lparen {
+            return copy_str(b"error: malformed column in CREATE INDEX\n", out);
+        }
+        let tname = trim_sql(&after_on[..lparen]);
+        let cname = trim_sql(&after_on[lparen + 1..rparen]);
+        let Some(t_idx) = self.find_table(tname) else {
+            return copy_str(b"error: table not found\n", out);
+        };
+        let Some(c_idx) = self.tables[t_idx].find_col(cname) else {
+            return copy_str(b"error: column not found in CREATE INDEX\n", out);
+        };
+        self.tables[t_idx].indexed_col = c_idx as u8;
+        self.tables[t_idx].index_name = [0u8; SQL_IDENT_LEN];
+        self.tables[t_idx].index_name[..idx_name.len()].copy_from_slice(idx_name);
+        self.tables[t_idx].index_name_len = idx_name.len() as u8;
+        self.tables[t_idx].rebuild_index();
+        self.tx_seq = self.tx_seq.wrapping_add(1);
+        let mut pos = 0usize;
+        pos += append_bytes(out, pos, b"CREATE INDEX ");
+        pos += append_bytes(out, pos, idx_name);
+        pos += append_bytes(out, pos, b" OK\n");
+        pos
+    }
+
     fn exec_drop(&mut self, rest: &[u8], out: &mut [u8]) -> usize {
-        let (kw_table, after_table) = next_token(rest);
-        if !eq_ignore_ascii_case(kw_table, b"TABLE") {
+        let (kw_kind, after_kind) = next_token(rest);
+        if eq_ignore_ascii_case(kw_kind, b"INDEX") {
+            let (idx_name, _) = next_token(after_kind);
+            let mut i = 0usize;
+            while i < SQL_MAX_TABLES {
+                if self.tables[i].used
+                    && self.tables[i].index_name_len > 0
+                    && eq_ignore_ascii_case(self.tables[i].index_name_bytes(), idx_name)
+                {
+                    self.tables[i].indexed_col = SQL_NO_INDEX;
+                    self.tables[i].index_name = [0u8; SQL_IDENT_LEN];
+                    self.tables[i].index_name_len = 0;
+                    self.tables[i].index_hashes = [0u64; SQL_MAX_ROWS];
+                    self.tx_seq = self.tx_seq.wrapping_add(1);
+                    let mut pos = 0usize;
+                    pos += append_bytes(out, pos, b"DROP INDEX ");
+                    pos += append_bytes(out, pos, idx_name);
+                    pos += append_bytes(out, pos, b" OK\n");
+                    return pos;
+                }
+                i += 1;
+            }
+            return copy_str(b"error: index not found\n", out);
+        }
+        if !eq_ignore_ascii_case(kw_kind, b"TABLE") {
             return copy_str(b"error: expected DROP TABLE <name>\n", out);
         }
-        let (tname, _) = next_token(after_table);
+        let (tname, _) = next_token(after_kind);
         let Some(t_idx) = self.find_table(tname) else {
             return copy_str(b"error: table not found\n", out);
         };
@@ -591,14 +810,18 @@ impl SqlDb {
             r += 1;
         }
         let Some(r_idx) = free_row else {
-            return copy_str(b"error: table row capacity full (max 16)\n", out);
+            return copy_str(b"error: table row capacity full (max 64)\n", out);
         };
+        let idx_col = self.tables[t_idx].indexed_col as usize;
+        if idx_col < col_count {
+            self.tables[t_idx].index_hashes[r_idx] = hash_sql_val(&row.cells[idx_col]);
+        }
         self.tables[t_idx].rows[r_idx] = row;
         self.tx_seq = self.tx_seq.wrapping_add(1);
         copy_str(b"INSERT 1\n", out)
     }
 
-    fn exec_select(&self, rest: &[u8], out: &mut [u8]) -> usize {
+    fn exec_select(&mut self, rest: &[u8], out: &mut [u8]) -> usize {
         let Some((proj_raw, after_from)) = split_keyword_ignore_case(rest, b"FROM") else {
             return copy_str(b"error: SELECT missing FROM clause\n", out);
         };
@@ -607,7 +830,6 @@ impl SqlDb {
         let Some(t_idx) = self.find_table(tname) else {
             return copy_str(b"error: table not found\n", out);
         };
-        let table = &self.tables[t_idx];
 
         // Parse optional LIMIT <n> at tail.
         let mut limit = SQL_MAX_ROWS;
@@ -629,7 +851,7 @@ impl SqlDb {
             if eq_ignore_ascii_case(kw_by, b"BY") {
                 let (ocol, dir_raw) = next_token(after_by);
                 let (dir_tok, _) = next_token(dir_raw);
-                let Some(c_idx) = table.find_col(ocol) else {
+                let Some(c_idx) = self.tables[t_idx].find_col(ocol) else {
                     return copy_str(b"error: unknown column in ORDER BY\n", out);
                 };
                 let desc = eq_ignore_ascii_case(dir_tok, b"DESC");
@@ -645,11 +867,24 @@ impl SqlDb {
             if !eq_ignore_ascii_case(kw_where, b"WHERE") {
                 return copy_str(b"error: unexpected clause after FROM\n", out);
             }
-            let Some(parsed_cond) = parse_where_clause(table, cond_raw) else {
+            let Some(parsed_cond) = parse_where_clause(&self.tables[t_idx], cond_raw) else {
                 return copy_str(b"error: malformed WHERE condition\n", out);
             };
             filter = Some(parsed_cond);
         }
+
+        // Check if secondary hash index can accelerate an equality WHERE clause.
+        let indexed_eq_hash = match &filter {
+            Some((c_idx, CmpOp::Eq, rhs))
+                if self.tables[t_idx].indexed_col as usize == *c_idx =>
+            {
+                self.idx_hits = self.idx_hits.wrapping_add(1);
+                Some(hash_sql_val(rhs))
+            }
+            _ => None,
+        };
+
+        let table = &self.tables[t_idx];
 
         // Collect matching row indices.
         let mut matched = [0usize; SQL_MAX_ROWS];
@@ -657,6 +892,12 @@ impl SqlDb {
         let mut r = 0usize;
         while r < SQL_MAX_ROWS {
             if table.rows[r].used {
+                if let Some(h) = indexed_eq_hash {
+                    if table.index_hashes[r] != h {
+                        r += 1;
+                        continue;
+                    }
+                }
                 let pass = match &filter {
                     Some((c_idx, op, rhs)) => table.rows[r].cells[*c_idx].compare(*op, rhs),
                     None => true,
@@ -696,6 +937,56 @@ impl SqlDb {
             let mut pos = 0usize;
             pos += append_bytes(out, pos, b"count\n");
             pos += append_u64(out, pos, mcount as u64);
+            pos += append_bytes(out, pos, b"\n");
+            return pos;
+        }
+
+        // Handle SUM(<col>), MIN(<col>), MAX(<col>), AVG(<col>) aggregates.
+        if let Some((agg_kind, agg_col_name)) = parse_aggregate_proj(proj) {
+            let Some(c_idx) = table.find_col(agg_col_name) else {
+                return copy_str(b"error: unknown column in aggregate\n", out);
+            };
+            if table.cols[c_idx].col_type != SqlType::Int {
+                return copy_str(b"error: numeric aggregate requires INT column\n", out);
+            }
+            let hdr: &[u8] = match agg_kind {
+                AggKind::Sum => b"sum\n",
+                AggKind::Min => b"min\n",
+                AggKind::Max => b"max\n",
+                AggKind::Avg => b"avg\n",
+            };
+            let mut pos = 0usize;
+            pos += append_bytes(out, pos, hdr);
+            if mcount == 0 {
+                pos += append_bytes(out, pos, b"0\n");
+                return pos;
+            }
+            let mut sum: i128 = 0;
+            let mut min_v = i64::MAX;
+            let mut max_v = i64::MIN;
+            let mut k = 0usize;
+            while k < mcount {
+                if let SqlVal::Int(v) = table.rows[matched[k]].cells[c_idx] {
+                    sum = sum.saturating_add(v as i128);
+                    if v < min_v {
+                        min_v = v;
+                    }
+                    if v > max_v {
+                        max_v = v;
+                    }
+                }
+                k += 1;
+            }
+            let res_i64 = match agg_kind {
+                AggKind::Sum => sum.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+                AggKind::Min => min_v,
+                AggKind::Max => max_v,
+                AggKind::Avg => {
+                    let avg = sum / (mcount as i128);
+                    avg.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+                }
+            };
+            pos += append_i64(out, pos, res_i64);
             pos += append_bytes(out, pos, b"\n");
             return pos;
         }
@@ -798,10 +1089,26 @@ impl SqlDb {
             None
         };
 
+        let indexed_eq_hash = match &filter {
+            Some((c_idx, CmpOp::Eq, rhs))
+                if self.tables[t_idx].indexed_col as usize == *c_idx =>
+            {
+                self.idx_hits = self.idx_hits.wrapping_add(1);
+                Some(hash_sql_val(rhs))
+            }
+            _ => None,
+        };
+
         let mut updated = 0u64;
         let mut r = 0usize;
         while r < SQL_MAX_ROWS {
             if self.tables[t_idx].rows[r].used {
+                if let Some(h) = indexed_eq_hash {
+                    if self.tables[t_idx].index_hashes[r] != h {
+                        r += 1;
+                        continue;
+                    }
+                }
                 let pass = match &filter {
                     Some((c_idx, op, rhs)) => {
                         self.tables[t_idx].rows[r].cells[*c_idx].compare(*op, rhs)
@@ -810,6 +1117,9 @@ impl SqlDb {
                 };
                 if pass {
                     self.tables[t_idx].rows[r].cells[set_col_idx] = new_val;
+                    if self.tables[t_idx].indexed_col as usize == set_col_idx {
+                        self.tables[t_idx].index_hashes[r] = hash_sql_val(&new_val);
+                    }
                     updated += 1;
                 }
             }
@@ -848,10 +1158,26 @@ impl SqlDb {
             None
         };
 
+        let indexed_eq_hash = match &filter {
+            Some((c_idx, CmpOp::Eq, rhs))
+                if self.tables[t_idx].indexed_col as usize == *c_idx =>
+            {
+                self.idx_hits = self.idx_hits.wrapping_add(1);
+                Some(hash_sql_val(rhs))
+            }
+            _ => None,
+        };
+
         let mut deleted = 0u64;
         let mut r = 0usize;
         while r < SQL_MAX_ROWS {
             if self.tables[t_idx].rows[r].used {
+                if let Some(h) = indexed_eq_hash {
+                    if self.tables[t_idx].index_hashes[r] != h {
+                        r += 1;
+                        continue;
+                    }
+                }
                 let pass = match &filter {
                     Some((c_idx, op, rhs)) => {
                         self.tables[t_idx].rows[r].cells[*c_idx].compare(*op, rhs)
@@ -860,6 +1186,7 @@ impl SqlDb {
                 };
                 if pass {
                     self.tables[t_idx].rows[r] = SqlRow::empty();
+                    self.tables[t_idx].index_hashes[r] = 0;
                     deleted += 1;
                 }
             }
@@ -891,7 +1218,7 @@ impl SqlDb {
         //   8..16  : tx_seq (u64 LE)
         //   16..18 : payload_len (u16 LE)
         //   18..20 : reserved (0)
-        //   20..52 : 32-byte keyed HMAC-SHA256 tag over flat[0..20] || flat[52..52+payload_len]
+        //   20..52 : 32-byte keyed HMAC-SHA256 tag over flat[0..20] || flat[52..4096]
         let mut pos = 52usize;
         let mut t = 0usize;
         while t < SQL_MAX_TABLES {
@@ -903,8 +1230,9 @@ impl SqlDb {
                 continue;
             }
             let col_count = (tbl.col_count as usize).min(SQL_MAX_COLS);
+            let has_idx = tbl.index_name_len > 0 && (tbl.indexed_col as usize) < col_count;
             let used_rows_hdr_pos = pos + 3;
-            flat[pos] = 1;
+            flat[pos] = if has_idx { 2 } else { 1 };
             flat[pos + 1] = tbl.name_len.min(SQL_IDENT_LEN as u8);
             flat[pos + 2] = col_count as u8;
             flat[pos + 3] = 0;
@@ -922,6 +1250,14 @@ impl SqlDb {
                 c += 1;
             }
 
+            if has_idx {
+                let ilen = (tbl.index_name_len as usize).min(SQL_IDENT_LEN);
+                flat[pos] = tbl.indexed_col;
+                flat[pos + 1] = ilen as u8;
+                flat[pos + 2..pos + 2 + ilen].copy_from_slice(&tbl.index_name[..ilen]);
+                pos += 2 + ilen;
+            }
+
             let mut written_rows = 0u8;
             let mut r2 = 0usize;
             while r2 < SQL_MAX_ROWS {
@@ -932,7 +1268,13 @@ impl SqlDb {
                     let mut rc0 = 0usize;
                     while rc0 < col_count {
                         row_bytes += match row.cells[rc0] {
-                            SqlVal::Int(_) => 9,
+                            SqlVal::Int(v) => {
+                                if v >= (i16::MIN as i64) && v <= (i16::MAX as i64) {
+                                    3
+                                } else {
+                                    9
+                                }
+                            }
                             SqlVal::Text(_, len) => 2 + (len as usize).min(SQL_TEXT_LEN),
                         };
                         rc0 += 1;
@@ -945,9 +1287,16 @@ impl SqlDb {
                     while rc < col_count {
                         match row.cells[rc] {
                             SqlVal::Int(v) => {
-                                flat[pos] = SqlType::Int as u8;
-                                flat[pos + 1..pos + 9].copy_from_slice(&v.to_le_bytes());
-                                pos += 9;
+                                if v >= (i16::MIN as i64) && v <= (i16::MAX as i64) {
+                                    flat[pos] = 3; // compact i16 cell tag
+                                    flat[pos + 1..pos + 3]
+                                        .copy_from_slice(&(v as i16).to_le_bytes());
+                                    pos += 3;
+                                } else {
+                                    flat[pos] = SqlType::Int as u8;
+                                    flat[pos + 1..pos + 9].copy_from_slice(&v.to_le_bytes());
+                                    pos += 9;
+                                }
                             }
                             SqlVal::Text(buf, len) => {
                                 let l = (len as usize).min(SQL_TEXT_LEN);
@@ -1031,8 +1380,8 @@ impl SqlDb {
             if pos >= total_pos {
                 return false;
             }
-            let used = flat[pos] != 0;
-            if !used {
+            let marker = flat[pos];
+            if marker == 0 {
                 pos += 1;
                 t += 1;
                 continue;
@@ -1067,6 +1416,21 @@ impl SqlDb {
                 c += 1;
             }
 
+            if marker == 2 {
+                if pos + 2 > total_pos {
+                    return false;
+                }
+                let idx_col = flat[pos];
+                let ilen = (flat[pos + 1] as usize).min(SQL_IDENT_LEN);
+                if pos + 2 + ilen > total_pos || (idx_col as usize) >= col_count {
+                    return false;
+                }
+                tbl.indexed_col = idx_col;
+                tbl.index_name_len = ilen as u8;
+                tbl.index_name[..ilen].copy_from_slice(&flat[pos + 2..pos + 2 + ilen]);
+                pos += 2 + ilen;
+            }
+
             let mut r = 0usize;
             while r < used_rows {
                 tbl.rows[r].used = true;
@@ -1088,6 +1452,13 @@ impl SqlDb {
                         buf[..len].copy_from_slice(&flat[pos + 2..pos + 2 + len]);
                         tbl.rows[r].cells[rc] = SqlVal::Text(buf, len as u8);
                         pos += 2 + len;
+                    } else if tag_b == 3 {
+                        if pos + 3 > total_pos {
+                            return false;
+                        }
+                        let v16 = i16::from_le_bytes([flat[pos + 1], flat[pos + 2]]);
+                        tbl.rows[r].cells[rc] = SqlVal::Int(v16 as i64);
+                        pos += 3;
                     } else {
                         if pos + 9 > total_pos {
                             return false;
@@ -1101,6 +1472,7 @@ impl SqlDb {
                 }
                 r += 1;
             }
+            tbl.rebuild_index();
             parsed_tables[t] = tbl;
             t += 1;
         }
@@ -1119,6 +1491,59 @@ impl SqlDb {
 // ---------------------------------------------------------------------------
 // Lexer / Parser Helpers
 // ---------------------------------------------------------------------------
+
+/// Non-recursive iterative SQL `LIKE` pattern matcher supporting `%` (0+ bytes) and `_` (1 byte).
+pub fn sql_like_match(text: &[u8], pat: &[u8]) -> bool {
+    let mut ti = 0usize;
+    let mut pi = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti: usize = 0;
+
+    while ti < text.len() {
+        if pi < pat.len() && (pat[pi] == b'_' || pat[pi] == text[ti]) {
+            ti += 1;
+            pi += 1;
+        } else if pi < pat.len() && pat[pi] == b'%' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_ti = ti;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == b'%' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+fn parse_aggregate_proj(proj: &[u8]) -> Option<(AggKind, &[u8])> {
+    let lparen = find_byte(proj, b'(')?;
+    let rparen = rfind_byte(proj, b')')?;
+    if rparen <= lparen + 1 || rparen + 1 != proj.len() {
+        return None;
+    }
+    let fn_name = trim_sql(&proj[..lparen]);
+    let col_name = trim_sql(&proj[lparen + 1..rparen]);
+    if col_name.is_empty() {
+        return None;
+    }
+    if eq_ignore_ascii_case(fn_name, b"SUM") {
+        Some((AggKind::Sum, col_name))
+    } else if eq_ignore_ascii_case(fn_name, b"MIN") {
+        Some((AggKind::Min, col_name))
+    } else if eq_ignore_ascii_case(fn_name, b"MAX") {
+        Some((AggKind::Max, col_name))
+    } else if eq_ignore_ascii_case(fn_name, b"AVG") {
+        Some((AggKind::Avg, col_name))
+    } else {
+        None
+    }
+}
 
 fn trim_sql(s: &[u8]) -> &[u8] {
     let mut a = 0usize;
@@ -1215,6 +1640,12 @@ fn split_keyword_ignore_case<'a>(s: &'a [u8], kw: &[u8]) -> Option<(&'a [u8], &'
 
 fn parse_where_clause(table: &SqlTable, raw: &[u8]) -> Option<(usize, CmpOp, SqlVal)> {
     let raw = trim_sql(raw);
+    if let Some((col_raw, pat_raw)) = split_keyword_ignore_case(raw, b"LIKE") {
+        let col_name = trim_sql(col_raw);
+        let c_idx = table.find_col(col_name)?;
+        let val = parse_literal(trim_sql(pat_raw), SqlType::Text)?;
+        return Some((c_idx, CmpOp::Like, val));
+    }
     let ops: [(&[u8], CmpOp); 7] = [
         (b"!=", CmpOp::Ne),
         (b"<>", CmpOp::Ne),
@@ -1254,9 +1685,17 @@ fn parse_literal(raw: &[u8], expected: SqlType) -> Option<SqlVal> {
         SqlType::Int => parse_i64(raw).map(SqlVal::Int),
         SqlType::Text => {
             if raw.len() >= 2 && raw[0] == b'\'' && raw[raw.len() - 1] == b'\'' {
-                Some(SqlVal::from_text(&raw[1..raw.len() - 1]))
+                let inner = &raw[1..raw.len() - 1];
+                if find_byte(inner, b'\'').is_some() {
+                    return None;
+                }
+                Some(SqlVal::from_text(inner))
             } else if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' {
-                Some(SqlVal::from_text(&raw[1..raw.len() - 1]))
+                let inner = &raw[1..raw.len() - 1];
+                if find_byte(inner, b'"').is_some() {
+                    return None;
+                }
+                Some(SqlVal::from_text(inner))
             } else {
                 None
             }
@@ -1279,19 +1718,31 @@ fn parse_i64(s: &[u8]) -> Option<i64> {
     if digits.is_empty() {
         return None;
     }
-    let mut acc: i64 = 0;
+    let mut acc: u64 = 0;
+    let max_mag: u64 = if neg {
+        (i64::MAX as u64) + 1
+    } else {
+        i64::MAX as u64
+    };
     let mut i = 0usize;
     while i < digits.len() {
         if !digits[i].is_ascii_digit() {
             return None;
         }
-        acc = acc.checked_mul(10)?.checked_add((digits[i] - b'0') as i64)?;
+        acc = acc.checked_mul(10)?.checked_add((digits[i] - b'0') as u64)?;
+        if acc > max_mag {
+            return None;
+        }
         i += 1;
     }
     if neg {
-        Some(-acc)
+        if acc == (i64::MAX as u64) + 1 {
+            Some(i64::MIN)
+        } else {
+            Some(-(acc as i64))
+        }
     } else {
-        Some(acc)
+        Some(acc as i64)
     }
 }
 
@@ -1488,5 +1939,95 @@ mod tests {
 
         sectors[1][12] ^= 0x01;
         assert!(!bad_db.load_partition(&key, &sectors));
+    }
+
+    #[test]
+    fn sql_64_rows_secondary_index_aggregates_like_and_redteam_hardening() {
+        let mut db = SqlDb::empty();
+        let mut out = [0u8; 512];
+
+        let n = db.exec(
+            b"CREATE TABLE telemetry (id INT, tag TEXT, val INT)",
+            &mut out,
+        );
+        assert_eq!(&out[..n], b"CREATE TABLE telemetry OK\n");
+        let n = db.exec(
+            b"CREATE INDEX idx_telem_tag ON telemetry (tag)",
+            &mut out,
+        );
+        assert_eq!(&out[..n], b"CREATE INDEX idx_telem_tag OK\n");
+        let n_bad_idx = db.exec(
+            b"CREATE INDEX idx_telemetry_tag_too_long ON telemetry (tag)",
+            &mut out,
+        );
+        assert_eq!(&out[..n_bad_idx], b"error: invalid index name\n");
+
+        // Insert 64 rows up to full table capacity (Blue Team scaling verification).
+        for i in 0..64i64 {
+            let prefix: &[u8] = if i % 2 == 0 { b"sensor.cpu." } else { b"net.eth." };
+            let mut q = [0u8; 128];
+            let mut pos = 0usize;
+            pos += append_bytes(&mut q, pos, b"INSERT INTO telemetry VALUES (");
+            pos += append_i64(&mut q, pos, i + 1);
+            pos += append_bytes(&mut q, pos, b", '");
+            pos += append_bytes(&mut q, pos, prefix);
+            pos += append_i64(&mut q, pos, i);
+            pos += append_bytes(&mut q, pos, b"', ");
+            pos += append_i64(&mut q, pos, (i + 1) * 10);
+            pos += append_bytes(&mut q, pos, b")");
+            let n = db.exec(&q[..pos], &mut out);
+            assert_eq!(&out[..n], b"INSERT 1\n");
+        }
+        // 65th insert must be cleanly rejected at the 64-row boundary.
+        let n = db.exec(b"INSERT INTO telemetry VALUES (65, 'overflow', 650)", &mut out);
+        assert_eq!(&out[..n], b"error: table row capacity full (max 64)\n");
+
+        // Index-accelerated equality lookup increments `idx_hits`:
+        let hits_before = db.idx_hits;
+        let n = db.exec(
+            b"SELECT id, val FROM telemetry WHERE tag = 'sensor.cpu.42'",
+            &mut out,
+        );
+        assert_eq!(&out[..n], b"id|val\n43|430\n");
+        assert_eq!(db.idx_hits, hits_before + 1);
+
+        // Aggregates: SUM, MIN, MAX, AVG over all 64 rows (sum of 10..=640 = 20800, avg = 325).
+        let n = db.exec(b"SELECT SUM(val) FROM telemetry", &mut out);
+        assert_eq!(&out[..n], b"sum\n20800\n");
+        let n = db.exec(b"SELECT MIN(val) FROM telemetry", &mut out);
+        assert_eq!(&out[..n], b"min\n10\n");
+        let n = db.exec(b"SELECT MAX(val) FROM telemetry", &mut out);
+        assert_eq!(&out[..n], b"max\n640\n");
+        let n = db.exec(b"SELECT AVG(val) FROM telemetry", &mut out);
+        assert_eq!(&out[..n], b"avg\n325\n");
+
+        // LIKE pattern matching (`WHERE tag LIKE 'sensor.cpu.%'` matches 32 even rows).
+        let n = db.exec(
+            b"SELECT COUNT(*) FROM telemetry WHERE tag LIKE 'sensor.cpu.%'",
+            &mut out,
+        );
+        assert_eq!(&out[..n], b"count\n32\n");
+
+        // Persist all 64 rows + secondary index metadata into the 8-sector PRTSSQL1 partition and restore.
+        let key = [0x99u8; 32];
+        let mut sectors = [[0u8; 512]; SQL_PART_SECTORS];
+        db.save_partition(&key, &mut sectors);
+        let mut restored = SqlDb::empty();
+        assert!(restored.load_partition(&key, &sectors));
+        assert_eq!(restored.total_rows(), 64);
+        let n = restored.exec(
+            b"SELECT id, val FROM telemetry WHERE tag = 'net.eth.63'",
+            &mut out,
+        );
+        assert_eq!(&out[..n], b"id|val\n64|640\n");
+        assert_eq!(restored.idx_hits, 1);
+
+        // Red Team parser hardening: reject interior unescaped quotes, integer overflow beyond i64, and pathological LIKE patterns.
+        let n = restored.exec(b"SELECT * FROM telemetry WHERE tag = 'a' OR '1'='1'", &mut out);
+        assert_eq!(&out[..n], b"error: malformed WHERE condition\n");
+        let n = restored.exec(b"SELECT * FROM telemetry WHERE id = 99999999999999999999999", &mut out);
+        assert_eq!(&out[..n], b"error: malformed WHERE condition\n");
+        assert!(sql_like_match(b"sensor.cpu.42", b"%%%%%sensor%_%42%%%%"));
+        assert!(!sql_like_match(b"sensor.cpu.42", b"%%%%%sensor%_%99%%%%"));
     }
 }

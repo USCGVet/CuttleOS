@@ -129,11 +129,17 @@ pub(crate) fn banner_dma() {
 /// Live hardware GDT + 64-bit TSS (`lgdt`/`ltr`), 256-entry IDT (`lidt`),
 /// `IST1` breakpoint exception (`int3`), and Ring-0 -> Ring-3 (`iretq`) ->
 /// Ring-0 (`int 0x80` on `RSP0` + `dispatch_with_cap`) privilege transition proof.
-/// Execute a 21-byte x86-64 Ring-3 (`CPL=3`) machine-code stub at hardware `CPL=3` via
+/// Execute a 32-byte x86-64 Ring-3 (`CPL=3`) machine-code stub at hardware `CPL=3` via
 /// `iretq` -> `int 0x80` on `TSS.RSP0`, verifying the `IST1` breakpoint stack switch,
-/// `CPL=3` `USER_CODE_SEL`/`USER_DATA_SEL` selectors, `SYS_GETPID` trap, and `expected_arg0`.
+/// `CPL=3` `USER_CODE_SEL`/`USER_DATA_SEL` selectors, user-mapped IPC mailbox request/canary
+/// read (`[rsp - 0x20]`) and signed response write (`[rsp - 0x18]`), `SYS_GETPID` trap, and `expected_arg0`.
 #[inline(never)]
-pub(crate) fn exec_service_ring3_stub(ring3_code: &[u8; 21], expected_arg0: u64) -> bool {
+pub(crate) fn exec_service_ring3_stub(
+    ring3_code: &[u8; 32],
+    mailbox_req_word: u64,
+    expected_arg0: u64,
+    corrupt_canary: bool,
+) -> bool {
     use target_enterprise::gdt::{
         Gdt, Tss64, KERNEL_CODE_SEL, KERNEL_DATA_SEL, TSS64_LEN, TSS_SEL, USER_CODE_SEL,
         USER_DATA_SEL,
@@ -151,8 +157,8 @@ pub(crate) fn exec_service_ring3_stub(ring3_code: &[u8; 21], expected_arg0: u64)
     // Dedicated physical frames in `dma + 0x2_4000 .. dma + 0x2_B000`:
     //   +0x2_4000: PDPT for temporary lower-half user mapping
     //   +0x2_5000: PD
-    //   +0x2_6000: PT (`PT[0]` = Ring-3 code/stack page, `PT[1]` = Ring-0 ISR trampoline page)
-    //   +0x2_7000: Ring-3 user code + stack frame
+    //   +0x2_6000: PT (`PT[0]` = Ring-3 code/stack/mailbox page, `PT[1]` = Ring-0 ISR trampoline page)
+    //   +0x2_7000: Ring-3 user code + stack + IPC mailbox frame (`+0xFD0` request/canary, `+0xFD8` response)
     //   +0x2_8000: Ring-0 ISR trampoline + state frame
     //   +0x2_9000: Live 256-entry IDT (4096 bytes)
     //   +0x2_A000: Live GDT (`+0x000`), descriptor pointers (`+0x040..+0x080`),
@@ -221,7 +227,13 @@ pub(crate) fn exec_service_ring3_stub(ring3_code: &[u8; 21], expected_arg0: u64)
         );
     }
 
-    // Write Ring-3 payload into `user_phys`.
+    // Write Ring-3 payload into `user_phys` and populate the user-mapped IPC mailbox request + canary
+    // word at `user_phys + 0xFD0` (`[rsp - 0x20]`).
+    let planted_req = if corrupt_canary {
+        mailbox_req_word ^ 0xDEAD_BEEF_0000_0000
+    } else {
+        mailbox_req_word
+    };
     // SAFETY: `user_phys` is a dedicated 4 KiB frame in the reserved DMA window mapped via `pa_to_va`.
     unsafe {
         let dst = pa_to_va(user_phys);
@@ -229,6 +241,12 @@ pub(crate) fn exec_service_ring3_stub(ring3_code: &[u8; 21], expected_arg0: u64)
         while i < ring3_code.len() {
             core::ptr::write_volatile(dst.add(i), ring3_code[i]);
             i += 1;
+        }
+        let req_bytes = planted_req.to_le_bytes();
+        let mut k = 0usize;
+        while k < 8 {
+            core::ptr::write_volatile(dst.add(0xFD0 + k), req_bytes[k]);
+            k += 1;
         }
     }
 
@@ -391,10 +409,10 @@ pub(crate) fn exec_service_ring3_stub(ring3_code: &[u8; 21], expected_arg0: u64)
             "3:",
             "mov [r8 + 0x10], rsp",
             "push {u_ss}",
-            "push {u_rsp}",
+            "push rsi",
             "push 0x2",
             "push {u_cs}",
-            "push {u_rip}",
+            "push rdi",
             "iretq",
             "4:",
             // Restore bootloader GDTR, CS, SS, IDTR, and RFLAGS.
@@ -413,6 +431,11 @@ pub(crate) fn exec_service_ring3_stub(ring3_code: &[u8; 21], expected_arg0: u64)
             in("r10") idtr_orig_va,
             in("r11") gdtr_new_va,
             in("r12") idtr_new_va,
+            inout("rsi") user_rsp => _,
+            inout("rdi") user_va => _,
+            out("rax") _,
+            out("rcx") _,
+            out("rdx") _,
             out("r13") _,
             out("r14") _,
             out("r15") _,
@@ -420,17 +443,23 @@ pub(crate) fn exec_service_ring3_stub(ring3_code: &[u8; 21], expected_arg0: u64)
             k_ds = const (KERNEL_DATA_SEL as u32),
             tss_sel = const (TSS_SEL as u32),
             u_ss = const (USER_DATA_SEL as u64),
-            u_rsp = in(reg) user_rsp,
             u_cs = const (USER_CODE_SEL as u64),
-            u_rip = in(reg) user_va,
             clobber_abi("C"),
         );
     }
 
-    // Read back the hardware state captured by `isr_breakpoint_ist1` and `isr_syscall_int80`.
-    // SAFETY: `tramp_state_va` points to the 64-bit state slots at `tramp_phys + 0x200`, and `pml4_va` points to the active PML4.
-    let (bp_count, bp_rsp, r3_cs, frame_cs, frame_ss, sys_nr, sys_arg0, trap_rsp) = unsafe {
+    // Read back the hardware state captured by `isr_breakpoint_ist1` and `isr_syscall_int80`,
+    // plus the signed IPC response word written by `CPL=3` into `user_phys + 0xFD8` (`[rsp - 0x18]`).
+    // SAFETY: `tramp_state_va` points to the 64-bit state slots at `tramp_phys + 0x200`, `user_phys` is mapped via `pa_to_va`, and `pml4_va` points to the active PML4.
+    let (bp_count, bp_rsp, r3_cs, frame_cs, frame_ss, sys_nr, sys_arg0, trap_rsp, mb_resp) = unsafe {
         let st = pa_to_va(tramp_phys + 0x200) as *const u64;
+        let user_ptr = pa_to_va(user_phys);
+        let mut mb_bytes = [0u8; 8];
+        let mut m = 0usize;
+        while m < 8 {
+            mb_bytes[m] = core::ptr::read_volatile(user_ptr.add(0xFD8 + m));
+            m += 1;
+        }
         let vals = (
             core::ptr::read_volatile(st.add(0)),
             core::ptr::read_volatile(st.add(1)),
@@ -440,6 +469,7 @@ pub(crate) fn exec_service_ring3_stub(ring3_code: &[u8; 21], expected_arg0: u64)
             core::ptr::read_volatile(st.add(7)),
             core::ptr::read_volatile(st.add(8)),
             core::ptr::read_volatile(st.add(9)),
+            u64::from_le_bytes(mb_bytes),
         );
         // Tear down temporary PML4 entry and flush TLB.
         core::ptr::write_volatile(pml4_va.add(pml4_slot), 0);
@@ -465,7 +495,8 @@ pub(crate) fn exec_service_ring3_stub(ring3_code: &[u8; 21], expected_arg0: u64)
     if trap_rsp != rsp0_top - 40 {
         return false;
     }
-    if sys_nr != SYS_GETPID || sys_arg0 != expected_arg0 {
+    let expected_resp = mailbox_req_word ^ expected_arg0;
+    if sys_nr != SYS_GETPID || sys_arg0 != expected_resp || mb_resp != expected_resp {
         return false;
     }
 
@@ -473,21 +504,28 @@ pub(crate) fn exec_service_ring3_stub(ring3_code: &[u8; 21], expected_arg0: u64)
         Ok(v) => v,
         Err(_) => return false,
     };
-    pid == 1 && pid.wrapping_add(sys_arg0) == 1u64.wrapping_add(expected_arg0)
+    pid == 1 && pid.wrapping_add(sys_arg0) == 1u64.wrapping_add(expected_resp)
 }
 
 #[cfg(not(proteus_prod))]
 #[inline(never)]
 pub(crate) fn banner_ring3_transition() {
-    let ring3_code: [u8; 21] = [
-        0x8C, 0xC8,
-        0x48, 0x89, 0xC6,
-        0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00,
-        0x48, 0xC7, 0xC2, 0x2A, 0x00, 0x00, 0x00,
-        0xCD, 0x80,
+    let ring3_code: [u8; 32] = [
+        0x8C, 0xC8, // mov eax, cs
+        0x48, 0x89, 0xC6, // mov rsi, rax
+        0x48, 0x8B, 0x44, 0x24, 0xE0, // mov rax, [rsp - 0x20]
+        0x48, 0x89, 0xC2, // mov rdx, rax
+        0x48, 0x81, 0xF2, 0x2A, 0x00, 0x00, 0x00, // xor rdx, 42
+        0x48, 0x89, 0x54, 0x24, 0xE8, // mov [rsp - 0x18], rdx
+        0xBF, 0x02, 0x00, 0x00, 0x00, // mov edi, 2 (SYS_GETPID)
+        0xCD, 0x80, // int 0x80
     ];
-    if !exec_service_ring3_stub(&ring3_code, 42) {
+    if !exec_service_ring3_stub(&ring3_code, 0, 42, false) {
         panic!("RING3: hardware CPL=3 transition verification failed");
+    }
+    // Red Team negative verification: corrupted user-space mailbox canary must be rejected.
+    if exec_service_ring3_stub(&ring3_code, 0xA55A_3C3C_0000_0001, 42, true) {
+        panic!("RING3: corrupted user-space mailbox canary was not rejected");
     }
     serial_write_str("RING3 transition OK cpl=3->0 vec=0x80 ist1=ok rsp0=ok syscall=43\n");
 }

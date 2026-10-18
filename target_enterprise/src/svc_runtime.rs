@@ -439,8 +439,9 @@ impl IpcMessage {
     }
 }
 
-/// Byte length of each service's diversified x86-64 `CPL=3` machine-code stub (`mov eax, cs; mov rsi, rax; mov rdi, 2; mov rdx, tag; int 0x80`).
-pub const SVC_RING3_STUB_LEN: usize = 21;
+/// Byte length of each service's diversified x86-64 `CPL=3` machine-code stub
+/// (`mov eax, cs; mov rsi, rax; mov rax, [rsp-0x20]; mov rdx, rax; xor rdx, salt32; mov [rsp-0x18], rdx; mov edi, 2; int 0x80`).
+pub const SVC_RING3_STUB_LEN: usize = 32;
 
 /// Per-service IPC & hardware execution mailbox.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -449,6 +450,8 @@ pub struct IpcMailbox {
     pub req_seq: u64,
     /// Last [`IpcOp`] discriminant delivered to this service (`0` when idle).
     pub last_op: u8,
+    /// Per-service 32-bit mailbox canary verified across hardware `CPL=3` mailbox transitions.
+    pub canary: u32,
     /// Last 64-bit response tag returned by this service's ELF64 handler.
     pub resp_tag: u64,
     /// Number of populated user-mode entries verified in the serialized x86-64 PML4 (`x86_pml4::serialize_into`).
@@ -463,6 +466,7 @@ impl IpcMailbox {
         Self {
             req_seq: 0,
             last_op: 0,
+            canary: 0,
             resp_tag: 0,
             pml4_entries: 0,
             cpl3_runs: 0,
@@ -751,6 +755,7 @@ impl ServiceSupervisor {
         slot.user_l4 = user_l4;
         slot.kpti_isolated = true;
         slot.mailbox.pml4_entries = slot.user_l4.len();
+        slot.mailbox.canary = ((variant_seed as u32).wrapping_mul(0x9E37_79B9)) ^ 0xA55A_3C3C;
         slot.ring3_code = ring3_code;
         slot.ring3_expected_arg0 = ring3_expected_arg0;
         slot.elf_sha256 = bin_dig;
@@ -1163,14 +1168,19 @@ pub fn verify_service_kpti_isolation(user_l4: &PageTable<8>, svc: ServiceId) -> 
     true
 }
 
-/// Synthesize a diversified 21-byte x86-64 Ring-3 (`CPL=3`) machine-code stub for `svc`
-/// parameterized by `variant_seed`:
+/// Synthesize a diversified 32-byte x86-64 Ring-3 (`CPL=3`) machine-code stub for `svc`
+/// parameterized by `variant_seed` that reads the user-mapped IPC mailbox request + canary word
+/// from `[rsp - 0x20]`, signs it with `salt32`, writes the response to `[rsp - 0x18]`, and
+/// traps to Ring-0 via `int 0x80`:
 ///
 /// ```text
 ///   8C C8                         mov eax, cs
 ///   48 89 C6                      mov rsi, rax
-///   48 C7 C7 02 00 00 00          mov rdi, 2        (SYS_GETPID)
-///   48 C7 C2 <imm32 LE>           mov rdx, <arg0>
+///   48 8B 44 24 E0                mov rax, qword ptr [rsp - 0x20]
+///   48 89 C2                      mov rdx, rax
+///   48 81 F2 <imm32 LE>           xor rdx, <salt32>
+///   48 89 54 24 E8                mov qword ptr [rsp - 0x18], rdx
+///   BF 02 00 00 00                mov edi, 2        (SYS_GETPID)
 ///   CD 80                         int 0x80
 /// ```
 ///
@@ -1185,8 +1195,11 @@ pub fn build_service_ring3_stub(
     let code: [u8; SVC_RING3_STUB_LEN] = [
         0x8C, 0xC8, // mov eax, cs
         0x48, 0x89, 0xC6, // mov rsi, rax
-        0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00, // mov rdi, 2 (SYS_GETPID)
-        0x48, 0xC7, 0xC2, b[0], b[1], b[2], b[3], // mov rdx, salt32
+        0x48, 0x8B, 0x44, 0x24, 0xE0, // mov rax, [rsp - 0x20]
+        0x48, 0x89, 0xC2, // mov rdx, rax
+        0x48, 0x81, 0xF2, b[0], b[1], b[2], b[3], // xor rdx, salt32
+        0x48, 0x89, 0x54, 0x24, 0xE8, // mov [rsp - 0x18], rdx
+        0xBF, 0x02, 0x00, 0x00, 0x00, // mov edi, 2 (SYS_GETPID)
         0xCD, 0x80, // int 0x80
     ];
     (code, salt32 as u64)

@@ -1169,12 +1169,270 @@ impl Tls13Client for Tls13ClientImpl {
 }
 
 // ============================================================
+// RFC 7748 X25519 Curve25519 Elliptic-Curve Diffie-Hellman
+// ============================================================
+
+fn fe_car25519(o: &mut [i64; 16]) {
+    let mut i = 0usize;
+    while i < 16 {
+        o[i] += 1i64 << 16;
+        let c = o[i] >> 16;
+        if i < 15 {
+            o[i + 1] += c - 1;
+        } else {
+            o[0] += 38 * (c - 1);
+        }
+        o[i] -= c << 16;
+        i += 1;
+    }
+}
+
+fn fe_sel25519(p: &mut [i64; 16], q: &mut [i64; 16], b: i64) {
+    let c = !(b - 1);
+    let mut i = 0usize;
+    while i < 16 {
+        let t = c & (p[i] ^ q[i]);
+        p[i] ^= t;
+        q[i] ^= t;
+        i += 1;
+    }
+}
+
+fn fe_unpack25519(o: &mut [i64; 16], n: &[u8; 32]) {
+    let mut i = 0usize;
+    while i < 16 {
+        o[i] = (n[2 * i] as i64) + ((n[2 * i + 1] as i64) << 8);
+        i += 1;
+    }
+    o[15] &= 0x7fff;
+}
+
+fn fe_pack25519(o: &mut [u8; 32], n: &[i64; 16]) {
+    let mut t = *n;
+    fe_car25519(&mut t);
+    fe_car25519(&mut t);
+    fe_car25519(&mut t);
+    let mut m = [0i64; 16];
+    let mut j = 0usize;
+    while j < 2 {
+        m[0] = t[0] - 0xffed;
+        let mut i = 1usize;
+        while i < 15 {
+            m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1);
+            m[i - 1] &= 0xffff;
+            i += 1;
+        }
+        m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1);
+        let b = (m[15] >> 16) & 1;
+        m[14] &= 0xffff;
+        fe_sel25519(&mut t, &mut m, 1 - b);
+        j += 1;
+    }
+    let mut i = 0usize;
+    while i < 16 {
+        o[2 * i] = (t[i] & 0xff) as u8;
+        o[2 * i + 1] = (t[i] >> 8) as u8;
+        i += 1;
+    }
+}
+
+fn fe_add25519(a: &[i64; 16], b: &[i64; 16]) -> [i64; 16] {
+    let mut o = [0i64; 16];
+    let mut i = 0usize;
+    while i < 16 {
+        o[i] = a[i] + b[i];
+        i += 1;
+    }
+    o
+}
+
+fn fe_sub25519(a: &[i64; 16], b: &[i64; 16]) -> [i64; 16] {
+    let mut o = [0i64; 16];
+    let mut i = 0usize;
+    while i < 16 {
+        o[i] = a[i] - b[i];
+        i += 1;
+    }
+    o
+}
+
+fn fe_mul25519(a: &[i64; 16], b: &[i64; 16]) -> [i64; 16] {
+    let mut t = [0i64; 31];
+    let mut i = 0usize;
+    while i < 16 {
+        let mut j = 0usize;
+        while j < 16 {
+            t[i + j] += a[i] * b[j];
+            j += 1;
+        }
+        i += 1;
+    }
+    let mut k = 0usize;
+    while k < 15 {
+        t[k] += 38 * t[k + 16];
+        k += 1;
+    }
+    let mut o = [0i64; 16];
+    let mut idx = 0usize;
+    while idx < 16 {
+        o[idx] = t[idx];
+        idx += 1;
+    }
+    fe_car25519(&mut o);
+    fe_car25519(&mut o);
+    o
+}
+
+fn fe_inv25519(inp: &[i64; 16]) -> [i64; 16] {
+    let mut c = *inp;
+    let mut a = 253i32;
+    while a >= 0 {
+        c = fe_mul25519(&c, &c);
+        if a != 2 && a != 4 {
+            c = fe_mul25519(&c, inp);
+        }
+        a -= 1;
+    }
+    c
+}
+
+/// Constant-time RFC 7748 §5 X25519 scalar multiplication over $GF(2^{255}-19)$.
+///
+/// Computes `out = X25519(scalar, point)` using a 255-step Montgomery ladder and
+/// returns `true` if the resulting shared secret is non-zero, or `false` if `point`
+/// is a low-order torsion point producing the all-zero shared secret (RFC 8446 §7.4.2).
+pub fn x25519_scalarmult(scalar: &[u8; 32], point: &[u8; 32], out: &mut [u8; 32]) -> bool {
+    let mut z = *scalar;
+    z[0] &= 248;
+    z[31] = (z[31] & 127) | 64;
+
+    let mut x = [0i64; 16];
+    fe_unpack25519(&mut x, point);
+
+    let mut a = [0i64; 16];
+    let mut b = x;
+    let mut c = [0i64; 16];
+    let mut d = [0i64; 16];
+    a[0] = 1;
+    d[0] = 1;
+
+    let mut c121665 = [0i64; 16];
+    c121665[0] = 0xdb41;
+    c121665[1] = 1;
+
+    let mut i = 254i32;
+    while i >= 0 {
+        let bit_idx = i as usize;
+        let r = ((z[bit_idx >> 3] >> (bit_idx & 7)) & 1) as i64;
+        fe_sel25519(&mut a, &mut b, r);
+        fe_sel25519(&mut c, &mut d, r);
+
+        let e = fe_add25519(&a, &c);
+        a = fe_sub25519(&a, &c);
+        c = fe_add25519(&b, &d);
+        b = fe_sub25519(&b, &d);
+        d = fe_mul25519(&e, &e);
+        let f = fe_mul25519(&a, &a);
+        a = fe_mul25519(&c, &a);
+        c = fe_mul25519(&b, &e);
+        let e2 = fe_add25519(&a, &c);
+        a = fe_sub25519(&a, &c);
+        b = fe_mul25519(&a, &a);
+        c = fe_sub25519(&d, &f);
+        a = fe_mul25519(&c, &c121665);
+        a = fe_add25519(&a, &d);
+        c = fe_mul25519(&c, &a);
+        a = fe_mul25519(&d, &f);
+        d = fe_mul25519(&b, &x);
+        b = fe_mul25519(&e2, &e2);
+
+        fe_sel25519(&mut a, &mut b, r);
+        fe_sel25519(&mut c, &mut d, r);
+        i -= 1;
+    }
+
+    let inv_c = fe_inv25519(&c);
+    let res = fe_mul25519(&a, &inv_c);
+    fe_pack25519(out, &res);
+
+    let mut nz = 0u8;
+    let mut k = 0usize;
+    while k < 32 {
+        nz |= out[k];
+        k += 1;
+    }
+    nz != 0
+}
+
+/// Derive an X25519 public key `X25519(scalar, 9)` from `scalar`.
+pub fn x25519_basepoint(scalar: &[u8; 32]) -> [u8; 32] {
+    let mut base = [0u8; 32];
+    base[0] = 9;
+    let mut out = [0u8; 32];
+    let _ = x25519_scalarmult(scalar, &base, &mut out);
+    out
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn x25519_rfc7748_section_6_1_kat_and_low_order_rejection() {
+        let alice_priv: [u8; 32] = [
+            0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d,
+            0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2, 0x66, 0x45,
+            0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a,
+            0xb1, 0x77, 0xfb, 0xa5, 0x1d, 0xb9, 0x2c, 0x2a,
+        ];
+        let alice_pub_expected: [u8; 32] = [
+            0x85, 0x20, 0xf0, 0x09, 0x89, 0x30, 0xa7, 0x54,
+            0x74, 0x8b, 0x7d, 0xdc, 0xb4, 0x3e, 0xf7, 0x5a,
+            0x0d, 0xbf, 0x3a, 0x0d, 0x26, 0x38, 0x1a, 0xf4,
+            0xeb, 0xa4, 0xa9, 0x8e, 0xaa, 0x9b, 0x4e, 0x6a,
+        ];
+        let bob_priv: [u8; 32] = [
+            0x5d, 0xab, 0x08, 0x7e, 0x62, 0x4a, 0x8a, 0x4b,
+            0x79, 0xe1, 0x7f, 0x8b, 0x83, 0x80, 0x0e, 0xe6,
+            0x6f, 0x3b, 0xb1, 0x29, 0x26, 0x18, 0xb6, 0xfd,
+            0x1c, 0x2f, 0x8b, 0x27, 0xff, 0x88, 0xe0, 0xeb,
+        ];
+        let bob_pub_expected: [u8; 32] = [
+            0xde, 0x9e, 0xdb, 0x7d, 0x7b, 0x7d, 0xc1, 0xb4,
+            0xd3, 0x5b, 0x61, 0xc2, 0xec, 0xe4, 0x35, 0x37,
+            0x3f, 0x83, 0x43, 0xc8, 0x5b, 0x78, 0x67, 0x4d,
+            0xad, 0xfc, 0x7e, 0x14, 0x6f, 0x88, 0x2b, 0x4f,
+        ];
+        let shared_expected: [u8; 32] = [
+            0x4a, 0x5d, 0x9d, 0x5b, 0xa4, 0xce, 0x2d, 0xe1,
+            0x72, 0x8e, 0x3b, 0xf4, 0x80, 0x35, 0x0f, 0x25,
+            0xe0, 0x7e, 0x21, 0xc9, 0x47, 0xd1, 0x9e, 0x33,
+            0x76, 0xf0, 0x9b, 0x3c, 0x1e, 0x16, 0x17, 0x42,
+        ];
+
+        let alice_pub = x25519_basepoint(&alice_priv);
+        let bob_pub = x25519_basepoint(&bob_priv);
+        assert_eq!(alice_pub, alice_pub_expected);
+        assert_eq!(bob_pub, bob_pub_expected);
+
+        let mut shared_ab = [0u8; 32];
+        let mut shared_ba = [0u8; 32];
+        assert!(x25519_scalarmult(&alice_priv, &bob_pub, &mut shared_ab));
+        assert!(x25519_scalarmult(&bob_priv, &alice_pub, &mut shared_ba));
+        assert_eq!(shared_ab, shared_expected);
+        assert_eq!(shared_ba, shared_expected);
+
+        // Red Team: low-order torsion points (0 and 1) must be rejected (`false`).
+        let mut bad_out = [0u8; 32];
+        assert!(!x25519_scalarmult(&alice_priv, &[0u8; 32], &mut bad_out));
+        let mut order2 = [0u8; 32];
+        order2[0] = 1;
+        assert!(!x25519_scalarmult(&alice_priv, &order2, &mut bad_out));
+    }
 
     // ---- resumption (RFC 8446 §4.6.1) ----
 

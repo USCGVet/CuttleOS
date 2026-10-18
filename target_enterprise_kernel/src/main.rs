@@ -782,9 +782,11 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 static CONSOLE_NET_REPLIES: spin::Mutex<target_enterprise::ReplySet> =
     spin::Mutex::new(target_enterprise::ReplySet::new());
 static CONSOLE_NET_FRAME: spin::Mutex<[u8; 2048]> = spin::Mutex::new([0u8; 2048]);
+static CONSOLE_NET_SVC: spin::Mutex<target_enterprise::LivedNet> =
+    spin::Mutex::new(target_enterprise::LivedNet::empty());
 
 /// Unified continuous OS event loop multiplexing:
-/// - VirtIO-Net (`VnetModern`) + [`target_enterprise::LivedNet`] (`HTTP :80`, `TLS 1.3 :443`, `UDP :8080`, `ICMP`, `ARP`)
+/// - VirtIO-Net (`VnetModern`) + [`target_enterprise::LivedNet`] (`HTTP :80`, `TLS 1.3 :443`, `UDP :8080`, `UDP :8081`, `ICMP`, `ARP`)
 /// - Serial console (`COM1` `0x3F8`) and PS/2 keyboard (`0x60`/`0x64`)
 /// - Live AHCI disk persistence (`LBA 1040..=1065`) on `sync`, SQL mutations, `halt`, and `reboot`
 pub(crate) fn live_os_console_loop() -> ! {
@@ -821,12 +823,14 @@ pub(crate) fn live_os_console_loop() -> ! {
         gw[38..42].copy_from_slice(&[10, 0, 2, 2]);
         vnet_tx(vn, &gw);
     }
-    let mut net_svc_opt = vnet_opt.as_ref().map(|vn| {
-        match derive_runtime_net_auth_key(vn.mac) {
+    let mut svc_guard = CONSOLE_NET_SVC.lock();
+    let svc: &mut target_enterprise::LivedNet = &mut *svc_guard;
+    if let Some(vn) = vnet_opt.as_ref() {
+        *svc = match derive_runtime_net_auth_key(vn.mac) {
             Some(k) => target_enterprise::LivedNet::with_auth_key(vn.mac, k),
             None => target_enterprise::LivedNet::new_unprovisioned(vn.mac),
-        }
-    });
+        };
+    }
     let mut net_rx: u64 = 0;
     let mut net_tx: u64 = 0;
     let mut last_sql_tx: u64 = sh.db.tx_seq;
@@ -845,8 +849,9 @@ pub(crate) fn live_os_console_loop() -> ! {
         let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
         let mut did_io = false;
 
-        // 0. Drain live VirtIO-Net interface for HTTP (:80), TLS 1.3 (:443), UDP (:8080), ICMP, and ARP.
-        if let (Some(vn), Some(svc)) = (vnet_opt.as_mut(), net_svc_opt.as_mut()) {
+        // 0. Drain live VirtIO-Net interface for HTTP (:80), TLS 1.3 (:443), UDP (:8080/:8081), ICMP, and ARP.
+        if let Some(vn) = vnet_opt.as_mut() {
+            let _ = svc.tick_tcp_rto();
             let mut f_guard = CONSOLE_NET_FRAME.lock();
             while let Some((flen, head_id)) = vnet_rx(vn, &mut *f_guard) {
                 did_io = true;

@@ -202,6 +202,18 @@ pub struct OsShell {
     pub failed_login_streak: u32,
     /// Remaining decaying cooldown ticks while login brute-force lockout is active (`0` = unlocked).
     pub login_cooldown_ticks: u32,
+    /// Node index (`0..=2`) within the 3-node Triad TMR cluster.
+    pub triad_node_id: u8,
+    /// Highest replicated SQL transaction sequence number committed on this node.
+    pub triad_tx_seq: u64,
+    /// Latest reported SQL transaction sequence per Triad peer (`0..3`).
+    pub triad_peer_seq: [u64; 3],
+    /// Latest reported 64-bit FNV-1a SQL state hash per Triad peer (`0..3`).
+    pub triad_peer_hash: [u64; 3],
+    /// Total 2-of-3 TMR quorum-verified SQL transactions committed across the cluster.
+    pub triad_quorum_commits: u64,
+    /// Total TMR state-hash divergence alerts detected across peer acknowledgments.
+    pub triad_divergences: u64,
     /// Next PID to assign on `spawn`.
     next_pid: TaskId,
     /// Monotonic command counter (used as synthetic timestamp/sequence).
@@ -243,6 +255,12 @@ impl OsShell {
             svc: crate::svc_runtime::ServiceSupervisor::empty(),
             failed_login_streak: 0,
             login_cooldown_ticks: 0,
+            triad_node_id: 0,
+            triad_tx_seq: 0,
+            triad_peer_seq: [0u64; 3],
+            triad_peer_hash: [0u64; 3],
+            triad_quorum_commits: 0,
+            triad_divergences: 0,
             next_pid: 5,
             cmd_seq: 1,
             line_buf: [0u8; SHELL_LINE_MAX],
@@ -349,6 +367,13 @@ impl OsShell {
         // with a per-node AND per-boot base seed derived from `self.seal_key` and `boot_gen`.
         self.failed_login_streak = 0;
         self.login_cooldown_ticks = 0;
+        self.triad_node_id = 0;
+        self.triad_tx_seq = 0;
+        let init_hash = self.db.state_hash();
+        self.triad_peer_seq = [0u64; 3];
+        self.triad_peer_hash = [init_hash, 0, 0];
+        self.triad_quorum_commits = 0;
+        self.triad_divergences = 0;
         self.svc = crate::svc_runtime::ServiceSupervisor::empty();
         let base_seed =
             crate::svc_runtime::derive_service_base_seed_for_boot(&self.seal_key, boot_gen.max(1));
@@ -626,7 +651,8 @@ impl OsShell {
             || bytes_eq(cmd, b"seccomp")
             || bytes_eq(cmd, b"session")
             || bytes_eq(cmd, b"smp")
-            || bytes_eq(cmd, b"service"))
+            || bytes_eq(cmd, b"service")
+            || bytes_eq(cmd, b"triad"))
             && (rest.is_empty() || bytes_eq(rest, b"status") || bytes_eq(rest, b"threads"))
         {
             return true;
@@ -1552,6 +1578,11 @@ impl OsShell {
 
         if bytes_eq(cmd, b"service") || bytes_eq(cmd, b"svc") {
             let n = self.cmd_service(rest, out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"triad") {
+            let n = self.cmd_triad(rest, out);
             return ShellAction::Continue(n);
         }
 
@@ -2567,6 +2598,147 @@ impl OsShell {
 
         copy_into(
             b"usage: service [status | role <wfe|sql|shell|full> | rotate <name> [seed] | crash <name> | restart <name>]\n",
+            out,
+        )
+    }
+
+    /// Synchronize this node's slot (`self.triad_node_id % 3`) in `triad_peer_seq`
+    /// and `triad_peer_hash` with the current local SQL state hash.
+    pub fn sync_triad_local(&mut self) {
+        let idx = (self.triad_node_id as usize) % 3;
+        self.triad_peer_seq[idx] = self.triad_tx_seq;
+        self.triad_peer_hash[idx] = self.db.state_hash();
+    }
+
+    /// Count how many Triad nodes (`1..=3`) currently agree on this node's
+    /// `triad_tx_seq` and 64-bit FNV-1a SQL `state_hash()`.
+    pub fn triad_quorum_count(&self) -> usize {
+        let local_hash = self.db.state_hash();
+        let local_idx = (self.triad_node_id as usize) % 3;
+        let mut count = 1usize;
+        let mut i = 0usize;
+        while i < 3 {
+            if i != local_idx
+                && self.triad_peer_seq[i] == self.triad_tx_seq
+                && self.triad_peer_hash[i] == local_hash
+                && local_hash != 0
+            {
+                count += 1;
+            }
+            i += 1;
+        }
+        count
+    }
+
+    /// Execute `triad [status | node <0|1|2> | propose <sql>]` in-guest cluster command.
+    pub fn cmd_triad(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        self.sync_triad_local();
+        let (sub, rest) = split_first_word(trim_ascii(arg));
+        if sub.is_empty() || bytes_eq(sub, b"status") {
+            self.record_audit(34, AuditVerdict::Allowed, b"shell:triad:status");
+            let local_hash = self.db.state_hash();
+            let hb = local_hash.to_be_bytes();
+            let quorum = self.triad_quorum_count();
+            let mut pos = 0usize;
+            pos += copy_into(b"triad: node=", &mut out[pos..]);
+            pos += dec_u64((self.triad_node_id % 3) as u64, &mut out[pos..]);
+            pos += copy_into(b"/3 port=8081 seq=", &mut out[pos..]);
+            pos += dec_u64(self.triad_tx_seq, &mut out[pos..]);
+            pos += copy_into(b" hash=", &mut out[pos..]);
+            pos += hex_bytes(&hb, &mut out[pos..]);
+            pos += copy_into(b" quorum=", &mut out[pos..]);
+            pos += dec_u64(quorum as u64, &mut out[pos..]);
+            pos += copy_into(b"/3 commits=", &mut out[pos..]);
+            pos += dec_u64(self.triad_quorum_commits, &mut out[pos..]);
+            pos += copy_into(b" divergences=", &mut out[pos..]);
+            pos += dec_u64(self.triad_divergences, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            let mut i = 0usize;
+            while i < 3 {
+                let ph = self.triad_peer_hash[i].to_be_bytes();
+                pos += copy_into(b"  peer[", &mut out[pos..]);
+                pos += dec_u64(i as u64, &mut out[pos..]);
+                pos += copy_into(b"] seq=", &mut out[pos..]);
+                pos += dec_u64(self.triad_peer_seq[i], &mut out[pos..]);
+                pos += copy_into(b" hash=", &mut out[pos..]);
+                pos += hex_bytes(&ph, &mut out[pos..]);
+                pos += copy_into(b"\n", &mut out[pos..]);
+                i += 1;
+            }
+            return pos;
+        }
+        if bytes_eq(sub, b"node") {
+            if self
+                .svc
+                .mediate_endpoint(
+                    crate::svc_runtime::IpcOp::ShellExec,
+                    false,
+                    true,
+                    &mut self.audit,
+                )
+                .is_err()
+            {
+                return copy_into(
+                    b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                    out,
+                );
+            }
+            let Some(nid) = parse_u32_ascii(trim_ascii(rest)) else {
+                return copy_into(b"usage: triad node <0|1|2>\n", out);
+            };
+            if nid > 2 {
+                return copy_into(b"usage: triad node <0|1|2>\n", out);
+            }
+            self.triad_node_id = nid as u8;
+            self.sync_triad_local();
+            self.record_audit(34, AuditVerdict::Allowed, b"shell:triad:node");
+            let mut pos = 0usize;
+            pos += copy_into(b"triad: node_id=", &mut out[pos..]);
+            pos += dec_u64(nid as u64, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            return pos;
+        }
+        if bytes_eq(sub, b"propose") {
+            let sql = trim_ascii(rest);
+            if sql.is_empty() || crate::sql::SqlDb::is_readonly_query(sql) {
+                return copy_into(b"usage: triad propose <mutating-sql>\n", out);
+            }
+            if self
+                .svc
+                .mediate_endpoint(
+                    crate::svc_runtime::IpcOp::SqlMutate,
+                    false,
+                    true,
+                    &mut self.audit,
+                )
+                .is_err()
+            {
+                return copy_into(
+                    b"error: EACCES (svc-sql disabled by node role or policy)\n",
+                    out,
+                );
+            }
+            let mut sql_res = [0u8; 192];
+            let slen = self.db.exec(sql, &mut sql_res);
+            if sql_res[..slen].starts_with(b"error:") {
+                return copy_into(&sql_res[..slen], out);
+            }
+            self.triad_tx_seq = self.triad_tx_seq.wrapping_add(1);
+            self.sync_triad_local();
+            let hb = self.db.state_hash().to_be_bytes();
+            self.record_audit(34, AuditVerdict::Allowed, b"shell:triad:propose");
+            let mut pos = 0usize;
+            pos += copy_into(b"triad: proposed seq=", &mut out[pos..]);
+            pos += dec_u64(self.triad_tx_seq, &mut out[pos..]);
+            pos += copy_into(b" node=", &mut out[pos..]);
+            pos += dec_u64((self.triad_node_id % 3) as u64, &mut out[pos..]);
+            pos += copy_into(b" hash=", &mut out[pos..]);
+            pos += hex_bytes(&hb, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            return pos;
+        }
+        copy_into(
+            b"usage: triad [status | node <0|1|2> | propose <mutating-sql>]\n",
             out,
         )
     }

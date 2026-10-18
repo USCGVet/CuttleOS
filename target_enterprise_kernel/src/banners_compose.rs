@@ -924,9 +924,17 @@ pub(crate) fn banner_shell_compose() {
     while s_idx < target_enterprise::svc_runtime::SERVICE_COUNT {
         let code = sh.svc.services[s_idx].ring3_code;
         let expected_arg0 = sh.svc.services[s_idx].ring3_expected_arg0;
-        if !crate::banners_arch_platform::exec_service_ring3_stub(&code, expected_arg0) {
+        let mb_req = ((sh.svc.services[s_idx].mailbox.canary as u64) << 32)
+            | (sh.svc.services[s_idx].id.pid() as u64);
+        if !crate::banners_arch_platform::exec_service_ring3_stub(
+            &code,
+            mb_req,
+            expected_arg0,
+            false,
+        ) {
             panic!("SVC_RUNTIME compose: live shell service CPL=3 stub execution failed");
         }
+        sh.svc.services[s_idx].mailbox.resp_tag = mb_req ^ expected_arg0;
         sh.svc.services[s_idx].mailbox.cpl3_runs =
             sh.svc.services[s_idx].mailbox.cpl3_runs.wrapping_add(1);
         s_idx += 1;
@@ -959,9 +967,22 @@ fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
     while i < SERVICE_COUNT {
         let code = vsh.svc.services[i].ring3_code;
         let expected_arg0 = vsh.svc.services[i].ring3_expected_arg0;
-        if !crate::banners_arch_platform::exec_service_ring3_stub(&code, expected_arg0) {
+        let mb_req = ((vsh.svc.services[i].mailbox.canary as u64) << 32)
+            | (vsh.svc.services[i].id.pid() as u64);
+        if !crate::banners_arch_platform::exec_service_ring3_stub(
+            &code,
+            mb_req,
+            expected_arg0,
+            false,
+        ) {
             panic!("SVC_RUNTIME compose: hardware CPL=3 service stub execution failed");
         }
+        // Red Team negative verification: corrupted user-mapped mailbox canary must be rejected.
+        if crate::banners_arch_platform::exec_service_ring3_stub(&code, mb_req, expected_arg0, true)
+        {
+            panic!("SVC_RUNTIME compose: corrupted CPL=3 mailbox canary was not rejected");
+        }
+        vsh.svc.services[i].mailbox.resp_tag = mb_req ^ expected_arg0;
         vsh.svc.services[i].mailbox.cpl3_runs =
             vsh.svc.services[i].mailbox.cpl3_runs.wrapping_add(1);
         i += 1;
@@ -999,7 +1020,14 @@ fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
     // Verify rotated service's new CPL=3 Ring-3 stub also executes at hardware CPL=3:
     let rot_code = vsh.svc.services[ServiceId::Http.index()].ring3_code;
     let rot_arg0 = vsh.svc.services[ServiceId::Http.index()].ring3_expected_arg0;
-    if !crate::banners_arch_platform::exec_service_ring3_stub(&rot_code, rot_arg0) {
+    let rot_mb_req = ((vsh.svc.services[ServiceId::Http.index()].mailbox.canary as u64) << 32)
+        | (ServiceId::Http.pid() as u64);
+    if !crate::banners_arch_platform::exec_service_ring3_stub(
+        &rot_code,
+        rot_mb_req,
+        rot_arg0,
+        false,
+    ) {
         panic!("SVC_RUNTIME compose: rotated service CPL=3 stub execution failed");
     }
     // 4. Role switch to Wfe unloads svc-sql and svc-sh from memory; switching back to Full reloads them:
@@ -1032,7 +1060,7 @@ fn verify_https_and_concurrent_tcp_compose(boots: u64, auth_key: [u8; 32]) {
     use target_enterprise::tcp::TcpImpl;
     use target_enterprise::tls::{
         build_client_hello, decode_record_header, encode_record_header, parse_server_hello,
-        CONTENT_TYPE_HANDSHAKE, LEGACY_VERSION, RECORD_HEADER_LEN,
+        x25519_basepoint, CONTENT_TYPE_HANDSHAKE, LEGACY_VERSION, RECORD_HEADER_LEN,
     };
 
     const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -1041,8 +1069,12 @@ fn verify_https_and_concurrent_tcp_compose(boots: u64, auth_key: [u8; 32]) {
 
     static COMPOSE_REPLIES: spin::Mutex<target_enterprise::ReplySet> =
         spin::Mutex::new(target_enterprise::ReplySet::new());
+    static COMPOSE_NET: spin::Mutex<target_enterprise::LivedNet> =
+        spin::Mutex::new(target_enterprise::LivedNet::empty());
 
-    let mut net = target_enterprise::LivedNet::with_auth_key(MAC, auth_key);
+    let mut net_guard = COMPOSE_NET.lock();
+    let net: &mut target_enterprise::LivedNet = &mut *net_guard;
+    *net = target_enterprise::LivedNet::with_auth_key(MAC, auth_key);
     let mut tls_server_isn = 0u32;
 
     let wrap_eth_ip = |tcp_seg: &[u8], frame_out: &mut [u8; 384]| -> usize {
@@ -1108,12 +1140,13 @@ fn verify_https_and_concurrent_tcp_compose(boots: u64, auth_key: [u8; 32]) {
         slot += 1;
     }
 
-    if net.active_tcp_slots() != 4 {
-        panic!("HTTPS+TCP4 compose: expected 4 active concurrent TCP slots");
+    if net.active_tcp_slots() != TCP_MAX_SLOTS {
+        panic!("HTTPS+TCP4 compose: expected all 16 concurrent TCP slots active");
     }
 
     let client_random = [0x33u8; 32];
-    let client_pubkey = [0x77u8; 32];
+    let client_scalar = [0x77u8; 32];
+    let client_pubkey = x25519_basepoint(&client_scalar);
     let mut ch_msg = [0u8; 256];
     let ch_len = build_client_hello(&client_random, &client_pubkey, &mut ch_msg).unwrap();
     let mut tls_rec = [0u8; 264];
@@ -1164,7 +1197,7 @@ fn verify_https_and_concurrent_tcp_compose(boots: u64, auth_key: [u8; 32]) {
     }
     let mut record_key = [0u8; 16];
     let _ = target_enterprise::LivedNet::derive_tls13_record_key(
-        &client_pubkey,
+        &client_scalar,
         &ch_msg[..ch_len],
         sh_slice,
         &mut record_key,

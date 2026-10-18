@@ -23,20 +23,23 @@ use crate::net::ipv4_header_checksum;
 use crate::tcp::{close, process_segment, send_payload, Tcb, TcpImpl, TcpState};
 use crate::tls::{
     build_server_hello, decode_record_header, derive_handshake_keys, encode_record_header,
-    hkdf_expand_label, hmac_sha256, parse_client_hello, parse_server_hello, CONTENT_TYPE_HANDSHAKE,
-    LEGACY_VERSION, MAX_SERVER_HELLO_LEN, RECORD_HEADER_LEN,
+    hkdf_expand_label, hmac_sha256, parse_client_hello, parse_server_hello, x25519_basepoint,
+    x25519_scalarmult, CONTENT_TYPE_HANDSHAKE, LEGACY_VERSION, MAX_SERVER_HELLO_LEN,
+    RECORD_HEADER_LEN,
 };
 
 /// Guest IPv4 the service claims (QEMU slirp default guest).
 pub const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
 /// UDP status port (existing hostfwd).
 pub const UDP_STATUS_PORT: u16 = 8080;
+/// In-guest Peer-to-Peer Triad replication & 2-of-3 TMR quorum UDP port.
+pub const TRIAD_REPL_PORT: u16 = 8081;
 /// HTTP status port.
 pub const HTTP_PORT: u16 = 80;
 /// HTTPS / TLS 1.3 port.
 pub const HTTPS_PORT: u16 = 443;
 /// Maximum number of concurrent TCP connections tracked in [`LivedNet`].
-pub const TCP_MAX_SLOTS: usize = 4;
+pub const TCP_MAX_SLOTS: usize = 16;
 /// TLS 1.3 content-type byte for encrypted `ApplicationData` records (RFC 8446 §5.1).
 pub const TLS_CONTENT_APPLICATION_DATA: u8 = 23;
 /// Domain-separation root seed for per-connection TLS 1.3 `server_random` derivation on port 443.
@@ -108,8 +111,8 @@ impl ReplySet {
 }
 
 /// Multi-connection guest network service supporting ARP, ICMP echo,
-/// authenticated UDP control plane (`8080`), HTTP/1.1 (`80`), and
-/// TLS 1.3 (`443`) across a 4-slot concurrent TCP table.
+/// authenticated UDP control plane (`8080`), Peer-to-Peer Triad replication (`8081`),
+/// HTTP/1.1 (`80`), and TLS 1.3 (`443`) across a 16-slot concurrent TCP table.
 pub struct LivedNet {
     /// Guest MAC (copied into Ethernet source).
     pub mac: [u8; 6],
@@ -124,8 +127,11 @@ pub struct LivedNet {
     pub last_auth_seq: u64,
     /// Monotonic counter of TLS 1.3 handshakes used to derive fresh per-connection keyshares.
     pub tls_handshake_seq: u64,
+    /// Total TCP retransmission / half-open reclamation events triggered by RTO timers.
+    pub rto_retransmits: u64,
     tcbs: [Tcb; TCP_MAX_SLOTS],
     slot_last_tick: [u32; TCP_MAX_SLOTS],
+    slot_rto_ticks: [u32; TCP_MAX_SLOTS],
     ticks: u32,
     ip_ident: u16,
     http_bufs: [[u8; SLOT_BUF]; TCP_MAX_SLOTS],
@@ -135,6 +141,28 @@ pub struct LivedNet {
 }
 
 impl LivedNet {
+    /// Zero-initialized BSS constructor suitable for `static spin::Mutex<LivedNet>`.
+    pub const fn empty() -> Self {
+        Self {
+            mac: [0u8; 6],
+            ip: GUEST_IP,
+            auth_key: [0u8; 32],
+            auth_enabled: false,
+            last_auth_seq: 0,
+            tls_handshake_seq: 0,
+            rto_retransmits: 0,
+            tcbs: [Tcb::EMPTY; TCP_MAX_SLOTS],
+            slot_last_tick: [0u32; TCP_MAX_SLOTS],
+            slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
+            ticks: 1,
+            ip_ident: 1,
+            http_bufs: [[0u8; SLOT_BUF]; TCP_MAX_SLOTS],
+            http_lens: [0usize; TCP_MAX_SLOTS],
+            tls_keys: [[0u8; 16]; TCP_MAX_SLOTS],
+            tls_ready: [false; TCP_MAX_SLOTS],
+        }
+    }
+
     /// Test-only constructor binding `mac` / `GUEST_IP` with [`DEFAULT_NET_AUTH_KEY`].
     #[cfg(test)]
     pub fn new(mac: [u8; 6]) -> Self {
@@ -150,8 +178,10 @@ impl LivedNet {
             auth_enabled: true,
             last_auth_seq: 0,
             tls_handshake_seq: 0,
+            rto_retransmits: 0,
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
+            slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
             ticks: 1,
             ip_ident: 1,
             http_bufs: [[0u8; SLOT_BUF]; TCP_MAX_SLOTS],
@@ -171,8 +201,10 @@ impl LivedNet {
             auth_enabled: false,
             last_auth_seq: 0,
             tls_handshake_seq: 0,
+            rto_retransmits: 0,
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
+            slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
             ticks: 1,
             ip_ident: 1,
             http_bufs: [[0u8; SLOT_BUF]; TCP_MAX_SLOTS],
@@ -196,11 +228,41 @@ impl LivedNet {
         count
     }
 
-    /// Derive the 32-byte ECDHE shared secret and 16-byte record AEAD key for a
-    /// TLS 1.3 handshake (`ClientHello` + `ServerHello`) against [`LivedNet`] on port 443,
-    /// extracting the ephemeral X25519 `server_pubkey` directly from `server_hello`.
+    /// Advance per-slot TCP Retransmission Timeout (RTO) timers, reclaiming stale
+    /// half-open (`SynReceived`) or closing (`LastAck`) slots so embryonic SYN floods
+    /// cannot pin connection slots indefinitely.
+    pub fn tick_tcp_rto(&mut self) -> usize {
+        self.ticks = self.ticks.wrapping_add(1);
+        let mut actions = 0usize;
+        let mut i = 0usize;
+        while i < TCP_MAX_SLOTS {
+            let st = self.tcbs[i].state;
+            if st == TcpState::SynReceived || st == TcpState::LastAck {
+                let elapsed = self.ticks.wrapping_sub(self.slot_rto_ticks[i]);
+                if elapsed >= 8 {
+                    self.rto_retransmits = self.rto_retransmits.wrapping_add(1);
+                    actions += 1;
+                    if self.ticks.wrapping_sub(self.slot_last_tick[i]) >= 16 {
+                        self.tcbs[i] = Tcb::EMPTY;
+                        self.http_lens[i] = 0;
+                        self.tls_ready[i] = false;
+                        self.tls_keys[i] = [0u8; 16];
+                    } else {
+                        self.slot_rto_ticks[i] = self.ticks;
+                    }
+                }
+            }
+            i += 1;
+        }
+        actions
+    }
+
+    /// Derive the 32-byte RFC 7748 X25519 ECDHE shared secret and 16-byte record AEAD key
+    /// for a TLS 1.3 handshake (`ClientHello` + `ServerHello`) against [`LivedNet`] on port 443,
+    /// extracting the ephemeral Curve25519 `server_pubkey` from `server_hello` and performing
+    /// `X25519(client_scalar, server_pubkey)`.
     pub fn derive_tls13_record_key(
-        client_pubkey: &[u8; 32],
+        client_scalar: &[u8; 32],
         client_hello: &[u8],
         server_hello: &[u8],
         key_out: &mut [u8; 16],
@@ -210,7 +272,7 @@ impl LivedNet {
             Err(_) => TLS_SERVER_PUBKEY,
         };
         let mut shared_secret = [0u8; 32];
-        hmac_sha256(&server_pub, client_pubkey, &mut shared_secret);
+        let _ = x25519_scalarmult(client_scalar, &server_pub, &mut shared_secret);
         let mut hs = HandshakeKeys {
             handshake_secret: [0u8; 32],
             client_handshake_traffic_secret: [0u8; 32],
@@ -250,6 +312,46 @@ impl LivedNet {
         let c_len = cmd.len().min(msg.len() - pos);
         msg[pos..pos + c_len].copy_from_slice(&cmd[..c_len]);
         pos += c_len;
+        hmac_sha256(key, &msg[..pos], out);
+    }
+
+    /// Compute the 32-byte HMAC-SHA256 tag over `"proteus-triad-prep-v1:<seq>:<node_id>:<sql>"`
+    /// for in-guest Peer-to-Peer Triad replication (`TRIAD_PREPARE`) datagrams on UDP `:8081`.
+    pub fn compute_triad_prepare_tag(
+        key: &[u8; 32],
+        seq_ascii: &[u8],
+        node_ascii: &[u8],
+        sql: &[u8],
+        out: &mut [u8; 32],
+    ) {
+        let mut msg = [0u8; 384];
+        let mut pos = 0usize;
+        pos += copy_msg(b"proteus-triad-prep-v1:", &mut msg[pos..]);
+        pos += copy_msg(&seq_ascii[..seq_ascii.len().min(24)], &mut msg[pos..]);
+        pos += copy_msg(b":", &mut msg[pos..]);
+        pos += copy_msg(&node_ascii[..node_ascii.len().min(8)], &mut msg[pos..]);
+        pos += copy_msg(b":", &mut msg[pos..]);
+        pos += copy_msg(sql, &mut msg[pos..]);
+        hmac_sha256(key, &msg[..pos], out);
+    }
+
+    /// Compute the 32-byte HMAC-SHA256 tag over `"proteus-triad-ack-v1:<seq>:<peer_id>:<hash_hex16>"`
+    /// for in-guest Peer-to-Peer Triad quorum acknowledgment (`TRIAD_ACK`) datagrams on UDP `:8081`.
+    pub fn compute_triad_ack_tag(
+        key: &[u8; 32],
+        seq_ascii: &[u8],
+        peer_ascii: &[u8],
+        hash_hex16: &[u8],
+        out: &mut [u8; 32],
+    ) {
+        let mut msg = [0u8; 160];
+        let mut pos = 0usize;
+        pos += copy_msg(b"proteus-triad-ack-v1:", &mut msg[pos..]);
+        pos += copy_msg(&seq_ascii[..seq_ascii.len().min(24)], &mut msg[pos..]);
+        pos += copy_msg(b":", &mut msg[pos..]);
+        pos += copy_msg(&peer_ascii[..peer_ascii.len().min(8)], &mut msg[pos..]);
+        pos += copy_msg(b":", &mut msg[pos..]);
+        pos += copy_msg(&hash_hex16[..hash_hex16.len().min(16)], &mut msg[pos..]);
         hmac_sha256(key, &msg[..pos], out);
     }
 
@@ -458,7 +560,7 @@ impl LivedNet {
         let src_port = u16::from_be_bytes([udp[0], udp[1]]);
         let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
         let ulen = u16::from_be_bytes([udp[4], udp[5]]) as usize;
-        if dst_port != UDP_STATUS_PORT || src_port < 1024 {
+        if (dst_port != UDP_STATUS_PORT && dst_port != TRIAD_REPL_PORT) || src_port < 1024 {
             return;
         }
         let payload_len = ulen.saturating_sub(8).min(udp.len().saturating_sub(8));
@@ -469,7 +571,13 @@ impl LivedNet {
         }
         let _ = src_ip;
         let mut body = [0u8; 512];
-        let blen = if payload.len() >= 4 && payload.starts_with(b"CMD ") {
+        let blen = if dst_port == TRIAD_REPL_PORT {
+            if let Some(sh) = shell {
+                self.handle_udp_triad(payload, sh, &mut body)
+            } else {
+                status_body(boots, &mut body)
+            }
+        } else if payload.len() >= 4 && payload.starts_with(b"CMD ") {
             if let Some(sh) = shell {
                 let cmd_line = &payload[4..];
                 if crate::shell::OsShell::is_readonly_command(cmd_line) {
@@ -494,15 +602,253 @@ impl LivedNet {
         } else {
             status_body(boots, &mut body)
         };
+        if blen == 0 {
+            return;
+        }
         let mut udp_full = [0u8; 536];
         let udp_len = 8 + blen;
-        udp_full[0..2].copy_from_slice(&UDP_STATUS_PORT.to_be_bytes());
+        udp_full[0..2].copy_from_slice(&dst_port.to_be_bytes());
         udp_full[2..4].copy_from_slice(&src_port.to_be_bytes());
         udp_full[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
         udp_full[8..udp_len].copy_from_slice(&body[..blen]);
         let uc = crate::net::udp_checksum(self.ip, reply_ip, &udp_full[..udp_len]);
         udp_full[6..8].copy_from_slice(&uc.to_be_bytes());
         self.emit_ipv4(dst_mac, reply_ip, IP_PROTO_UDP, &udp_full[..udp_len], out);
+    }
+
+    #[inline(never)]
+    fn handle_udp_triad(
+        &mut self,
+        payload: &[u8],
+        sh: &mut crate::shell::OsShell,
+        body: &mut [u8],
+    ) -> usize {
+        use crate::svc_runtime::IpcOp;
+
+        let trimmed = trim_ws(payload);
+        if trimmed == b"TRIAD_STATUS" {
+            return sh.cmd_triad(b"status", body);
+        }
+        if !self.auth_enabled {
+            sh.record_net_audit(AuditVerdict::Denied, b"net:triad:unprovisioned");
+            return copy_msg(
+                b"error: EACCES (device key not provisioned; TRIAD disabled)\n",
+                body,
+            );
+        }
+
+        if trimmed.len() > 14 && trimmed.starts_with(b"TRIAD_PREPARE ") {
+            let rest = &trimmed[14..];
+            let (seq_tok, after_seq) = split_ws(rest);
+            let (node_tok, after_node) = split_ws(after_seq);
+            let (hmac_tok, sql_raw) = split_ws(after_node);
+            let sql = trim_ws(sql_raw);
+            let (Some(seq), Some(leader_id)) = (parse_u64_dec(seq_tok), parse_u64_dec(node_tok))
+            else {
+                sh.record_net_audit(AuditVerdict::Error, b"net:triad:prep-syntax");
+                return copy_msg(
+                    b"usage: TRIAD_PREPARE <seq> <node_id> <hmac_hex64> <sql>\n",
+                    body,
+                );
+            };
+            if leader_id > 2 || hmac_tok.len() != 64 || sql.is_empty() {
+                sh.record_net_audit(AuditVerdict::Error, b"net:triad:prep-syntax");
+                return copy_msg(
+                    b"usage: TRIAD_PREPARE <seq> <node_id> <hmac_hex64> <sql>\n",
+                    body,
+                );
+            }
+            if seq <= sh.triad_tx_seq {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:replay");
+                return copy_msg(
+                    b"error: EACCES (triad replay detected: sequence not monotonic)\n",
+                    body,
+                );
+            }
+            let mut provided_mac = [0u8; 32];
+            if !decode_hex_32(hmac_tok, &mut provided_mac) {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:bad-hex");
+                return copy_msg(b"error: EACCES (invalid triad HMAC hex)\n", body);
+            }
+            let mut expected_mac = [0u8; 32];
+            Self::compute_triad_prepare_tag(
+                &self.auth_key,
+                seq_tok,
+                node_tok,
+                sql,
+                &mut expected_mac,
+            );
+            let mut diff = 0u8;
+            let mut i = 0usize;
+            while i < 32 {
+                diff |= provided_mac[i] ^ expected_mac[i];
+                i += 1;
+            }
+            if diff != 0 {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:bad-hmac");
+                return copy_msg(
+                    b"error: EACCES (triad HMAC-SHA256 verification failed)\n",
+                    body,
+                );
+            }
+            if crate::sql::SqlDb::is_readonly_query(sql) {
+                sh.record_net_audit(AuditVerdict::Error, b"net:triad:ro-sql");
+                return copy_msg(b"error: EINVAL (TRIAD_PREPARE requires mutating SQL)\n", body);
+            }
+            if sh
+                .svc
+                .mediate_endpoint(IpcOp::SqlMutate, true, true, &mut sh.audit)
+                .is_err()
+            {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:role-denied");
+                return copy_msg(
+                    b"error: EACCES (svc-sql disabled by node role or policy)\n",
+                    body,
+                );
+            }
+            let mut sql_out = [0u8; 192];
+            let slen = sh.db.exec(sql, &mut sql_out);
+            if sql_out[..slen].starts_with(b"error:") {
+                sh.record_net_audit(AuditVerdict::Error, b"net:triad:sql-err");
+                return copy_msg(&sql_out[..slen], body);
+            }
+            sh.triad_tx_seq = seq;
+            let state_hash = sh.db.state_hash();
+            sh.triad_peer_seq[leader_id as usize] = seq;
+            sh.triad_peer_hash[leader_id as usize] = state_hash;
+            sh.sync_triad_local();
+            if (leader_id as u8) != (sh.triad_node_id % 3) {
+                sh.triad_quorum_commits = sh.triad_quorum_commits.wrapping_add(1);
+            }
+            sh.record_net_audit(AuditVerdict::Allowed, b"net:triad:prep-ok");
+
+            let my_id = (sh.triad_node_id % 3) as u64;
+            let mut my_id_ascii = [0u8; 4];
+            let my_id_len = dec_u64(my_id, &mut my_id_ascii);
+            let mut hash_hex = [0u8; 16];
+            hex_encode_bytes(&state_hash.to_be_bytes(), &mut hash_hex);
+            let mut ack_mac = [0u8; 32];
+            Self::compute_triad_ack_tag(
+                &self.auth_key,
+                seq_tok,
+                &my_id_ascii[..my_id_len],
+                &hash_hex,
+                &mut ack_mac,
+            );
+            let mut ack_hex = [0u8; 64];
+            hex_encode_bytes(&ack_mac, &mut ack_hex);
+
+            let mut pos = 0usize;
+            pos += copy_msg(b"TRIAD_ACK ", &mut body[pos..]);
+            pos += copy_msg(seq_tok, &mut body[pos..]);
+            pos += copy_msg(b" ", &mut body[pos..]);
+            pos += copy_msg(&my_id_ascii[..my_id_len], &mut body[pos..]);
+            pos += copy_msg(b" ", &mut body[pos..]);
+            pos += copy_msg(&hash_hex, &mut body[pos..]);
+            pos += copy_msg(b" ", &mut body[pos..]);
+            pos += copy_msg(&ack_hex, &mut body[pos..]);
+            pos += copy_msg(b"\n", &mut body[pos..]);
+            return pos;
+        }
+
+        if trimmed.len() > 10 && trimmed.starts_with(b"TRIAD_ACK ") {
+            let rest = &trimmed[10..];
+            let (seq_tok, after_seq) = split_ws(rest);
+            let (peer_tok, after_peer) = split_ws(after_seq);
+            let (hash_tok, after_hash) = split_ws(after_peer);
+            let (hmac_tok, _) = split_ws(after_hash);
+            let (Some(seq), Some(peer_id), Some(peer_hash)) = (
+                parse_u64_dec(seq_tok),
+                parse_u64_dec(peer_tok),
+                decode_hex_u64(hash_tok),
+            ) else {
+                sh.record_net_audit(AuditVerdict::Error, b"net:triad:ack-syntax");
+                return copy_msg(
+                    b"usage: TRIAD_ACK <seq> <peer_id> <state_hash_hex16> <hmac_hex64>\n",
+                    body,
+                );
+            };
+            if peer_id > 2 || hmac_tok.len() != 64 {
+                sh.record_net_audit(AuditVerdict::Error, b"net:triad:ack-syntax");
+                return copy_msg(
+                    b"usage: TRIAD_ACK <seq> <peer_id> <state_hash_hex16> <hmac_hex64>\n",
+                    body,
+                );
+            }
+            if seq < sh.triad_tx_seq || seq == 0 {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:ack-stale");
+                return copy_msg(b"error: EACCES (stale triad ACK sequence)\n", body);
+            }
+            let mut provided_mac = [0u8; 32];
+            if !decode_hex_32(hmac_tok, &mut provided_mac) {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:ack-hex");
+                return copy_msg(b"error: EACCES (invalid triad ACK HMAC hex)\n", body);
+            }
+            let mut expected_mac = [0u8; 32];
+            Self::compute_triad_ack_tag(
+                &self.auth_key,
+                seq_tok,
+                peer_tok,
+                hash_tok,
+                &mut expected_mac,
+            );
+            let mut diff = 0u8;
+            let mut i = 0usize;
+            while i < 32 {
+                diff |= provided_mac[i] ^ expected_mac[i];
+                i += 1;
+            }
+            if diff != 0 {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:ack-bad-hmac");
+                return copy_msg(b"error: EACCES (triad ACK HMAC verification failed)\n", body);
+            }
+
+            sh.sync_triad_local();
+            sh.triad_peer_seq[peer_id as usize] = seq;
+            sh.triad_peer_hash[peer_id as usize] = peer_hash;
+            let local_hash = sh.db.state_hash();
+            if seq == sh.triad_tx_seq && peer_hash != local_hash {
+                sh.triad_divergences = sh.triad_divergences.wrapping_add(1);
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:tmr-divergence");
+                let mut loc_hex = [0u8; 16];
+                hex_encode_bytes(&local_hash.to_be_bytes(), &mut loc_hex);
+                let mut pos = 0usize;
+                pos += copy_msg(b"TRIAD_ALERT seq=", &mut body[pos..]);
+                pos += copy_msg(seq_tok, &mut body[pos..]);
+                pos += copy_msg(b" peer=", &mut body[pos..]);
+                pos += copy_msg(peer_tok, &mut body[pos..]);
+                pos += copy_msg(b" status=DIVERGENCE local_hash=", &mut body[pos..]);
+                pos += copy_msg(&loc_hex, &mut body[pos..]);
+                pos += copy_msg(b" peer_hash=", &mut body[pos..]);
+                pos += copy_msg(hash_tok, &mut body[pos..]);
+                pos += copy_msg(b"\n", &mut body[pos..]);
+                return pos;
+            }
+            let quorum = sh.triad_quorum_count();
+            if quorum >= 2 {
+                sh.triad_quorum_commits = sh.triad_quorum_commits.wrapping_add(1);
+            }
+            sh.record_net_audit(AuditVerdict::Allowed, b"net:triad:quorum-ok");
+            let mut loc_hex = [0u8; 16];
+            hex_encode_bytes(&local_hash.to_be_bytes(), &mut loc_hex);
+            let mut pos = 0usize;
+            pos += copy_msg(b"TRIAD_QUORUM seq=", &mut body[pos..]);
+            pos += copy_msg(seq_tok, &mut body[pos..]);
+            pos += copy_msg(b" quorum=", &mut body[pos..]);
+            pos += dec_u64(quorum as u64, &mut body[pos..]);
+            pos += copy_msg(b"/3 hash=", &mut body[pos..]);
+            pos += copy_msg(&loc_hex, &mut body[pos..]);
+            pos += copy_msg(b" commits=", &mut body[pos..]);
+            pos += dec_u64(sh.triad_quorum_commits, &mut body[pos..]);
+            pos += copy_msg(b"\n", &mut body[pos..]);
+            return pos;
+        }
+
+        sh.record_net_audit(AuditVerdict::Error, b"net:triad:unknown");
+        copy_msg(
+            b"usage: TRIAD_PREPARE <seq> <node> <hmac> <sql> | TRIAD_ACK <seq> <peer> <hash> <hmac> | TRIAD_STATUS\n",
+            body,
+        )
     }
 
     fn handle_udp_auth(
@@ -584,6 +930,8 @@ impl LivedNet {
             return None;
         }
         let mut free_slot: Option<usize> = None;
+        let mut half_open_slot: Option<usize> = None;
+        let mut half_open_tick = u32::MAX;
         let mut lru_slot = 0usize;
         let mut lru_tick = u32::MAX;
         let mut j = 0usize;
@@ -593,14 +941,21 @@ impl LivedNet {
                 free_slot = Some(j);
                 break;
             }
+            // Red Team SYN-flood mitigation: prefer evicting half-open (`SynReceived`)
+            // or closing (`CloseWait`, `LastAck`) slots before any `Established` connection.
+            if st != TcpState::Established && self.slot_last_tick[j] < half_open_tick {
+                half_open_tick = self.slot_last_tick[j];
+                half_open_slot = Some(j);
+            }
             if self.slot_last_tick[j] < lru_tick {
                 lru_tick = self.slot_last_tick[j];
                 lru_slot = j;
             }
             j += 1;
         }
-        let idx = free_slot.unwrap_or(lru_slot);
+        let idx = free_slot.or(half_open_slot).unwrap_or(lru_slot);
         self.tcbs[idx] = Tcb::listen(self.ip, dst_port, 65535);
+        self.slot_rto_ticks[idx] = self.ticks;
         self.http_lens[idx] = 0;
         self.tls_ready[idx] = false;
         self.tls_keys[idx] = [0u8; 16];
@@ -630,6 +985,7 @@ impl LivedNet {
             None => return,
         };
         self.slot_last_tick[idx] = self.ticks;
+        self.slot_rto_ticks[idx] = self.ticks;
         let inbound_payload = seg.payload;
         let (next, hint) = match process_segment(self.tcbs[idx], &seg, self.ticks) {
             Ok(t) => t,
@@ -726,7 +1082,7 @@ impl LivedNet {
         &mut self,
         idx: usize,
         boots: u64,
-        shell: Option<&mut crate::shell::OsShell>,
+        mut shell: Option<&mut crate::shell::OsShell>,
         out: &mut [u8],
     ) -> usize {
         let cur = self.http_lens[idx];
@@ -759,7 +1115,8 @@ impl LivedNet {
             let Some(client_pub) = ch_view.x25519_pub else {
                 return 0;
             };
-            // Derive a fresh per-handshake ephemeral server_random and X25519 server_pubkey.
+            // Derive a fresh per-handshake ephemeral server_random, ephemeral X25519 scalar,
+            // Curve25519 public key (`x25519_basepoint`), and ECDHE shared secret (`x25519_scalarmult`).
             self.tls_handshake_seq = self.tls_handshake_seq.wrapping_add(1);
             let mut seed_buf = [0u8; 48];
             seed_buf[..32].copy_from_slice(&client_pub);
@@ -769,8 +1126,17 @@ impl LivedNet {
             seed_buf[47] = (self.ticks & 0xFF) as u8;
             let mut ephemeral_random = [0u8; 32];
             hmac_sha256(&TLS_SERVER_RANDOM, &seed_buf, &mut ephemeral_random);
-            let mut ephemeral_pubkey = [0u8; 32];
-            hmac_sha256(&TLS_SERVER_PUBKEY, &ephemeral_random, &mut ephemeral_pubkey);
+            let mut ephemeral_scalar = [0u8; 32];
+            hmac_sha256(&TLS_SERVER_PUBKEY, &ephemeral_random, &mut ephemeral_scalar);
+            let ephemeral_pubkey = x25519_basepoint(&ephemeral_scalar);
+
+            let mut shared_secret = [0u8; 32];
+            if !x25519_scalarmult(&ephemeral_scalar, &client_pub, &mut shared_secret) {
+                if let Some(sh) = shell.as_deref_mut() {
+                    sh.record_net_audit(AuditVerdict::Denied, b"net:tls:low-order-pub");
+                }
+                return 0;
+            }
 
             let mut sh_msg = [0u8; MAX_SERVER_HELLO_LEN];
             let Ok(sh_len) = build_server_hello(
@@ -782,10 +1148,16 @@ impl LivedNet {
             ) else {
                 return 0;
             };
-            let _ = Self::derive_tls13_record_key(
-                &client_pub,
-                ch_msg,
-                &sh_msg[..sh_len],
+            let mut hs = HandshakeKeys {
+                handshake_secret: [0u8; 32],
+                client_handshake_traffic_secret: [0u8; 32],
+                server_handshake_traffic_secret: [0u8; 32],
+            };
+            derive_handshake_keys(&shared_secret, ch_msg, &sh_msg[..sh_len], &mut hs);
+            hkdf_expand_label(
+                &hs.server_handshake_traffic_secret,
+                b"key",
+                b"",
                 &mut self.tls_keys[idx],
             );
             self.tls_ready[idx] = true;
@@ -926,7 +1298,8 @@ impl LivedNet {
                 || view.path == b"/seccomp"
                 || view.path == b"/ima"
                 || view.path == b"/fw"
-                || view.path == b"/session";
+                || view.path == b"/session"
+                || view.path == b"/triad";
             if is_shell_endpoint {
                 if let Err(e) = sh.svc.mediate_endpoint(
                     IpcOp::HttpGetTelemetry,
@@ -1683,6 +2056,31 @@ fn decode_hex_32(hex: &[u8], out: &mut [u8; 32]) -> bool {
     true
 }
 
+fn decode_hex_u64(hex: &[u8]) -> Option<u64> {
+    if hex.len() != 16 {
+        return None;
+    }
+    let mut bytes = [0u8; 8];
+    let mut i = 0usize;
+    while i < 8 {
+        let hi = hex_nibble(hex[i * 2])?;
+        let lo = hex_nibble(hex[i * 2 + 1])?;
+        bytes[i] = (hi << 4) | lo;
+        i += 1;
+    }
+    Some(u64::from_be_bytes(bytes))
+}
+
+fn hex_encode_bytes(src: &[u8], out: &mut [u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut i = 0usize;
+    while i < src.len() && (i * 2 + 1) < out.len() {
+        out[i * 2] = HEX[(src[i] >> 4) as usize];
+        out[i * 2 + 1] = HEX[(src[i] & 0x0F) as usize];
+        i += 1;
+    }
+}
+
 fn dec_u64(mut v: u64, out: &mut [u8]) -> usize {
     if out.is_empty() {
         return 0;
@@ -2123,11 +2521,11 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_four_slot_tcp_connections_and_lru_eviction() {
+    fn concurrent_16_slot_tcp_connections_syn_flood_priority_and_rto_work() {
         let mut net = LivedNet::new(MAC);
         let mut server_isns = [0u32; TCP_MAX_SLOTS];
 
-        // Open 4 simultaneous TCP connections on ports 50000..50003 without closing any:
+        // 1. Open 16 simultaneous TCP connections on ports 50000..50015 without closing any:
         for slot in 0..TCP_MAX_SLOTS {
             let cport = 50000 + (slot as u16);
             let cisn = 0x1000_0000 + ((slot as u32) << 16);
@@ -2153,60 +2551,71 @@ mod tests {
             assert_eq!(sa.flags, tcp_flags::SYN | tcp_flags::ACK);
             server_isns[slot] = sa.seq;
         }
-        assert_eq!(net.active_tcp_slots(), 4);
+        assert_eq!(net.active_tcp_slots(), 16);
 
-        // Interleave HTTP GET requests across all 4 established connections:
-        for slot in (0..TCP_MAX_SLOTS).rev() {
-            let cport = 50000 + (slot as u16);
-            let cisn = 0x1000_0000 + ((slot as u32) << 16);
-            let req = b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n";
-            let mut pkt = [0u8; 128];
-            let n = TcpImpl::build_segment(
-                cport,
-                HTTP_PORT,
-                cisn.wrapping_add(1),
-                server_isns[slot].wrapping_add(1),
-                tcp_flags::ACK | tcp_flags::PSH,
-                65535,
-                req,
-                PEER_IP,
-                GUEST_IP,
-                &mut pkt,
-            )
-            .unwrap();
-            let (frame, flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &pkt[..n]);
-            let mut out = ReplySet::new();
-            net.handle_frame(&frame[..flen], 7, &mut out);
-            assert_eq!(out.len(), 1);
-            let seg = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
-            assert_eq!(seg.dst_port, cport);
-            let body = core::str::from_utf8(seg.payload).unwrap();
-            assert!(body.contains("PROTEUS-STATUS boots=7"));
-        }
-
-        // Opening a 5th concurrent connection evicts the oldest LRU slot cleanly:
-        let mut syn5 = [0u8; 40];
-        let n = TcpImpl::build_segment(
-            50099,
+        // 2. Complete the 3-way handshake + HTTP GET on slot 0 (port 50000) so it is `Established`,
+        //    leaving slots 1..15 in half-open `SynReceived` state:
+        let req = b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mut pkt0 = [0u8; 128];
+        let n0 = TcpImpl::build_segment(
+            50000,
             HTTP_PORT,
-            0x9000_0000,
-            0,
-            tcp_flags::SYN,
+            0x1000_0001,
+            server_isns[0].wrapping_add(1),
+            tcp_flags::ACK | tcp_flags::PSH,
             65535,
-            b"",
+            req,
             PEER_IP,
             GUEST_IP,
-            &mut syn5,
+            &mut pkt0,
         )
         .unwrap();
-        let (frame, flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn5[..n]);
-        let mut out = ReplySet::new();
-        net.handle_frame(&frame[..flen], 7, &mut out);
-        assert_eq!(out.len(), 1);
-        let sa5 = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
-        assert_eq!(sa5.flags, tcp_flags::SYN | tcp_flags::ACK);
-        assert_eq!(sa5.dst_port, 50099);
-        assert_eq!(net.active_tcp_slots(), 4);
+        let (frame0, flen0) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &pkt0[..n0]);
+        let mut out0 = ReplySet::new();
+        net.handle_frame(&frame0[..flen0], 7, &mut out0);
+        assert_eq!(out0.len(), 1);
+
+        // 3. Red Team SYN-flood resistance: even if we touch slots 1..15 or send a burst of
+        //    20 new half-open SYN flood packets, slot 0 (`Established`) MUST NEVER be evicted
+        //    while any half-open `SynReceived` slot exists!
+        for flood in 0..20u16 {
+            let mut syn_f = [0u8; 40];
+            let nf = TcpImpl::build_segment(
+                55000 + flood,
+                HTTP_PORT,
+                0x8000_0000 + (flood as u32),
+                0,
+                tcp_flags::SYN,
+                65535,
+                b"",
+                PEER_IP,
+                GUEST_IP,
+                &mut syn_f,
+            )
+            .unwrap();
+            let (ff, fflen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn_f[..nf]);
+            let mut fout = ReplySet::new();
+            net.handle_frame(&ff[..fflen], 7, &mut fout);
+            assert_eq!(fout.len(), 1);
+        }
+        assert_eq!(
+            net.tcbs[0].state,
+            TcpState::Established,
+            "Red Team SYN flood must evict half-open SynReceived slots before Established slot 0"
+        );
+        assert_eq!(net.tcbs[0].remote_port, 50000);
+
+        // 4. Advance RTO timer (`tick_tcp_rto`) and verify all 15 half-open `SynReceived` slots
+        //    are automatically reclaimed while `Established` slot 0 remains active:
+        for _ in 0..20 {
+            let _ = net.tick_tcp_rto();
+        }
+        assert!(net.rto_retransmits >= 15);
+        assert_eq!(
+            net.active_tcp_slots(),
+            1,
+            "RTO reclamation must clean up all stale half-open SynReceived slots while preserving Established slot 0"
+        );
     }
 
     #[test]
@@ -2239,9 +2648,49 @@ mod tests {
         assert_eq!(sa.flags, tcp_flags::SYN | tcp_flags::ACK);
         let server_isn = sa.seq;
 
-        // 2. Build a TLS 1.3 ClientHello record and send over TCP/443:
+        // 1b. Red Team Low-Order Torsion Point Rejection: sending a ClientHello with an
+        //     all-zero X25519 keyshare (`[0u8; 32]`) must be rejected by RFC 7748 check!
+        let mut bad_ch = [0u8; 256];
+        let bad_ch_len =
+            crate::tls::build_client_hello(&[0x99u8; 32], &[0u8; 32], &mut bad_ch).unwrap();
+        let mut bad_rec = [0u8; 264];
+        let _ = encode_record_header(
+            CONTENT_TYPE_HANDSHAKE,
+            LEGACY_VERSION,
+            bad_ch_len as u16,
+            &mut bad_rec,
+        );
+        bad_rec[RECORD_HEADER_LEN..RECORD_HEADER_LEN + bad_ch_len]
+            .copy_from_slice(&bad_ch[..bad_ch_len]);
+        let bad_total = RECORD_HEADER_LEN + bad_ch_len;
+        let mut bad_seg = [0u8; 320];
+        let bad_n = TcpImpl::build_segment(
+            client_port,
+            HTTPS_PORT,
+            client_isn.wrapping_add(1),
+            server_isn.wrapping_add(1),
+            tcp_flags::ACK | tcp_flags::PSH,
+            65535,
+            &bad_rec[..bad_total],
+            PEER_IP,
+            GUEST_IP,
+            &mut bad_seg,
+        )
+        .unwrap();
+        let (bad_frame, bad_flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &bad_seg[..bad_n]);
+        let mut bad_out = ReplySet::new();
+        net.handle_frame_with_shell(&bad_frame[..bad_flen], 9, &mut sh, &mut bad_out);
+        let bad_resp =
+            TcpImpl::parse_segment(&bad_out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        assert!(
+            bad_resp.payload.is_empty(),
+            "Red Team low-order X25519 ClientHello must be rejected with zero ServerHello bytes"
+        );
+
+        // 2. Build a valid RFC 7748 X25519 ClientHello record and send over TCP/443:
         let client_random = [0x11u8; 32];
-        let client_pubkey = [0x22u8; 32];
+        let client_scalar = [0x22u8; 32];
+        let client_pubkey = crate::tls::x25519_basepoint(&client_scalar);
         let mut ch_msg = [0u8; 256];
         let ch_len =
             crate::tls::build_client_hello(&client_random, &client_pubkey, &mut ch_msg).unwrap();
@@ -2256,10 +2705,11 @@ mod tests {
         let rec_total = RECORD_HEADER_LEN + ch_len;
 
         let mut ch_seg = [0u8; 320];
+        let c_seq_after_bad = client_isn.wrapping_add(1 + (bad_total as u32));
         let n = TcpImpl::build_segment(
             client_port,
             HTTPS_PORT,
-            client_isn.wrapping_add(1),
+            c_seq_after_bad,
             server_isn.wrapping_add(1),
             tcp_flags::ACK | tcp_flags::PSH,
             65535,
@@ -2277,7 +2727,7 @@ mod tests {
             TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
         let payload = resp_seg.payload;
 
-        // 3. Parse ServerHello record + decrypt ApplicationData status record:
+        // 3. Parse ServerHello record + decrypt ApplicationData status record via X25519 ECDHE:
         let (r1_type, r1_ver, r1_len_u16) = decode_record_header(payload).unwrap();
         assert_eq!(r1_type, CONTENT_TYPE_HANDSHAKE);
         assert_eq!(r1_ver, LEGACY_VERSION);
@@ -2295,7 +2745,7 @@ mod tests {
 
         let mut record_key = [0u8; 16];
         let _ = LivedNet::derive_tls13_record_key(
-            &client_pubkey,
+            &client_scalar,
             &ch_msg[..ch_len],
             sh_slice,
             &mut record_key,
@@ -2337,7 +2787,7 @@ mod tests {
         );
         let req_rec_total = RECORD_HEADER_LEN + w;
 
-        let next_c_seq = client_isn.wrapping_add(1 + (rec_total as u32));
+        let next_c_seq = c_seq_after_bad.wrapping_add(rec_total as u32);
         let next_s_seq = server_isn.wrapping_add(1 + (payload.len() as u32));
         let mut app_seg = [0u8; 192];
         let n = TcpImpl::build_segment(
@@ -2424,12 +2874,127 @@ mod tests {
         assert_ne!(parsed_sh2.server_random, parsed_sh.server_random);
         let mut record_key2 = [0u8; 16];
         let _ = LivedNet::derive_tls13_record_key(
-            &client_pubkey,
+            &client_scalar,
             &ch_msg[..ch_len],
             sh_slice2,
             &mut record_key2,
         );
         assert_ne!(record_key2, record_key);
+    }
+
+    #[test]
+    fn triad_peer_to_peer_replication_2_of_3_quorum_and_redteam_divergence_work() {
+        // Construct 3 independent in-guest Triad nodes (Node 0, Node 1, Node 2) sharing the cluster key:
+        let mut net0 = LivedNet::new(MAC);
+        let mut sh0 = crate::shell::OsShell::new();
+        sh0.triad_node_id = 0;
+
+        let mut net1 = LivedNet::new(MAC);
+        let mut sh1 = crate::shell::OsShell::new();
+        sh1.triad_node_id = 1;
+
+        let mut net2 = LivedNet::new(MAC);
+        let mut sh2 = crate::shell::OsShell::new();
+        sh2.triad_node_id = 2;
+
+        let send_triad_udp = |net: &mut LivedNet,
+                              sh: &mut crate::shell::OsShell,
+                              payload: &[u8]|
+         -> ReplySet {
+            let udp_len = 8 + payload.len();
+            let mut udp = [0u8; 512];
+            udp[0..2].copy_from_slice(&41000u16.to_be_bytes());
+            udp[2..4].copy_from_slice(&TRIAD_REPL_PORT.to_be_bytes());
+            udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+            udp[8..udp_len].copy_from_slice(payload);
+            let uc = crate::net::udp_checksum(PEER_IP, GUEST_IP, &udp[..udp_len]);
+            udp[6..8].copy_from_slice(&uc.to_be_bytes());
+            let (frame, flen) = eth_ip(IP_PROTO_UDP, PEER_IP, GUEST_IP, &udp[..udp_len]);
+            let mut out = ReplySet::new();
+            net.handle_frame_with_shell(&frame[..flen], 1, sh, &mut out);
+            out
+        };
+
+        // 1. Leader (Node 0) proposes a SQL mutation (`triad propose INSERT ...`):
+        let sql = b"INSERT INTO kv VALUES ('cluster.leader', 'node0', 1)";
+        let mut cmd_buf = [0u8; 128];
+        let mut cpos = 0usize;
+        cpos += copy_msg(b"triad propose ", &mut cmd_buf[cpos..]);
+        cpos += copy_msg(sql, &mut cmd_buf[cpos..]);
+        let mut sh_out = [0u8; 256];
+        let n = sh0.exec_line(&cmd_buf[..cpos], 1, 0, 0, &mut sh_out).bytes_written();
+        let prop_str = core::str::from_utf8(&sh_out[..n]).unwrap();
+        assert!(prop_str.starts_with("triad: proposed seq=1 node=0 hash="), "got {prop_str:?}");
+
+        // 2. Build signed `TRIAD_PREPARE 1 0 <hmac_hex64> <sql>` and replicate to Follower Node 1:
+        let mut prep_mac = [0u8; 32];
+        LivedNet::compute_triad_prepare_tag(&DEFAULT_NET_AUTH_KEY, b"1", b"0", sql, &mut prep_mac);
+        let mut prep_hex = [0u8; 64];
+        hex_encode_bytes(&prep_mac, &mut prep_hex);
+        let mut prep_pkt = [0u8; 256];
+        let mut ppos = 0usize;
+        ppos += copy_msg(b"TRIAD_PREPARE 1 0 ", &mut prep_pkt[ppos..]);
+        ppos += copy_msg(&prep_hex, &mut prep_pkt[ppos..]);
+        ppos += copy_msg(b" ", &mut prep_pkt[ppos..]);
+        ppos += copy_msg(sql, &mut prep_pkt[ppos..]);
+
+        let ack1_out = send_triad_udp(&mut net1, &mut sh1, &prep_pkt[..ppos]);
+        assert_eq!(ack1_out.len(), 1);
+        let ack1_payload = &ack1_out.get(0).unwrap()[42..];
+        let ack1_str = core::str::from_utf8(ack1_payload).unwrap();
+        assert!(ack1_str.starts_with("TRIAD_ACK 1 1 "), "got {ack1_str:?}");
+        assert_eq!(sh1.db.state_hash(), sh0.db.state_hash());
+
+        // 3. Red Team Replay Check: re-sending `TRIAD_PREPARE 1 ...` to Node 1 is rejected!
+        let replay_out = send_triad_udp(&mut net1, &mut sh1, &prep_pkt[..ppos]);
+        let replay_str = core::str::from_utf8(&replay_out.get(0).unwrap()[42..]).unwrap();
+        assert!(replay_str.starts_with("error: EACCES (triad replay detected"));
+
+        // 4. Feed Follower Node 1's signed `TRIAD_ACK` back to Leader Node 0 on UDP `:8081`:
+        let q_out = send_triad_udp(&mut net0, &mut sh0, ack1_payload);
+        let q_str = core::str::from_utf8(&q_out.get(0).unwrap()[42..]).unwrap();
+        assert!(
+            q_str.starts_with("TRIAD_QUORUM seq=1 quorum=2/3 hash="),
+            "expected 2-of-3 quorum commit on Node 0, got {q_str:?}"
+        );
+        assert_eq!(sh0.triad_quorum_count(), 2);
+        assert_eq!(sh0.triad_quorum_commits, 1);
+
+        // 5. Red Team Split-Brain / Tampered Follower Detection:
+        //    Suppose Node 2 has a diverging SQL state hash (`0xdeadbeefcafebabe`) at `seq=1`
+        //    and sends a validly signed `TRIAD_ACK 1 2 deadbeefcafebabe <hmac>` to Node 0:
+        let bad_hash_hex = b"deadbeefcafebabe";
+        let mut ack2_mac = [0u8; 32];
+        LivedNet::compute_triad_ack_tag(
+            &DEFAULT_NET_AUTH_KEY,
+            b"1",
+            b"2",
+            bad_hash_hex,
+            &mut ack2_mac,
+        );
+        let mut ack2_hex = [0u8; 64];
+        hex_encode_bytes(&ack2_mac, &mut ack2_hex);
+        let mut ack2_pkt = [0u8; 160];
+        let mut a2pos = 0usize;
+        a2pos += copy_msg(b"TRIAD_ACK 1 2 ", &mut ack2_pkt[a2pos..]);
+        a2pos += copy_msg(bad_hash_hex, &mut ack2_pkt[a2pos..]);
+        a2pos += copy_msg(b" ", &mut ack2_pkt[a2pos..]);
+        a2pos += copy_msg(&ack2_hex, &mut ack2_pkt[a2pos..]);
+
+        let div_out = send_triad_udp(&mut net0, &mut sh0, &ack2_pkt[..a2pos]);
+        let div_str = core::str::from_utf8(&div_out.get(0).unwrap()[42..]).unwrap();
+        assert!(
+            div_str.contains("TRIAD_ALERT seq=1 peer=2 status=DIVERGENCE"),
+            "divergent peer state hash must trigger TRIAD_ALERT, got {div_str:?}"
+        );
+        assert_eq!(sh0.triad_divergences, 1);
+
+        // 6. Replicate `TRIAD_PREPARE 1` to Node 2 so all 3 nodes converge to 3-of-3 quorum:
+        let ack2_good = send_triad_udp(&mut net2, &mut sh2, &prep_pkt[..ppos]);
+        let q3_out = send_triad_udp(&mut net0, &mut sh0, &ack2_good.get(0).unwrap()[42..]);
+        let q3_str = core::str::from_utf8(&q3_out.get(0).unwrap()[42..]).unwrap();
+        assert!(q3_str.starts_with("TRIAD_QUORUM seq=1 quorum=3/3 hash="));
+        assert_eq!(sh0.triad_quorum_count(), 3);
     }
 
     #[test]
