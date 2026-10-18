@@ -507,6 +507,17 @@ pub(crate) fn exec_service_ring3_stub(
     pid == 1 && pid.wrapping_add(sys_arg0) == 1u64.wrapping_add(expected_resp)
 }
 
+/// Hardware `CPL=3` (`CS=0x23`/`SS=0x1B`, `PTE_U` user page) execution callback registered on
+/// [`target_enterprise::svc_runtime::ServiceSupervisor`] so every live mediated request executes
+/// the service's diversified x86-64 stub at hardware `CPL=3` via `iretq` -> `int 0x80`.
+pub(crate) fn exec_service_ring3_stub_live(
+    ring3_code: &[u8; 32],
+    mailbox_req_word: u64,
+    expected_arg0: u64,
+) -> bool {
+    exec_service_ring3_stub(ring3_code, mailbox_req_word, expected_arg0, false)
+}
+
 #[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_ring3_transition() {

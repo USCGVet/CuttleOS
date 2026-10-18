@@ -1772,6 +1772,237 @@ impl LivedNet {
             }
         }
 
+        // 7. CuttleVault Encrypted Secrets Manager (`GET /vault`, `GET /vault/list`, `GET /vault/<key>`, `POST /vault`).
+        if view.path == b"/vault" || view.path.starts_with(b"/vault/") {
+            let mut vbuf = [0u8; 384];
+            if view.method == HttpMethod::Get {
+                let authed = extract_session_token(view.headers_raw)
+                    .and_then(|tok| sh.validate_session(tok))
+                    .is_some();
+                if view.path == b"/vault" || view.path == b"/vault/status" {
+                    return match sh.dispatch_mailbox_op(
+                        IpcOp::VaultRead,
+                        true,
+                        authed,
+                        boots,
+                        view.path,
+                        b"status",
+                        &mut vbuf,
+                    ) {
+                        Ok((status, vlen)) => {
+                            HttpImpl::build_response(status, b"text/plain", &vbuf[..vlen], out)
+                                .unwrap_or(0)
+                        }
+                        Err(e) => build_service_error_response(e, out),
+                    };
+                }
+                if view.path == b"/vault/list" {
+                    return match sh.dispatch_mailbox_op(
+                        IpcOp::VaultRead,
+                        true,
+                        authed,
+                        boots,
+                        view.path,
+                        b"list",
+                        &mut vbuf,
+                    ) {
+                        Ok((status, vlen)) => {
+                            HttpImpl::build_response(status, b"text/plain", &vbuf[..vlen], out)
+                                .unwrap_or(0)
+                        }
+                        Err(e) => build_service_error_response(e, out),
+                    };
+                }
+                if !authed {
+                    return build_service_error_response(
+                        crate::svc_runtime::ServiceError::Unauthenticated,
+                        out,
+                    );
+                }
+                let kname = &view.path[7..];
+                let mut cmd = [0u8; 32];
+                let mut cp = 0usize;
+                cp += copy_msg(b"get ", &mut cmd[cp..]);
+                cp += copy_msg(kname, &mut cmd[cp..]);
+                return match sh.dispatch_mailbox_op(
+                    IpcOp::VaultRead,
+                    true,
+                    true,
+                    boots,
+                    view.path,
+                    &cmd[..cp],
+                    &mut vbuf,
+                ) {
+                    Ok((status, vlen)) => {
+                        HttpImpl::build_response(status, b"text/plain", &vbuf[..vlen], out)
+                            .unwrap_or(0)
+                    }
+                    Err(e) => build_service_error_response(e, out),
+                };
+            }
+            if view.method == HttpMethod::Put && view.path.len() > 7 {
+                let authed = extract_session_token(view.headers_raw)
+                    .and_then(|tok| sh.validate_session(tok))
+                    .is_some();
+                let kname = &view.path[7..];
+                let mut cmd = [0u8; 64];
+                let mut cp = 0usize;
+                cp += copy_msg(b"put ", &mut cmd[cp..]);
+                cp += copy_msg(kname, &mut cmd[cp..]);
+                cp += copy_msg(b" ", &mut cmd[cp..]);
+                cp += copy_msg(trim_ws(view.body), &mut cmd[cp..]);
+                return match sh.dispatch_mailbox_op(
+                    IpcOp::VaultWrite,
+                    true,
+                    authed,
+                    boots,
+                    view.path,
+                    &cmd[..cp],
+                    &mut vbuf,
+                ) {
+                    Ok((status, vlen)) => {
+                        HttpImpl::build_response(status, b"text/plain", &vbuf[..vlen], out)
+                            .unwrap_or(0)
+                    }
+                    Err(e) => build_service_error_response(e, out),
+                };
+            }
+            if view.method == HttpMethod::Delete && view.path.len() > 7 {
+                let authed = extract_session_token(view.headers_raw)
+                    .and_then(|tok| sh.validate_session(tok))
+                    .is_some();
+                let kname = &view.path[7..];
+                let mut cmd = [0u8; 32];
+                let mut cp = 0usize;
+                cp += copy_msg(b"del ", &mut cmd[cp..]);
+                cp += copy_msg(kname, &mut cmd[cp..]);
+                return match sh.dispatch_mailbox_op(
+                    IpcOp::VaultWrite,
+                    true,
+                    authed,
+                    boots,
+                    view.path,
+                    &cmd[..cp],
+                    &mut vbuf,
+                ) {
+                    Ok((status, vlen)) => {
+                        HttpImpl::build_response(status, b"text/plain", &vbuf[..vlen], out)
+                            .unwrap_or(0)
+                    }
+                    Err(e) => build_service_error_response(e, out),
+                };
+            }
+            if view.method == HttpMethod::Post {
+                let authed = extract_session_token(view.headers_raw)
+                    .and_then(|tok| sh.validate_session(tok))
+                    .is_some();
+                return match sh.dispatch_mailbox_op(
+                    IpcOp::VaultWrite,
+                    true,
+                    authed,
+                    boots,
+                    view.path,
+                    trim_ws(view.body),
+                    &mut vbuf,
+                ) {
+                    Ok((status, vlen)) => {
+                        HttpImpl::build_response(status, b"text/plain", &vbuf[..vlen], out)
+                            .unwrap_or(0)
+                    }
+                    Err(e) => build_service_error_response(e, out),
+                };
+            }
+        }
+
+        // 8. CuttleGuard Security Posture & Lockdown (`GET /guard`, `GET /guard/alerts`, `POST /guard`).
+        if view.path == b"/guard" || view.path == b"/guard/alerts" {
+            let mut gbuf = [0u8; 384];
+            if view.method == HttpMethod::Get {
+                let q = if view.path == b"/guard/alerts" {
+                    &b"alerts"[..]
+                } else {
+                    &b"status"[..]
+                };
+                return match sh.dispatch_mailbox_op(
+                    IpcOp::GuardQuery,
+                    true,
+                    false,
+                    boots,
+                    view.path,
+                    q,
+                    &mut gbuf,
+                ) {
+                    Ok((status, glen)) => {
+                        HttpImpl::build_response(status, b"text/plain", &gbuf[..glen], out)
+                            .unwrap_or(0)
+                    }
+                    Err(e) => build_service_error_response(e, out),
+                };
+            }
+            if view.method == HttpMethod::Post {
+                let authed = extract_session_token(view.headers_raw)
+                    .and_then(|tok| sh.validate_session(tok))
+                    .is_some();
+                return match sh.dispatch_mailbox_op(
+                    IpcOp::GuardControl,
+                    true,
+                    authed,
+                    boots,
+                    view.path,
+                    trim_ws(view.body),
+                    &mut gbuf,
+                ) {
+                    Ok((status, glen)) => {
+                        HttpImpl::build_response(status, b"text/plain", &gbuf[..glen], out)
+                            .unwrap_or(0)
+                    }
+                    Err(e) => build_service_error_response(e, out),
+                };
+            }
+        }
+
+        // 9. CuttleChronos Periodic Task Scheduler (`GET /cron`, `POST /cron`).
+        if view.path == b"/cron" {
+            let mut cbuf = [0u8; 384];
+            if view.method == HttpMethod::Get {
+                return match sh.dispatch_mailbox_op(
+                    IpcOp::CronQuery,
+                    true,
+                    false,
+                    boots,
+                    view.path,
+                    b"list",
+                    &mut cbuf,
+                ) {
+                    Ok((status, clen)) => {
+                        HttpImpl::build_response(status, b"text/plain", &cbuf[..clen], out)
+                            .unwrap_or(0)
+                    }
+                    Err(e) => build_service_error_response(e, out),
+                };
+            }
+            if view.method == HttpMethod::Post {
+                let authed = extract_session_token(view.headers_raw)
+                    .and_then(|tok| sh.validate_session(tok))
+                    .is_some();
+                return match sh.dispatch_mailbox_op(
+                    IpcOp::CronControl,
+                    true,
+                    authed,
+                    boots,
+                    view.path,
+                    trim_ws(view.body),
+                    &mut cbuf,
+                ) {
+                    Ok((status, clen)) => {
+                        HttpImpl::build_response(status, b"text/plain", &cbuf[..clen], out)
+                            .unwrap_or(0)
+                    }
+                    Err(e) => build_service_error_response(e, out),
+                };
+            }
+        }
+
         HttpImpl::build_response(404, b"text/plain", b"not found\n", out).unwrap_or(0)
     }
 
@@ -3363,6 +3594,96 @@ mod tests {
         assert!(
             out[..n_login_ok].starts_with(b"HTTP/1.1 200 OK\r\n"),
             "valid login must succeed after the brute-force cooldown window expires"
+        );
+    }
+
+    #[test]
+    fn http_vault_guard_and_cron_endpoints_work() {
+        let mut net = LivedNet::new([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+        let mut sh = crate::shell::OsShell::new();
+        let mut out = [0u8; 1500];
+        let sid = sh.create_session(b"admin", b"app-test");
+
+        let mk_req = |method: &[u8], path: &[u8], body: &[u8]| -> ([u8; 320], usize) {
+            let mut buf = [0u8; 320];
+            let mut p = 0usize;
+            p += copy_msg(method, &mut buf[p..]);
+            p += copy_msg(b" ", &mut buf[p..]);
+            p += copy_msg(path, &mut buf[p..]);
+            p += copy_msg(b" HTTP/1.1\r\nCookie: sid=", &mut buf[p..]);
+            p += copy_msg(&sid, &mut buf[p..]);
+            p += copy_msg(b"\r\n\r\n", &mut buf[p..]);
+            p += copy_msg(body, &mut buf[p..]);
+            (buf, p)
+        };
+
+        // 1. CuttleVault HTTP endpoints (`PUT /vault/<key>`, `GET /vault/<key>`, `GET /vault/list`, `DELETE /vault/<key>`)
+        let (req, rlen) = mk_req(b"PUT", b"/vault/master_pw", b"top_secret_9");
+        let n = net.handle_http_request(&req[..rlen], 1, Some(&mut sh), &mut out);
+        let resp = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK\r\n")
+                && resp.contains("vault: sealed key=master_pw ct="),
+            "got: {resp}"
+        );
+
+        let (req, rlen) = mk_req(b"GET", b"/vault/master_pw", b"");
+        let n = net.handle_http_request(&req[..rlen], 1, Some(&mut sh), &mut out);
+        let resp = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(
+            resp.contains("vault: key=master_pw value=top_secret_9 verified=true"),
+            "got: {resp}"
+        );
+
+        let (req, rlen) = mk_req(b"GET", b"/vault/list", b"");
+        let n = net.handle_http_request(&req[..rlen], 1, Some(&mut sh), &mut out);
+        let resp = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(
+            resp.contains("k|v|rev\nv:master_pw|"),
+            "got: {resp}"
+        );
+
+        // 2. CuttleGuard HTTP endpoints (`GET /guard`, `POST /guard`, `GET /guard/alerts`)
+        let (req, rlen) = mk_req(b"GET", b"/guard", b"");
+        let n = net.handle_http_request(&req[..rlen], 1, Some(&mut sh), &mut out);
+        let resp = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(resp.contains("guard: posture=NORMAL"), "got: {resp}");
+
+        let (req, rlen) = mk_req(b"POST", b"/guard", b"lockdown");
+        let n = net.handle_http_request(&req[..rlen], 1, Some(&mut sh), &mut out);
+        let resp = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(
+            resp.contains("guard: posture=LOCKDOWN vault=sealed"),
+            "got: {resp}"
+        );
+
+        // Vault unseal is blocked while Guard lockdown is active:
+        let (req, rlen) = mk_req(b"GET", b"/vault/master_pw", b"");
+        let n = net.handle_http_request(&req[..rlen], 1, Some(&mut sh), &mut out);
+        let resp = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(
+            resp.contains("error: EACCES (vault sealed by CuttleGuard lockdown)"),
+            "got: {resp}"
+        );
+
+        let (req, rlen) = mk_req(b"POST", b"/guard", b"unlock");
+        let _ = net.handle_http_request(&req[..rlen], 1, Some(&mut sh), &mut out);
+
+        // 3. CuttleChronos HTTP endpoints (`POST /cron`, `GET /cron`)
+        let (req, rlen) = mk_req(b"POST", b"/cron", b"add 2 status");
+        let n = net.handle_http_request(&req[..rlen], 1, Some(&mut sh), &mut out);
+        let resp = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(
+            resp.contains("cron: scheduled id=1 every=2t cmd=\"status\""),
+            "got: {resp}"
+        );
+
+        let (req, rlen) = mk_req(b"GET", b"/cron", b"");
+        let n = net.handle_http_request(&req[..rlen], 1, Some(&mut sh), &mut out);
+        let resp = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(
+            resp.contains("id=1 every=2t elapsed=0t runs=0 cmd=\"status\""),
+            "got: {resp}"
         );
     }
 }

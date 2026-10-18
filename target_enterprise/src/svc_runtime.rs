@@ -341,6 +341,18 @@ pub enum IpcOp {
     VfsWrite = 12,
     /// `DELETE /fs/<path>` VFS unlink (`svc-http -> svc-sh` IPC, requires valid session `sid`).
     VfsDelete = 13,
+    /// `GET /vault` or `GET /vault/<key>` AEAD secret read (`svc-http -> svc-sh` IPC, requires valid session `sid`).
+    VaultRead = 14,
+    /// `PUT /vault/<key>`, `POST /vault/<key>`, `DELETE /vault/<key>` AEAD secret mutation (`svc-http -> svc-sh` IPC, requires valid session `sid`).
+    VaultWrite = 15,
+    /// `GET /guard` live Blue-Team security posture report (`svc-http`, public read-only).
+    GuardQuery = 16,
+    /// `POST /guard` security posture control (`svc-http -> svc-sh` IPC, requires valid session `sid`).
+    GuardControl = 17,
+    /// `GET /cron` scheduled periodic jobs query (`svc-http`, public read-only).
+    CronQuery = 18,
+    /// `POST /cron` scheduled periodic jobs mutation (`svc-http -> svc-sh` IPC, requires valid session `sid`).
+    CronControl = 19,
 }
 
 impl IpcOp {
@@ -355,6 +367,10 @@ impl IpcOp {
                 | IpcOp::UserElfExec
                 | IpcOp::VfsWrite
                 | IpcOp::VfsDelete
+                | IpcOp::VaultRead
+                | IpcOp::VaultWrite
+                | IpcOp::GuardControl
+                | IpcOp::CronControl
         )
     }
 
@@ -367,11 +383,18 @@ impl IpcOp {
             | IpcOp::SessionLogin
             | IpcOp::SessionWhoami
             | IpcOp::SessionLogout
-            | IpcOp::VfsRead => ServiceId::Http,
+            | IpcOp::VfsRead
+            | IpcOp::GuardQuery
+            | IpcOp::CronQuery => ServiceId::Http,
             IpcOp::SqlQuery | IpcOp::SqlMutate => ServiceId::Sql,
-            IpcOp::ShellExec | IpcOp::UserElfExec | IpcOp::VfsWrite | IpcOp::VfsDelete => {
-                ServiceId::Shell
-            }
+            IpcOp::ShellExec
+            | IpcOp::UserElfExec
+            | IpcOp::VfsWrite
+            | IpcOp::VfsDelete
+            | IpcOp::VaultRead
+            | IpcOp::VaultWrite
+            | IpcOp::GuardControl
+            | IpcOp::CronControl => ServiceId::Shell,
         }
     }
 
@@ -384,10 +407,18 @@ impl IpcOp {
             | IpcOp::SessionLogin
             | IpcOp::SessionWhoami
             | IpcOp::SessionLogout
-            | IpcOp::VfsRead => SvcSyscall::NetIo,
+            | IpcOp::VfsRead
+            | IpcOp::GuardQuery
+            | IpcOp::CronQuery => SvcSyscall::NetIo,
             IpcOp::SqlQuery | IpcOp::SqlMutate => SvcSyscall::StorageIo,
-            IpcOp::ShellExec | IpcOp::UserElfExec => SvcSyscall::Exec,
-            IpcOp::VfsWrite | IpcOp::VfsDelete => SvcSyscall::Open,
+            IpcOp::ShellExec
+            | IpcOp::UserElfExec
+            | IpcOp::GuardControl
+            | IpcOp::CronControl => SvcSyscall::Exec,
+            IpcOp::VfsWrite
+            | IpcOp::VfsDelete
+            | IpcOp::VaultRead
+            | IpcOp::VaultWrite => SvcSyscall::Open,
         }
     }
 }
@@ -585,6 +616,10 @@ pub fn derive_service_base_seed(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> u64 {
     derive_service_base_seed_for_boot(seal_key, 1)
 }
 
+/// Hardware Ring-3 (`CPL=3`, `CS=0x23`/`SS=0x1B`, `PTE_U` user page) execution callback:
+/// `fn(ring3_code, mailbox_req_word, expected_arg0) -> bool`.
+pub type Ring3HwHook = fn(&[u8; SVC_RING3_STUB_LEN], u64, u64) -> bool;
+
 /// Ring-3 Service Init / Supervisor, KPTI Loader, IPC Bus, and Policy Enforcer.
 #[derive(Copy, Clone, Debug)]
 pub struct ServiceSupervisor {
@@ -604,6 +639,8 @@ pub struct ServiceSupervisor {
     pub ipc_head: usize,
     /// Monotonic count of inter-service IPC messages mediated by the kernel.
     pub ipc_total: u64,
+    /// Optional bare-metal hardware Ring-3 (`CPL=3`) execution callback invoked on every mediated endpoint.
+    pub ring3_hw_hook: Option<Ring3HwHook>,
 }
 
 impl ServiceSupervisor {
@@ -622,7 +659,15 @@ impl ServiceSupervisor {
             ipc_ring: [IpcMessage::empty(); IPC_RING_CAP],
             ipc_head: 0,
             ipc_total: 0,
+            ring3_hw_hook: None,
         }
+    }
+
+    /// Register a bare-metal hardware Ring-3 (`CPL=3`) execution callback so every
+    /// mediated service request executes the service's diversified x86-64 machine-code
+    /// stub at hardware `CPL=3` via `iretq` -> `int 0x80` on `TSS.RSP0`.
+    pub fn set_ring3_hw_hook(&mut self, hook: Ring3HwHook) {
+        self.ring3_hw_hook = Some(hook);
     }
 
     /// Derive a per-service variant seed from the node's `base_seed` and `svc`.
@@ -989,8 +1034,24 @@ impl ServiceSupervisor {
         self.mediate_syscall(target, sys, audit)?;
 
         // 5. Execute the target service's loaded ELF64 eBPF handler inside an in-stack canary frame
-        //    and record the IPC request/response in the service's mailbox.
+        //    and, when a bare-metal hardware Ring-3 (`CPL=3`) hook is registered, execute the target
+        //    service's diversified x86-64 machine-code stub at hardware `CPL=3` (`iretq` -> `int 0x80`).
         let ret = self.execute_service_elf(target, op as u64)?;
+        if let Some(hook) = self.ring3_hw_hook {
+            let code = self.services[target_idx].ring3_code;
+            let expected_arg0 = self.services[target_idx].ring3_expected_arg0;
+            let next_seq = self.services[target_idx].mailbox.req_seq.wrapping_add(1);
+            let mb_req = ((self.services[target_idx].mailbox.canary as u64) << 32)
+                | (next_seq & 0xFFFF_FFFF);
+            if !hook(&code, mb_req, expected_arg0) {
+                self.services[target_idx].policy_denials =
+                    self.services[target_idx].policy_denials.wrapping_add(1);
+                record_svc_audit(audit, 44, AuditVerdict::Denied, b"svc:cpl3:trap");
+                return Err(ServiceError::SandboxTrap);
+            }
+            self.services[target_idx].mailbox.cpl3_runs =
+                self.services[target_idx].mailbox.cpl3_runs.wrapping_add(1);
+        }
         let slot = &mut self.services[target_idx];
         slot.requests_served = slot.requests_served.wrapping_add(1);
         slot.mailbox.req_seq = slot.mailbox.req_seq.wrapping_add(1);

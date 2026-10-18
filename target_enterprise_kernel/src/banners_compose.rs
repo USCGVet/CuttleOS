@@ -939,6 +939,8 @@ pub(crate) fn banner_shell_compose() {
             sh.svc.services[s_idx].mailbox.cpl3_runs.wrapping_add(1);
         s_idx += 1;
     }
+    sh.svc
+        .set_ring3_hw_hook(crate::banners_arch_platform::exec_service_ring3_stub_live);
     let _ = sh.exec_line(b"seccomp clear 5", boots, 0, 0, &mut out);
     let _ = sh.exec_line(b"fw clear", boots, 0, 0, &mut out);
     sh.auth_seq = 0;
@@ -986,6 +988,16 @@ fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
         vsh.svc.services[i].mailbox.cpl3_runs =
             vsh.svc.services[i].mailbox.cpl3_runs.wrapping_add(1);
         i += 1;
+    }
+    vsh.svc
+        .set_ring3_hw_hook(crate::banners_arch_platform::exec_service_ring3_stub_live);
+    let mut mb_out = [0u8; 64];
+    if vsh
+        .dispatch_mailbox_op(IpcOp::HttpGetStatus, true, false, 1, b"/status", b"", &mut mb_out)
+        .is_err()
+        || vsh.svc.services[ServiceId::Http.index()].mailbox.cpl3_runs < 2
+    {
+        panic!("SVC_RUNTIME compose: live dispatch_mailbox_op did not increment hardware cpl3_runs");
     }
     // 1. Deny-by-default cross-service syscall/capability violations must be refused:
     if vsh

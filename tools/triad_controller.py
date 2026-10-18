@@ -449,13 +449,23 @@ class TriadController:
         if c.startswith("sql "):
             return (
                 "INSERT " in joined
+                or "REPLACE " in joined
                 or "UPDATE " in joined
                 or "DELETE " in joined
                 or "CREATE TABLE" in joined
                 or "DROP TABLE" in joined
+                or "BEGIN" in joined
+                or "COMMIT" in joined
+                or "ROLLBACK" in joined
                 or "error:" in joined
                 or "tables:" in joined
             )
+        if c.startswith("vault"):
+            return "vault:" in joined or "k|v|rev" in joined or "error:" in joined
+        if c.startswith("guard"):
+            return "guard:" in joined or "error:" in joined
+        if c.startswith("cron"):
+            return "cron:" in joined or "error:" in joined
         if c == "smp":
             return "cpu3:" in joined
         if c.startswith("smp run"):
@@ -465,6 +475,23 @@ class TriadController:
         if c == "service status":
             return "svc-sh" in joined
         return len(lines) >= 1
+
+    @staticmethod
+    def _normalize_kv_for_tmr(sql_out: str) -> str:
+        """
+        Normalize raw `SELECT * FROM kv` output for 2-of-3 TMR comparison across Triad nodes:
+        because each Triad node encrypts `CuttleVault` secrets (`k = 'v:<name>'`) under its own
+        independent 256-bit hardware `seal_key`, the on-disk ciphertext (`v`) and MAC tag (`rev`)
+        are cryptographically distinct per node while the key set (`v:<name>`) is identical.
+        """
+        norm_lines = []
+        for ln in sql_out.splitlines():
+            if ln.startswith("v:") and "|" in ln:
+                kname = ln.split("|", 1)[0]
+                norm_lines.append(f"{kname}|<HW_SEALED>")
+            else:
+                norm_lines.append(ln)
+        return "\n".join(norm_lines)
 
     def refresh_node_telemetry(self, node: TriadNode):
         if node.state not in ("ONLINE", "CATCHING_UP", "HEALING"):
@@ -496,7 +523,9 @@ class TriadController:
 
             # Check if any node diverges from the 2-of-3 majority!
             if len(online_nodes) == 3 and all("k|v|rev" in outputs.get(i, "") for i in (1, 2, 3)):
-                o1, o2, o3 = outputs[1], outputs[2], outputs[3]
+                o1 = self._normalize_kv_for_tmr(outputs[1])
+                o2 = self._normalize_kv_for_tmr(outputs[2])
+                o3 = self._normalize_kv_for_tmr(outputs[3])
                 if o1 == o2 == o3:
                     self.parity_syndrome_ok = True
                     self.quorum_status = f"3/3 TMR MAJORITY LOCKED | RAID PARITY D1⊕D2=P VERIFIED (tx_seq={self.triad_tx_seq})"
@@ -646,6 +675,102 @@ class TriadController:
             "per_node": per_node,
         }
 
+    def execute_triad_app(self, app_cmd: str) -> dict:
+        """
+        Execute a Cuttle OS built-in application command (`vault`, `guard`, or `cron`) across the 3-as-1 Triad:
+        - `vault put <key> <val>` / `vault del <key>`: encrypts `<val>` under each node's independent 256-bit
+          hardware `seal_key`, persists to the Triad WAL, and flushes AHCI (`sync`).
+        - `vault get <key>`: unseals and verifies `<key>` on all online nodes and returns a 2-of-3 Majority Vote!
+        - `guard status` / `guard alerts` / `guard lockdown` / `guard unlock`: queries or enforces Blue-Team
+          security posture across all 3 Triad nodes simultaneously.
+        - `cron add <ticks> <cmd>` / `cron list` / `cron del <id>` / `cron run`: manages deterministic periodic
+          jobs across all 3 Triad nodes.
+        """
+        if not is_printable_ascii_command(app_cmd):
+            raise ValueError("command contains non-printable or control characters")
+        c = app_cmd.strip()
+        parts = c.split()
+        if not parts or parts[0].lower() not in ("vault", "guard", "cron"):
+            return {"ok": False, "error": "unsupported app command (expected vault, guard, or cron)", "quorum": "0/3"}
+
+        app = parts[0].lower()
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+        online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
+        if not online_nodes:
+            return {"ok": False, "error": "no online nodes in triad", "quorum": "0/3"}
+
+        is_read = (
+            (app == "vault" and sub in ("get", "list", "status"))
+            or (app == "guard" and sub in ("status", "alerts"))
+            or (app == "cron" and sub in ("list", "status"))
+        )
+
+        per_node = {}
+        accepted_nodes = []
+        for n in online_nodes:
+            out = self.send_shell_cmd(n, c)
+            per_node[n.name] = out
+            low_out = out.strip().lower()
+            if low_out and not low_out.startswith("error:") and not low_out.startswith("usage:"):
+                accepted_nodes.append(n)
+
+        vals = list(per_node.values())
+        chosen = max(set(vals), key=vals.count) if vals else ""
+        agree = vals.count(chosen)
+
+        if is_read:
+            return {
+                "ok": len(accepted_nodes) > 0,
+                "mode": f"APP READ ({app.upper()} 2-of-3 Majority)",
+                "quorum": f"{agree}/{len(online_nodes)} ONLINE NODES AGREED",
+                "tx_seq": self.triad_tx_seq,
+                "output": chosen,
+                "per_node": per_node,
+            }
+
+        if not accepted_nodes:
+            return {
+                "ok": False,
+                "error": chosen or f"error: {app} command rejected by online nodes",
+                "output": chosen,
+                "quorum": f"0/{len(online_nodes)} online nodes accepted",
+                "per_node": per_node,
+            }
+
+        # Persist durable `vault put` / `vault del` mutations into the Triad WAL so morphing/healing
+        # nodes replay and re-seal the secret under their own hardware `seal_key`.
+        tx_id = self.triad_tx_seq
+        if app == "vault" and sub in ("put", "del"):
+            with self.wal_lock:
+                self.triad_tx_seq += 1
+                tx_id = self.triad_tx_seq
+                self.wal_entries.append((tx_id, c))
+                self._save_wal_to_disk()
+            for n in accepted_nodes:
+                self.send_shell_cmd(n, "sync")
+                n.tx_seq = tx_id
+            self.compute_and_verify_raid_parity()
+
+        self.log_event(
+            f"APP-{app.upper()}",
+            f"Executed '{c}' across {len(accepted_nodes)}/3 online Triad nodes (tx_seq={tx_id}).",
+        )
+        return {
+            "ok": True,
+            "mode": f"APP WRITE ({app.upper()} Replicated)",
+            "quorum": f"Applied on {len(accepted_nodes)}/{len(online_nodes)} online nodes (tx_seq={tx_id})",
+            "tx_seq": tx_id,
+            "output": chosen,
+            "per_node": per_node,
+        }
+
+    def _replay_wal_entry(self, node: TriadNode, stmt: str):
+        s = stmt.strip()
+        if s.lower().startswith("vault "):
+            self.send_shell_cmd(node, s)
+        else:
+            self.send_shell_cmd(node, f"sql {s}")
+
     def bounce_and_morph_node(self, node_id: int) -> bool:
         """
         Perform a live zero-downtime MTD Morph on a single node while the other 2 nodes
@@ -714,7 +839,7 @@ class TriadController:
                         node.tx_seq = tid
                         continue
                     try:
-                        self.send_shell_cmd(node, f"sql {stmt}")
+                        self._replay_wal_entry(node, stmt)
                     except Exception as e:
                         self.log_event("WARN", f"{node.name}: Error replaying WAL entry #{tid}: {e}")
                     node.tx_seq = tid
@@ -770,7 +895,7 @@ class TriadController:
                     node.tx_seq = tid
                     continue
                 try:
-                    self.send_shell_cmd(node, f"sql {stmt}")
+                    self._replay_wal_entry(node, stmt)
                 except Exception as e:
                     self.log_event("WARN", f"{node.name}: Error replaying WAL entry #{tid} during heal: {e}")
                 node.tx_seq = tid
@@ -982,7 +1107,16 @@ DASHBOARD_HTML = r"""<!doctype html>
       <button onclick="runShCmd('attest')">attest</button>
       <button onclick="runShCmd('seal')">seal</button>
     </div>
-    <pre id="consoleOut">Ready. Enter your Operator Session Token above, then execute a SQL write even while a node is MORPHING — watch the surviving 2/3 majority commit it and automatically resync the morphing node on wakeup!</pre>
+    <div class="input-bar">
+      <input id="appInput" type="text" value="vault put cluster.key Cuttle99" />
+      <button onclick="runApp()">Run App (3-Node TMR)</button>
+      <button onclick="runAppCmd('vault get cluster.key')">Vault Get</button>
+      <button onclick="runAppCmd('guard status')">Guard</button>
+      <button class="tamper-btn" onclick="runAppCmd('guard lockdown')">Lockdown</button>
+      <button onclick="runAppCmd('guard unlock')">Unlock</button>
+      <button onclick="runAppCmd('cron list')">Cron</button>
+    </div>
+    <pre id="consoleOut">Ready. Enter your Operator Session Token above, then execute a SQL write or CuttleVault/CuttleGuard/CuttleChronos app command across the 3-as-1 Triad!</pre>
   </div>
 
   <div class="box">
@@ -1085,6 +1219,29 @@ async function runShCmd(c) {
   let txt = `Command: ${c}\n\n`;
   for (const [k, v] of Object.entries(d.per_node || {})) {
     txt += `=== ${k} ===\n${v}\n\n`;
+  }
+  out.textContent = txt;
+  refresh();
+}
+
+async function runApp() {
+  const c = document.getElementById('appInput').value;
+  runAppCmd(c);
+}
+
+async function runAppCmd(c) {
+  document.getElementById('appInput').value = c;
+  const out = document.getElementById('consoleOut');
+  out.textContent = `Executing '${c}' across Triad 2-of-3 Majority...`;
+  const r = await fetch('/api/app', {method:'POST', headers: authHeaders(), body: c});
+  const d = await r.json();
+  if (!d.ok) {
+    out.textContent = `Error (${r.status}): ${d.error || d.output}`;
+    return;
+  }
+  let txt = `[${d.mode}] ${d.quorum}\n\n${d.output}\n\n--- Per-OS Execution Breakdown ---\n`;
+  for (const [k, v] of Object.entries(d.per_node || {})) {
+    txt += `> ${k}:\n${v}\n\n`;
   }
   out.textContent = txt;
   refresh();
@@ -1283,6 +1440,25 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                 return self._send_json(400, {"ok": False, "error": f"rejected: {e}"})
             return self._send_json(200, {"ok": True, "per_node": per_node})
 
+        if self.path in ("/api/app", "/api/vault", "/api/guard", "/api/cron"):
+            if not is_printable_ascii_command(body):
+                return self._send_json(
+                    400,
+                    {"ok": False, "error": "rejected: command contains non-printable or control characters"},
+                )
+            cmd_str = body
+            if self.path == "/api/vault" and not cmd_str.lower().startswith("vault"):
+                cmd_str = f"vault {cmd_str}"
+            elif self.path == "/api/guard" and not cmd_str.lower().startswith("guard"):
+                cmd_str = f"guard {cmd_str}"
+            elif self.path == "/api/cron" and not cmd_str.lower().startswith("cron"):
+                cmd_str = f"cron {cmd_str}"
+            try:
+                res = self.ctrl.execute_triad_app(cmd_str)
+            except ValueError as e:
+                return self._send_json(400, {"ok": False, "error": f"rejected: {e}"})
+            return self._send_json(200 if res.get("ok") else 400, res)
+
         if self.path.startswith("/api/morph/"):
             nid = int(self.path.rsplit("/", 1)[-1])
             threading.Thread(
@@ -1398,7 +1574,7 @@ def main():
 
                 auth_req = urllib.request.Request(
                     f"http://127.0.0.1:{test_port}/api/sql",
-                    data=b"INSERT INTO kv VALUES ('triad.init', 'active', 1)",
+                    data=b"INSERT OR REPLACE INTO kv VALUES ('triad.init', 'active', 1)",
                     headers={"X-Cuttle-Session": ctrl.coordinator_token},
                     method="POST",
                 )
@@ -1406,6 +1582,55 @@ def main():
                     assert resp.status == 200
                     r1 = json.loads(resp.read().decode("utf-8"))
                     assert r1["ok"] and "3/3" in r1["quorum"], f"Expected 3/3 majority write: {r1}"
+
+                # 3b. Verify CuttleVault, CuttleGuard, and CuttleChronos across the 3-node Triad:
+                vault_put_req = urllib.request.Request(
+                    f"http://127.0.0.1:{test_port}/api/vault",
+                    data=b"put cluster.secret ThreeHearts9",
+                    headers={"X-Cuttle-Session": ctrl.coordinator_token},
+                    method="POST",
+                )
+                with urllib.request.urlopen(vault_put_req, timeout=10.0) as resp:
+                    rv_put = json.loads(resp.read().decode("utf-8"))
+                    assert rv_put["ok"] and "3/3" in rv_put["quorum"], f"Expected 3/3 vault put: {rv_put}"
+                    # Verify each node encrypted `ThreeHearts9` with its own distinct hardware seal_key!
+                    assert len(set(rv_put["per_node"].values())) == 3, (
+                        f"Each Triad node must produce a distinct hardware-sealed ciphertext: {rv_put['per_node']}"
+                    )
+
+                vault_get_req = urllib.request.Request(
+                    f"http://127.0.0.1:{test_port}/api/vault",
+                    data=b"get cluster.secret",
+                    headers={"X-Cuttle-Session": ctrl.coordinator_token},
+                    method="POST",
+                )
+                with urllib.request.urlopen(vault_get_req, timeout=10.0) as resp:
+                    rv_get = json.loads(resp.read().decode("utf-8"))
+                    assert (
+                        rv_get["ok"]
+                        and "3/3 ONLINE NODES AGREED" in rv_get["quorum"]
+                        and "value=ThreeHearts9 verified=true" in rv_get["output"]
+                    ), f"Expected 3/3 verified vault unseal: {rv_get}"
+
+                guard_req = urllib.request.Request(
+                    f"http://127.0.0.1:{test_port}/api/guard",
+                    data=b"status",
+                    headers={"X-Cuttle-Session": ctrl.coordinator_token},
+                    method="POST",
+                )
+                with urllib.request.urlopen(guard_req, timeout=10.0) as resp:
+                    rg = json.loads(resp.read().decode("utf-8"))
+                    assert rg["ok"] and "posture=NORMAL" in rg["output"], f"Expected NORMAL guard posture: {rg}"
+
+                cron_req = urllib.request.Request(
+                    f"http://127.0.0.1:{test_port}/api/cron",
+                    data=b"add 4 status",
+                    headers={"X-Cuttle-Session": ctrl.coordinator_token},
+                    method="POST",
+                )
+                with urllib.request.urlopen(cron_req, timeout=10.0) as resp:
+                    rc = json.loads(resp.read().decode("utf-8"))
+                    assert rc["ok"] and "3/3" in rc["quorum"], f"Expected 3/3 cron schedule: {rc}"
             finally:
                 test_srv.shutdown()
 
@@ -1445,6 +1670,9 @@ def main():
                 time.sleep(0.5)
             q2_out = ctrl.send_shell_cmd(ctrl.nodes[1], "sql SELECT * FROM kv")
             assert "pwned" not in q2_out and "zero_downtime" in q2_out, f"OS-2 heal failed:\n{q2_out}"
+            # Also verify OS-2 reconstructed and re-sealed `cluster.secret` from the WAL during heal!
+            v2_out = ctrl.send_shell_cmd(ctrl.nodes[1], "vault get cluster.secret")
+            assert "value=ThreeHearts9 verified=true" in v2_out, f"OS-2 vault heal failed:\n{v2_out}"
             print("=== TRIAD 3-AS-1 SELF-TEST PASSED ===", flush=True)
         finally:
             ctrl.shutdown()

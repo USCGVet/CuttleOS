@@ -308,6 +308,9 @@ impl SqlTable {
     }
 }
 
+/// Maximum number of row mutations tracked in an active `BEGIN ... ROLLBACK` transaction.
+pub const SQL_TX_UNDO_CAP: usize = 8;
+
 /// Embedded zero-allocation SQL database engine.
 #[derive(Copy, Clone, Debug)]
 pub struct SqlDb {
@@ -317,6 +320,18 @@ pub struct SqlDb {
     pub tx_seq: u64,
     /// Monotonic counter of secondary-index-accelerated `WHERE <col> = <val>` lookups.
     pub idx_hits: u64,
+    /// Whether an explicit `BEGIN` transaction is currently open.
+    pub tx_active: bool,
+    /// Number of row-level undo records captured in the current transaction (`0..=SQL_TX_UNDO_CAP`).
+    pub tx_undo_len: u8,
+    /// Saved `tx_seq` prior to `BEGIN`, restored on `ROLLBACK`.
+    pub tx_undo_seq: u64,
+    /// Table index for each undo slot.
+    pub tx_undo_table: [u8; SQL_TX_UNDO_CAP],
+    /// Row index for each undo slot.
+    pub tx_undo_row: [u8; SQL_TX_UNDO_CAP],
+    /// Pre-transaction row snapshot for each undo slot.
+    pub tx_undo_prev: [SqlRow; SQL_TX_UNDO_CAP],
 }
 
 impl Default for SqlDb {
@@ -332,6 +347,33 @@ impl SqlDb {
             tables: [SqlTable::empty(); SQL_MAX_TABLES],
             tx_seq: 0,
             idx_hits: 0,
+            tx_active: false,
+            tx_undo_len: 0,
+            tx_undo_seq: 0,
+            tx_undo_table: [0u8; SQL_TX_UNDO_CAP],
+            tx_undo_row: [0u8; SQL_TX_UNDO_CAP],
+            tx_undo_prev: [SqlRow::empty(); SQL_TX_UNDO_CAP],
+        }
+    }
+
+    fn record_row_undo(&mut self, t_idx: usize, r_idx: usize) {
+        if !self.tx_active {
+            return;
+        }
+        let len = self.tx_undo_len as usize;
+        let mut i = 0usize;
+        while i < len {
+            if (self.tx_undo_table[i] as usize) == t_idx && (self.tx_undo_row[i] as usize) == r_idx
+            {
+                return;
+            }
+            i += 1;
+        }
+        if len < SQL_TX_UNDO_CAP {
+            self.tx_undo_table[len] = t_idx as u8;
+            self.tx_undo_row[len] = r_idx as u8;
+            self.tx_undo_prev[len] = self.tables[t_idx].rows[r_idx];
+            self.tx_undo_len = (len + 1) as u8;
         }
     }
 
@@ -488,12 +530,50 @@ impl SqlDb {
             return self.exec_schema(trim_sql(rest), out);
         }
         let (kw, rest) = next_token(q);
-        if eq_ignore_ascii_case(kw, b"CREATE") {
+        if eq_ignore_ascii_case(kw, b"BEGIN") {
+            self.tx_active = true;
+            self.tx_undo_len = 0;
+            self.tx_undo_seq = self.tx_seq;
+            copy_str(b"BEGIN OK\n", out)
+        } else if eq_ignore_ascii_case(kw, b"COMMIT") {
+            if !self.tx_active {
+                return copy_str(b"error: no transaction active\n", out);
+            }
+            self.tx_active = false;
+            self.tx_undo_len = 0;
+            copy_str(b"COMMIT OK\n", out)
+        } else if eq_ignore_ascii_case(kw, b"ROLLBACK") {
+            if !self.tx_active {
+                return copy_str(b"error: no transaction active\n", out);
+            }
+            let mut k = self.tx_undo_len as usize;
+            while k > 0 {
+                k -= 1;
+                let t = self.tx_undo_table[k] as usize;
+                let r = self.tx_undo_row[k] as usize;
+                if t < SQL_MAX_TABLES && r < SQL_MAX_ROWS {
+                    self.tables[t].rows[r] = self.tx_undo_prev[k];
+                }
+            }
+            let mut t = 0usize;
+            while t < SQL_MAX_TABLES {
+                if self.tables[t].used {
+                    self.tables[t].rebuild_index();
+                }
+                t += 1;
+            }
+            self.tx_seq = self.tx_undo_seq;
+            self.tx_active = false;
+            self.tx_undo_len = 0;
+            copy_str(b"ROLLBACK OK\n", out)
+        } else if eq_ignore_ascii_case(kw, b"CREATE") {
             self.exec_create(rest, out)
         } else if eq_ignore_ascii_case(kw, b"DROP") {
             self.exec_drop(rest, out)
         } else if eq_ignore_ascii_case(kw, b"INSERT") {
-            self.exec_insert(rest, out)
+            self.exec_insert(rest, false, out)
+        } else if eq_ignore_ascii_case(kw, b"REPLACE") {
+            self.exec_insert(rest, true, out)
         } else if eq_ignore_ascii_case(kw, b"SELECT") {
             self.exec_select(rest, out)
         } else if eq_ignore_ascii_case(kw, b"UPDATE") {
@@ -750,11 +830,25 @@ impl SqlDb {
         pos
     }
 
-    fn exec_insert(&mut self, rest: &[u8], out: &mut [u8]) -> usize {
-        let (kw_into, after_into) = next_token(rest);
-        if !eq_ignore_ascii_case(kw_into, b"INTO") {
+    fn exec_insert(&mut self, rest: &[u8], mut is_replace: bool, out: &mut [u8]) -> usize {
+        let (kw1, after_kw1) = next_token(rest);
+        let after_into = if eq_ignore_ascii_case(kw1, b"OR") {
+            let (kw_rep, after_rep) = next_token(after_kw1);
+            let (kw_into, after_i) = next_token(after_rep);
+            if !eq_ignore_ascii_case(kw_rep, b"REPLACE") || !eq_ignore_ascii_case(kw_into, b"INTO")
+            {
+                return copy_str(
+                    b"error: expected INSERT [OR REPLACE] INTO <table> VALUES (...)\n",
+                    out,
+                );
+            }
+            is_replace = true;
+            after_i
+        } else if eq_ignore_ascii_case(kw1, b"INTO") {
+            after_kw1
+        } else {
             return copy_str(b"error: expected INSERT INTO <table> VALUES (...)\n", out);
-        }
+        };
         let (tname, after_tname) = next_token(after_into);
         let Some(t_idx) = self.find_table(tname) else {
             return copy_str(b"error: table not found\n", out);
@@ -800,6 +894,26 @@ impl SqlDb {
         if val_idx != col_count {
             return copy_str(b"error: column count mismatch in VALUES\n", out);
         }
+
+        if is_replace && col_count > 0 {
+            let mut r = 0usize;
+            while r < SQL_MAX_ROWS {
+                if self.tables[t_idx].rows[r].used
+                    && self.tables[t_idx].rows[r].cells[0].compare(CmpOp::Eq, &row.cells[0])
+                {
+                    self.record_row_undo(t_idx, r);
+                    let idx_col = self.tables[t_idx].indexed_col as usize;
+                    if idx_col < col_count {
+                        self.tables[t_idx].index_hashes[r] = hash_sql_val(&row.cells[idx_col]);
+                    }
+                    self.tables[t_idx].rows[r] = row;
+                    self.tx_seq = self.tx_seq.wrapping_add(1);
+                    return copy_str(b"REPLACE 1\n", out);
+                }
+                r += 1;
+            }
+        }
+
         let mut free_row = None;
         let mut r = 0usize;
         while r < SQL_MAX_ROWS {
@@ -812,13 +926,18 @@ impl SqlDb {
         let Some(r_idx) = free_row else {
             return copy_str(b"error: table row capacity full (max 64)\n", out);
         };
+        self.record_row_undo(t_idx, r_idx);
         let idx_col = self.tables[t_idx].indexed_col as usize;
         if idx_col < col_count {
             self.tables[t_idx].index_hashes[r_idx] = hash_sql_val(&row.cells[idx_col]);
         }
         self.tables[t_idx].rows[r_idx] = row;
         self.tx_seq = self.tx_seq.wrapping_add(1);
-        copy_str(b"INSERT 1\n", out)
+        if is_replace {
+            copy_str(b"REPLACE 1\n", out)
+        } else {
+            copy_str(b"INSERT 1\n", out)
+        }
     }
 
     fn exec_select(&mut self, rest: &[u8], out: &mut [u8]) -> usize {
@@ -859,30 +978,27 @@ impl SqlDb {
             }
         }
 
-        // Parse optional WHERE <col> <op> <val>.
-        let mut filter: Option<(usize, CmpOp, SqlVal)> = None;
+        // Parse optional WHERE <col> <op> <val> [AND|OR <col2> <op2> <val2>].
+        let mut filter: Option<WhereFilter> = None;
         let clauses = trim_sql(clauses);
         if !clauses.is_empty() {
             let (kw_where, cond_raw) = next_token(clauses);
             if !eq_ignore_ascii_case(kw_where, b"WHERE") {
                 return copy_str(b"error: unexpected clause after FROM\n", out);
             }
-            let Some(parsed_cond) = parse_where_clause(&self.tables[t_idx], cond_raw) else {
+            let Some(parsed_cond) = parse_where_filter(&self.tables[t_idx], cond_raw) else {
                 return copy_str(b"error: malformed WHERE condition\n", out);
             };
             filter = Some(parsed_cond);
         }
 
         // Check if secondary hash index can accelerate an equality WHERE clause.
-        let indexed_eq_hash = match &filter {
-            Some((c_idx, CmpOp::Eq, rhs))
-                if self.tables[t_idx].indexed_col as usize == *c_idx =>
-            {
-                self.idx_hits = self.idx_hits.wrapping_add(1);
-                Some(hash_sql_val(rhs))
-            }
-            _ => None,
-        };
+        let indexed_eq_hash = filter
+            .as_ref()
+            .and_then(|f| f.single_indexed_eq(self.tables[t_idx].indexed_col as usize));
+        if indexed_eq_hash.is_some() {
+            self.idx_hits = self.idx_hits.wrapping_add(1);
+        }
 
         let table = &self.tables[t_idx];
 
@@ -899,7 +1015,7 @@ impl SqlDb {
                     }
                 }
                 let pass = match &filter {
-                    Some((c_idx, op, rhs)) => table.rows[r].cells[*c_idx].compare(*op, rhs),
+                    Some(f) => f.eval(&table.rows[r]),
                     None => true,
                 };
                 if pass {
@@ -1081,7 +1197,7 @@ impl SqlDb {
         };
 
         let filter = if let Some(w_raw) = where_clause {
-            let Some(cond) = parse_where_clause(&self.tables[t_idx], w_raw) else {
+            let Some(cond) = parse_where_filter(&self.tables[t_idx], w_raw) else {
                 return copy_str(b"error: malformed WHERE condition\n", out);
             };
             Some(cond)
@@ -1089,15 +1205,12 @@ impl SqlDb {
             None
         };
 
-        let indexed_eq_hash = match &filter {
-            Some((c_idx, CmpOp::Eq, rhs))
-                if self.tables[t_idx].indexed_col as usize == *c_idx =>
-            {
-                self.idx_hits = self.idx_hits.wrapping_add(1);
-                Some(hash_sql_val(rhs))
-            }
-            _ => None,
-        };
+        let indexed_eq_hash = filter
+            .as_ref()
+            .and_then(|f| f.single_indexed_eq(self.tables[t_idx].indexed_col as usize));
+        if indexed_eq_hash.is_some() {
+            self.idx_hits = self.idx_hits.wrapping_add(1);
+        }
 
         let mut updated = 0u64;
         let mut r = 0usize;
@@ -1110,12 +1223,11 @@ impl SqlDb {
                     }
                 }
                 let pass = match &filter {
-                    Some((c_idx, op, rhs)) => {
-                        self.tables[t_idx].rows[r].cells[*c_idx].compare(*op, rhs)
-                    }
+                    Some(f) => f.eval(&self.tables[t_idx].rows[r]),
                     None => true,
                 };
                 if pass {
+                    self.record_row_undo(t_idx, r);
                     self.tables[t_idx].rows[r].cells[set_col_idx] = new_val;
                     if self.tables[t_idx].indexed_col as usize == set_col_idx {
                         self.tables[t_idx].index_hashes[r] = hash_sql_val(&new_val);
@@ -1150,7 +1262,7 @@ impl SqlDb {
             if !eq_ignore_ascii_case(kw_where, b"WHERE") {
                 return copy_str(b"error: expected WHERE after table name\n", out);
             }
-            let Some(cond) = parse_where_clause(&self.tables[t_idx], cond_raw) else {
+            let Some(cond) = parse_where_filter(&self.tables[t_idx], cond_raw) else {
                 return copy_str(b"error: malformed WHERE condition\n", out);
             };
             Some(cond)
@@ -1158,15 +1270,12 @@ impl SqlDb {
             None
         };
 
-        let indexed_eq_hash = match &filter {
-            Some((c_idx, CmpOp::Eq, rhs))
-                if self.tables[t_idx].indexed_col as usize == *c_idx =>
-            {
-                self.idx_hits = self.idx_hits.wrapping_add(1);
-                Some(hash_sql_val(rhs))
-            }
-            _ => None,
-        };
+        let indexed_eq_hash = filter
+            .as_ref()
+            .and_then(|f| f.single_indexed_eq(self.tables[t_idx].indexed_col as usize));
+        if indexed_eq_hash.is_some() {
+            self.idx_hits = self.idx_hits.wrapping_add(1);
+        }
 
         let mut deleted = 0u64;
         let mut r = 0usize;
@@ -1179,12 +1288,11 @@ impl SqlDb {
                     }
                 }
                 let pass = match &filter {
-                    Some((c_idx, op, rhs)) => {
-                        self.tables[t_idx].rows[r].cells[*c_idx].compare(*op, rhs)
-                    }
+                    Some(f) => f.eval(&self.tables[t_idx].rows[r]),
                     None => true,
                 };
                 if pass {
+                    self.record_row_undo(t_idx, r);
                     self.tables[t_idx].rows[r] = SqlRow::empty();
                     self.tables[t_idx].index_hashes[r] = 0;
                     deleted += 1;
@@ -1638,6 +1746,58 @@ fn split_keyword_ignore_case<'a>(s: &'a [u8], kw: &[u8]) -> Option<(&'a [u8], &'
     None
 }
 
+#[derive(Clone, Copy)]
+enum WhereFilter {
+    Single(usize, CmpOp, SqlVal),
+    And((usize, CmpOp, SqlVal), (usize, CmpOp, SqlVal)),
+    Or((usize, CmpOp, SqlVal), (usize, CmpOp, SqlVal)),
+}
+
+impl WhereFilter {
+    fn eval(&self, row: &SqlRow) -> bool {
+        match self {
+            WhereFilter::Single(c, op, rhs) => row.cells[*c].compare(*op, rhs),
+            WhereFilter::And((c1, op1, rhs1), (c2, op2, rhs2)) => {
+                row.cells[*c1].compare(*op1, rhs1) && row.cells[*c2].compare(*op2, rhs2)
+            }
+            WhereFilter::Or((c1, op1, rhs1), (c2, op2, rhs2)) => {
+                row.cells[*c1].compare(*op1, rhs1) || row.cells[*c2].compare(*op2, rhs2)
+            }
+        }
+    }
+
+    fn single_indexed_eq(&self, indexed_col: usize) -> Option<u64> {
+        match self {
+            WhereFilter::Single(c_idx, CmpOp::Eq, rhs) if *c_idx == indexed_col => {
+                Some(hash_sql_val(rhs))
+            }
+            WhereFilter::And((c1, CmpOp::Eq, rhs1), _) if *c1 == indexed_col => {
+                Some(hash_sql_val(rhs1))
+            }
+            WhereFilter::And(_, (c2, CmpOp::Eq, rhs2)) if *c2 == indexed_col => {
+                Some(hash_sql_val(rhs2))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn parse_where_filter(table: &SqlTable, raw: &[u8]) -> Option<WhereFilter> {
+    let raw = trim_sql(raw);
+    if let Some((lhs, rhs)) = split_keyword_ignore_case(raw, b"AND") {
+        let p1 = parse_where_clause(table, lhs)?;
+        let p2 = parse_where_clause(table, rhs)?;
+        return Some(WhereFilter::And(p1, p2));
+    }
+    if let Some((lhs, rhs)) = split_keyword_ignore_case(raw, b"OR") {
+        let p1 = parse_where_clause(table, lhs)?;
+        let p2 = parse_where_clause(table, rhs)?;
+        return Some(WhereFilter::Or(p1, p2));
+    }
+    let p = parse_where_clause(table, raw)?;
+    Some(WhereFilter::Single(p.0, p.1, p.2))
+}
+
 fn parse_where_clause(table: &SqlTable, raw: &[u8]) -> Option<(usize, CmpOp, SqlVal)> {
     let raw = trim_sql(raw);
     if let Some((col_raw, pat_raw)) = split_keyword_ignore_case(raw, b"LIKE") {
@@ -2029,5 +2189,68 @@ mod tests {
         assert_eq!(&out[..n], b"error: malformed WHERE condition\n");
         assert!(sql_like_match(b"sensor.cpu.42", b"%%%%%sensor%_%42%%%%"));
         assert!(!sql_like_match(b"sensor.cpu.42", b"%%%%%sensor%_%99%%%%"));
+    }
+
+    #[test]
+    fn sql_upsert_compound_where_and_transactions() {
+        let mut db = SqlDb::new();
+        let mut out = [0u8; 512];
+
+        // 1. INSERT OR REPLACE / REPLACE INTO upsert on primary key (col 0).
+        let n = db.exec(
+            b"INSERT OR REPLACE INTO kv VALUES ('os.brand', 'CuttleOS-Pro', 9)",
+            &mut out,
+        );
+        assert_eq!(&out[..n], b"REPLACE 1\n");
+        let n = db.exec(b"SELECT v, rev FROM kv WHERE k = 'os.brand'", &mut out);
+        assert_eq!(&out[..n], b"v|rev\nCuttleOS-Pro|9\n");
+
+        // 2. Compound WHERE with AND / OR.
+        let n = db.exec(
+            b"SELECT name FROM services WHERE port >= 443 AND proto = 'TCP'",
+            &mut out,
+        );
+        assert_eq!(&out[..n], b"name\nhttps-tls13\n");
+
+        let n = db.exec(
+            b"SELECT name FROM services WHERE id = 1 OR id = 3",
+            &mut out,
+        );
+        assert_eq!(&out[..n], b"name\nhttp-web\nctrl-udp\n");
+
+        // 3. Atomic Transactions: BEGIN, mutate, ROLLBACK restores exact prior rows and tx_seq.
+        let seq_before = db.tx_seq;
+        let n = db.exec(b"BEGIN", &mut out);
+        assert_eq!(&out[..n], b"BEGIN OK\n");
+        let _ = db.exec(
+            b"UPDATE services SET proto = 'DOWN' WHERE id = 1 OR id = 2",
+            &mut out,
+        );
+        let _ = db.exec(
+            b"INSERT OR REPLACE INTO kv VALUES ('os.brand', 'Tampered', 99)",
+            &mut out,
+        );
+        let n = db.exec(b"ROLLBACK", &mut out);
+        assert_eq!(&out[..n], b"ROLLBACK OK\n");
+        assert_eq!(db.tx_seq, seq_before);
+
+        let n = db.exec(b"SELECT v, rev FROM kv WHERE k = 'os.brand'", &mut out);
+        assert_eq!(&out[..n], b"v|rev\nCuttleOS-Pro|9\n");
+        let n = db.exec(
+            b"SELECT COUNT(*) FROM services WHERE proto = 'TCP'",
+            &mut out,
+        );
+        assert_eq!(&out[..n], b"count\n2\n");
+
+        // 4. BEGIN + COMMIT persists changes.
+        let _ = db.exec(b"BEGIN", &mut out);
+        let _ = db.exec(
+            b"REPLACE INTO kv VALUES ('vault.mode', 'sealed-aead', 1)",
+            &mut out,
+        );
+        let n = db.exec(b"COMMIT", &mut out);
+        assert_eq!(&out[..n], b"COMMIT OK\n");
+        let n = db.exec(b"SELECT v FROM kv WHERE k = 'vault.mode'", &mut out);
+        assert_eq!(&out[..n], b"v\nsealed-aead\n");
     }
 }

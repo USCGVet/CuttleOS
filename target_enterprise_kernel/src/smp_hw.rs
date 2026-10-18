@@ -1034,6 +1034,7 @@ pub(crate) fn smp_hw_tick_and_sync(sh: &mut target_enterprise::OsShell) {
         }
         t += 1;
     }
+    let _ = sh.tick_cron_jobs(1);
 }
 
 /// Boot self-proof banner for hardware SMP AP bringup, Doorbell IPI (`0x41`) wakeup

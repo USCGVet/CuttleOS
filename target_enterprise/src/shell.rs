@@ -68,8 +68,52 @@ pub const SHELL_AUDIT_CAP: usize = 32;
 pub const SHELL_IMA_CAP: usize = 8;
 /// Maximum number of concurrent authenticated web/control-plane sessions.
 pub const SHELL_MAX_SESSIONS: usize = 4;
+/// Maximum number of periodic scheduled jobs in CuttleChronos (`cron`).
+pub const SHELL_MAX_CRON_JOBS: usize = 4;
 /// Interactive console prompt string.
 pub const SHELL_PROMPT: &[u8] = b"cuttle> ";
+
+/// Periodic scheduled task entry in CuttleChronos (`cron`).
+#[derive(Copy, Clone, Debug)]
+pub struct CronJob {
+    /// Whether this cron slot is active.
+    pub active: bool,
+    /// 1-based job identifier (`1..=SHELL_MAX_CRON_JOBS`).
+    pub id: u8,
+    /// Execution period in hardware timer ticks (`1..=3600`).
+    pub interval_ticks: u16,
+    /// Ticks elapsed since last execution.
+    pub elapsed_ticks: u16,
+    /// Valid length of `cmd`.
+    pub cmd_len: u8,
+    /// Shell command line to execute when `elapsed_ticks >= interval_ticks`.
+    pub cmd: [u8; 48],
+    /// Total number of completed executions.
+    pub runs: u32,
+    /// Byte length of output from the most recent execution.
+    pub last_bytes: u16,
+}
+
+impl CronJob {
+    /// Construct an empty inactive cron job slot.
+    pub const fn empty() -> Self {
+        Self {
+            active: false,
+            id: 0,
+            interval_ticks: 0,
+            elapsed_ticks: 0,
+            cmd_len: 0,
+            cmd: [0u8; 48],
+            runs: 0,
+            last_bytes: 0,
+        }
+    }
+
+    /// Scheduled command slice.
+    pub fn cmd_bytes(&self) -> &[u8] {
+        &self.cmd[..self.cmd_len as usize]
+    }
+}
 
 /// Authenticated dynamic web/control-plane session entry.
 #[derive(Copy, Clone, Debug)]
@@ -214,6 +258,10 @@ pub struct OsShell {
     pub triad_quorum_commits: u64,
     /// Total TMR state-hash divergence alerts detected across peer acknowledgments.
     pub triad_divergences: u64,
+    /// Whether CuttleGuard emergency security lockdown is currently active.
+    pub guard_lockdown: bool,
+    /// CuttleChronos periodic scheduled jobs (`cron`).
+    pub cron_jobs: [CronJob; SHELL_MAX_CRON_JOBS],
     /// Next PID to assign on `spawn`.
     next_pid: TaskId,
     /// Monotonic command counter (used as synthetic timestamp/sequence).
@@ -261,6 +309,8 @@ impl OsShell {
             triad_peer_hash: [0u64; 3],
             triad_quorum_commits: 0,
             triad_divergences: 0,
+            guard_lockdown: false,
+            cron_jobs: [CronJob::empty(); SHELL_MAX_CRON_JOBS],
             next_pid: 5,
             cmd_seq: 1,
             line_buf: [0u8; SHELL_LINE_MAX],
@@ -374,11 +424,42 @@ impl OsShell {
         self.triad_peer_hash = [init_hash, 0, 0];
         self.triad_quorum_commits = 0;
         self.triad_divergences = 0;
+        self.guard_lockdown = false;
+        self.cron_jobs = [CronJob::empty(); SHELL_MAX_CRON_JOBS];
         self.svc = crate::svc_runtime::ServiceSupervisor::empty();
         let base_seed =
             crate::svc_runtime::derive_service_base_seed_for_boot(&self.seal_key, boot_gen.max(1));
         self.svc
             .init_role(crate::svc_runtime::NodeRole::Full, base_seed);
+    }
+
+    /// Advance all active CuttleChronos (`cron`) periodic jobs by one hardware timer tick,
+    /// executing any job whose `elapsed_ticks` reaches `interval_ticks`.
+    /// Returns the number of jobs that fired on this tick.
+    pub fn tick_cron_jobs(&mut self, boots: u64) -> usize {
+        let mut fired = 0usize;
+        let mut scratch = [0u8; 192];
+        let mut i = 0usize;
+        while i < SHELL_MAX_CRON_JOBS {
+            if self.cron_jobs[i].active && self.cron_jobs[i].interval_ticks > 0 {
+                self.cron_jobs[i].elapsed_ticks =
+                    self.cron_jobs[i].elapsed_ticks.saturating_add(1);
+                if self.cron_jobs[i].elapsed_ticks >= self.cron_jobs[i].interval_ticks {
+                    self.cron_jobs[i].elapsed_ticks = 0;
+                    let clen = (self.cron_jobs[i].cmd_len as usize).min(48);
+                    let mut cmd_buf = [0u8; 48];
+                    cmd_buf[..clen].copy_from_slice(&self.cron_jobs[i].cmd[..clen]);
+                    let n = self
+                        .exec_line(&cmd_buf[..clen], boots, 0, 0, &mut scratch)
+                        .bytes_written();
+                    self.cron_jobs[i].runs = self.cron_jobs[i].runs.wrapping_add(1);
+                    self.cron_jobs[i].last_bytes = n as u16;
+                    fired += 1;
+                }
+            }
+            i += 1;
+        }
+        fired
     }
 
     /// Seed standard user-space ELF64 executables (`/bin/fib` and `/bin/sum`)
@@ -697,10 +778,10 @@ impl OsShell {
                     pos += dec_u64(self.sessions[s_idx].requests as u64, &mut resp_out[pos..]);
                     pos += copy_into(b"</p>", &mut resp_out[pos..]);
                 }
-                pos += copy_into(b"<div>SID:<input id=t size=33 value=\"", &mut resp_out[pos..]);
+                pos += copy_into(b"<div>SID:<input id=t size=32 value=\"", &mut resp_out[pos..]);
                 pos += copy_into(default_tok, &mut resp_out[pos..]);
                 pos += copy_into(
-                    b"\"><br>Sh:<input id=c size=22 value=\"status\"><button onclick=\"S(c.value)\">Run</button><button onclick=\"S('smp')\">smp</button><button onclick=\"S('ps')\">ps</button><button onclick=\"S('ls')\">ls</button><button onclick=\"S('audit')\">audit</button><br>SQL:<input id=q size=30 value=\"SELECT * FROM kv\"><button onclick=\"R('/sql?'+encodeURIComponent(q.value))\">Query</button><button onclick=\"P('/sql',q.value)\">Mutate</button><br>ELF:<input id=x size=14 value=\"/bin/fib 10\"><button onclick=\"P('/exec',x.value)\">Exec</button> VFS:<input id=f size=10 value=\"etc/motd\"><button onclick=\"R('/fs/'+f.value)\">Cat</button></div><pre id=o>cuttle&gt; ready</pre><script>R=async(u,b)=>{o.textContent=await(await fetch(u,{method:b?'POST':'GET',headers:{'X-Session-Token':t.value},body:b})).text()};P=R;S=x=>P('/sh',x)</script></body></html>\n",
+                    b"\"><br>Sh:<input id=c size=14 value=status><button onclick=\"S(c.value)\">Run</button><button onclick=\"S('smp')\">smp</button><button onclick=\"R('/vault')\">vault</button><button onclick=\"R('/guard')\">guard</button><button onclick=\"R('/cron')\">cron</button><br>SQL:<input id=q size=22 value=\"SELECT * FROM kv\"><button onclick=\"R('/sql?'+encodeURIComponent(q.value))\">Query</button><button onclick=\"P('/sql',q.value)\">Exec</button><br>ELF:<input id=x size=10 value=\"/bin/fib 10\"><button onclick=\"P('/exec',x.value)\">Run</button> VFS:<input id=f size=8 value=etc/motd><button onclick=\"R('/fs/'+f.value)\">Cat</button></div><pre id=o>cuttle&gt; ready</pre><script>R=async(u,b)=>{o.textContent=await(await fetch(u,{method:b?'POST':'GET',headers:{'X-Session-Token':t.value},body:b})).text()};P=R;S=x=>P('/sh',x)</script></body></html>\n",
                     &mut resp_out[pos..],
                 );
                 (200u16, pos)
@@ -739,6 +820,22 @@ impl OsShell {
                     self.record_net_audit(AuditVerdict::Allowed, b"net:http:sql-write");
                 }
                 let n = self.db.exec(mb_body, resp_out);
+                (200u16, n)
+            }
+            IpcOp::VaultRead => {
+                let arg = if mb_body.is_empty() {
+                    &b"status"[..]
+                } else {
+                    mb_body
+                };
+                let n = self.cmd_vault_inner(arg, resp_out);
+                (200u16, n)
+            }
+            IpcOp::VaultWrite => {
+                if via_http_gateway {
+                    self.record_net_audit(AuditVerdict::Allowed, b"net:http:vault-write");
+                }
+                let n = self.cmd_vault_inner(mb_body, resp_out);
                 (200u16, n)
             }
             IpcOp::ShellExec => {
@@ -800,6 +897,24 @@ impl OsShell {
                     (404u16, n)
                 }
             }
+            IpcOp::GuardQuery | IpcOp::GuardControl => {
+                let arg = if mb_body.is_empty() {
+                    &b"status"[..]
+                } else {
+                    mb_body
+                };
+                let n = self.cmd_guard_inner(arg, resp_out);
+                (200u16, n)
+            }
+            IpcOp::CronQuery | IpcOp::CronControl => {
+                let arg = if mb_body.is_empty() {
+                    &b"list"[..]
+                } else {
+                    mb_body
+                };
+                let n = self.cmd_cron_inner(arg, boots, resp_out);
+                (200u16, n)
+            }
         };
 
         self.svc
@@ -853,8 +968,16 @@ impl OsShell {
             || bytes_eq(cmd, b"session")
             || bytes_eq(cmd, b"smp")
             || bytes_eq(cmd, b"service")
-            || bytes_eq(cmd, b"triad"))
-            && (rest.is_empty() || bytes_eq(rest, b"status") || bytes_eq(rest, b"threads"))
+            || bytes_eq(cmd, b"triad")
+            || bytes_eq(cmd, b"vault")
+            || bytes_eq(cmd, b"guard")
+            || bytes_eq(cmd, b"cron"))
+            && (rest.is_empty()
+                || bytes_eq(rest, b"status")
+                || bytes_eq(rest, b"list")
+                || bytes_eq(rest, b"alerts")
+                || bytes_eq(rest, b"audit")
+                || bytes_eq(rest, b"threads"))
         {
             return true;
         }
@@ -1608,7 +1731,7 @@ impl OsShell {
         if bytes_eq(cmd, b"help") || bytes_eq(cmd, b"?") {
             self.record_audit(1, AuditVerdict::Allowed, b"shell:help");
             let n = copy_into(
-                b"commands: help uname status ps smp threads service spawn kill caps grant revoke syscall seccomp exec ima fw seal attest ls cat write rm stat df sync sql session net audit halt reboot\n",
+                b"commands: help uname status ps smp threads service spawn kill caps grant revoke syscall seccomp exec ima fw seal attest ls cat write rm stat df sync sql vault guard cron session net audit halt reboot\n",
                 out,
             );
             return ShellAction::Continue(n);
@@ -1769,6 +1892,21 @@ impl OsShell {
 
         if bytes_eq(cmd, b"sql") {
             let n = self.cmd_sql(rest, out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"vault") {
+            let n = self.cmd_vault(rest, out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"guard") {
+            let n = self.cmd_guard(rest, out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"cron") {
+            let n = self.cmd_cron(rest, boots, out);
             return ShellAction::Continue(n);
         }
 
@@ -2632,6 +2770,596 @@ impl OsShell {
     }
 
     #[inline(never)]
+    fn cmd_vault(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        let (sub, _) = split_first_word(trim_ascii(arg));
+        let is_write =
+            bytes_eq(sub, b"put") || bytes_eq(sub, b"del") || bytes_eq(sub, b"delete");
+        let op = if is_write {
+            crate::svc_runtime::IpcOp::VaultWrite
+        } else {
+            crate::svc_runtime::IpcOp::VaultRead
+        };
+        if self
+            .svc
+            .mediate_endpoint(op, false, true, &mut self.audit)
+            .is_err()
+        {
+            return copy_into(
+                b"error: EACCES (svc-sql disabled by node role or policy)\n",
+                out,
+            );
+        }
+        self.cmd_vault_inner(arg, out)
+    }
+
+    #[inline(never)]
+    fn cmd_vault_inner(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        let (sub, rest) = split_first_word(trim_ascii(arg));
+        if sub.is_empty() || bytes_eq(sub, b"status") {
+            self.record_audit(35, AuditVerdict::Allowed, b"shell:vault:status");
+            let mut qout = [0u8; 64];
+            let qlen = self
+                .db
+                .exec(b"SELECT COUNT(*) FROM kv WHERE k LIKE 'v:%'", &mut qout);
+            let count_slice = if qlen > 6 && qout[..6] == *b"count\n" {
+                trim_ascii(&qout[6..qlen])
+            } else {
+                b"0"
+            };
+            let mut pos = 0usize;
+            pos += copy_into(
+                if self.guard_lockdown {
+                    b"vault: status=LOCKDOWN cipher=HMAC-SHA256-ETM secrets="
+                } else {
+                    b"vault: status=SEALED cipher=HMAC-SHA256-ETM secrets="
+                },
+                &mut out[pos..],
+            );
+            pos += copy_into(count_slice, &mut out[pos..]);
+            pos += copy_into(b" key_bound=true\n", &mut out[pos..]);
+            return pos;
+        }
+
+        if bytes_eq(sub, b"list") {
+            self.record_audit(35, AuditVerdict::Allowed, b"shell:vault:list");
+            return self.db.exec(
+                b"SELECT k, v, rev FROM kv WHERE k LIKE 'v:%' ORDER BY k ASC",
+                out,
+            );
+        }
+
+        if self.guard_lockdown {
+            self.record_audit(35, AuditVerdict::Denied, b"shell:vault:lockdown");
+            return copy_into(
+                b"error: EACCES (vault sealed by CuttleGuard lockdown)\n",
+                out,
+            );
+        }
+
+        if bytes_eq(sub, b"put") {
+            let (kname, secret) = split_first_word(trim_ascii(rest));
+            let secret = trim_ascii(secret);
+            if !is_valid_vault_key(kname) || !is_valid_vault_secret(secret) {
+                self.record_audit(35, AuditVerdict::Error, b"shell:vault:bad-arg");
+                return copy_into(
+                    b"usage: vault put <key:1..18> <secret:1..12-printable>\n",
+                    out,
+                );
+            }
+            let (ks, _) = vault_derive_stream_and_mac(&self.seal_key, kname, b"");
+            let slen = secret.len();
+            let mut ct = [0u8; 12];
+            let mut i = 0usize;
+            while i < slen {
+                ct[i] = secret[i] ^ ks[i];
+                i += 1;
+            }
+            let (_, tag_u64) = vault_derive_stream_and_mac(&self.seal_key, kname, &ct[..slen]);
+            let mut ct_hex = [0u8; 24];
+            let hex_len = hex_bytes(&ct[..slen], &mut ct_hex);
+
+            let mut sql_q = [0u8; 128];
+            let mut qp = 0usize;
+            qp += copy_into(
+                b"INSERT OR REPLACE INTO kv VALUES ('v:",
+                &mut sql_q[qp..],
+            );
+            qp += copy_into(kname, &mut sql_q[qp..]);
+            qp += copy_into(b"', '", &mut sql_q[qp..]);
+            qp += copy_into(&ct_hex[..hex_len], &mut sql_q[qp..]);
+            qp += copy_into(b"', ", &mut sql_q[qp..]);
+            qp += dec_u64(tag_u64, &mut sql_q[qp..]);
+            qp += copy_into(b")", &mut sql_q[qp..]);
+
+            let mut sql_out = [0u8; 64];
+            let sn = self.db.exec(&sql_q[..qp], &mut sql_out);
+            if sql_out[..sn].starts_with(b"error:") {
+                return copy_into(&sql_out[..sn], out);
+            }
+            self.record_audit(35, AuditVerdict::Allowed, b"shell:vault:put");
+            let tag_be = tag_u64.to_be_bytes();
+            let mut pos = 0usize;
+            pos += copy_into(b"vault: sealed key=", &mut out[pos..]);
+            pos += copy_into(kname, &mut out[pos..]);
+            pos += copy_into(b" ct=", &mut out[pos..]);
+            pos += copy_into(&ct_hex[..hex_len], &mut out[pos..]);
+            pos += copy_into(b" tag=", &mut out[pos..]);
+            pos += hex_bytes(&tag_be[..4], &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            return pos;
+        }
+
+        if bytes_eq(sub, b"get") {
+            let kname = trim_ascii(rest);
+            if !is_valid_vault_key(kname) {
+                self.record_audit(35, AuditVerdict::Error, b"shell:vault:bad-key");
+                return copy_into(b"usage: vault get <key>\n", out);
+            }
+            let mut sql_q = [0u8; 96];
+            let mut qp = 0usize;
+            qp += copy_into(
+                b"SELECT v, rev FROM kv WHERE k = 'v:",
+                &mut sql_q[qp..],
+            );
+            qp += copy_into(kname, &mut sql_q[qp..]);
+            qp += copy_into(b"'", &mut sql_q[qp..]);
+            let mut qout = [0u8; 128];
+            let qlen = self.db.exec(&sql_q[..qp], &mut qout);
+            // Expect header `v|rev\n` (6 bytes) followed by `<ct_hex>|<tag_dec>\n`.
+            if qlen <= 6 || &qout[..6] != b"v|rev\n" {
+                self.record_audit(35, AuditVerdict::Error, b"shell:vault:not-found");
+                return copy_into(b"error: secret not found\n", out);
+            }
+            let row_line = trim_ascii(&qout[6..qlen]);
+            let mut pipe_pos = None;
+            let mut idx = 0usize;
+            while idx < row_line.len() {
+                if row_line[idx] == b'|' {
+                    pipe_pos = Some(idx);
+                    break;
+                }
+                idx += 1;
+            }
+            let Some(p_idx) = pipe_pos else {
+                return copy_into(b"error: secret not found\n", out);
+            };
+            let ct_hex = &row_line[..p_idx];
+            let tag_str = trim_ascii(&row_line[p_idx + 1..]);
+            let mut ct = [0u8; 12];
+            let Some(ct_len) = decode_hex_slice(ct_hex, &mut ct) else {
+                self.record_audit(35, AuditVerdict::Denied, b"shell:vault:tamper");
+                return copy_into(
+                    b"error: EBADMSG (vault AEAD authentication tag mismatch)\n",
+                    out,
+                );
+            };
+            let Some(stored_tag) = parse_u64_ascii(tag_str) else {
+                self.record_audit(35, AuditVerdict::Denied, b"shell:vault:tamper");
+                return copy_into(
+                    b"error: EBADMSG (vault AEAD authentication tag mismatch)\n",
+                    out,
+                );
+            };
+            let (ks, expected_tag) =
+                vault_derive_stream_and_mac(&self.seal_key, kname, &ct[..ct_len]);
+            if (stored_tag ^ expected_tag) != 0 {
+                self.record_audit(35, AuditVerdict::Denied, b"shell:vault:tamper");
+                return copy_into(
+                    b"error: EBADMSG (vault AEAD authentication tag mismatch)\n",
+                    out,
+                );
+            }
+            let mut pt = [0u8; 12];
+            let mut i = 0usize;
+            while i < ct_len {
+                pt[i] = ct[i] ^ ks[i];
+                i += 1;
+            }
+            self.record_audit(35, AuditVerdict::Allowed, b"shell:vault:get");
+            let mut pos = 0usize;
+            pos += copy_into(b"vault: key=", &mut out[pos..]);
+            pos += copy_into(kname, &mut out[pos..]);
+            pos += copy_into(b" value=", &mut out[pos..]);
+            pos += copy_into(&pt[..ct_len], &mut out[pos..]);
+            pos += copy_into(b" verified=true\n", &mut out[pos..]);
+            return pos;
+        }
+
+        if bytes_eq(sub, b"del") || bytes_eq(sub, b"delete") {
+            let kname = trim_ascii(rest);
+            if !is_valid_vault_key(kname) {
+                return copy_into(b"usage: vault del <key>\n", out);
+            }
+            let mut sql_q = [0u8; 96];
+            let mut qp = 0usize;
+            qp += copy_into(b"DELETE FROM kv WHERE k = 'v:", &mut sql_q[qp..]);
+            qp += copy_into(kname, &mut sql_q[qp..]);
+            qp += copy_into(b"'", &mut sql_q[qp..]);
+            let mut qout = [0u8; 64];
+            let _ = self.db.exec(&sql_q[..qp], &mut qout);
+            self.record_audit(35, AuditVerdict::Allowed, b"shell:vault:del");
+            let mut pos = 0usize;
+            pos += copy_into(b"vault: deleted key=", &mut out[pos..]);
+            pos += copy_into(kname, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            return pos;
+        }
+
+        copy_into(
+            b"usage: vault [status | list | put <key> <secret> | get <key> | del <key>]\n",
+            out,
+        )
+    }
+
+    #[inline(never)]
+    fn cmd_guard(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        let (sub, _) = split_first_word(trim_ascii(arg));
+        let is_ctrl = bytes_eq(sub, b"lockdown") || bytes_eq(sub, b"unlock");
+        let op = if is_ctrl {
+            crate::svc_runtime::IpcOp::GuardControl
+        } else {
+            crate::svc_runtime::IpcOp::GuardQuery
+        };
+        if self
+            .svc
+            .mediate_endpoint(op, false, true, &mut self.audit)
+            .is_err()
+        {
+            return copy_into(
+                b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                out,
+            );
+        }
+        self.cmd_guard_inner(arg, out)
+    }
+
+    #[inline(never)]
+    fn cmd_guard_inner(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        use crate::svc_runtime::SERVICE_COUNT;
+
+        let (sub, _) = split_first_word(trim_ascii(arg));
+        if sub.is_empty() || bytes_eq(sub, b"status") {
+            self.record_audit(36, AuditVerdict::Allowed, b"shell:guard:status");
+            let mut cpl3_total = 0u64;
+            let mut si = 0usize;
+            while si < SERVICE_COUNT {
+                cpl3_total = cpl3_total.wrapping_add(self.svc.services[si].mailbox.cpl3_runs);
+                si += 1;
+            }
+            let mut sc_tasks = 0u64;
+            let mut ti = 0usize;
+            while ti < SHELL_MAX_TASKS {
+                if self.seccomp_mask[ti] != 0 {
+                    sc_tasks += 1;
+                }
+                ti += 1;
+            }
+            let mut denied_events = 0u64;
+            for ev in self.audit.iter() {
+                if ev.verdict == AuditVerdict::Denied {
+                    denied_events += 1;
+                }
+            }
+            let mut pos = 0usize;
+            pos += copy_into(
+                if self.guard_lockdown {
+                    b"guard: posture=LOCKDOWN role="
+                } else {
+                    b"guard: posture=NORMAL role="
+                },
+                &mut out[pos..],
+            );
+            pos += copy_into(self.svc.role.as_bytes(), &mut out[pos..]);
+            pos += copy_into(b" running=", &mut out[pos..]);
+            pos += dec_u64(self.svc.running_count() as u64, &mut out[pos..]);
+            pos += copy_into(b"/3 cpl3_runs=", &mut out[pos..]);
+            pos += dec_u64(cpl3_total, &mut out[pos..]);
+            pos += copy_into(b" fw_rules=", &mut out[pos..]);
+            pos += dec_u64(self.fw.as_slice().len() as u64, &mut out[pos..]);
+            pos += copy_into(b" seccomp_tasks=", &mut out[pos..]);
+            pos += dec_u64(sc_tasks, &mut out[pos..]);
+            pos += copy_into(b" ima_bins=", &mut out[pos..]);
+            pos += dec_u64(self.ima_count as u64, &mut out[pos..]);
+            pos += copy_into(b" audit_denied=", &mut out[pos..]);
+            pos += dec_u64(denied_events, &mut out[pos..]);
+            pos += copy_into(b" pcr10=", &mut out[pos..]);
+            pos += hex_bytes(&self.svc.svc_pcr10[..8], &mut out[pos..]);
+            pos += copy_into(b"...\n", &mut out[pos..]);
+            return pos;
+        }
+
+        if bytes_eq(sub, b"alerts") || bytes_eq(sub, b"audit") {
+            self.record_audit(36, AuditVerdict::Allowed, b"shell:guard:alerts");
+            let mut alert_count = 0u64;
+            for ev in self.audit.iter() {
+                if ev.verdict == AuditVerdict::Denied || ev.verdict == AuditVerdict::Error {
+                    alert_count += 1;
+                }
+            }
+            let mut pos = 0usize;
+            pos += copy_into(b"guard: alerts=", &mut out[pos..]);
+            pos += dec_u64(alert_count, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            for ev in self.audit.iter() {
+                if ev.verdict == AuditVerdict::Denied || ev.verdict == AuditVerdict::Error {
+                    pos += copy_into(b"  id=", &mut out[pos..]);
+                    pos += dec_u64(ev.event_id, &mut out[pos..]);
+                    pos += copy_into(
+                        if ev.verdict == AuditVerdict::Denied {
+                            b" verdict=Denied msg="
+                        } else {
+                            b" verdict=Error msg="
+                        },
+                        &mut out[pos..],
+                    );
+                    let mut mlen = 0usize;
+                    while mlen < ev.message.len() && ev.message[mlen] != 0 {
+                        mlen += 1;
+                    }
+                    pos += copy_into(&ev.message[..mlen], &mut out[pos..]);
+                    pos += copy_into(b"\n", &mut out[pos..]);
+                }
+            }
+            return pos;
+        }
+
+        if bytes_eq(sub, b"lockdown") {
+            self.guard_lockdown = true;
+            let mut pid = 5usize;
+            while pid < SHELL_MAX_TASKS {
+                self.task_caps[pid] = 0;
+                self.seccomp_mask[pid] = SECCOMP_DENY_ALL;
+                pid += 1;
+            }
+            let mut has_threat_rule = false;
+            let rules = self.fw.as_slice();
+            let mut ri = 0usize;
+            while ri < rules.len() {
+                if rules[ri].src_ip == [198, 51, 100, 0] && rules[ri].src_mask == 24 {
+                    has_threat_rule = true;
+                    break;
+                }
+                ri += 1;
+            }
+            if !has_threat_rule {
+                let _ = self.fw.insert(FilterRule {
+                    src_ip: [198, 51, 100, 0],
+                    src_mask: 24,
+                    dst_ip: [0, 0, 0, 0],
+                    dst_mask: 0,
+                    proto: FW_PROTO_ANY,
+                    src_port_start: FW_PORT_ANY,
+                    src_port_end: FW_PORT_ANY,
+                    dst_port_start: FW_PORT_ANY,
+                    dst_port_end: FW_PORT_ANY,
+                    action: FilterAction::Drop,
+                });
+            }
+            self.record_audit(36, AuditVerdict::Allowed, b"shell:guard:lockdown");
+            let mut pos = 0usize;
+            pos += copy_into(
+                b"guard: posture=LOCKDOWN vault=sealed workers_sandboxed=true fw_rules=",
+                &mut out[pos..],
+            );
+            pos += dec_u64(self.fw.as_slice().len() as u64, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            return pos;
+        }
+
+        if bytes_eq(sub, b"unlock") {
+            self.guard_lockdown = false;
+            let mut pid = 5usize;
+            while pid < SHELL_MAX_TASKS {
+                self.seccomp_mask[pid] = 0;
+                pid += 1;
+            }
+            self.failed_login_streak = 0;
+            self.login_cooldown_ticks = 0;
+            self.record_audit(36, AuditVerdict::Allowed, b"shell:guard:unlock");
+            return copy_into(
+                b"guard: posture=NORMAL vault=ready lockdown=cleared\n",
+                out,
+            );
+        }
+
+        copy_into(
+            b"usage: guard [status | alerts | lockdown | unlock]\n",
+            out,
+        )
+    }
+
+    #[inline(never)]
+    fn cmd_cron(&mut self, arg: &[u8], boots: u64, out: &mut [u8]) -> usize {
+        let (sub, _) = split_first_word(trim_ascii(arg));
+        let is_ctrl = bytes_eq(sub, b"add")
+            || bytes_eq(sub, b"del")
+            || bytes_eq(sub, b"rm")
+            || bytes_eq(sub, b"run")
+            || bytes_eq(sub, b"tick");
+        let op = if is_ctrl {
+            crate::svc_runtime::IpcOp::CronControl
+        } else {
+            crate::svc_runtime::IpcOp::CronQuery
+        };
+        if self
+            .svc
+            .mediate_endpoint(op, false, true, &mut self.audit)
+            .is_err()
+        {
+            return copy_into(
+                b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                out,
+            );
+        }
+        self.cmd_cron_inner(arg, boots, out)
+    }
+
+    #[inline(never)]
+    fn cmd_cron_inner(&mut self, arg: &[u8], boots: u64, out: &mut [u8]) -> usize {
+        let (sub, rest) = split_first_word(trim_ascii(arg));
+        if sub.is_empty() || bytes_eq(sub, b"list") || bytes_eq(sub, b"status") {
+            self.record_audit(37, AuditVerdict::Allowed, b"shell:cron:list");
+            let mut active = 0u64;
+            let mut total_runs = 0u64;
+            let mut i = 0usize;
+            while i < SHELL_MAX_CRON_JOBS {
+                if self.cron_jobs[i].active {
+                    active += 1;
+                    total_runs += self.cron_jobs[i].runs as u64;
+                }
+                i += 1;
+            }
+            let mut pos = 0usize;
+            pos += copy_into(b"cron: active=", &mut out[pos..]);
+            pos += dec_u64(active, &mut out[pos..]);
+            pos += copy_into(b"/", &mut out[pos..]);
+            pos += dec_u64(SHELL_MAX_CRON_JOBS as u64, &mut out[pos..]);
+            pos += copy_into(b" total_runs=", &mut out[pos..]);
+            pos += dec_u64(total_runs, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            let mut k = 0usize;
+            while k < SHELL_MAX_CRON_JOBS {
+                if self.cron_jobs[k].active {
+                    let j = &self.cron_jobs[k];
+                    pos += copy_into(b"  id=", &mut out[pos..]);
+                    pos += dec_u64(j.id as u64, &mut out[pos..]);
+                    pos += copy_into(b" every=", &mut out[pos..]);
+                    pos += dec_u64(j.interval_ticks as u64, &mut out[pos..]);
+                    pos += copy_into(b"t elapsed=", &mut out[pos..]);
+                    pos += dec_u64(j.elapsed_ticks as u64, &mut out[pos..]);
+                    pos += copy_into(b"t runs=", &mut out[pos..]);
+                    pos += dec_u64(j.runs as u64, &mut out[pos..]);
+                    pos += copy_into(b" cmd=\"", &mut out[pos..]);
+                    pos += copy_into(j.cmd_bytes(), &mut out[pos..]);
+                    pos += copy_into(b"\"\n", &mut out[pos..]);
+                }
+                k += 1;
+            }
+            return pos;
+        }
+
+        if bytes_eq(sub, b"add") {
+            let (int_tok, cmd_raw) = split_first_word(trim_ascii(rest));
+            let cmd_line = trim_ascii(cmd_raw);
+            let Some(interval) = parse_u32_ascii(int_tok) else {
+                return copy_into(b"usage: cron add <interval_ticks:1..3600> <cmd>\n", out);
+            };
+            if interval == 0 || interval > 3600 || cmd_line.is_empty() || cmd_line.len() > 48 {
+                return copy_into(b"usage: cron add <interval_ticks:1..3600> <cmd>\n", out);
+            }
+            let (first_cmd, _) = split_first_word(cmd_line);
+            if bytes_eq(first_cmd, b"cron")
+                || bytes_eq(first_cmd, b"halt")
+                || bytes_eq(first_cmd, b"poweroff")
+                || bytes_eq(first_cmd, b"reboot")
+            {
+                self.record_audit(37, AuditVerdict::Denied, b"shell:cron:forbidden");
+                return copy_into(
+                    b"error: EPERM (cron cannot schedule recursive or power commands)\n",
+                    out,
+                );
+            }
+            let mut free_slot = None;
+            let mut i = 0usize;
+            while i < SHELL_MAX_CRON_JOBS {
+                if !self.cron_jobs[i].active {
+                    free_slot = Some(i);
+                    break;
+                }
+                i += 1;
+            }
+            let Some(slot) = free_slot else {
+                return copy_into(b"error: cron table full (max 4)\n", out);
+            };
+            let mut job = CronJob::empty();
+            job.active = true;
+            job.id = (slot + 1) as u8;
+            job.interval_ticks = interval as u16;
+            job.elapsed_ticks = 0;
+            job.cmd_len = cmd_line.len() as u8;
+            job.cmd[..cmd_line.len()].copy_from_slice(cmd_line);
+            self.cron_jobs[slot] = job;
+            self.record_audit(37, AuditVerdict::Allowed, b"shell:cron:add");
+            let mut pos = 0usize;
+            pos += copy_into(b"cron: scheduled id=", &mut out[pos..]);
+            pos += dec_u64(job.id as u64, &mut out[pos..]);
+            pos += copy_into(b" every=", &mut out[pos..]);
+            pos += dec_u64(job.interval_ticks as u64, &mut out[pos..]);
+            pos += copy_into(b"t cmd=\"", &mut out[pos..]);
+            pos += copy_into(cmd_line, &mut out[pos..]);
+            pos += copy_into(b"\"\n", &mut out[pos..]);
+            return pos;
+        }
+
+        if bytes_eq(sub, b"del") || bytes_eq(sub, b"rm") {
+            let Some(id_val) = parse_u32_ascii(trim_ascii(rest)) else {
+                return copy_into(b"usage: cron del <id:1..4>\n", out);
+            };
+            if id_val == 0 || id_val as usize > SHELL_MAX_CRON_JOBS {
+                return copy_into(b"error: cron job not found\n", out);
+            }
+            let slot = (id_val as usize) - 1;
+            if !self.cron_jobs[slot].active {
+                return copy_into(b"error: cron job not found\n", out);
+            }
+            self.cron_jobs[slot] = CronJob::empty();
+            self.record_audit(37, AuditVerdict::Allowed, b"shell:cron:del");
+            let mut pos = 0usize;
+            pos += copy_into(b"cron: deleted id=", &mut out[pos..]);
+            pos += dec_u64(id_val as u64, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            return pos;
+        }
+
+        if bytes_eq(sub, b"run") {
+            let Some(id_val) = parse_u32_ascii(trim_ascii(rest)) else {
+                return copy_into(b"usage: cron run <id:1..4>\n", out);
+            };
+            if id_val == 0 || id_val as usize > SHELL_MAX_CRON_JOBS {
+                return copy_into(b"error: cron job not found\n", out);
+            }
+            let slot = (id_val as usize) - 1;
+            if !self.cron_jobs[slot].active {
+                return copy_into(b"error: cron job not found\n", out);
+            }
+            let clen = (self.cron_jobs[slot].cmd_len as usize).min(48);
+            let mut cmd_buf = [0u8; 48];
+            cmd_buf[..clen].copy_from_slice(&self.cron_jobs[slot].cmd[..clen]);
+            let mut exec_out = [0u8; 256];
+            let n = self
+                .exec_line(&cmd_buf[..clen], boots, 0, 0, &mut exec_out)
+                .bytes_written();
+            self.cron_jobs[slot].runs = self.cron_jobs[slot].runs.wrapping_add(1);
+            self.cron_jobs[slot].last_bytes = n as u16;
+            self.cron_jobs[slot].elapsed_ticks = 0;
+            self.record_audit(37, AuditVerdict::Allowed, b"shell:cron:run");
+            let mut pos = 0usize;
+            pos += copy_into(b"cron: executed id=", &mut out[pos..]);
+            pos += dec_u64(id_val as u64, &mut out[pos..]);
+            pos += copy_into(b" runs=", &mut out[pos..]);
+            pos += dec_u64(self.cron_jobs[slot].runs as u64, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            pos += copy_into(&exec_out[..n], &mut out[pos..]);
+            return pos;
+        }
+
+        if bytes_eq(sub, b"tick") {
+            let fired = self.tick_cron_jobs(boots);
+            self.record_audit(37, AuditVerdict::Allowed, b"shell:cron:tick");
+            let mut pos = 0usize;
+            pos += copy_into(b"cron: tick fired=", &mut out[pos..]);
+            pos += dec_u64(fired as u64, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            return pos;
+        }
+
+        copy_into(
+            b"usage: cron [list | add <ticks> <cmd> | del <id> | run <id> | tick]\n",
+            out,
+        )
+    }
+
+    #[inline(never)]
     fn cmd_service(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
         use crate::svc_runtime::{NodeRole, ServiceId, SERVICE_COUNT};
 
@@ -2676,6 +3404,8 @@ impl OsShell {
                 pos += dec_u64(s.restarts, &mut out[pos..]);
                 pos += copy_into(b" reqs=", &mut out[pos..]);
                 pos += dec_u64(s.requests_served, &mut out[pos..]);
+                pos += copy_into(b" cpl3=", &mut out[pos..]);
+                pos += dec_u64(s.mailbox.cpl3_runs, &mut out[pos..]);
                 pos += copy_into(b" denials=", &mut out[pos..]);
                 pos += dec_u64(s.policy_denials, &mut out[pos..]);
                 pos += copy_into(b" sha256=", &mut out[pos..]);
@@ -3750,6 +4480,90 @@ fn hex_bytes(src: &[u8], out: &mut [u8]) -> usize {
     pos
 }
 
+fn hex_nibble_val(b: u8) -> Option<u8> {
+    if b.is_ascii_digit() {
+        Some(b - b'0')
+    } else if (b'a'..=b'f').contains(&b) {
+        Some(b - b'a' + 10)
+    } else if (b'A'..=b'F').contains(&b) {
+        Some(b - b'A' + 10)
+    } else {
+        None
+    }
+}
+
+fn decode_hex_slice(hex: &[u8], out: &mut [u8]) -> Option<usize> {
+    if hex.is_empty() || hex.len() % 2 != 0 || hex.len() / 2 > out.len() {
+        return None;
+    }
+    let n = hex.len() / 2;
+    let mut i = 0usize;
+    while i < n {
+        let hi = hex_nibble_val(hex[2 * i])?;
+        let lo = hex_nibble_val(hex[2 * i + 1])?;
+        out[i] = (hi << 4) | lo;
+        i += 1;
+    }
+    Some(n)
+}
+
+fn is_valid_vault_key(s: &[u8]) -> bool {
+    if s.is_empty() || s.len() > 18 {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < s.len() {
+        let c = s[i];
+        if !(c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b'.') {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn is_valid_vault_secret(s: &[u8]) -> bool {
+    if s.is_empty() || s.len() > 12 {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < s.len() {
+        let c = s[i];
+        if !(0x21..=0x7E).contains(&c) || c == b'\'' || c == b'"' || c == b'|' {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn vault_derive_stream_and_mac(
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+    key_name: &[u8],
+    ct: &[u8],
+) -> ([u8; DURABLE_DIGEST_LEN], u64) {
+    let mut ks_msg = [0u8; 64];
+    let mut kp = 0usize;
+    kp += copy_into(b"cuttle-vault-ks-v1:", &mut ks_msg[kp..]);
+    kp += copy_into(key_name, &mut ks_msg[kp..]);
+    let mut ks = [0u8; DURABLE_DIGEST_LEN];
+    seal_bytes_keyed(seal_key, &ks_msg[..kp], &mut ks);
+
+    let mut mac_msg = [0u8; 96];
+    let mut mp = 0usize;
+    mp += copy_into(b"cuttle-vault-mac-v1:", &mut mac_msg[mp..]);
+    mp += copy_into(key_name, &mut mac_msg[mp..]);
+    mp += copy_into(b":", &mut mac_msg[mp..]);
+    mp += copy_into(ct, &mut mac_msg[mp..]);
+    let mut mac = [0u8; DURABLE_DIGEST_LEN];
+    seal_bytes_keyed(seal_key, &mac_msg[..mp], &mut mac);
+    let tag = (u64::from_le_bytes([
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], mac[6], mac[7],
+    ]) & 0x7FFF_FFFF_FFFF_FFFF)
+        .max(1);
+    (ks, tag)
+}
+
 fn trim_ascii(s: &[u8]) -> &[u8] {
     let mut start = 0usize;
     while start < s.len() && (s[start] == b' ' || s[start] == b'\t' || s[start] == b'\r' || s[start] == b'\n') {
@@ -4665,5 +5479,110 @@ mod tests {
         sh1.tick_login_cooldown();
         assert!(!sh1.is_login_rate_limited());
         assert_eq!(sh1.failed_login_streak, 0);
+    }
+
+    #[test]
+    fn cuttle_vault_guard_and_chronos_apps_work() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 512];
+
+        // 1. CuttleVault: seal a secret, verify raw SQL stores only ciphertext, unseal, and detect tamper.
+        let act = sh.exec_line(b"vault put api.token Secr3tKey99", 1, 0, 0, &mut out);
+        let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
+        assert!(s.starts_with("vault: sealed key=api.token ct="));
+        assert!(!s.contains("Secr3tKey99"));
+
+        let act = sh.exec_line(
+            b"sql SELECT v FROM kv WHERE k = 'v:api.token'",
+            1,
+            0,
+            0,
+            &mut out,
+        );
+        let raw_sql = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
+        assert!(!raw_sql.contains("Secr3tKey99"));
+
+        let act = sh.exec_line(b"vault get api.token", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"vault: key=api.token value=Secr3tKey99 verified=true\n"
+        );
+
+        // Tampering with the MAC tag in SQL must be rejected by CuttleVault with EBADMSG:
+        let _ = sh.exec_line(
+            b"sql BEGIN",
+            1,
+            0,
+            0,
+            &mut out,
+        );
+        let _ = sh.exec_line(
+            b"sql UPDATE kv SET rev = 12345 WHERE k = 'v:api.token'",
+            1,
+            0,
+            0,
+            &mut out,
+        );
+        let act = sh.exec_line(b"vault get api.token", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"error: EBADMSG (vault AEAD authentication tag mismatch)\n"
+        );
+        let _ = sh.exec_line(b"sql ROLLBACK", 1, 0, 0, &mut out);
+        let act = sh.exec_line(b"vault get api.token", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"vault: key=api.token value=Secr3tKey99 verified=true\n"
+        );
+
+        // 2. CuttleGuard: inspect posture, trigger lockdown, verify vault is sealed and workers are sandboxed.
+        let _ = sh.exec_line(b"spawn", 1, 0, 0, &mut out);
+        let _ = sh.exec_line(b"grant 5 fs", 1, 0, 0, &mut out);
+        let act = sh.exec_line(b"guard lockdown", 1, 0, 0, &mut out);
+        assert!(core::str::from_utf8(&out[..act.bytes_written()])
+            .unwrap()
+            .starts_with("guard: posture=LOCKDOWN vault=sealed"));
+        let act = sh.exec_line(b"vault get api.token", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"error: EACCES (vault sealed by CuttleGuard lockdown)\n"
+        );
+        let act = sh.exec_line(b"syscall 5 open /etc/hostname", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"syscall denied: EACCES (blocked by eBPF seccomp filter)\n"
+        );
+        let act = sh.exec_line(b"guard unlock", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"guard: posture=NORMAL vault=ready lockdown=cleared\n"
+        );
+        let act = sh.exec_line(b"vault get api.token", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"vault: key=api.token value=Secr3tKey99 verified=true\n"
+        );
+
+        // 3. CuttleChronos: schedule a periodic job, reject recursive/power jobs, and fire via ticks.
+        let act = sh.exec_line(b"cron add 2 reboot", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"error: EPERM (cron cannot schedule recursive or power commands)\n"
+        );
+        let act = sh.exec_line(
+            b"cron add 2 write /var/heartbeat alive",
+            1,
+            0,
+            0,
+            &mut out,
+        );
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"cron: scheduled id=1 every=2t cmd=\"write /var/heartbeat alive\"\n"
+        );
+        assert_eq!(sh.tick_cron_jobs(1), 0);
+        assert_eq!(sh.tick_cron_jobs(1), 1);
+        let act = sh.exec_line(b"cat /var/heartbeat", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act.bytes_written()], b"alive\n");
     }
 }
