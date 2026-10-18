@@ -18,21 +18,21 @@ use crate::tls::{hmac_sha256, sha256_into};
 pub const DURABLE_DIGEST_LEN: usize = 32;
 
 /// Deterministic 256-bit seal key fixture used only by in-memory unit tests
-/// (`OsShell::empty`). The live kernel (`target_enterprise_kernel`) never
-/// references this constant; it derives `seal_key` from the out-of-band
-/// provisioned secret (`fw_cfg` `opt/cuttle_device_key` backed by gitignored
-/// `device_secret_key.bin`, or x86-64 `RDRAND` hardware entropy at boot).
+/// (`OsShell::new`). Limited to `#[cfg(test)]` so production and kernel code
+/// can never fall back to a public constant.
+#[cfg(test)]
 pub const DEFAULT_DURABLE_SEAL_KEY: [u8; DURABLE_DIGEST_LEN] =
     *b"Cuttle-Enterprise-DiskSeal-K0001";
 
-/// Pre-rebrand (`Proteus`) deterministic 256-bit seal key fixture used to verify
-/// and migrate legacy `PRTS*` disk images in unit tests.
+/// Pre-rebrand (`Proteus`) deterministic 256-bit seal key fixture used only by
+/// in-memory unit tests (`OsShell::new`). Limited to `#[cfg(test)]`.
+#[cfg(test)]
 pub const DEFAULT_LEGACY_DURABLE_SEAL_KEY: [u8; DURABLE_DIGEST_LEN] =
     *b"Proteus-Enterprise-DiskSeal-K001";
 
 /// Deterministic 256-bit remote attestation key fixture used only by in-memory
-/// unit tests (`OsShell::empty`). The live kernel derives `attest_key` from the
-/// out-of-band provisioned `fw_cfg` secret via [`derive_attest_key`].
+/// unit tests (`OsShell::new`). Limited to `#[cfg(test)]`.
+#[cfg(test)]
 pub const DEFAULT_ATTEST_KEY: [u8; DURABLE_DIGEST_LEN] =
     *b"Cuttle-Enterprise-Attest-Key0001";
 
@@ -146,6 +146,12 @@ pub fn seal_matches_keyed(
     let mut got = [0u8; DURABLE_DIGEST_LEN];
     seal_bytes_keyed(key, data, &mut got);
     constant_time_eq(&got, expected)
+}
+
+/// Returns `true` iff `key` is non-zero (i.e. has been explicitly provisioned
+/// rather than left at the zeroed `OsShell::empty()` BSS state).
+pub fn is_seal_key_set(key: &[u8; DURABLE_DIGEST_LEN]) -> bool {
+    !constant_time_eq(key, &[0u8; DURABLE_DIGEST_LEN])
 }
 
 /// Constant-time compare of two digests (avoid short-circuit on first

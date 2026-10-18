@@ -30,9 +30,12 @@ use cuttle_contracts::{
 
 use crate::audit::AuditLogImpl;
 use crate::durable_seal::{
-    seal_bytes, seal_bytes_keyed, seal_matches, seal_matches_keyed, zeroize_secret_bytes,
+    is_seal_key_set, seal_bytes, seal_bytes_keyed, seal_matches, seal_matches_keyed,
+    zeroize_secret_bytes, DURABLE_DIGEST_LEN,
+};
+#[cfg(test)]
+use crate::durable_seal::{
     DEFAULT_ATTEST_KEY, DEFAULT_DURABLE_SEAL_KEY, DEFAULT_LEGACY_DURABLE_SEAL_KEY,
-    DURABLE_DIGEST_LEN,
 };
 use crate::ebpf::EBpfImpl;
 use crate::elf64::Elf64Impl;
@@ -287,7 +290,8 @@ pub struct OsShell {
 
 impl OsShell {
     /// Construct an unseeded empty shell suitable for `static mut` BSS allocation.
-    /// Call [`OsShell::seed_defaults`] before executing commands.
+    /// Keys (`seal_key`, `legacy_seal_key`, `attest_key`) start unset (`[0u8; 32]`)
+    /// and must be provisioned before any seal or verify operation.
     pub const fn empty() -> Self {
         Self {
             fs: MemRamFs::new(),
@@ -305,9 +309,9 @@ impl OsShell {
             ima_pcr10: [0u8; DURABLE_DIGEST_LEN],
             ima_measurements: 0,
             auth_seq: 0,
-            seal_key: DEFAULT_DURABLE_SEAL_KEY,
-            legacy_seal_key: DEFAULT_LEGACY_DURABLE_SEAL_KEY,
-            attest_key: DEFAULT_ATTEST_KEY,
+            seal_key: [0u8; DURABLE_DIGEST_LEN],
+            legacy_seal_key: [0u8; DURABLE_DIGEST_LEN],
+            attest_key: [0u8; DURABLE_DIGEST_LEN],
             smp_cpus_online: 4,
             smp_cpu_ticks: [0u64; 4],
             smp_cpu_jobs: [0u64; 4],
@@ -336,16 +340,14 @@ impl OsShell {
         }
     }
 
-    /// Construct and seed a fresh live OS shell environment.
-    ///
-    /// Pre-populates:
-    /// - `/etc/hostname` (`"cuttle-te\n"`)
-    /// - `/etc/os-release` (`"NAME=\"Cuttle MTD OS\"\nVERSION=\"1.0-enterprise\"\nARCH=\"x86_64\"\n"`)
-    /// - `/etc/motd` (`"Cuttle Enterprise Moving-Target-Defense OS\nType 'help' for commands.\n"`)
-    /// - `/proc/net` (`"iface=virtio-net0 ip=10.0.2.15 udp=8080 tcp=80 icmp=echo\n"`)
-    /// - System tasks: PID 1 (`init`), PID 2 (`kthreadd-net`), PID 3 (`kthreadd-wal`), PID 4 (`cuttle-sh`)
+    /// Test-only constructor that seeds a fresh live OS shell environment with
+    /// deterministic test fixture keys.
+    #[cfg(test)]
     pub fn new() -> Self {
         let mut s = Self::empty();
+        s.seal_key = DEFAULT_DURABLE_SEAL_KEY;
+        s.legacy_seal_key = DEFAULT_LEGACY_DURABLE_SEAL_KEY;
+        s.attest_key = DEFAULT_ATTEST_KEY;
         s.seed_defaults();
         s
     }
@@ -1291,6 +1293,10 @@ impl OsShell {
         wal: &mut WalImpl<C>,
         seal_out: &mut [u8; DURABLE_DIGEST_LEN],
     ) -> Result<usize, WalError> {
+        if !is_seal_key_set(&self.seal_key) {
+            self.record_audit(19, AuditVerdict::Denied, b"shell:wal:key-unset");
+            return Err(WalError::PayloadTooLarge);
+        }
         let count = self.checkpoint_wal(wal)?;
         compute_wal_seal(&self.seal_key, wal, seal_out);
         Ok(count)
@@ -1306,6 +1312,10 @@ impl OsShell {
         wal: &WalImpl<C>,
         expected_seal: &[u8; DURABLE_DIGEST_LEN],
     ) -> Result<usize, WalError> {
+        if !is_seal_key_set(&self.seal_key) {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:wal:key-unset");
+            return Err(WalError::PayloadTooLarge);
+        }
         let mut scratch = [0u8; 1024];
         let len = serialize_wal_for_seal(wal, &mut scratch);
         if !seal_matches_keyed(&self.seal_key, &scratch[..len], expected_seal) {
@@ -1408,13 +1418,10 @@ impl OsShell {
         if is_legacy {
             let mut scratch = [0u8; 1024];
             let len = serialize_wal_for_seal(&wal, &mut scratch);
-            let ok = seal_matches_keyed(&self.seal_key, &scratch[..len], &expected_seal)
-                || seal_matches_keyed(&self.legacy_seal_key, &scratch[..len], &expected_seal)
-                || seal_matches_keyed(
-                    &DEFAULT_LEGACY_DURABLE_SEAL_KEY,
-                    &scratch[..len],
-                    &expected_seal,
-                );
+            let ok = (is_seal_key_set(&self.seal_key)
+                && seal_matches_keyed(&self.seal_key, &scratch[..len], &expected_seal))
+                || (is_seal_key_set(&self.legacy_seal_key)
+                    && seal_matches_keyed(&self.legacy_seal_key, &scratch[..len], &expected_seal));
             if !ok {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:wal:seal-mismatch");
                 return Err(WalError::PayloadTooLarge);
@@ -1438,6 +1445,10 @@ impl OsShell {
         generation: u64,
         sectors: &mut [[u8; 512]; SHELL_FS_PART_SECTORS],
     ) -> Result<(usize, usize), WalError> {
+        if !is_seal_key_set(&self.seal_key) {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:fs:key-unset");
+            return Err(WalError::PayloadTooLarge);
+        }
         let proof = match durable_wal_proof(self.task_caps[4]) {
             Ok(p) => p,
             Err(_) => {
@@ -1585,15 +1596,13 @@ impl OsShell {
             h += 1;
         }
         let seal_ok = if is_legacy {
-            verify_fs_partition_seal(&self.seal_key, sectors, &expected_seal)
-                || verify_fs_partition_seal(&self.legacy_seal_key, sectors, &expected_seal)
-                || verify_fs_partition_seal(
-                    &DEFAULT_LEGACY_DURABLE_SEAL_KEY,
-                    sectors,
-                    &expected_seal,
-                )
+            (is_seal_key_set(&self.seal_key)
+                && verify_fs_partition_seal(&self.seal_key, sectors, &expected_seal))
+                || (is_seal_key_set(&self.legacy_seal_key)
+                    && verify_fs_partition_seal(&self.legacy_seal_key, sectors, &expected_seal))
         } else {
-            verify_fs_partition_seal(&self.seal_key, sectors, &expected_seal)
+            is_seal_key_set(&self.seal_key)
+                && verify_fs_partition_seal(&self.seal_key, sectors, &expected_seal)
         };
         if !seal_ok {
             self.record_audit(21, AuditVerdict::Denied, b"shell:fs:seal-mismatch");
@@ -4385,6 +4394,9 @@ impl OsShell {
         nonce: &[u8],
         expected_mac: &[u8; DURABLE_DIGEST_LEN],
     ) -> bool {
+        if !is_seal_key_set(&self.attest_key) {
+            return false;
+        }
         let mut body = [0u8; 320];
         let blen = self.format_attestation_body(boots, nonce, &mut body);
         seal_matches_keyed(&self.attest_key, &body[..blen], expected_mac)
@@ -4410,6 +4422,7 @@ impl OsShell {
     }
 }
 
+#[cfg(test)]
 impl Default for OsShell {
     fn default() -> Self {
         Self::new()
@@ -5835,6 +5848,61 @@ mod tests {
         assert_eq!(&fs_secs[0][0..8], b"CTTLFS01");
         new_sh.pack_sql_partition(&mut sql_secs);
         assert_eq!(&sql_secs[0][0..8], b"CTTLSQL1");
+
+        // Verify that a legacy `PRTS*` image sealed with the public test fixture constant
+        // (`DEFAULT_LEGACY_DURABLE_SEAL_KEY`) is REFUSED by `new_sh` (which is bound to
+        // `cuttle_key` and `legacy_key`), across all three partitions (WAL, FS, SQL).
+        let mut pub_sh = OsShell::with_seal_key(DEFAULT_LEGACY_DURABLE_SEAL_KEY);
+        let _ = pub_sh.exec_line(b"write /var/forged.txt pwned", 3, 0, 0, &mut out);
+        let _ = pub_sh.exec_line(
+            b"sql INSERT INTO kv VALUES ('forged.k', 'pwned', 1)",
+            3,
+            0,
+            0,
+            &mut out,
+        );
+        let mut pub_hdr = [0u8; 512];
+        let mut pub_wal = [0u8; 512];
+        pub_sh.pack_disk_image(3, &mut pub_hdr, &mut pub_wal).unwrap();
+        pub_hdr[0..8].copy_from_slice(b"PRTSSHL1");
+
+        let mut pub_fs = [[0u8; 512]; SHELL_FS_PART_SECTORS];
+        pub_sh.pack_fs_partition(3, &mut pub_fs).unwrap();
+        pub_fs[0][0..8].copy_from_slice(b"PRTSFS01");
+        let mut pub_fs_seal = [0u8; DURABLE_DIGEST_LEN];
+        compute_fs_partition_seal(&DEFAULT_LEGACY_DURABLE_SEAL_KEY, &pub_fs, &mut pub_fs_seal);
+        pub_fs[0][24..24 + DURABLE_DIGEST_LEN].copy_from_slice(&pub_fs_seal);
+
+        let mut pub_sql = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
+        pub_sh.pack_sql_partition(&mut pub_sql);
+        pub_sql[0][0..8].copy_from_slice(b"PRTSSQL1");
+        let mut pub_flat = [0u8; crate::sql::SQL_PART_SECTORS * 512];
+        for s in 0..crate::sql::SQL_PART_SECTORS {
+            pub_flat[s * 512..(s + 1) * 512].copy_from_slice(&pub_sql[s]);
+        }
+        let mut pub_mac_in = [0u8; crate::sql::SQL_PART_SECTORS * 512];
+        pub_mac_in[0..20].copy_from_slice(&pub_flat[0..20]);
+        pub_mac_in[20..20 + rest_len].copy_from_slice(&pub_flat[52..]);
+        let mut pub_sql_tag = [0u8; DURABLE_DIGEST_LEN];
+        seal_bytes_keyed(
+            &DEFAULT_LEGACY_DURABLE_SEAL_KEY,
+            &pub_mac_in[..20 + rest_len],
+            &mut pub_sql_tag,
+        );
+        pub_sql[0][20..52].copy_from_slice(&pub_sql_tag);
+
+        assert!(
+            new_sh.unpack_disk_image(&pub_hdr, &pub_wal).is_err(),
+            "PRTSSHL1 image sealed with public default key must be rejected"
+        );
+        assert!(
+            new_sh.unpack_fs_partition(&pub_fs).is_err(),
+            "PRTSFS01 partition sealed with public default key must be rejected"
+        );
+        assert!(
+            !new_sh.unpack_sql_partition(&pub_sql),
+            "PRTSSQL1 partition sealed with public default key must be rejected"
+        );
     }
 
     #[test]
@@ -5962,5 +6030,36 @@ mod tests {
             &out2[..n2],
             "identical plaintext sealed twice to the same key must produce distinct ciphertexts"
         );
+    }
+
+    #[test]
+    fn regression_round3_item2_unset_shell_keys_refuse_seal_and_verify() {
+        // `OsShell::empty()` initializes `seal_key`, `legacy_seal_key`, and `attest_key` to unset (`[0u8; 32]`).
+        let mut unprov = OsShell::empty();
+        unprov.seed_defaults();
+        assert!(!is_seal_key_set(&unprov.seal_key));
+        assert!(!is_seal_key_set(&unprov.legacy_seal_key));
+        assert!(!is_seal_key_set(&unprov.attest_key));
+
+        // 1. Sealing operations must refuse while `seal_key` is unset.
+        let mut hdr = [0u8; 512];
+        let mut wal = [0u8; 512];
+        assert!(unprov.pack_disk_image(1, &mut hdr, &mut wal).is_err());
+        let mut fs_secs = [[0u8; 512]; SHELL_FS_PART_SECTORS];
+        assert!(unprov.pack_fs_partition(1, &mut fs_secs).is_err());
+        let mut sql_secs = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
+        unprov.pack_sql_partition(&mut sql_secs);
+        assert_eq!(&sql_secs[0][0..8], &[0u8; 8]);
+
+        // 2. Verification operations must refuse even if the disk image was forged with `[0u8; 32]`.
+        let mut forged_wal: WalImpl<512> = WalImpl::new();
+        let mut forged_seal = [0u8; DURABLE_DIGEST_LEN];
+        compute_wal_seal(&[0u8; DURABLE_DIGEST_LEN], &forged_wal, &mut forged_seal);
+        assert!(unprov.restore_sealed(&forged_wal, &forged_seal).is_err());
+
+        // 3. Attestation MAC verification must refuse while `attest_key` is unset.
+        let mut mac = [0u8; DURABLE_DIGEST_LEN];
+        unprov.compute_attestation_mac(1, b"nonce", &mut mac);
+        assert!(!unprov.verify_attestation_mac(1, b"nonce", &mac));
     }
 }

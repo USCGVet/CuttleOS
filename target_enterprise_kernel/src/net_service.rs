@@ -736,6 +736,7 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
             let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
             if sh.fs.inode_count() == 0 {
                 sh.seal_key = derive_runtime_seal_key();
+                sh.legacy_seal_key = derive_runtime_legacy_seal_key();
                 sh.attest_key = derive_runtime_attest_key();
                 sh.seed_defaults();
                 let _ = restore_shell_from_ahci(sh);
@@ -1223,6 +1224,7 @@ pub(crate) fn service_udp_status_legacy() {
             let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
             if sh.fs.inode_count() == 0 {
                 sh.seal_key = derive_runtime_seal_key();
+                sh.legacy_seal_key = derive_runtime_legacy_seal_key();
                 sh.attest_key = derive_runtime_attest_key();
                 sh.seed_defaults();
                 let _ = restore_shell_from_ahci(sh);

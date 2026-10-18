@@ -15,7 +15,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::durable_seal::{
-    seal_bytes_keyed, seal_matches_keyed, DEFAULT_LEGACY_DURABLE_SEAL_KEY, DURABLE_DIGEST_LEN,
+    is_seal_key_set, seal_bytes_keyed, seal_matches_keyed, DURABLE_DIGEST_LEN,
 };
 
 /// Maximum number of relational tables in a [`SqlDb`] instance.
@@ -1530,6 +1530,14 @@ impl SqlDb {
         key: &[u8; DURABLE_DIGEST_LEN],
         sectors: &mut [[u8; 512]; SQL_PART_SECTORS],
     ) {
+        if !is_seal_key_set(key) {
+            let mut s = 0usize;
+            while s < SQL_PART_SECTORS {
+                sectors[s] = [0u8; 512];
+                s += 1;
+            }
+            return;
+        }
         let mut flat = [0u8; SQL_PART_SECTORS * 512];
         flat[0..8].copy_from_slice(SQL_PART_MAGIC);
         let committed_seq = if self.tx_active {
@@ -1668,16 +1676,11 @@ impl SqlDb {
         key: &[u8; DURABLE_DIGEST_LEN],
         sectors: &[[u8; 512]; SQL_PART_SECTORS],
     ) -> bool {
-        self.load_partition_with_legacy(
-            key,
-            &crate::durable_seal::DEFAULT_LEGACY_DURABLE_SEAL_KEY,
-            sectors,
-        )
+        self.load_partition_with_legacy(key, &[0u8; DURABLE_DIGEST_LEN], sectors)
     }
 
     /// Restore the database from an 8-sector (`4 KiB`) partition image, verifying
-    /// `CTTLSQL1` with `key` or legacy `PRTSSQL1` with `key`, `legacy_key`, or
-    /// `DEFAULT_LEGACY_DURABLE_SEAL_KEY`.
+    /// `CTTLSQL1` with `key` or legacy `PRTSSQL1` with device-derived `key` / `legacy_key`.
     pub fn load_partition_with_legacy(
         &mut self,
         key: &[u8; DURABLE_DIGEST_LEN],
@@ -1708,11 +1711,11 @@ impl SqlDb {
         tag_in.copy_from_slice(&flat[20..52]);
         let mac_slice = &mac_input[..20 + rest_len];
         let tag_ok = if is_legacy {
-            seal_matches_keyed(key, mac_slice, &tag_in)
-                || seal_matches_keyed(legacy_key, mac_slice, &tag_in)
-                || seal_matches_keyed(&DEFAULT_LEGACY_DURABLE_SEAL_KEY, mac_slice, &tag_in)
+            (is_seal_key_set(key) && seal_matches_keyed(key, mac_slice, &tag_in))
+                || (is_seal_key_set(legacy_key)
+                    && seal_matches_keyed(legacy_key, mac_slice, &tag_in))
         } else {
-            seal_matches_keyed(key, mac_slice, &tag_in)
+            is_seal_key_set(key) && seal_matches_keyed(key, mac_slice, &tag_in)
         };
         if !tag_ok {
             return false;

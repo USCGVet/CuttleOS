@@ -623,7 +623,7 @@ pub(crate) fn persist_shell_to_ahci(sh: &mut target_enterprise::OsShell, boots: 
 }
 
 pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Option<(u64, usize)> {
-    if sh.legacy_seal_key == target_enterprise::durable_seal::DEFAULT_LEGACY_DURABLE_SEAL_KEY {
+    if !target_enterprise::durable_seal::is_seal_key_set(&sh.legacy_seal_key) {
         sh.legacy_seal_key = derive_runtime_legacy_seal_key();
     }
     let port = AhciHwPort::probe_start_quiet();
@@ -887,6 +887,7 @@ pub(crate) fn banner_shell_compose() {
     let vsh: &mut target_enterprise::OsShell = &mut *vsh_guard;
     *vsh = target_enterprise::OsShell::empty();
     vsh.seal_key = seal_key;
+    vsh.legacy_seal_key = legacy_seal_key;
     vsh.attest_key = attest_key;
     vsh.seed_defaults_for_boot(boots);
     if restore_shell_from_ahci(vsh) != Some((boots, 4)) {
