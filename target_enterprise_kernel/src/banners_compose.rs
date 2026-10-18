@@ -641,9 +641,15 @@ pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Op
     let res = match sh.unpack_disk_image(&hdr_sec, &wal_sec) {
         Ok(res) => res,
         Err(_) => {
-            serial_write_str(
-                "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
-            );
+            if &hdr_sec[0..4] == b"PRTS" && &hdr_sec[0..8] != b"PRTSSHL1" {
+                serial_write_str(
+                    "SHELL resume NOTICE: legacy PRTS* disk format detected; migrating to CTTL* state\n",
+                );
+            } else {
+                serial_write_str(
+                    "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
+                );
+            }
             return None;
         }
     };

@@ -128,6 +128,21 @@ fn constant_time_eq(a: &[u8; DURABLE_DIGEST_LEN], b: &[u8; DURABLE_DIGEST_LEN]) 
     diff == 0
 }
 
+/// Overwrite sensitive key or secret material in `buf` using volatile byte writes
+/// followed by a `SeqCst` compiler fence so the optimizer cannot elide the wipe
+/// as a dead store.
+pub fn zeroize_secret_bytes(buf: &mut [u8]) {
+    let mut i = 0usize;
+    while i < buf.len() {
+        // SAFETY: `buf[i]` is a valid, aligned mutable `u8` within the slice bounds.
+        unsafe {
+            core::ptr::write_volatile(&mut buf[i], 0u8);
+        }
+        i += 1;
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

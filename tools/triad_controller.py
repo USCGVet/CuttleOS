@@ -218,6 +218,72 @@ class TriadController:
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(self.wal_file)
 
+    def _encrypt_wal_vault_cmd(self, cmd_str: str) -> str:
+        """
+        Encrypt a `vault put <key> <secret>` WAL command under `self.master_key_bytes`
+        using a random 64-bit nonce, HMAC-SHA256 counter-mode keystream, and 128-bit
+        HMAC-SHA256 authentication tag so plaintext secrets never touch `triad_wal.json`.
+        """
+        pt = cmd_str.strip().encode("ascii")
+        nonce = os.urandom(8)
+        ks = bytearray()
+        blk = 0
+        while len(ks) < len(pt):
+            ks.extend(
+                hmac.new(
+                    self.master_key_bytes,
+                    b"cuttle-triad-wal-ks-v1:" + nonce + blk.to_bytes(4, "little"),
+                    hashlib.sha256,
+                ).digest()
+            )
+            blk += 1
+        ct = bytes(a ^ b for a, b in zip(pt, ks[: len(pt)]))
+        mac = hmac.new(
+            self.master_key_bytes,
+            b"cuttle-triad-wal-mac-v1:" + nonce + ct,
+            hashlib.sha256,
+        ).digest()[:16]
+        return f"ENC_WAL_V1:{nonce.hex()}:{ct.hex()}:{mac.hex()}"
+
+    def _decrypt_wal_vault_cmd(self, wal_entry: str) -> str:
+        """Verify and decrypt an `ENC_WAL_V1:<nonce>:<ct>:<mac>` WAL entry in constant time."""
+        parts = wal_entry.strip().split(":")
+        if len(parts) != 4 or parts[0] != "ENC_WAL_V1":
+            raise ValueError("invalid encrypted WAL entry format")
+        nonce = bytes.fromhex(parts[1])
+        ct = bytes.fromhex(parts[2])
+        mac = bytes.fromhex(parts[3])
+        expected_mac = hmac.new(
+            self.master_key_bytes,
+            b"cuttle-triad-wal-mac-v1:" + nonce + ct,
+            hashlib.sha256,
+        ).digest()[:16]
+        if not hmac.compare_digest(mac, expected_mac):
+            raise ValueError("WAL AEAD authentication tag mismatch")
+        ks = bytearray()
+        blk = 0
+        while len(ks) < len(ct):
+            ks.extend(
+                hmac.new(
+                    self.master_key_bytes,
+                    b"cuttle-triad-wal-ks-v1:" + nonce + blk.to_bytes(4, "little"),
+                    hashlib.sha256,
+                ).digest()
+            )
+            blk += 1
+        pt = bytes(a ^ b for a, b in zip(ct, ks[: len(ct)])).decode("ascii")
+        if not is_printable_ascii_command(pt):
+            raise ValueError("decrypted WAL entry contains non-printable characters")
+        return pt
+
+    @staticmethod
+    def _redact_app_cmd(cmd_str: str) -> str:
+        """Redact the secret value from `vault put <key> <secret>` before logging to events/stdout."""
+        parts = cmd_str.strip().split()
+        if len(parts) >= 3 and parts[0].lower() == "vault" and parts[1].lower() == "put":
+            return f"vault put {parts[2]} [REDACTED]"
+        return cmd_str.strip()
+
     def log_event(self, level: str, msg: str):
         ts = time.strftime("%H:%M:%S")
         entry = {"ts": ts, "level": level, "msg": msg}
@@ -613,53 +679,58 @@ class TriadController:
                 "per_node": results,
             }
 
-        # Mutating SQL write: execute across ONLINE nodes FIRST, and only append to the
-        # persistent Triad WAL if at least one online node accepted the statement without error.
-        per_node = {}
-        accepted_nodes = []
-        for n in online_nodes:
-            try:
-                out = self.send_shell_cmd(n, f"sql {q}")
-            except ValueError as e:
+        # Mutating SQL write: hold `self.wal_lock` across snapshotting `ONLINE` nodes,
+        # executing the mutation, appending to the Triad WAL, and advancing `tx_seq` so
+        # no concurrent write can slip in between a node's `CATCHING_UP` replay and its
+        # transition to `ONLINE`.
+        with self.wal_lock:
+            online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
+            if not online_nodes:
+                return {"ok": False, "output": "error: no online nodes in triad", "quorum": "0/3"}
+            per_node = {}
+            accepted_nodes = []
+            for n in online_nodes:
+                try:
+                    out = self.send_shell_cmd(n, f"sql {q}")
+                except ValueError as e:
+                    return {
+                        "ok": False,
+                        "error": f"rejected: {e}",
+                        "output": f"error: {e}",
+                        "quorum": "0/3",
+                    }
+                per_node[n.name] = out
+                low_out = out.strip().lower()
+                if (
+                    low_out
+                    and "error:" not in low_out
+                    and "unknown command" not in low_out
+                    and "usage:" not in low_out
+                ):
+                    accepted_nodes.append(n)
+
+            primary_out = next(iter(per_node.values()), "")
+            if not accepted_nodes:
                 return {
                     "ok": False,
-                    "error": f"rejected: {e}",
-                    "output": f"error: {e}",
-                    "quorum": "0/3",
+                    "error": primary_out or "error: SQL statement rejected by online nodes",
+                    "output": primary_out,
+                    "quorum": f"0/{len(online_nodes)} online nodes accepted",
+                    "per_node": per_node,
                 }
-            per_node[n.name] = out
-            low_out = out.strip().lower()
-            if (
-                low_out
-                and "error:" not in low_out
-                and "unknown command" not in low_out
-                and "usage:" not in low_out
-            ):
-                accepted_nodes.append(n)
 
-        primary_out = next(iter(per_node.values()), "")
-        if not accepted_nodes:
-            return {
-                "ok": False,
-                "error": primary_out or "error: SQL statement rejected by online nodes",
-                "output": primary_out,
-                "quorum": f"0/{len(online_nodes)} online nodes accepted",
-                "per_node": per_node,
-            }
-
-        with self.wal_lock:
             self.triad_tx_seq += 1
             tx_id = self.triad_tx_seq
             self.wal_entries.append((tx_id, q))
             self._save_wal_to_disk()
 
-        for n in accepted_nodes:
-            self.send_shell_cmd(n, "sync")
-            n.tx_seq = tx_id
+            for n in accepted_nodes:
+                self.send_shell_cmd(n, "sync")
+                n.tx_seq = tx_id
 
-        for n in self.nodes:
-            if n.state != "ONLINE":
-                per_node[n.name] = f"[QUEUED IN WAL tx #{tx_id} — will replay on wakeup]"
+            for n in self.nodes:
+                if n.state != "ONLINE":
+                    per_node[n.name] = f"[QUEUED IN WAL tx #{tx_id} — will replay on wakeup]"
 
         self.log_event(
             "SQL-RAID",
@@ -679,7 +750,7 @@ class TriadController:
         """
         Execute a Cuttle OS built-in application command (`vault`, `guard`, or `cron`) across the 3-as-1 Triad:
         - `vault put <key> <val>` / `vault del <key>`: encrypts `<val>` under each node's independent 256-bit
-          hardware `seal_key`, persists to the Triad WAL, and flushes AHCI (`sync`).
+          hardware `seal_key`, persists an encrypted `ENC_WAL_V1:...` record to the Triad WAL, and flushes AHCI (`sync`).
         - `vault get <key>`: unseals and verifies `<key>` on all online nodes and returns a 2-of-3 Majority Vote!
         - `guard status` / `guard alerts` / `guard lockdown` / `guard unlock`: queries or enforces Blue-Team
           security posture across all 3 Triad nodes simultaneously.
@@ -695,9 +766,6 @@ class TriadController:
 
         app = parts[0].lower()
         sub = parts[1].lower() if len(parts) > 1 else "status"
-        online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
-        if not online_nodes:
-            return {"ok": False, "error": "no online nodes in triad", "quorum": "0/3"}
 
         is_read = (
             (app == "vault" and sub in ("get", "list", "status"))
@@ -705,20 +773,21 @@ class TriadController:
             or (app == "cron" and sub in ("list", "status"))
         )
 
-        per_node = {}
-        accepted_nodes = []
-        for n in online_nodes:
-            out = self.send_shell_cmd(n, c)
-            per_node[n.name] = out
-            low_out = out.strip().lower()
-            if low_out and not low_out.startswith("error:") and not low_out.startswith("usage:"):
-                accepted_nodes.append(n)
-
-        vals = list(per_node.values())
-        chosen = max(set(vals), key=vals.count) if vals else ""
-        agree = vals.count(chosen)
-
         if is_read:
+            online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
+            if not online_nodes:
+                return {"ok": False, "error": "no online nodes in triad", "quorum": "0/3"}
+            per_node = {}
+            accepted_nodes = []
+            for n in online_nodes:
+                out = self.send_shell_cmd(n, c)
+                per_node[n.name] = out
+                low_out = out.strip().lower()
+                if low_out and not low_out.startswith("error:") and not low_out.startswith("usage:"):
+                    accepted_nodes.append(n)
+            vals = list(per_node.values())
+            chosen = max(set(vals), key=vals.count) if vals else ""
+            agree = vals.count(chosen)
             return {
                 "ok": len(accepted_nodes) > 0,
                 "mode": f"APP READ ({app.upper()} 2-of-3 Majority)",
@@ -728,32 +797,50 @@ class TriadController:
                 "per_node": per_node,
             }
 
-        if not accepted_nodes:
-            return {
-                "ok": False,
-                "error": chosen or f"error: {app} command rejected by online nodes",
-                "output": chosen,
-                "quorum": f"0/{len(online_nodes)} online nodes accepted",
-                "per_node": per_node,
-            }
+        # Mutating app write: hold `self.wal_lock` across snapshotting `ONLINE` nodes,
+        # executing the command, appending the encrypted WAL record, and updating `tx_seq`.
+        with self.wal_lock:
+            online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
+            if not online_nodes:
+                return {"ok": False, "error": "no online nodes in triad", "quorum": "0/3"}
+            per_node = {}
+            accepted_nodes = []
+            for n in online_nodes:
+                out = self.send_shell_cmd(n, c)
+                per_node[n.name] = out
+                low_out = out.strip().lower()
+                if low_out and not low_out.startswith("error:") and not low_out.startswith("usage:"):
+                    accepted_nodes.append(n)
 
-        # Persist durable `vault put` / `vault del` mutations into the Triad WAL so morphing/healing
-        # nodes replay and re-seal the secret under their own hardware `seal_key`.
-        tx_id = self.triad_tx_seq
-        if app == "vault" and sub in ("put", "del"):
-            with self.wal_lock:
+            vals = list(per_node.values())
+            chosen = max(set(vals), key=vals.count) if vals else ""
+            if not accepted_nodes:
+                return {
+                    "ok": False,
+                    "error": chosen or f"error: {app} command rejected by online nodes",
+                    "output": chosen,
+                    "quorum": f"0/{len(online_nodes)} online nodes accepted",
+                    "per_node": per_node,
+                }
+
+            tx_id = self.triad_tx_seq
+            if app == "vault" and sub in ("put", "del"):
                 self.triad_tx_seq += 1
                 tx_id = self.triad_tx_seq
-                self.wal_entries.append((tx_id, c))
+                wal_record = self._encrypt_wal_vault_cmd(c) if sub == "put" else c
+                self.wal_entries.append((tx_id, wal_record))
                 self._save_wal_to_disk()
-            for n in accepted_nodes:
-                self.send_shell_cmd(n, "sync")
-                n.tx_seq = tx_id
+                for n in accepted_nodes:
+                    self.send_shell_cmd(n, "sync")
+                    n.tx_seq = tx_id
+
+        if app == "vault" and sub in ("put", "del"):
             self.compute_and_verify_raid_parity()
 
+        redacted_cmd = self._redact_app_cmd(c)
         self.log_event(
             f"APP-{app.upper()}",
-            f"Executed '{c}' across {len(accepted_nodes)}/3 online Triad nodes (tx_seq={tx_id}).",
+            f"Executed '{redacted_cmd}' across {len(accepted_nodes)}/3 online Triad nodes (tx_seq={tx_id}).",
         )
         return {
             "ok": True,
@@ -766,7 +853,10 @@ class TriadController:
 
     def _replay_wal_entry(self, node: TriadNode, stmt: str):
         s = stmt.strip()
-        if s.lower().startswith("vault "):
+        if s.startswith("ENC_WAL_V1:"):
+            decrypted_cmd = self._decrypt_wal_vault_cmd(s)
+            self.send_shell_cmd(node, decrypted_cmd)
+        elif s.lower().startswith("vault "):
             self.send_shell_cmd(node, s)
         else:
             self.send_shell_cmd(node, f"sql {s}")
@@ -822,36 +912,37 @@ class TriadController:
                 node.state = "OFFLINE"
                 return False
 
-            # 4. CATCHING_UP: Replay any SQL transactions committed while this node was morphing!
+            # 4. CATCHING_UP: Replay any SQL transactions committed while this node was morphing,
+            #    holding `self.wal_lock` across the replay AND the `node.state = "ONLINE"` transition
+            #    so no concurrent write can be missed in the gap.
             node.state = "CATCHING_UP"
             with self.wal_lock:
                 missed = [(tid, stmt) for (tid, stmt) in self.wal_entries if tid > node.tx_seq]
-
-            if missed:
-                self.log_event(
-                    "RESYNC",
-                    f"{node.name}: Woke up at tx_seq={node.tx_seq} (Triad is at tx_seq={self.triad_tx_seq}). "
-                    f"Replaying {len(missed)} missed WAL transaction(s) from twin/parity majority...",
-                )
-                for tid, stmt in missed:
-                    if not is_printable_ascii_command(stmt):
-                        self.log_event("WARN", f"{node.name}: Skipping non-printable WAL entry #{tid}")
+                if missed:
+                    self.log_event(
+                        "RESYNC",
+                        f"{node.name}: Woke up at tx_seq={node.tx_seq} (Triad is at tx_seq={self.triad_tx_seq}). "
+                        f"Replaying {len(missed)} missed WAL transaction(s) from twin/parity majority...",
+                    )
+                    for tid, stmt in missed:
+                        if not is_printable_ascii_command(stmt):
+                            self.log_event("WARN", f"{node.name}: Skipping non-printable WAL entry #{tid}")
+                            node.tx_seq = tid
+                            continue
+                        try:
+                            self._replay_wal_entry(node, stmt)
+                        except Exception as e:
+                            self.log_event("WARN", f"{node.name}: Error replaying WAL entry #{tid}: {e}")
                         node.tx_seq = tid
-                        continue
-                    try:
-                        self._replay_wal_entry(node, stmt)
-                    except Exception as e:
-                        self.log_event("WARN", f"{node.name}: Error replaying WAL entry #{tid}: {e}")
-                    node.tx_seq = tid
-                self.send_shell_cmd(node, "sync")
-            else:
-                self.log_event(
-                    "RESYNC",
-                    f"{node.name}: Woke up in sync at tx_seq={node.tx_seq} (CONTINUITY resume OK + SHELL resume OK).",
-                )
+                    self.send_shell_cmd(node, "sync")
+                else:
+                    self.log_event(
+                        "RESYNC",
+                        f"{node.name}: Woke up in sync at tx_seq={node.tx_seq} (CONTINUITY resume OK + SHELL resume OK).",
+                    )
+                node.tampered = False
+                node.state = "ONLINE"
 
-            node.tampered = False
-            node.state = "ONLINE"
             self.refresh_node_telemetry(node)
             self.log_event(
                 "ONLINE",
@@ -882,25 +973,24 @@ class TriadController:
                 "HEAL",
                 f"{node.name}: Isolating tampered node, verifying 4 KiB XOR parity block (D_peer ⊕ P = {xor_tag}..), and reconstructing from 2/3 RAID Majority + WAL...",
             )
-            # Reconstruct canonical kv table from clean state + WAL replay
-            self.send_shell_cmd(node, "sql DROP TABLE kv")
-            self.send_shell_cmd(node, "sql CREATE TABLE kv (k TEXT, v TEXT, rev INT)")
-            self.send_shell_cmd(node, "sql INSERT INTO kv VALUES ('cluster.role', 'primary', 1)")
-            self.send_shell_cmd(node, "sql INSERT INTO kv VALUES ('mtd.policy', 'binmorph-7pass', 1)")
-            self.send_shell_cmd(node, "sql INSERT INTO kv VALUES ('boot.state', 'ready', 1)")
+            # Reconstruct canonical kv table from clean state + WAL replay under `self.wal_lock`
             with self.wal_lock:
-                entries = list(self.wal_entries)
-            for tid, stmt in entries:
-                if not is_printable_ascii_command(stmt):
+                self.send_shell_cmd(node, "sql DROP TABLE kv")
+                self.send_shell_cmd(node, "sql CREATE TABLE kv (k TEXT, v TEXT, rev INT)")
+                self.send_shell_cmd(node, "sql INSERT INTO kv VALUES ('cluster.role', 'primary', 1)")
+                self.send_shell_cmd(node, "sql INSERT INTO kv VALUES ('mtd.policy', 'binmorph-7pass', 1)")
+                self.send_shell_cmd(node, "sql INSERT INTO kv VALUES ('boot.state', 'ready', 1)")
+                for tid, stmt in self.wal_entries:
+                    if not is_printable_ascii_command(stmt):
+                        node.tx_seq = tid
+                        continue
+                    try:
+                        self._replay_wal_entry(node, stmt)
+                    except Exception as e:
+                        self.log_event("WARN", f"{node.name}: Error replaying WAL entry #{tid} during heal: {e}")
                     node.tx_seq = tid
-                    continue
-                try:
-                    self._replay_wal_entry(node, stmt)
-                except Exception as e:
-                    self.log_event("WARN", f"{node.name}: Error replaying WAL entry #{tid} during heal: {e}")
-                node.tx_seq = tid
-            self.send_shell_cmd(node, "sync")
-            node.tampered = False
+                self.send_shell_cmd(node, "sync")
+                node.tampered = False
 
         # Now force an immediate binary re-morph so the exploit can never work again
         self.bounce_and_morph_node(node.node_id)
@@ -1635,6 +1725,14 @@ def main():
                 test_srv.shutdown()
 
             assert ctrl.wal_file.exists(), "Triad WAL must be persisted to triad_wal.json"
+            wal_disk_txt = ctrl.wal_file.read_text(encoding="utf-8")
+            assert "ThreeHearts9" not in wal_disk_txt and "ENC_WAL_V1:" in wal_disk_txt, (
+                f"Plaintext vault secret leaked into triad_wal.json: {wal_disk_txt}"
+            )
+            events_txt = json.dumps(ctrl.events)
+            assert "ThreeHearts9" not in events_txt and "[REDACTED]" in events_txt, (
+                f"Plaintext vault secret leaked into /api/triad events: {events_txt}"
+            )
             wal_len_before = len(ctrl.wal_entries)
             try:
                 ctrl.execute_triad_sql("INSERT INTO kv VALUES ('bad\x08key', 'val', 1)")

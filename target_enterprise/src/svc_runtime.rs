@@ -440,6 +440,8 @@ pub enum ServiceError {
     KptiIsolationFailed,
     /// Service eBPF handler trapped or corrupted its stack canary (`EFAULT`).
     SandboxTrap,
+    /// Incoming request path (`> 64` bytes) or body (`> 256` bytes) exceeds [`IpcMailbox`] capacity (`413` / `E2BIG`).
+    PayloadTooLarge,
 }
 
 /// Bounded zero-allocation IPC message recorded on the kernel [`IpcBus`].
@@ -1063,16 +1065,29 @@ impl ServiceSupervisor {
     /// Stage an incoming request path and body into `svc`'s [`IpcMailbox`] prior to
     /// or immediately after endpoint mediation so the target service handler reads
     /// exclusively from its isolated mailbox buffer.
-    pub fn stage_mailbox_request(&mut self, svc: ServiceId, path: &[u8], body: &[u8]) {
+    ///
+    /// Rejects any `path` exceeding [`IPC_MAILBOX_PATH_CAP`] (`64` bytes) or `body`
+    /// exceeding [`IPC_MAILBOX_BODY_CAP`] (`256` bytes) with [`ServiceError::PayloadTooLarge`]
+    /// instead of silently truncating.
+    pub fn stage_mailbox_request(
+        &mut self,
+        svc: ServiceId,
+        path: &[u8],
+        body: &[u8],
+    ) -> Result<(), ServiceError> {
+        if path.len() > IPC_MAILBOX_PATH_CAP || body.len() > IPC_MAILBOX_BODY_CAP {
+            return Err(ServiceError::PayloadTooLarge);
+        }
         let mb = &mut self.services[svc.index()].mailbox;
-        let plen = path.len().min(IPC_MAILBOX_PATH_CAP);
-        let blen = body.len().min(IPC_MAILBOX_BODY_CAP);
+        let plen = path.len();
+        let blen = body.len();
         mb.req_path = [0u8; IPC_MAILBOX_PATH_CAP];
         mb.req_body = [0u8; IPC_MAILBOX_BODY_CAP];
-        mb.req_path[..plen].copy_from_slice(&path[..plen]);
-        mb.req_body[..blen].copy_from_slice(&body[..blen]);
+        mb.req_path[..plen].copy_from_slice(path);
+        mb.req_body[..blen].copy_from_slice(body);
         mb.req_path_len = plen as u8;
         mb.req_body_len = blen as u16;
+        Ok(())
     }
 
     /// Record the HTTP/IPC status code and response byte length produced by `svc`'s
@@ -1765,5 +1780,17 @@ mod tests {
         assert_eq!(sql_mb.req_seq, 1);
         assert_eq!(sql_mb.last_op, IpcOp::SqlQuery as u8);
         assert_eq!(sql_mb.resp_tag, tag);
+
+        // Verify stage_mailbox_request rejects paths > 64B and bodies > 256B instead of truncating:
+        let long_path = [b'a'; IPC_MAILBOX_PATH_CAP + 1];
+        assert_eq!(
+            sup1.stage_mailbox_request(ServiceId::Sql, &long_path, b"SELECT 1"),
+            Err(ServiceError::PayloadTooLarge)
+        );
+        let long_body = [b'x'; IPC_MAILBOX_BODY_CAP + 1];
+        assert_eq!(
+            sup1.stage_mailbox_request(ServiceId::Sql, b"/sql", &long_body),
+            Err(ServiceError::PayloadTooLarge)
+        );
     }
 }

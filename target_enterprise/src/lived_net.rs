@@ -1143,22 +1143,20 @@ impl LivedNet {
             ctx_buf[95] = if self.auth_enabled { 1 } else { 0 };
             let mut conn_prk = [0u8; 32];
             hmac_sha256(&node_tls_secret, &ctx_buf, &mut conn_prk);
-            node_tls_secret = [0u8; 32];
-            let _ = node_tls_secret;
+            crate::durable_seal::zeroize_secret_bytes(&mut node_tls_secret);
 
             let mut ephemeral_random = [0u8; 32];
             hkdf_expand_label(&conn_prk, b"cuttle-srv-rand", &client_pub, &mut ephemeral_random);
             let mut ephemeral_scalar = [0u8; 32];
             hkdf_expand_label(&conn_prk, b"cuttle-x25519-sk", &client_pub, &mut ephemeral_scalar);
-            conn_prk = [0u8; 32];
-            let _ = conn_prk;
+            crate::durable_seal::zeroize_secret_bytes(&mut conn_prk);
             let ephemeral_pubkey = x25519_basepoint(&ephemeral_scalar);
 
             let mut shared_secret = [0u8; 32];
             let ok_ecdh = x25519_scalarmult(&ephemeral_scalar, &client_pub, &mut shared_secret);
-            ephemeral_scalar = [0u8; 32];
-            let _ = ephemeral_scalar;
+            crate::durable_seal::zeroize_secret_bytes(&mut ephemeral_scalar);
             if !ok_ecdh {
+                crate::durable_seal::zeroize_secret_bytes(&mut shared_secret);
                 if let Some(sh) = shell.as_deref_mut() {
                     sh.record_net_audit(AuditVerdict::Denied, b"net:tls:low-order-pub");
                 }
@@ -1173,6 +1171,7 @@ impl LivedNet {
                 None,
                 &mut sh_msg,
             ) else {
+                crate::durable_seal::zeroize_secret_bytes(&mut shared_secret);
                 return 0;
             };
             let mut hs = HandshakeKeys {
@@ -1181,12 +1180,16 @@ impl LivedNet {
                 server_handshake_traffic_secret: [0u8; 32],
             };
             derive_handshake_keys(&shared_secret, ch_msg, &sh_msg[..sh_len], &mut hs);
+            crate::durable_seal::zeroize_secret_bytes(&mut shared_secret);
             hkdf_expand_label(
                 &hs.server_handshake_traffic_secret,
                 b"key",
                 b"",
                 &mut self.tls_keys[idx],
             );
+            crate::durable_seal::zeroize_secret_bytes(&mut hs.handshake_secret);
+            crate::durable_seal::zeroize_secret_bytes(&mut hs.client_handshake_traffic_secret);
+            crate::durable_seal::zeroize_secret_bytes(&mut hs.server_handshake_traffic_secret);
             self.tls_ready[idx] = true;
 
             let mut pos = 0usize;
@@ -1541,7 +1544,7 @@ impl LivedNet {
                     None
                 };
                 if let Some(raw_q) = q_opt {
-                    let mut decoded = [0u8; 192];
+                    let mut decoded = [0u8; crate::svc_runtime::IPC_MAILBOX_BODY_CAP + 1];
                     let mut dlen = 0usize;
                     let mut qi = 0usize;
                     while qi < raw_q.len() && dlen < decoded.len() {
@@ -1568,13 +1571,18 @@ impl LivedNet {
                         }
                     }
                     let q_slice = &decoded[..dlen];
+                    let sql_path = if view.path.starts_with(b"/db?") {
+                        &b"/db"[..]
+                    } else {
+                        &b"/sql"[..]
+                    };
                     if !crate::sql::SqlDb::is_readonly_query(q_slice) {
                         if let Err(e) = sh.dispatch_mailbox_op(
                             IpcOp::SqlMutate,
                             true,
                             false,
                             boots,
-                            view.path,
+                            sql_path,
                             q_slice,
                             &mut body,
                         ) {
@@ -1595,7 +1603,7 @@ impl LivedNet {
                         true,
                         false,
                         boots,
-                        view.path,
+                        sql_path,
                         q_slice,
                         &mut body,
                     ) {
@@ -1820,7 +1828,7 @@ impl LivedNet {
                     );
                 }
                 let kname = &view.path[7..];
-                let mut cmd = [0u8; 32];
+                let mut cmd = [0u8; 72];
                 let mut cp = 0usize;
                 cp += copy_msg(b"get ", &mut cmd[cp..]);
                 cp += copy_msg(kname, &mut cmd[cp..]);
@@ -1845,7 +1853,7 @@ impl LivedNet {
                     .and_then(|tok| sh.validate_session(tok))
                     .is_some();
                 let kname = &view.path[7..];
-                let mut cmd = [0u8; 64];
+                let mut cmd = [0u8; crate::svc_runtime::IPC_MAILBOX_BODY_CAP + 8];
                 let mut cp = 0usize;
                 cp += copy_msg(b"put ", &mut cmd[cp..]);
                 cp += copy_msg(kname, &mut cmd[cp..]);
@@ -1872,7 +1880,7 @@ impl LivedNet {
                     .and_then(|tok| sh.validate_session(tok))
                     .is_some();
                 let kname = &view.path[7..];
-                let mut cmd = [0u8; 32];
+                let mut cmd = [0u8; 72];
                 let mut cp = 0usize;
                 cp += copy_msg(b"del ", &mut cmd[cp..]);
                 cp += copy_msg(kname, &mut cmd[cp..]);
@@ -2108,6 +2116,13 @@ fn build_service_error_response(err: crate::svc_runtime::ServiceError, out: &mut
         ServiceError::Unauthenticated => {
             HttpImpl::build_response(401, b"text/plain", b"error: unauthorized\n", out).unwrap_or(0)
         }
+        ServiceError::PayloadTooLarge => HttpImpl::build_response(
+            413,
+            b"text/plain",
+            b"error: EMSGSIZE (request path or body exceeds IPC mailbox capacity)\n",
+            out,
+        )
+        .unwrap_or(0),
         ServiceError::RoleDisabled => HttpImpl::build_response(
             503,
             b"text/plain",
@@ -3685,5 +3700,54 @@ mod tests {
             resp.contains("id=1 every=2t elapsed=0t runs=0 cmd=\"status\""),
             "got: {resp}"
         );
+
+        // 4. Oversized IPC mailbox path (> 64 bytes) or body (> 256 bytes) returns 413 Payload Too Large:
+        let mut big_sql = [b'A'; 360];
+        let mut p = 0usize;
+        p += copy_msg(b"POST /sql HTTP/1.1\r\nCookie: sid=", &mut big_sql[p..]);
+        p += copy_msg(&sid, &mut big_sql[p..]);
+        p += copy_msg(b"\r\n\r\nSELECT '", &mut big_sql[p..]);
+        p += 260;
+        let n_413 = net.handle_http_request(&big_sql[..p], 1, Some(&mut sh), &mut out);
+        assert!(
+            out[..n_413].starts_with(b"HTTP/1.1 413 "),
+            "oversized POST /sql body must return HTTP 413, got {:?}",
+            core::str::from_utf8(&out[..n_413]).unwrap()
+        );
+
+        let mut big_fs = [b'a'; 160];
+        let mut fp = 0usize;
+        fp += copy_msg(b"PUT /fs/", &mut big_fs[fp..]);
+        fp += 68;
+        fp += copy_msg(b" HTTP/1.1\r\nCookie: sid=", &mut big_fs[fp..]);
+        fp += copy_msg(&sid, &mut big_fs[fp..]);
+        fp += copy_msg(b"\r\n\r\nhi", &mut big_fs[fp..]);
+        let n_fs_413 = net.handle_http_request(&big_fs[..fp], 1, Some(&mut sh), &mut out);
+        assert!(
+            out[..n_fs_413].starts_with(b"HTTP/1.1 413 "),
+            "oversized VFS path (> 64 bytes) must return HTTP 413, got {:?}",
+            core::str::from_utf8(&out[..n_fs_413]).unwrap()
+        );
+
+        // 5. Multi-session SQL transaction isolation over HTTP:
+        let sid2 = sh.create_session(b"admin", b"app-test-2");
+        let (req_begin, rlen_b) = mk_req(b"POST", b"/sql", b"BEGIN");
+        let _ = net.handle_http_request(&req_begin[..rlen_b], 1, Some(&mut sh), &mut out);
+        let mut s2_req = [0u8; 256];
+        let mut s2p = 0usize;
+        s2p += copy_msg(b"POST /sql HTTP/1.1\r\nCookie: sid=", &mut s2_req[s2p..]);
+        s2p += copy_msg(&sid2, &mut s2_req[s2p..]);
+        s2p += copy_msg(
+            b"\r\n\r\nINSERT INTO kv VALUES ('hijack', 'x', 1)",
+            &mut s2_req[s2p..],
+        );
+        let n_busy = net.handle_http_request(&s2_req[..s2p], 1, Some(&mut sh), &mut out);
+        let resp_busy = core::str::from_utf8(&out[..n_busy]).unwrap();
+        assert!(
+            resp_busy.contains("error: EBUSY (database locked by another session's transaction)"),
+            "got: {resp_busy}"
+        );
+        let (req_rb, rlen_rb) = mk_req(b"POST", b"/sql", b"ROLLBACK");
+        let _ = net.handle_http_request(&req_rb[..rlen_rb], 1, Some(&mut sh), &mut out);
     }
 }

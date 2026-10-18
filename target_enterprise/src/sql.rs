@@ -310,6 +310,8 @@ impl SqlTable {
 
 /// Maximum number of row mutations tracked in an active `BEGIN ... ROLLBACK` transaction.
 pub const SQL_TX_UNDO_CAP: usize = 8;
+/// Maximum number of idle timer ticks before an open transaction is automatically rolled back.
+pub const SQL_TX_MAX_IDLE_TICKS: u8 = 16;
 
 /// Embedded zero-allocation SQL database engine.
 #[derive(Copy, Clone, Debug)]
@@ -322,6 +324,10 @@ pub struct SqlDb {
     pub idx_hits: u64,
     /// Whether an explicit `BEGIN` transaction is currently open.
     pub tx_active: bool,
+    /// Session/client owner identifier holding the active transaction (`0` = console/system, `>0` = session slot).
+    pub tx_owner: u64,
+    /// Idle timer ticks elapsed since the last statement inside the active transaction.
+    pub tx_age_ticks: u8,
     /// Number of row-level undo records captured in the current transaction (`0..=SQL_TX_UNDO_CAP`).
     pub tx_undo_len: u8,
     /// Saved `tx_seq` prior to `BEGIN`, restored on `ROLLBACK`.
@@ -348,6 +354,8 @@ impl SqlDb {
             tx_seq: 0,
             idx_hits: 0,
             tx_active: false,
+            tx_owner: 0,
+            tx_age_ticks: 0,
             tx_undo_len: 0,
             tx_undo_seq: 0,
             tx_undo_table: [0u8; SQL_TX_UNDO_CAP],
@@ -356,25 +364,101 @@ impl SqlDb {
         }
     }
 
-    fn record_row_undo(&mut self, t_idx: usize, r_idx: usize) {
-        if !self.tx_active {
-            return;
-        }
+    fn has_undo_record(&self, t_idx: usize, r_idx: usize) -> bool {
         let len = self.tx_undo_len as usize;
         let mut i = 0usize;
         while i < len {
             if (self.tx_undo_table[i] as usize) == t_idx && (self.tx_undo_row[i] as usize) == r_idx
             {
-                return;
+                return true;
             }
             i += 1;
         }
+        false
+    }
+
+    fn can_record_row_undo(&self, t_idx: usize, r_idx: usize) -> bool {
+        if !self.tx_active {
+            return true;
+        }
+        if self.has_undo_record(t_idx, r_idx) {
+            return true;
+        }
+        (self.tx_undo_len as usize) < SQL_TX_UNDO_CAP
+    }
+
+    fn record_row_undo(&mut self, t_idx: usize, r_idx: usize) {
+        if !self.tx_active || self.has_undo_record(t_idx, r_idx) {
+            return;
+        }
+        let len = self.tx_undo_len as usize;
         if len < SQL_TX_UNDO_CAP {
             self.tx_undo_table[len] = t_idx as u8;
             self.tx_undo_row[len] = r_idx as u8;
             self.tx_undo_prev[len] = self.tables[t_idx].rows[r_idx];
             self.tx_undo_len = (len + 1) as u8;
         }
+    }
+
+    /// Return the last committed snapshot of row `(t_idx, r_idx)` so [`SqlDb::save_partition`]
+    /// never persists uncommitted rows from an in-flight `BEGIN` transaction.
+    fn committed_row(&self, t_idx: usize, r_idx: usize) -> &SqlRow {
+        if self.tx_active {
+            let len = self.tx_undo_len as usize;
+            let mut i = 0usize;
+            while i < len {
+                if (self.tx_undo_table[i] as usize) == t_idx
+                    && (self.tx_undo_row[i] as usize) == r_idx
+                {
+                    return &self.tx_undo_prev[i];
+                }
+                i += 1;
+            }
+        }
+        &self.tables[t_idx].rows[r_idx]
+    }
+
+    /// Roll back the currently active transaction in-place and release its session lock.
+    pub fn rollback_active_transaction(&mut self) {
+        if !self.tx_active {
+            return;
+        }
+        let mut k = self.tx_undo_len as usize;
+        while k > 0 {
+            k -= 1;
+            let t = self.tx_undo_table[k] as usize;
+            let r = self.tx_undo_row[k] as usize;
+            if t < SQL_MAX_TABLES && r < SQL_MAX_ROWS {
+                self.tables[t].rows[r] = self.tx_undo_prev[k];
+            }
+        }
+        let mut t = 0usize;
+        while t < SQL_MAX_TABLES {
+            if self.tables[t].used {
+                self.tables[t].rebuild_index();
+            }
+            t += 1;
+        }
+        self.tx_seq = self.tx_undo_seq;
+        self.tx_active = false;
+        self.tx_owner = 0;
+        self.tx_age_ticks = 0;
+        self.tx_undo_len = 0;
+    }
+
+    /// Advance the active transaction idle timer by one tick, automatically rolling back
+    /// any abandoned transaction that has been idle for [`SQL_TX_MAX_IDLE_TICKS`] ticks.
+    /// Returns `true` if a stale transaction was rolled back.
+    pub fn tick_transaction_timeout(&mut self) -> bool {
+        if !self.tx_active {
+            return false;
+        }
+        self.tx_age_ticks = self.tx_age_ticks.saturating_add(1);
+        if self.tx_age_ticks >= SQL_TX_MAX_IDLE_TICKS {
+            self.rollback_active_transaction();
+            return true;
+        }
+        false
     }
 
     /// Construct and seed a default SQL database with system tables (`services`, `kv`).
@@ -515,9 +599,18 @@ impl SqlDb {
             || eq_ignore_ascii_case(kw, b"DESCRIBE")
     }
 
-    /// Execute a SQL statement or meta-command and format the output into `out`.
+    /// Execute a SQL statement or meta-command on behalf of the default system/console session (`owner = 0`).
     /// Returns the number of bytes written to `out`.
     pub fn exec(&mut self, query: &[u8], out: &mut [u8]) -> usize {
+        self.exec_as(0, query, out)
+    }
+
+    /// Execute a SQL statement or meta-command on behalf of `owner` (`0` = console/system, `>0` = HTTP session slot)
+    /// and format the output into `out`.
+    ///
+    /// Enforces session-bound transactions: while `self.tx_active` is `true`, mutating statements and
+    /// `BEGIN`/`COMMIT`/`ROLLBACK` from any `owner != self.tx_owner` are refused with `EBUSY`.
+    pub fn exec_as(&mut self, owner: u64, query: &[u8], out: &mut [u8]) -> usize {
         let q = trim_sql(query);
         if q.is_empty() {
             return copy_str(b"error: empty SQL query\n", out);
@@ -530,8 +623,28 @@ impl SqlDb {
             return self.exec_schema(trim_sql(rest), out);
         }
         let (kw, rest) = next_token(q);
+        if eq_ignore_ascii_case(kw, b"SELECT") {
+            return self.exec_select(rest, out);
+        }
+
+        // Non-read-only statement: enforce active transaction ownership!
+        if self.tx_active && self.tx_owner != owner {
+            return copy_str(
+                b"error: EBUSY (database locked by another session's transaction)\n",
+                out,
+            );
+        }
+        if self.tx_active {
+            self.tx_age_ticks = 0;
+        }
+
         if eq_ignore_ascii_case(kw, b"BEGIN") {
+            if self.tx_active {
+                return copy_str(b"error: transaction already active\n", out);
+            }
             self.tx_active = true;
+            self.tx_owner = owner;
+            self.tx_age_ticks = 0;
             self.tx_undo_len = 0;
             self.tx_undo_seq = self.tx_seq;
             copy_str(b"BEGIN OK\n", out)
@@ -540,42 +653,36 @@ impl SqlDb {
                 return copy_str(b"error: no transaction active\n", out);
             }
             self.tx_active = false;
+            self.tx_owner = 0;
+            self.tx_age_ticks = 0;
             self.tx_undo_len = 0;
             copy_str(b"COMMIT OK\n", out)
         } else if eq_ignore_ascii_case(kw, b"ROLLBACK") {
             if !self.tx_active {
                 return copy_str(b"error: no transaction active\n", out);
             }
-            let mut k = self.tx_undo_len as usize;
-            while k > 0 {
-                k -= 1;
-                let t = self.tx_undo_table[k] as usize;
-                let r = self.tx_undo_row[k] as usize;
-                if t < SQL_MAX_TABLES && r < SQL_MAX_ROWS {
-                    self.tables[t].rows[r] = self.tx_undo_prev[k];
-                }
-            }
-            let mut t = 0usize;
-            while t < SQL_MAX_TABLES {
-                if self.tables[t].used {
-                    self.tables[t].rebuild_index();
-                }
-                t += 1;
-            }
-            self.tx_seq = self.tx_undo_seq;
-            self.tx_active = false;
-            self.tx_undo_len = 0;
+            self.rollback_active_transaction();
             copy_str(b"ROLLBACK OK\n", out)
         } else if eq_ignore_ascii_case(kw, b"CREATE") {
+            if self.tx_active {
+                return copy_str(
+                    b"error: DDL (CREATE/DROP) not allowed inside active transaction; COMMIT or ROLLBACK first\n",
+                    out,
+                );
+            }
             self.exec_create(rest, out)
         } else if eq_ignore_ascii_case(kw, b"DROP") {
+            if self.tx_active {
+                return copy_str(
+                    b"error: DDL (CREATE/DROP) not allowed inside active transaction; COMMIT or ROLLBACK first\n",
+                    out,
+                );
+            }
             self.exec_drop(rest, out)
         } else if eq_ignore_ascii_case(kw, b"INSERT") {
             self.exec_insert(rest, false, out)
         } else if eq_ignore_ascii_case(kw, b"REPLACE") {
             self.exec_insert(rest, true, out)
-        } else if eq_ignore_ascii_case(kw, b"SELECT") {
-            self.exec_select(rest, out)
         } else if eq_ignore_ascii_case(kw, b"UPDATE") {
             self.exec_update(rest, out)
         } else if eq_ignore_ascii_case(kw, b"DELETE") {
@@ -901,6 +1008,12 @@ impl SqlDb {
                 if self.tables[t_idx].rows[r].used
                     && self.tables[t_idx].rows[r].cells[0].compare(CmpOp::Eq, &row.cells[0])
                 {
+                    if !self.can_record_row_undo(t_idx, r) {
+                        return copy_str(
+                            b"error: transaction undo log full (max 8 rows); COMMIT or ROLLBACK first\n",
+                            out,
+                        );
+                    }
                     self.record_row_undo(t_idx, r);
                     let idx_col = self.tables[t_idx].indexed_col as usize;
                     if idx_col < col_count {
@@ -926,6 +1039,12 @@ impl SqlDb {
         let Some(r_idx) = free_row else {
             return copy_str(b"error: table row capacity full (max 64)\n", out);
         };
+        if !self.can_record_row_undo(t_idx, r_idx) {
+            return copy_str(
+                b"error: transaction undo log full (max 8 rows); COMMIT or ROLLBACK first\n",
+                out,
+            );
+        }
         self.record_row_undo(t_idx, r_idx);
         let idx_col = self.tables[t_idx].indexed_col as usize;
         if idx_col < col_count {
@@ -1212,7 +1331,9 @@ impl SqlDb {
             self.idx_hits = self.idx_hits.wrapping_add(1);
         }
 
-        let mut updated = 0u64;
+        let mut matched = [0usize; SQL_MAX_ROWS];
+        let mut mcount = 0usize;
+        let mut new_undo = 0usize;
         let mut r = 0usize;
         while r < SQL_MAX_ROWS {
             if self.tables[t_idx].rows[r].used {
@@ -1227,15 +1348,33 @@ impl SqlDb {
                     None => true,
                 };
                 if pass {
-                    self.record_row_undo(t_idx, r);
-                    self.tables[t_idx].rows[r].cells[set_col_idx] = new_val;
-                    if self.tables[t_idx].indexed_col as usize == set_col_idx {
-                        self.tables[t_idx].index_hashes[r] = hash_sql_val(&new_val);
+                    matched[mcount] = r;
+                    mcount += 1;
+                    if self.tx_active && !self.has_undo_record(t_idx, r) {
+                        new_undo += 1;
                     }
-                    updated += 1;
                 }
             }
             r += 1;
+        }
+        if self.tx_active && (self.tx_undo_len as usize) + new_undo > SQL_TX_UNDO_CAP {
+            return copy_str(
+                b"error: transaction undo log full (max 8 rows); COMMIT or ROLLBACK first\n",
+                out,
+            );
+        }
+
+        let mut updated = 0u64;
+        let mut m = 0usize;
+        while m < mcount {
+            let row_idx = matched[m];
+            self.record_row_undo(t_idx, row_idx);
+            self.tables[t_idx].rows[row_idx].cells[set_col_idx] = new_val;
+            if self.tables[t_idx].indexed_col as usize == set_col_idx {
+                self.tables[t_idx].index_hashes[row_idx] = hash_sql_val(&new_val);
+            }
+            updated += 1;
+            m += 1;
         }
         if updated > 0 {
             self.tx_seq = self.tx_seq.wrapping_add(1);
@@ -1277,7 +1416,9 @@ impl SqlDb {
             self.idx_hits = self.idx_hits.wrapping_add(1);
         }
 
-        let mut deleted = 0u64;
+        let mut matched = [0usize; SQL_MAX_ROWS];
+        let mut mcount = 0usize;
+        let mut new_undo = 0usize;
         let mut r = 0usize;
         while r < SQL_MAX_ROWS {
             if self.tables[t_idx].rows[r].used {
@@ -1292,13 +1433,31 @@ impl SqlDb {
                     None => true,
                 };
                 if pass {
-                    self.record_row_undo(t_idx, r);
-                    self.tables[t_idx].rows[r] = SqlRow::empty();
-                    self.tables[t_idx].index_hashes[r] = 0;
-                    deleted += 1;
+                    matched[mcount] = r;
+                    mcount += 1;
+                    if self.tx_active && !self.has_undo_record(t_idx, r) {
+                        new_undo += 1;
+                    }
                 }
             }
             r += 1;
+        }
+        if self.tx_active && (self.tx_undo_len as usize) + new_undo > SQL_TX_UNDO_CAP {
+            return copy_str(
+                b"error: transaction undo log full (max 8 rows); COMMIT or ROLLBACK first\n",
+                out,
+            );
+        }
+
+        let mut deleted = 0u64;
+        let mut m = 0usize;
+        while m < mcount {
+            let row_idx = matched[m];
+            self.record_row_undo(t_idx, row_idx);
+            self.tables[t_idx].rows[row_idx] = SqlRow::empty();
+            self.tables[t_idx].index_hashes[row_idx] = 0;
+            deleted += 1;
+            m += 1;
         }
         if deleted > 0 {
             self.tx_seq = self.tx_seq.wrapping_add(1);
@@ -1312,6 +1471,10 @@ impl SqlDb {
 
     /// Serialize the entire database into an 8-sector (`4 KiB`) partition image
     /// protected by `CTTLSQL1` magic and a keyed `HMAC-SHA256` authentication tag.
+    ///
+    /// If a `BEGIN` transaction is currently open, serializes the last **committed**
+    /// pre-transaction state (`tx_undo_seq` and `committed_row`) so uncommitted rows
+    /// are never persisted to disk before `COMMIT`.
     pub fn save_partition(
         &self,
         key: &[u8; DURABLE_DIGEST_LEN],
@@ -1319,7 +1482,12 @@ impl SqlDb {
     ) {
         let mut flat = [0u8; SQL_PART_SECTORS * 512];
         flat[0..8].copy_from_slice(SQL_PART_MAGIC);
-        flat[8..16].copy_from_slice(&self.tx_seq.to_le_bytes());
+        let committed_seq = if self.tx_active {
+            self.tx_undo_seq
+        } else {
+            self.tx_seq
+        };
+        flat[8..16].copy_from_slice(&committed_seq.to_le_bytes());
 
         // Header layout:
         //   0..8   : SQL_PART_MAGIC ("CTTLSQL1")
@@ -1369,7 +1537,7 @@ impl SqlDb {
             let mut written_rows = 0u8;
             let mut r2 = 0usize;
             while r2 < SQL_MAX_ROWS {
-                let row = &tbl.rows[r2];
+                let row = self.committed_row(t, r2);
                 if row.used {
                     // Compute exact serialized byte length of this row first.
                     let mut row_bytes = 0usize;
@@ -1444,7 +1612,7 @@ impl SqlDb {
     }
 
     /// Restore the database from an 8-sector (`4 KiB`) partition image after verifying
-    /// the `CTTLSQL1` magic and constant-time keyed `HMAC-SHA256` tag.
+    /// the `CTTLSQL1` (or legacy `PRTSSQL1`) magic and constant-time keyed `HMAC-SHA256` tag.
     pub fn load_partition(
         &mut self,
         key: &[u8; DURABLE_DIGEST_LEN],
@@ -1456,7 +1624,7 @@ impl SqlDb {
             flat[s * 512..(s + 1) * 512].copy_from_slice(&sectors[s]);
             s += 1;
         }
-        if &flat[0..8] != SQL_PART_MAGIC {
+        if &flat[0..8] != SQL_PART_MAGIC && &flat[0..8] != b"PRTSSQL1" {
             return false;
         }
         let payload_len = u16::from_le_bytes([flat[16], flat[17]]) as usize;
@@ -2252,5 +2420,80 @@ mod tests {
         assert_eq!(&out[..n], b"COMMIT OK\n");
         let n = db.exec(b"SELECT v FROM kv WHERE k = 'vault.mode'", &mut out);
         assert_eq!(&out[..n], b"v\nsealed-aead\n");
+
+        // 5. Undo log capacity (> 8 rows) and DDL refusal inside an active transaction:
+        for i in 1..=8i64 {
+            let mut q = [0u8; 96];
+            let mut p = 0usize;
+            p += append_bytes(&mut q, p, b"INSERT INTO kv VALUES ('extra.");
+            p += append_i64(&mut q, p, i);
+            p += append_bytes(&mut q, p, b"', 'val', 1)");
+            let _ = db.exec(&q[..p], &mut out);
+        }
+        let rows_before = db.tables[db.find_table(b"kv").unwrap()].row_count();
+        assert!(rows_before > SQL_TX_UNDO_CAP);
+
+        let _ = db.exec(b"BEGIN", &mut out);
+        // DDL inside a transaction must be refused:
+        let n_ddl = db.exec(b"CREATE TABLE tmp (x INT)", &mut out);
+        assert!(out[..n_ddl].starts_with(b"error: DDL (CREATE/DROP) not allowed"));
+        let n_drop = db.exec(b"DROP TABLE kv", &mut out);
+        assert!(out[..n_drop].starts_with(b"error: DDL (CREATE/DROP) not allowed"));
+
+        // Bulk DELETE or UPDATE affecting > 8 rows must be refused before modifying any row:
+        let n_del = db.exec(b"DELETE FROM kv", &mut out);
+        assert_eq!(
+            &out[..n_del],
+            b"error: transaction undo log full (max 8 rows); COMMIT or ROLLBACK first\n"
+        );
+        assert_eq!(
+            db.tables[db.find_table(b"kv").unwrap()].row_count(),
+            rows_before
+        );
+        let _ = db.exec(b"ROLLBACK", &mut out);
+        assert_eq!(
+            db.tables[db.find_table(b"kv").unwrap()].row_count(),
+            rows_before
+        );
+
+        // 6. Session-bound transactions (`exec_as`), `save_partition` uncommitted row isolation, and timeout:
+        let n_b1 = db.exec_as(10, b"BEGIN", &mut out);
+        assert_eq!(&out[..n_b1], b"BEGIN OK\n");
+        let _ = db.exec_as(
+            10,
+            b"REPLACE INTO kv VALUES ('vault.mode', 'uncommitted-secret', 99)",
+            &mut out,
+        );
+        // Another session (owner = 20 or console owner = 0) cannot mutate or ROLLBACK session 10's transaction:
+        let n_busy_w = db.exec_as(
+            20,
+            b"INSERT INTO kv VALUES ('intruder', '1', 1)",
+            &mut out,
+        );
+        assert!(out[..n_busy_w].starts_with(b"error: EBUSY"));
+        let n_busy_rb = db.exec_as(0, b"ROLLBACK", &mut out);
+        assert!(out[..n_busy_rb].starts_with(b"error: EBUSY"));
+
+        // `save_partition` while session 10's transaction is open must serialize ONLY the committed state:
+        let key = [0x77u8; 32];
+        let mut sectors = [[0u8; 512]; SQL_PART_SECTORS];
+        db.save_partition(&key, &mut sectors);
+        let mut snap = SqlDb::empty();
+        assert!(snap.load_partition(&key, &sectors));
+        let n_snap = snap.exec(b"SELECT v FROM kv WHERE k = 'vault.mode'", &mut out);
+        assert_eq!(
+            &out[..n_snap],
+            b"v\nsealed-aead\n",
+            "save_partition must not persist uncommitted transaction mutations"
+        );
+
+        // Idle timeout (`SQL_TX_MAX_IDLE_TICKS = 16`) automatically rolls back abandoned transactions:
+        for _ in 0..15 {
+            assert!(!db.tick_transaction_timeout());
+        }
+        assert!(db.tick_transaction_timeout());
+        assert!(!db.tx_active);
+        let n_after_to = db.exec(b"SELECT v FROM kv WHERE k = 'vault.mode'", &mut out);
+        assert_eq!(&out[..n_after_to], b"v\nsealed-aead\n");
     }
 }

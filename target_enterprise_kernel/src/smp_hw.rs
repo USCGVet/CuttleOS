@@ -1010,15 +1010,20 @@ pub(crate) fn smp_hw_tick_and_sync(sh: &mut target_enterprise::OsShell) {
         ring_smp_doorbell();
     }
 
+    const APIC_IRQS_PER_COOLDOWN_TICK: u64 = 937;
     let hw_irqs = read_hw_irq_wakeups();
     let hw_ipis = HW_IPI_DOORBELLS.load(Ordering::Relaxed);
     if hw_irqs > sh.smp_irq_wakeups {
-        let delta = (hw_irqs - sh.smp_irq_wakeups).min(8);
+        let prev_epochs = sh.smp_irq_wakeups / APIC_IRQS_PER_COOLDOWN_TICK;
+        let cur_epochs = hw_irqs / APIC_IRQS_PER_COOLDOWN_TICK;
         sh.smp_irq_wakeups = hw_irqs;
-        let mut d = 0u64;
-        while d < delta {
-            sh.tick_login_cooldown();
-            d += 1;
+        if cur_epochs > prev_epochs {
+            let delta = (cur_epochs - prev_epochs).min(8);
+            let mut d = 0u64;
+            while d < delta {
+                sh.tick_login_cooldown();
+                d += 1;
+            }
         }
     }
     if hw_ipis > sh.smp_ipi_doorbells {

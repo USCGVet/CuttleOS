@@ -30,8 +30,8 @@ use cuttle_contracts::{
 
 use crate::audit::AuditLogImpl;
 use crate::durable_seal::{
-    seal_bytes, seal_bytes_keyed, seal_matches, seal_matches_keyed, DEFAULT_ATTEST_KEY,
-    DEFAULT_DURABLE_SEAL_KEY, DURABLE_DIGEST_LEN,
+    seal_bytes, seal_bytes_keyed, seal_matches, seal_matches_keyed, zeroize_secret_bytes,
+    DEFAULT_ATTEST_KEY, DEFAULT_DURABLE_SEAL_KEY, DURABLE_DIGEST_LEN,
 };
 use crate::ebpf::EBpfImpl;
 use crate::elf64::Elf64Impl;
@@ -246,6 +246,12 @@ pub struct OsShell {
     pub failed_login_streak: u32,
     /// Remaining decaying cooldown ticks while login brute-force lockout is active (`0` = unlocked).
     pub login_cooldown_ticks: u32,
+    /// Exponential backoff shift (`0..=5`) doubling the cooldown window (`8 << level`) on repeated lockouts.
+    pub login_backoff_level: u8,
+    /// Monotonic 15-bit per-write nonce counter (`1..=0x7FFF`) mixed into `CuttleVault` keystream and MAC derivation.
+    pub vault_nonce_seq: u16,
+    /// Most recently validated HTTP session slot owner ID (`0` = console/unauthenticated, `1..=SHELL_MAX_SESSIONS` = session slot).
+    pub last_session_owner: u64,
     /// Node index (`0..=2`) within the 3-node Triad TMR cluster.
     pub triad_node_id: u8,
     /// Highest replicated SQL transaction sequence number committed on this node.
@@ -303,6 +309,9 @@ impl OsShell {
             svc: crate::svc_runtime::ServiceSupervisor::empty(),
             failed_login_streak: 0,
             login_cooldown_ticks: 0,
+            login_backoff_level: 0,
+            vault_nonce_seq: 0,
+            last_session_owner: 0,
             triad_node_id: 0,
             triad_tx_seq: 0,
             triad_peer_seq: [0u64; 3],
@@ -416,7 +425,10 @@ impl OsShell {
         // Initialize Ring-3 isolated service runtime (`svc-http`, `svc-sql`, `svc-sh`)
         // with a per-node AND per-boot base seed derived from `self.seal_key` and `boot_gen`.
         self.failed_login_streak = 0;
+        self.login_backoff_level = 0;
         self.login_cooldown_ticks = 0;
+        self.vault_nonce_seq = ((boot_gen as u16).wrapping_mul(37)) & 0x7FFF;
+        self.last_session_owner = 0;
         self.triad_node_id = 0;
         self.triad_tx_seq = 0;
         let init_hash = self.db.state_hash();
@@ -435,8 +447,10 @@ impl OsShell {
 
     /// Advance all active CuttleChronos (`cron`) periodic jobs by one hardware timer tick,
     /// executing any job whose `elapsed_ticks` reaches `interval_ticks`.
+    /// Also advances the SQL open-transaction idle timeout (`tick_transaction_timeout`).
     /// Returns the number of jobs that fired on this tick.
     pub fn tick_cron_jobs(&mut self, boots: u64) -> usize {
+        let _ = self.db.tick_transaction_timeout();
         let mut fired = 0usize;
         let mut scratch = [0u8; 192];
         let mut i = 0usize;
@@ -549,29 +563,33 @@ impl OsShell {
     }
 
     /// Returns `true` if login attempts are currently rate-limited inside the decaying cooldown window.
-    #[inline]
     pub const fn is_login_rate_limited(&self) -> bool {
         self.login_cooldown_ticks > 0
     }
 
     /// Advance the decaying login brute-force cooldown timer by one hardware timer tick; when
-    /// `login_cooldown_ticks` reaches `0`, resets `failed_login_streak` so legitimate
-    /// operators can authenticate again. Never called from HTTP request handlers.
+    /// `login_cooldown_ticks` reaches `0`, resets `failed_login_streak` (or sets it to `4` when
+    /// `login_backoff_level > 0` so a single post-cooldown failure immediately triggers the next
+    /// doubled backoff window) so legitimate operators can authenticate again.
+    /// Never called from HTTP request handlers.
     pub fn tick_login_cooldown(&mut self) {
         if self.login_cooldown_ticks > 0 {
             self.login_cooldown_ticks -= 1;
             if self.login_cooldown_ticks == 0 {
-                self.failed_login_streak = 0;
+                self.failed_login_streak = if self.login_backoff_level > 0 { 4 } else { 0 };
             }
         }
     }
 
-    /// Record a failed login attempt, incrementing `failed_login_streak` and arming a
-    /// bounded `8`-tick cooldown window once `5` consecutive failures occur.
+    /// Record a failed login attempt, incrementing `failed_login_streak` and arming an
+    /// exponential backoff cooldown window (`8, 16, 32, 64, 128, 256` ticks) once `5`
+    /// consecutive failures occur.
     pub fn record_login_failure(&mut self) {
         self.failed_login_streak = self.failed_login_streak.saturating_add(1);
         if self.failed_login_streak >= 5 {
-            self.login_cooldown_ticks = 8;
+            let shift = (self.login_backoff_level as u32).min(5);
+            self.login_cooldown_ticks = 8u32 << shift;
+            self.login_backoff_level = self.login_backoff_level.saturating_add(1).min(5);
             self.record_audit(32, AuditVerdict::Denied, b"shell:session:rate-limit");
         } else {
             self.record_audit(32, AuditVerdict::Denied, b"shell:session:bad-auth");
@@ -582,6 +600,7 @@ impl OsShell {
     /// derived via `HMAC-SHA256(self.attest_key, "cuttle-session-v1:" || user || seq || challenge)`.
     pub fn create_session(&mut self, user: &[u8], challenge: &[u8]) -> [u8; 32] {
         self.failed_login_streak = 0;
+        self.login_backoff_level = 0;
         self.login_cooldown_ticks = 0;
         let uname = if user.is_empty() { b"admin" } else { user };
         let ulen = uname.len().min(16);
@@ -661,8 +680,10 @@ impl OsShell {
     pub fn validate_session(&mut self, token_hex: &[u8]) -> Option<usize> {
         if let Some(idx) = self.find_session(token_hex) {
             self.sessions[idx].requests = self.sessions[idx].requests.wrapping_add(1);
+            self.last_session_owner = (idx + 1) as u64;
             Some(idx)
         } else {
+            self.last_session_owner = 0;
             None
         }
     }
@@ -700,6 +721,11 @@ impl OsShell {
         };
         use cuttle_contracts::{FS_O_CREATE, FS_O_RDONLY, FS_O_RDWR, FS_O_TRUNC};
 
+        if req_path.len() > IPC_MAILBOX_PATH_CAP || req_body.len() > IPC_MAILBOX_BODY_CAP {
+            self.record_audit(36, AuditVerdict::Denied, b"svc:ipc:payload-too-large");
+            return Err(ServiceError::PayloadTooLarge);
+        }
+
         let target = op.target_service();
         let prev_seq = self.svc.services[target.index()].mailbox.req_seq;
         // 1. Mediate role availability, session requirement, IPC bus routing (`svc-http -> target`),
@@ -710,7 +736,7 @@ impl OsShell {
 
         // 2. Stage request path & body into the target service's isolated IpcMailbox and verify
         //    that `mediate_endpoint` advanced `req_seq`, recorded `last_op`, and left `canary != 0`.
-        self.svc.stage_mailbox_request(target, req_path, req_body);
+        self.svc.stage_mailbox_request(target, req_path, req_body)?;
         let mb = &self.svc.services[target.index()].mailbox;
         if mb.req_seq != prev_seq.wrapping_add(1)
             || mb.last_op != (op as u8)
@@ -819,7 +845,12 @@ impl OsShell {
                 if via_http_gateway {
                     self.record_net_audit(AuditVerdict::Allowed, b"net:http:sql-write");
                 }
-                let n = self.db.exec(mb_body, resp_out);
+                let owner = if session_verified {
+                    self.last_session_owner.max(1)
+                } else {
+                    0
+                };
+                let n = self.db.exec_as(owner, mb_body, resp_out);
                 (200u16, n)
             }
             IpcOp::VaultRead => {
@@ -1308,8 +1339,8 @@ impl OsShell {
 
     /// Unpack and verify a two-sector (`hdr_sector`, `wal_sector`) disk image
     /// written by [`OsShell::pack_disk_image`], restoring files, worker tasks,
-    /// and capabilities only if the `CTTLSHL1` magic and 32-byte SHA-256 seal
-    /// match in constant time.
+    /// and capabilities only if the `CTTLSHL1` (or legacy `PRTSSHL1`) magic and
+    /// 32-byte SHA-256 seal match in constant time.
     ///
     /// Returns `Ok((saved_boots, applied_records))`.
     pub fn unpack_disk_image(
@@ -1317,7 +1348,9 @@ impl OsShell {
         hdr_sector: &[u8; 512],
         wal_sector: &[u8; 512],
     ) -> Result<(u64, usize), WalError> {
-        if !bytes_eq(&hdr_sector[0..8], b"CTTLSHL1") {
+        if !bytes_eq(&hdr_sector[0..8], b"CTTLSHL1")
+            && !bytes_eq(&hdr_sector[0..8], b"PRTSSHL1")
+        {
             self.record_audit(21, AuditVerdict::Denied, b"shell:wal:header-corrupt");
             return Err(WalError::PayloadTooLarge);
         }
@@ -1463,15 +1496,17 @@ impl OsShell {
     /// Verify and unpack a 16-sector (`8 KiB`) block-backed filesystem partition
     /// written by [`OsShell::pack_fs_partition`].
     ///
-    /// Verifies the `CTTLFS01` superblock magic and the chained keyed `HMAC-SHA256`
-    /// seal over all 16 sectors in constant time before mounting/restoring files
-    /// (including multi-sector files up to `SHELL_FS_POOL = 4096` bytes).
+    /// Verifies the `CTTLFS01` (or legacy `PRTSFS01`) superblock magic and the chained
+    /// keyed `HMAC-SHA256` seal over all 16 sectors in constant time before mounting/restoring
+    /// files (including multi-sector files up to `SHELL_FS_POOL = 4096` bytes).
     /// Returns `Ok((generation, file_count, data_bytes))`.
     pub fn unpack_fs_partition(
         &mut self,
         sectors: &[[u8; 512]; SHELL_FS_PART_SECTORS],
     ) -> Result<(u64, usize, usize), WalError> {
-        if !bytes_eq(&sectors[0][0..8], SHELL_FS_MAGIC) {
+        if !bytes_eq(&sectors[0][0..8], SHELL_FS_MAGIC)
+            && !bytes_eq(&sectors[0][0..8], b"PRTSFS01")
+        {
             self.record_audit(21, AuditVerdict::Denied, b"shell:fs:magic-corrupt");
             return Err(WalError::PayloadTooLarge);
         }
@@ -2846,7 +2881,24 @@ impl OsShell {
                     out,
                 );
             }
-            let (ks, _) = vault_derive_stream_and_mac(&self.seal_key, kname, b"");
+            let mut prev_nonce = 0u16;
+            let mut prev_q = [0u8; 96];
+            let mut pqp = 0usize;
+            pqp += copy_into(b"SELECT rev FROM kv WHERE k = 'v:", &mut prev_q[pqp..]);
+            pqp += copy_into(kname, &mut prev_q[pqp..]);
+            pqp += copy_into(b"'", &mut prev_q[pqp..]);
+            let mut pq_out = [0u8; 64];
+            let pq_len = self.db.exec(&prev_q[..pqp], &mut pq_out);
+            if pq_len > 4 && &pq_out[..4] == b"rev\n" {
+                if let Some(prev_rev) = parse_u64_ascii(trim_ascii(&pq_out[4..pq_len])) {
+                    prev_nonce = ((prev_rev >> 47) & 0x7FFF) as u16;
+                }
+            }
+            let base_nonce = self.vault_nonce_seq.max(prev_nonce);
+            let nonce15 = (base_nonce % 0x7FFF).saturating_add(1);
+            self.vault_nonce_seq = nonce15;
+
+            let (mut ks, _) = vault_derive_stream_and_mac(&self.seal_key, kname, nonce15, b"");
             let slen = secret.len();
             let mut ct = [0u8; 12];
             let mut i = 0usize;
@@ -2854,7 +2906,10 @@ impl OsShell {
                 ct[i] = secret[i] ^ ks[i];
                 i += 1;
             }
-            let (_, tag_u64) = vault_derive_stream_and_mac(&self.seal_key, kname, &ct[..slen]);
+            zeroize_secret_bytes(&mut ks);
+            let (mut ks_mac, tag_u64) =
+                vault_derive_stream_and_mac(&self.seal_key, kname, nonce15, &ct[..slen]);
+            zeroize_secret_bytes(&mut ks_mac);
             let mut ct_hex = [0u8; 24];
             let hex_len = hex_bytes(&ct[..slen], &mut ct_hex);
 
@@ -2940,9 +2995,18 @@ impl OsShell {
                     out,
                 );
             };
-            let (ks, expected_tag) =
-                vault_derive_stream_and_mac(&self.seal_key, kname, &ct[..ct_len]);
+            let nonce15 = ((stored_tag >> 47) & 0x7FFF) as u16;
+            if nonce15 == 0 {
+                self.record_audit(35, AuditVerdict::Denied, b"shell:vault:tamper");
+                return copy_into(
+                    b"error: EBADMSG (vault AEAD authentication tag mismatch)\n",
+                    out,
+                );
+            }
+            let (mut ks, expected_tag) =
+                vault_derive_stream_and_mac(&self.seal_key, kname, nonce15, &ct[..ct_len]);
             if (stored_tag ^ expected_tag) != 0 {
+                zeroize_secret_bytes(&mut ks);
                 self.record_audit(35, AuditVerdict::Denied, b"shell:vault:tamper");
                 return copy_into(
                     b"error: EBADMSG (vault AEAD authentication tag mismatch)\n",
@@ -2955,6 +3019,7 @@ impl OsShell {
                 pt[i] = ct[i] ^ ks[i];
                 i += 1;
             }
+            zeroize_secret_bytes(&mut ks);
             self.record_audit(35, AuditVerdict::Allowed, b"shell:vault:get");
             let mut pos = 0usize;
             pos += copy_into(b"vault: key=", &mut out[pos..]);
@@ -2962,6 +3027,7 @@ impl OsShell {
             pos += copy_into(b" value=", &mut out[pos..]);
             pos += copy_into(&pt[..ct_len], &mut out[pos..]);
             pos += copy_into(b" verified=true\n", &mut out[pos..]);
+            zeroize_secret_bytes(&mut pt);
             return pos;
         }
 
@@ -4540,27 +4606,35 @@ fn is_valid_vault_secret(s: &[u8]) -> bool {
 fn vault_derive_stream_and_mac(
     seal_key: &[u8; DURABLE_DIGEST_LEN],
     key_name: &[u8],
+    nonce15: u16,
     ct: &[u8],
 ) -> ([u8; DURABLE_DIGEST_LEN], u64) {
+    let nb = (nonce15 & 0x7FFF).to_le_bytes();
     let mut ks_msg = [0u8; 64];
     let mut kp = 0usize;
-    kp += copy_into(b"cuttle-vault-ks-v1:", &mut ks_msg[kp..]);
+    kp += copy_into(b"cuttle-vault-ks-v2:", &mut ks_msg[kp..]);
+    kp += copy_into(&nb, &mut ks_msg[kp..]);
+    kp += copy_into(b":", &mut ks_msg[kp..]);
     kp += copy_into(key_name, &mut ks_msg[kp..]);
     let mut ks = [0u8; DURABLE_DIGEST_LEN];
     seal_bytes_keyed(seal_key, &ks_msg[..kp], &mut ks);
 
     let mut mac_msg = [0u8; 96];
     let mut mp = 0usize;
-    mp += copy_into(b"cuttle-vault-mac-v1:", &mut mac_msg[mp..]);
+    mp += copy_into(b"cuttle-vault-mac-v2:", &mut mac_msg[mp..]);
+    mp += copy_into(&nb, &mut mac_msg[mp..]);
+    mp += copy_into(b":", &mut mac_msg[mp..]);
     mp += copy_into(key_name, &mut mac_msg[mp..]);
     mp += copy_into(b":", &mut mac_msg[mp..]);
     mp += copy_into(ct, &mut mac_msg[mp..]);
     let mut mac = [0u8; DURABLE_DIGEST_LEN];
     seal_bytes_keyed(seal_key, &mac_msg[..mp], &mut mac);
-    let tag = (u64::from_le_bytes([
+    let mac47 = (u64::from_le_bytes([
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], mac[6], mac[7],
-    ]) & 0x7FFF_FFFF_FFFF_FFFF)
+    ]) & 0x7FFF_FFFF_FFFF)
         .max(1);
+    let tag = (((nonce15 as u64) & 0x7FFF) << 47) | mac47;
+    zeroize_secret_bytes(&mut mac);
     (ks, tag)
 }
 
@@ -5472,13 +5546,26 @@ mod tests {
         }
         assert!(sh1.is_login_rate_limited());
         assert_eq!(sh1.login_cooldown_ticks, 8);
+        assert_eq!(sh1.login_backoff_level, 1);
         for _ in 0..7 {
             sh1.tick_login_cooldown();
             assert!(sh1.is_login_rate_limited());
         }
         sh1.tick_login_cooldown();
         assert!(!sh1.is_login_rate_limited());
+        assert_eq!(sh1.failed_login_streak, 4);
+
+        // Next failure after cooldown expiry immediately triggers exponential backoff (16 ticks).
+        sh1.record_login_failure();
+        assert!(sh1.is_login_rate_limited());
+        assert_eq!(sh1.login_cooldown_ticks, 16);
+        assert_eq!(sh1.login_backoff_level, 2);
+
+        // Successful session creation resets streak, cooldown, and backoff level.
+        let _ = sh1.create_session(b"admin", b"nonce");
+        assert!(!sh1.is_login_rate_limited());
         assert_eq!(sh1.failed_login_streak, 0);
+        assert_eq!(sh1.login_backoff_level, 0);
     }
 
     #[test]
@@ -5488,9 +5575,16 @@ mod tests {
 
         // 1. CuttleVault: seal a secret, verify raw SQL stores only ciphertext, unseal, and detect tamper.
         let act = sh.exec_line(b"vault put api.token Secr3tKey99", 1, 0, 0, &mut out);
-        let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
-        assert!(s.starts_with("vault: sealed key=api.token ct="));
-        assert!(!s.contains("Secr3tKey99"));
+        let s1 = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
+        assert!(s1.starts_with("vault: sealed key=api.token ct="));
+        assert!(!s1.contains("Secr3tKey99"));
+        let mut out2 = [0u8; 512];
+        let act2 = sh.exec_line(b"vault put api.token Secr3tKey99", 1, 0, 0, &mut out2);
+        let s2 = core::str::from_utf8(&out2[..act2.bytes_written()]).unwrap();
+        assert_ne!(
+            s1, s2,
+            "overwriting a vault key must diversify the stream cipher keystream with a fresh 15-bit nonce"
+        );
 
         let act = sh.exec_line(
             b"sql SELECT v FROM kv WHERE k = 'v:api.token'",
