@@ -439,6 +439,37 @@ impl IpcMessage {
     }
 }
 
+/// Byte length of each service's diversified x86-64 `CPL=3` machine-code stub (`mov eax, cs; mov rsi, rax; mov rdi, 2; mov rdx, tag; int 0x80`).
+pub const SVC_RING3_STUB_LEN: usize = 21;
+
+/// Per-service IPC & hardware execution mailbox.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IpcMailbox {
+    /// Monotonic count of IPC/endpoint requests delivered to this service's mailbox.
+    pub req_seq: u64,
+    /// Last [`IpcOp`] discriminant delivered to this service (`0` when idle).
+    pub last_op: u8,
+    /// Last 64-bit response tag returned by this service's ELF64 handler.
+    pub resp_tag: u64,
+    /// Number of populated user-mode entries verified in the serialized x86-64 PML4 (`x86_pml4::serialize_into`).
+    pub pml4_entries: usize,
+    /// Count of hardware Ring-3 (`CPL=3`, `CS=0x23`) executions completed via `iretq` -> `int 0x80`.
+    pub cpl3_runs: u64,
+}
+
+impl IpcMailbox {
+    /// Construct a zeroed service mailbox.
+    pub const fn empty() -> Self {
+        Self {
+            req_seq: 0,
+            last_op: 0,
+            resp_tag: 0,
+            pml4_entries: 0,
+            cpl3_runs: 0,
+        }
+    }
+}
+
 /// Per-service runtime descriptor managed by [`ServiceSupervisor`].
 #[derive(Copy, Clone, Debug)]
 pub struct ServiceSlot {
@@ -448,7 +479,7 @@ pub struct ServiceSlot {
     pub state: ServiceState,
     /// Deny-by-default security policy enforced by the kernel.
     pub policy: ServicePolicy,
-    /// Active binary diversification seed used to synthesize `elf_image`.
+    /// Active binary diversification seed used to synthesize `elf_image` and `ring3_code`.
     pub variant_seed: u64,
     /// Number of times this service's ELF binary has been rotated in place without rebooting.
     pub rotations: u64,
@@ -462,6 +493,12 @@ pub struct ServiceSlot {
     pub kpti_isolated: bool,
     /// Live per-service KPTI user page table (`UserL4`) isolating this service's address space.
     pub user_l4: PageTable<8>,
+    /// Per-service IPC & hardware execution mailbox.
+    pub mailbox: IpcMailbox,
+    /// Diversified x86-64 Ring-3 (`CPL=3`) machine-code stub executed via `iretq` -> `int 0x80`.
+    pub ring3_code: [u8; SVC_RING3_STUB_LEN],
+    /// Expected `RDX` (`arg0`) syscall argument produced when `ring3_code` executes at `CPL=3`.
+    pub ring3_expected_arg0: u64,
     /// SHA-256 digest of the currently loaded ELF64 binary (`[0; 32]` when `Unloaded`).
     pub elf_sha256: [u8; DURABLE_DIGEST_LEN],
     /// Valid byte length of `elf_image` (`0` when `Unloaded`).
@@ -484,6 +521,9 @@ impl ServiceSlot {
             policy_denials: 0,
             kpti_isolated: false,
             user_l4: PageTable::new(),
+            mailbox: IpcMailbox::empty(),
+            ring3_code: [0u8; SVC_RING3_STUB_LEN],
+            ring3_expected_arg0: 0,
             elf_sha256: [0u8; DURABLE_DIGEST_LEN],
             elf_len: 0,
             elf_image: [0u8; SVC_ELF_CAP],
@@ -491,11 +531,19 @@ impl ServiceSlot {
     }
 }
 
-/// Derive a deterministic per-node 64-bit base seed from a 256-bit `seal_key` so
-/// nodes with distinct device keys boot with distinct service variants (`svc-http`, `svc-sql`, `svc-sh`).
-pub fn derive_service_base_seed(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> u64 {
+/// Derive a deterministic per-node AND per-boot 64-bit base seed from a 256-bit `seal_key`
+/// and monotonic `boot_gen` counter so both distinct nodes and reboots of the same node
+/// start with fresh service ELF variants (`svc-http`, `svc-sql`, `svc-sh`).
+pub fn derive_service_base_seed_for_boot(
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+    boot_gen: u64,
+) -> u64 {
+    let mut label = [0u8; 36];
+    let prefix = b"proteus-svc-variant-seed-v1:";
+    label[..28].copy_from_slice(prefix);
+    label[28..36].copy_from_slice(&boot_gen.to_le_bytes());
     let mut dig = [0u8; DURABLE_DIGEST_LEN];
-    seal_bytes_keyed(seal_key, b"proteus-svc-variant-seed-v1", &mut dig);
+    seal_bytes_keyed(seal_key, &label, &mut dig);
     let raw = u64::from_le_bytes([
         dig[0], dig[1], dig[2], dig[3], dig[4], dig[5], dig[6], dig[7],
     ]);
@@ -504,6 +552,11 @@ pub fn derive_service_base_seed(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> u64 {
     } else {
         raw
     }
+}
+
+/// Derive a deterministic per-node 64-bit base seed from a 256-bit `seal_key` (boot generation 1).
+pub fn derive_service_base_seed(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> u64 {
+    derive_service_base_seed_for_boot(seal_key, 1)
 }
 
 /// Ring-3 Service Init / Supervisor, KPTI Loader, IPC Bus, and Policy Enforcer.
@@ -603,12 +656,15 @@ impl ServiceSupervisor {
         record_svc_audit(audit, 40, AuditVerdict::Allowed, b"svc:role:updated");
     }
 
-    /// Unload a service from memory and clear its ELF image and live KPTI page table.
+    /// Unload a service from memory and clear its ELF image, Ring-3 stub, and live KPTI page table.
     fn unload_service(&mut self, svc: ServiceId) {
         let idx = svc.index();
         self.services[idx].state = ServiceState::Unloaded;
         self.services[idx].kpti_isolated = false;
         self.services[idx].user_l4 = PageTable::new();
+        self.services[idx].mailbox = IpcMailbox::empty();
+        self.services[idx].ring3_code = [0u8; SVC_RING3_STUB_LEN];
+        self.services[idx].ring3_expected_arg0 = 0;
         self.services[idx].elf_sha256 = [0u8; DURABLE_DIGEST_LEN];
         self.services[idx].elf_len = 0;
         self.services[idx].elf_image = [0u8; SVC_ELF_CAP];
@@ -657,7 +713,8 @@ impl ServiceSupervisor {
             return Err(ServiceError::KptiIsolationFailed);
         }
 
-        // 3. Build and validate the service's live KPTI user page table (`user_l4`):
+        // 3. Build and validate the service's live KPTI user page table (`user_l4`) and
+        //    serialize it via `kpti::x86_pml4::serialize_into` to verify hardware x86-64 PML4 layout:
         //    - Maps KPTI_TRAMPOLINE_VIRT and ONLY this service's user_va_base.
         //    - Excludes KERNEL_SECRET_VA AND excludes all peer services' virtual addresses!
         let user_l4 = build_service_user_l4(svc);
@@ -665,7 +722,10 @@ impl ServiceSupervisor {
             return Err(ServiceError::KptiIsolationFailed);
         }
 
-        // 4. Build and verify TCG TPM 2.0 PCR-10 Extend command and update svc_pcr10.
+        // 4. Synthesize the service's diversified x86-64 Ring-3 (`CPL=3`) machine-code stub.
+        let (ring3_code, ring3_expected_arg0) = build_service_ring3_stub(svc, variant_seed);
+
+        // 5. Build and verify TCG TPM 2.0 PCR-10 Extend command and update svc_pcr10.
         let mut tpm_cmd = [0u8; TPM_MAX_CMD_LEN];
         let tpm_len = TpmImpl::build_pcr_extend(&mut tpm_cmd, 10, TPM_ALG_SHA256, &bin_dig)
             .map_err(|_| ServiceError::ImaVerificationFailed)?;
@@ -680,7 +740,7 @@ impl ServiceSupervisor {
         self.svc_pcr10 = next_pcr;
         self.svc_measurements = self.svc_measurements.wrapping_add(1);
 
-        // 5. Commit verified service binary and live user_l4 page table into the supervisor slot.
+        // 6. Commit verified service binary, Ring-3 stub, and live user_l4 page table into the supervisor slot.
         let slot = &mut self.services[idx];
         slot.state = ServiceState::Running;
         slot.policy = svc.policy();
@@ -690,6 +750,9 @@ impl ServiceSupervisor {
         }
         slot.user_l4 = user_l4;
         slot.kpti_isolated = true;
+        slot.mailbox.pml4_entries = slot.user_l4.len();
+        slot.ring3_code = ring3_code;
+        slot.ring3_expected_arg0 = ring3_expected_arg0;
         slot.elf_sha256 = bin_dig;
         slot.elf_len = elf_len;
         slot.elf_image = img;
@@ -898,10 +961,14 @@ impl ServiceSupervisor {
         let sys = op.target_syscall();
         self.mediate_syscall(target, sys, audit)?;
 
-        // 5. Execute the target service's loaded ELF64 eBPF handler inside an in-stack canary frame.
+        // 5. Execute the target service's loaded ELF64 eBPF handler inside an in-stack canary frame
+        //    and record the IPC request/response in the service's mailbox.
         let ret = self.execute_service_elf(target, op as u64)?;
-        self.services[target_idx].requests_served =
-            self.services[target_idx].requests_served.wrapping_add(1);
+        let slot = &mut self.services[target_idx];
+        slot.requests_served = slot.requests_served.wrapping_add(1);
+        slot.mailbox.req_seq = slot.mailbox.req_seq.wrapping_add(1);
+        slot.mailbox.last_op = op as u8;
+        slot.mailbox.resp_tag = ret;
         Ok(ret)
     }
 
@@ -1047,15 +1114,16 @@ pub fn build_service_user_l4(svc: ServiceId) -> PageTable<8> {
 }
 
 /// Verify that a service's live `user_l4` KPTI page table maps `svc.user_va_base()` and
-/// `KPTI_TRAMPOLINE_VIRT` while leaving `KERNEL_SECRET_VA` and every other service's
-/// `user_va_base()` unmapped.
+/// `KPTI_TRAMPOLINE_VIRT`, leaves `KERNEL_SECRET_VA` and every peer service's `user_va_base()`
+/// unmapped, and serializes cleanly into a hardware x86-64 PML4 via [`crate::kpti::x86_pml4::serialize_into`].
 pub fn verify_service_kpti_isolation(user_l4: &PageTable<8>, svc: ServiceId) -> bool {
     let own_va = svc.user_va_base() & PAGE_MASK;
     let (kernel_l4, peer_secrets) = build_service_kernel_reference(svc);
     if KptiImpl::<8>::validate_user_view(user_l4, &kernel_l4, &peer_secrets).is_err() {
         return false;
     }
-    if !user_l4.is_mapped(own_va)
+    if user_l4.len() != 2
+        || !user_l4.is_mapped(own_va)
         || !user_l4.is_mapped(KPTI_TRAMPOLINE_VIRT)
         || user_l4.is_mapped(KERNEL_SECRET_VA)
     {
@@ -1069,7 +1137,59 @@ pub fn verify_service_kpti_isolation(user_l4: &PageTable<8>, svc: ServiceId) -> 
         }
         k += 1;
     }
+    let mut pml4_bytes = [0u8; crate::kpti::x86_pml4::PML4_BYTES];
+    let serialized = crate::kpti::x86_pml4::serialize_into(user_l4, &mut pml4_bytes);
+    if serialized != 2 {
+        return false;
+    }
+    let mut idx = 0usize;
+    while idx < serialized {
+        let off = idx * 8;
+        let pte = u64::from_le_bytes([
+            pml4_bytes[off],
+            pml4_bytes[off + 1],
+            pml4_bytes[off + 2],
+            pml4_bytes[off + 3],
+            pml4_bytes[off + 4],
+            pml4_bytes[off + 5],
+            pml4_bytes[off + 6],
+            pml4_bytes[off + 7],
+        ]);
+        if (pte & (PTE_PRESENT | PTE_USER)) != (PTE_PRESENT | PTE_USER) {
+            return false;
+        }
+        idx += 1;
+    }
     true
+}
+
+/// Synthesize a diversified 21-byte x86-64 Ring-3 (`CPL=3`) machine-code stub for `svc`
+/// parameterized by `variant_seed`:
+///
+/// ```text
+///   8C C8                         mov eax, cs
+///   48 89 C6                      mov rsi, rax
+///   48 C7 C7 02 00 00 00          mov rdi, 2        (SYS_GETPID)
+///   48 C7 C2 <imm32 LE>           mov rdx, <arg0>
+///   CD 80                         int 0x80
+/// ```
+///
+/// Returns `(ring3_code, expected_arg0)`.
+pub fn build_service_ring3_stub(
+    svc: ServiceId,
+    variant_seed: u64,
+) -> ([u8; SVC_RING3_STUB_LEN], u64) {
+    let salt32 = (((variant_seed as u32) ^ ((variant_seed >> 32) as u32)) & 0x7FFF_FF00)
+        | (svc.pid() as u32);
+    let b = salt32.to_le_bytes();
+    let code: [u8; SVC_RING3_STUB_LEN] = [
+        0x8C, 0xC8, // mov eax, cs
+        0x48, 0x89, 0xC6, // mov rsi, rax
+        0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00, // mov rdi, 2 (SYS_GETPID)
+        0x48, 0xC7, 0xC2, b[0], b[1], b[2], b[3], // mov rdx, salt32
+        0xCD, 0x80, // int 0x80
+    ];
+    (code, salt32 as u64)
 }
 
 /// Synthesize a morphed 64-bit ELF (`ELF64` + `PT_LOAD`) for `svc` parameterized by `variant_seed`.
@@ -1489,5 +1609,41 @@ mod tests {
             sup.mediate_endpoint(IpcOp::SqlMutate, false, false, &mut audit),
             Err(ServiceError::Unauthenticated)
         );
+    }
+
+    #[test]
+    fn per_boot_seed_rotation_and_ring3_stub_mailbox_tracking() {
+        let mut audit: AuditLogImpl<16> = AuditLogImpl::new();
+        let same_key = [0x42u8; DURABLE_DIGEST_LEN];
+        let seed_boot1 = derive_service_base_seed_for_boot(&same_key, 1);
+        let seed_boot2 = derive_service_base_seed_for_boot(&same_key, 2);
+        assert_ne!(
+            seed_boot1, seed_boot2,
+            "rebooting a node with the same seal_key must mix boot_gen into a fresh service seed"
+        );
+
+        let mut sup1 = ServiceSupervisor::empty();
+        let mut sup2 = ServiceSupervisor::empty();
+        sup1.init_role(NodeRole::Full, seed_boot1);
+        sup2.init_role(NodeRole::Full, seed_boot2);
+        for i in 0..SERVICE_COUNT {
+            assert_ne!(
+                sup1.services[i].elf_sha256, sup2.services[i].elf_sha256,
+                "consecutive boots on the same node must start with distinct service ELF variants"
+            );
+            assert_ne!(
+                sup1.services[i].ring3_code, sup2.services[i].ring3_code,
+                "consecutive boots must also diversify the CPL=3 x86-64 machine-code stub"
+            );
+            assert_eq!(sup1.services[i].mailbox.pml4_entries, 2);
+        }
+
+        let tag = sup1
+            .mediate_endpoint(IpcOp::SqlQuery, true, false, &mut audit)
+            .expect("mediate SqlQuery");
+        let sql_mb = sup1.services[ServiceId::Sql.index()].mailbox;
+        assert_eq!(sql_mb.req_seq, 1);
+        assert_eq!(sql_mb.last_op, IpcOp::SqlQuery as u8);
+        assert_eq!(sql_mb.resp_tag, tag);
     }
 }

@@ -200,6 +200,8 @@ pub struct OsShell {
     pub svc: crate::svc_runtime::ServiceSupervisor,
     /// Consecutive failed authentication attempts for brute-force rate limiting.
     pub failed_login_streak: u32,
+    /// Remaining decaying cooldown ticks while login brute-force lockout is active (`0` = unlocked).
+    pub login_cooldown_ticks: u32,
     /// Next PID to assign on `spawn`.
     next_pid: TaskId,
     /// Monotonic command counter (used as synthetic timestamp/sequence).
@@ -240,6 +242,7 @@ impl OsShell {
             kthread_switches: [0u64; SHELL_MAX_TASKS],
             svc: crate::svc_runtime::ServiceSupervisor::empty(),
             failed_login_streak: 0,
+            login_cooldown_ticks: 0,
             next_pid: 5,
             cmd_seq: 1,
             line_buf: [0u8; SHELL_LINE_MAX],
@@ -272,8 +275,15 @@ impl OsShell {
     /// Populate default system files (`/etc/hostname`, `/etc/os-release`,
     /// `/etc/motd`, `/proc/net`), kernel tasks (`PID 1..4`), pre-enrolled
     /// IMA SHA-256 digests for `/bin/fib` and `/bin/sum`, and default relational
-    /// SQL tables (`services`, `kv`) in place.
+    /// SQL tables (`services`, `kv`) in place (boot generation `1`).
     pub fn seed_defaults(&mut self) {
+        self.seed_defaults_for_boot(1);
+    }
+
+    /// Populate default system files, tasks, IMA digests, SQL tables, and initialize
+    /// the Ring-3 service runtime mixing both `self.seal_key` and `boot_gen` into the
+    /// initial service variant seed so reboots automatically rotate initial service ELFs.
+    pub fn seed_defaults_for_boot(&mut self, boot_gen: u64) {
         let _ = self.fs.seed_file(b"/etc/hostname", b"proteus-te\n", 64, 1);
         let _ = self.fs.seed_file(
             b"/etc/os-release",
@@ -336,10 +346,12 @@ impl OsShell {
         let _ = self.enroll_ima_digest(b"/bin/sum", &sum_dig);
 
         // Initialize Ring-3 isolated service runtime (`svc-http`, `svc-sql`, `svc-sh`)
-        // with a per-node base seed derived from `self.seal_key`.
+        // with a per-node AND per-boot base seed derived from `self.seal_key` and `boot_gen`.
         self.failed_login_streak = 0;
+        self.login_cooldown_ticks = 0;
         self.svc = crate::svc_runtime::ServiceSupervisor::empty();
-        let base_seed = crate::svc_runtime::derive_service_base_seed(&self.seal_key);
+        let base_seed =
+            crate::svc_runtime::derive_service_base_seed_for_boot(&self.seal_key, boot_gen.max(1));
         self.svc
             .init_role(crate::svc_runtime::NodeRole::Full, base_seed);
     }
@@ -430,16 +442,30 @@ impl OsShell {
         count
     }
 
-    /// Returns `true` if login attempts are currently rate-limited due to repeated failures (`>= 5`).
+    /// Returns `true` if login attempts are currently rate-limited inside the decaying cooldown window.
     #[inline]
     pub const fn is_login_rate_limited(&self) -> bool {
-        self.failed_login_streak >= 5
+        self.login_cooldown_ticks > 0
     }
 
-    /// Record a failed login attempt, incrementing `failed_login_streak` and logging to the audit ring.
+    /// Advance the decaying login brute-force cooldown timer by one tick/request; when
+    /// `login_cooldown_ticks` reaches `0`, resets `failed_login_streak` so legitimate
+    /// operators can authenticate again.
+    pub fn tick_login_cooldown(&mut self) {
+        if self.login_cooldown_ticks > 0 {
+            self.login_cooldown_ticks -= 1;
+            if self.login_cooldown_ticks == 0 {
+                self.failed_login_streak = 0;
+            }
+        }
+    }
+
+    /// Record a failed login attempt, incrementing `failed_login_streak` and arming a
+    /// bounded `8`-tick cooldown window once `5` consecutive failures occur.
     pub fn record_login_failure(&mut self) {
         self.failed_login_streak = self.failed_login_streak.saturating_add(1);
         if self.failed_login_streak >= 5 {
+            self.login_cooldown_ticks = 8;
             self.record_audit(32, AuditVerdict::Denied, b"shell:session:rate-limit");
         } else {
             self.record_audit(32, AuditVerdict::Denied, b"shell:session:bad-auth");
@@ -450,6 +476,7 @@ impl OsShell {
     /// derived via `HMAC-SHA256(self.attest_key, "proteus-session-v1:" || user || seq || challenge)`.
     pub fn create_session(&mut self, user: &[u8], challenge: &[u8]) -> [u8; 32] {
         self.failed_login_streak = 0;
+        self.login_cooldown_ticks = 0;
         let uname = if user.is_empty() { b"admin" } else { user };
         let ulen = uname.len().min(16);
 
@@ -1851,6 +1878,21 @@ impl OsShell {
     }
 
     fn cmd_grant_revoke(&mut self, arg: &[u8], is_grant: bool, out: &mut [u8]) -> usize {
+        if self
+            .svc
+            .mediate_endpoint(
+                crate::svc_runtime::IpcOp::ShellExec,
+                false,
+                true,
+                &mut self.audit,
+            )
+            .is_err()
+        {
+            return copy_into(
+                b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                out,
+            );
+        }
         let (pid_str, cap_name) = split_first_word(trim_ascii(arg));
         let Some(pid) = parse_u32_ascii(pid_str) else {
             self.record_audit(17, AuditVerdict::Error, b"shell:cap:bad-args");
@@ -2007,6 +2049,23 @@ impl OsShell {
                 pid += 1;
             }
             return pos;
+        }
+        if bytes_eq(sub, b"clear") || bytes_eq(sub, b"deny") {
+            if self
+                .svc
+                .mediate_endpoint(
+                    crate::svc_runtime::IpcOp::ShellExec,
+                    false,
+                    true,
+                    &mut self.audit,
+                )
+                .is_err()
+            {
+                return copy_into(
+                    b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                    out,
+                );
+            }
         }
         if bytes_eq(sub, b"clear") {
             let Some(pid) = parse_u32_ascii(trim_ascii(rest)) else {
@@ -2260,6 +2319,21 @@ impl OsShell {
     }
 
     fn cmd_sync(&mut self, out: &mut [u8]) -> usize {
+        if self
+            .svc
+            .mediate_endpoint(
+                crate::svc_runtime::IpcOp::ShellExec,
+                false,
+                true,
+                &mut self.audit,
+            )
+            .is_err()
+        {
+            return copy_into(
+                b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                out,
+            );
+        }
         let proof = match durable_wal_proof(self.task_caps[4]) {
             Ok(p) => p,
             Err(_) => {
@@ -2845,6 +2919,21 @@ impl OsShell {
             return pos;
         }
         if bytes_eq(sub, b"enroll") {
+            if self
+                .svc
+                .mediate_endpoint(
+                    crate::svc_runtime::IpcOp::ShellExec,
+                    false,
+                    true,
+                    &mut self.audit,
+                )
+                .is_err()
+            {
+                return copy_into(
+                    b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                    out,
+                );
+            }
             let path = trim_ascii(rest);
             if path.is_empty() {
                 self.record_audit(24, AuditVerdict::Error, b"shell:ima:no-path");
@@ -2908,6 +2997,27 @@ impl OsShell {
                 i += 1;
             }
             return pos;
+        }
+        if bytes_eq(sub, b"clear")
+            || bytes_eq(sub, b"block")
+            || bytes_eq(sub, b"drop")
+            || bytes_eq(sub, b"allow")
+        {
+            if self
+                .svc
+                .mediate_endpoint(
+                    crate::svc_runtime::IpcOp::ShellExec,
+                    false,
+                    true,
+                    &mut self.audit,
+                )
+                .is_err()
+            {
+                return copy_into(
+                    b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                    out,
+                );
+            }
         }
         if bytes_eq(sub, b"clear") {
             self.fw.clear();
@@ -4142,6 +4252,14 @@ mod tests {
             b"rm /var/test.txt".as_slice(),
             b"spawn".as_slice(),
             b"kill 5".as_slice(),
+            b"grant 4 fs".as_slice(),
+            b"revoke 4 fs".as_slice(),
+            b"seccomp deny 5 open".as_slice(),
+            b"seccomp clear 5".as_slice(),
+            b"fw block 10.9.9.9/32".as_slice(),
+            b"fw clear".as_slice(),
+            b"ima enroll /etc/hostname".as_slice(),
+            b"sync".as_slice(),
         ] {
             let act_sh = sh.exec_line(cmd, 1, 0, 0, &mut out);
             assert_eq!(
@@ -4149,5 +4267,30 @@ mod tests {
                 b"error: EACCES (svc-sh disabled by node role or policy)\n"
             );
         }
+    }
+
+    #[test]
+    fn login_cooldown_expires_after_ticks_and_seed_defaults_for_boot_rotates_variants() {
+        let mut sh1 = OsShell::empty();
+        let mut sh2 = OsShell::empty();
+        sh1.seed_defaults_for_boot(1);
+        sh2.seed_defaults_for_boot(2);
+        assert_ne!(
+            sh1.svc.services[0].elf_sha256, sh2.svc.services[0].elf_sha256,
+            "seed_defaults_for_boot must rotate initial service ELF variants across boot generations"
+        );
+
+        for _ in 0..5 {
+            sh1.record_login_failure();
+        }
+        assert!(sh1.is_login_rate_limited());
+        assert_eq!(sh1.login_cooldown_ticks, 8);
+        for _ in 0..7 {
+            sh1.tick_login_cooldown();
+            assert!(sh1.is_login_rate_limited());
+        }
+        sh1.tick_login_cooldown();
+        assert!(!sh1.is_login_rate_limited());
+        assert_eq!(sh1.failed_login_streak, 0);
     }
 }

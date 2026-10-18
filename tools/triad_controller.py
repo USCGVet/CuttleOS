@@ -11,15 +11,15 @@ Features:
   1. Real post-link x86-64 binary diversification (`binmorph.exe`) per VM boot:
      rewrites ~15,350 instructions and permutes registers across 787 functions in ~250ms,
      splicing the morphed ELF directly into each VM's BIOS boot image.
-  2. 2-of-3 Byzantine Quorum + 4 KiB RAID Parity verification (D1 ^ D2 = P) across
-     the persistent AHCI SQL partitions (`LBA 1058..1065`, `PRTSSQL1`).
+  2. Triple Modular Redundancy (TMR) 2-of-3 Majority Vote + 4 KiB RAID Parity verification
+     (D1 ^ D2 = P) across the persistent AHCI SQL partitions (`LBA 1058..1065`, `PRTSSQL1`).
   3. Zero-downtime Rolling MTD Morph: while 1 OS bounces into a freshly scrambled
      kernel binary, the other 2 OSes serve 100% of reads and writes; when the bounced
      OS wakes up (`SHELL resume OK`), it enters `CATCHING_UP` and automatically replays
      all missed SQL writes from the Triad WAL before rejoining `ONLINE`.
-  4. Byzantine Tamper Self-Healing: detects unauthorized state divergence on any single
-     OS via 2-of-3 quorum + parity check, heals the corrupted node from its peers, and
-     triggers an emergency binary re-morph.
+  4. Single-Node Tamper Self-Healing: detects unauthorized state divergence on any single
+     OS via 2-of-3 majority vote + parity check, heals the corrupted node from its peers,
+     and triggers an emergency binary re-morph.
 """
 
 import argparse
@@ -30,6 +30,7 @@ import os
 import queue
 import random
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,11 @@ DEVICE_KEY = ROOT / "device_secret_key.bin"
 # AHCI SQL partition layout (LBA 1058..1065 = 8 sectors = 4096 bytes)
 SQL_PART_OFFSET = 1058 * 512
 SQL_PART_SIZE = 8 * 512
+
+
+def is_printable_ascii_command(s: str) -> bool:
+    """Return True iff `s` is non-empty and every character is printable ASCII (0x20..=0x7E)."""
+    return bool(s) and all(0x20 <= ord(ch) <= 0x7E for ch in s)
 
 
 def find_qemu() -> str:
@@ -153,11 +159,8 @@ class TriadController:
             self.master_key_bytes = os.urandom(32)
             DEVICE_KEY.write_bytes(self.master_key_bytes)
 
-        self.coordinator_token = hmac.new(
-            self.master_key_bytes,
-            b"proteus-triad-coordinator-session-v1",
-            hashlib.sha256,
-        ).hexdigest()[:32]
+        # Generate a fresh ephemeral 128-bit session token on every controller startup.
+        self.coordinator_token = secrets.token_hex(16)
         (TRIAD_DIR / "operator_token.txt").write_text(self.coordinator_token + "\n", encoding="utf-8")
 
         self.base_elf_bytes = BASE_ELF.read_bytes()
@@ -184,7 +187,7 @@ class TriadController:
         self.parity_Buffer = b"\x00" * SQL_PART_SIZE
         self.parity_sha256 = hashlib.sha256(self.parity_Buffer).hexdigest()[:16]
         self.parity_syndrome_ok = True
-        self.quorum_status = "3/3 QUORUM VERIFIED (D1 ^ D2 = P)"
+        self.quorum_status = "3/3 TMR MAJORITY VERIFIED (D1 ^ D2 = P)"
         self.auto_morph_enabled = False
         self.auto_morph_interval = 45  # seconds
         self.next_rotate_idx = 0
@@ -197,7 +200,11 @@ class TriadController:
         try:
             data = json.loads(self.wal_file.read_text(encoding="utf-8"))
             self.triad_tx_seq = int(data.get("triad_tx_seq", 0))
-            self.wal_entries = [(int(tid), str(stmt)) for tid, stmt in data.get("wal_entries", [])]
+            self.wal_entries = [
+                (int(tid), str(stmt))
+                for tid, stmt in data.get("wal_entries", [])
+                if is_printable_ascii_command(str(stmt))
+            ]
         except Exception:
             self.triad_tx_seq = 0
             self.wal_entries = []
@@ -368,8 +375,14 @@ class TriadController:
         return True
 
     def send_shell_cmd(self, node: TriadNode, cmd_str: str, timeout: float = 5.0) -> str:
-        """Send a single-line command over the node's serial console (paced for the 16-byte 16550 UART FIFO) and capture output."""
-        clean_cmd = cmd_str.replace("\r", " ").replace("\n", " ").strip()
+        """
+        Send a single-line command over the node's serial console (paced for the 16-byte 16550 UART FIFO)
+        and capture output. Rejects any command containing non-printable or control characters (such as
+        0x08 BS or 0x7F DEL) so callers cannot manipulate the kernel's serial line buffer.
+        """
+        if any(not (0x20 <= ord(ch) <= 0x7E) for ch in cmd_str):
+            raise ValueError("command contains non-printable or control characters")
+        clean_cmd = cmd_str.strip()
         if not clean_cmd:
             return ""
         with node.cmd_lock:
@@ -460,13 +473,13 @@ class TriadController:
     def compute_and_verify_raid_parity(self):
         """
         Compute 4 KiB RAID Parity P = D1 ^ D2 across OS-1 and OS-2 SQL partitions,
-        and verify 2-of-3 quorum consistency across all online Triad members.
+        and verify Triple Modular Redundancy (TMR) 2-of-3 majority consistency across all online Triad members.
         """
         n1, n2, n3 = self.nodes[0], self.nodes[1], self.nodes[2]
         online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
 
         if len(online_nodes) >= 2:
-            # Query live kv table from all online nodes to verify Byzantine 2-of-3 quorum
+            # Query live kv table from all online nodes to verify 2-of-3 majority consistency
             outputs = {}
             for n in online_nodes:
                 out = self.send_shell_cmd(n, "sql SELECT * FROM kv", timeout=4.0)
@@ -474,12 +487,12 @@ class TriadController:
                     n.last_sql_table = out
                 outputs[n.node_id] = out
 
-            # Check if any node diverges from the 2-of-3 quorum!
+            # Check if any node diverges from the 2-of-3 majority!
             if len(online_nodes) == 3 and all("k|v|rev" in outputs.get(i, "") for i in (1, 2, 3)):
                 o1, o2, o3 = outputs[1], outputs[2], outputs[3]
                 if o1 == o2 == o3:
                     self.parity_syndrome_ok = True
-                    self.quorum_status = f"3/3 QUORUM LOCKED | RAID PARITY D1⊕D2=P VERIFIED (tx_seq={self.triad_tx_seq})"
+                    self.quorum_status = f"3/3 TMR MAJORITY LOCKED | RAID PARITY D1⊕D2=P VERIFIED (tx_seq={self.triad_tx_seq})"
                 else:
                     # 2-of-3 Majority Vote identifies the exact tampered/corrupted node!
                     corrupted = None
@@ -491,10 +504,10 @@ class TriadController:
                         corrupted = n3
                     if corrupted:
                         self.parity_syndrome_ok = False
-                        self.quorum_status = f"BYZANTINE PARITY FAULT ON {corrupted.name} — 2/3 QUORUM HEALING!"
+                        self.quorum_status = f"TMR PARITY FAULT ON {corrupted.name} — 2/3 MAJORITY HEALING!"
                         self.log_event(
                             "ALERT",
-                            f"RAID Parity & 2/3 Quorum mismatch on {corrupted.name}! "
+                            f"RAID Parity & 2/3 Majority mismatch on {corrupted.name}! "
                             f"Outvoted 2-to-1 by peers. Triggering automatic RAID reconstruction + Emergency Morph!",
                         )
                         threading.Thread(
@@ -503,7 +516,7 @@ class TriadController:
                         return
             else:
                 names = " + ".join(n.name.split()[0] for n in online_nodes)
-                self.quorum_status = f"2/3 DEGRADED QUORUM ACTIVE ({names}) — 0ms Downtime During Morph"
+                self.quorum_status = f"2/3 DEGRADED TMR MAJORITY ACTIVE ({names}) — 0ms Downtime During Morph"
 
         # Update 4 KiB bitwise XOR parity across D1 and D2 AHCI SQL partitions
         d1 = n1.read_sql_partition_bytes()
@@ -515,12 +528,22 @@ class TriadController:
     def execute_triad_sql(self, sql_query: str) -> dict:
         """
         Execute a SQL statement across the 3-as-1 Triad:
-        - Read-only queries (`SELECT`, `.tables`, `.schema`) execute with 2-of-3 quorum verification.
+        - Strictly rejects any query containing non-printable or control characters (0x08 BS, 0x7F DEL, etc.).
+        - Read-only queries (`SELECT`, `.tables`, `.schema`) execute with 2-of-3 majority verification.
         - Mutating queries (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`) increment `triad_tx_seq`,
           append to the Triad WAL, execute in parallel across all ONLINE nodes, and flush AHCI.
           Any node currently `MORPHING` automatically replays the missed WAL entries during `CATCHING_UP`.
         """
+        if not is_printable_ascii_command(sql_query):
+            return {
+                "ok": False,
+                "error": "rejected: query contains non-printable or control characters",
+                "output": "error: non-printable characters rejected",
+                "quorum": "0/3",
+            }
         q = sql_query.strip()
+        if not q:
+            return {"ok": False, "error": "empty SQL query", "output": "error: empty SQL query", "quorum": "0/3"}
         upper = q.upper()
         is_read = (
             upper.startswith("SELECT")
@@ -544,7 +567,7 @@ class TriadController:
             agree = vals.count(chosen)
             return {
                 "ok": True,
-                "mode": "READ (Quorum Verified)",
+                "mode": "READ (2-of-3 Majority Verified)",
                 "quorum": f"{agree}/{len(online_nodes)} ONLINE NODES AGREED",
                 "tx_seq": self.triad_tx_seq,
                 "output": chosen,
@@ -590,21 +613,21 @@ class TriadController:
         keep the logical SQL Appliance 100% online, followed by automatic WAL Delta Catch-Up.
         """
         if not self.morph_op_lock.acquire(blocking=False):
-            self.log_event("WARN", "Another node is currently morphing; keeping 2/3 quorum intact.")
+            self.log_event("WARN", "Another node is currently morphing; keeping 2/3 majority intact.")
             return False
 
         try:
             node = self.nodes[node_id - 1]
             peers = [n for n in self.nodes if n.node_id != node_id and n.state == "ONLINE"]
             if len(peers) < 2:
-                self.log_event("WARN", f"Cannot morph {node.name}: need 2 healthy peers for quorum.")
+                self.log_event("WARN", f"Cannot morph {node.name}: need 2 healthy peers for majority.")
                 return False
 
             # 1. DRAINING: Flush state to AHCI disk
             node.state = "DRAINING"
             self.log_event(
                 "MTD",
-                f"{node.name}: Draining & sealing AHCI disk (peers {peers[0].name.split()[0]} + {peers[1].name.split()[0]} holding 2/3 quorum)...",
+                f"{node.name}: Draining & sealing AHCI disk (peers {peers[0].name.split()[0]} + {peers[1].name.split()[0]} holding 2/3 majority)...",
             )
             self.send_shell_cmd(node, "sync", timeout=2.0)
             if node.proc and node.proc.poll() is None:
@@ -617,7 +640,7 @@ class TriadController:
 
             # 2. MORPHING: Rewrite kernel ELF with fresh seed via binmorph (~250ms)
             node.state = "MORPHING"
-            self.quorum_status = f"2/3 QUORUM ACTIVE ({peers[0].name.split()[0]} + {peers[1].name.split()[0]}) | {node.name.split()[0]} MORPHING"
+            self.quorum_status = f"2/3 TMR MAJORITY ACTIVE ({peers[0].name.split()[0]} + {peers[1].name.split()[0]}) | {node.name.split()[0]} MORPHING"
             new_seed = random.randint(100_000, 999_999)
             self.morph_node_image(node, new_seed)
 
@@ -638,7 +661,7 @@ class TriadController:
                 self.log_event(
                     "RESYNC",
                     f"{node.name}: Woke up at tx_seq={node.tx_seq} (Triad is at tx_seq={self.triad_tx_seq}). "
-                    f"Replaying {len(missed)} missed WAL transaction(s) from twin/parity quorum...",
+                    f"Replaying {len(missed)} missed WAL transaction(s) from twin/parity majority...",
                 )
                 for tid, stmt in missed:
                     self.send_shell_cmd(node, f"sql {stmt}")
@@ -665,7 +688,7 @@ class TriadController:
 
     def heal_and_remorph_node(self, node: TriadNode):
         """
-        Reconstruct a corrupted/tampered node from the 2-of-3 healthy quorum (D1 = D2 ^ P),
+        Reconstruct a corrupted/tampered node from the 2-of-3 healthy majority (D1 = D2 ^ P),
         replay the full canonical WAL, and emergency-morph its binary.
         """
         with self.morph_op_lock:
@@ -680,7 +703,7 @@ class TriadController:
             xor_tag = hashlib.sha256(xor_recovered).hexdigest()[:12]
             self.log_event(
                 "HEAL",
-                f"{node.name}: Isolating tampered node, verifying 4 KiB XOR parity block (D_peer ⊕ P = {xor_tag}..), and reconstructing from 2/3 RAID Quorum + WAL...",
+                f"{node.name}: Isolating tampered node, verifying 4 KiB XOR parity block (D_peer ⊕ P = {xor_tag}..), and reconstructing from 2/3 RAID Majority + WAL...",
             )
             # Reconstruct canonical kv table from clean state + WAL replay
             self.send_shell_cmd(node, "sql DROP TABLE kv")
@@ -712,7 +735,7 @@ class TriadController:
         self.send_shell_cmd(
             node, "sql INSERT INTO kv VALUES ('hacked.backdoor', 'pwned', 999)"
         )
-        # Immediately run the RAID parity & 2-of-3 quorum check so the controller catches and heals it
+        # Immediately run the RAID parity & 2-of-3 majority check so the controller catches and heals it
         self.compute_and_verify_raid_parity()
 
     def boot_all_parallel(self):
@@ -868,7 +891,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
 <div class="header">
   <div>
-    <h1>PROTEUS "3-AS-1" TRIAD APPLIANCE (RAID-SQL + ROLLING MTD)</h1>
+    <h1>PROTEUS "3-AS-1" TRIAD APPLIANCE (TMR 2-OF-3 MAJORITY + RAID-SQL + ROLLING MTD)</h1>
     <div class="sub">
       One Logical SQL/OS Endpoint (:18080) Backed by 3 Independent 4-Core Proteus Unikernels (12 vCPUs in HLT Idle | D1 ⊕ D2 = P Parity)
     </div>
@@ -901,22 +924,17 @@ DASHBOARD_HTML = r"""<!doctype html>
       <button onclick="runShCmd('attest')">attest</button>
       <button onclick="runShCmd('seal')">seal</button>
     </div>
-    <pre id="consoleOut">Ready. Execute a SQL write even while a node is MORPHING — watch the surviving 2/3 quorum commit it and automatically resync the morphing node on wakeup!</pre>
+    <pre id="consoleOut">Ready. Enter your Operator Session Token above, then execute a SQL write even while a node is MORPHING — watch the surviving 2/3 majority commit it and automatically resync the morphing node on wakeup!</pre>
   </div>
 
   <div class="box">
-    <h2>HYPERVISOR MTD, RAID PARITY & QUORUM EVENT STREAM</h2>
+    <h2>HYPERVISOR MTD, RAID PARITY & TMR MAJORITY EVENT STREAM</h2>
     <div class="event-list" id="eventList"></div>
   </div>
 </div>
 
 <script>
 (function initToken() {
-  const params = new URLSearchParams(window.location.search);
-  const urlTok = params.get('token');
-  if (urlTok) {
-    localStorage.setItem('proteus_triad_token', urlTok);
-  }
   const saved = localStorage.getItem('proteus_triad_token') || '';
   document.getElementById('tokInput').value = saved;
 })();
@@ -971,7 +989,7 @@ async function refresh() {
 async function runSql() {
   const q = document.getElementById('sqlInput').value;
   const out = document.getElementById('consoleOut');
-  out.textContent = 'Executing across Triad Quorum...';
+  out.textContent = 'Executing across Triad 2-of-3 Majority...';
   const r = await fetch('/api/sql', {method:'POST', headers: authHeaders(), body: q});
   const d = await r.json();
   if (!d.ok) {
@@ -1120,9 +1138,21 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
             return self._send_json(200, data)
 
         if self.path.startswith("/sql"):
+            if not self._is_authenticated():
+                return self._send_text(
+                    401,
+                    "text/plain; charset=utf-8",
+                    "error: unauthorized (provide valid X-Proteus-Session or Authorization: Bearer token)\n",
+                )
             q = "SELECT * FROM kv"
             if "?" in self.path:
                 q = urllib.parse.unquote_plus(self.path.split("?", 1)[1]).strip()
+            if not is_printable_ascii_command(q):
+                return self._send_text(
+                    400,
+                    "text/plain; charset=utf-8",
+                    "error: query contains non-printable or control characters\n",
+                )
             up = q.upper()
             if not (
                 up.startswith("SELECT")
@@ -1145,30 +1175,27 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8", errors="replace").strip()
 
-        if self.path in ("/api/sql", "/sql"):
-            up = body.upper()
-            is_read = (
-                up.startswith("SELECT")
-                or up.startswith(".TABLES")
-                or up.startswith("SHOW")
-                or up.startswith(".SCHEMA")
-                or up.startswith("DESCRIBE")
-            )
-            if not is_read and not self._is_authenticated():
-                return self._send_json(
-                    401,
-                    {"ok": False, "error": "unauthorized: provide valid X-Proteus-Session or Authorization: Bearer token"},
-                )
-            res = self.ctrl.execute_triad_sql(body)
-            return self._send_json(200, res)
-
         if not self._is_authenticated():
             return self._send_json(
                 401,
                 {"ok": False, "error": "unauthorized: provide valid X-Proteus-Session or Authorization: Bearer token"},
             )
 
+        if self.path in ("/api/sql", "/sql"):
+            if not is_printable_ascii_command(body):
+                return self._send_json(
+                    400,
+                    {"ok": False, "error": "rejected: query contains non-printable or control characters"},
+                )
+            res = self.ctrl.execute_triad_sql(body)
+            return self._send_json(200 if res.get("ok") else 400, res)
+
         if self.path == "/api/sh":
+            if not is_printable_ascii_command(body):
+                return self._send_json(
+                    400,
+                    {"ok": False, "error": "rejected: command contains non-printable or control characters"},
+                )
             first_word = body.split()[0].lower() if body.split() else ""
             if first_word in ("halt", "reboot"):
                 return self._send_json(
@@ -1223,7 +1250,7 @@ def main():
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="Boot the 3-node Triad, test SQL RAID writes during a live node morph, test Byzantine self-healing, and exit",
+        help="Boot the 3-node Triad, test SQL RAID writes during a live node morph, test 2-of-3 self-healing, and exit",
     )
     args = parser.parse_args()
 
@@ -1233,8 +1260,9 @@ def main():
     ctrl = TriadController(show_gui=args.gui)
     if args.self_test:
         for n in ctrl.nodes:
-            if n.ahci_img.exists():
-                n.ahci_img.unlink()
+            for img in (n.ahci_img, n.virtio_img, n.nvme_img):
+                if img.exists():
+                    img.unlink()
     TriadHttpHandler.ctrl = ctrl
     ctrl.boot_all_parallel()
 
@@ -1246,11 +1274,33 @@ def main():
         svc_outputs = [ctrl.send_shell_cmd(n, "service status") for n in ctrl.nodes]
         assert len(set(svc_outputs)) == 3, f"Each Triad node must boot distinct service ELF variants:\n{svc_outputs}"
 
-        # 2. Verify Coordinator HTTP authentication: unauthenticated mutations return 401, authenticated return 200
+        # 2. Verify serial line-editing injection (0x08 backspace / 0x7F DEL) is strictly rejected
+        try:
+            ctrl.send_shell_cmd(
+                ctrl.nodes[0],
+                "sql SELECT " + ("\x08" * 11) + "write /var/pwn hacked",
+            )
+            raise AssertionError("send_shell_cmd must reject commands containing 0x08 backspace")
+        except ValueError:
+            pass
+
+        # 3. Verify Coordinator HTTP authentication & control-character rejection:
+        #    unauthenticated reads/writes return 401, control-character payloads return 400, authenticated return 200
         test_srv = ThreadingHTTPServer(("127.0.0.1", 0), TriadHttpHandler)
         test_port = test_srv.server_address[1]
         threading.Thread(target=test_srv.serve_forever, daemon=True).start()
         try:
+            unauth_read_req = urllib.request.Request(
+                f"http://127.0.0.1:{test_port}/api/sql",
+                data=b"SELECT * FROM kv",
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(unauth_read_req, timeout=5.0)
+                raise AssertionError("Unauthenticated POST /api/sql SELECT must be refused with 401")
+            except urllib.error.HTTPError as e:
+                assert e.code == 401, f"Expected 401 on unauthenticated POST /api/sql SELECT, got {e.code}"
+
             unauth_req = urllib.request.Request(
                 f"http://127.0.0.1:{test_port}/api/sql",
                 data=b"INSERT INTO kv VALUES ('unauth', 'nope', 1)",
@@ -1262,6 +1312,18 @@ def main():
             except urllib.error.HTTPError as e:
                 assert e.code == 401, f"Expected 401 on unauthenticated POST /api/sql, got {e.code}"
 
+            bs_req = urllib.request.Request(
+                f"http://127.0.0.1:{test_port}/api/sql",
+                data=b"SELECT \x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08write /var/pwn hacked",
+                headers={"X-Proteus-Session": ctrl.coordinator_token},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(bs_req, timeout=5.0)
+                raise AssertionError("Backspace-injected POST /api/sql must be refused with 400")
+            except urllib.error.HTTPError as e:
+                assert e.code == 400, f"Expected 400 on backspace-injected POST /api/sql, got {e.code}"
+
             auth_req = urllib.request.Request(
                 f"http://127.0.0.1:{test_port}/api/sql",
                 data=b"INSERT INTO kv VALUES ('triad.init', 'active', 1)",
@@ -1271,13 +1333,13 @@ def main():
             with urllib.request.urlopen(auth_req, timeout=10.0) as resp:
                 assert resp.status == 200
                 r1 = json.loads(resp.read().decode("utf-8"))
-                assert r1["ok"] and "3/3" in r1["quorum"], f"Expected 3/3 quorum write: {r1}"
+                assert r1["ok"] and "3/3" in r1["quorum"], f"Expected 3/3 majority write: {r1}"
         finally:
             test_srv.shutdown()
 
         assert ctrl.wal_file.exists(), "Triad WAL must be persisted to triad_wal.json"
 
-        # 3. Start morphing OS-1 in background thread, and fire a SQL write while OS-1 is MORPHING!
+        # 4. Start morphing OS-1 in background thread, and fire a SQL write while OS-1 is MORPHING!
         t_morph = threading.Thread(target=ctrl.bounce_and_morph_node, args=(1,))
         t_morph.start()
         while ctrl.nodes[0].state == "ONLINE":
@@ -1291,7 +1353,7 @@ def main():
         assert "zero_downtime" in q_out, f"OS-1 failed to catch up missed write! Output:\n{q_out}"
         print("OS-1 successfully morphed AND caught up missed SQL write from WAL!", flush=True)
 
-        # 4. Simulate Byzantine tamper on OS-2 and verify automatic 2-of-3 self-healing + 4 KiB XOR parity check
+        # 5. Simulate single-node tamper on OS-2 and verify automatic 2-of-3 self-healing + 4 KiB XOR parity check
         old_morphs = ctrl.nodes[1].morph_count
         ctrl.simulate_byzantine_tamper(2)
         deadline = time.time() + 35.0
@@ -1308,9 +1370,9 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", args.port), TriadHttpHandler)
     print("\n============================================================================", flush=True)
     print(f"  PROTEUS 3-AS-1 TRIAD APPLIANCE ONLINE!", flush=True)
-    print(f"  Unified Command Center : http://127.0.0.1:{args.port}/app?token={ctrl.coordinator_token}", flush=True)
+    print(f"  Unified Command Center : http://127.0.0.1:{args.port}/app", flush=True)
     print(f"  Operator Session Token : {ctrl.coordinator_token} (saved to triad/operator_token.txt)", flush=True)
-    print(f"  Unified SQL Endpoint   : http://127.0.0.1:{args.port}/sql?SELECT+*+FROM+kv", flush=True)
+    print(f"  Unified SQL Endpoint   : POST http://127.0.0.1:{args.port}/api/sql (with X-Proteus-Session header)", flush=True)
     print(f"  Individual OS Ports    : OS-1 :18101 | OS-2 :18102 | OS-3 (Parity) :18103", flush=True)
     print(f"  Press Ctrl+C to shut down all 3 VMs cleanly.", flush=True)
     print("============================================================================\n", flush=True)

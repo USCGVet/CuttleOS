@@ -727,14 +727,14 @@ pub(crate) fn banner_shell_compose() {
 
     let seal_key = derive_runtime_seal_key();
     let attest_key = derive_runtime_attest_key();
+    let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
     let mut sh_guard = KERNEL_SHELL.lock();
     let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
     *sh = target_enterprise::OsShell::empty();
     sh.seal_key = seal_key;
     sh.attest_key = attest_key;
-    sh.seed_defaults();
+    sh.seed_defaults_for_boot(boots);
 
-    let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
     let mut out = [0u8; 256];
     let mut seal_rejected = false;
 
@@ -764,7 +764,7 @@ pub(crate) fn banner_shell_compose() {
         *sh = target_enterprise::OsShell::empty();
         sh.seal_key = seal_key;
         sh.attest_key = attest_key;
-        sh.seed_defaults();
+        sh.seed_defaults_for_boot(boots);
     }
 
     let a1 = sh.exec_line(b"write /var/boot.ok ready", boots, 0, 0, &mut out);
@@ -851,7 +851,7 @@ pub(crate) fn banner_shell_compose() {
     *vsh = target_enterprise::OsShell::empty();
     vsh.seal_key = seal_key;
     vsh.attest_key = attest_key;
-    vsh.seed_defaults();
+    vsh.seed_defaults_for_boot(boots);
     if restore_shell_from_ahci(vsh) != Some((boots, 4)) {
         panic!("SHELL compose: AHCI sealed restore failed");
     }
@@ -920,6 +920,17 @@ pub(crate) fn banner_shell_compose() {
     serial_write_str("FS partition OK lba=1042..1057 sectors=16 files=1 magic=PRTSFS01\n");
     verify_https_and_concurrent_tcp_compose(boots, seal_key);
     verify_service_runtime_compose(vsh);
+    let mut s_idx = 0usize;
+    while s_idx < target_enterprise::svc_runtime::SERVICE_COUNT {
+        let code = sh.svc.services[s_idx].ring3_code;
+        let expected_arg0 = sh.svc.services[s_idx].ring3_expected_arg0;
+        if !crate::banners_arch_platform::exec_service_ring3_stub(&code, expected_arg0) {
+            panic!("SVC_RUNTIME compose: live shell service CPL=3 stub execution failed");
+        }
+        sh.svc.services[s_idx].mailbox.cpl3_runs =
+            sh.svc.services[s_idx].mailbox.cpl3_runs.wrapping_add(1);
+        s_idx += 1;
+    }
     let _ = sh.exec_line(b"seccomp clear 5", boots, 0, 0, &mut out);
     let _ = sh.exec_line(b"fw clear", boots, 0, 0, &mut out);
     sh.auth_seq = 0;
@@ -937,11 +948,23 @@ pub(crate) fn banner_shell_compose() {
 #[inline(never)]
 fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
     use target_enterprise::svc_runtime::{
-        IpcOp, NodeRole, ServiceError, ServiceId, SvcSyscall,
+        IpcOp, NodeRole, ServiceError, ServiceId, SvcSyscall, SERVICE_COUNT,
     };
 
     if vsh.svc.running_count() != 3 {
         panic!("SVC_RUNTIME compose: expected 3 running Ring-3 services");
+    }
+    // 0. Execute each service's diversified x86-64 Ring-3 stub at hardware CPL=3 (`iretq` -> `int 0x80` on `TSS.RSP0`):
+    let mut i = 0usize;
+    while i < SERVICE_COUNT {
+        let code = vsh.svc.services[i].ring3_code;
+        let expected_arg0 = vsh.svc.services[i].ring3_expected_arg0;
+        if !crate::banners_arch_platform::exec_service_ring3_stub(&code, expected_arg0) {
+            panic!("SVC_RUNTIME compose: hardware CPL=3 service stub execution failed");
+        }
+        vsh.svc.services[i].mailbox.cpl3_runs =
+            vsh.svc.services[i].mailbox.cpl3_runs.wrapping_add(1);
+        i += 1;
     }
     // 1. Deny-by-default cross-service syscall/capability violations must be refused:
     if vsh
@@ -972,6 +995,12 @@ fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
         .expect("SVC_RUNTIME compose: rotate svc-http");
     if dig_before == dig_after || vsh.svc.svc_pcr10 == pcr_before {
         panic!("SVC_RUNTIME compose: service rotation did not update digest/PCR-10");
+    }
+    // Verify rotated service's new CPL=3 Ring-3 stub also executes at hardware CPL=3:
+    let rot_code = vsh.svc.services[ServiceId::Http.index()].ring3_code;
+    let rot_arg0 = vsh.svc.services[ServiceId::Http.index()].ring3_expected_arg0;
+    if !crate::banners_arch_platform::exec_service_ring3_stub(&rot_code, rot_arg0) {
+        panic!("SVC_RUNTIME compose: rotated service CPL=3 stub execution failed");
     }
     // 4. Role switch to Wfe unloads svc-sql and svc-sh from memory; switching back to Full reloads them:
     vsh.svc.set_role(NodeRole::Wfe, &mut vsh.audit);
@@ -1130,8 +1159,8 @@ fn verify_https_and_concurrent_tcp_compose(boots: u64, auth_key: [u8; 32]) {
     let r1_len = r1_len_u16 as usize;
     let sh_slice = &payload[RECORD_HEADER_LEN..RECORD_HEADER_LEN + r1_len];
     let parsed_sh = parse_server_hello(sh_slice).unwrap();
-    if parsed_sh.server_pubkey != TLS_SERVER_PUBKEY {
-        panic!("HTTPS+TCP4 compose: ServerHello pubkey mismatch");
+    if parsed_sh.server_pubkey == TLS_SERVER_PUBKEY || parsed_sh.server_pubkey == [0u8; 32] {
+        panic!("HTTPS+TCP4 compose: ServerHello pubkey must be ephemeral");
     }
     let mut record_key = [0u8; 16];
     let _ = target_enterprise::LivedNet::derive_tls13_record_key(

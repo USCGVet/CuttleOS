@@ -20,8 +20,8 @@ use crate::durable_seal::{seal_bytes_keyed, DURABLE_DIGEST_LEN};
 pub const SQL_MAX_TABLES: usize = 4;
 /// Maximum number of columns per table.
 pub const SQL_MAX_COLS: usize = 4;
-/// Maximum number of rows per table.
-pub const SQL_MAX_ROWS: usize = 16;
+/// Maximum number of rows per table (`128` total rows across [`SQL_MAX_TABLES`]).
+pub const SQL_MAX_ROWS: usize = 32;
 /// Maximum byte length of a table or column identifier.
 pub const SQL_IDENT_LEN: usize = 16;
 /// Maximum byte length of a `TEXT` cell value.
@@ -903,19 +903,11 @@ impl SqlDb {
                 continue;
             }
             let col_count = (tbl.col_count as usize).min(SQL_MAX_COLS);
-            let mut used_rows = 0u8;
-            let mut r = 0usize;
-            while r < SQL_MAX_ROWS {
-                if tbl.rows[r].used {
-                    used_rows = used_rows.saturating_add(1);
-                }
-                r += 1;
-            }
-
+            let used_rows_hdr_pos = pos + 3;
             flat[pos] = 1;
             flat[pos + 1] = tbl.name_len.min(SQL_IDENT_LEN as u8);
             flat[pos + 2] = col_count as u8;
-            flat[pos + 3] = used_rows;
+            flat[pos + 3] = 0;
             pos += 4;
             flat[pos..pos + SQL_IDENT_LEN].copy_from_slice(&tbl.name);
             pos += SQL_IDENT_LEN;
@@ -930,10 +922,25 @@ impl SqlDb {
                 c += 1;
             }
 
+            let mut written_rows = 0u8;
             let mut r2 = 0usize;
             while r2 < SQL_MAX_ROWS {
                 let row = &tbl.rows[r2];
                 if row.used {
+                    // Compute exact serialized byte length of this row first.
+                    let mut row_bytes = 0usize;
+                    let mut rc0 = 0usize;
+                    while rc0 < col_count {
+                        row_bytes += match row.cells[rc0] {
+                            SqlVal::Int(_) => 9,
+                            SqlVal::Text(_, len) => 2 + (len as usize).min(SQL_TEXT_LEN),
+                        };
+                        rc0 += 1;
+                    }
+                    // Reserve 8 bytes at the end of `flat` so remaining table headers always fit.
+                    if pos + row_bytes + 8 > flat.len() {
+                        break;
+                    }
                     let mut rc = 0usize;
                     while rc < col_count {
                         match row.cells[rc] {
@@ -952,9 +959,11 @@ impl SqlDb {
                         }
                         rc += 1;
                     }
+                    written_rows = written_rows.saturating_add(1);
                 }
                 r2 += 1;
             }
+            flat[used_rows_hdr_pos] = written_rows;
             t += 1;
         }
 

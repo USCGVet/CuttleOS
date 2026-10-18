@@ -912,11 +912,11 @@ pub(crate) fn live_os_console_loop() -> ! {
             let rlen = act.bytes_written();
             if rlen > 0 {
                 smp_hw_tick_and_sync(sh);
-                serial_write_bytes(&reply[..rlen]);
                 if reply[..rlen].starts_with(b"sync: ok ") || sh.db.tx_seq != last_sql_tx {
                     last_sql_tx = sh.db.tx_seq;
                     let _ = persist_shell_to_ahci(sh, boots);
                 }
+                serial_write_bytes(&reply[..rlen]);
             }
             match act {
                 ShellAction::Continue(_) => {}

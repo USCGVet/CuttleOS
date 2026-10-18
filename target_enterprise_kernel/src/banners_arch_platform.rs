@@ -129,9 +129,11 @@ pub(crate) fn banner_dma() {
 /// Live hardware GDT + 64-bit TSS (`lgdt`/`ltr`), 256-entry IDT (`lidt`),
 /// `IST1` breakpoint exception (`int3`), and Ring-0 -> Ring-3 (`iretq`) ->
 /// Ring-0 (`int 0x80` on `RSP0` + `dispatch_with_cap`) privilege transition proof.
-#[cfg(not(proteus_prod))]
+/// Execute a 21-byte x86-64 Ring-3 (`CPL=3`) machine-code stub at hardware `CPL=3` via
+/// `iretq` -> `int 0x80` on `TSS.RSP0`, verifying the `IST1` breakpoint stack switch,
+/// `CPL=3` `USER_CODE_SEL`/`USER_DATA_SEL` selectors, `SYS_GETPID` trap, and `expected_arg0`.
 #[inline(never)]
-pub(crate) fn banner_ring3_transition() {
+pub(crate) fn exec_service_ring3_stub(ring3_code: &[u8; 21], expected_arg0: u64) -> bool {
     use target_enterprise::gdt::{
         Gdt, Tss64, KERNEL_CODE_SEL, KERNEL_DATA_SEL, TSS64_LEN, TSS_SEL, USER_CODE_SEL,
         USER_DATA_SEL,
@@ -143,7 +145,7 @@ pub(crate) fn banner_ring3_transition() {
 
     let dma = dma_phys_base();
     if dma == 0 || phys_map_offset() == 0 {
-        panic!("RING3: DMA window not initialized");
+        return false;
     }
 
     // Dedicated physical frames in `dma + 0x2_4000 .. dma + 0x2_B000`:
@@ -190,7 +192,7 @@ pub(crate) fn banner_ring3_transition() {
         idx += 1;
     }
     let Some(pml4_slot) = pml4_idx else {
-        panic!("RING3: no free lower-half PML4 slot");
+        return false;
     };
 
     let user_va: u64 = (pml4_slot as u64) << 39;
@@ -219,19 +221,7 @@ pub(crate) fn banner_ring3_transition() {
         );
     }
 
-    // Write Ring-3 payload into `user_phys`:
-    //   mov eax, cs
-    //   mov rsi, rax
-    //   mov rdi, 2   (SYS_GETPID)
-    //   mov rdx, 42  (arg0)
-    //   int 0x80
-    let ring3_code: [u8; 21] = [
-        0x8C, 0xC8,
-        0x48, 0x89, 0xC6,
-        0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00,
-        0x48, 0xC7, 0xC2, 0x2A, 0x00, 0x00, 0x00,
-        0xCD, 0x80,
-    ];
+    // Write Ring-3 payload into `user_phys`.
     // SAFETY: `user_phys` is a dedicated 4 KiB frame in the reserved DMA window mapped via `pa_to_va`.
     unsafe {
         let dst = pa_to_va(user_phys);
@@ -464,29 +454,41 @@ pub(crate) fn banner_ring3_transition() {
     };
 
     if bp_count != 1 || bp_rsp != ist1_top - 48 {
-        panic!("RING3: IST1 breakpoint stack switch verification failed");
+        return false;
     }
     if (r3_cs as u16) != USER_CODE_SEL
         || (frame_cs as u16) != USER_CODE_SEL
         || (frame_ss as u16) != USER_DATA_SEL
     {
-        panic!("RING3: CPL=3 segment selector verification failed");
+        return false;
     }
     if trap_rsp != rsp0_top - 40 {
-        panic!("RING3: TSS RSP0 stack switch verification failed");
+        return false;
     }
-    if sys_nr != SYS_GETPID {
-        panic!("RING3: trapped syscall number mismatch");
+    if sys_nr != SYS_GETPID || sys_arg0 != expected_arg0 {
+        return false;
     }
 
     let pid = match dispatch_with_cap(sys_nr, u64::MAX, sys_arg0, 0, 0, 0, 0, 0) {
         Ok(v) => v,
-        Err(_) => panic!("RING3: dispatch_with_cap failed for SYS_GETPID"),
+        Err(_) => return false,
     };
-    if pid != 1 || pid.wrapping_add(sys_arg0) != 43 {
-        panic!("RING3: unexpected SYS_GETPID return value");
-    }
+    pid == 1 && pid.wrapping_add(sys_arg0) == 1u64.wrapping_add(expected_arg0)
+}
 
+#[cfg(not(proteus_prod))]
+#[inline(never)]
+pub(crate) fn banner_ring3_transition() {
+    let ring3_code: [u8; 21] = [
+        0x8C, 0xC8,
+        0x48, 0x89, 0xC6,
+        0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00,
+        0x48, 0xC7, 0xC2, 0x2A, 0x00, 0x00, 0x00,
+        0xCD, 0x80,
+    ];
+    if !exec_service_ring3_stub(&ring3_code, 42) {
+        panic!("RING3: hardware CPL=3 transition verification failed");
+    }
     serial_write_str("RING3 transition OK cpl=3->0 vec=0x80 ist1=ok rsp0=ok syscall=43\n");
 }
 

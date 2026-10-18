@@ -23,8 +23,8 @@ use crate::net::ipv4_header_checksum;
 use crate::tcp::{close, process_segment, send_payload, Tcb, TcpImpl, TcpState};
 use crate::tls::{
     build_server_hello, decode_record_header, derive_handshake_keys, encode_record_header,
-    hkdf_expand_label, hmac_sha256, parse_client_hello, CONTENT_TYPE_HANDSHAKE, LEGACY_VERSION,
-    MAX_SERVER_HELLO_LEN, RECORD_HEADER_LEN,
+    hkdf_expand_label, hmac_sha256, parse_client_hello, parse_server_hello, CONTENT_TYPE_HANDSHAKE,
+    LEGACY_VERSION, MAX_SERVER_HELLO_LEN, RECORD_HEADER_LEN,
 };
 
 /// Guest IPv4 the service claims (QEMU slirp default guest).
@@ -39,9 +39,9 @@ pub const HTTPS_PORT: u16 = 443;
 pub const TCP_MAX_SLOTS: usize = 4;
 /// TLS 1.3 content-type byte for encrypted `ApplicationData` records (RFC 8446 §5.1).
 pub const TLS_CONTENT_APPLICATION_DATA: u8 = 23;
-/// Deterministic 32-byte server random used by the in-kernel TLS 1.3 listener on port 443.
+/// Domain-separation root seed for per-connection TLS 1.3 `server_random` derivation on port 443.
 pub const TLS_SERVER_RANDOM: [u8; 32] = [0x53u8; 32];
-/// Deterministic 32-byte server X25519 keyshare public key advertised in `ServerHello`.
+/// Domain-separation root seed for per-connection ephemeral X25519 `server_pubkey` derivation in `ServerHello`.
 pub const TLS_SERVER_PUBKEY: [u8; 32] = [0xA5u8; 32];
 /// Ethernet II header length.
 pub const ETH_HEADER_LEN: usize = 14;
@@ -122,6 +122,8 @@ pub struct LivedNet {
     pub auth_enabled: bool,
     /// Highest accepted monotonic sequence number for anti-replay protection.
     pub last_auth_seq: u64,
+    /// Monotonic counter of TLS 1.3 handshakes used to derive fresh per-connection keyshares.
+    pub tls_handshake_seq: u64,
     tcbs: [Tcb; TCP_MAX_SLOTS],
     slot_last_tick: [u32; TCP_MAX_SLOTS],
     ticks: u32,
@@ -147,6 +149,7 @@ impl LivedNet {
             auth_key,
             auth_enabled: true,
             last_auth_seq: 0,
+            tls_handshake_seq: 0,
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
             ticks: 1,
@@ -167,6 +170,7 @@ impl LivedNet {
             auth_key: [0u8; 32],
             auth_enabled: false,
             last_auth_seq: 0,
+            tls_handshake_seq: 0,
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
             ticks: 1,
@@ -193,15 +197,20 @@ impl LivedNet {
     }
 
     /// Derive the 32-byte ECDHE shared secret and 16-byte record AEAD key for a
-    /// TLS 1.3 handshake (`ClientHello` + `ServerHello`) against [`LivedNet`] on port 443.
+    /// TLS 1.3 handshake (`ClientHello` + `ServerHello`) against [`LivedNet`] on port 443,
+    /// extracting the ephemeral X25519 `server_pubkey` directly from `server_hello`.
     pub fn derive_tls13_record_key(
         client_pubkey: &[u8; 32],
         client_hello: &[u8],
         server_hello: &[u8],
         key_out: &mut [u8; 16],
     ) -> HandshakeKeys {
+        let server_pub = match parse_server_hello(server_hello) {
+            Ok(sh) => sh.server_pubkey,
+            Err(_) => TLS_SERVER_PUBKEY,
+        };
         let mut shared_secret = [0u8; 32];
-        hmac_sha256(&TLS_SERVER_PUBKEY, client_pubkey, &mut shared_secret);
+        hmac_sha256(&server_pub, client_pubkey, &mut shared_secret);
         let mut hs = HandshakeKeys {
             handshake_secret: [0u8; 32],
             client_handshake_traffic_secret: [0u8; 32],
@@ -750,11 +759,24 @@ impl LivedNet {
             let Some(client_pub) = ch_view.x25519_pub else {
                 return 0;
             };
+            // Derive a fresh per-handshake ephemeral server_random and X25519 server_pubkey.
+            self.tls_handshake_seq = self.tls_handshake_seq.wrapping_add(1);
+            let mut seed_buf = [0u8; 48];
+            seed_buf[..32].copy_from_slice(&client_pub);
+            seed_buf[32..40].copy_from_slice(&self.tls_handshake_seq.to_le_bytes());
+            seed_buf[40..46].copy_from_slice(&self.mac);
+            seed_buf[46] = idx as u8;
+            seed_buf[47] = (self.ticks & 0xFF) as u8;
+            let mut ephemeral_random = [0u8; 32];
+            hmac_sha256(&TLS_SERVER_RANDOM, &seed_buf, &mut ephemeral_random);
+            let mut ephemeral_pubkey = [0u8; 32];
+            hmac_sha256(&TLS_SERVER_PUBKEY, &ephemeral_random, &mut ephemeral_pubkey);
+
             let mut sh_msg = [0u8; MAX_SERVER_HELLO_LEN];
             let Ok(sh_len) = build_server_hello(
                 ch_msg,
-                &TLS_SERVER_RANDOM,
-                &TLS_SERVER_PUBKEY,
+                &ephemeral_random,
+                &ephemeral_pubkey,
                 None,
                 &mut sh_msg,
             ) else {
@@ -862,6 +884,12 @@ impl LivedNet {
             Ok(v) => v,
             Err(_) => return 0,
         };
+        let is_login_req = view.method == HttpMethod::Post && view.path == b"/session/login";
+        if !is_login_req {
+            if let Some(sh) = shell.as_deref_mut() {
+                sh.tick_login_cooldown();
+            }
+        }
         let ok_path = view.path == b"/status"
             || view.path == b"/healthz"
             || view.path == b"/";
@@ -987,6 +1015,7 @@ impl LivedNet {
             }
             if sh.is_login_rate_limited() {
                 sh.record_net_audit(AuditVerdict::Denied, b"net:http:login-ratelimit");
+                sh.tick_login_cooldown();
                 return HttpImpl::build_response(
                     429,
                     b"text/plain",
@@ -2255,7 +2284,14 @@ mod tests {
         let r1_len = r1_len_u16 as usize;
         let sh_slice = &payload[RECORD_HEADER_LEN..RECORD_HEADER_LEN + r1_len];
         let parsed_sh = crate::tls::parse_server_hello(sh_slice).unwrap();
-        assert_eq!(parsed_sh.server_pubkey, TLS_SERVER_PUBKEY);
+        assert_ne!(
+            parsed_sh.server_pubkey, TLS_SERVER_PUBKEY,
+            "TLS 1.3 ServerHello must advertise a fresh ephemeral X25519 keyshare"
+        );
+        assert_ne!(
+            parsed_sh.server_random, TLS_SERVER_RANDOM,
+            "TLS 1.3 ServerHello must advertise a fresh per-handshake server_random"
+        );
 
         let mut record_key = [0u8; 16];
         let _ = LivedNet::derive_tls13_record_key(
@@ -2339,6 +2375,61 @@ mod tests {
         let http_str = core::str::from_utf8(&dec_http[..dlen]).unwrap();
         assert!(http_str.starts_with("HTTP/1.1 200"));
         assert!(http_str.contains("Proteus-TE x86_64 1.0-mtd"));
+
+        // 5. Open a second TLS 1.3 connection on port 443 and verify it generates a
+        //    distinct ephemeral server_random, distinct server_pubkey, and distinct AEAD record key:
+        let client_port2 = 51002u16;
+        let client_isn2 = 0x2000_0000u32;
+        let mut syn2 = [0u8; 40];
+        let n = TcpImpl::build_segment(
+            client_port2,
+            HTTPS_PORT,
+            client_isn2,
+            0,
+            tcp_flags::SYN,
+            65535,
+            b"",
+            PEER_IP,
+            GUEST_IP,
+            &mut syn2,
+        )
+        .unwrap();
+        let (frame2, flen2) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn2[..n]);
+        let mut out2 = ReplySet::new();
+        net.handle_frame_with_shell(&frame2[..flen2], 9, &mut sh, &mut out2);
+        let sa2 = TcpImpl::parse_segment(&out2.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        let mut ch_seg2 = [0u8; 320];
+        let n = TcpImpl::build_segment(
+            client_port2,
+            HTTPS_PORT,
+            client_isn2.wrapping_add(1),
+            sa2.seq.wrapping_add(1),
+            tcp_flags::ACK | tcp_flags::PSH,
+            65535,
+            &tls_rec[..rec_total],
+            PEER_IP,
+            GUEST_IP,
+            &mut ch_seg2,
+        )
+        .unwrap();
+        let (frame2b, flen2b) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &ch_seg2[..n]);
+        let mut out2b = ReplySet::new();
+        net.handle_frame_with_shell(&frame2b[..flen2b], 9, &mut sh, &mut out2b);
+        let resp_seg2 =
+            TcpImpl::parse_segment(&out2b.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        let (_, _, r1_len2_u16) = decode_record_header(resp_seg2.payload).unwrap();
+        let sh_slice2 = &resp_seg2.payload[RECORD_HEADER_LEN..RECORD_HEADER_LEN + (r1_len2_u16 as usize)];
+        let parsed_sh2 = crate::tls::parse_server_hello(sh_slice2).unwrap();
+        assert_ne!(parsed_sh2.server_pubkey, parsed_sh.server_pubkey);
+        assert_ne!(parsed_sh2.server_random, parsed_sh.server_random);
+        let mut record_key2 = [0u8; 16];
+        let _ = LivedNet::derive_tls13_record_key(
+            &client_pubkey,
+            &ch_msg[..ch_len],
+            sh_slice2,
+            &mut record_key2,
+        );
+        assert_ne!(record_key2, record_key);
     }
 
     #[test]
@@ -2619,9 +2710,9 @@ mod tests {
             );
         }
 
-        // 4. Brute-force login rate limiting: 5 consecutive failed logins trigger 429 Too Many Requests.
+        // 4. Brute-force login rate limiting: 5 consecutive failed logins trigger a bounded 429 cooldown
+        //    that automatically expires after 8 ticks/requests so a legitimate login succeeds!
         sh.svc.set_role(crate::svc_runtime::NodeRole::Full, &mut sh.audit);
-        // Note: `sh.create_session` above reset `failed_login_streak` to 0, so run 5 failed attempts:
         for seq in 2..=6 {
             let mut bad_login = [0u8; 160];
             let mut bp = 0usize;
@@ -2642,5 +2733,33 @@ mod tests {
             &mut out,
         );
         assert!(out[..n_ratelimited].starts_with(b"HTTP/1.1 429 Too Many Requests\r\n"));
+        // The 429 request above ticked cooldown from 8 -> 7; send 7 GET /status requests to expire the cooldown:
+        for _ in 0..7 {
+            let _ = net.handle_http_request(
+                b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n",
+                1,
+                Some(&mut sh),
+                &mut out,
+            );
+        }
+        assert!(!sh.is_login_rate_limited());
+        let mut mac_ok = [0u8; 32];
+        LivedNet::compute_auth_tag(&DEFAULT_NET_AUTH_KEY, b"100", b"admin", &mut mac_ok);
+        let mut hex_ok = [0u8; 64];
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for (i, &b) in mac_ok.iter().enumerate() {
+            hex_ok[i * 2] = HEX[(b >> 4) as usize];
+            hex_ok[i * 2 + 1] = HEX[(b & 0x0F) as usize];
+        }
+        let mut ok_login = [0u8; 180];
+        let mut op = 0usize;
+        op += copy_msg(b"POST /session/login HTTP/1.1\r\nHost: x\r\n\r\n100 ", &mut ok_login[op..]);
+        op += copy_msg(&hex_ok, &mut ok_login[op..]);
+        op += copy_msg(b" admin", &mut ok_login[op..]);
+        let n_login_ok = net.handle_http_request(&ok_login[..op], 1, Some(&mut sh), &mut out);
+        assert!(
+            out[..n_login_ok].starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "valid login must succeed after the brute-force cooldown window expires"
+        );
     }
 }
