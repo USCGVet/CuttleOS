@@ -730,6 +730,7 @@ pub(crate) fn banner_ahci_hw() {
 /// the 2048-sector disk size.
 pub(crate) const CONTINUITY_LBA: u64 = 1024;
 pub(crate) const CONTINUITY_MAGIC: &[u8; 8] = b"CTTLWAL1";
+pub(crate) const CONTINUITY_LEGACY_MAGIC: &[u8; 8] = b"PRTSWAL1";
 pub(crate) const CONTINUITY_WAL_SECTORS: u64 = (kf::WAL_CAPACITY / 512) as u64;
 
 #[inline(never)]
@@ -744,7 +745,7 @@ pub(crate) fn banner_continuity() {
     let mut resumed_boots: u64 = 0;
     let mut resumed_cursor: usize = 0;
     let mut is_resume = false;
-    if hdr[..8] == CONTINUITY_MAGIC[..] {
+    if hdr[..8] == CONTINUITY_MAGIC[..] || hdr[..8] == CONTINUITY_LEGACY_MAGIC[..] {
         resumed_boots = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
         resumed_cursor =
             u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as usize;
@@ -759,6 +760,8 @@ pub(crate) fn banner_continuity() {
         if crc32_ieee(&wal_buf) == want_crc && resumed_cursor <= kf::WAL_CAPACITY {
             is_resume = true;
         }
+    } else if &hdr[..4] == b"PRTS" {
+        serial_write_str("CONTINUITY resume NOTICE: legacy format, state not migrated\n");
     }
 
     let mut wal: WalImpl<{ kf::WAL_CAPACITY }> = if is_resume {

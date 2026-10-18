@@ -623,6 +623,9 @@ pub(crate) fn persist_shell_to_ahci(sh: &mut target_enterprise::OsShell, boots: 
 }
 
 pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Option<(u64, usize)> {
+    if sh.legacy_seal_key == target_enterprise::durable_seal::DEFAULT_LEGACY_DURABLE_SEAL_KEY {
+        sh.legacy_seal_key = derive_runtime_legacy_seal_key();
+    }
     let port = AhciHwPort::probe_start_quiet();
     let hdr_sec = port.read_sector(SHELL_DISK_LBA);
     let wal_sec = port.read_sector(SHELL_DISK_LBA + 1);
@@ -638,12 +641,14 @@ pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Op
     if all_zero {
         return None;
     }
+    let mut had_legacy_magic = &hdr_sec[0..4] == b"PRTS";
     let res = match sh.unpack_disk_image(&hdr_sec, &wal_sec) {
         Ok(res) => res,
         Err(_) => {
-            if &hdr_sec[0..4] == b"PRTS" && &hdr_sec[0..8] != b"PRTSSHL1" {
+            if &hdr_sec[0..4] == b"PRTS" {
+                sh.audit = target_enterprise::audit::AuditLogImpl::new();
                 serial_write_str(
-                    "SHELL resume NOTICE: legacy PRTS* disk format detected; migrating to CTTL* state\n",
+                    "SHELL resume NOTICE: legacy format, state not migrated\n",
                 );
             } else {
                 serial_write_str(
@@ -664,6 +669,9 @@ pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Op
         j += 1;
     }
     if fs_present {
+        if &sb_sec[0..4] == b"PRTS" {
+            had_legacy_magic = true;
+        }
         let mut fs_secs = FS_PART_SECTORS.lock();
         fs_secs[0] = sb_sec;
         let mut s = 1usize;
@@ -674,9 +682,16 @@ pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Op
         match sh.unpack_fs_partition(&*fs_secs) {
             Ok((generation, _, _)) if generation == res.0 => {}
             _ => {
-                serial_write_str(
-                    "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
-                );
+                if &sb_sec[0..4] == b"PRTS" {
+                    sh.audit = target_enterprise::audit::AuditLogImpl::new();
+                    serial_write_str(
+                        "SHELL resume NOTICE: legacy format, state not migrated\n",
+                    );
+                } else {
+                    serial_write_str(
+                        "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
+                    );
+                }
                 return None;
             }
         }
@@ -692,6 +707,9 @@ pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Op
         k += 1;
     }
     if sql_present {
+        if &sql_sb[0..4] == b"PRTS" {
+            had_legacy_magic = true;
+        }
         let mut sql_secs = SQL_PART_SECTORS_BUF.lock();
         sql_secs[0] = sql_sb;
         let mut sq = 1usize;
@@ -700,11 +718,21 @@ pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Op
             sq += 1;
         }
         if !sh.unpack_sql_partition(&*sql_secs) {
-            serial_write_str(
-                "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
-            );
+            if &sql_sb[0..4] == b"PRTS" {
+                sh.audit = target_enterprise::audit::AuditLogImpl::new();
+                serial_write_str(
+                    "SHELL resume NOTICE: legacy format, state not migrated\n",
+                );
+            } else {
+                serial_write_str(
+                    "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
+                );
+            }
             return None;
         }
+    }
+    if had_legacy_magic {
+        let _ = persist_shell_to_ahci(sh, res.0);
     }
     Some(res)
 }
@@ -732,12 +760,14 @@ pub(crate) fn banner_shell_compose() {
     use target_enterprise::ShellAction;
 
     let seal_key = derive_runtime_seal_key();
+    let legacy_seal_key = derive_runtime_legacy_seal_key();
     let attest_key = derive_runtime_attest_key();
     let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
     let mut sh_guard = KERNEL_SHELL.lock();
     let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
     *sh = target_enterprise::OsShell::empty();
     sh.seal_key = seal_key;
+    sh.legacy_seal_key = legacy_seal_key;
     sh.attest_key = attest_key;
     sh.seed_defaults_for_boot(boots);
 
@@ -769,6 +799,7 @@ pub(crate) fn banner_shell_compose() {
         }
         *sh = target_enterprise::OsShell::empty();
         sh.seal_key = seal_key;
+        sh.legacy_seal_key = legacy_seal_key;
         sh.attest_key = attest_key;
         sh.seed_defaults_for_boot(boots);
     }

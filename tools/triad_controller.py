@@ -67,6 +67,73 @@ def is_printable_ascii_command(s: str) -> bool:
     return bool(s) and all(0x20 <= ord(ch) <= 0x7E for ch in s)
 
 
+def is_readonly_sql_query(q: str) -> bool:
+    """Return True iff `q` is a read-only SQL query (`SELECT`, `.tables`, `SHOW`, `.schema`, `DESCRIBE`)."""
+    trimmed = q.strip()
+    if trimmed.startswith("/*triad*/"):
+        trimmed = trimmed[len("/*triad*/") :].strip()
+    if not trimmed:
+        return True
+    up = trimmed.upper()
+    return (
+        up.startswith("SELECT")
+        or up.startswith(".TABLES")
+        or up.startswith("SHOW")
+        or up.startswith(".SCHEMA")
+        or up.startswith("DESCRIBE")
+    )
+
+
+def is_readonly_shell_command(s: str) -> bool:
+    """
+    Return True iff `s` is a strictly read-only inspection shell command
+    (matching `OsShell::is_readonly_command` in `target_enterprise/src/shell.rs`).
+    State-changing commands must go through `/api/sql` or `/api/app` so they
+    acquire `wal_lock`, append to the Triad WAL, and verify quorum acceptance.
+    """
+    trimmed = s.strip()
+    if not trimmed:
+        return True
+    parts = trimmed.split(None, 1)
+    cmd = parts[0].lower()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    if cmd in (
+        "help",
+        "?",
+        "uname",
+        "status",
+        "uptime",
+        "ps",
+        "threads",
+        "caps",
+        "ls",
+        "cat",
+        "stat",
+        "df",
+        "net",
+        "audit",
+        "seal",
+        "attest",
+    ):
+        return True
+    if cmd in (
+        "ima",
+        "fw",
+        "seccomp",
+        "session",
+        "smp",
+        "service",
+        "triad",
+        "vault",
+        "guard",
+        "cron",
+    ) and rest.lower() in ("", "status", "list", "alerts", "audit", "threads"):
+        return True
+    if cmd == "sql" and rest:
+        return is_readonly_sql_query(rest)
+    return False
+
+
 def find_qemu() -> str:
     q = shutil.which("qemu-system-x86_64")
     if q:
@@ -566,7 +633,7 @@ class TriadController:
         if smp_out and "cpus=" in smp_out:
             first_line = smp_out.splitlines()[0]
             node.last_smp = first_line
-        sql_out = self.send_shell_cmd(node, "sql SELECT * FROM kv", timeout=3.0)
+        sql_out = self.send_shell_cmd(node, "sql /*triad*/ SELECT * FROM kv", timeout=3.0)
         if sql_out and "k|v|rev" in sql_out:
             node.last_sql_table = sql_out
 
@@ -582,7 +649,7 @@ class TriadController:
             # Query live kv table from all online nodes to verify 2-of-3 majority consistency
             outputs = {}
             for n in online_nodes:
-                out = self.send_shell_cmd(n, "sql SELECT * FROM kv", timeout=4.0)
+                out = self.send_shell_cmd(n, "sql /*triad*/ SELECT * FROM kv", timeout=4.0)
                 if out:
                     n.last_sql_table = out
                 outputs[n.node_id] = out
@@ -641,14 +708,7 @@ class TriadController:
         q = sql_query.strip()
         if not q:
             return {"ok": False, "error": "empty SQL query", "output": "error: empty SQL query", "quorum": "0/3"}
-        upper = q.upper()
-        is_read = (
-            upper.startswith("SELECT")
-            or upper.startswith(".TABLES")
-            or upper.startswith("SHOW")
-            or upper.startswith(".SCHEMA")
-            or upper.startswith("DESCRIBE")
-        )
+        is_read = is_readonly_sql_query(q)
 
         online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
         if not online_nodes:
@@ -658,7 +718,7 @@ class TriadController:
             results = {}
             for n in online_nodes:
                 try:
-                    results[n.name] = self.send_shell_cmd(n, f"sql {q}")
+                    results[n.name] = self.send_shell_cmd(n, f"sql /*triad*/ {q}")
                 except ValueError as e:
                     return {
                         "ok": False,
@@ -691,7 +751,7 @@ class TriadController:
             accepted_nodes = []
             for n in online_nodes:
                 try:
-                    out = self.send_shell_cmd(n, f"sql {q}")
+                    out = self.send_shell_cmd(n, f"sql /*triad*/ {q}")
                 except ValueError as e:
                     return {
                         "ok": False,
@@ -859,7 +919,7 @@ class TriadController:
         elif s.lower().startswith("vault "):
             self.send_shell_cmd(node, s)
         else:
-            self.send_shell_cmd(node, f"sql {s}")
+            self.send_shell_cmd(node, f"sql /*triad*/ {s}")
 
     def bounce_and_morph_node(self, node_id: int) -> bool:
         """
@@ -975,11 +1035,11 @@ class TriadController:
             )
             # Reconstruct canonical kv table from clean state + WAL replay under `self.wal_lock`
             with self.wal_lock:
-                self.send_shell_cmd(node, "sql DROP TABLE kv")
-                self.send_shell_cmd(node, "sql CREATE TABLE kv (k TEXT, v TEXT, rev INT)")
-                self.send_shell_cmd(node, "sql INSERT INTO kv VALUES ('cluster.role', 'primary', 1)")
-                self.send_shell_cmd(node, "sql INSERT INTO kv VALUES ('mtd.policy', 'binmorph-7pass', 1)")
-                self.send_shell_cmd(node, "sql INSERT INTO kv VALUES ('boot.state', 'ready', 1)")
+                self.send_shell_cmd(node, "sql /*triad*/ DROP TABLE kv")
+                self.send_shell_cmd(node, "sql /*triad*/ CREATE TABLE kv (k TEXT, v TEXT, rev INT)")
+                self.send_shell_cmd(node, "sql /*triad*/ INSERT INTO kv VALUES ('cluster.role', 'primary', 1)")
+                self.send_shell_cmd(node, "sql /*triad*/ INSERT INTO kv VALUES ('mtd.policy', 'binmorph-7pass', 1)")
+                self.send_shell_cmd(node, "sql /*triad*/ INSERT INTO kv VALUES ('boot.state', 'ready', 1)")
                 for tid, stmt in self.wal_entries:
                     if not is_printable_ascii_command(stmt):
                         node.tx_seq = tid
@@ -1517,6 +1577,14 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                     403,
                     {"ok": False, "error": "Use the Hypervisor Morph controls to bounce nodes safely."},
                 )
+            if not is_readonly_shell_command(body):
+                return self._send_json(
+                    403,
+                    {
+                        "ok": False,
+                        "error": "rejected: /api/sh allows only read-only inspection commands; use /api/sql or /api/app for state-changing operations",
+                    },
+                )
             per_node = {}
             try:
                 for n in self.ctrl.nodes:
@@ -1673,6 +1741,36 @@ def main():
                     r1 = json.loads(resp.read().decode("utf-8"))
                     assert r1["ok"] and "3/3" in r1["quorum"], f"Expected 3/3 majority write: {r1}"
 
+                # 3a. Verify /api/sh allows read-only inspection commands (`status`) and refuses state-changing commands with 403:
+                sh_ro_req = urllib.request.Request(
+                    f"http://127.0.0.1:{test_port}/api/sh",
+                    data=b"status",
+                    headers={"X-Cuttle-Session": ctrl.coordinator_token},
+                    method="POST",
+                )
+                with urllib.request.urlopen(sh_ro_req, timeout=10.0) as resp:
+                    assert resp.status == 200
+                    r_sh = json.loads(resp.read().decode("utf-8"))
+                    assert r_sh["ok"], f"Expected read-only /api/sh status to succeed: {r_sh}"
+
+                for mut_cmd in (
+                    b"sql DELETE FROM kv",
+                    b"vault put bypass secret",
+                    b"write /var/bypass 1",
+                    b"cron add 5 status",
+                ):
+                    sh_mut_req = urllib.request.Request(
+                        f"http://127.0.0.1:{test_port}/api/sh",
+                        data=mut_cmd,
+                        headers={"X-Cuttle-Session": ctrl.coordinator_token},
+                        method="POST",
+                    )
+                    try:
+                        urllib.request.urlopen(sh_mut_req, timeout=5.0)
+                        raise AssertionError(f"State-changing /api/sh ({mut_cmd!r}) must be refused with 403")
+                    except urllib.error.HTTPError as e:
+                        assert e.code == 403, f"Expected 403 on state-changing /api/sh ({mut_cmd!r}), got {e.code}"
+
                 # 3b. Verify CuttleVault, CuttleGuard, and CuttleChronos across the 3-node Triad:
                 vault_put_req = urllib.request.Request(
                     f"http://127.0.0.1:{test_port}/api/vault",
@@ -1743,6 +1841,45 @@ def main():
             bad_sql_res = ctrl.execute_triad_sql("INSERT INTO nonexistent_table VALUES ('a', 'b', 1)")
             assert not bad_sql_res["ok"], "Invalid SQL table write must return ok=False"
             assert len(ctrl.wal_entries) == wal_len_before, "Failed SQL write must not poison the Triad WAL"
+
+            # 3c. Fire 4 conflicting writes in parallel threads to the same key ('concurrent.key') and verify
+            #     `wal_lock` serializes replica execution + WAL order so all 3 replicas converge identically:
+            barrier = threading.Barrier(4)
+            concurrent_results = [None] * 4
+
+            def _parallel_writer(idx: int):
+                barrier.wait(timeout=10.0)
+                concurrent_results[idx] = ctrl.execute_triad_sql(
+                    f"INSERT OR REPLACE INTO kv VALUES ('concurrent.key', 'thread_{idx}', {10 + idx})"
+                )
+
+            threads = [threading.Thread(target=_parallel_writer, args=(i,)) for i in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30.0)
+            assert all(r is not None and r.get("ok") for r in concurrent_results), (
+                f"Parallel conflicting writes failed: {concurrent_results}"
+            )
+            tx_seqs = sorted(r["tx_seq"] for r in concurrent_results)
+            assert tx_seqs == list(range(tx_seqs[0], tx_seqs[0] + 4)), (
+                f"Expected 4 consecutive monotonic tx_seqs from parallel writes, got {tx_seqs}"
+            )
+            last_wal_tid, last_wal_stmt = ctrl.wal_entries[-1]
+            assert last_wal_tid == tx_seqs[-1] and "concurrent.key" in last_wal_stmt, (
+                f"Final WAL entry mismatch: {(last_wal_tid, last_wal_stmt)}"
+            )
+            replica_tables = [
+                ctrl._normalize_kv_for_tmr(ctrl.send_shell_cmd(n, "sql /*triad*/ SELECT * FROM kv"))
+                for n in ctrl.nodes
+            ]
+            assert replica_tables[0] == replica_tables[1] == replica_tables[2], (
+                f"Replicas diverged after concurrent writes:\n{replica_tables}"
+            )
+            winning_Thread = re.search(r"thread_\d+", last_wal_stmt).group(0)
+            assert f"concurrent.key|{winning_Thread}|" in replica_tables[0], (
+                f"Replicas do not match final WAL entry ({last_wal_stmt}):\n{replica_tables[0]}"
+            )
 
             # 4. Start morphing OS-1 in background thread, and fire a SQL write while OS-1 is MORPHING!
             t_morph = threading.Thread(target=ctrl.bounce_and_morph_node, args=(1,))

@@ -259,6 +259,14 @@ pub(crate) fn derive_runtime_seal_key() -> [u8; 32] {
     target_enterprise::durable_seal::derive_seal_key(&master, b"cuttle-ahci-wal-seal-v1")
 }
 
+/// Derive the legacy pre-rebrand (`Proteus`) 256-bit `HMAC-SHA256` durable-state
+/// seal key (`proteus-durable-seal-v1:proteus-ahci-wal-seal-v1`) from the device
+/// master key so pre-rebrand `PRTS*` disks can be verified and migrated to `CTTL*`.
+pub(crate) fn derive_runtime_legacy_seal_key() -> [u8; 32] {
+    let (master, _) = device_master_key_state();
+    target_enterprise::durable_seal::derive_legacy_seal_key(&master, b"proteus-ahci-wal-seal-v1")
+}
+
 /// Derive the 256-bit `HMAC-SHA256` remote attestation quote key from the
 /// out-of-band provisioned device master key (or boot-ephemeral hardware key).
 pub(crate) fn derive_runtime_attest_key() -> [u8; 32] {

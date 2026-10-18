@@ -1793,4 +1793,36 @@ mod tests {
             Err(ServiceError::PayloadTooLarge)
         );
     }
+
+    #[test]
+    fn regression_item2_mailbox_rejects_oversized_body() {
+        let mut sup = ServiceSupervisor::empty();
+        sup.init_role(NodeRole::Full, 777);
+
+        let exact_path = [b'p'; IPC_MAILBOX_PATH_CAP];
+        let exact_body = [b'b'; IPC_MAILBOX_BODY_CAP];
+        assert_eq!(
+            sup.stage_mailbox_request(ServiceId::Sql, &exact_path, &exact_body),
+            Ok(())
+        );
+        let mb_before = sup.services[ServiceId::Sql.index()].mailbox;
+        assert_eq!(mb_before.req_path_len as usize, IPC_MAILBOX_PATH_CAP);
+        assert_eq!(mb_before.req_body_len as usize, IPC_MAILBOX_BODY_CAP);
+
+        let oversized_path = [b'p'; IPC_MAILBOX_PATH_CAP + 1];
+        assert_eq!(
+            sup.stage_mailbox_request(ServiceId::Sql, &oversized_path, b"SELECT 1"),
+            Err(ServiceError::PayloadTooLarge)
+        );
+
+        let oversized_body = [b'b'; IPC_MAILBOX_BODY_CAP + 1];
+        assert_eq!(
+            sup.stage_mailbox_request(ServiceId::Sql, b"/sql", &oversized_body),
+            Err(ServiceError::PayloadTooLarge)
+        );
+        // Existing staged mailbox content must not be silently overwritten on rejection:
+        let mb_after = sup.services[ServiceId::Sql.index()].mailbox;
+        assert_eq!(mb_after.req_seq, mb_before.req_seq);
+        assert_eq!(mb_after.req_body_len, mb_before.req_body_len);
+    }
 }

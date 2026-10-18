@@ -52,6 +52,35 @@ pub fn pit_divisor(hz: u32) -> u16 {
     (PIT_BASE_HZ / hz).clamp(1, u16::MAX as u32) as u16
 }
 
+/// Number of 8254 PIT base oscillator ticks (`1,193,182 Hz`) in a `10 ms` calibration window (`11,932` ticks).
+pub const PIT_CALIBRATION_TICKS_10MS: u16 = 11_932;
+
+/// Periodic Local APIC Timer initial count programmed on `CPU 0` (`250,000` divided ticks).
+pub const LAPIC_TIMER_PERIOD_COUNT: u32 = 250_000;
+
+/// Compute the calibrated number of Local APIC timer interrupts per second (`1 Hz` cooldown tick)
+/// from the number of divided Local APIC timer ticks (`lapic_ticks_elapsed`) observed while the
+/// 8254 PIT (`PIT_BASE_HZ = 1,193,182 Hz`) counted down by `pit_ticks_elapsed`, given a periodic
+/// reload count of `period_init_count`.
+///
+/// Clamps the result to `16..=4096` interrupts per second (defaulting to `250` if any input is `0`)
+/// so a 1-second login cooldown tick is anchored to the hardware PIT crystal regardless of whether
+/// the host/hypervisor APIC bus runs at `100 MHz`, `250 MHz`, or `1 GHz`.
+#[inline]
+pub fn calibrate_apic_irqs_per_sec(
+    lapic_ticks_elapsed: u32,
+    pit_ticks_elapsed: u32,
+    period_init_count: u32,
+) -> u64 {
+    if lapic_ticks_elapsed == 0 || pit_ticks_elapsed == 0 || period_init_count == 0 {
+        return 250;
+    }
+    let lapic_hz =
+        ((lapic_ticks_elapsed as u64) * (PIT_BASE_HZ as u64)) / (pit_ticks_elapsed as u64);
+    let irqs_per_sec = (lapic_hz + (period_init_count as u64 / 2)) / (period_init_count as u64);
+    irqs_per_sec.clamp(16, 4096)
+}
+
 /// Convert a packed BCD nibble-pair to binary.
 /// `0x47` → `47`. No range check — caller owns the register content.
 #[inline]
@@ -935,5 +964,31 @@ mod tests {
         assert_eq!(a.write_at(0), b.write_at(0));
         assert_eq!(a.write_at(1), b.write_at(1));
         assert_eq!(a.write_at(2), b.write_at(2));
+    }
+
+    #[test]
+    fn regression_item4_calibrated_apic_cooldown_ticks() {
+        let pit_10ms = PIT_CALIBRATION_TICKS_10MS as u32;
+        let period = LAPIC_TIMER_PERIOD_COUNT;
+
+        // 1. QEMU standard 1 GHz APIC bus divided by 16 -> 62.5 MHz (~625,000 ticks per 10 ms) -> 250 IRQs/sec.
+        let irqs_qemu = calibrate_apic_irqs_per_sec(625_000, pit_10ms, period);
+        assert_eq!(irqs_qemu, 250);
+
+        // 2. 250 MHz APIC bus divided by 16 -> 15.625 MHz (~156,250 ticks per 10 ms) -> ~62-63 IRQs/sec.
+        let irqs_250m = calibrate_apic_irqs_per_sec(156_250, pit_10ms, period);
+        assert!((62..=63).contains(&irqs_250m));
+
+        // 3. 3.75 GHz bus divided by 16 -> 234.375 MHz (~2,343,750 ticks per 10 ms) -> ~937 IRQs/sec.
+        let irqs_fast = calibrate_apic_irqs_per_sec(2_343_750, pit_10ms, period);
+        assert!((936..=938).contains(&irqs_fast));
+
+        // 4. Zero / uncalibrated inputs fall back to 250 IRQs/sec and extreme values clamp to 16..=4096.
+        assert_eq!(calibrate_apic_irqs_per_sec(0, pit_10ms, period), 250);
+        assert_eq!(calibrate_apic_irqs_per_sec(100, pit_10ms, period), 16);
+        assert_eq!(
+            calibrate_apic_irqs_per_sec(50_000_000, pit_10ms, period),
+            4096
+        );
     }
 }

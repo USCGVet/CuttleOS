@@ -31,7 +31,8 @@ use cuttle_contracts::{
 use crate::audit::AuditLogImpl;
 use crate::durable_seal::{
     seal_bytes, seal_bytes_keyed, seal_matches, seal_matches_keyed, zeroize_secret_bytes,
-    DEFAULT_ATTEST_KEY, DEFAULT_DURABLE_SEAL_KEY, DURABLE_DIGEST_LEN,
+    DEFAULT_ATTEST_KEY, DEFAULT_DURABLE_SEAL_KEY, DEFAULT_LEGACY_DURABLE_SEAL_KEY,
+    DURABLE_DIGEST_LEN,
 };
 use crate::ebpf::EBpfImpl;
 use crate::elf64::Elf64Impl;
@@ -40,6 +41,7 @@ use crate::kpti::{
     KptiImpl, PageTable, KPTI_TRAMPOLINE_VIRT, PAGE_MASK, PTE_PRESENT, PTE_USER, PTE_WRITABLE,
 };
 use crate::scheduler::{RoundRobin, TaskId, TaskState};
+use crate::sql::{SQL_OWNER_CRON, SQL_OWNER_TRIAD, SQL_OWNER_VAULT};
 use crate::stack_canary::StackCanaryImpl;
 use crate::syscall::{
     check_cap, dispatch_with_cap, Errno, SYS_EXIT, SYS_GETPID, SYS_GETTIME_NS, SYS_OPEN, SYS_YIELD,
@@ -224,6 +226,9 @@ pub struct OsShell {
     /// 256-bit HMAC-SHA256 device key used to cryptographically seal and verify
     /// WAL/disk persistence checkpoints (`checkpoint_sealed` / `restore_sealed`).
     pub seal_key: [u8; DURABLE_DIGEST_LEN],
+    /// Legacy pre-rebrand (`"proteus-durable-seal-v1:"`) 256-bit HMAC-SHA256 key used only to
+    /// verify and migrate legacy `PRTS*` disk images on first boot after upgrade.
+    pub legacy_seal_key: [u8; DURABLE_DIGEST_LEN],
     /// 256-bit HMAC-SHA256 device key used to sign live remote attestation quotes
     /// (`attest [nonce]` / `GET /attest`).
     pub attest_key: [u8; DURABLE_DIGEST_LEN],
@@ -252,6 +257,8 @@ pub struct OsShell {
     pub vault_nonce_seq: u16,
     /// Most recently validated HTTP session slot owner ID (`0` = console/unauthenticated, `1..=SHELL_MAX_SESSIONS` = session slot).
     pub last_session_owner: u64,
+    /// Active SQL transaction owner override (`0` = console, `1..=4` = HTTP session, `SQL_OWNER_*` = internal subsystem).
+    pub sql_owner_override: u64,
     /// Node index (`0..=2`) within the 3-node Triad TMR cluster.
     pub triad_node_id: u8,
     /// Highest replicated SQL transaction sequence number committed on this node.
@@ -299,6 +306,7 @@ impl OsShell {
             ima_measurements: 0,
             auth_seq: 0,
             seal_key: DEFAULT_DURABLE_SEAL_KEY,
+            legacy_seal_key: DEFAULT_LEGACY_DURABLE_SEAL_KEY,
             attest_key: DEFAULT_ATTEST_KEY,
             smp_cpus_online: 4,
             smp_cpu_ticks: [0u64; 4],
@@ -312,6 +320,7 @@ impl OsShell {
             login_backoff_level: 0,
             vault_nonce_seq: 0,
             last_session_owner: 0,
+            sql_owner_override: 0,
             triad_node_id: 0,
             triad_tx_seq: 0,
             triad_peer_seq: [0u64; 3],
@@ -429,6 +438,7 @@ impl OsShell {
         self.login_cooldown_ticks = 0;
         self.vault_nonce_seq = ((boot_gen as u16).wrapping_mul(37)) & 0x7FFF;
         self.last_session_owner = 0;
+        self.sql_owner_override = 0;
         self.triad_node_id = 0;
         self.triad_tx_seq = 0;
         let init_hash = self.db.state_hash();
@@ -463,9 +473,12 @@ impl OsShell {
                     let clen = (self.cron_jobs[i].cmd_len as usize).min(48);
                     let mut cmd_buf = [0u8; 48];
                     cmd_buf[..clen].copy_from_slice(&self.cron_jobs[i].cmd[..clen]);
+                    let prev_owner = self.sql_owner_override;
+                    self.sql_owner_override = SQL_OWNER_CRON;
                     let n = self
                         .exec_line(&cmd_buf[..clen], boots, 0, 0, &mut scratch)
                         .bytes_written();
+                    self.sql_owner_override = prev_owner;
                     self.cron_jobs[i].runs = self.cron_jobs[i].runs.wrapping_add(1);
                     self.cron_jobs[i].last_bytes = n as u16;
                     fired += 1;
@@ -838,7 +851,12 @@ impl OsShell {
                 } else {
                     mb_body
                 };
-                let n = self.db.exec(query, resp_out);
+                let owner = if session_verified {
+                    self.last_session_owner.max(1)
+                } else {
+                    self.sql_owner_override
+                };
+                let n = self.db.exec_as(owner, query, resp_out);
                 (200u16, n)
             }
             IpcOp::SqlMutate => {
@@ -848,7 +866,7 @@ impl OsShell {
                 let owner = if session_verified {
                     self.last_session_owner.max(1)
                 } else {
-                    0
+                    self.sql_owner_override
                 };
                 let n = self.db.exec_as(owner, mb_body, resp_out);
                 (200u16, n)
@@ -870,9 +888,14 @@ impl OsShell {
                 (200u16, n)
             }
             IpcOp::ShellExec => {
+                let prev_owner = self.sql_owner_override;
+                if session_verified {
+                    self.sql_owner_override = self.last_session_owner.max(1);
+                }
                 let n = self
                     .exec_line(mb_body, boots, 0, 0, resp_out)
                     .bytes_written();
+                self.sql_owner_override = prev_owner;
                 (200u16, n)
             }
             IpcOp::UserElfExec => {
@@ -958,12 +981,14 @@ impl OsShell {
         self.db.save_partition(&self.seal_key, sectors);
     }
 
-    /// Verify and restore `self.db` from an 8-sector (`4 KiB`) partition image sealed with `self.seal_key`.
+    /// Verify and restore `self.db` from an 8-sector (`4 KiB`) partition image sealed with `self.seal_key`
+    /// (or legacy `self.legacy_seal_key` when migrating a `PRTSSQL1` partition).
     pub fn unpack_sql_partition(
         &mut self,
         sectors: &[[u8; 512]; crate::sql::SQL_PART_SECTORS],
     ) -> bool {
-        self.db.load_partition(&self.seal_key, sectors)
+        self.db
+            .load_partition_with_legacy(&self.seal_key, &self.legacy_seal_key, sectors)
     }
 
     /// Returns `true` if `line` is a strictly read-only inspection command
@@ -1348,9 +1373,8 @@ impl OsShell {
         hdr_sector: &[u8; 512],
         wal_sector: &[u8; 512],
     ) -> Result<(u64, usize), WalError> {
-        if !bytes_eq(&hdr_sector[0..8], b"CTTLSHL1")
-            && !bytes_eq(&hdr_sector[0..8], b"PRTSSHL1")
-        {
+        let is_legacy = bytes_eq(&hdr_sector[0..8], b"PRTSSHL1");
+        if !bytes_eq(&hdr_sector[0..8], b"CTTLSHL1") && !is_legacy {
             self.record_audit(21, AuditVerdict::Denied, b"shell:wal:header-corrupt");
             return Err(WalError::PayloadTooLarge);
         }
@@ -1381,8 +1405,26 @@ impl OsShell {
             s += 1;
         }
         let wal = WalImpl::<512>::from_backing(*wal_sector, cursor);
-        let applied = self.restore_sealed(&wal, &expected_seal)?;
-        Ok((saved_boots, applied))
+        if is_legacy {
+            let mut scratch = [0u8; 1024];
+            let len = serialize_wal_for_seal(&wal, &mut scratch);
+            let ok = seal_matches_keyed(&self.seal_key, &scratch[..len], &expected_seal)
+                || seal_matches_keyed(&self.legacy_seal_key, &scratch[..len], &expected_seal)
+                || seal_matches_keyed(
+                    &DEFAULT_LEGACY_DURABLE_SEAL_KEY,
+                    &scratch[..len],
+                    &expected_seal,
+                );
+            if !ok {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:wal:seal-mismatch");
+                return Err(WalError::PayloadTooLarge);
+            }
+            let applied = self.restore_wal(&wal);
+            Ok((saved_boots, applied))
+        } else {
+            let applied = self.restore_sealed(&wal, &expected_seal)?;
+            Ok((saved_boots, applied))
+        }
     }
 
     /// Pack all mutable/user files (`!is_default_system_file`) from `self.fs`
@@ -1504,9 +1546,8 @@ impl OsShell {
         &mut self,
         sectors: &[[u8; 512]; SHELL_FS_PART_SECTORS],
     ) -> Result<(u64, usize, usize), WalError> {
-        if !bytes_eq(&sectors[0][0..8], SHELL_FS_MAGIC)
-            && !bytes_eq(&sectors[0][0..8], b"PRTSFS01")
-        {
+        let is_legacy = bytes_eq(&sectors[0][0..8], b"PRTSFS01");
+        if !bytes_eq(&sectors[0][0..8], SHELL_FS_MAGIC) && !is_legacy {
             self.record_audit(21, AuditVerdict::Denied, b"shell:fs:magic-corrupt");
             return Err(WalError::PayloadTooLarge);
         }
@@ -1543,7 +1584,18 @@ impl OsShell {
             expected_seal[h] = sectors[0][24 + h];
             h += 1;
         }
-        if !verify_fs_partition_seal(&self.seal_key, sectors, &expected_seal) {
+        let seal_ok = if is_legacy {
+            verify_fs_partition_seal(&self.seal_key, sectors, &expected_seal)
+                || verify_fs_partition_seal(&self.legacy_seal_key, sectors, &expected_seal)
+                || verify_fs_partition_seal(
+                    &DEFAULT_LEGACY_DURABLE_SEAL_KEY,
+                    sectors,
+                    &expected_seal,
+                )
+        } else {
+            verify_fs_partition_seal(&self.seal_key, sectors, &expected_seal)
+        };
+        if !seal_ok {
             self.record_audit(21, AuditVerdict::Denied, b"shell:fs:seal-mismatch");
             return Err(WalError::PayloadTooLarge);
         }
@@ -2801,7 +2853,7 @@ impl OsShell {
             );
         }
         self.record_audit(31, AuditVerdict::Allowed, b"shell:sql");
-        self.db.exec(q, out)
+        self.db.exec_as(self.sql_owner_override, q, out)
     }
 
     #[inline(never)]
@@ -2833,9 +2885,11 @@ impl OsShell {
         if sub.is_empty() || bytes_eq(sub, b"status") {
             self.record_audit(35, AuditVerdict::Allowed, b"shell:vault:status");
             let mut qout = [0u8; 64];
-            let qlen = self
-                .db
-                .exec(b"SELECT COUNT(*) FROM kv WHERE k LIKE 'v:%'", &mut qout);
+            let qlen = self.db.exec_as(
+                SQL_OWNER_VAULT,
+                b"SELECT COUNT(*) FROM kv WHERE k LIKE 'v:%'",
+                &mut qout,
+            );
             let count_slice = if qlen > 6 && qout[..6] == *b"count\n" {
                 trim_ascii(&qout[6..qlen])
             } else {
@@ -2857,7 +2911,8 @@ impl OsShell {
 
         if bytes_eq(sub, b"list") {
             self.record_audit(35, AuditVerdict::Allowed, b"shell:vault:list");
-            return self.db.exec(
+            return self.db.exec_as(
+                SQL_OWNER_VAULT,
                 b"SELECT k, v, rev FROM kv WHERE k LIKE 'v:%' ORDER BY k ASC",
                 out,
             );
@@ -2888,15 +2943,23 @@ impl OsShell {
             pqp += copy_into(kname, &mut prev_q[pqp..]);
             pqp += copy_into(b"'", &mut prev_q[pqp..]);
             let mut pq_out = [0u8; 64];
-            let pq_len = self.db.exec(&prev_q[..pqp], &mut pq_out);
+            let pq_len = self
+                .db
+                .exec_as(SQL_OWNER_VAULT, &prev_q[..pqp], &mut pq_out);
             if pq_len > 4 && &pq_out[..4] == b"rev\n" {
                 if let Some(prev_rev) = parse_u64_ascii(trim_ascii(&pq_out[4..pq_len])) {
                     prev_nonce = ((prev_rev >> 47) & 0x7FFF) as u16;
                 }
             }
             let base_nonce = self.vault_nonce_seq.max(prev_nonce);
-            let nonce15 = (base_nonce % 0x7FFF).saturating_add(1);
-            self.vault_nonce_seq = nonce15;
+            if base_nonce >= 0x7FFF {
+                self.record_audit(35, AuditVerdict::Denied, b"shell:vault:nonce-exhausted");
+                return copy_into(
+                    b"error: EOVERFLOW (vault key nonce exhausted; delete or rotate key)\n",
+                    out,
+                );
+            }
+            let nonce15 = base_nonce + 1;
 
             let (mut ks, _) = vault_derive_stream_and_mac(&self.seal_key, kname, nonce15, b"");
             let slen = secret.len();
@@ -2927,10 +2990,13 @@ impl OsShell {
             qp += copy_into(b")", &mut sql_q[qp..]);
 
             let mut sql_out = [0u8; 64];
-            let sn = self.db.exec(&sql_q[..qp], &mut sql_out);
+            let sn = self
+                .db
+                .exec_as(SQL_OWNER_VAULT, &sql_q[..qp], &mut sql_out);
             if sql_out[..sn].starts_with(b"error:") {
                 return copy_into(&sql_out[..sn], out);
             }
+            self.vault_nonce_seq = nonce15;
             self.record_audit(35, AuditVerdict::Allowed, b"shell:vault:put");
             let tag_be = tag_u64.to_be_bytes();
             let mut pos = 0usize;
@@ -2959,7 +3025,9 @@ impl OsShell {
             qp += copy_into(kname, &mut sql_q[qp..]);
             qp += copy_into(b"'", &mut sql_q[qp..]);
             let mut qout = [0u8; 128];
-            let qlen = self.db.exec(&sql_q[..qp], &mut qout);
+            let qlen = self
+                .db
+                .exec_as(SQL_OWNER_VAULT, &sql_q[..qp], &mut qout);
             // Expect header `v|rev\n` (6 bytes) followed by `<ct_hex>|<tag_dec>\n`.
             if qlen <= 6 || &qout[..6] != b"v|rev\n" {
                 self.record_audit(35, AuditVerdict::Error, b"shell:vault:not-found");
@@ -3042,7 +3110,12 @@ impl OsShell {
             qp += copy_into(kname, &mut sql_q[qp..]);
             qp += copy_into(b"'", &mut sql_q[qp..]);
             let mut qout = [0u8; 64];
-            let _ = self.db.exec(&sql_q[..qp], &mut qout);
+            let sn = self
+                .db
+                .exec_as(SQL_OWNER_VAULT, &sql_q[..qp], &mut qout);
+            if qout[..sn].starts_with(b"error:") {
+                return copy_into(&qout[..sn], out);
+            }
             self.record_audit(35, AuditVerdict::Allowed, b"shell:vault:del");
             let mut pos = 0usize;
             pos += copy_into(b"vault: deleted key=", &mut out[pos..]);
@@ -3392,9 +3465,12 @@ impl OsShell {
             let mut cmd_buf = [0u8; 48];
             cmd_buf[..clen].copy_from_slice(&self.cron_jobs[slot].cmd[..clen]);
             let mut exec_out = [0u8; 256];
+            let prev_owner = self.sql_owner_override;
+            self.sql_owner_override = SQL_OWNER_CRON;
             let n = self
                 .exec_line(&cmd_buf[..clen], boots, 0, 0, &mut exec_out)
                 .bytes_written();
+            self.sql_owner_override = prev_owner;
             self.cron_jobs[slot].runs = self.cron_jobs[slot].runs.wrapping_add(1);
             self.cron_jobs[slot].last_bytes = n as u16;
             self.cron_jobs[slot].elapsed_ticks = 0;
@@ -3716,7 +3792,7 @@ impl OsShell {
                 );
             }
             let mut sql_res = [0u8; 192];
-            let slen = self.db.exec(sql, &mut sql_res);
+            let slen = self.db.exec_as(SQL_OWNER_TRIAD, sql, &mut sql_res);
             if sql_res[..slen].starts_with(b"error:") {
                 return copy_into(&sql_res[..slen], out);
             }
@@ -5602,14 +5678,10 @@ mod tests {
             b"vault: key=api.token value=Secr3tKey99 verified=true\n"
         );
 
-        // Tampering with the MAC tag in SQL must be rejected by CuttleVault with EBADMSG:
-        let _ = sh.exec_line(
-            b"sql BEGIN",
-            1,
-            0,
-            0,
-            &mut out,
-        );
+        // Tampering with the MAC tag in SQL: while console `sql BEGIN` is uncommitted,
+        // `vault get` (running as `SQL_OWNER_VAULT`) is insulated by Read Committed isolation;
+        // once `sql COMMIT` commits the tampered tag, `vault get` rejects it with `EBADMSG`:
+        let _ = sh.exec_line(b"sql BEGIN", 1, 0, 0, &mut out);
         let _ = sh.exec_line(
             b"sql UPDATE kv SET rev = 12345 WHERE k = 'v:api.token'",
             1,
@@ -5617,12 +5689,18 @@ mod tests {
             0,
             &mut out,
         );
+        let act_rc = sh.exec_line(b"vault get api.token", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_rc.bytes_written()],
+            b"vault: key=api.token value=Secr3tKey99 verified=true\n"
+        );
+        let _ = sh.exec_line(b"sql COMMIT", 1, 0, 0, &mut out);
         let act = sh.exec_line(b"vault get api.token", 1, 0, 0, &mut out);
         assert_eq!(
             &out[..act.bytes_written()],
             b"error: EBADMSG (vault AEAD authentication tag mismatch)\n"
         );
-        let _ = sh.exec_line(b"sql ROLLBACK", 1, 0, 0, &mut out);
+        let _ = sh.exec_line(b"vault put api.token Secr3tKey99", 1, 0, 0, &mut out);
         let act = sh.exec_line(b"vault get api.token", 1, 0, 0, &mut out);
         assert_eq!(
             &out[..act.bytes_written()],
@@ -5678,5 +5756,211 @@ mod tests {
         assert_eq!(sh.tick_cron_jobs(1), 1);
         let act = sh.exec_line(b"cat /var/heartbeat", 1, 0, 0, &mut out);
         assert_eq!(&out[..act.bytes_written()], b"alive\n");
+    }
+
+    #[test]
+    fn regression_item1_legacy_prts_disk_migration_and_seal_verification() {
+        use crate::durable_seal::{derive_legacy_seal_key, derive_seal_key};
+
+        let root_secret = [0x5Au8; 32];
+        let legacy_key = derive_legacy_seal_key(&root_secret, b"proteus-ahci-wal-seal-v1");
+        let cuttle_key = derive_seal_key(&root_secret, b"cuttle-ahci-wal-seal-v1");
+        assert_ne!(legacy_key, cuttle_key);
+
+        // Build a pre-rebrand shell state sealed with `legacy_key` and `PRTS*` magic headers.
+        let mut old_sh = OsShell::with_seal_key(legacy_key);
+        let mut out = [0u8; 256];
+        let _ = old_sh.exec_line(b"write /var/legacy.txt migrated-ok", 3, 0, 0, &mut out);
+        let _ = old_sh.exec_line(
+            b"sql INSERT INTO kv VALUES ('legacy.k', 'legacy.v', 7)",
+            3,
+            0,
+            0,
+            &mut out,
+        );
+
+        let mut hdr_sec = [0u8; 512];
+        let mut wal_sec = [0u8; 512];
+        old_sh.pack_disk_image(3, &mut hdr_sec, &mut wal_sec).unwrap();
+        hdr_sec[0..8].copy_from_slice(b"PRTSSHL1");
+
+        let mut fs_secs = [[0u8; 512]; SHELL_FS_PART_SECTORS];
+        old_sh.pack_fs_partition(3, &mut fs_secs).unwrap();
+        fs_secs[0][0..8].copy_from_slice(b"PRTSFS01");
+        let mut fs_seal = [0u8; DURABLE_DIGEST_LEN];
+        compute_fs_partition_seal(&legacy_key, &fs_secs, &mut fs_seal);
+        fs_secs[0][24..24 + DURABLE_DIGEST_LEN].copy_from_slice(&fs_seal);
+
+        let mut sql_secs = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
+        old_sh.pack_sql_partition(&mut sql_secs);
+        sql_secs[0][0..8].copy_from_slice(b"PRTSSQL1");
+        // Recompute SQL HMAC over `PRTSSQL1` header using `legacy_key`.
+        let mut flat = [0u8; crate::sql::SQL_PART_SECTORS * 512];
+        for s in 0..crate::sql::SQL_PART_SECTORS {
+            flat[s * 512..(s + 1) * 512].copy_from_slice(&sql_secs[s]);
+        }
+        let rest_len = flat.len() - 52;
+        let mut mac_input = [0u8; crate::sql::SQL_PART_SECTORS * 512];
+        mac_input[0..20].copy_from_slice(&flat[0..20]);
+        mac_input[20..20 + rest_len].copy_from_slice(&flat[52..]);
+        let mut sql_tag = [0u8; DURABLE_DIGEST_LEN];
+        seal_bytes_keyed(&legacy_key, &mac_input[..20 + rest_len], &mut sql_tag);
+        sql_secs[0][20..52].copy_from_slice(&sql_tag);
+
+        // Now boot a post-rebrand Cuttle shell with `cuttle_key` + `legacy_seal_key = legacy_key`.
+        let mut new_sh = OsShell::with_seal_key(cuttle_key);
+        new_sh.legacy_seal_key = legacy_key;
+
+        let (saved_boots, _) = new_sh.unpack_disk_image(&hdr_sec, &wal_sec).unwrap();
+        assert_eq!(saved_boots, 3);
+        let (_, fcount, _) = new_sh.unpack_fs_partition(&fs_secs).unwrap();
+        assert_eq!(fcount, 1);
+        assert!(new_sh.unpack_sql_partition(&sql_secs));
+
+        let act = new_sh.exec_line(b"cat /var/legacy.txt", 4, 0, 0, &mut out);
+        assert_eq!(&out[..act.bytes_written()], b"migrated-ok\n");
+        let act_sql = new_sh.exec_line(
+            b"sql SELECT v FROM kv WHERE k = 'legacy.k'",
+            4,
+            0,
+            0,
+            &mut out,
+        );
+        assert_eq!(&out[..act_sql.bytes_written()], b"v\nlegacy.v\n");
+
+        // Re-pack under `new_sh` and verify disk headers are migrated to `CTTL*` under `cuttle_key`.
+        new_sh.pack_disk_image(4, &mut hdr_sec, &mut wal_sec).unwrap();
+        assert_eq!(&hdr_sec[0..8], b"CTTLSHL1");
+        new_sh.pack_fs_partition(4, &mut fs_secs).unwrap();
+        assert_eq!(&fs_secs[0][0..8], b"CTTLFS01");
+        new_sh.pack_sql_partition(&mut sql_secs);
+        assert_eq!(&sql_secs[0][0..8], b"CTTLSQL1");
+    }
+
+    #[test]
+    fn regression_item3_subsystem_owner_isolation_during_console_tx() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 512];
+
+        let _ = sh.exec_line(b"vault put root.key InitialVal1", 1, 0, 0, &mut out);
+        let _ = sh.exec_line(
+            b"cron add 1 sql INSERT INTO kv VALUES ('cron.k', '1', 1)",
+            1,
+            0,
+            0,
+            &mut out,
+        );
+
+        // Open an uncommitted transaction on the interactive console (`owner = 0`).
+        let act = sh.exec_line(b"sql BEGIN", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act.bytes_written()], b"BEGIN OK\n");
+        let _ = sh.exec_line(
+            b"sql INSERT INTO kv VALUES ('console.uncommitted', 'temp', 1)",
+            1,
+            0,
+            0,
+            &mut out,
+        );
+
+        // 1. `vault put` and `vault del` must NOT piggyback on console's transaction; they must return `EBUSY`.
+        let act_vp = sh.exec_line(b"vault put other.key SecretVal2", 1, 0, 0, &mut out);
+        assert!(out[..act_vp.bytes_written()].starts_with(b"error: EBUSY"));
+        let act_vd = sh.exec_line(b"vault del root.key", 1, 0, 0, &mut out);
+        assert!(out[..act_vd.bytes_written()].starts_with(b"error: EBUSY"));
+
+        // 2. `triad propose` must NOT piggyback on console's transaction; it must return `EBUSY`.
+        let act_tp = sh.exec_line(
+            b"triad propose INSERT INTO kv VALUES ('triad.k', 'v', 1)",
+            1,
+            0,
+            0,
+            &mut out,
+        );
+        assert!(out[..act_tp.bytes_written()].starts_with(b"error: EBUSY"));
+
+        // 3. `cron` tick firing `sql INSERT ...` runs as `SQL_OWNER_CRON` and is refused by `EBUSY`,
+        //    so rolling back the console transaction leaves no cron row behind.
+        assert_eq!(sh.tick_cron_jobs(1), 1);
+        let _ = sh.exec_line(b"sql ROLLBACK", 1, 0, 0, &mut out);
+
+        let act_check = sh.exec_line(
+            b"sql SELECT v FROM kv WHERE k = 'cron.k'",
+            1,
+            0,
+            0,
+            &mut out,
+        );
+        assert_eq!(&out[..act_check.bytes_written()], b"v\n");
+        let act_vg = sh.exec_line(b"vault get root.key", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_vg.bytes_written()],
+            b"vault: key=root.key value=InitialVal1 verified=true\n"
+        );
+    }
+
+    #[test]
+    fn regression_item6_vault_nonce_exhaustion_refuses_wrap() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 512];
+
+        // Advance `vault_nonce_seq` to `0x7FFE` (one below the 15-bit ceiling `0x7FFF`).
+        sh.vault_nonce_seq = 0x7FFE;
+        let act1 = sh.exec_line(b"vault put max.key LastValid99", 1, 0, 0, &mut out);
+        assert!(
+            out[..act1.bytes_written()].starts_with(b"vault: sealed key=max.key"),
+            "nonce 0x7FFF must succeed"
+        );
+        assert_eq!(sh.vault_nonce_seq, 0x7FFF);
+
+        // Next write must refuse to wrap around to nonce 1 (`EOVERFLOW`), preserving keystream uniqueness.
+        let act2 = sh.exec_line(b"vault put max.key ReuseAttempt", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act2.bytes_written()],
+            b"error: EOVERFLOW (vault key nonce exhausted; delete or rotate key)\n"
+        );
+
+        // Existing sealed value at `0x7FFF` remains intact and readable.
+        let act_get = sh.exec_line(b"vault get max.key", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_get.bytes_written()],
+            b"vault: key=max.key value=LastValid99 verified=true\n"
+        );
+    }
+
+    #[test]
+    fn regression_prev_item6_login_exponential_backoff_cooldown() {
+        let mut sh = OsShell::new();
+        for _ in 0..5 {
+            sh.record_login_failure();
+        }
+        assert_eq!(sh.login_cooldown_ticks, 8);
+        while sh.is_login_rate_limited() {
+            sh.tick_login_cooldown();
+        }
+        sh.record_login_failure();
+        assert_eq!(sh.login_cooldown_ticks, 16);
+        while sh.is_login_rate_limited() {
+            sh.tick_login_cooldown();
+        }
+        sh.record_login_failure();
+        assert_eq!(sh.login_cooldown_ticks, 32);
+    }
+
+    #[test]
+    fn regression_prev_item7_vault_per_write_nonce_diversifies_keystream() {
+        let mut sh = OsShell::new();
+        let mut out1 = [0u8; 256];
+        let mut out2 = [0u8; 256];
+        let n1 = sh
+            .exec_line(b"vault put same.key AlphaSecret1", 1, 0, 0, &mut out1)
+            .bytes_written();
+        let n2 = sh
+            .exec_line(b"vault put same.key AlphaSecret1", 1, 0, 0, &mut out2)
+            .bytes_written();
+        assert_ne!(
+            &out1[..n1],
+            &out2[..n2],
+            "identical plaintext sealed twice to the same key must produce distinct ciphertexts"
+        );
     }
 }

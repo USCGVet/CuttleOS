@@ -14,7 +14,9 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use crate::durable_seal::{seal_bytes_keyed, DURABLE_DIGEST_LEN};
+use crate::durable_seal::{
+    seal_bytes_keyed, seal_matches_keyed, DEFAULT_LEGACY_DURABLE_SEAL_KEY, DURABLE_DIGEST_LEN,
+};
 
 /// Maximum number of relational tables in a [`SqlDb`] instance.
 pub const SQL_MAX_TABLES: usize = 4;
@@ -32,6 +34,17 @@ pub const SQL_PART_SECTORS: usize = 8;
 pub const SQL_PART_MAGIC: &[u8; 8] = b"CTTLSQL1";
 /// Sentinel value for [`SqlTable::indexed_col`] when no secondary index is defined.
 pub const SQL_NO_INDEX: u8 = 0xFF;
+
+/// SQL session owner ID for interactive serial/PS2 console commands.
+pub const SQL_OWNER_CONSOLE: u64 = 0;
+/// SQL session owner ID for the built-in `CuttleVault` (`vault`) application.
+pub const SQL_OWNER_VAULT: u64 = 0xFFFF_0001;
+/// SQL session owner ID for the built-in `CuttleChronos` (`cron`) scheduler.
+pub const SQL_OWNER_CRON: u64 = 0xFFFF_0002;
+/// SQL session owner ID for the 3-node Triad TMR replication and coordinator path.
+pub const SQL_OWNER_TRIAD: u64 = 0xFFFF_0003;
+/// SQL session owner ID for the UDP `:8080` control-plane service.
+pub const SQL_OWNER_UDP: u64 = 0xFFFF_0004;
 
 /// Column data type in [`SqlDb`].
 #[repr(u8)]
@@ -548,7 +561,7 @@ impl SqlDb {
                 h = mix_byte(h, tbl.col_count);
                 let mut r_idx = 0usize;
                 while r_idx < SQL_MAX_ROWS {
-                    let row = &tbl.rows[r_idx];
+                    let row = self.committed_row(t_idx, r_idx);
                     if row.used {
                         h = mix_byte(h, 0x5A);
                         let mut c_idx = 0usize;
@@ -584,9 +597,20 @@ impl SqlDb {
         h
     }
 
+    fn visible_row(&self, t_idx: usize, r_idx: usize, use_committed: bool) -> &SqlRow {
+        if use_committed {
+            self.committed_row(t_idx, r_idx)
+        } else {
+            &self.tables[t_idx].rows[r_idx]
+        }
+    }
+
     /// Return `true` if `query` is strictly read-only (`SELECT`, `.tables`, `.schema`, `SHOW`, `DESCRIBE`).
     pub fn is_readonly_query(query: &[u8]) -> bool {
-        let q = trim_sql(query);
+        let mut q = trim_sql(query);
+        if q.starts_with(b"/*triad*/") {
+            q = trim_sql(&q[9..]);
+        }
         if q.is_empty() {
             return true;
         }
@@ -599,24 +623,32 @@ impl SqlDb {
             || eq_ignore_ascii_case(kw, b"DESCRIBE")
     }
 
-    /// Execute a SQL statement or meta-command on behalf of the default system/console session (`owner = 0`).
+    /// Execute a SQL statement or meta-command on behalf of the default interactive console (`owner = SQL_OWNER_CONSOLE`).
     /// Returns the number of bytes written to `out`.
     pub fn exec(&mut self, query: &[u8], out: &mut [u8]) -> usize {
-        self.exec_as(0, query, out)
+        self.exec_as(SQL_OWNER_CONSOLE, query, out)
     }
 
-    /// Execute a SQL statement or meta-command on behalf of `owner` (`0` = console/system, `>0` = HTTP session slot)
+    /// Execute a SQL statement or meta-command on behalf of `owner` (`SQL_OWNER_CONSOLE`, HTTP session slot `1..=4`,
+    /// or subsystem owner `SQL_OWNER_VAULT` / `SQL_OWNER_CRON` / `SQL_OWNER_TRIAD` / `SQL_OWNER_UDP`)
     /// and format the output into `out`.
     ///
-    /// Enforces session-bound transactions: while `self.tx_active` is `true`, mutating statements and
-    /// `BEGIN`/`COMMIT`/`ROLLBACK` from any `owner != self.tx_owner` are refused with `EBUSY`.
-    pub fn exec_as(&mut self, owner: u64, query: &[u8], out: &mut [u8]) -> usize {
-        let q = trim_sql(query);
+    /// Enforces session-bound transactions with **Read Committed** isolation:
+    /// - While `self.tx_active` is `true`, mutating statements and `BEGIN`/`COMMIT`/`ROLLBACK` from any
+    ///   `owner != self.tx_owner` are refused with `EBUSY`.
+    /// - Read-only queries (`SELECT`, `SHOW TABLES`) from `owner != self.tx_owner` read the committed
+    ///   pre-transaction snapshot (`committed_row`), preventing dirty reads.
+    pub fn exec_as(&mut self, mut owner: u64, query: &[u8], out: &mut [u8]) -> usize {
+        let mut q = trim_sql(query);
+        if q.starts_with(b"/*triad*/") {
+            owner = SQL_OWNER_TRIAD;
+            q = trim_sql(&q[9..]);
+        }
         if q.is_empty() {
             return copy_str(b"error: empty SQL query\n", out);
         }
         if eq_ignore_ascii_case(q, b".tables") || eq_ignore_ascii_case(q, b"SHOW TABLES") {
-            return self.exec_show_tables(out);
+            return self.exec_show_tables(owner, out);
         }
         if q.starts_with(b".schema") || starts_with_ignore_case(q, b"DESCRIBE") {
             let (_, rest) = next_token(q);
@@ -624,7 +656,7 @@ impl SqlDb {
         }
         let (kw, rest) = next_token(q);
         if eq_ignore_ascii_case(kw, b"SELECT") {
-            return self.exec_select(rest, out);
+            return self.exec_select(owner, rest, out);
         }
 
         // Non-read-only statement: enforce active transaction ownership!
@@ -703,15 +735,24 @@ impl SqlDb {
         None
     }
 
-    fn exec_show_tables(&self, out: &mut [u8]) -> usize {
+    fn exec_show_tables(&self, owner: u64, out: &mut [u8]) -> usize {
+        let use_committed = self.tx_active && self.tx_owner != owner;
         let mut pos = 0usize;
         let mut i = 0usize;
         let mut count = 0usize;
         while i < SQL_MAX_TABLES {
             if self.tables[i].used {
+                let mut rows = 0usize;
+                let mut r = 0usize;
+                while r < SQL_MAX_ROWS {
+                    if self.visible_row(i, r, use_committed).used {
+                        rows += 1;
+                    }
+                    r += 1;
+                }
                 pos += append_bytes(out, pos, self.tables[i].name_bytes());
                 pos += append_bytes(out, pos, b" (rows=");
-                pos += append_u64(out, pos, self.tables[i].row_count() as u64);
+                pos += append_u64(out, pos, rows as u64);
                 pos += append_bytes(out, pos, b", cols=");
                 pos += append_u64(out, pos, self.tables[i].col_count as u64);
                 pos += append_bytes(out, pos, b")\n");
@@ -1059,7 +1100,7 @@ impl SqlDb {
         }
     }
 
-    fn exec_select(&mut self, rest: &[u8], out: &mut [u8]) -> usize {
+    fn exec_select(&mut self, owner: u64, rest: &[u8], out: &mut [u8]) -> usize {
         let Some((proj_raw, after_from)) = split_keyword_ignore_case(rest, b"FROM") else {
             return copy_str(b"error: SELECT missing FROM clause\n", out);
         };
@@ -1068,6 +1109,7 @@ impl SqlDb {
         let Some(t_idx) = self.find_table(tname) else {
             return copy_str(b"error: table not found\n", out);
         };
+        let use_committed = self.tx_active && self.tx_owner != owner;
 
         // Parse optional LIMIT <n> at tail.
         let mut limit = SQL_MAX_ROWS;
@@ -1112,29 +1154,35 @@ impl SqlDb {
         }
 
         // Check if secondary hash index can accelerate an equality WHERE clause.
-        let indexed_eq_hash = filter
-            .as_ref()
-            .and_then(|f| f.single_indexed_eq(self.tables[t_idx].indexed_col as usize));
+        // When `use_committed` is true (reading across another owner's active transaction),
+        // skip the live `index_hashes` shortcut so uncommitted mutations on the indexed column
+        // cannot hide or misroute committed rows.
+        let indexed_eq_hash = if use_committed {
+            None
+        } else {
+            filter
+                .as_ref()
+                .and_then(|f| f.single_indexed_eq(self.tables[t_idx].indexed_col as usize))
+        };
         if indexed_eq_hash.is_some() {
             self.idx_hits = self.idx_hits.wrapping_add(1);
         }
-
-        let table = &self.tables[t_idx];
 
         // Collect matching row indices.
         let mut matched = [0usize; SQL_MAX_ROWS];
         let mut mcount = 0usize;
         let mut r = 0usize;
         while r < SQL_MAX_ROWS {
-            if table.rows[r].used {
+            let row = self.visible_row(t_idx, r, use_committed);
+            if row.used {
                 if let Some(h) = indexed_eq_hash {
-                    if table.index_hashes[r] != h {
+                    if self.tables[t_idx].index_hashes[r] != h {
                         r += 1;
                         continue;
                     }
                 }
                 let pass = match &filter {
-                    Some(f) => f.eval(&table.rows[r]),
+                    Some(f) => f.eval(row),
                     None => true,
                 };
                 if pass {
@@ -1151,8 +1199,8 @@ impl SqlDb {
             while i < mcount {
                 let mut j = i + 1;
                 while j < mcount {
-                    let a = &table.rows[matched[i]].cells[c_idx];
-                    let b = &table.rows[matched[j]].cells[c_idx];
+                    let a = &self.visible_row(t_idx, matched[i], use_committed).cells[c_idx];
+                    let b = &self.visible_row(t_idx, matched[j], use_committed).cells[c_idx];
                     let swap = if desc {
                         a.compare(CmpOp::Lt, b)
                     } else {
@@ -1178,10 +1226,10 @@ impl SqlDb {
 
         // Handle SUM(<col>), MIN(<col>), MAX(<col>), AVG(<col>) aggregates.
         if let Some((agg_kind, agg_col_name)) = parse_aggregate_proj(proj) {
-            let Some(c_idx) = table.find_col(agg_col_name) else {
+            let Some(c_idx) = self.tables[t_idx].find_col(agg_col_name) else {
                 return copy_str(b"error: unknown column in aggregate\n", out);
             };
-            if table.cols[c_idx].col_type != SqlType::Int {
+            if self.tables[t_idx].cols[c_idx].col_type != SqlType::Int {
                 return copy_str(b"error: numeric aggregate requires INT column\n", out);
             }
             let hdr: &[u8] = match agg_kind {
@@ -1201,7 +1249,9 @@ impl SqlDb {
             let mut max_v = i64::MIN;
             let mut k = 0usize;
             while k < mcount {
-                if let SqlVal::Int(v) = table.rows[matched[k]].cells[c_idx] {
+                if let SqlVal::Int(v) =
+                    self.visible_row(t_idx, matched[k], use_committed).cells[c_idx]
+                {
                     sum = sum.saturating_add(v as i128);
                     if v < min_v {
                         min_v = v;
@@ -1230,7 +1280,7 @@ impl SqlDb {
         let mut proj_cols = [0usize; SQL_MAX_COLS];
         let mut proj_count = 0usize;
         if proj == b"*" {
-            while proj_count < table.col_count as usize {
+            while proj_count < self.tables[t_idx].col_count as usize {
                 proj_cols[proj_count] = proj_count;
                 proj_count += 1;
             }
@@ -1243,7 +1293,7 @@ impl SqlDb {
                 if cname.is_empty() {
                     continue;
                 }
-                let Some(c_idx) = table.find_col(cname) else {
+                let Some(c_idx) = self.tables[t_idx].find_col(cname) else {
                     return copy_str(b"error: unknown column in SELECT projection\n", out);
                 };
                 if proj_count < SQL_MAX_COLS {
@@ -1260,7 +1310,7 @@ impl SqlDb {
             if c > 0 {
                 pos += append_bytes(out, pos, b"|");
             }
-            pos += append_bytes(out, pos, table.cols[proj_cols[c]].name_bytes());
+            pos += append_bytes(out, pos, self.tables[t_idx].cols[proj_cols[c]].name_bytes());
             c += 1;
         }
         pos += append_bytes(out, pos, b"\n");
@@ -1268,7 +1318,7 @@ impl SqlDb {
         let emit_rows = mcount.min(limit);
         let mut m = 0usize;
         while m < emit_rows {
-            let row = &table.rows[matched[m]];
+            let row = self.visible_row(t_idx, matched[m], use_committed);
             let mut pc = 0usize;
             while pc < proj_count {
                 if pc > 0 {
@@ -1618,13 +1668,30 @@ impl SqlDb {
         key: &[u8; DURABLE_DIGEST_LEN],
         sectors: &[[u8; 512]; SQL_PART_SECTORS],
     ) -> bool {
+        self.load_partition_with_legacy(
+            key,
+            &crate::durable_seal::DEFAULT_LEGACY_DURABLE_SEAL_KEY,
+            sectors,
+        )
+    }
+
+    /// Restore the database from an 8-sector (`4 KiB`) partition image, verifying
+    /// `CTTLSQL1` with `key` or legacy `PRTSSQL1` with `key`, `legacy_key`, or
+    /// `DEFAULT_LEGACY_DURABLE_SEAL_KEY`.
+    pub fn load_partition_with_legacy(
+        &mut self,
+        key: &[u8; DURABLE_DIGEST_LEN],
+        legacy_key: &[u8; DURABLE_DIGEST_LEN],
+        sectors: &[[u8; 512]; SQL_PART_SECTORS],
+    ) -> bool {
         let mut flat = [0u8; SQL_PART_SECTORS * 512];
         let mut s = 0usize;
         while s < SQL_PART_SECTORS {
             flat[s * 512..(s + 1) * 512].copy_from_slice(&sectors[s]);
             s += 1;
         }
-        if &flat[0..8] != SQL_PART_MAGIC && &flat[0..8] != b"PRTSSQL1" {
+        let is_legacy = &flat[0..8] == b"PRTSSQL1";
+        if &flat[0..8] != SQL_PART_MAGIC && !is_legacy {
             return false;
         }
         let payload_len = u16::from_le_bytes([flat[16], flat[17]]) as usize;
@@ -1637,15 +1704,17 @@ impl SqlDb {
         let mut mac_input = [0u8; SQL_PART_SECTORS * 512];
         mac_input[0..20].copy_from_slice(&flat[0..20]);
         mac_input[20..20 + rest_len].copy_from_slice(&flat[52..]);
-        let mut expected_tag = [0u8; DURABLE_DIGEST_LEN];
-        seal_bytes_keyed(key, &mac_input[..20 + rest_len], &mut expected_tag);
-        let mut diff = 0u8;
-        let mut i = 0usize;
-        while i < DURABLE_DIGEST_LEN {
-            diff |= flat[20 + i] ^ expected_tag[i];
-            i += 1;
-        }
-        if diff != 0 {
+        let mut tag_in = [0u8; DURABLE_DIGEST_LEN];
+        tag_in.copy_from_slice(&flat[20..52]);
+        let mac_slice = &mac_input[..20 + rest_len];
+        let tag_ok = if is_legacy {
+            seal_matches_keyed(key, mac_slice, &tag_in)
+                || seal_matches_keyed(legacy_key, mac_slice, &tag_in)
+                || seal_matches_keyed(&DEFAULT_LEGACY_DURABLE_SEAL_KEY, mac_slice, &tag_in)
+        } else {
+            seal_matches_keyed(key, mac_slice, &tag_in)
+        };
+        if !tag_ok {
             return false;
         }
 
@@ -2495,5 +2564,86 @@ mod tests {
         assert!(!db.tx_active);
         let n_after_to = db.exec(b"SELECT v FROM kv WHERE k = 'vault.mode'", &mut out);
         assert_eq!(&out[..n_after_to], b"v\nsealed-aead\n");
+    }
+
+    #[test]
+    fn regression_item3_sql_read_committed_prevents_dirty_reads() {
+        let mut db = SqlDb::new();
+        let mut out = [0u8; 512];
+        let hash_committed = db.state_hash();
+
+        // Owner 0 (console) opens BEGIN and mutates rows.
+        let n = db.exec_as(SQL_OWNER_CONSOLE, b"BEGIN", &mut out);
+        assert_eq!(&out[..n], b"BEGIN OK\n");
+        let _ = db.exec_as(
+            SQL_OWNER_CONSOLE,
+            b"UPDATE kv SET v = 'DirtyRole' WHERE k = 'cluster.role'",
+            &mut out,
+        );
+        let _ = db.exec_as(
+            SQL_OWNER_CONSOLE,
+            b"INSERT INTO kv VALUES ('dirty.key', 'uncommitted', 1)",
+            &mut out,
+        );
+
+        // Owner 0 sees its own uncommitted changes.
+        let n_own = db.exec_as(
+            SQL_OWNER_CONSOLE,
+            b"SELECT v FROM kv WHERE k = 'cluster.role'",
+            &mut out,
+        );
+        assert_eq!(&out[..n_own], b"v\nDirtyRole\n");
+
+        // Another owner (e.g., SQL_OWNER_VAULT, SQL_OWNER_CRON, SQL_OWNER_TRIAD, or HTTP session 42)
+        // must see only the committed rows (Read Committed — no dirty reads).
+        let n_other = db.exec_as(
+            SQL_OWNER_VAULT,
+            b"SELECT v FROM kv WHERE k = 'cluster.role'",
+            &mut out,
+        );
+        assert_eq!(&out[..n_other], b"v\nprimary\n");
+        let n_dirty = db.exec_as(
+            42,
+            b"SELECT v FROM kv WHERE k = 'dirty.key'",
+            &mut out,
+        );
+        assert_eq!(&out[..n_dirty], b"v\n");
+
+        // `state_hash()` must also reflect only committed rows while a transaction is active.
+        assert_eq!(db.state_hash(), hash_committed);
+
+        // A `/*triad*/` prefixed statement runs as `SQL_OWNER_TRIAD` even if invoked via `exec` (owner 0),
+        // so it is refused with `EBUSY` on writes while console `BEGIN` is active.
+        let n_triad = db.exec(
+            b"/*triad*/ INSERT INTO kv VALUES ('triad.k', 'v', 1)",
+            &mut out,
+        );
+        assert!(out[..n_triad].starts_with(b"error: EBUSY"));
+
+        let _ = db.exec_as(SQL_OWNER_CONSOLE, b"ROLLBACK", &mut out);
+        assert_eq!(db.state_hash(), hash_committed);
+    }
+
+    #[test]
+    fn regression_prev_item3_rollback_undo_overflow_and_ddl_in_tx_refused() {
+        let mut db = SqlDb::new();
+        let mut out = [0u8; 512];
+        for i in 1..=8i64 {
+            let mut q = [0u8; 96];
+            let mut p = 0usize;
+            p += append_bytes(&mut q, p, b"INSERT INTO kv VALUES ('k.");
+            p += append_i64(&mut q, p, i);
+            p += append_bytes(&mut q, p, b"', 'v', 1)");
+            let _ = db.exec(&q[..p], &mut out);
+        }
+        let _ = db.exec(b"BEGIN", &mut out);
+        let n_ddl = db.exec(b"CREATE TABLE t2 (id INT)", &mut out);
+        assert!(out[..n_ddl].starts_with(b"error: DDL (CREATE/DROP) not allowed"));
+        let n_upd = db.exec(b"UPDATE kv SET rev = 99", &mut out);
+        assert_eq!(
+            &out[..n_upd],
+            b"error: transaction undo log full (max 8 rows); COMMIT or ROLLBACK first\n"
+        );
+        let _ = db.exec(b"ROLLBACK", &mut out);
     }
 }

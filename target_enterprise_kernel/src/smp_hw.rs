@@ -14,8 +14,8 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::{
-    alloc_pt_frame, dec_u64, ensure_mmio_page, mmio_read32, mmio_write32, outb, pa_to_va, read_cr3,
-    serial_write_bytes, KERNEL_SHELL, PTE_ADDR_MASK, PTE_P, PTE_PS, PTE_W,
+    alloc_pt_frame, dec_u64, ensure_mmio_page, inb, mmio_read32, mmio_write32, outb, pa_to_va,
+    read_cr3, serial_write_bytes, KERNEL_SHELL, PTE_ADDR_MASK, PTE_P, PTE_PS, PTE_W,
 };
 
 /// Maximum number of hardware SMP cores supported (`BSP + 3 APs`).
@@ -43,6 +43,8 @@ const LAPIC_ICR_HI: u64 = 0x0310;
 const LAPIC_LVT_TIMER: u64 = 0x0320;
 /// Local APIC Timer Initial Count Register offset.
 const LAPIC_TIMER_INIT: u64 = 0x0380;
+/// Local APIC Timer Current Count Register offset.
+const LAPIC_TIMER_CCR: u64 = 0x0390;
 /// Local APIC Timer Divide Configuration Register offset.
 const LAPIC_TIMER_DIV: u64 = 0x03E0;
 
@@ -773,22 +775,63 @@ pub(crate) fn kthread_switch_next() -> usize {
     tid
 }
 
-/// Arm the BSP (`CPU 0`) Local APIC Periodic Timer on vector `0x40` so `CPU 0`
-/// can sleep in hardware `HLT` (`0%` idle host CPU) and wake every ~4 ms to
-/// check VirtIO-Net, COM1 UART, and PS/2 keyboard input.
+/// Calibrated number of Local APIC timer interrupts (`vector 0x40`) corresponding to 1 second (`1 Hz` cooldown tick),
+/// measured against the 8254 PIT (`1,193,182 Hz`) during `smp_hw_enable_bsp_timer`.
+static CALIBRATED_IRQS_PER_COOLDOWN_TICK: AtomicU64 = AtomicU64::new(250);
+
+/// Calibrate the BSP (`CPU 0`) Local APIC Timer against the 8254 PIT (`1,193,182 Hz`, Channel 2)
+/// over a `10 ms` window (`11,932` PIT ticks) and arm the Periodic Timer on vector `0x40` so
+/// `CPU 0` can sleep in hardware `HLT` (`0%` idle host CPU) while login cooldown and cron ticks
+/// advance at a hardware-calibrated `1 Hz` rate across hypervisors and bare metal.
 pub(crate) fn smp_hw_enable_bsp_timer() {
+    use target_enterprise::timer::{
+        calibrate_apic_irqs_per_sec, LAPIC_TIMER_PERIOD_COUNT, PIT_CALIBRATION_TICKS_10MS,
+    };
+
     if !SMP_HW_INITIALIZED.load(Ordering::Acquire) {
         let _ = smp_hw_init();
     }
-    // SAFETY: `LAPIC_PHYS_BASE` is mapped and `RUNTIME_IDT` has `ISR_LAPIC_EOI` installed at vector `0x40`.
+    // SAFETY: `LAPIC_PHYS_BASE` is mapped, `RUNTIME_IDT` has `ISR_LAPIC_EOI` installed at vector `0x40`,
+    // and I/O ports `0x61`, `0x43`, `0x42` are the standard IBM-PC 8254 PIT Channel 2 registers at CPL=0.
     unsafe {
         mmio_write32(LAPIC_PHYS_BASE + LAPIC_TPR, 0);
         mmio_write32(LAPIC_PHYS_BASE + LAPIC_TIMER_DIV, 0x03); // Divide by 16
+
+        // 1. Gate PIT Channel 2 (`port 0x61` bit 0 = 1, bit 1 = 0) in Mode 0 (one-shot terminal count, `0xB0`)
+        //    for `PIT_CALIBRATION_TICKS_10MS` (`11,932` ticks = ~10 ms).
+        let gate = inb(0x61);
+        outb(0x61, (gate & 0xFC) | 0x01);
+        outb(0x43, 0xB0);
+        outb(0x42, (PIT_CALIBRATION_TICKS_10MS & 0xFF) as u8);
+        outb(0x42, (PIT_CALIBRATION_TICKS_10MS >> 8) as u8);
+
+        // 2. Start Local APIC timer in masked one-shot mode from `0xFFFF_FFFF` while PIT Channel 2 counts down.
+        mmio_write32(
+            LAPIC_PHYS_BASE + LAPIC_LVT_TIMER,
+            0x0001_0000 | LAPIC_TIMER_VECTOR, // Masked one-shot during calibration
+        );
+        mmio_write32(LAPIC_PHYS_BASE + LAPIC_TIMER_INIT, 0xFFFF_FFFF);
+
+        let mut spins = 0u32;
+        while (inb(0x61) & 0x20) == 0 && spins < 200_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        let ccr = mmio_read32(LAPIC_PHYS_BASE + LAPIC_TIMER_CCR);
+        let lapic_elapsed = 0xFFFF_FFFFu32.saturating_sub(ccr);
+        let irqs_per_sec = calibrate_apic_irqs_per_sec(
+            lapic_elapsed,
+            PIT_CALIBRATION_TICKS_10MS as u32,
+            LAPIC_TIMER_PERIOD_COUNT,
+        );
+        CALIBRATED_IRQS_PER_COOLDOWN_TICK.store(irqs_per_sec, Ordering::Relaxed);
+
+        // 3. Arm Periodic Local APIC Timer on vector `0x40` with `LAPIC_TIMER_PERIOD_COUNT` (`250,000`).
         mmio_write32(
             LAPIC_PHYS_BASE + LAPIC_LVT_TIMER,
             0x0002_0000 | LAPIC_TIMER_VECTOR, // Periodic mode (bit 17) | vector 0x40
         );
-        mmio_write32(LAPIC_PHYS_BASE + LAPIC_TIMER_INIT, 250_000);
+        mmio_write32(LAPIC_PHYS_BASE + LAPIC_TIMER_INIT, LAPIC_TIMER_PERIOD_COUNT);
     }
 }
 
@@ -1010,12 +1053,12 @@ pub(crate) fn smp_hw_tick_and_sync(sh: &mut target_enterprise::OsShell) {
         ring_smp_doorbell();
     }
 
-    const APIC_IRQS_PER_COOLDOWN_TICK: u64 = 937;
+    let irqs_per_cooldown_tick = CALIBRATED_IRQS_PER_COOLDOWN_TICK.load(Ordering::Relaxed).max(16);
     let hw_irqs = read_hw_irq_wakeups();
     let hw_ipis = HW_IPI_DOORBELLS.load(Ordering::Relaxed);
     if hw_irqs > sh.smp_irq_wakeups {
-        let prev_epochs = sh.smp_irq_wakeups / APIC_IRQS_PER_COOLDOWN_TICK;
-        let cur_epochs = hw_irqs / APIC_IRQS_PER_COOLDOWN_TICK;
+        let prev_epochs = sh.smp_irq_wakeups / irqs_per_cooldown_tick;
+        let cur_epochs = hw_irqs / irqs_per_cooldown_tick;
         sh.smp_irq_wakeups = hw_irqs;
         if cur_epochs > prev_epochs {
             let delta = (cur_epochs - prev_epochs).min(8);

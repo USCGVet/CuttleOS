@@ -25,6 +25,11 @@ pub const DURABLE_DIGEST_LEN: usize = 32;
 pub const DEFAULT_DURABLE_SEAL_KEY: [u8; DURABLE_DIGEST_LEN] =
     *b"Cuttle-Enterprise-DiskSeal-K0001";
 
+/// Pre-rebrand (`Proteus`) deterministic 256-bit seal key fixture used to verify
+/// and migrate legacy `PRTS*` disk images in unit tests.
+pub const DEFAULT_LEGACY_DURABLE_SEAL_KEY: [u8; DURABLE_DIGEST_LEN] =
+    *b"Proteus-Enterprise-DiskSeal-K001";
+
 /// Deterministic 256-bit remote attestation key fixture used only by in-memory
 /// unit tests (`OsShell::empty`). The live kernel derives `attest_key` from the
 /// out-of-band provisioned `fw_cfg` secret via [`derive_attest_key`].
@@ -38,6 +43,33 @@ pub fn derive_seal_key(
     node_id: &[u8],
 ) -> [u8; DURABLE_DIGEST_LEN] {
     const LABEL: &[u8] = b"cuttle-durable-seal-v1:";
+    let mut msg = [0u8; 64];
+    let mut pos = 0usize;
+    let mut i = 0usize;
+    while i < LABEL.len() && pos < msg.len() {
+        msg[pos] = LABEL[i];
+        pos += 1;
+        i += 1;
+    }
+    let mut j = 0usize;
+    while j < node_id.len() && pos < msg.len() {
+        msg[pos] = node_id[j];
+        pos += 1;
+        j += 1;
+    }
+    let mut out = [0u8; DURABLE_DIGEST_LEN];
+    hmac_sha256(root_secret, &msg[..pos], &mut out);
+    out
+}
+
+/// Derive a pre-rebrand (`Proteus`) 256-bit seal key from a root secret and
+/// device/node identifier via `HMAC-SHA256(root_secret, "proteus-durable-seal-v1:" || node_id)`
+/// so `PRTS*` disk images can be cryptographically verified and migrated to `CTTL*`.
+pub fn derive_legacy_seal_key(
+    root_secret: &[u8; DURABLE_DIGEST_LEN],
+    node_id: &[u8],
+) -> [u8; DURABLE_DIGEST_LEN] {
+    const LABEL: &[u8] = b"proteus-durable-seal-v1:";
     let mut msg = [0u8; 64];
     let mut pos = 0usize;
     let mut i = 0usize;
@@ -215,6 +247,20 @@ mod tests {
         // Mutate snapshot → mismatch.
         buf[4] ^= 1;
         assert!(!seal_matches(&buf[..n], &dig1));
+    }
+
+    #[test]
+    fn regression_prev_item9_zeroize_secret_bytes_wipes_buffer() {
+        let mut secret = [0xAAu8; 32];
+        zeroize_secret_bytes(&mut secret);
+        for i in 0..secret.len() {
+            // SAFETY: `secret[i]` is a valid aligned `u8` in the local array.
+            let b = unsafe { core::ptr::read_volatile(&secret[i]) };
+            assert_eq!(b, 0, "zeroize_secret_bytes must wipe every byte to 0");
+        }
+        let legacy = derive_legacy_seal_key(&DEFAULT_LEGACY_DURABLE_SEAL_KEY, b"proteus-ahci-wal-seal-v1");
+        let modern = derive_seal_key(&DEFAULT_DURABLE_SEAL_KEY, b"cuttle-ahci-wal-seal-v1");
+        assert_ne!(legacy, modern);
     }
 }
 

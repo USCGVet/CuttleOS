@@ -581,8 +581,13 @@ impl LivedNet {
             if let Some(sh) = shell {
                 let cmd_line = &payload[4..];
                 if crate::shell::OsShell::is_readonly_command(cmd_line) {
-                    sh.exec_line(cmd_line, boots, 0, 0, &mut body)
-                        .bytes_written()
+                    let prev_owner = sh.sql_owner_override;
+                    sh.sql_owner_override = crate::sql::SQL_OWNER_UDP;
+                    let n = sh
+                        .exec_line(cmd_line, boots, 0, 0, &mut body)
+                        .bytes_written();
+                    sh.sql_owner_override = prev_owner;
+                    n
                 } else {
                     sh.record_net_audit(AuditVerdict::Denied, b"net:udp:unauth");
                     copy_msg(
@@ -696,7 +701,9 @@ impl LivedNet {
                 return copy_msg(b"error: EINVAL (TRIAD_PREPARE requires mutating SQL)\n", body);
             }
             let mut sql_out = [0u8; 192];
-            let Ok((_, slen)) = sh.dispatch_mailbox_op(
+            let prev_owner = sh.sql_owner_override;
+            sh.sql_owner_override = crate::sql::SQL_OWNER_TRIAD;
+            let mb_res = sh.dispatch_mailbox_op(
                 IpcOp::SqlMutate,
                 false,
                 true,
@@ -704,7 +711,9 @@ impl LivedNet {
                 b"/triad/prepare",
                 sql,
                 &mut sql_out,
-            ) else {
+            );
+            sh.sql_owner_override = prev_owner;
+            let Ok((_, slen)) = mb_res else {
                 sh.record_net_audit(AuditVerdict::Denied, b"net:triad:role-denied");
                 return copy_msg(
                     b"error: EACCES (svc-sql disabled by node role or policy)\n",
@@ -906,7 +915,11 @@ impl LivedNet {
         self.last_auth_seq = seq;
         sh.auth_seq = seq;
         sh.record_net_audit(AuditVerdict::Allowed, b"net:udp:auth-ok");
-        sh.exec_line(cmd, boots, 0, 0, body).bytes_written()
+        let prev_owner = sh.sql_owner_override;
+        sh.sql_owner_override = crate::sql::SQL_OWNER_UDP;
+        let n = sh.exec_line(cmd, boots, 0, 0, body).bytes_written();
+        sh.sql_owner_override = prev_owner;
+        n
     }
 
     fn select_tcp_slot(
@@ -3749,5 +3762,85 @@ mod tests {
         );
         let (req_rb, rlen_rb) = mk_req(b"POST", b"/sql", b"ROLLBACK");
         let _ = net.handle_http_request(&req_rb[..rlen_rb], 1, Some(&mut sh), &mut out);
+    }
+
+    #[test]
+    fn regression_item2_http_oversized_body_returns_413() {
+        let mut net = LivedNet::new([0x52, 0x54, 0x00, 0x12, 0x34, 0x9A]);
+        let mut sh = crate::shell::OsShell::new();
+        let sid = sh.create_session(b"admin", b"item2-http");
+        let mut out = [0u8; 768];
+
+        let mut big_sql = [b'A'; 360];
+        let mut p = 0usize;
+        p += copy_msg(b"POST /sql HTTP/1.1\r\nCookie: sid=", &mut big_sql[p..]);
+        p += copy_msg(&sid, &mut big_sql[p..]);
+        p += copy_msg(b"\r\n\r\nSELECT '", &mut big_sql[p..]);
+        p += 260;
+        let n_413 = net.handle_http_request(&big_sql[..p], 1, Some(&mut sh), &mut out);
+        assert!(
+            out[..n_413].starts_with(b"HTTP/1.1 413 "),
+            "oversized POST /sql body (> 256B) must return HTTP 413, got {:?}",
+            core::str::from_utf8(&out[..n_413]).unwrap()
+        );
+
+        let mut big_fs = [b'a'; 160];
+        let mut fp = 0usize;
+        fp += copy_msg(b"PUT /fs/", &mut big_fs[fp..]);
+        fp += 68;
+        fp += copy_msg(b" HTTP/1.1\r\nCookie: sid=", &mut big_fs[fp..]);
+        fp += copy_msg(&sid, &mut big_fs[fp..]);
+        fp += copy_msg(b"\r\n\r\nhi", &mut big_fs[fp..]);
+        let n_fs_413 = net.handle_http_request(&big_fs[..fp], 1, Some(&mut sh), &mut out);
+        assert!(
+            out[..n_fs_413].starts_with(b"HTTP/1.1 413 "),
+            "oversized PUT /fs/ path (> 64B) must return HTTP 413, got {:?}",
+            core::str::from_utf8(&out[..n_fs_413]).unwrap()
+        );
+    }
+
+    #[test]
+    fn regression_item3_http_session_sql_isolation_and_read_committed() {
+        let mut net = LivedNet::new([0x52, 0x54, 0x00, 0x12, 0x34, 0x9B]);
+        let mut sh = crate::shell::OsShell::new();
+        let sid1 = sh.create_session(b"admin", b"s1");
+        let sid2 = sh.create_session(b"admin", b"s2");
+        let mut out = [0u8; 768];
+
+        let mk_sid_req = |sid: &[u8; 32], body: &[u8]| -> ([u8; 256], usize) {
+            let mut buf = [0u8; 256];
+            let mut p = 0usize;
+            p += copy_msg(b"POST /sql HTTP/1.1\r\nCookie: sid=", &mut buf[p..]);
+            p += copy_msg(sid, &mut buf[p..]);
+            p += copy_msg(b"\r\n\r\n", &mut buf[p..]);
+            p += copy_msg(body, &mut buf[p..]);
+            (buf, p)
+        };
+
+        let (r1, l1) = mk_sid_req(&sid1, b"BEGIN");
+        let _ = net.handle_http_request(&r1[..l1], 1, Some(&mut sh), &mut out);
+        let (r2, l2) = mk_sid_req(&sid1, b"UPDATE kv SET v = 'dirty-s1' WHERE k = 'cluster.role'");
+        let _ = net.handle_http_request(&r2[..l2], 1, Some(&mut sh), &mut out);
+
+        // Session 2 SELECT must see committed 'primary', not Session 1's uncommitted 'dirty-s1':
+        let (r3, l3) = mk_sid_req(&sid2, b"SELECT v FROM kv WHERE k = 'cluster.role'");
+        let n_sel = net.handle_http_request(&r3[..l3], 1, Some(&mut sh), &mut out);
+        let resp_sel = core::str::from_utf8(&out[..n_sel]).unwrap();
+        assert!(
+            resp_sel.contains("v\nprimary\n") && !resp_sel.contains("dirty-s1"),
+            "Session 2 must see Read Committed snapshot, got: {resp_sel}"
+        );
+
+        // Session 2 write attempt during Session 1's transaction is refused with EBUSY:
+        let (r4, l4) = mk_sid_req(&sid2, b"INSERT INTO kv VALUES ('x', 'y', 1)");
+        let n_busy = net.handle_http_request(&r4[..l4], 1, Some(&mut sh), &mut out);
+        let resp_busy = core::str::from_utf8(&out[..n_busy]).unwrap();
+        assert!(
+            resp_busy.contains("error: EBUSY (database locked by another session's transaction)"),
+            "got: {resp_busy}"
+        );
+
+        let (r5, l5) = mk_sid_req(&sid1, b"ROLLBACK");
+        let _ = net.handle_http_request(&r5[..l5], 1, Some(&mut sh), &mut out);
     }
 }
