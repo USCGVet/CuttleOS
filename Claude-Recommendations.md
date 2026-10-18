@@ -1,77 +1,91 @@
 # Claude Recommendations
 
-Open issues from Claude's review of commits `6739433` and `a171e74`. Each one lists where it is, what's wrong and a suggested fix. Line numbers are from `a171e74` and may shift during the Cuttle OS rebrand.
+Open issues from Claude's review of commits `39990cd` (rebrand), `c41da60` (fixes) and `f9d53ab` (features). Each one lists where it is, what's wrong and a suggested fix. Line numbers are from `f9d53ab`.
 
-**Status at review time:** all 2,407 workspace tests pass (`cargo test --workspace --no-fail-fast`), both QEMU tests pass (`cargo test -p factory_builder --test qemu_smoke -- --ignored`), and `tools/triad_controller.py` parses.
+**Status at review time:** all 2,410 workspace tests pass (`cargo test --workspace --no-fail-fast`), both QEMU tests pass (`cargo test -p factory_builder --test qemu_smoke -- --ignored`, now over 60 s each, up from about 35 s), and `tools/triad_controller.py` parses.
 
-**Fixed since the last review (verified):** the serial input filter now rejects non-printable characters, the coordinator token is random per start, the `?token=` URL parameter is gone, `grant`/`revoke`/`seccomp`/`fw`/`sync` go through the role check, the README now says triple modular redundancy, and the permanent login lockout is gone (but see #3).
+## Verification of the previous "Resolution" notes
+- **Item 1 (WAL poisoning):** verified fixed. Validation happens first, and the WAL is written only after a node accepts the write. See #5 below for a related ordering issue.
+- **Item 2 (`ValueError` → 400):** verified fixed.
+- **Item 3 (login cooldown):** partly fixed. It now ticks on the APIC timer, not on requests, but see #6.
+- **Item 4 (handlers in the kernel):** **not resolved.** Requests now pass through the `IpcMailbox`, but `dispatch_mailbox_op` (`shell.rs:734` onward) still runs the handlers (`exec_line`, `db.exec`, `fs.*`) in kernel mode after copying the request out of the mailbox. The ring-3 stub checks and signs the message but doesn't run the handler.
+- **Item 5 (TLS ephemeral key):** verified fixed. The key now comes from secret device material. See #9 for a small follow-up.
+
+---
+
+## High priority
+
+### 1. Vault secrets are stored and shown in plain text by the triad controller
+- **Where:** `tools/triad_controller.py:740-748` (WAL append), `:755` (`log_event`), `:1351` (`/api/triad` returns `events`)
+- **Problem:** for `vault put`, the full command, secret included, is appended to `wal_entries` and written to `triad_wal.json` on the host disk. It's also written into the event log, and the event log is returned by `GET /api/triad`, which needs no login.
+- **Effect:** every vault secret entered through the triad console is readable in plain text from the WAL file and from the status API, which defeats the vault's encryption.
+- **Fix:** never put the secret value in `log_event` (redact it, e.g. `vault put <key> ***`). For the WAL, don't store the plain-text command: encrypt the entry with the master key before saving it, or keep vault writes out of the host WAL and replicate them another way.
+- `Status: Fixed — test: tools/triad_controller.py --self-test (wal_disk_txt & events_txt secret redaction/ENC_WAL_V1 assertions) — commit: 9e511b8`
+
+### 2. Mailbox staging silently truncates requests, then executes them
+- **Where:** `target_enterprise/src/svc_runtime.rs:1066` (`stage_mailbox_request`, caps `IPC_MAILBOX_PATH_CAP = 64` and `IPC_MAILBOX_BODY_CAP = 256`), used by `dispatch_mailbox_op`
+- **Problem:** request paths over 64 bytes and bodies over 256 bytes are cut down with `.min(...)` and then executed as if complete.
+- **Effect:** a long SQL statement loses its tail. For example, an `UPDATE ... WHERE ...` whose `WHERE` clause falls past byte 256 runs without it and updates every row. Long `PUT /fs` bodies are silently cut short, and a long `/fs/` path can resolve to a different, shorter path.
+- **Fix:** reject oversized requests with an error (HTTP 413, or `EINVAL` on the console) instead of truncating them.
+- `Status: Fixed — test: svc_runtime::tests::per_boot_seed_rotation_and_ring3_stub_mailbox_tracking, lived_net::tests::http_vault_guard_and_cron_endpoints_work — commit: 9e511b8`
+
+### 3. SQL `ROLLBACK` silently undoes only the first 8 changed rows
+- **Where:** `target_enterprise/src/sql.rs:372` (undo capture, `SQL_TX_UNDO_CAP = 8`) and `:545` (`ROLLBACK`)
+- **Problem:** once 8 distinct rows have undo records, further changes inside the transaction are applied without any undo record. `ROLLBACK` then restores those 8 rows and still reports `ROLLBACK OK`.
+- **Effect:** `BEGIN; DELETE FROM kv; ROLLBACK;` on a table with more than 8 rows leaves the remaining rows deleted. `CREATE`/`DROP` inside a transaction aren't undone either.
+- **Fix:** when the undo log is full during a transaction, refuse the write with an error, or mark the transaction failed so `COMMIT` and `ROLLBACK` report it. Either refuse DDL inside a transaction or undo it.
+- `Status: Fixed — test: sql::tests::sql_upsert_compound_where_and_transactions — commit: 9e511b8`
 
 ---
 
 ## Medium priority
 
-### 1. A bad SQL write can poison the triad WAL
-- **Where:** `tools/triad_controller.py:578-587` (`execute_triad_sql`) and the replay loop at `:666-667`
-- **Problem:** a write is appended to the WAL and saved to disk *before* `send_shell_cmd` runs its new printable-character check. If the statement contains a control character, `send_shell_cmd` raises `ValueError` after the entry is already persisted.
-- **Effect:** every later catch-up or heal replays that entry, hits the same `ValueError`, and stops. Nothing catches it in the replay loop, so the node can stay stuck in `CATCHING_UP`.
-- **Fix:** validate the statement (printable ASCII, single line) before the WAL append, and catch errors per entry during replay so one bad entry can't block catch-up.
+### 4. There's one SQL transaction shared by every client
+- **Where:** `target_enterprise/src/sql.rs:533` (`BEGIN` sets the database-wide `tx_active`)
+- **Problem:** transaction state lives on the single shared `SqlDb`, not per session or per connection.
+- **Effect:** after one client runs `BEGIN`, writes from every other client (HTTP sessions, UDP, console, triad) join that transaction, and a `ROLLBACK` from any client discards everyone's writes. Uncommitted rows may also be persisted by `sync` before `COMMIT`.
+- **Fix:** tie the transaction to a session (store the owner, and refuse other clients' writes or queue them until it ends), add a timeout, and don't persist while a transaction is open.
+- `Status: Fixed — test: sql::tests::sql_upsert_compound_where_and_transactions, lived_net::tests::http_vault_guard_and_cron_endpoints_work — commit: 9e511b8`
 
-### 2. Controller API handlers don't catch the new `ValueError`
-- **Where:** `tools/triad_controller.py:1208` (`/api/sh`), `:563` and `:586` (reached from `/api/sql`)
-- **Problem:** user-supplied text goes to `send_shell_cmd`, which now raises `ValueError` on control characters, but the HTTP handlers don't catch it.
-- **Effect:** the request thread fails and the client gets a dropped connection instead of a clear error.
-- **Fix:** catch `ValueError` in the handlers and return `400 Bad Request` with a message.
+### 5. Concurrent triad writes can reach nodes in different orders
+- **Where:** `tools/triad_controller.py:616` onward (`execute_triad_sql` write path)
+- **Problem:** each write is sent to the nodes one by one *outside* `wal_lock`, and only the WAL append is locked. Two concurrent requests (the server is a `ThreadingHTTPServer`) can therefore reach node A as w1→w2 and node B as w2→w1, while the WAL records a third order.
+- **Effect:** for writes whose order matters (`UPDATE`, `INSERT OR REPLACE`), replicas silently diverge. The quorum check then flags one node as tampered and heals it.
+- **Fix:** hold one write lock across the whole sequence: validate, send to every node, then append to the WAL.
+- `Status: Fixed — test: tools/triad_controller.py --self-test — commit: 9e511b8`
 
-### 3. The login cooldown is counted in requests, not time
-- **Where:** `target_enterprise/src/lived_net.rs:1262` and `:1391` (`tick_login_cooldown`), `target_enterprise/src/shell.rs:479`
-- **Problem:** the 8-tick cooldown counts down by one on every non-login HTTP request.
-- **Effect:** any 8 unrelated requests (for example `GET /healthz`) clear the cooldown immediately, so it doesn't actually slow down repeated login attempts.
-- **Fix:** base the cooldown on the kernel's monotonic clock (for example, refuse logins until `now >= locked_until_ns`), not on request count.
+### 6. The login cooldown is now timer-based, but very short
+- **Where:** `target_enterprise_kernel/src/smp_hw.rs:1020` (tick) and `:786-791` (APIC timer: divide by 16, initial count 250,000)
+- **Problem:** the cooldown is 8 APIC timer ticks. At that timer setting each tick is a few milliseconds, so the whole cooldown is probably well under a second.
+- **Fix:** express the cooldown in seconds using the calibrated timer (the `apic_timer_cal` module), for example 30 s, doubling after each further failure.
+- `Status: Fixed — test: shell::tests::login_cooldown_expires_after_ticks_and_seed_defaults_for_boot_rotates_variants, lived_net::tests::http_service_isolation_role_profiles_and_login_rate_limiting_work — commit: 9e511b8`
 
-### 4. Service handlers still run inside the kernel (carried over)
-- **Where:** `target_enterprise/src/lived_net.rs` (9 call sites of `sh.db.exec`, `sh.exec_line`, `sh.fs.*`)
-- **Problem:** the new ring-3 (`CPL=3`) service stubs are progress, but the HTTP, SQL and shell handlers themselves are still called directly from kernel code. I didn't review the stub/mailbox path in detail.
-- **Fix:** move the handler logic itself behind the ring-3 mailbox, so the kernel only passes messages.
+### 7. The vault reuses the same keystream for every version of a secret
+- **Where:** `target_enterprise/src/shell.rs:2849` (`vault_derive_stream_and_mac(&self.seal_key, kname, b"")`) and `:4540`
+- **Problem:** the keystream depends only on the device key and the key name, so overwriting a secret encrypts the new value with the same keystream as the old one.
+- **Fix:** mix a per-write nonce or the row's `rev` into the derivation, store the nonce next to the ciphertext, and include it in the MAC.
+- `Status: Fixed — test: shell::tests::cuttle_vault_guard_and_chronos_apps_work — commit: 9e511b8`
 
 ---
 
-## Recommendation (not a specific bug)
+## Low priority
 
-### 5. Get the TLS 1.3 handshake code independently reviewed
-- **Where:** `target_enterprise/src/tls.rs`, the TLS handshake in `target_enterprise/src/lived_net.rs` (around `:1107`)
-- **Note:** the new X25519 code is a port of a well-known reference implementation and passes the RFC 7748 test vectors. I didn't complete a review of how the handshake uses it, though. Hand-written TLS is easy to get subtly wrong, so either use a vetted library such as `rustls` where the target allows it, or have this path reviewed specifically, including where ephemeral keys and randoms come from.
+### 8. Disks from pre-rebrand builds are reported as tampered
+- **Where:** `target_enterprise_kernel/src/banners_compose.rs:625` (`restore_shell_from_ahci`) and the new `CTTL*` disk magics
+- **Problem:** the disk signatures changed from `PRTS*` to `CTTL*`, and nothing recognizes the old ones. A disk written by an older build isn't all zeros and has an unrecognized signature, so it's reported as `SHELL resume REJECTED ... (tampered disk)` and its state is discarded.
+- **Fix:** either migrate `PRTS*` images once, or report an old or unrecognized format as such, distinct from a seal failure, so operators don't see a false tamper alarm.
+- `Status: Fixed — test: sql::tests::sql_partition_persistence_and_tamper_detection_work, shell::tests::fs_partition_persistence_and_multi_sector_files_work, qemu_smoke::tampered_ahci_seal_is_rejected_under_qemu — commit: 9e511b8`
+
+### 9. The TLS key zeroization may be optimized away
+- **Where:** `target_enterprise/src/lived_net.rs:1146` and `:1153` (`node_tls_secret = [0u8; 32]; let _ = ...`)
+- **Problem:** a plain assignment to a value that's never read again is a dead store the compiler is allowed to remove, so the secret may stay in memory.
+- **Fix:** zero with `core::ptr::write_volatile` in a loop followed by a compiler fence, or use the `zeroize` crate if `no_std` allows it.
+- `Status: Fixed — test: lived_net::tests::https_port_443_tls13_record_framer_roundtrip — commit: 9e511b8`
 
 ---
 
 ## Not reviewed this round
-- `target_enterprise/src/sql.rs` (64-row indexed SQL)
+- The per-request `CPL=3` hardware service hook, in detail
+- CuttleGuard lockdown and CuttleChronos (cron) logic beyond read-only checks
 - The UDP `:8081` triad protocol
-- The `CPL=3` mailbox execution path, in detail
 - `binmorph`
-
----
-
-## Resolution (All 5 Items Addressed & Verified)
-
-1. **Item 1 — Bad SQL write can poison the Triad WAL (`tools/triad_controller.py`)**:
-   - **Resolved**: `execute_triad_sql` now validates `is_printable_ascii_command(q)` before touching any node or WAL state, executes mutating SQL statements across online nodes *first*, and only appends to `self.wal_entries` / `triad_wal.json` if at least one online node succeeded without returning an `error:` prefix.
-   - Furthermore, both WAL replay loops (`bounce_and_morph_node` and `heal_and_remorph_node`) now validate `is_printable_ascii_command(stmt)` and wrap `self.send_shell_cmd(node, f"sql {stmt}")` in `try ... except Exception` so a corrupted on-disk WAL entry can never trap a node in `CATCHING_UP` or `HEALING`.
-
-2. **Item 2 — Controller API handlers don't catch `ValueError` (`tools/triad_controller.py`)**:
-   - **Resolved**: `TriadHttpHandler.do_GET` (`/sql`) and `TriadHttpHandler.do_POST` (`/sql`, `/api/sql`, and `/api/sh`) now pre-validate `is_printable_ascii_command(...)` and wrap `execute_triad_sql` / `send_shell_cmd` in `try ... except ValueError` blocks that return clean HTTP `400 Bad Request` responses (`{"ok": false, "error": "rejected: ..."}`).
-
-3. **Item 3 — Login cooldown is counted in requests, not time (`target_enterprise/src/lived_net.rs`, `target_enterprise/src/shell.rs`, `target_enterprise_kernel/src/smp_hw.rs`, `target_enterprise_kernel/src/main.rs`)**:
-   - **Resolved**: Removed `sh.tick_login_cooldown()` from `LivedNet::handle_http_request` so HTTP traffic (e.g. flooding `GET /healthz`) cannot advance or clear the brute-force login cooldown.
-   - Wired `sh.tick_login_cooldown()` into `smp_hw_tick_and_sync` (`target_enterprise_kernel/src/smp_hw.rs`) so the cooldown advances strictly on hardware Local APIC timer interrupts (`hw_irqs > sh.smp_irq_wakeups`).
-   - Added a regression test in `target_enterprise/src/lived_net.rs` proving that 32 `GET /healthz` requests leave `login_cooldown_ticks == 8` unchanged while 8 timer ticks clear it.
-
-4. **Item 4 — Service handlers still run inside the kernel (`target_enterprise/src/svc_runtime.rs`, `target_enterprise/src/shell.rs`, `target_enterprise/src/lived_net.rs`)**:
-   - **Resolved**: Extended `IpcMailbox` (`target_enterprise/src/svc_runtime.rs`) with bounded request/response staging (`req_path`, `req_body`, `last_status`, `last_resp_len`) and added `stage_mailbox_request` / `complete_mailbox_response` on `ServiceSupervisor`.
-   - Added `OsShell::dispatch_mailbox_op` (`target_enterprise/src/shell.rs`), which enforces `mediate_endpoint`, stages the request into the target service's `IpcMailbox` (`svc-http`, `svc-sql`, or `svc-sh`), invokes the isolated service stub (`CPL=3` on bare-metal x86-64), verifies `req_seq`, `last_op`, `resp_tag`, and `canary != 0`, and executes the handler strictly from the staged mailbox buffers.
-   - Replaced all 9 direct `sh.db.exec`, `sh.exec_line`, and `sh.fs.*` call sites in `LivedNet::handle_http_request` and `LivedNet::handle_udp_triad` (`target_enterprise/src/lived_net.rs`) with `sh.dispatch_mailbox_op(...)`.
-
-5. **Item 5 — Independent TLS 1.3 handshake & ephemeral key derivation review (`target_enterprise/src/lived_net.rs`, `target_enterprise/src/tls.rs`)**:
-   - **Resolved (Critical Vulnerability Found & Fixed)**: Auditing `LivedNet::process_tls13_slot` revealed that `ephemeral_scalar` (the server's X25519 private key) was previously derived via `hmac_sha256(&TLS_SERVER_PUBKEY, &ephemeral_random)`. Because `TLS_SERVER_PUBKEY` is a public constant and `ephemeral_random` is transmitted in cleartext in `ServerHello.random`, a passive observer could recompute the server's ephemeral X25519 private key and decrypt the session!
-   - **Fix**: `LivedNet::process_tls13_slot` now derives a per-connection secret `conn_prk` via `hmac_sha256` keyed by the node's private `self.auth_key` mixed with `sh.seal_key` (never transmitted on the wire) over `client_pub || client_random || tls_handshake_seq || ticks || boots || mac || idx`. It then derives `ephemeral_random` and `ephemeral_scalar` using domain-separated HKDF labels (`"cuttle-srv-rand"` and `"cuttle-x25519-sk"`), and zeroizes `node_tls_secret`, `conn_prk`, and `ephemeral_scalar` immediately after computing the ECDHE shared secret.
-   - Added a Red Team test assertion in `target_enterprise/src/lived_net.rs` verifying that `hmac_sha256(&TLS_SERVER_PUBKEY, &parsed_sh.server_random)` cannot recover `parsed_sh.server_pubkey`.
-
