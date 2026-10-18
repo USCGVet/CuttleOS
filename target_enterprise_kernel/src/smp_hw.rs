@@ -1,14 +1,14 @@
 //! Hardware Multi-Core SMP (`INIT`/`SIPI` AP bringup via Local APIC MMIO) and
-//! Hardware Multi-Stack Kernel Thread Context Switching (`proteus_switch_context`).
+//! Hardware Multi-Stack Kernel Thread Context Switching (`cuttle_switch_context`).
 //!
 //! - Wakes secondary x86-64 hardware cores (`AP 1..=3`) from `Wait-for-SIPI` at
 //!   physical page `0x8000` (16-bit Real Mode -> 32-bit Protected Mode -> 64-bit
 //!   Long Mode) onto dedicated 16 KiB per-CPU stacks (`AP_STACKS`).
-//! - Secondary cores execute `proteus_ap_entry` concurrently in 64-bit Long Mode,
+//! - Secondary cores execute `cuttle_ap_entry` concurrently in 64-bit Long Mode,
 //!   pulling parallel work items from a lock-free atomic ring buffer (`SMP_WORK_RING`).
 //! - Implements true hardware `%rsp` context switching (`0x8200`) across 4 dedicated
 //!   16 KiB kernel thread stacks (`KTHREAD_STACKS`) for `init`, `kthreadd-net`,
-//!   `kthreadd-wal`, and `proteus-sh`/`worker`.
+//!   `kthreadd-wal`, and `cuttle-sh`/`worker`.
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -53,7 +53,7 @@ const SMP_DOORBELL_VECTOR: u32 = 0x41;
 
 /// Physical and identity-mapped virtual address of the AP startup trampoline page.
 const TRAMPOLINE_PAGE_PHYS: u64 = 0x8000;
-/// Physical address of the 27-byte `proteus_switch_context` routine.
+/// Physical address of the 27-byte `cuttle_switch_context` routine.
 const SWITCH_CONTEXT_VA: u64 = 0x8200;
 /// Physical address of the 5-entry Runtime 64-bit GDT.
 const RUNTIME_GDT_PHYS: u64 = 0x8240;
@@ -116,7 +116,7 @@ static KTHREAD_STACKS: [HardwareStack; NUM_KTHREADS] = [
     HardwareStack::new(),
 ];
 
-/// Per-AP boot completion flags set by `proteus_ap_entry` once in 64-bit Long Mode.
+/// Per-AP boot completion flags set by `cuttle_ap_entry` once in 64-bit Long Mode.
 static AP_BOOT_READY: [AtomicBool; MAX_SMP_CPUS] = [
     AtomicBool::new(true),
     AtomicBool::new(false),
@@ -295,7 +295,7 @@ unsafe fn invoke_cpu_sleep_hlt() {
 /// (`AP 1..=3`) after completing the 16-bit -> 32-bit -> 64-bit trampoline at `0x8000`.
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn proteus_ap_entry(cpu_id: u64) -> ! {
+pub extern "C" fn cuttle_ap_entry(cpu_id: u64) -> ! {
     let idx = (cpu_id as usize) & (MAX_SMP_CPUS - 1);
 
     // 1. Load the shared higher-half 64-bit Runtime GDT (`CS=0x08, SS=0x10`) and 256-entry Runtime IDT,
@@ -342,14 +342,14 @@ pub extern "C" fn proteus_ap_entry(cpu_id: u64) -> ! {
 /// Saves `rbp, rbx, r12, r13, r14, r15` and `%rsp` into `*old_rsp_ptr`, loads
 /// `%rsp` from `*new_rsp_ptr`, pops `r15..rbp`, and `ret`s onto the new stack.
 #[inline(never)]
-// SAFETY: Caller must ensure `pa_to_va(0x8200)` contains the initialized `proteus_switch_context`
+// SAFETY: Caller must ensure `pa_to_va(0x8200)` contains the initialized `cuttle_switch_context`
 // machine code with `PTE_NX` cleared and that `old_rsp_ptr` and `new_rsp_ptr` point to valid
 // 8-byte stack-pointer slots whose target stacks follow `[r15, r14, r13, r12, rbx, rbp, rip]`.
 unsafe fn invoke_switch_context(old_rsp_ptr: *mut u64, new_rsp_ptr: *const u64) {
     let code_va = pa_to_va(SWITCH_CONTEXT_VA) as usize;
     let fn_ptr: unsafe extern "C" fn(*mut u64, *const u64) =
         // SAFETY: `pa_to_va(0x8200)` is mapped executable by `make_va_executable` and populated
-        // with the 27-byte System V AMD64 `proteus_switch_context` routine before any call.
+        // with the 27-byte System V AMD64 `cuttle_switch_context` routine before any call.
         unsafe { core::mem::transmute(code_va) };
     // SAFETY: Caller guarantees both stack pointer slots and target hardware stacks are valid.
     unsafe { fn_ptr(old_rsp_ptr, new_rsp_ptr) };
@@ -708,7 +708,7 @@ unsafe fn init_runtime_idt_and_isrs() {
 }
 
 /// Initialize the 4 hardware kernel thread stacks (`KTHREAD_STACKS[0..4]`) and
-/// install the 27-byte `proteus_switch_context` routine at `pa_to_va(0x8200)`.
+/// install the 27-byte `cuttle_switch_context` routine at `pa_to_va(0x8200)`.
 // SAFETY: Caller must execute at CPL=0 after `make_va_executable(pa_to_va(0x8200))` has cleared `PTE_NX`.
 unsafe fn init_kthread_stacks() {
     // 27-byte System V AMD64 context switcher at 0x8200:
@@ -889,10 +889,10 @@ pub(crate) fn smp_hw_init() -> usize {
         i += 1;
     }
 
-    // 3. Populate shared BSP control registers and `proteus_ap_entry` address in mailbox `0x8100..0x8130`.
+    // 3. Populate shared BSP control registers and `cuttle_ap_entry` address in mailbox `0x8100..0x8130`.
     // SAFETY: Running at CPL=0; `read_bsp_control_regs` reads CR0/CR3/CR4/EFER without side effects.
     let (cr0, cr3, cr4, efer) = unsafe { read_bsp_control_regs() };
-    let ap_entry_va = proteus_ap_entry as *const () as usize as u64;
+    let ap_entry_va = cuttle_ap_entry as *const () as usize as u64;
     // SAFETY: Offsets `0x100..0x130` lie within the mapped 4 KiB trampoline page at `0x8000`.
     unsafe {
         core::ptr::write_volatile(tramp_va.add(0x100).cast::<u32>(), cr3);
@@ -967,7 +967,7 @@ pub(crate) fn smp_hw_init() -> usize {
     }
 
     // 5. Restore the original page-table entry at `0x8000` now that all online APs are executing
-    //    `proteus_ap_entry` in higher-half `.text`.
+    //    `cuttle_ap_entry` in higher-half `.text`.
     // SAFETY: `saved_pte_ptr` is the PTE slot modified by `map_temp_identity_trampoline`.
     unsafe {
         core::ptr::write_volatile(saved_pte_ptr, orig_pte);

@@ -15,7 +15,7 @@
 //! module agreement with the entry's JSON fields.
 
 use anyhow::{bail, Context, Result};
-use proteus_contracts::{
+use cuttle_contracts::{
     AttestTlv, Base64, ATTEST_TLV_TAG_CYCLE, ATTEST_TLV_TAG_MODULE, ATTEST_TLV_TAG_SEED,
 };
 use target_enterprise::attest_tlv::AttestTlvImpl;

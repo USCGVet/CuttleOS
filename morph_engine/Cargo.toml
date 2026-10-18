@@ -1,5 +1,5 @@
 [package]
-name = "proteus-morph-engine"
+name = "cuttle-morph-engine"
 edition.workspace = true
 version.workspace = true
 authors.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 description = "Factory orchestrator. Cycle loop: synthesize -> diversify -> verify -> sign -> deploy."
 
 [lib]
-name = "proteus_morph_engine"
+name = "cuttle_morph_engine"
 path = "src/lib.rs"
 
 [[bin]]
@@ -15,14 +15,14 @@ name = "morph"
 path = "src/main.rs"
 
 [dependencies]
-proteus-diversifier = { path = "../diversifier" }
+cuttle-diversifier = { path = "../diversifier" }
 # Host-side use of contract-locked TLV + Base64 codecs (TASK-102).
 # The factory embeds extension fields built by the same pure codecs
 # the enterprise target proves under morph — one wire surface.
-proteus-contracts = { path = "../contracts" }
+cuttle-contracts = { path = "../contracts" }
 target_enterprise = { path = "../target_enterprise" }
 # TASK-124: gadget churn measurement for diversity evidence on attest entries.
-proteus-mtd-metrics = { path = "../mtd_metrics" }
+cuttle-mtd-metrics = { path = "../mtd_metrics" }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
 ed25519-dalek = { workspace = true }

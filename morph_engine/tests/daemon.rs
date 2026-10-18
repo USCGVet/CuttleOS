@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use proteus_morph_engine::{
+use cuttle_morph_engine::{
     daemon::{
         run_daemon_with, Clock, DaemonArgs, FakeClock, WorkRunner, DAEMON_LOG,
         DEFAULT_HEARTBEAT_SECS, DEFAULT_MAX_CYCLE_SECS, DEFAULT_POLL_SECS,
@@ -36,7 +36,7 @@ use proteus_morph_engine::{
 /// even when the prior run left behind a stale daemon.log.
 fn fixture(label: &str) -> PathBuf {
     let base = std::env::temp_dir().join(format!(
-        "proteus-daemon-it-{}-{}",
+        "cuttle-daemon-it-{}-{}",
         label,
         std::process::id()
     ));
@@ -165,7 +165,7 @@ fn daemon_max_iters_3_runs_3_module_cycles() {
         "[modules.lib]\n\
          priority = 1\n\
          max_age_secs = 0\n\
-         target_dir = \"/tmp/proteus-fixture-src\"\n",
+         target_dir = \"/tmp/cuttle-fixture-src\"\n",
     );
 
     let args = DaemonArgs {
@@ -231,7 +231,7 @@ fn daemon_survives_first_cycle_failure_and_continues() {
         "[modules.lib]\n\
          priority = 1\n\
          max_age_secs = 0\n\
-         target_dir = \"/tmp/proteus-fixture-src\"\n",
+         target_dir = \"/tmp/cuttle-fixture-src\"\n",
     );
 
     let args = DaemonArgs {
@@ -693,7 +693,7 @@ fn default_constants_match_task_brief() {
 
 #[test]
 fn system_clock_sleeps_minimum_duration() {
-    use proteus_morph_engine::daemon::SystemClock;
+    use cuttle_morph_engine::daemon::SystemClock;
     let c = SystemClock;
     let t1 = c.now_unix();
     c.sleep(Duration::from_millis(1));

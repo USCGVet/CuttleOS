@@ -25,7 +25,7 @@ exclude = ["target_enterprise_kernel", "factory_builder_pkg"]
 [workspace.package]
 edition = "2024"
 version = "0.0.1"
-authors = ["Proteus Research"]
+authors = ["Cuttle Research"]
 license = "Apache-2.0"
 
 [workspace.dependencies]

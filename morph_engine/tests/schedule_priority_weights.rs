@@ -8,7 +8,7 @@
 //! So at elapsed = 400s, the priority-10 module is due and the
 //! priority-1 module is not.
 
-use proteus_morph_engine::scheduler::{
+use cuttle_morph_engine::scheduler::{
     pick_next_at, ModuleConfig, ModuleState, SchedulerConfig, SchedulerState,
 };
 use std::collections::BTreeMap;

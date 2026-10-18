@@ -1,4 +1,4 @@
-//! Golden output corpus for proteus-target-minimal.
+//! Golden output corpus for cuttle-target-minimal.
 //!
 //! This integration test is the load-bearing semantic check that every
 //! morph candidate must pass. It loads `golden.txt` (compiled in via
@@ -6,17 +6,17 @@
 //! locked function on the candidate, and asserts byte-for-byte equality.
 //!
 //! It also drives the property-test harness defined in
-//! `proteus_contracts::harness` against the candidate's `DemoHash` and
+//! `cuttle_contracts::harness` against the candidate's `DemoHash` and
 //! `DemoAead` impls — the verifier downstream relies on this test target
 //! compiling and passing as proof that the candidate honours the trait
 //! contract.
 
-use proteus_contracts::harness::{
+use cuttle_contracts::harness::{
     check_aead, check_hash, check_signature, check_signature_thorough, check_syscall_dispatch,
     Verdict,
 };
-use proteus_contracts::{Aead, Hash, SignatureVerify, SyscallDispatch};
-use proteus_target_minimal::{
+use cuttle_contracts::{Aead, Hash, SignatureVerify, SyscallDispatch};
+use cuttle_target_minimal::{
     derive_byte, feistel_mix, fletcher32, fletcher_pair, DemoAead, DemoErrno, DemoHash,
     DemoSignatureVerify, DemoSyscallDispatch,
 };
@@ -359,7 +359,7 @@ fn demo_sigverify_satisfies_harness_invariants() {
     let mut wrong_pk = pk;
     wrong_pk[0] ^= 0x01;
 
-    let msg: &[u8] = b"proteus-harness-msg";
+    let msg: &[u8] = b"cuttle-harness-msg";
     let lo = fletcher_pair(&pk, msg);
     let hi = fletcher_pair(msg, &pk);
     let mut sig = [0u8; <DemoSignatureVerify as SignatureVerify>::SIGNATURE_LEN];

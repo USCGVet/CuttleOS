@@ -19,7 +19,7 @@
 //!    ext_type + 2 for ext_len + 2 for inner list_len + 1 for name_len
 //!    + 2 for the protocol name `"h2"`).
 
-use proteus_contracts::Tls13Server;
+use cuttle_contracts::Tls13Server;
 use target_enterprise::tls::{
     build_server_hello, hkdf_expand_label, hkdf_extract, parse_client_hello, EXT_KEY_SHARE,
     EXT_SUPPORTED_VERSIONS, NAMED_GROUP_X25519,

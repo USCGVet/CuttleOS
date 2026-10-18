@@ -39,8 +39,8 @@
 #![allow(clippy::needless_range_loop)]
 
 #[cfg(test)]
-use proteus_contracts::JFS_INODES_PER_SECTOR;
-use proteus_contracts::{
+use cuttle_contracts::JFS_INODES_PER_SECTOR;
+use cuttle_contracts::{
     JournalFs, JfsDirEntry, JfsError, JfsInode, JfsSuperblock, JFS_DE_OFF_INODE, JFS_DE_OFF_NAME,
     JFS_DE_OFF_NAME_LEN, JFS_DIRENT_LEN, JFS_DIRENT_MAX_NAME, JFS_INODE_LEN, JFS_INODE_MAGIC,
     JFS_INO_OFF_EXTENT0, JFS_INO_OFF_EXTENT1, JFS_INO_OFF_EXTENT2,
@@ -161,13 +161,13 @@ pub fn parse_superblock(buf: &[u8]) -> Result<JfsSuperblock, JfsError> {
 /// Encode a superblock into the first [`JFS_SB_LEN`] bytes of `out`.
 ///
 /// **TASK-164:** requires a [`CapProof`] minted under
-/// [`proteus_contracts::caps::DURABLE_FS_WRITE`]. This is the first
+/// [`cuttle_contracts::caps::DURABLE_FS_WRITE`]. This is the first
 /// JFS durable-write gate (superblock is the image root of trust).
 /// Inode/dirent/body encodes remain open residual.
 pub fn encode_superblock(
     sb: &JfsSuperblock,
     out: &mut [u8],
-    _proof: proteus_contracts::CapProof,
+    _proof: cuttle_contracts::CapProof,
 ) -> Result<(), JfsError> {
     let _ = _proof;
     if out.len() < JFS_SB_LEN {
@@ -184,19 +184,19 @@ pub fn encode_superblock(
     Ok(())
 }
 
-/// Mint a CapProof for [`proteus_contracts::caps::DURABLE_FS_WRITE`]
+/// Mint a CapProof for [`cuttle_contracts::caps::DURABLE_FS_WRITE`]
 /// when `held` includes that bit (TASK-164).
 #[inline]
 pub fn durable_fs_proof(
     held: u64,
-) -> Result<proteus_contracts::CapProof, proteus_contracts::CapError> {
-    proteus_contracts::mint_cap_proof(held, proteus_contracts::caps::DURABLE_FS_WRITE)
+) -> Result<cuttle_contracts::CapProof, cuttle_contracts::CapError> {
+    cuttle_contracts::mint_cap_proof(held, cuttle_contracts::caps::DURABLE_FS_WRITE)
 }
 
 /// Privileged self-grant for fixtures / banner / tests (TASK-164).
 #[inline]
-pub fn durable_fs_proof_init() -> proteus_contracts::CapProof {
-    durable_fs_proof(proteus_contracts::caps::DURABLE_FS_WRITE)
+pub fn durable_fs_proof_init() -> cuttle_contracts::CapProof {
+    durable_fs_proof(cuttle_contracts::caps::DURABLE_FS_WRITE)
         .expect("DURABLE_FS_WRITE self-grant must succeed")
 }
 
@@ -241,11 +241,11 @@ pub fn parse_inode(buf: &[u8], ino: u32) -> Result<JfsInode, JfsError> {
 /// Encode one inode into a 32-byte buffer.
 ///
 /// **TASK-167:** requires [`CapProof`] under
-/// [`proteus_contracts::caps::DURABLE_FS_WRITE`] (same bit as superblock).
+/// [`cuttle_contracts::caps::DURABLE_FS_WRITE`] (same bit as superblock).
 pub fn encode_inode(
     inode: &JfsInode,
     out: &mut [u8],
-    _proof: proteus_contracts::CapProof,
+    _proof: cuttle_contracts::CapProof,
 ) -> Result<(), JfsError> {
     let _ = _proof;
     if out.len() < JFS_INODE_LEN {
@@ -286,14 +286,14 @@ pub fn parse_dirent(buf: &[u8]) -> Result<Option<(u32, &[u8])>, JfsError> {
 /// Encode one directory entry.
 ///
 /// **TASK-168:** requires [`CapProof`] under
-/// [`proteus_contracts::caps::DURABLE_FS_WRITE`] (namespace mutation is
+/// [`cuttle_contracts::caps::DURABLE_FS_WRITE`] (namespace mutation is
 /// durable when the image hits media). File *body* sector writes remain
 /// open residual (no single encode helper for arbitrary payloads).
 pub fn encode_dirent(
     ino: u32,
     name: &[u8],
     out: &mut [u8],
-    _proof: proteus_contracts::CapProof,
+    _proof: cuttle_contracts::CapProof,
 ) -> Result<(), JfsError> {
     let _ = _proof;
     if out.len() < JFS_DIRENT_LEN {
@@ -465,9 +465,9 @@ pub const FIXTURE_SECTORS: usize = 4;
 pub const FIXTURE_BYTES: usize = FIXTURE_SECTORS * JFS_SECTOR_SIZE;
 
 /// Body of `/hello.txt` in the banner fixture.
-pub const HELLO_BODY: &[u8] = b"hello, proteus!\n";
+pub const HELLO_BODY: &[u8] = b"hello, cuttle!\n";
 /// Expected length of [`HELLO_BODY`].
-pub const HELLO_BODY_LEN: usize = 16;
+pub const HELLO_BODY_LEN: usize = 15;
 
 /// Build the locked banner fixture into `out` (must be ≥ [`FIXTURE_BYTES`]).
 /// Returns the number of bytes written ([`FIXTURE_BYTES`]).
@@ -551,7 +551,7 @@ pub fn fletcher32_body(data: &[u8]) -> u32 {
 /// banner can assert without recomputing a golden each morph.
 ///
 /// Verified by `hello_body_fletcher_locked` unit test.
-pub const HELLO_BODY_FLETCHER32: u32 = 0xaa3c_e1c0;
+pub const HELLO_BODY_FLETCHER32: u32 = 0x7e76_bd63;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -560,7 +560,7 @@ pub const HELLO_BODY_FLETCHER32: u32 = 0xaa3c_e1c0;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::JournalFs;
+    use cuttle_contracts::JournalFs;
 
     fn fixture() -> [u8; FIXTURE_BYTES] {
         let mut img = [0u8; FIXTURE_BYTES];
@@ -659,9 +659,9 @@ mod tests {
     fn encode_superblock_requires_durable_fs_cap() {
         // TASK-164: unprivileged held mask cannot mint FS durable proof.
         assert!(durable_fs_proof(0).is_err());
-        assert!(durable_fs_proof(proteus_contracts::caps::BLOCK_WRITE).is_err());
-        assert!(durable_fs_proof(proteus_contracts::caps::DURABLE_WAL_WRITE).is_err());
-        let p = durable_fs_proof(proteus_contracts::caps::DURABLE_FS_WRITE).unwrap();
+        assert!(durable_fs_proof(cuttle_contracts::caps::BLOCK_WRITE).is_err());
+        assert!(durable_fs_proof(cuttle_contracts::caps::DURABLE_WAL_WRITE).is_err());
+        let p = durable_fs_proof(cuttle_contracts::caps::DURABLE_FS_WRITE).unwrap();
         let sb = JfsSuperblock {
             version: JFS_VERSION,
             block_size: JFS_SECTOR_SIZE as u32,

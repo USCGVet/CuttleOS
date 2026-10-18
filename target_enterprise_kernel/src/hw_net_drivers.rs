@@ -14,10 +14,10 @@ pub(crate) use crate::*;
 ///   `VIRTIO_NET_HW probe OK slot=N mac=…`  (RX peer)
 ///   `VIRTIO_NET_HW tx OK bytes=76`         (12-byte hdr + 64-byte eth)
 ///   `VIRTIO_NET_HW rx OK bytes=N`          (used.len from RX virtqueue)
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_virtio_net_hw() {
-    use proteus_contracts::{
+    use cuttle_contracts::{
         Pci, PciAddress, PciBar, PciConfigBus, PCI_CFG_OFFSET_COMMAND_STATUS,
         PCI_CFG_OFFSET_VENDOR_DEVICE, PCI_COMMAND_BUS_MASTER,
     };
@@ -395,10 +395,10 @@ pub(crate) fn virtio_legacy_net_hub_roundtrip(rx_io: u16, tx_io: u16, tx_mac: &[
 
 /// Banner: `E1000_HW probe OK slot=N mac=…` then `E1000_HW tx OK bytes=64`
 /// (TASK-116 probe + TASK-120 real TX descriptor ring + DD completion).
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_e1000_hw() {
-    use proteus_contracts::{
+    use cuttle_contracts::{
         Pci, PciAddress, PciBar, PciConfigBus, PCI_CFG_OFFSET_COMMAND_STATUS,
         PCI_CFG_OFFSET_VENDOR_DEVICE, PCI_COMMAND_BUS_MASTER, E1000_CTRL_RST,
         E1000_CTRL_SLU, E1000_DESC_STA_DD, E1000_EEPROM_MAC_WORD0,
@@ -740,7 +740,7 @@ pub(crate) fn banner_e1000_hw() {
         mmio_write32(rx_bar0 + E1000_REG_CTRL as u64, ctrl | E1000_CTRL_SLU);
     }
 
-    use proteus_contracts::{
+    use cuttle_contracts::{
         E1000_RCTL_BAM, E1000_RCTL_EN, E1000_RCTL_SECRC, E1000_REG_RDBAH, E1000_REG_RDBAL,
         E1000_REG_RDH, E1000_REG_RDLEN, E1000_REG_RDT, E1000_REG_RCTL, E1000_RX_DESC_LEN,
     };

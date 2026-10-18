@@ -1,5 +1,5 @@
 //! One-shot generator for DemoSignatureVerify golden vectors. Run with
-//! `cargo run -p proteus-target-minimal --example gen_sigverify_goldens`.
+//! `cargo run -p cuttle-target-minimal --example gen_sigverify_goldens`.
 //! Prints lines suitable for appending to `golden.txt`. NOT part of the
 //! morph contract — this file is build-system scaffolding.
 //!
@@ -9,7 +9,7 @@
 //! and emits accept + reject (tampered-sig, wrong-msg, wrong-pubkey)
 //! golden lines.
 
-use proteus_target_minimal::fletcher_pair;
+use cuttle_target_minimal::fletcher_pair;
 
 fn hex(bytes: &[u8]) -> String {
     if bytes.is_empty() {
@@ -43,8 +43,8 @@ fn main() {
     let messages: &[(&str, &[u8])] = &[
         ("empty", b""),
         ("onebyte", b"A"),
-        ("medium", b"proteus-sigverify-demo"),
-        ("long", b"Proteus morphs every cycle; the contract survives.--END"),
+        ("medium", b"cuttle-sigverify-demo"),
+        ("long", b"Cuttle morphs every cycle; the contract survives.--END"),
     ];
 
     // demo_sigverify_accept lines: legitimate (pk, msg, sig) triples.
@@ -61,7 +61,7 @@ fn main() {
     // demo_sigverify_reject_tampered_sig: same (pk, msg) but with a
     // single bit flipped somewhere in the middle of the signature.
     {
-        let msg: &[u8] = b"proteus-sigverify-demo";
+        let msg: &[u8] = b"cuttle-sigverify-demo";
         let mut sig = sign(&pk, msg);
         sig[20] ^= 0x40;
         println!(
@@ -85,7 +85,7 @@ fn main() {
     // demo_sigverify_reject_wrong_msg: legitimate signature over msgA
     // presented against msgB (one-byte mutation of msgA).
     {
-        let msg_a: &[u8] = b"proteus-sigverify-demo";
+        let msg_a: &[u8] = b"cuttle-sigverify-demo";
         let mut msg_b = msg_a.to_vec();
         msg_b[0] ^= 0x01;
         let sig = sign(&pk, msg_a);
@@ -100,7 +100,7 @@ fn main() {
     // demo_sigverify_reject_wrong_pubkey: signature legit under pk,
     // but verifier presented wrong_pk.
     {
-        let msg: &[u8] = b"proteus-sigverify-demo";
+        let msg: &[u8] = b"cuttle-sigverify-demo";
         let sig = sign(&pk, msg);
         println!(
             "demo_sigverify_reject_wrong_pubkey {} {} {}",

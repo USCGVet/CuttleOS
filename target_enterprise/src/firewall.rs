@@ -45,7 +45,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     FilterAction, FilterRule, FilterRuleError, Ipv4PacketView, PacketFilter, Verdict,
     FW_PORT_ANY, FW_PROTO_ANY,
 };
@@ -111,7 +111,7 @@ pub const fn cidr_match(rule_ip: [u8; 4], rule_mask: u8, packet_ip: [u8; 4]) -> 
 /// Trait-free helpers attached to the contract type so callers don't
 /// need to bring in a separate module for the math. None of the
 /// helpers are part of the locked surface (they're not in
-/// `proteus_contracts`).
+/// `cuttle_contracts`).
 pub trait FilterRuleExt {
     fn validate(&self) -> Result<(), FilterRuleError>;
     fn mask_score(&self) -> u16;
@@ -383,7 +383,7 @@ pub fn apply_table_with_default<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::{IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP};
+    use cuttle_contracts::{IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP};
 
     fn pkt(
         src_ip: [u8; 4],

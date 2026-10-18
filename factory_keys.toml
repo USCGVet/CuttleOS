@@ -1,4 +1,4 @@
-# Proteus M-of-N federation public keyset (2-of-3 threshold).
+# Cuttle M-of-N federation public keyset (2-of-3 threshold).
 #
 # `primary` corresponds to `factory_signing_key.bin` at the workspace root.
 # `placeholder-a` and `placeholder-b` are deterministic test signers used by

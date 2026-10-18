@@ -4,14 +4,14 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     IoPort, Serial16550, SERIAL_COM1, SERIAL_DIVISOR_HI_38400, SERIAL_DIVISOR_LO_38400,
     SERIAL_FCR_INIT, SERIAL_FCR_OFF, SERIAL_IER_OFF, SERIAL_INIT_WRITES, SERIAL_LCR_8N1,
     SERIAL_LCR_DLAB, SERIAL_LCR_OFF, SERIAL_LSR_OFF, SERIAL_LSR_THRE, SERIAL_MCR_INIT,
     SERIAL_MCR_OFF,
 };
 #[cfg(test)]
-use proteus_contracts::{SERIAL_COM2, SERIAL_LSR_DR};
+use cuttle_contracts::{SERIAL_COM2, SERIAL_LSR_DR};
 
 /// Stateless 16550 codec.
 pub struct Serial16550Impl;
@@ -147,7 +147,7 @@ impl IoPort for RecordingSerialPort {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::Serial16550;
+    use cuttle_contracts::Serial16550;
 
     #[test]
     fn constants() {

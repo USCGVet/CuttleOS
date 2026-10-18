@@ -283,7 +283,7 @@ fn default_stack_pad_off_in_experiment() {
         }
         let body = std::fs::read_to_string(&p).expect("read candidate");
         assert!(
-            !body.contains("__proteus_stack_pad_"),
+            !body.contains("__cuttle_stack_pad_"),
             "candidate {} must not contain stack pads when stack_pad_enabled=false",
             p.display()
         );
@@ -477,7 +477,7 @@ fn boot_each_cycle_is_noop_under_fast_mode() {
     );
 }
 
-/// Real-mode, opt-in via `PROTEUS_BOOT_EACH_CYCLE_TEST=1`. Drives a
+/// Real-mode, opt-in via `CUTTLE_BOOT_EACH_CYCLE_TEST=1`. Drives a
 /// 2-cycle real run against `target_enterprise/tls` with
 /// `--boot-each-cycle`, then asserts every accepted cycle's
 /// `cycles.jsonl` record carries a 64-hex-char `serial_log_sha256`
@@ -498,9 +498,9 @@ fn boot_each_cycle_is_noop_under_fast_mode() {
 ///     (e.g. clean checkout without the out-of-workspace crates).
 #[test]
 fn boot_each_cycle_real_mode_captures_per_cycle_serial_logs() {
-    if std::env::var("PROTEUS_BOOT_EACH_CYCLE_TEST").as_deref() != Ok("1") {
+    if std::env::var("CUTTLE_BOOT_EACH_CYCLE_TEST").as_deref() != Ok("1") {
         eprintln!(
-            "SKIP: PROTEUS_BOOT_EACH_CYCLE_TEST != 1; set the env var to run the 2-cycle \
+            "SKIP: CUTTLE_BOOT_EACH_CYCLE_TEST != 1; set the env var to run the 2-cycle \
              real-mode boot-each-cycle test (requires QEMU + nightly toolchain + several minutes)"
         );
         return;
@@ -616,8 +616,8 @@ fn boot_each_cycle_real_mode_captures_per_cycle_serial_logs() {
             // qemu_boot::boot_and_capture call before we got here.
             let s = String::from_utf8_lossy(&bytes);
             assert!(
-                s.contains("PROTEUS-TE HALT"),
-                "captured serial log at {} missing PROTEUS-TE HALT",
+                s.contains("CUTTLE-TE HALT"),
+                "captured serial log at {} missing CUTTLE-TE HALT",
                 p.display()
             );
             log_count += 1;

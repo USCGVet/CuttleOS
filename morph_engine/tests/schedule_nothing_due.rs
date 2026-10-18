@@ -2,7 +2,7 @@
 //! window), the scheduler must return None so `morph next` exits with
 //! EX_NOINPUT (64). This is the "factory should sit idle" path.
 
-use proteus_morph_engine::scheduler::{
+use cuttle_morph_engine::scheduler::{
     pick_next_at, ModuleConfig, ModuleState, SchedulerConfig, SchedulerState, EX_NOINPUT,
 };
 use std::collections::BTreeMap;

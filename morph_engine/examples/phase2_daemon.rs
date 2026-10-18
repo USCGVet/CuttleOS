@@ -25,7 +25,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use proteus_morph_engine::{run_bundle, BundleCycleArgs, SynthesizerKind};
+use cuttle_morph_engine::{run_bundle, BundleCycleArgs, SynthesizerKind};
 
 const DEFAULT_MODULES: &[&str] = &[
     "tls", "wal", "iommu", "net", "nvme", "tcp", "http", "dns", "icmp", "shell", "lived_net",
@@ -62,7 +62,7 @@ fn spawn_qemu(img: &Path, work: &Path, serial_log: &Path) -> Result<std::process
         fs::write(&ahd, vec![0u8; 1 << 20])?;
     }
     let key_path = work.join("device_secret_key.bin");
-    let _ = proteus_morph_engine::durable_seal::load_or_generate_device_seal_key(&key_path)?;
+    let _ = cuttle_morph_engine::durable_seal::load_or_generate_device_seal_key(&key_path)?;
     let qemu = r"C:\Program Files\qemu\qemu-system-x86_64.exe";
     let qemu = if Path::new(qemu).exists() { qemu.to_string() } else { "qemu-system-x86_64".to_string() };
     let child = Command::new(&qemu)
@@ -82,8 +82,8 @@ fn spawn_qemu(img: &Path, work: &Path, serial_log: &Path) -> Result<std::process
         .arg("-netdev").arg("hubport,id=e1,hubid=2")
         .arg("-device").arg("e1000,netdev=e1")
         .arg("-drive").arg(format!("if=none,id=nvme0,format=raw,file={}", work.join("nvme0.img").display()))
-        .arg("-device").arg("nvme,drive=nvme0,serial=PROTEUS-NVME-HW")
-        .arg("-fw_cfg").arg(format!("name=opt/proteus_device_key,file={}", key_path.display()))
+        .arg("-device").arg("nvme,drive=nvme0,serial=CUTTLE-NVME-HW")
+        .arg("-fw_cfg").arg(format!("name=opt/cuttle_device_key,file={}", key_path.display()))
         .arg("-serial").arg(format!("file:{}", serial_log.display()))
         .arg("-display").arg("none")
         .arg("-no-reboot")
@@ -99,7 +99,7 @@ fn wait_for_marker(log: &Path, timeout: Duration) -> Option<String> {
     let start = Instant::now();
     while start.elapsed() < timeout {
         if let Ok(s) = fs::read_to_string(log) {
-            for marker in ["PROTEUS-TE HALT", "PANIC"] {
+            for marker in ["CUTTLE-TE HALT", "PANIC"] {
                 if s.contains(marker) {
                     return Some(marker.to_string());
                 }
@@ -245,7 +245,7 @@ fn real_main() -> Result<()> {
         // Stage 3: boot rotation against the persistent continuity disk.
         let boot_t = Instant::now();
         let serial = work.join(format!("boot_c{}.log", cycle));
-        // Stale logs from prior runs contain "PROTEUS-TE HALT" and would
+        // Stale logs from prior runs contain "CUTTLE-TE HALT" and would
         // make wait_for_marker return instantly — always boot into a
         // fresh file.
         let _ = fs::remove_file(&serial);
@@ -257,8 +257,8 @@ fn real_main() -> Result<()> {
 
         let log = fs::read_to_string(&serial).unwrap_or_default();
         let continuity = extract_continuity(&log).unwrap_or_else(|| "none".to_string());
-        let prod = log.contains("PROTEUS-TE PROD");
-        let halt = marker.as_deref() == Some("PROTEUS-TE HALT");
+        let prod = log.contains("CUTTLE-TE PROD");
+        let halt = marker.as_deref() == Some("CUTTLE-TE HALT");
         let shell_compose = log.contains("SHELL compose OK tasks=5 files=5 audit=5");
         let shell_resume = log.contains("SHELL resume OK");
 

@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     Gpt, GptError, GptHeader, GptPart, GPT_ENTRY_LEN, GPT_MBR_TYPE, GPT_SECTOR, GPT_SIG,
 };
 
@@ -141,7 +141,7 @@ pub fn build_banner_fixture(out: &mut [u8]) -> Result<usize, GptError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::Gpt;
+    use cuttle_contracts::Gpt;
 
     fn fix() -> [u8; GPT_FIXTURE_BYTES] {
         let mut b = [0u8; GPT_FIXTURE_BYTES];

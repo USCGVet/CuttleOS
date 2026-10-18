@@ -11,7 +11,7 @@
 //!
 //! This is the load-bearing durability proof. If this test passes
 //! across all 100 seeds, the WAL satisfies the contract documented
-//! in `proteus_contracts::WriteAheadLog`:
+//! in `cuttle_contracts::WriteAheadLog`:
 //!
 //! - `append` returns monotonic LSNs.
 //! - `flush` advances the durable cursor atomically.
@@ -29,7 +29,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use proteus_contracts::WriteAheadLog as _;
+use cuttle_contracts::WriteAheadLog as _;
 use target_enterprise::wal::durable_wal_proof_init;
 use target_enterprise::WalImpl;
 

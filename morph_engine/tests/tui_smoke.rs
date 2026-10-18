@@ -18,7 +18,7 @@ fn unique_tempdir(tag: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    p.push(format!("proteus_tui_smoke_{}_{}", tag, nonce));
+    p.push(format!("cuttle_tui_smoke_{}_{}", tag, nonce));
     fs::create_dir_all(&p).unwrap();
     p
 }

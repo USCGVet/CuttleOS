@@ -10,7 +10,7 @@
 //!
 //! The byte-observable surface — ServerHello layout, HKDF-Extract /
 //! HKDF-Expand-Label outputs, TLS record header encoding — is the
-//! [`proteus_contracts::Tls13Server`] contract and **does not morph
+//! [`cuttle_contracts::Tls13Server`] contract and **does not morph
 //! across cycles**. The internal helpers (cursor parser, scratch buffer
 //! sizing, branch ordering, local naming) ARE candidates for the
 //! diversifier; see `diversifier/tests/tls_diversify_roundtrip.rs`.
@@ -40,11 +40,11 @@
 //! bytes), and the fixed prelude, 256 is comfortable for every shape
 //! the trait allows.
 
-use proteus_contracts::{HandshakeKeys, ParsedServerHello, Tls13Client, Tls13Server};
+use cuttle_contracts::{HandshakeKeys, ParsedServerHello, Tls13Client, Tls13Server};
 use sha2::{Digest, Sha256};
 
 /// SHA-256 output length in bytes. Matches
-/// [`Tls13Server::HASH_LEN`](proteus_contracts::Tls13Server::HASH_LEN).
+/// [`Tls13Server::HASH_LEN`](cuttle_contracts::Tls13Server::HASH_LEN).
 pub const HASH_LEN: usize = 32;
 
 /// TLS record header length: type(1) + version(2) + length(2).
@@ -577,7 +577,7 @@ impl<'a> Cursor<'a> {
 // Tls13Server impl — the contract surface
 // ============================================================
 
-/// Concrete [`proteus_contracts::Tls13Server`] impl. Wraps the free
+/// Concrete [`cuttle_contracts::Tls13Server`] impl. Wraps the free
 /// functions above in a zero-sized type so callers can name the
 /// contract surface explicitly.
 pub struct Tls13ServerImpl;
@@ -663,7 +663,7 @@ pub fn early_secret_from_psk(psk: &[u8; HASH_LEN], out: &mut [u8; HASH_LEN]) {
 /// Sealed resumption blob: `magic(8) || nonce(32) || psk(32) || crc32(4)`.
 /// CRC is over magic||nonce||psk (72 bytes). Total 76 bytes — small
 /// enough to ride in any durable seal / WAL frame / fw_cfg blob.
-pub const RESUMPTION_BLOB_MAGIC: &[u8; 8] = b"PRTSPSK1";
+pub const RESUMPTION_BLOB_MAGIC: &[u8; 8] = b"CTTLPSK1";
 /// Total byte length of the sealed resumption blob.
 pub const RESUMPTION_BLOB_LEN: usize = 8 + 32 + 32 + 4;
 
@@ -1128,7 +1128,7 @@ pub fn build_client_finished(
 // Tls13Client trait impl
 // ----------------------------------------------------------------
 
-/// Concrete [`proteus_contracts::Tls13Client`] impl. Wraps the free
+/// Concrete [`cuttle_contracts::Tls13Client`] impl. Wraps the free
 /// functions above in a zero-sized type so callers can name the
 /// contract surface explicitly.
 pub struct Tls13ClientImpl;

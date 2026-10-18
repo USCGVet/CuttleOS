@@ -1,4 +1,4 @@
-//! Permanent poison corpus for the Proteus verifier.
+//! Permanent poison corpus for the Cuttle verifier.
 //!
 //! # Why this exists
 //!
@@ -11,13 +11,13 @@
 //! # Layers
 //!
 //! 1. **Static unit path** (default `cargo test`): drives
-//!    [`proteus_verifier::evaluate_static`] against every static
+//!    [`cuttle_verifier::evaluate_static`] against every static
 //!    poison fixture. No rustc of the candidate. Always on.
 //! 2. **Binary smoke path** (default `cargo test`): spawns the real
 //!    `verify` binary against static poisons with `--no-perf-check`.
 //!    Static rejects exit 1 *before* the scratch cargo build, so these
 //!    stay fast.
-//! 3. **Semantic e2e** (`#[ignore]` / `PROTEUS_VERIFIER_POISON_E2E=1`):
+//! 3. **Semantic e2e** (`#[ignore]` / `CUTTLE_VERIFIER_POISON_E2E=1`):
 //!    the existing `broken_fletcher32` fixture — golden-test reject
 //!    after a real cargo build.
 //!
@@ -27,7 +27,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use proteus_verifier::{
+use cuttle_verifier::{
     evaluate_static, parse_manifest_str, StaticCheckInput, StaticCheckOutcome, StaticRejectReason,
 };
 
@@ -323,7 +323,7 @@ fn poison_canonical_duplicate_verify_binary_rejects() {
 }
 
 // =====================================================================
-// Layer 3 — semantic golden (slow; opt-in via PROTEUS_VERIFIER_POISON_E2E=1)
+// Layer 3 — semantic golden (slow; opt-in via CUTTLE_VERIFIER_POISON_E2E=1)
 // =====================================================================
 
 /// Semantic poisons: pass static checks, compile, fail golden/harness.
@@ -405,14 +405,14 @@ fn semantic_poison_files_present_and_enrolled() {
 /// rebuilds a scratch workspace (~1 min cold).
 ///
 /// ```text
-/// PROTEUS_VERIFIER_POISON_E2E=1 cargo test -p proteus-verifier \
+/// CUTTLE_VERIFIER_POISON_E2E=1 cargo test -p cuttle-verifier \
 ///   --test poison_corpus semantic_poison_e2e -- --nocapture
 /// ```
 #[test]
 fn semantic_poison_e2e_all_reject() {
-    if std::env::var("PROTEUS_VERIFIER_POISON_E2E").as_deref() != Ok("1") {
+    if std::env::var("CUTTLE_VERIFIER_POISON_E2E").as_deref() != Ok("1") {
         eprintln!(
-            "SKIP semantic e2e: set PROTEUS_VERIFIER_POISON_E2E=1 to run {} poisons \
+            "SKIP semantic e2e: set CUTTLE_VERIFIER_POISON_E2E=1 to run {} poisons \
              through the full verify binary (scratch cargo build each)",
             SEMANTIC_POISONS.len()
         );

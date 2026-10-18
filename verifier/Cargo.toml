@@ -1,5 +1,5 @@
 [package]
-name = "proteus-verifier"
+name = "cuttle-verifier"
 edition.workspace = true
 version.workspace = true
 authors.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 description = "Runs the contract-trait invariant battery against a morph candidate. Accepts or rejects."
 
 [lib]
-name = "proteus_verifier"
+name = "cuttle_verifier"
 path = "src/lib.rs"
 
 [[bin]]
@@ -15,8 +15,8 @@ name = "verify"
 path = "src/main.rs"
 
 [dependencies]
-proteus-contracts = { path = "../contracts", features = ["property_tests"] }
-proteus-diversifier = { path = "../diversifier" }
+cuttle-contracts = { path = "../contracts", features = ["property_tests"] }
+cuttle-diversifier = { path = "../diversifier" }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
 syn = { workspace = true }

@@ -112,7 +112,7 @@ fn boots_under_qemu_and_emits_banner() {
     eprintln!("smoke: built kernel ELF: {}", elf.display());
 
     // 2) Package as BIOS image via `factory_builder` (package mode).
-    let images_dir = root.join("target").join("proteus_images");
+    let images_dir = root.join("target").join("cuttle_images");
     std::fs::create_dir_all(&images_dir).ok();
     let bios = images_dir.join("qemu_smoke_bios.img");
     let pkg_out = Command::new(factory_builder_bin())
@@ -183,12 +183,12 @@ fn boots_under_qemu_and_emits_banner() {
 
     // TASK-023: the kernel now exercises every morphed surface
     // (TLS hkdf, TLS ServerHello, WAL replay, IOMMU translate,
-    // HashImpl digest) BEFORE emitting `PROTEUS-TE HALT`. Waiting for
+    // HashImpl digest) BEFORE emitting `CUTTLE-TE HALT`. Waiting for
     // the HALT line is the gate: if it appears, every preceding
     // banner is also present because the kernel panics on any drift
     // and the HALT line is suppressed.
     let required_banners: &[&str] = &[
-        "PROTEUS-TE OK",
+        "CUTTLE-TE OK",
         "TLS hkdf OK prk_sha=",
         "TLS server_hello OK len=",
         // TASK-049: TLS 1.3 client. The kernel builds a ClientHello
@@ -218,7 +218,7 @@ fn boots_under_qemu_and_emits_banner() {
         // round-trip parse recovers every field. A morph that perturbs
         // the wire layout panics inside `banner_net_build` and the
         // banner never appears.
-        "NET build OK len=38 ip_cksum=63c7 udp_cksum=fa94",
+        "NET build OK len=37 ip_cksum=63c8 udp_cksum=50c2",
         // TASK-017: KPTI banners assert the locked-invariant boundary
         // held against a synthetic-but-realistic kernel L4. The
         // build banner records that 4 secret pages were stripped from
@@ -246,7 +246,7 @@ fn boots_under_qemu_and_emits_banner() {
         // appearing means the SQ/CQ ring arithmetic, the command
         // encoding/decoding, the bring-up state machine, and the
         // BlockDevice contract impl are all wired correctly.
-        "NVMe init OK ctrl=PROTEUS-NVME-EMU",
+        "NVMe init OK ctrl=CUTTLE-NVME-EMU",
         "NVMe read_lba(7) OK first_byte=a5",
         // TCP state machine + wire codec. The kernel drives a full
         // 3-way handshake (LISTEN→SYN_RCVD→ESTABLISHED) followed by a
@@ -270,7 +270,7 @@ fn boots_under_qemu_and_emits_banner() {
         "HTTP parse OK method=GET path=/healthz",
         "HTTP build OK status=200 bytes=",
         // DNS/RFC 1035 wire codec. The kernel builds an A query for
-        // `proteus.local`, asserts the byte-exact canonical encoding,
+        // `cuttle.local`, asserts the byte-exact canonical encoding,
         // parses the query, then builds a response pointing to
         // 10.0.0.42 with TTL 60 and asserts the rdata bytes land at
         // the locked offset. Both banners appearing means: the 12-byte
@@ -279,10 +279,10 @@ fn boots_under_qemu_and_emits_banner() {
         // RDLENGTH/RDATA assembly are all wired correctly. A morph
         // that perturbs byte order or label-length octet placement
         // panics inside `banner_dns` and these banners never appear.
-        "DNS query OK id=c0de qname=proteus.local",
+        "DNS query OK id=c0de qname=cuttle.local",
         "DNS response OK id=c0de ans=10.0.0.42 bytes=",
         // ICMP/RFC 792 echo with RFC 1071 checksum. The kernel builds
-        // an echo request with id=0x4242, seq=7, payload "proteus-ping",
+        // an echo request with id=0x4242, seq=7, payload "cuttle-ping",
         // parses it (which verifies the recomputed RFC 1071 16-bit
         // one's-complement checksum against the wire field), then
         // builds the matching reply. Both banners appearing means: the
@@ -306,7 +306,7 @@ fn boots_under_qemu_and_emits_banner() {
         // and TCI field packing are all wired correctly. A morph
         // that swaps any byte position in the header or fields
         // panics here and the banners never appear.
-        "ETH build OK len=52 ethertype=0800",
+        "ETH build OK len=51 ethertype=0800",
         "ETH parse OK src=00aabbccddee dst=123456789abc",
         "ETH vlan OK tci=6064 vid=100 pcp=3",
         // TASK-046: ARP/RFC 826 IPv4-over-Ethernet. The kernel
@@ -489,7 +489,7 @@ fn boots_under_qemu_and_emits_banner() {
         // (mount_count == 1, mount_at(0) == b"/"). The second banner
         // proves the full open → read → close round-trip through
         // `VfsImpl<8>` returns exactly 11 bytes for the locked
-        // `/etc/hostname = b"proteus-te\n"` fixture, byte-for-byte
+        // `/etc/hostname = b"cuttle-te\n"` fixture, byte-for-byte
         // against `HOSTNAME_BYTES`. A morph that perturbs the path
         // normalisation, the mount-table dispatch (longest-prefix
         // routing), the handle packing (mount_id << 24 | per_fs),
@@ -497,7 +497,7 @@ fn boots_under_qemu_and_emits_banner() {
         // panics inside `banner_vfs` and the two banners never
         // appear.
         "VFS mount OK fs=ramfs root=/",
-        "VFS read OK path=/etc/hostname bytes=11",
+        "VFS read OK path=/etc/hostname bytes=10",
         // TASK-055: eBPF interpreter banners. The first banner proves
         // the 6-instruction reference program round-trips three input
         // bytes [0, 1, 2] through the locked
@@ -532,7 +532,7 @@ fn boots_under_qemu_and_emits_banner() {
         "SMP discover OK bsp=0 aps=3",
         "SMP wake OK ipis=9 vec=0x08",
         // TASK-058: TFTP/RFC 1350 client wire codec. The kernel
-        // builds an RRQ for `/proteus-boot.img` in octet mode and
+        // builds an RRQ for `/cuttle-boot.img` in octet mode and
         // byte-exact-asserts the 26-byte canonical encoding
         // (opcode 0x0001 + filename + NUL + "octet" + NUL). It then
         // parses a locked ACK(1) reply and a locked DATA(2,
@@ -542,7 +542,7 @@ fn boots_under_qemu_and_emits_banner() {
         // block-number encoding are all wired correctly. A morph
         // that perturbs any of those panics inside `banner_tftp`
         // and these banners never appear.
-        "TFTP rrq OK len=26 mode=octet",
+        "TFTP rrq OK len=25 mode=octet",
         "TFTP data OK block=2 bytes=10",
         // TASK-059: PCI/0xCF8-0xCFC configuration-space wire codec.
         // The kernel constructs an in-RAM RecordingBus scripted with
@@ -570,8 +570,8 @@ fn boots_under_qemu_and_emits_banner() {
         // are all wired correctly. A morph that perturbs any byte
         // position in any of those panics inside `banner_x509` and
         // the banners never appear.
-        "X509 parse OK len=257 serial=42",
-        "X509 cn OK cn=proteus-te-x509-kernel-fixture",
+        "X509 parse OK len=255 serial=42",
+        "X509 cn OK cn=cuttle-te-x509-kernel-fixture",
         // TASK-062: PIT + CMOS RTC wire codec. The kernel programs
         // channel 0 for 1 kHz against a recording IoPort and asserts
         // the exact three-byte sequence (cmd=0x36, divisor=1193 →
@@ -600,7 +600,7 @@ fn boots_under_qemu_and_emits_banner() {
         // locked 4-sector fixture (superblock + inode table + root
         // dir + hello.txt body), mounts it, looks up hello.txt from
         // the root directory, reads 16 body bytes, and asserts
-        // byte-equality against `b"hello, proteus!\n"` plus the
+        // byte-equality against `b"hello, cuttle!\n"` plus the
         // locked Fletcher-32 fingerprint `aa3ce1c0`. Both banners
         // appearing means: superblock magic/version/field offsets,
         // 32-byte inode encode/decode, fixed dirent walk, direct-
@@ -608,7 +608,7 @@ fn boots_under_qemu_and_emits_banner() {
         // A morph that perturbs any of those panics inside
         // `banner_jfs` and these banners never appear.
         "JFS mount OK root_ino=1 inodes=3",
-        "JFS read OK path=/hello.txt bytes=16 sha=aa3ce1c0",
+        "JFS read OK path=/hello.txt bytes=15 sha=7e76bd63",
         // TASK-065: GDB Remote Serial Protocol wire codec. The kernel
         // parses the locked `$g#67` frame (body=`g`, cksum=0x67),
         // classifies it as ReadRegisters, builds the 256-hex-zero
@@ -681,7 +681,7 @@ fn boots_under_qemu_and_emits_banner() {
         // Quota check_write gates a real VFS create/write: uid 1000
         // allowed → 8-byte write to /var/ok; uid 1001 BlockLimit
         // reject. Proves storage policy + VFS path composition.
-        "VFS+QUOTA compose OK allow=1000 reject=1001 bytes=8",
+        "VFS+QUOTA compose OK allow=1000 reject=1001 bytes=7",
         // AHCI FIS + command header + PRDT agree on one IDENTIFY slot
         // (CFL=5 == H2D FIS dwords, PRDTL=1, 512 B IOC buffer).
         "AHCI storage compose OK fis=ec prdtl=1 bytes=512",
@@ -734,17 +734,17 @@ fn boots_under_qemu_and_emits_banner() {
         // are wired correctly. A morph that perturbs any byte of
         // the layout, the CRC routine, or the symbol-resolution
         // containment rule panics here and the banners never appear.
-        "CRASH_DUMP wrote 16384 bytes to lba=1024 crc=8fb6eb0e",
+        "CRASH_DUMP wrote 16384 bytes to lba=1024 crc=659ece68",
         "SYMBOL resolve OK kernel_main+0x42 (5 frames)",
-        "WEB+SQL+SESSION compose OK tables=2 rows=6 magic=PRTSSQL1",
+        "WEB+SQL+SESSION compose OK tables=2 rows=6 magic=CTTLSQL1",
         "SECCOMP: OK engine=ebpf filter=enforced",
         "ATTEST: OK seed=",
-        "FS partition OK lba=1042..1057 sectors=16 files=1 magic=PRTSFS01",
+        "FS partition OK lba=1042..1057 sectors=16 files=1 magic=CTTLFS01",
         "HTTPS+TCP4 compose OK slots=4 port=443 tls13=ok",
         "SVC_RUNTIME: OK role=full->wfe->full svcs=3 kpti=isolated seccomp=deny-default rot=1",
         "SHELL compose OK tasks=5 files=5 audit=5",
         "SMP_HW init OK cpus=4 threads=4 ctx_sw=4",
-        "PROTEUS-TE HALT",
+        "CUTTLE-TE HALT",
     ];
     eprintln!("smoke: launching QEMU (+4x SMP +virtio-blk +2x net hub +ahci +nvme +fw_cfg device key)...");
     let (log_contents, all_seen) =
@@ -891,7 +891,7 @@ impl SmokeVm<'_> {
                 self.nvme_disk.display()
             ))
             .arg("-device")
-            .arg("nvme,drive=nvme0,serial=PROTEUS-NVME-HW")
+            .arg("nvme,drive=nvme0,serial=CUTTLE-NVME-HW")
             .arg("-serial")
             .arg(format!("file:{}", serial_log.display()))
             .arg("-display")
@@ -927,7 +927,7 @@ impl SmokeVm<'_> {
 }
 
 fn halted(log: &str) -> bool {
-    log.contains("PROTEUS-TE HALT")
+    log.contains("CUTTLE-TE HALT")
 }
 
 #[test]
@@ -937,7 +937,7 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
         panic!("qemu-system-x86_64 not found");
     };
     let root = workspace_root();
-    let images_dir = root.join("target").join("proteus_images");
+    let images_dir = root.join("target").join("cuttle_images");
     std::fs::create_dir_all(&images_dir).expect("create images_dir");
     // Build a dedicated boot image from the current source on every run.
     // Reusing qemu_smoke_bios.img would boot whatever kernel the last smoke
@@ -949,16 +949,16 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
     let morphed_elf = images_dir.join("qemu_tamper_morphed.elf");
     let bm = Command::new("cargo")
         .current_dir(&root)
-        .args(["run", "--release", "-p", "proteus-binmorph", "--", "--in"])
+        .args(["run", "--release", "-p", "cuttle-binmorph", "--", "--in"])
         .arg(&elf)
         .arg("--out")
         .arg(&morphed_elf)
         .args(["--seed", "42"])
         .output()
-        .expect("run proteus-binmorph");
+        .expect("run cuttle-binmorph");
     assert!(
         bm.status.success(),
-        "proteus-binmorph failed: {}",
+        "cuttle-binmorph failed: {}",
         String::from_utf8_lossy(&bm.stderr)
     );
     factory_builder::package_kernel_via_pkg(&pkg_crate, &morphed_elf, &bios, None)
@@ -992,8 +992,8 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
     for expected in [
         "RING3 transition OK cpl=3->0 vec=0x80 ist1=ok rsp0=ok syscall=43",
         "TPM2_TIS driver OK did_vid=000115d1 locality=0 pcr10=extended",
-        "WEB+SQL+SESSION compose OK tables=2 rows=6 magic=PRTSSQL1",
-        "FS partition OK lba=1042..1057 sectors=16 files=1 magic=PRTSFS01",
+        "WEB+SQL+SESSION compose OK tables=2 rows=6 magic=CTTLSQL1",
+        "FS partition OK lba=1042..1057 sectors=16 files=1 magic=CTTLFS01",
         "HTTPS+TCP4 compose OK slots=4 port=443 tls13=ok",
         "SHELL compose OK tasks=5 files=5 audit=5",
     ] {

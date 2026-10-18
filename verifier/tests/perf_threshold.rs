@@ -9,7 +9,7 @@
 //! cargo test` chain inside the verifier's scratch dir (wall-clock cost
 //! is rustc-dominated). Run them explicitly with:
 //!
-//!   `cargo test -p proteus-verifier --test perf_threshold -- --ignored`
+//!   `cargo test -p cuttle-verifier --test perf_threshold -- --ignored`
 //!
 //! Hermeticity: every test writes its baseline under
 //! `std::env::temp_dir()` with a unique per-test suffix. None of these
@@ -59,7 +59,7 @@ fn run_verify_args(args: &[&str]) -> (i32, String, String) {
 fn write_baseline(name: &str, line: &str) -> PathBuf {
     const MIN_REPEATS: usize = 10;
     let dir = std::env::temp_dir().join(format!(
-        "proteus-verify-perf-{}-{}",
+        "cuttle-verify-perf-{}-{}",
         name,
         std::process::id()
     ));
@@ -97,7 +97,7 @@ fn accept_without_baseline_when_file_missing() {
     let candidate = good_candidate();
     let manifest = good_manifest();
     let missing = std::env::temp_dir().join(format!(
-        "proteus-verify-perf-missing-{}-baseline.jsonl",
+        "cuttle-verify-perf-missing-{}-baseline.jsonl",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&missing);

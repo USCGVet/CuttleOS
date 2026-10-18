@@ -3,7 +3,7 @@
 //! borrow checker rejects the privileged-action call because the
 //! proof has already been moved.
 
-use proteus_contracts::{CapError, CapProof, SyscallCapTable};
+use cuttle_contracts::{CapError, CapProof, SyscallCapTable};
 
 struct PermissiveTable;
 

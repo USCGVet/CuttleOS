@@ -9,7 +9,7 @@
 //! - `UPDATE <name> SET <col> = <val> [WHERE <col> <op> <val>]`
 //! - `DELETE FROM <name> [WHERE <col> <op> <val>]`
 //! - `.tables` / `SHOW TABLES` and `.schema` / `DESCRIBE <name>`
-//! - Deterministic 8-sector (`4 KiB`) AHCI partition serialization (`PRTSSQL1`)
+//! - Deterministic 8-sector (`4 KiB`) AHCI partition serialization (`CTTLSQL1`)
 //!   protected by a chained keyed `HMAC-SHA256` tag.
 
 #![allow(clippy::needless_range_loop)]
@@ -28,8 +28,8 @@ pub const SQL_IDENT_LEN: usize = 16;
 pub const SQL_TEXT_LEN: usize = 24;
 /// Number of 512-byte disk sectors used to persist [`SqlDb`] (`4 KiB`).
 pub const SQL_PART_SECTORS: usize = 8;
-/// 8-byte superblock magic for the persistent SQL partition (`PRTSSQL1`).
-pub const SQL_PART_MAGIC: &[u8; 8] = b"PRTSSQL1";
+/// 8-byte superblock magic for the persistent SQL partition (`CTTLSQL1`).
+pub const SQL_PART_MAGIC: &[u8; 8] = b"CTTLSQL1";
 /// Sentinel value for [`SqlTable::indexed_col`] when no secondary index is defined.
 pub const SQL_NO_INDEX: u8 = 0xFF;
 
@@ -1203,7 +1203,7 @@ impl SqlDb {
     }
 
     /// Serialize the entire database into an 8-sector (`4 KiB`) partition image
-    /// protected by `PRTSSQL1` magic and a keyed `HMAC-SHA256` authentication tag.
+    /// protected by `CTTLSQL1` magic and a keyed `HMAC-SHA256` authentication tag.
     pub fn save_partition(
         &self,
         key: &[u8; DURABLE_DIGEST_LEN],
@@ -1214,7 +1214,7 @@ impl SqlDb {
         flat[8..16].copy_from_slice(&self.tx_seq.to_le_bytes());
 
         // Header layout:
-        //   0..8   : SQL_PART_MAGIC ("PRTSSQL1")
+        //   0..8   : SQL_PART_MAGIC ("CTTLSQL1")
         //   8..16  : tx_seq (u64 LE)
         //   16..18 : payload_len (u16 LE)
         //   18..20 : reserved (0)
@@ -1336,7 +1336,7 @@ impl SqlDb {
     }
 
     /// Restore the database from an 8-sector (`4 KiB`) partition image after verifying
-    /// the `PRTSSQL1` magic and constant-time keyed `HMAC-SHA256` tag.
+    /// the `CTTLSQL1` magic and constant-time keyed `HMAC-SHA256` tag.
     pub fn load_partition(
         &mut self,
         key: &[u8; DURABLE_DIGEST_LEN],
@@ -2008,7 +2008,7 @@ mod tests {
         );
         assert_eq!(&out[..n], b"count\n32\n");
 
-        // Persist all 64 rows + secondary index metadata into the 8-sector PRTSSQL1 partition and restore.
+        // Persist all 64 rows + secondary index metadata into the 8-sector CTTLSQL1 partition and restore.
         let key = [0x99u8; 32];
         let mut sectors = [[0u8; 512]; SQL_PART_SECTORS];
         db.save_partition(&key, &mut sectors);

@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{AcpiRsdp, RsdpError, RsdpV1, RSDP_SIG, RSDP_V1_LEN};
+use cuttle_contracts::{AcpiRsdp, RsdpError, RsdpV1, RSDP_SIG, RSDP_V1_LEN};
 
 pub struct AcpiRsdpImpl;
 
@@ -68,7 +68,7 @@ pub fn build_banner_fixture(out: &mut [u8]) -> Result<(), RsdpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::AcpiRsdp;
+    use cuttle_contracts::AcpiRsdp;
 
     fn fix() -> [u8; 20] {
         let mut b = [0u8; 20];

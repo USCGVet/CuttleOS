@@ -24,7 +24,7 @@ use crate::Seed;
 /// Domain-separation tag for the semantic-perturb decision hash.
 /// Bumping this string is the contract-versioning lever, same policy
 /// as `codegen_perturb::HASH_TAG`.
-const HASH_TAG: &[u8] = b"proteus-semantic-perturb-v1";
+const HASH_TAG: &[u8] = b"cuttle-semantic-perturb-v1";
 
 /// Log label for the strength-reduction transform.
 pub const LABEL_STRENGTH: &str = "strength-reduction";
@@ -52,7 +52,7 @@ fn coin_fires(byte: u8, rate_percent: u8) -> bool {
 /// hash bytes gate the three transforms; each fires with probability
 /// `fire_rate_percent`%.
 fn flips_for(seed: &Seed, fn_name: &str, fire_rate_percent: u8) -> Flips {
-    let base_name = crate::strip_proteus_fn_suffix(fn_name);
+    let base_name = crate::strip_cuttle_fn_suffix(fn_name);
     let mut h = Sha256::new();
     h.update(HASH_TAG);
     h.update(seed.0);

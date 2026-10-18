@@ -6,7 +6,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     Hpet, HpetCaps, HpetError, MmioRegBus, HPET_CAP_COUNT_SIZE_64, HPET_CFG_ENABLE,
     HPET_REG_CAP, HPET_REG_CONFIG, HPET_REG_MAIN_COUNTER, HPET_REG_TIMER0_COMPARATOR,
     HPET_REG_TIMER0_CONFIG, HPET_TN_INT_ENB, HPET_TN_TYPE_PERIODIC, HPET_TN_VAL_SET,
@@ -188,7 +188,7 @@ pub const BANNER_PERIOD_MS: u32 = 1;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::Hpet;
+    use cuttle_contracts::Hpet;
 
     #[test]
     fn constants() {

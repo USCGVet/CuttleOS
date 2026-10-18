@@ -10,7 +10,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\seal_factory_baselines.ps1 -OutDir path\to\seals
 #
 # After a real write, sets nothing permanently; prints:
-#   $env:PROTEUS_DURABLE_SEALS_DIR = '<abs path>'
+#   $env:CUTTLE_DURABLE_SEALS_DIR = '<abs path>'
 #
 # Files sealed (when present at workspace root):
 #   factory_expected.toml  → factory_expected.json  (label: factory_expected)
@@ -36,7 +36,7 @@ function Resolve-Morph {
     if (Test-Path $exeRel) { return $exeRel }
     # Build debug morph once.
     Write-Host "seal_factory_baselines: building morph (debug)..."
-    & cargo build -p proteus-morph-engine --bin morph --quiet
+    & cargo build -p cuttle-morph-engine --bin morph --quiet
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build morph failed exit=$LASTEXITCODE"
     }
@@ -97,7 +97,7 @@ if ($DryRun) {
     }
     Write-Host ""
     Write-Host "# After real run, attach on morph/daemon/soak:"
-    Write-Host "`$env:PROTEUS_DURABLE_SEALS_DIR = '$outAbs'"
+    Write-Host "`$env:CUTTLE_DURABLE_SEALS_DIR = '$outAbs'"
     exit 0
 }
 
@@ -122,9 +122,9 @@ foreach ($p in $present) {
 Write-Host ""
 Write-Host "seal_factory_baselines: sealed $sealed file(s) into $outAbs"
 Write-Host "# Attach on morph cycle / daemon / north-star soak:"
-Write-Host "`$env:PROTEUS_DURABLE_SEALS_DIR = '$outAbs'"
+Write-Host "`$env:CUTTLE_DURABLE_SEALS_DIR = '$outAbs'"
 Write-Host "# Optional scorecard gate (TASK-148):"
-Write-Host "`$env:PROTEUS_VERIFY_REQUIRE_DURABLE_SEALS = '1'"
+Write-Host "`$env:CUTTLE_VERIFY_REQUIRE_DURABLE_SEALS = '1'"
 Write-Host "# Optional soak gate (TASK-150):"
-Write-Host "`$env:PROTEUS_SOAK_REQUIRE_DURABLE_SEALS = '1'"
+Write-Host "`$env:CUTTLE_SOAK_REQUIRE_DURABLE_SEALS = '1'"
 exit 0

@@ -21,7 +21,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     GdbCommand, GdbError, GdbPacket, GdbStub, GDB_ACK, GDB_INTERRUPT, GDB_MAX_BODY,
     GDB_MAX_MEM_READ, GDB_NACK, GDB_PACKET_END, GDB_PACKET_START, GDB_REG_HEX_LEN, GDB_SIGTRAP,
 };
@@ -368,7 +368,7 @@ pub fn classify_control(b: u8) -> GdbCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::GdbStub;
+    use cuttle_contracts::GdbStub;
 
     #[test]
     fn constants_locked() {

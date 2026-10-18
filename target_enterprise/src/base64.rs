@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{Base64, Base64Error};
+use cuttle_contracts::{Base64, Base64Error};
 
 const ENC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -129,9 +129,9 @@ pub fn decode_impl(input: &[u8], out: &mut [u8]) -> Result<usize, Base64Error> {
     Ok(o)
 }
 
-/// Banner: encode "proteus" and decode back.
+/// Banner: encode "cuttle" and decode back.
 pub fn banner_roundtrip() -> bool {
-    let msg = b"proteus";
+    let msg = b"cuttle";
     let mut enc = [0u8; 16];
     let n = match Base64Impl::encode(msg, &mut enc) {
         Ok(n) => n,
@@ -148,7 +148,7 @@ pub fn banner_roundtrip() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::Base64;
+    use cuttle_contracts::Base64;
 
     #[test]
     fn empty() {
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn end_to_end() {
-        let msg = b"proteus-b64";
+        let msg = b"cuttle-b64";
         let mut e = [0u8; 32];
         let n = Base64Impl::encode(msg, &mut e).unwrap();
         let mut d = [0u8; 32];

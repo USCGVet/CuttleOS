@@ -1,5 +1,5 @@
 //! Integration test asserting the `target_enterprise` crate exposes
-//! at least four `proteus_contracts::*` trait implementations at its
+//! at least four `cuttle_contracts::*` trait implementations at its
 //! public API surface.
 //!
 //! This is the acceptance criterion for TASK-001: "the new crate's
@@ -7,7 +7,7 @@
 //! the seed exposes are `Hash`, `Aead`, `SyscallDispatch`, and
 //! `SignatureVerify`.
 
-use proteus_contracts::{Aead, Hash, NetStack, SignatureVerify, SyscallDispatch, WriteAheadLog};
+use cuttle_contracts::{Aead, Hash, NetStack, SignatureVerify, SyscallDispatch, WriteAheadLog};
 use target_enterprise::{
     AeadImpl, HashImpl, NetStackImpl, SignatureVerifyImpl, SyscallDispatch as TeSyscall, WalImpl,
 };
@@ -149,7 +149,7 @@ fn syscall_capability_gate_blocks_open_without_caps() {
     // SYS_OPEN requires FS_BYPASS. Without that bit, check_cap rejects.
     use target_enterprise::syscall::{check_cap, SYS_OPEN};
     assert!(check_cap(SYS_OPEN, 0).is_err());
-    assert!(check_cap(SYS_OPEN, proteus_contracts::caps::FS_BYPASS).is_ok());
+    assert!(check_cap(SYS_OPEN, cuttle_contracts::caps::FS_BYPASS).is_ok());
 }
 
 #[test]

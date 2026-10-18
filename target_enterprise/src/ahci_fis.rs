@@ -6,7 +6,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     AhciFis, AhciFisError, H2dFisParams, AHCI_FIS_C_BIT, AHCI_FIS_H2D_LEN, AHCI_FIS_PMP_MASK,
     AHCI_FIS_TYPE_H2D, ATA_CMD_IDENTIFY, ATA_CMD_READ_DMA, ATA_DEV_LBA,
 };
@@ -139,7 +139,7 @@ pub fn banner_identify_cmd() -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::{AhciFis, ATA_CMD_READ_DMA_EXT};
+    use cuttle_contracts::{AhciFis, ATA_CMD_READ_DMA_EXT};
 
     #[test]
     fn constants() {

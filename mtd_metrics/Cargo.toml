@@ -1,5 +1,5 @@
 [package]
-name = "proteus-mtd-metrics"
+name = "cuttle-mtd-metrics"
 edition.workspace = true
 version.workspace = true
 authors.workspace = true
@@ -27,4 +27,4 @@ object = "0.36"
 iced-x86 = "1"
 # Diversify the built-in specimen in-process so the harness measures the
 # project's real morph pipeline, not a reimplementation of it.
-proteus-diversifier = { path = "../diversifier" }
+cuttle-diversifier = { path = "../diversifier" }

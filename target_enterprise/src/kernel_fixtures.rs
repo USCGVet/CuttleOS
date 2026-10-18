@@ -45,16 +45,16 @@ pub const HKDF_INFO: [u8; 10] = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
 
 /// Label for the HKDF-Expand-Label step. RFC 8446 prepends `"tls13 "`
 /// inside `hkdf_expand_label`; we pass only the label proper.
-pub const HKDF_EXPAND_LABEL: &[u8] = b"proteus-te-key";
+pub const HKDF_EXPAND_LABEL: &[u8] = b"cuttle-te-key";
 
 /// Output length the kernel asks `hkdf_expand_label` to produce.
 pub const HKDF_EXPAND_OUT_LEN: usize = 16;
 
 /// First 8 bytes of [`HKDF_EXPAND_OUT_LEN`] bytes produced by
-/// `hkdf_expand_label(prk, b"proteus-te-key", HKDF_INFO, &mut out)`.
+/// `hkdf_expand_label(prk, b"cuttle-te-key", HKDF_INFO, &mut out)`.
 /// Populated by `tests/kernel_fixtures_check.rs`.
 pub const HKDF_EXPECTED_EXPAND_PREFIX8: [u8; 8] = [
-    0x52, 0xb3, 0xc8, 0x0c, 0x79, 0x70, 0xae, 0x5f,
+    0xad, 0x2b, 0xe6, 0xc8, 0x9e, 0xae, 0x85, 0xe2,
 ];
 
 // ============================================================
@@ -282,15 +282,15 @@ pub const IOMMU_EXPECTED_PA: u64 = IOMMU_HOST_PHYS | IOMMU_PAGE_OFFSET;
 // ============================================================
 
 /// Input the kernel hashes with `target_enterprise::HashImpl`.
-pub const HASH_INPUT: &[u8] = b"proteus-te-fixture-2026-05-16";
+pub const HASH_INPUT: &[u8] = b"cuttle-te-fixture-2026-05-16";
 
 /// Expected 32-byte digest produced by `HashImpl::hash(HASH_INPUT, &mut out)`.
 /// HashImpl is the locked Fletcher-32-chained construction described in
 /// `target_enterprise/src/lib.rs::HashImpl`. Populated by
 /// `tests/kernel_fixtures_check.rs`.
 pub const HASH_EXPECTED: [u8; 32] = [
-    0xe7, 0xb1, 0x71, 0xa1, 0xe8, 0xb3, 0x72, 0xa2, 0xe9, 0xb5, 0x73, 0xa3, 0xea, 0xb7, 0x74, 0xa4,
-    0xeb, 0xb9, 0x75, 0xa5, 0xec, 0xbb, 0x76, 0xa6, 0xed, 0xbd, 0x77, 0xa7, 0xee, 0xbf, 0x78, 0xa8,
+    0xb9, 0x1f, 0x88, 0xd0, 0xba, 0x20, 0x89, 0xd1, 0xbb, 0x21, 0x8a, 0xd2, 0xbc, 0x22, 0x8b, 0xd3,
+    0xbd, 0x23, 0x8c, 0xd4, 0xbe, 0x24, 0x8d, 0xd5, 0xbf, 0x25, 0x8e, 0xd6, 0xc0, 0x26, 0x8f, 0xd7,
 ];
 
 // ============================================================
@@ -322,44 +322,44 @@ pub const NET_TTL: u8 = 64;
 pub const NET_IDENT: u16 = 0xBEEF;
 
 /// Payload the kernel embeds in the UDP datagram.
-pub const NET_PAYLOAD: &[u8] = b"proteus-te";
+pub const NET_PAYLOAD: &[u8] = b"cuttle-te";
 
 /// Expected total datagram length: 20 (IPv4) + 8 (UDP) + 10 (payload).
-pub const NET_EXPECTED_LEN: usize = 38;
+pub const NET_EXPECTED_LEN: usize = 37;
 
 /// Locked golden bytes for the canonical UDP/IPv4 datagram.
 ///
 /// Computed by `target_enterprise::net::build_udp_datagram` against
 /// the constants above. The `kernel_fixtures_check` host test asserts
 /// this byte-for-byte AND the bare-metal kernel asserts the same on
-/// boot before emitting the `NET build OK len=38 …` banner. Any morph
+/// boot before emitting the `NET build OK len=37 …` banner. Any morph
 /// candidate that drifts from this byte string fails both shadows.
 pub const NET_EXPECTED_DATAGRAM: [u8; NET_EXPECTED_LEN] = [
     // IPv4 header
     0x45, 0x00, // version/IHL, DSCP/ECN
-    0x00, 0x26, // total_length = 38
+    0x00, 0x25, // total_length = 37
     0xBE, 0xEF, // identification
     0x40, 0x00, // flags=DF, frag=0
     0x40, // TTL = 64
     0x11, // protocol = UDP (17)
-    0x63, 0xC7, // header checksum (RFC 1071)
+    0x63, 0xC8, // header checksum (RFC 1071)
     0x0A, 0x00, 0x02, 0x0F, // src_ip = 10.0.2.15
     0x0A, 0x00, 0x02, 0x02, // dst_ip = 10.0.2.2
     // UDP header
     0xC0, 0x00, // src_port = 49152
     0x00, 0x35, // dst_port = 53
-    0x00, 0x12, // length = 18 = UDP_HEADER(8) + PAYLOAD(10)
-    0xFA, 0x94, // UDP checksum (RFC 768)
-    // Payload "proteus-te"
-    b'p', b'r', b'o', b't', b'e', b'u', b's', b'-', b't', b'e',
+    0x00, 0x11, // length = 17 = UDP_HEADER(8) + PAYLOAD(9)
+    0x50, 0xC2, // UDP checksum (RFC 768)
+    // Payload "cuttle-te"
+    b'c', b'u', b't', b't', b'l', b'e', b'-', b't', b'e',
 ];
 
 /// Expected IPv4 header checksum (host order) — exposed separately so
 /// the kernel banner can hex-encode it for the serial log.
-pub const NET_EXPECTED_IP_CHECKSUM: u16 = 0x63C7;
+pub const NET_EXPECTED_IP_CHECKSUM: u16 = 0x63C8;
 
 /// Expected UDP checksum (host order).
-pub const NET_EXPECTED_UDP_CHECKSUM: u16 = 0xFA94;
+pub const NET_EXPECTED_UDP_CHECKSUM: u16 = 0x50C2;
 
 // ============================================================
 // Crash dump / symbol resolution — TASK-019
@@ -428,7 +428,7 @@ pub const CRASH_BACKTRACE: [u64; 5] = [
 ];
 
 /// Sample kmsg ring tail bytes captured into the dump.
-pub const CRASH_KMSG: &[u8] = b"[INFO ] proteus-te boot\n[WARN ] scheduler queue near full\n";
+pub const CRASH_KMSG: &[u8] = b"[INFO ] cuttle-te boot\n[WARN ] scheduler queue near full\n";
 
 /// Locked CRC32-C body checksum that
 /// [`PanicDumpImpl::build_dump`] emits for the canonical
@@ -440,7 +440,7 @@ pub const CRASH_KMSG: &[u8] = b"[INFO ] proteus-te boot\n[WARN ] scheduler queue
 /// Any morph that perturbs the layout, register order, kmsg
 /// pad, or the CRC32-C polynomial changes this and the banner
 /// suppresses itself.
-pub const CRASH_EXPECTED_CRC32C: u32 = 0x8FB6_EB0E;
+pub const CRASH_EXPECTED_CRC32C: u32 = 0x659E_CE68;
 
 /// Resolved (name, offset) for the FIRST address in
 /// [`CRASH_BACKTRACE`]. The kernel banner formats this exactly
@@ -469,7 +469,7 @@ pub const CRASH_EXPECTED_RESOLVE_OFFSET: u64 = 0x42;
 //     [6..11]   version=v3 via [0] EXPLICIT INTEGER
 //     [11..14]  serial INTEGER = 42 (0x2A)
 //     [14..21]  TBS sig alg: id-Ed25519
-//     [21..64]  Issuer Name SEQUENCE (CN = "proteus-te-x509-kernel-fixture")
+//     [21..64]  Issuer Name SEQUENCE (CN = "cuttle-te-x509-kernel-fixture")
 //     [64..96]  Validity (notBefore 1970-01-01, notAfter 2049-12-31)
 //     [96..139] Subject Name (same CN)
 //     [139..183] SubjectPublicKeyInfo (Ed25519 + 32-byte pubkey)
@@ -489,24 +489,24 @@ pub const CRASH_EXPECTED_RESOLVE_OFFSET: u64 = 0x42;
 /// 257 bytes — Ed25519 self-signed, fixed serial, fixed validity
 /// window of 1970-01-01..2049-12-31.
 pub const X509_FIXTURE_DER: &[u8] = &[
-    // Outer SEQUENCE header (3 bytes): tag, long-form length 0xFE
-    0x30, 0x81, 0xFE,
-    // TBSCertificate SEQUENCE header (3 bytes): tag, long-form 0xB1
-    0x30, 0x81, 0xB1,
+    // Outer SEQUENCE header (3 bytes): tag, long-form length 0xFC
+    0x30, 0x81, 0xFC,
+    // TBSCertificate SEQUENCE header (3 bytes): tag, long-form 0xAF
+    0x30, 0x81, 0xAF,
     // version = [0] EXPLICIT INTEGER 2 (5 bytes)
     0xA0, 0x03, 0x02, 0x01, 0x02,
     // serialNumber INTEGER = 0x2A (3 bytes)
     0x02, 0x01, 0x2A,
     // TBS sig alg: SEQUENCE { OID(id-Ed25519) } (7 bytes)
     0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70,
-    // Issuer Name (43 bytes): SEQUENCE { SET { SEQ { OID(CN), PrintableString } } }
-    0x30, 0x29,                         // Name SEQUENCE, length 41
-    0x31, 0x27,                         // RDN SET, length 39
-    0x30, 0x25,                         // ATV SEQ, length 37
+    // Issuer Name (42 bytes): SEQUENCE { SET { SEQ { OID(CN), PrintableString } } }
+    0x30, 0x28,                         // Name SEQUENCE, length 40
+    0x31, 0x26,                         // RDN SET, length 38
+    0x30, 0x24,                         // ATV SEQ, length 36
     0x06, 0x03, 0x55, 0x04, 0x03,       // OID(commonName) = 2.5.4.3
-    0x13, 0x1E,                         // PrintableString, length 30
-    // "proteus-te-x509-kernel-fixture" — 30 bytes
-    0x70, 0x72, 0x6F, 0x74, 0x65, 0x75, 0x73, 0x2D,
+    0x13, 0x1D,                         // PrintableString, length 29
+    // "cuttle-te-x509-kernel-fixture" — 29 bytes
+    0x63, 0x75, 0x74, 0x74, 0x6C, 0x65, 0x2D,
     0x74, 0x65, 0x2D, 0x78, 0x35, 0x30, 0x39, 0x2D,
     0x6B, 0x65, 0x72, 0x6E, 0x65, 0x6C, 0x2D, 0x66,
     0x69, 0x78, 0x74, 0x75, 0x72, 0x65,
@@ -516,11 +516,11 @@ pub const X509_FIXTURE_DER: &[u8] = &[
     0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x5A, // "700101000000Z"
     0x17, 0x0D, 0x34, 0x39, 0x31, 0x32, 0x33, 0x31,
     0x32, 0x33, 0x35, 0x39, 0x35, 0x39, 0x5A, // "491231235959Z"
-    // Subject Name (43 bytes) — same CN as issuer
-    0x30, 0x29, 0x31, 0x27, 0x30, 0x25,
+    // Subject Name (42 bytes) — same CN as issuer
+    0x30, 0x28, 0x31, 0x26, 0x30, 0x24,
     0x06, 0x03, 0x55, 0x04, 0x03,
-    0x13, 0x1E,
-    0x70, 0x72, 0x6F, 0x74, 0x65, 0x75, 0x73, 0x2D,
+    0x13, 0x1D,
+    0x63, 0x75, 0x74, 0x74, 0x6C, 0x65, 0x2D,
     0x74, 0x65, 0x2D, 0x78, 0x35, 0x30, 0x39, 0x2D,
     0x6B, 0x65, 0x72, 0x6E, 0x65, 0x6C, 0x2D, 0x66,
     0x69, 0x78, 0x74, 0x75, 0x72, 0x65,
@@ -561,7 +561,7 @@ pub const X509_FIXTURE_PUBKEY: &[u8] = &[
 /// Expected Common Name string bytes inside the parsed subject DN.
 /// The kernel banner uses `X509Impl::find_cn(cert.subject)` to
 /// recover it and asserts byte-equality.
-pub const X509_FIXTURE_SUBJECT_CN: &[u8] = b"proteus-te-x509-kernel-fixture";
+pub const X509_FIXTURE_SUBJECT_CN: &[u8] = b"cuttle-te-x509-kernel-fixture";
 
 /// Expected serial-number magnitude byte. Fixture uses a 1-byte serial.
 pub const X509_FIXTURE_SERIAL: u8 = 0x2A;

@@ -314,7 +314,7 @@ mod tests {
             schema_version = 1
             locked = ["a/b.rs", "c/d.rs"]
         "#;
-        let root = Path::new("/tmp/proteus-test-fake-root");
+        let root = Path::new("/tmp/cuttle-test-fake-root");
         let parsed = parse_locked_modules_str(root, Path::new("locked_modules.toml"), raw).unwrap();
         assert_eq!(parsed.locked.len(), 2);
         assert!(parsed.locked[0].ends_with("a/b.rs") || parsed.locked[0].ends_with("a\\b.rs"));
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn missing_schema_version_is_a_parse_error() {
         let raw = r#"locked = []"#;
-        let root = Path::new("/tmp/proteus-test-fake-root");
+        let root = Path::new("/tmp/cuttle-test-fake-root");
         let err = parse_locked_modules_str(root, Path::new("x"), raw).unwrap_err();
         assert!(matches!(err, DiversifyError::ParseLockedModulesFile { .. }));
     }
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn missing_locked_array_is_a_parse_error() {
         let raw = "schema_version = 1\n";
-        let root = Path::new("/tmp/proteus-test-fake-root");
+        let root = Path::new("/tmp/cuttle-test-fake-root");
         let err = parse_locked_modules_str(root, Path::new("x"), raw).unwrap_err();
         assert!(matches!(err, DiversifyError::ParseLockedModulesFile { .. }));
     }
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn unsupported_schema_version_rejected() {
         let raw = "schema_version = 99\nlocked = []\n";
-        let root = Path::new("/tmp/proteus-test-fake-root");
+        let root = Path::new("/tmp/cuttle-test-fake-root");
         let err = parse_locked_modules_str(root, Path::new("x"), raw).unwrap_err();
         assert!(matches!(
             err,
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn missing_locked_modules_file_is_fatal() {
         // Use a temp dir that definitely doesn't have a locked_modules.toml.
-        let tmp = std::env::temp_dir().join("proteus-locked-test-no-file");
+        let tmp = std::env::temp_dir().join("cuttle-locked-test-no-file");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         let candidate = tmp.join("subdir").join("file.rs");
@@ -370,7 +370,7 @@ mod tests {
     fn end_to_end_locked_path_refused() {
         // Create a tiny fake workspace with a locked_modules.toml and
         // a locked file.
-        let tmp = std::env::temp_dir().join("proteus-locked-test-end-to-end");
+        let tmp = std::env::temp_dir().join("cuttle-locked-test-end-to-end");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         write(
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn end_to_end_unlocked_path_morphs_successfully() {
-        let tmp = std::env::temp_dir().join("proteus-locked-test-unlocked");
+        let tmp = std::env::temp_dir().join("cuttle-locked-test-unlocked");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         write(
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn workspace_root_walks_up_from_nested_dir() {
-        let tmp = std::env::temp_dir().join("proteus-locked-test-walkup");
+        let tmp = std::env::temp_dir().join("cuttle-locked-test-walkup");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         write(&tmp.join("locked_modules.toml"), "schema_version = 1\nlocked = []\n");

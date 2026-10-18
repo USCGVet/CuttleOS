@@ -5,8 +5,8 @@
 #![allow(missing_docs)]
 
 #[cfg(test)]
-use proteus_contracts::SLP_TYP_S5;
-use proteus_contracts::{
+use cuttle_contracts::SLP_TYP_S5;
+use cuttle_contracts::{
     Pm1Control, Power, PM1A_CNT_PORT, PM1_SLP_EN, PM1_SLP_TYP_MASK, PM1_SLP_TYP_SHIFT,
 };
 
@@ -79,7 +79,7 @@ impl RecordingPm1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::Power;
+    use cuttle_contracts::Power;
 
     #[test]
     fn constants() {

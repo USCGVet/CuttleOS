@@ -1,7 +1,7 @@
 //! Verify the scheduler picks the module with the oldest `last_morph_unix`
 //! when two equally-prioritised modules are both due.
 
-use proteus_morph_engine::scheduler::{
+use cuttle_morph_engine::scheduler::{
     pick_next_at, ModuleConfig, ModuleState, SchedulerConfig, SchedulerState,
 };
 use std::collections::BTreeMap;

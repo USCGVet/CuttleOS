@@ -16,9 +16,9 @@
 //! # Invocation
 //!
 //! ```text
-//! $env:PROTEUS_BUNDLE_SOAK_BOOT = "1"
-//! $env:PROTEUS_SOAK_ITERS = "2"   # optional; default 2
-//! cargo test -p proteus-morph-engine --test bundle_soak_boot -- --nocapture
+//! $env:CUTTLE_BUNDLE_SOAK_BOOT = "1"
+//! $env:CUTTLE_SOAK_ITERS = "2"   # optional; default 2
+//! cargo test -p cuttle-morph-engine --test bundle_soak_boot -- --nocapture
 //! ```
 //!
 //! Or: `tools\bundle_soak_boot.ps1`
@@ -29,7 +29,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use proteus_morph_engine::{
+use cuttle_morph_engine::{
     daemon::{run_daemon, DaemonArgs, DAEMON_LOG},
     verify_chain_with_options, SynthesizerKind, VerifyOptions, ATTEST_DIR_ENV,
 };
@@ -39,12 +39,12 @@ static MUTEX: Mutex<()> = Mutex::new(());
 const MODULES: &[&str] = &["tls", "wal", "net"];
 
 const REQUIRED_BANNERS: &[&str] = &[
-    "PROTEUS-TE OK",
+    "CUTTLE-TE OK",
     "TLS hkdf OK prk_sha=",
     "TLS server_hello OK len=",
     "WAL replay OK frames=",
     "NET build OK len=38 ip_cksum=63c7 udp_cksum=fa94",
-    "PROTEUS-TE HALT",
+    "CUTTLE-TE HALT",
 ];
 
 /// Same bijective mix as `diversity_demo::cycle_layout_seed` /
@@ -120,7 +120,7 @@ fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Package ELF + boot QEMU until PROTEUS-TE HALT (or timeout).
+/// Package ELF + boot QEMU until CUTTLE-TE HALT (or timeout).
 fn boot_kernel(elf: &Path, results_dir: &Path, cycle: u64) -> Result<PathBuf, String> {
     let qemu = find_qemu().ok_or_else(|| "qemu-system-x86_64 not found".to_string())?;
     let pkg = factory_builder::locate_pkg_crate().map_err(|e| format!("{:#}", e))?;
@@ -169,7 +169,7 @@ fn boot_kernel(elf: &Path, results_dir: &Path, cycle: u64) -> Result<PathBuf, St
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
         if let Ok(s) = fs::read_to_string(&serial) {
-            if s.contains("PROTEUS-TE HALT") {
+            if s.contains("CUTTLE-TE HALT") {
                 halted = true;
                 break;
             }
@@ -185,7 +185,7 @@ fn boot_kernel(elf: &Path, results_dir: &Path, cycle: u64) -> Result<PathBuf, St
             .take(2000)
             .collect();
         return Err(format!(
-            "no PROTEUS-TE HALT within 25s; serial preview:\n{}",
+            "no CUTTLE-TE HALT within 25s; serial preview:\n{}",
             preview
         ));
     }
@@ -194,9 +194,9 @@ fn boot_kernel(elf: &Path, results_dir: &Path, cycle: u64) -> Result<PathBuf, St
 
 #[test]
 fn mini_bundle_soak_then_qemu_boot() {
-    if std::env::var("PROTEUS_BUNDLE_SOAK_BOOT").as_deref() != Ok("1") {
+    if std::env::var("CUTTLE_BUNDLE_SOAK_BOOT").as_deref() != Ok("1") {
         eprintln!(
-            "SKIP: set PROTEUS_BUNDLE_SOAK_BOOT=1 to run mini-bundle soak + QEMU boot \
+            "SKIP: set CUTTLE_BUNDLE_SOAK_BOOT=1 to run mini-bundle soak + QEMU boot \
              (needs QEMU + nightly kernel build; several minutes)"
         );
         return;
@@ -210,7 +210,7 @@ fn mini_bundle_soak_then_qemu_boot() {
         "missing soak_bundle_mini/scheduler.toml"
     );
 
-    let iters: u64 = std::env::var("PROTEUS_SOAK_ITERS")
+    let iters: u64 = std::env::var("CUTTLE_SOAK_ITERS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
@@ -236,7 +236,7 @@ fn mini_bundle_soak_then_qemu_boot() {
     );
 
     let st = Command::new("cargo")
-        .args(["build", "-p", "proteus-verifier", "--bin", "verify"])
+        .args(["build", "-p", "cuttle-verifier", "--bin", "verify"])
         .current_dir(&root)
         .status()
         .expect("build verify");

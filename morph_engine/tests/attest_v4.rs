@@ -1,16 +1,16 @@
 //! TASK-022 — integration tests for the v4 attestation schema
 //! (`factory_binaries` map) and `verify-attest --strict-factory`.
 //!
-//! Test isolation uses `PROTEUS_ATTEST_DIR` like `tests/attest.rs`; the
+//! Test isolation uses `CUTTLE_ATTEST_DIR` like `tests/attest.rs`; the
 //! env-var lock is local to this file (Rust integration tests live in
 //! separate binaries, so we can't share `ENV_LOCK` across files).
 
-use proteus_morph_engine::attest::{
+use cuttle_morph_engine::attest::{
     self, compute_entry_sha256, load_entries, verify_chain, verify_chain_with_options,
     write_attestation, AttestEntry, AttestEntryFields, MerkleRootStatus, VerifyOptions,
     ATTEST_DIR_ENV, READABLE_MIN_SCHEMA, SCHEMA_VERSION,
 };
-use proteus_morph_engine::factory::{
+use cuttle_morph_engine::factory::{
     self, FactoryExpected, COMPONENT_DIVERSIFY, COMPONENT_MORPH, COMPONENT_RUSTC,
     COMPONENT_VERIFY,
 };
@@ -32,7 +32,7 @@ fn fresh_tempdir(label: &str) -> PathBuf {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "proteus_attest_v4_test_{}_{}_{}_{}",
+        "cuttle_attest_v4_test_{}_{}_{}_{}",
         label,
         std::process::id(),
         nanos,
@@ -293,7 +293,7 @@ fn write_chain_with_factory_binaries_verifies() {
     assert_eq!(report.entries_ok, 3);
     let entries = load_entries().unwrap();
     for e in &entries {
-        assert_eq!(e.schema_version, proteus_morph_engine::attest::LEGACY_SCHEMA_VERSION);
+        assert_eq!(e.schema_version, cuttle_morph_engine::attest::LEGACY_SCHEMA_VERSION);
         assert_eq!(e.factory_binaries.len(), 4);
     }
 
@@ -379,7 +379,7 @@ fn v3_then_v4_chain_verifies() {
     // Phase A). The post-v3 hardcoded `4` was right at the time this
     // test was written; assert against the live SCHEMA_VERSION so
     // future bumps don't have to re-edit every chain test.
-    assert_eq!(entries[1].schema_version, proteus_morph_engine::attest::LEGACY_SCHEMA_VERSION);
+    assert_eq!(entries[1].schema_version, cuttle_morph_engine::attest::LEGACY_SCHEMA_VERSION);
     assert_eq!(entries[1].factory_binaries.len(), 4);
     // Chain link: entry 1's prev points at entry 0's hash.
     assert_eq!(entries[1].prev_entry_sha256, entries[0].entry_sha256);
@@ -404,7 +404,7 @@ fn legacy_v3_with_cosigs_still_verifies_under_v4() {
 
     use std::io::Write;
     let mut cosigs = Vec::new();
-    cosigs.push(proteus_morph_engine::Cosignature {
+    cosigs.push(cuttle_morph_engine::Cosignature {
         signer_id: "primary".into(),
         sig_ed25519: "ab".repeat(64),
     });
@@ -460,7 +460,7 @@ fn legacy_v3_with_cosigs_still_verifies_under_v4() {
     // TASK-036). The chain still verifies because v3..=v5 entries
     // canonicalize compatibly via `skip_serializing_if` on every
     // post-v2 field.
-    assert_eq!(entries[1].schema_version, proteus_morph_engine::attest::LEGACY_SCHEMA_VERSION);
+    assert_eq!(entries[1].schema_version, cuttle_morph_engine::attest::LEGACY_SCHEMA_VERSION);
 
     unsafe {
         std::env::remove_var(ATTEST_DIR_ENV);

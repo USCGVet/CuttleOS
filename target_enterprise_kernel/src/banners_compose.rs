@@ -8,10 +8,10 @@ pub(crate) use crate::*;
 /// after independent morph of `nvme` + `virtio_blk`.
 ///
 /// Banner: `BLOCK path compose OK sector=512 nvme=a5 virtio=a5`
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_block_path_compose() {
-    use proteus_contracts::{BlockDeviceVirtio, VIRTIO_BLK_SECTOR_SIZE};
+    use cuttle_contracts::{BlockDeviceVirtio, VIRTIO_BLK_SECTOR_SIZE};
     use target_enterprise::nvme::{
         MemNvmeController, NvmeImpl, NVME_BLOCK_SIZE,
     };
@@ -101,10 +101,10 @@ pub(crate) fn banner_block_path_compose() {
 /// isolated demos): morph damage to either side drops this banner.
 ///
 /// Banner: `NET path compose OK method=GET status=200`
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_net_path_compose() {
-    use proteus_contracts::{tcp_flags, Http, HttpMethod, Tcp};
+    use cuttle_contracts::{tcp_flags, Http, HttpMethod, Tcp};
     use target_enterprise::http::HttpImpl;
     use target_enterprise::tcp::{process_segment, Tcb, TcpImpl, TcpState};
 
@@ -176,7 +176,7 @@ pub(crate) fn banner_net_path_compose() {
 
     // ---- HTTP request as TCP data on the established stream ----
     let http_req: &[u8] =
-        b"GET /healthz HTTP/1.1\r\nHost: proteus.local\r\n\r\n";
+        b"GET /healthz HTTP/1.1\r\nHost: cuttle.local\r\n\r\n";
     let n = match TcpImpl::build_segment(
         client_port,
         server_port,
@@ -270,10 +270,10 @@ pub(crate) fn banner_net_path_compose() {
 /// silently desync the others.
 ///
 /// Banner: `AHCI storage compose OK fis=ec prdtl=1 bytes=512`
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_ahci_storage_compose() {
-    use proteus_contracts::{
+    use cuttle_contracts::{
         AhciCmd, AhciFis, AHCI_CFL_H2D, AHCI_FIS_H2D_LEN, ATA_CMD_IDENTIFY,
     };
     use target_enterprise::ahci_cmd::AhciCmdImpl;
@@ -347,16 +347,16 @@ pub(crate) fn banner_ahci_storage_compose() {
 // the *integration* risk: PIT program → tick mux → watchdog pet/fire,
 // and quota check-on-write gating a real VFS create/write. A morph
 // that diversifies one side of the pair but breaks the glue panics
-// here and suppresses PROTEUS-TE HALT.
+// here and suppresses CUTTLE-TE HALT.
 
 /// TIMEBASE compose: PIT 1 kHz program + TickSource (PIT then HPET)
 /// drives Watchdog arm → tick → pet → fire.
 ///
 /// Banner: `TIMEBASE compose OK pit_div=1193 pet_rem=5 fire=timeout`
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_timebase_compose() {
-    use proteus_contracts::{
+    use cuttle_contracts::{
         PicTimer, TickKind, TickSource, Watchdog, WatchdogError, PIT_CH0_PORT,
         PIT_CMD_CH0_LOHI_MODE3_BIN, PIT_CMD_PORT,
     };
@@ -457,10 +457,10 @@ pub(crate) fn banner_timebase_compose() {
 /// uid 1001 (at block limit) is rejected → no write attempted.
 ///
 /// Banner: `VFS+QUOTA compose OK allow=1000 reject=1001 bytes=8`
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_vfs_quota_compose() {
-    use proteus_contracts::{
+    use cuttle_contracts::{
         Filesystem, Quota, QuotaReject, Vfs, FS_O_CREATE, FS_O_RDWR, FS_O_RDONLY,
     };
     use target_enterprise::quota::{build_banner_fixture, BANNER_NOW_UNIX, QuotaImpl};
@@ -512,7 +512,7 @@ pub(crate) fn banner_vfs_quota_compose() {
         Ok(h) => h,
         Err(_) => panic!("VFS+QUOTA compose: open failed"),
     };
-    const PAYLOAD: &[u8] = b"proteus\n";
+    const PAYLOAD: &[u8] = b"cuttle\n";
     let n = match <VfsImpl<8> as Vfs>::write(&mut vfs, h, 0, PAYLOAD) {
         Ok(n) => n,
         Err(_) => panic!("VFS+QUOTA compose: write failed"),
@@ -577,13 +577,13 @@ impl ComposeVfsArena {
 pub(crate) static KERNEL_SHELL: spin::Mutex<target_enterprise::OsShell> =
     spin::Mutex::new(target_enterprise::OsShell::empty());
 
-/// First LBA of the 2-sector (`PRTSSHL1` header + 512-byte WAL) sealed
+/// First LBA of the 2-sector (`CTTLSHL1` header + 512-byte WAL) sealed
 /// `OsShell` persistence region on the AHCI disk (`LBA 1040..=1041`).
 pub(crate) const SHELL_DISK_LBA: u64 = 1040;
-/// First LBA of the 16-sector (`8 KiB`, `PRTSFS01` superblock + inode table +
+/// First LBA of the 16-sector (`8 KiB`, `CTTLFS01` superblock + inode table +
 /// data pool) block-backed filesystem partition on the AHCI disk (`LBA 1042..=1057`).
 pub(crate) const SHELL_FS_DISK_LBA: u64 = 1042;
-/// First LBA of the 8-sector (`4 KiB`, `PRTSSQL1` superblock + relational tables)
+/// First LBA of the 8-sector (`4 KiB`, `CTTLSQL1` superblock + relational tables)
 /// embedded SQL database partition on the AHCI disk (`LBA 1058..=1065`).
 pub(crate) const SHELL_SQL_DISK_LBA: u64 = 1058;
 
@@ -874,7 +874,7 @@ pub(crate) fn banner_shell_compose() {
     {
         panic!("SHELL compose: session create drift");
     }
-    serial_write_str("WEB+SQL+SESSION compose OK tables=2 rows=6 magic=PRTSSQL1\n");
+    serial_write_str("WEB+SQL+SESSION compose OK tables=2 rows=6 magic=CTTLSQL1\n");
     let av_sc = vsh.exec_line(b"syscall 5 open /var/boot.ok", boots, 0, 0, &mut out);
     if &out[..av_sc.bytes_written()]
         != b"syscall denied: EACCES (blocked by eBPF seccomp filter)\n"
@@ -905,11 +905,11 @@ pub(crate) fn banner_shell_compose() {
         panic!("SHELL compose: remote attestation MAC accepted the wrong nonce");
     }
     serial_write_str("ATTEST: OK seed=");
-    serial_write_str(option_env!("PROTEUS_VARIANT_SEED").unwrap_or("default-variant"));
+    serial_write_str(option_env!("CUTTLE_VARIANT_SEED").unwrap_or("default-variant"));
     serial_write_str(" quote=verified\n");
     let av_df = vsh.exec_line(b"df", boots, 0, 0, &mut out);
     if &out[..av_df.bytes_written()]
-        != b"fs: magic=PRTSFS01 inodes=5/16 pool_bytes=704/4096 part_sectors=16\n"
+        != b"fs: magic=CTTLFS01 inodes=5/16 pool_bytes=704/4096 part_sectors=16\n"
     {
         panic!("SHELL compose: df output drift");
     }
@@ -917,7 +917,7 @@ pub(crate) fn banner_shell_compose() {
     if !out[..av_sync.bytes_written()].starts_with(b"sync: ok files=1 bytes=6 seal=") {
         panic!("SHELL compose: sync output drift");
     }
-    serial_write_str("FS partition OK lba=1042..1057 sectors=16 files=1 magic=PRTSFS01\n");
+    serial_write_str("FS partition OK lba=1042..1057 sectors=16 files=1 magic=CTTLFS01\n");
     verify_https_and_concurrent_tcp_compose(boots, seal_key);
     verify_service_runtime_compose(vsh);
     let mut s_idx = 0usize;
@@ -949,7 +949,7 @@ pub(crate) fn banner_shell_compose() {
 
     serial_write_str("SHELL compose OK tasks=5 files=5 audit=5\n");
     if seal_rejected {
-        sh.record_net_audit(proteus_contracts::AuditVerdict::Denied, b"shell:wal:seal-mismatch");
+        sh.record_net_audit(cuttle_contracts::AuditVerdict::Denied, b"shell:wal:seal-mismatch");
     }
 }
 
@@ -1052,7 +1052,7 @@ fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
 
 #[inline(never)]
 fn verify_https_and_concurrent_tcp_compose(boots: u64, auth_key: [u8; 32]) {
-    use proteus_contracts::{tcp_flags, Aead, Tcp, IP_PROTO_TCP};
+    use cuttle_contracts::{tcp_flags, Aead, Tcp, IP_PROTO_TCP};
     use target_enterprise::lived_net::{
         GUEST_IP, HTTPS_PORT, HTTP_PORT, TCP_MAX_SLOTS, TLS_CONTENT_APPLICATION_DATA,
         TLS_SERVER_PUBKEY,
@@ -1217,7 +1217,7 @@ fn verify_https_and_concurrent_tcp_compose(boots: u64, auth_key: [u8; 32]) {
         &mut plain_status,
     )
     .unwrap();
-    if !plain_status[..plen].starts_with(b"PROTEUS-STATUS boots=") {
+    if !plain_status[..plen].starts_with(b"CUTTLE-STATUS boots=") {
         panic!("HTTPS+TCP4 compose: decrypted TLS 1.3 status payload drift");
     }
 

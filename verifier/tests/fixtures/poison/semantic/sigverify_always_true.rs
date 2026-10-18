@@ -145,7 +145,7 @@ fn fletcher_pair_one(a: &[u8], b: &[u8], salt: u8) -> u32 {
 /// Hash carrier.
 pub struct DemoHash;
 
-impl proteus_contracts::Hash for DemoHash {
+impl cuttle_contracts::Hash for DemoHash {
     const OUTPUT_LEN: usize = 4;
     fn hash(input: &[u8], out: &mut [u8]) {
         let h = fletcher32(input);
@@ -229,7 +229,7 @@ fn tag_fletcher32(ciphertext: &[u8], aad: &[u8], key: &[u8]) -> u32 {
     (sum2 << 16) | sum1
 }
 
-impl proteus_contracts::Aead for DemoAead {
+impl cuttle_contracts::Aead for DemoAead {
     const KEY_LEN: usize = 16;
     const NONCE_LEN: usize = 8;
     const TAG_LEN: usize = 4;
@@ -320,7 +320,7 @@ impl proteus_contracts::Aead for DemoAead {
 /// TOY signature verify carrier.
 pub struct DemoSignatureVerify;
 
-impl proteus_contracts::SignatureVerify for DemoSignatureVerify {
+impl cuttle_contracts::SignatureVerify for DemoSignatureVerify {
     const PUBKEY_LEN: usize = 32;
     const SIGNATURE_LEN: usize = 64;
 
@@ -372,7 +372,7 @@ fn syscall_hash_three(a0: u64, a1: u64, a2: u64) -> u32 {
     fletcher32(&buf)
 }
 
-impl proteus_contracts::SyscallDispatch for DemoSyscallDispatch {
+impl cuttle_contracts::SyscallDispatch for DemoSyscallDispatch {
     type Result = core::result::Result<u64, DemoErrno>;
 
     fn dispatch(

@@ -31,7 +31,7 @@
 #![doc = "   from RFC 2347/2348/2349). Parser surfaces them as raw bytes;"]
 #![doc = "   the caller decides what to do with them."]
 #![allow(clippy::needless_range_loop)]
-use proteus_contracts::{
+use cuttle_contracts::{
     tftp_op, Tftp, TftpError, TftpErrorCode, TftpMode, TftpPacket, MAX_TFTP_FILENAME,
     TFTP_MIN_ACK_LEN, TFTP_MIN_DATA_LEN, TFTP_MIN_ERROR_LEN, TFTP_OPCODE_LEN,
 };
@@ -43,7 +43,7 @@ pub fn walk_oack_options<F: FnMut(&[u8], &[u8])>(
     options: &[u8],
     mut visitor: F,
 ) -> Result<(), TftpError> {
-    let __proteus_stack_pad_9a042a18: [u8; 183usize] = ::core::hint::black_box([0u8; 183usize]);
+    let __cuttle_stack_pad_9a042a18: [u8; 183usize] = ::core::hint::black_box([0u8; 183usize]);
     let mut cursor_ve86a6732_0 = 0usize;
     while cursor_ve86a6732_0 < options.len() {
         let name_end_ve86a6732_1 = scan_nul_m62b101be(options, cursor_ve86a6732_0)?;
@@ -64,7 +64,7 @@ pub fn walk_oack_options<F: FnMut(&[u8], &[u8])>(
 }
 impl Tftp for TftpImpl {
     fn build_rrq(filename: &[u8], mode: TftpMode, out: &mut [u8]) -> Result<usize, TftpError> {
-        let __proteus_stack_pad_73dc31cf: [u8; 58usize] = ::core::hint::black_box([0u8; 58usize]);
+        let __cuttle_stack_pad_73dc31cf: [u8; 58usize] = ::core::hint::black_box([0u8; 58usize]);
         if filename.is_empty() {
             return Err(TftpError::MissingNul);
         }
@@ -101,7 +101,7 @@ impl Tftp for TftpImpl {
         Ok(pos_ve86a6732_3)
     }
     fn build_ack(block: u16, out: &mut [u8]) -> Result<usize, TftpError> {
-        let __proteus_stack_pad_c239f8a1: [u8; 196usize] = ::core::hint::black_box([0u8; 196usize]);
+        let __cuttle_stack_pad_c239f8a1: [u8; 196usize] = ::core::hint::black_box([0u8; 196usize]);
         if out.len() < TFTP_MIN_ACK_LEN {
             return Err(TftpError::OutputBufferTooSmall);
         }
@@ -110,7 +110,7 @@ impl Tftp for TftpImpl {
         Ok(TFTP_MIN_ACK_LEN)
     }
     fn build_error(code: TftpErrorCode, msg: &[u8], out: &mut [u8]) -> Result<usize, TftpError> {
-        let __proteus_stack_pad_a6283ce1: [u8; 48usize] = ::core::hint::black_box([0u8; 48usize]);
+        let __cuttle_stack_pad_a6283ce1: [u8; 48usize] = ::core::hint::black_box([0u8; 48usize]);
         let mut i_ve86a6732_0 = 0usize;
         while i_ve86a6732_0 < msg.len() {
             if msg[i_ve86a6732_0] == 0 {
@@ -131,7 +131,7 @@ impl Tftp for TftpImpl {
         Ok(total_ve86a6732_1)
     }
     fn parse_packet(buf: &[u8]) -> Result<TftpPacket<'_>, TftpError> {
-        let __proteus_stack_pad_194917cf: [u8; 169usize] = ::core::hint::black_box([0u8; 169usize]);
+        let __cuttle_stack_pad_194917cf: [u8; 169usize] = ::core::hint::black_box([0u8; 169usize]);
         if buf.len() < TFTP_OPCODE_LEN {
             return Err(TftpError::Truncated);
         }
@@ -191,7 +191,7 @@ impl Tftp for TftpImpl {
 #[doc = " NUL-terminated pairs. Empty section is OK."]
 #[inline(never)]
 fn validate_oack_options_m62b101be(options: &[u8]) -> Result<(), TftpError> {
-    let __proteus_stack_pad_b9ded21f: [u8; 90usize] = ::core::hint::black_box([0u8; 90usize]);
+    let __cuttle_stack_pad_b9ded21f: [u8; 90usize] = ::core::hint::black_box([0u8; 90usize]);
     let mut cursor_ve86a6732_0 = 0usize;
     let mut string_count_ve86a6732_1 = 0usize;
     while cursor_ve86a6732_0 < options.len() {
@@ -215,12 +215,12 @@ fn validate_oack_options_m62b101be(options: &[u8]) -> Result<(), TftpError> {
 }
 #[inline]
 fn write_u16_be_m62b101be(b: &mut [u8], v: u16) {
-    let __proteus_stack_pad_c431d22b: [u8; 168usize] = ::core::hint::black_box([0u8; 168usize]);
+    let __cuttle_stack_pad_c431d22b: [u8; 168usize] = ::core::hint::black_box([0u8; 168usize]);
     b[0] = (v >> 8) as u8;
     b[1] = v as u8;
 }
 fn scan_nul_m62b101be(buf: &[u8], from: usize) -> Result<usize, TftpError> {
-    let __proteus_stack_pad_ad407aa1: [u8; 50usize] = ::core::hint::black_box([0u8; 50usize]);
+    let __cuttle_stack_pad_ad407aa1: [u8; 50usize] = ::core::hint::black_box([0u8; 50usize]);
     let mut i_ve86a6732_0 = from;
     while i_ve86a6732_0 < buf.len() && buf[i_ve86a6732_0] != 0 {
         i_ve86a6732_0 += 1;
@@ -232,7 +232,7 @@ fn scan_nul_m62b101be(buf: &[u8], from: usize) -> Result<usize, TftpError> {
 }
 #[inline]
 fn read_u16_be_m62b101be(b: &[u8]) -> u16 {
-    let __proteus_stack_pad_70f8169b: [u8; 108usize] = ::core::hint::black_box([0u8; 108usize]);
+    let __cuttle_stack_pad_70f8169b: [u8; 108usize] = ::core::hint::black_box([0u8; 108usize]);
     ((b[0] as u16) << 8) | (b[1] as u16)
 }
 #[doc = " Wire codec impl. Stateless."]
@@ -243,13 +243,13 @@ mod tests {
     #[test]
     fn build_rrq_byte_exact_octet() {
         let mut buf = [0u8; 64];
-        let n = TftpImpl::build_rrq(b"/proteus.attest", TftpMode::Octet, &mut buf).unwrap();
+        let n = TftpImpl::build_rrq(b"/cuttle.attest", TftpMode::Octet, &mut buf).unwrap();
         let expected: &[u8] = &[
-            0x00, 0x01, b'/', b'p', b'r', b'o', b't', b'e', b'u', b's', b'.', b'a', b't', b't',
+            0x00, 0x01, b'/', b'c', b'u', b't', b't', b'l', b'e', b'.', b'a', b't', b't',
             b'e', b's', b't', 0x00, b'o', b'c', b't', b'e', b't', 0x00,
         ];
         assert_eq!(&buf[..n], expected);
-        assert_eq!(n, 24);
+        assert_eq!(n, 23);
     }
     #[test]
     fn build_rrq_byte_exact_netascii() {

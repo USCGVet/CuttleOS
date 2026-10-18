@@ -11,7 +11,7 @@
 #   powershell -ExecutionPolicy Bypass -File tools\north_star_soak.ps1 -Iters 2 -EmitImage
 #   # Durable seals (TASK-149/150): seal baselines first, then:
 #   powershell -File tools\seal_factory_baselines.ps1
-#   $env:PROTEUS_DURABLE_SEALS_DIR = (Resolve-Path seals).Path
+#   $env:CUTTLE_DURABLE_SEALS_DIR = (Resolve-Path seals).Path
 #   powershell -File tools\north_star_soak.ps1 -Iters 1 -RequireDurableSeals
 #
 # Wall-clock: full enrolled kernel bundle × N workspace verifies
@@ -25,9 +25,9 @@ param(
     # TASK-127: after N accepts, QEMU-boot the still-morphed sources.
     [switch]$Boot,
     # TASK-150: post-verify require durable_seals on accepted entries.
-    # Needs PROTEUS_DURABLE_SEALS_DIR set (or pass -SealsDir) during morph.
+    # Needs CUTTLE_DURABLE_SEALS_DIR set (or pass -SealsDir) during morph.
     [switch]$RequireDurableSeals,
-    # Optional seals dir; sets PROTEUS_DURABLE_SEALS_DIR for the soak process.
+    # Optional seals dir; sets CUTTLE_DURABLE_SEALS_DIR for the soak process.
     [string]$SealsDir = ""
 )
 
@@ -40,19 +40,19 @@ if ($Iters -lt 1 -or $Iters -gt 20) {
     exit 2
 }
 
-$env:PROTEUS_NORTH_STAR_SOAK = '1'
-$env:PROTEUS_SOAK_ITERS = "$Iters"
+$env:CUTTLE_NORTH_STAR_SOAK = '1'
+$env:CUTTLE_SOAK_ITERS = "$Iters"
 if ($EmitImage) {
-    $env:PROTEUS_SOAK_EMIT_IMAGE = '1'
+    $env:CUTTLE_SOAK_EMIT_IMAGE = '1'
     Write-Host "north_star_soak: EmitImage ON (kernel ELF per cycle)"
 } else {
-    Remove-Item Env:PROTEUS_SOAK_EMIT_IMAGE -ErrorAction SilentlyContinue
+    Remove-Item Env:CUTTLE_SOAK_EMIT_IMAGE -ErrorAction SilentlyContinue
 }
 if ($Boot) {
-    $env:PROTEUS_NORTH_STAR_BOOT = '1'
+    $env:CUTTLE_NORTH_STAR_BOOT = '1'
     Write-Host "north_star_soak: Boot ON (QEMU after soak)"
 } else {
-    Remove-Item Env:PROTEUS_NORTH_STAR_BOOT -ErrorAction SilentlyContinue
+    Remove-Item Env:CUTTLE_NORTH_STAR_BOOT -ErrorAction SilentlyContinue
 }
 if ($SealsDir) {
     $abs = if ([System.IO.Path]::IsPathRooted($SealsDir)) {
@@ -64,19 +64,19 @@ if ($SealsDir) {
         Write-Error "SealsDir does not exist: $abs (run tools\seal_factory_baselines.ps1 first)"
         exit 2
     }
-    $env:PROTEUS_DURABLE_SEALS_DIR = (Resolve-Path $abs).Path
-    Write-Host "north_star_soak: DURABLE_SEALS_DIR=$($env:PROTEUS_DURABLE_SEALS_DIR)"
+    $env:CUTTLE_DURABLE_SEALS_DIR = (Resolve-Path $abs).Path
+    Write-Host "north_star_soak: DURABLE_SEALS_DIR=$($env:CUTTLE_DURABLE_SEALS_DIR)"
 }
 if ($RequireDurableSeals) {
-    $env:PROTEUS_SOAK_REQUIRE_DURABLE_SEALS = '1'
+    $env:CUTTLE_SOAK_REQUIRE_DURABLE_SEALS = '1'
     Write-Host "north_star_soak: RequireDurableSeals ON"
 } else {
     # Leave parent env alone if already set; only clear when switch off and we own it.
-    if (-not $env:PROTEUS_SOAK_REQUIRE_DURABLE_SEALS) {
-        Remove-Item Env:PROTEUS_SOAK_REQUIRE_DURABLE_SEALS -ErrorAction SilentlyContinue
+    if (-not $env:CUTTLE_SOAK_REQUIRE_DURABLE_SEALS) {
+        Remove-Item Env:CUTTLE_SOAK_REQUIRE_DURABLE_SEALS -ErrorAction SilentlyContinue
     }
 }
 
 Write-Host "north_star_soak: iters=$Iters (full [bundle.kernel]; require_diversity; boot=$Boot; seals_req=$RequireDurableSeals)"
-cargo test -p proteus-morph-engine --test north_star_soak -- --nocapture
+cargo test -p cuttle-morph-engine --test north_star_soak -- --nocapture
 exit $LASTEXITCODE

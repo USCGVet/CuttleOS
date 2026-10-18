@@ -36,7 +36,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     Arp, ArpError, ArpPacketView, MacAddr, ARP_HLEN_ETHERNET, ARP_HTYPE_ETHERNET, ARP_PACKET_LEN,
     ARP_PLEN_IPV4, ARP_PTYPE_IPV4,
 };
@@ -69,7 +69,7 @@ impl Arp for ArpImpl {
         // RFC 826 §1: REQUEST has THA = all zeros (sender doesn't know
         // the target's MAC — that's literally what is being asked).
         build_packet(
-            proteus_contracts::arp_op::REQUEST,
+            cuttle_contracts::arp_op::REQUEST,
             sender_mac,
             sender_ip,
             [0u8; MAC_LEN],
@@ -86,7 +86,7 @@ impl Arp for ArpImpl {
         out: &mut [u8],
     ) -> Result<usize, ArpError> {
         build_packet(
-            proteus_contracts::arp_op::REPLY,
+            cuttle_contracts::arp_op::REPLY,
             sender_mac,
             sender_ip,
             target_mac,
@@ -116,8 +116,8 @@ impl Arp for ArpImpl {
             return Err(ArpError::InvalidProtocolLength);
         }
         let oper = read_u16_be(&bytes[6..8]);
-        if oper != proteus_contracts::arp_op::REQUEST
-            && oper != proteus_contracts::arp_op::REPLY
+        if oper != cuttle_contracts::arp_op::REQUEST
+            && oper != cuttle_contracts::arp_op::REPLY
         {
             return Err(ArpError::InvalidOperation);
         }
@@ -451,7 +451,7 @@ fn write_ipv4(out: &mut [u8], ip: &[u8; 4]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::{arp_op, Arp};
+    use cuttle_contracts::{arp_op, Arp};
 
     const SENDER_MAC: MacAddr = [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
     const SENDER_IP: [u8; 4] = [10, 0, 0, 1];

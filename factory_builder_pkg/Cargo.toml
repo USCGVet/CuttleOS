@@ -4,7 +4,7 @@ version = "0.0.1"
 edition = "2021"
 description = "Out-of-workspace heavy packager. Owns the bootloader-0.11 dep (whose build.rs needs nightly) so the main workspace can stay on stable. Invoked by the workspace-member `factory_builder` crate via cargo run."
 
-# Empty workspace marker — stops Cargo from walking up to the Proteus
+# Empty workspace marker — stops Cargo from walking up to the Cuttle
 # workspace's Cargo.toml, which would inherit the resolver/members and
 # break this crate's nightly-only build.
 [workspace]

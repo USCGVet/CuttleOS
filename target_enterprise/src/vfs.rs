@@ -1,7 +1,7 @@
 //! Virtual filesystem layer — [`VfsImpl`] dispatcher + [`MemRamFs`].
 //!
-//! This module is the [`proteus_contracts::Vfs`] +
-//! [`proteus_contracts::Filesystem`] contract impl. Closes the
+//! This module is the [`cuttle_contracts::Vfs`] +
+//! [`cuttle_contracts::Filesystem`] contract impl. Closes the
 //! no-filesystem gap left by every prior iteration — the kernel had no
 //! inode dispatch before this, and the donor `RustOSa/src/vfs.rs`
 //! shipped only a per-process file-descriptor table that slurped whole
@@ -44,7 +44,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     FileStat, Filesystem, FsError, FsHandle, Vfs, FS_MAX_MOUNTS, FS_NAME_MAX, FS_O_ACCMODE,
     FS_O_CREATE, FS_O_EXCL, FS_O_RDONLY, FS_O_RDWR, FS_O_TRUNC, FS_O_WRONLY, FS_PATH_MAX,
 };
@@ -1061,7 +1061,7 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::{FS_MODE_DIR as MODE_DIR, FS_MODE_FILE as MODE_FILE, FS_MODE_TYPE_MASK};
+    use cuttle_contracts::{FS_MODE_DIR as MODE_DIR, FS_MODE_FILE as MODE_FILE, FS_MODE_TYPE_MASK};
 
     // --- path validation + normalisation -------------------------
 
@@ -1192,12 +1192,12 @@ mod tests {
     #[test]
     fn memramfs_seed_then_open_then_read() {
         let mut fs = MemRamFs::<4, 256>::new();
-        let _ = fs.seed_file(b"/etc/hostname", b"proteus-te\n", 32, 0).unwrap();
+        let _ = fs.seed_file(b"/etc/hostname", b"cuttle-te\n", 32, 0).unwrap();
         let h = fs.open(b"/etc/hostname", FS_O_RDONLY).unwrap();
         let mut buf = [0u8; 32];
         let n = fs.read(h, 0, &mut buf).unwrap();
-        assert_eq!(n, 11);
-        assert_eq!(&buf[..n], b"proteus-te\n");
+        assert_eq!(n, 10);
+        assert_eq!(&buf[..n], b"cuttle-te\n");
         fs.close(h).unwrap();
     }
 
@@ -1315,9 +1315,9 @@ mod tests {
     #[test]
     fn memramfs_stat_file_returns_size() {
         let mut fs = MemRamFs::<4, 256>::new();
-        fs.seed_file(b"/etc/hostname", b"proteus-te\n", 32, 1700000000).unwrap();
+        fs.seed_file(b"/etc/hostname", b"cuttle-te\n", 32, 1700000000).unwrap();
         let st = fs.stat(b"/etc/hostname").unwrap();
-        assert_eq!(st.size, 11);
+        assert_eq!(st.size, 10);
         assert_eq!(st.mtime, 1700000000);
         assert!(st.is_file());
         assert_eq!(st.mode & FS_MODE_TYPE_MASK, MODE_FILE);
@@ -1389,13 +1389,13 @@ mod tests {
     fn vfsimpl_open_read_close_on_root_mount() {
         let mut vfs = VfsImpl::<2>::new();
         let fs = make_static_ramfs();
-        fs.seed_file(b"/etc/hostname", b"proteus-te\n", 32, 0).unwrap();
+        fs.seed_file(b"/etc/hostname", b"cuttle-te\n", 32, 0).unwrap();
         vfs.mount(b"/", fs as &mut dyn Filesystem).unwrap();
         let h = vfs.open(b"/etc/hostname", FS_O_RDONLY).unwrap();
         let mut buf = [0u8; 32];
         let n = vfs.read(h, 0, &mut buf).unwrap();
-        assert_eq!(n, 11);
-        assert_eq!(&buf[..n], b"proteus-te\n");
+        assert_eq!(n, 10);
+        assert_eq!(&buf[..n], b"cuttle-te\n");
         vfs.close(h).unwrap();
     }
 

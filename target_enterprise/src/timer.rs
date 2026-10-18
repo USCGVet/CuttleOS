@@ -27,7 +27,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     IoPort, PicTimer, Rtc, RtcTimeView, TimerError, CMOS_DATA_PORT, CMOS_INDEX_PORT,
     PIT_BASE_HZ, PIT_CH0_PORT, PIT_CMD_CH0_LOHI_MODE3_BIN, PIT_CMD_PORT, RTC_CONSISTENCY_PASSES,
     RTC_HOUR_PM, RTC_REG_DAY, RTC_REG_HOURS, RTC_REG_MINUTES, RTC_REG_MONTH, RTC_REG_SECONDS,
@@ -570,7 +570,7 @@ impl RecordingIoPort {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::{PicTimer, Rtc};
+    use cuttle_contracts::{PicTimer, Rtc};
 
     // ---- constant locks ---------------------------------------------------
 

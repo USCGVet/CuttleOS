@@ -2,7 +2,7 @@
 //! never-morphed (`last_morph_unix = 0`) and is therefore due. The
 //! highest-priority module wins. This is the "first ever boot" path.
 
-use proteus_morph_engine::scheduler::{
+use cuttle_morph_engine::scheduler::{
     load_state, pick_next_at, ModuleConfig, SchedulerConfig,
 };
 use std::collections::BTreeMap;
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 fn missing_state_file_means_all_modules_due() {
     // Point load_state at a path that does not exist.
     let tmp = std::env::temp_dir().join(format!(
-        "proteus_morph_missing_state_{}.json",
+        "cuttle_morph_missing_state_{}.json",
         std::process::id()
     ));
     if tmp.exists() {

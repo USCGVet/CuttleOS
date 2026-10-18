@@ -1,11 +1,11 @@
 //! Integration tests for the v2 attestation log (hash chain + Merkle
 //! anchors).
 //!
-//! Each test isolates itself via `PROTEUS_ATTEST_DIR` pointing at a fresh
+//! Each test isolates itself via `CUTTLE_ATTEST_DIR` pointing at a fresh
 //! per-test tempdir. We serialize tests that touch the env var with a
 //! mutex so parallel `cargo test` workers don't stomp on each other.
 
-use proteus_morph_engine::attest::{
+use cuttle_morph_engine::attest::{
     self, compute_entry_sha256, compute_merkle_root, load_anchors, load_entries, parse_hex32,
     verify_chain, write_attestation, AttestEntry, AttestEntryFields, ANCHOR_INTERVAL,
     ATTEST_DIR_ENV, SCHEMA_VERSION,
@@ -27,7 +27,7 @@ fn fresh_tempdir(label: &str) -> PathBuf {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "proteus_attest_test_{}_{}_{}_{}",
+        "cuttle_attest_test_{}_{}_{}_{}",
         label,
         std::process::id(),
         nanos,

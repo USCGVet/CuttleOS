@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{FrameBitmap, FrameBitmapError, FRAME_BITMAP_BITS};
+use cuttle_contracts::{FrameBitmap, FrameBitmapError, FRAME_BITMAP_BITS};
 
 /// Bitmap: bit=1 means free, bit=0 means used (or invert — we use 1=free).
 pub struct FrameBitmapImpl {
@@ -91,7 +91,7 @@ fn set_bit(bits: &mut [u8], idx: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::FrameBitmap;
+    use cuttle_contracts::FrameBitmap;
 
     #[test]
     fn bits_const() {

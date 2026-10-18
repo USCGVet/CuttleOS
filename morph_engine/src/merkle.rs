@@ -32,7 +32,7 @@
 //!
 //! The Bitcoin-padding choice carries a known second-preimage caveat
 //! (an N-leaf tree and an `N+1`-leaf tree where the last leaf is
-//! duplicated produce the same root). Proteus's threat model is not
+//! duplicated produce the same root). Cuttle's threat model is not
 //! affected: leaf supplies in this module come from the attestation
 //! writer, which sees every appended entry, so an attacker cannot
 //! sneak a duplicated leaf into the writer's view. Verifier-side, the

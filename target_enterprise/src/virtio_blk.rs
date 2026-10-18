@@ -9,22 +9,22 @@
 //!
 //! # Locked surface
 //!
-//! - [`proteus_contracts::VirtqDesc`] — 16-byte descriptor entry
+//! - [`cuttle_contracts::VirtqDesc`] — 16-byte descriptor entry
 //!   (spec §2.6.5). Reused from the TASK-048 VirtIO-net port.
-//! - [`proteus_contracts::VirtBlkRequest`] — 16-byte request header
+//! - [`cuttle_contracts::VirtBlkRequest`] — 16-byte request header
 //!   (spec §5.2.6).
-//! - [`proteus_contracts::virtio_blk_feature`] — feature bit constants.
-//! - [`proteus_contracts::virtio_blk_req_type`] — request-type byte
+//! - [`cuttle_contracts::virtio_blk_feature`] — feature bit constants.
+//! - [`cuttle_contracts::virtio_blk_req_type`] — request-type byte
 //!   values.
-//! - [`proteus_contracts::virtio_blk_status_byte`] — status-byte
+//! - [`cuttle_contracts::virtio_blk_status_byte`] — status-byte
 //!   values written by the device.
-//! - [`proteus_contracts::virtio_blk_device_cfg`] — device-cfg field
+//! - [`cuttle_contracts::virtio_blk_device_cfg`] — device-cfg field
 //!   offsets.
-//! - [`proteus_contracts::virtio_status`] — `device_status` bit
+//! - [`cuttle_contracts::virtio_status`] — `device_status` bit
 //!   constants. Reused.
-//! - [`proteus_contracts::virtio_common_cfg`] — common-cfg field
+//! - [`cuttle_contracts::virtio_common_cfg`] — common-cfg field
 //!   offsets. Reused.
-//! - [`proteus_contracts::BlockDeviceVirtio`] — the trait surface.
+//! - [`cuttle_contracts::BlockDeviceVirtio`] — the trait surface.
 //!
 //! # What this port covers
 //!
@@ -48,7 +48,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     virtio_blk_device_cfg as dcfg, virtio_blk_feature as feat, virtio_blk_req_type as req_type,
     virtio_blk_status_byte as st, virtio_common_cfg as ccfg, virtio_status, virtq_desc_flags,
     BlockDeviceVirtio, MmioBus, VirtBlkError, VirtBlkRequest, VirtqDesc, VIRTIO_BLK_HDR_LEN,
@@ -1130,7 +1130,7 @@ impl MmioBus for MemVirtioBlkBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::virtio_blk_feature as f;
+    use cuttle_contracts::virtio_blk_feature as f;
 
     fn fresh() -> (VirtioBlk, MemVirtioBlkBus) {
         (VirtioBlk::new(), MemVirtioBlkBus::new())

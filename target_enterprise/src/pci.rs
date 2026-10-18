@@ -51,7 +51,7 @@
 #![doc = "  bits  7:0  : register (offset & 0xFC)"]
 #![doc = " ```"]
 #![allow(clippy::needless_range_loop)]
-use proteus_contracts::{
+use cuttle_contracts::{
     pci_class, Pci, PciAddress, PciBar, PciConfigBus, PciDevice, PciError, PciMsixInfo,
     PCI_BAR_INT_LINE_NONE, PCI_BAR_IO_ADDR_MASK, PCI_BAR_MMIO_ADDR_MASK, PCI_BAR_MMIO_TYPE_64BIT,
     PCI_BAR_MMIO_TYPE_MASK, PCI_BAR_TYPE_IO_BIT, PCI_CAP_ID_MSIX, PCI_CFG_OFFSET_CAP_PTR,
@@ -73,7 +73,7 @@ pub struct PciWriteRecord {
 }
 impl Pci for PciImpl {
     fn probe(bus: &mut dyn PciConfigBus, addr: PciAddress) -> Option<PciDevice> {
-        let __proteus_stack_pad_76cfccf1: [u8; 89usize] = ::core::hint::black_box([0u8; 89usize]);
+        let __cuttle_stack_pad_76cfccf1: [u8; 89usize] = ::core::hint::black_box([0u8; 89usize]);
         let id_vd3b15b95_0 = bus.read_dword(addr, PCI_CFG_OFFSET_VENDOR_DEVICE);
         let vendor_id_vd3b15b95_1 = (id_vd3b15b95_0 & 0xFFFF) as u16;
         if vendor_id_vd3b15b95_1 == PCI_VENDOR_NONE {
@@ -99,9 +99,9 @@ impl Pci for PciImpl {
         })
     }
     fn enumerate(bus: &mut dyn PciConfigBus, sink: &mut dyn FnMut(PciDevice)) {
-        let __proteus_stack_pad_dd538ab9: [u8; 67usize] = ::core::hint::black_box([0u8; 67usize]);
+        let __cuttle_stack_pad_dd538ab9: [u8; 67usize] = ::core::hint::black_box([0u8; 67usize]);
         let mut bus_no_vd3b15b95_0: u16 = 0;
-        while bus_no_vd3b15b95_0 < proteus_contracts::PCI_MAX_BUS {
+        while bus_no_vd3b15b95_0 < cuttle_contracts::PCI_MAX_BUS {
             let mut device_vd3b15b95_1: u8 = 0;
             while device_vd3b15b95_1 < PCI_MAX_DEVICE {
                 let f0_vd3b15b95_2 = PciAddress {
@@ -135,7 +135,7 @@ impl Pci for PciImpl {
         }
     }
     fn class_name(class: u8, subclass: u8) -> &'static str {
-        let __proteus_stack_pad_0459547d: [u8; 40usize] = ::core::hint::black_box([0u8; 40usize]);
+        let __cuttle_stack_pad_0459547d: [u8; 40usize] = ::core::hint::black_box([0u8; 40usize]);
         use pci_class::*;
         match (class, subclass) {
             (CLASS_MASS_STORAGE, SUBCLASS_IDE) => "Mass Storage: IDE",
@@ -156,7 +156,7 @@ impl Pci for PciImpl {
         }
     }
     fn int_line(bus: &mut dyn PciConfigBus, addr: PciAddress) -> Option<u8> {
-        let __proteus_stack_pad_182942bd: [u8; 70usize] = ::core::hint::black_box([0u8; 70usize]);
+        let __cuttle_stack_pad_182942bd: [u8; 70usize] = ::core::hint::black_box([0u8; 70usize]);
         let dw_vd3b15b95_0 = bus.read_dword(addr, PCI_CFG_OFFSET_INT_LINE);
         let line_vd3b15b95_1 = (dw_vd3b15b95_0 & 0xFF) as u8;
         if line_vd3b15b95_1 == PCI_BAR_INT_LINE_NONE {
@@ -166,11 +166,11 @@ impl Pci for PciImpl {
         }
     }
     fn read_bar(bus: &mut dyn PciConfigBus, addr: PciAddress, idx: u8) -> Result<PciBar, PciError> {
-        let __proteus_stack_pad_380a36f3: [u8; 198usize] = ::core::hint::black_box([0u8; 198usize]);
+        let __cuttle_stack_pad_380a36f3: [u8; 198usize] = ::core::hint::black_box([0u8; 198usize]);
         if idx > PCI_MAX_BAR_INDEX {
             return Err(PciError::BadBarIndex);
         }
-        let offset_vd3b15b95_0 = proteus_contracts::PCI_CFG_OFFSET_BAR0 + idx * 4;
+        let offset_vd3b15b95_0 = cuttle_contracts::PCI_CFG_OFFSET_BAR0 + idx * 4;
         let lo_vd3b15b95_1 = bus.read_dword(addr, offset_vd3b15b95_0);
         if lo_vd3b15b95_1 == 0 {
             return Err(PciError::EmptyBar);
@@ -192,7 +192,7 @@ impl Pci for PciImpl {
         }
     }
     fn enable_bus_master(bus: &mut dyn PciConfigBus, addr: PciAddress) {
-        let __proteus_stack_pad_985f0f7c: [u8; 79usize] = ::core::hint::black_box([0u8; 79usize]);
+        let __cuttle_stack_pad_985f0f7c: [u8; 79usize] = ::core::hint::black_box([0u8; 79usize]);
         let cur_vd3b15b95_0 = bus.read_dword(addr, PCI_CFG_OFFSET_COMMAND_STATUS);
         let new_vd3b15b95_1 = cur_vd3b15b95_0 | PCI_COMMAND_BUS_MASTER;
         bus.write_dword(addr, PCI_CFG_OFFSET_COMMAND_STATUS, new_vd3b15b95_1);
@@ -202,7 +202,7 @@ impl Pci for PciImpl {
         addr: PciAddress,
         cap_id: u8,
     ) -> Result<u8, PciError> {
-        let __proteus_stack_pad_09e27238: [u8; 211usize] = ::core::hint::black_box([0u8; 211usize]);
+        let __cuttle_stack_pad_09e27238: [u8; 211usize] = ::core::hint::black_box([0u8; 211usize]);
         let status_cmd_vd3b15b95_0 = bus.read_dword(addr, PCI_CFG_OFFSET_COMMAND_STATUS);
         let status_vd3b15b95_1 = (status_cmd_vd3b15b95_0 >> 16) as u16;
         if status_vd3b15b95_1 & PCI_STATUS_CAPABILITIES_LIST == 0 {
@@ -230,7 +230,7 @@ impl Pci for PciImpl {
         Err(PciError::CapWalkOverflow)
     }
     fn msix_info(bus: &mut dyn PciConfigBus, addr: PciAddress) -> Result<PciMsixInfo, PciError> {
-        let __proteus_stack_pad_7bb04dac: [u8; 37usize] = ::core::hint::black_box([0u8; 37usize]);
+        let __cuttle_stack_pad_7bb04dac: [u8; 37usize] = ::core::hint::black_box([0u8; 37usize]);
         let cap_offset_vd3b15b95_0 = Self::find_capability(bus, addr, PCI_CAP_ID_MSIX)?;
         let dw0_vd3b15b95_1 = bus.read_dword(addr, cap_offset_vd3b15b95_0);
         let table_dw_vd3b15b95_2 = bus.read_dword(addr, cap_offset_vd3b15b95_0 + 4);
@@ -251,7 +251,7 @@ impl Pci for PciImpl {
         })
     }
     fn msix_set_enable(bus: &mut dyn PciConfigBus, addr: PciAddress, info: &PciMsixInfo, on: bool) {
-        let __proteus_stack_pad_6c7c78ef: [u8; 111usize] = ::core::hint::black_box([0u8; 111usize]);
+        let __cuttle_stack_pad_6c7c78ef: [u8; 111usize] = ::core::hint::black_box([0u8; 111usize]);
         let cur_vd3b15b95_0 = bus.read_dword(addr, info.cap_offset);
         let mut mc_vd3b15b95_1 = (cur_vd3b15b95_0 >> 16) as u16;
         match on {
@@ -306,7 +306,7 @@ pub struct RecordingBus {
 }
 impl Default for RecordingBus {
     fn default() -> Self {
-        let __proteus_stack_pad_d221c244: [u8; 34usize] = ::core::hint::black_box([0u8; 34usize]);
+        let __cuttle_stack_pad_d221c244: [u8; 34usize] = ::core::hint::black_box([0u8; 34usize]);
         Self::new()
     }
 }
@@ -326,7 +326,7 @@ impl RecordingBus {
     #[doc = " `read_dword`. Overwrites an existing entry if one matches."]
     #[doc = " Returns `false` if the script table is full."]
     pub fn set(&mut self, addr: PciAddress, offset: u8, value: u32) -> bool {
-        let __proteus_stack_pad_47bf8601: [u8; 171usize] = ::core::hint::black_box([0u8; 171usize]);
+        let __cuttle_stack_pad_47bf8601: [u8; 171usize] = ::core::hint::black_box([0u8; 171usize]);
         let mut i_vd3b15b95_1 = 0usize;
         let off_vd3b15b95_0 = offset & 0xFC;
         while i_vd3b15b95_1 < self.script_count {
@@ -356,13 +356,13 @@ impl RecordingBus {
     #[doc = " Number of writes the driver has issued through this bus since"]
     #[doc = " construction."]
     pub fn write_count(&self) -> usize {
-        let __proteus_stack_pad_a763ac5e: [u8; 123usize] = ::core::hint::black_box([0u8; 123usize]);
+        let __cuttle_stack_pad_a763ac5e: [u8; 123usize] = ::core::hint::black_box([0u8; 123usize]);
         self.write_count
     }
     #[doc = " Look up the `idx`'th recorded write. Returns `None` past the"]
     #[doc = " end of the log."]
     pub fn write_at(&self, idx: usize) -> Option<PciWriteRecord> {
-        let __proteus_stack_pad_74cb48f2: [u8; 196usize] = ::core::hint::black_box([0u8; 196usize]);
+        let __cuttle_stack_pad_74cb48f2: [u8; 196usize] = ::core::hint::black_box([0u8; 196usize]);
         if idx >= self.write_count {
             return None;
         }
@@ -370,13 +370,13 @@ impl RecordingBus {
     }
     #[doc = " Total number of scripted entries."]
     pub fn script_count(&self) -> usize {
-        let __proteus_stack_pad_7ff218c1: [u8; 54usize] = ::core::hint::black_box([0u8; 54usize]);
+        let __cuttle_stack_pad_7ff218c1: [u8; 54usize] = ::core::hint::black_box([0u8; 54usize]);
         self.script_count
     }
 }
 impl PciConfigBus for RecordingBus {
     fn read_dword(&mut self, addr: PciAddress, offset: u8) -> u32 {
-        let __proteus_stack_pad_76fc4025: [u8; 41usize] = ::core::hint::black_box([0u8; 41usize]);
+        let __cuttle_stack_pad_76fc4025: [u8; 41usize] = ::core::hint::black_box([0u8; 41usize]);
         let off_vd3b15b95_0 = offset & 0xFC;
         let mut i_vd3b15b95_1 = 0usize;
         while i_vd3b15b95_1 < self.script_count {
@@ -390,7 +390,7 @@ impl PciConfigBus for RecordingBus {
         0xFFFF_FFFF
     }
     fn write_dword(&mut self, addr: PciAddress, offset: u8, value: u32) {
-        let __proteus_stack_pad_3471647d: [u8; 127usize] = ::core::hint::black_box([0u8; 127usize]);
+        let __cuttle_stack_pad_3471647d: [u8; 127usize] = ::core::hint::black_box([0u8; 127usize]);
         let mut i_vd3b15b95_1 = 0usize;
         let off_vd3b15b95_0 = offset & 0xFC;
         let mut found_vd3b15b95_2 = false;
@@ -429,8 +429,8 @@ impl PciConfigBus for RecordingBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::pci_class::*;
-    use proteus_contracts::{
+    use cuttle_contracts::pci_class::*;
+    use cuttle_contracts::{
         PCI_CAP_ID_MSI, PCI_CAP_ID_MSIX, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_PORT,
         PCI_MAX_BUS, PCI_MAX_DEVICE, PCI_MAX_FUNCTION,
     };

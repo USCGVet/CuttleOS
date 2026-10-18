@@ -13,7 +13,7 @@
 //! perturb the TLS module five times without introducing a parse or
 //! wire-format regression.
 
-use proteus_diversifier::{diversify, Seed};
+use cuttle_diversifier::{diversify, Seed};
 use syn::File;
 
 const TLS_SRC: &str = include_str!("../../target_enterprise/src/tls.rs");
@@ -59,7 +59,7 @@ fn target_enterprise_tls_morph_changes_with_seed() {
 
 #[test]
 fn target_enterprise_tls_chained_300_cycles_is_bounded_and_ergodic() {
-    use proteus_diversifier::{diversify_with_options, DiversifyOptions};
+    use cuttle_diversifier::{diversify_with_options, DiversifyOptions};
 
     let opts = DiversifyOptions {
         stack_pad: true,
@@ -107,7 +107,7 @@ fn target_enterprise_tls_chained_300_cycles_is_bounded_and_ergodic() {
 
 #[test]
 fn target_enterprise_shell_chained_100_cycles_is_bounded_and_ergodic() {
-    use proteus_diversifier::{diversify_with_options, DiversifyOptions};
+    use cuttle_diversifier::{diversify_with_options, DiversifyOptions};
 
     const SHELL_SRC: &str = include_str!("../../target_enterprise/src/shell.rs");
     let opts = DiversifyOptions {

@@ -11,7 +11,7 @@
 //!
 //! **TASK-122 (north-star G5):** before boot, build a pristine-base ELF
 //! and the morphed variant under consecutive layout seeds, run
-//! `proteus_mtd_metrics` gadget churn, and **fail** if positional
+//! `cuttle_mtd_metrics` gadget churn, and **fail** if positional
 //! survival exceeds [`diversity_demo::KERNEL_POSITIONAL_SURVIVAL_MAX`]
 //! or if `.text` is bit-identical.
 //!
@@ -19,7 +19,7 @@
 //!
 //! ```text
 //! # PowerShell
-//! $env:PROTEUS_MORPHED_QEMU_PROOF = "1"
+//! $env:CUTTLE_MORPHED_QEMU_PROOF = "1"
 //! cargo test -p diversity_demo --test morphed_qemu_proof -- --nocapture
 //! ```
 //!
@@ -96,7 +96,7 @@ const PROOF_MODULES: &[&str] = &[
 /// Banners that must appear when the modules above still work after
 /// morph. Composition lines are the load-bearing assertions.
 const REQUIRED_BANNERS: &[&str] = &[
-    "PROTEUS-TE OK",
+    "CUTTLE-TE OK",
     // crypto / transport
     "TLS hkdf OK prk_sha=",
     "TLS server_hello OK len=",
@@ -106,7 +106,7 @@ const REQUIRED_BANNERS: &[&str] = &[
     "HTTP parse OK method=GET path=/healthz",
     // durability + block
     "WAL replay OK frames=",
-    "NVMe init OK ctrl=PROTEUS-NVME-EMU",
+    "NVMe init OK ctrl=CUTTLE-NVME-EMU",
     "NVMe read_lba(7) OK first_byte=a5",
     "VIRTIO_BLK init OK capacity=32 blk_size=512",
     "VIRTIO_BLK roundtrip OK reqs=2 sector=3 first_byte=a5",
@@ -145,7 +145,7 @@ const REQUIRED_BANNERS: &[&str] = &[
     "NVME_HW identify OK sn=",
     "NVME_HW sector OK first_byte=5a",
     "DURABLE seal OK dig=",
-    "PROTEUS-TE HALT",
+    "CUTTLE-TE HALT",
 ];
 
 /// TASK-121/133: always-on enrollment check — HW banner set must not drop.
@@ -197,9 +197,9 @@ impl Drop for SourceBackup {
 
 #[test]
 fn morphed_modules_boot_under_qemu_with_banners() {
-    if std::env::var("PROTEUS_MORPHED_QEMU_PROOF").as_deref() != Ok("1") {
+    if std::env::var("CUTTLE_MORPHED_QEMU_PROOF").as_deref() != Ok("1") {
         eprintln!(
-            "SKIP: set PROTEUS_MORPHED_QEMU_PROOF=1 to run the morphed-kernel QEMU proof \
+            "SKIP: set CUTTLE_MORPHED_QEMU_PROOF=1 to run the morphed-kernel QEMU proof \
              (requires QEMU + nightly x86_64-unknown-none + several minutes)"
         );
         return;
@@ -293,13 +293,13 @@ fn morphed_modules_boot_under_qemu_with_banners() {
     for m in PROOF_MODULES {
         let path = enterprise.join("src").join(format!("{}.rs", m));
         let src = std::fs::read_to_string(&path).expect("read for diversify");
-        let seed = proteus_diversifier::Seed::derive(PROOF_CYCLE, m);
-        let opts = proteus_diversifier::DiversifyOptions::default();
+        let seed = cuttle_diversifier::Seed::derive(PROOF_CYCLE, m);
+        let opts = cuttle_diversifier::DiversifyOptions::default();
         assert!(
             !opts.stack_pad,
             "production diversify must leave stack_pad off"
         );
-        let (candidate, log) = proteus_diversifier::diversify_with_options(&src, &seed, &opts)
+        let (candidate, log) = cuttle_diversifier::diversify_with_options(&src, &seed, &opts)
             .unwrap_or_else(|e| panic!("diversify {} failed: {:#}", m, e));
         assert!(
             log.pad_decisions.is_empty(),
@@ -307,8 +307,8 @@ fn morphed_modules_boot_under_qemu_with_banners() {
             log.pad_decisions
         );
         // Must not be a no-op on a real module (canonical diversity).
-        let h_src = proteus_diversifier::canonical_hash(&src).expect("hash src");
-        let h_cand = proteus_diversifier::canonical_hash(&candidate).expect("hash cand");
+        let h_src = cuttle_diversifier::canonical_hash(&src).expect("hash src");
+        let h_cand = cuttle_diversifier::canonical_hash(&candidate).expect("hash cand");
         assert_ne!(
             h_src, h_cand,
             "diversify of {} produced zero AST diversity under cycle {}",

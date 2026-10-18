@@ -19,11 +19,11 @@
 //!    inputs exercises the documented rejection variants.
 //!
 //! 4. **Trait + free function agreement** — every wire-level routine
-//!    is reachable through both the [`proteus_contracts::NetStack`]
+//!    is reachable through both the [`cuttle_contracts::NetStack`]
 //!    trait surface and the corresponding free function. The two MUST
 //!    produce identical outputs on every input.
 
-use proteus_contracts::{ipv4_flags, NetError, NetStack, IP_PROTO_UDP};
+use cuttle_contracts::{ipv4_flags, NetError, NetStack, IP_PROTO_UDP};
 use target_enterprise::net::{
     build_udp_datagram, ipv4_header_checksum, parse_ipv4_header, parse_udp_datagram, udp_checksum,
     IPV4_CHECKSUM_OFFSET, IPV4_FLAGS_FRAG_OFFSET, IPV4_HEADER_LEN, IPV4_PROTO_OFFSET,
@@ -38,7 +38,7 @@ const SRC_IP: [u8; 4] = [10, 0, 2, 15];
 const DST_IP: [u8; 4] = [10, 0, 2, 2];
 const SRC_PORT: u16 = 49152;
 const DST_PORT: u16 = 53;
-const PAYLOAD: &[u8] = b"proteus-te";
+const PAYLOAD: &[u8] = b"cuttle-te";
 const TTL: u8 = 64;
 const IDENT: u16 = 0xBEEF;
 
@@ -61,30 +61,30 @@ const IDENT: u16 = 0xBEEF;
 /// - `0x00 0x35`                — UDP dst_port = 53
 /// - `0x00 0x12`                — UDP length = 18
 /// - `0x?? 0x??`                — UDP checksum (locked here)
-/// - `"proteus-te"`             — payload (10 bytes)
+/// - `"cuttle-te"`             — payload (10 bytes)
 ///
 /// The header_checksum and UDP checksum bytes are filled in by running
 /// the impl once and capturing the values. Both are derived
 /// deterministically from the other inputs (no entropy / time source),
 /// so a future morph that produces different bytes IS a regression.
-const GOLDEN_DATAGRAM: [u8; 38] = [
+const GOLDEN_DATAGRAM: [u8; 37] = [
     // IPv4 header
     0x45, 0x00, // version/IHL, DSCP/ECN
-    0x00, 0x26, // total_length = 38
+    0x00, 0x25, // total_length = 37
     0xBE, 0xEF, // identification
     0x40, 0x00, // flags=DF, frag=0
     0x40, // TTL
     0x11, // protocol = UDP
-    0x63, 0xC7, // header checksum (RFC 1071 over the locked bytes)
+    0x63, 0xC8, // header checksum (RFC 1071 over the locked bytes)
     0x0A, 0x00, 0x02, 0x0F, // src_ip
     0x0A, 0x00, 0x02, 0x02, // dst_ip
     // UDP header
     0xC0, 0x00, // src_port = 49152
     0x00, 0x35, // dst_port = 53
-    0x00, 0x12, // length = 18
-    0xFA, 0x94, // checksum (RFC 768 over pseudo-header + segment)
+    0x00, 0x11, // length = 17
+    0x50, 0xC2, // checksum (RFC 768 over pseudo-header + segment)
     // Payload
-    b'p', b'r', b'o', b't', b'e', b'u', b's', b'-', b't', b'e',
+    b'c', b'u', b't', b't', b'l', b'e', b'-', b't', b'e',
 ];
 
 // ============================================================
@@ -391,5 +391,5 @@ fn bitwise_field_extraction_matches_rfc791_layout() {
     assert_eq!(dst_port, DST_PORT);
     let udp_len = ((buf[24] as u16) << 8) | (buf[25] as u16);
     assert_eq!(udp_len as usize, UDP_HEADER_LEN + PAYLOAD.len());
-    assert_eq!(&buf[28..38], PAYLOAD);
+    assert_eq!(&buf[28..37], PAYLOAD);
 }

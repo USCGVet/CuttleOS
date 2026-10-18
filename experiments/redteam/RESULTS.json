@@ -80,9 +80,9 @@
     "semantic_eligibility_v2": "unsafe-fn bodies now perturbable at safe positions (unsafe-block contents never); fire_rate option, production cycles at 100%",
     "rung1_kernel_verdict": "81.1% address-masked semantic survival (vs 79.9% before) — Rung-1 source rewrites remain NOISE-LEVEL at kernel scale. Honest conclusion: layout shuffle is the positional lever (0.0%); semantic survival below ~70% requires Rung 2 (LLM rewriter) or Rung 3 (backend gadget elimination)",
     "prod_build": {
-      "what": "factory_builder build-kernel --prod: cfg-gates 74 banner fns + attack harness OUT; keeps PROTEUS-TE OK/HALT + PROD marker + banner_continuity + banner_durable_seal",
+      "what": "factory_builder build-kernel --prod: cfg-gates 74 banner fns + attack harness OUT; keeps CUTTLE-TE OK/HALT + PROD marker + banner_continuity + banner_durable_seal",
       "text_size": "180,530 B → 19,090 B (−89.4%) — deployed image is ~10x smaller, ~10x less gadget material",
-      "boot": "PROTEUS-TE PROD, CONTINUITY resume OK boots=5 frames=5 lsn=5, HALT clean (layout seed 9002)"
+      "boot": "CUTTLE-TE PROD, CONTINUITY resume OK boots=5 frames=5 lsn=5, HALT clean (layout seed 9002)"
     },
     "enrollment": "scheduler [bundle.kernel] already enrolls ~60 modules (was never the bottleneck)"
   },
@@ -115,15 +115,15 @@
     "run": "1000-cycle duration soak: 243 consecutive ACCEPTED cycles (zero rejects, continuity boots=249, WAL checkpoint rotation fired live at ~boot 170 as designed) before the environment broke",
     "finding": "UNBOUNDED SOURCE BLOAT: stack pads were injected per cycle but never stripped. Sources grew ~27x in 243 cycles (dns.rs 22KB→609KB, tls.rs 71KB→1.9MB). Past the threshold, syn's recursive AST visitors overflowed the default 8MB stack — the daemon died deterministically at cycle ~244 ('main has overflowed its stack'), and after restart every verify rejected (verifier subprocess also 8MB-limited). 757 consecutive REJECTED cycles followed, all from tooling choking on bloat, not from semantic failures.",
     "fixes": [
-      "diversifier stack_pad: strip-then-inject (strip_old_pads removes prior __proteus_stack_pad_* before injecting fresh) + regression test: 50 apply cycles produce byte-identical size to 1 cycle",
+      "diversifier stack_pad: strip-then-inject (strip_old_pads removes prior __cuttle_stack_pad_* before injecting fresh) + regression test: 50 apply cycles produce byte-identical size to 1 cycle",
       "phase2_daemon: soak loop runs in a 256MB-stack thread (defense in depth for deep AST recursion)"
     ],
     "verdict": "the soak did its job: found a scaling limit no short test could. Morph cycles are now provably size-bounded; the 243-cycle clean run + checkpoint rotation + this bug is the full duration-soak harvest. Moral for the paper: MTD factories need bounded-output invariants per cycle, not just correctness invariants."
   },
   "real_workload_2026_07_30": {
-    "what": "first real network service on the kernel: UDP status responder (service_udp_status_modern) in prod builds. Static guest 10.0.2.15 on QEMU user-mode networking, hostfwd udp::8080. Payload 'PROTEUS-STATUS boots=N' = live continuity counter over the wire",
+    "what": "first real network service on the kernel: UDP status responder (service_udp_status_modern) in prod builds. Static guest 10.0.2.15 on QEMU user-mode networking, hostfwd udp::8080. Payload 'CUTTLE-STATUS boots=N' = live continuity counter over the wire",
     "driver": "modern virtio 1.x driver ported from RustOSa (MMIO common-config, FEATURES_OK handshake, 2-desc RX chains, notify-cap kicks) — legacy I/O-port path proven deaf on slirp (hub-only) and kept as fallback",
-    "acceptance": "HOST RECEIVED: PROTEUS-STATUS boots=279 — host PowerShell UdpClient → hostfwd → guest RX → reply → host. Serial: 'UDP SVC got flen=60 dport=8080 sport=63915' + rx/tx counters",
+    "acceptance": "HOST RECEIVED: CUTTLE-STATUS boots=279 — host PowerShell UdpClient → hostfwd → guest RX → reply → host. Serial: 'UDP SVC got flen=60 dport=8080 sport=63915' + rx/tx counters",
     "bugs_fixed_on_the_way": [
       "legacy virtio-net RX: never kicked after posting buffers (device never started); modern path chosen instead",
       "feature negotiation: F_MAC+F_STATUS required or unicast RX filtered",

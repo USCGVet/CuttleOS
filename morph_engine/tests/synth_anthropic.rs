@@ -5,7 +5,7 @@
 //! and bills the operator's account. CI runs it on-demand only:
 //!
 //! ```text
-//! cargo test -p proteus-morph-engine -- --ignored anthropic
+//! cargo test -p cuttle-morph-engine -- --ignored anthropic
 //! ```
 //!
 //! Behaviour:
@@ -29,7 +29,7 @@
 //! — those stages have their own test suites. This test exists only to
 //! prove the synthesizer round-trips against the real API surface.
 
-use proteus_morph_engine::{
+use cuttle_morph_engine::{
     AnthropicSynth, MutationBudget, SynthRequest, Synthesizer, ANTHROPIC_API_KEY_ENV,
 };
 use std::env;

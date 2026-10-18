@@ -14,7 +14,7 @@
 //! `Vec<u8>` fields backed by `extern crate alloc`. Both are removed:
 //!
 //! - **Pure parser.** Signature verification is the caller's job —
-//!   the existing [`proteus_contracts::SignatureVerify`] trait handles
+//!   the existing [`cuttle_contracts::SignatureVerify`] trait handles
 //!   it. A morph that broke `parse` would surface long before any
 //!   crypto code runs; conflating the two enlarges the morphable
 //!   surface for no isolation benefit.
@@ -63,7 +63,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     X509Cert, X509Error, X509PubKey, X509PubKeyAlg, X509SigAlg, X509Time,
     X509_ED25519_KEY_LEN, X509_MAX_CERT_LEN, X509_MAX_DEPTH, X509_OID_CN,
     X509_OID_ECDSA_WITH_SHA256, X509_OID_ED25519, X509_OID_EC_PUBLIC_KEY,
@@ -911,7 +911,7 @@ mod tests {
             b.extend(explicit_ctx_0(&int_unsigned(&[0x02])));
             b.extend(int_unsigned(&[0x2A]));
             b.extend(alg_ed25519());
-            b.extend(name_cn(b"proteus-x509-ed25519"));
+            b.extend(name_cn(b"cuttle-x509-ed25519"));
             let validity = {
                 let mut v = Vec::new();
                 v.extend(utc_time(b"700101000000Z"));
@@ -919,7 +919,7 @@ mod tests {
                 seq(&v)
             };
             b.extend(validity);
-            b.extend(name_cn(b"proteus-x509-ed25519"));
+            b.extend(name_cn(b"cuttle-x509-ed25519"));
             let spki = {
                 let mut s = Vec::new();
                 s.extend(alg_ed25519());
@@ -970,7 +970,7 @@ mod tests {
             let serial_body: Vec<u8> = (0..18).map(|i| 0x10u8 + i as u8).collect();
             b.extend(int_unsigned(&serial_body));
             b.extend(alg_sha256_rsa());
-            b.extend(name_cn(b"Proteus Test CA"));
+            b.extend(name_cn(b"Cuttle Test CA"));
             let validity = {
                 let mut v = Vec::new();
                 v.extend(utc_time(b"260101000000Z"));
@@ -978,7 +978,7 @@ mod tests {
                 seq(&v)
             };
             b.extend(validity);
-            b.extend(name_cn(b"proteus.example.com"));
+            b.extend(name_cn(b"cuttle.example.com"));
             b.extend(spki);
             b
         };
@@ -1200,9 +1200,9 @@ mod tests {
         let (der, _, _) = build_rsa_cert();
         let cert = X509Impl::parse(&der).unwrap();
         let cn = X509Impl::find_cn(cert.subject).expect("CN");
-        assert_eq!(cn, b"proteus.example.com");
+        assert_eq!(cn, b"cuttle.example.com");
         let issuer_cn = X509Impl::find_cn(cert.issuer).expect("CN");
-        assert_eq!(issuer_cn, b"Proteus Test CA");
+        assert_eq!(issuer_cn, b"Cuttle Test CA");
     }
 
     #[test]

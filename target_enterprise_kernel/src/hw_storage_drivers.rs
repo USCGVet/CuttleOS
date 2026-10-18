@@ -17,10 +17,10 @@ pub(crate) use crate::*;
 ///
 /// TASK-107: after capacity, runs a real legacy virtqueue write+read
 /// of sector 0 (pattern 0xA5^i) against QEMU — not MemBus.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_virtio_hw() {
-    use proteus_contracts::{
+    use cuttle_contracts::{
         Pci, PciAddress, PciBar, PciConfigBus, PCI_CFG_OFFSET_COMMAND_STATUS,
         PCI_CFG_OFFSET_VENDOR_DEVICE, PCI_COMMAND_BUS_MASTER,
     };
@@ -228,7 +228,7 @@ impl AhciHwPort {
     }
 
     fn probe_start_inner(emit_banner: bool) -> Self {
-        use proteus_contracts::{
+        use cuttle_contracts::{
             pci_class, Pci, PciAddress, PciBar, PciConfigBus, PCI_CFG_OFFSET_CLASS_REVISION,
             PCI_CFG_OFFSET_COMMAND_STATUS, PCI_CFG_OFFSET_VENDOR_DEVICE, PCI_COMMAND_BUS_MASTER,
         };
@@ -448,8 +448,8 @@ impl AhciHwPort {
     }
 
     /// Issue one H2D command in slot 0 against the running port.
-    pub(crate) fn issue(&self, fis_params: &proteus_contracts::H2dFisParams, write: bool, tag: &[u8]) {
-        use proteus_contracts::{
+    pub(crate) fn issue(&self, fis_params: &cuttle_contracts::H2dFisParams, write: bool, tag: &[u8]) {
+        use cuttle_contracts::{
             AhciCmd, AhciCmdHeader, AhciFis, AhciPrdt, AHCI_CFL_H2D, AHCI_CMD_HDR_LEN,
             AHCI_FIS_H2D_LEN, AHCI_PRDT_LEN,
         };
@@ -572,7 +572,7 @@ impl AhciHwPort {
 
     /// ATA WRITE DMA one 512-byte sector at `lba`.
     pub(crate) fn write_sector(&self, lba: u64, data: &[u8; 512]) {
-        use proteus_contracts::{H2dFisParams, ATA_DEV_LBA};
+        use cuttle_contracts::{H2dFisParams, ATA_DEV_LBA};
         const ATA_CMD_WRITE_DMA: u8 = 0xCA;
         self.fill_data(data);
         let wr = H2dFisParams {
@@ -589,7 +589,7 @@ impl AhciHwPort {
 
     /// ATA READ DMA one 512-byte sector at `lba`.
     pub(crate) fn read_sector(&self, lba: u64) -> [u8; 512] {
-        use proteus_contracts::{AhciFis, ATA_CMD_READ_DMA};
+        use cuttle_contracts::{AhciFis, ATA_CMD_READ_DMA};
         use target_enterprise::ahci_fis::AhciFisImpl;
         let rd = match AhciFisImpl::read_dma(lba, 1, 0) {
             Ok(p) => p,
@@ -606,10 +606,10 @@ impl AhciHwPort {
 /// Banner: `AHCI_HW probe OK slot=N abar=… pi=…`, `AHCI_HW identify OK
 /// sectors=2048`, `AHCI_HW sector OK first_byte=5a` (real PCI + MMIO +
 /// IDENTIFY + sector DMA — TASK-113/117).
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_ahci_hw() {
-    use proteus_contracts::{AhciFis, ATA_CMD_READ_DMA};
+    use cuttle_contracts::{AhciFis, ATA_CMD_READ_DMA};
     use target_enterprise::ahci_fis::AhciFisImpl;
 
     /// 1 MiB `ahci_hw.img` → 2048 × 512 B sectors.
@@ -729,7 +729,7 @@ pub(crate) fn banner_ahci_hw() {
 /// above the sectors exercised by other banners (sector 0) and below
 /// the 2048-sector disk size.
 pub(crate) const CONTINUITY_LBA: u64 = 1024;
-pub(crate) const CONTINUITY_MAGIC: &[u8; 8] = b"PRTSWAL1";
+pub(crate) const CONTINUITY_MAGIC: &[u8; 8] = b"CTTLWAL1";
 pub(crate) const CONTINUITY_WAL_SECTORS: u64 = (kf::WAL_CAPACITY / 512) as u64;
 
 #[inline(never)]
@@ -808,7 +808,7 @@ pub(crate) fn banner_continuity() {
     // Append the boot-marker frame: payload = [boot counter, resumed
     // frame count] — each morph boot leaves an auditable trace.
     let this_boot = resumed_boots + 1;
-    // Publish for the UDP status payload ("PROTEUS-STATUS boots=N").
+    // Publish for the UDP status payload ("CUTTLE-STATUS boots=N").
     CONTINUITY_BOOT_COUNT.store(this_boot, core::sync::atomic::Ordering::Relaxed);
     let mut marker = [0u8; 16];
     marker[..8].copy_from_slice(&this_boot.to_le_bytes());
@@ -878,10 +878,10 @@ pub(crate) fn banner_continuity() {
 // ---------------------------------------------------------------------------
 
 /// Banner: `NVME_HW probe OK slot=N` then `NVME_HW identify OK sn=…`
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_nvme_hw() {
-    use proteus_contracts::{
+    use cuttle_contracts::{
         Pci, PciAddress, PciBar, PciConfigBus, PCI_CFG_OFFSET_CLASS_REVISION,
         PCI_CFG_OFFSET_COMMAND_STATUS, PCI_CFG_OFFSET_VENDOR_DEVICE, PCI_COMMAND_BUS_MASTER,
     };
@@ -1129,7 +1129,7 @@ pub(crate) fn banner_nvme_hw() {
     }
     // Must not be the in-kernel emu stamp.
     if sn_len >= 15 {
-        let emu = b"PROTEUS-NVME-EMU";
+        let emu = b"CUTTLE-NVME-EMU";
         let mut same = true;
         let mut i = 0usize;
         while i < 15 {
@@ -1427,8 +1427,8 @@ pub(crate) const DMA_ZERO_LEN: usize = 0x5000;
 /// Write then read sector 0 via legacy virtqueue; return data[0].
 pub(crate) fn virtio_legacy_sector_roundtrip(io_base: u16) -> u8 {
     use core::sync::atomic::{fence, Ordering};
-    use proteus_contracts::virtio_blk_req_type;
-    use proteus_contracts::virtio_blk_status_byte;
+    use cuttle_contracts::virtio_blk_req_type;
+    use cuttle_contracts::virtio_blk_status_byte;
 
     let dma_phys = dma_phys_base();
     let q_pa = dma_phys + DMA_Q_OFF;

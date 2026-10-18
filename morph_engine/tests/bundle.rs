@@ -11,13 +11,13 @@
 //! The full end-to-end `run_bundle` test (which spawns the verifier
 //! binary and runs cargo against a scratch workspace) is
 //! `#[ignore]`-gated; run it explicitly with
-//! `cargo test -p proteus-morph-engine --test bundle -- --ignored
+//! `cargo test -p cuttle-morph-engine --test bundle -- --ignored
 //! end_to_end_bundle_runs_clean`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use proteus_morph_engine::{
+use cuttle_morph_engine::{
     attest::{AttestEntry, ModuleArtifact, SCHEMA_VERSION},
     scheduler::{
         pick_next_work_at, BundleConfig, ModuleConfig, ModuleState, NextWork, SchedulerConfig,

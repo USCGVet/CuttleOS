@@ -12,7 +12,7 @@
 //!   type-state pattern: it calls `check_cap`, gets a `CapProof`, and
 //!   threads it into `dispatch_inner` by value.
 //! - `MinimalCapTable` — the type that `impl
-//!   proteus_contracts::SyscallCapTable for` lives on. Overrides
+//!   cuttle_contracts::SyscallCapTable for` lives on. Overrides
 //!   [`SyscallCapTable::check_raw`]; the default `check` provides the
 //!   proof mint.
 //!
@@ -29,7 +29,7 @@
 //! The new design closes that hole by making the Rust **compiler**
 //! enforce the obligation. `check_cap` returns
 //! `Result<CapProof, DemoErrno>`. `CapProof` is a zero-sized type from
-//! `proteus_contracts` whose constructor is private to that crate, so
+//! `cuttle_contracts` whose constructor is private to that crate, so
 //! no morph candidate can mint one. `dispatch_inner` takes
 //! `_proof: CapProof` by value; the compiler refuses to compile any
 //! caller that does not own a fresh proof. The verifier's AST walker
@@ -38,7 +38,7 @@
 //! Backed by a permissive `[u64; 32]` static table. The morph engine
 //! will tighten this in a later task.
 
-use proteus_contracts::{CapError, CapProof, SyscallCapTable};
+use cuttle_contracts::{CapError, CapProof, SyscallCapTable};
 
 use crate::DemoErrno;
 
@@ -61,7 +61,7 @@ pub const SYSCALL_REQUIRED_CAPS: [u64; SYS_MAX as usize] = [
     0,                                          // 2: SYS_GETPID
     0,                                          // 3: SYS_GETTIME_NS
     0,                                          // 4: SYS_READ_KEY
-    proteus_contracts::caps::FS_BYPASS,         // 5: SYS_OPEN
+    cuttle_contracts::caps::FS_BYPASS,         // 5: SYS_OPEN
     0,                                          // 6: SYS_READ
     0,                                          // 7: SYS_CLOSE
     0,                                          // 8: SYS_SLEEP_MS
@@ -80,11 +80,11 @@ pub const SYSCALL_REQUIRED_CAPS: [u64; SYS_MAX as usize] = [
 /// site for `CapProof` in the contracts crate's type-state design.
 /// A morph candidate cannot mint a `CapProof` by other means: the
 /// inner field is private and the seal helper lives in a
-/// `pub(crate)` module of `proteus_contracts`.
+/// `pub(crate)` module of `cuttle_contracts`.
 pub fn check_cap(nr: u64, cap_mask: u64) -> Result<CapProof, DemoErrno> {
     let table = MinimalCapTable;
     // Route through the trait method so the proof comes from the
-    // single sealed mint path in `proteus_contracts`. The task-id is
+    // single sealed mint path in `cuttle_contracts`. The task-id is
     // pinned to 0 because target_minimal does not model multi-task
     // state — the production scheduler uses the real task-id.
     match table.check(0, cap_mask, nr as u32) {
@@ -113,7 +113,7 @@ pub fn dispatch_syscall(
 
 /// Privileged dispatch. Takes the `CapProof` by value, consuming it.
 /// The signature is the type-state gate: callers cannot fabricate a
-/// `CapProof` (its constructor is private to `proteus_contracts`), so
+/// `CapProof` (its constructor is private to `cuttle_contracts`), so
 /// the only way to reach this function is through a successful
 /// `check_cap` call.
 pub fn dispatch_inner(
@@ -194,7 +194,7 @@ mod tests {
     fn fs_bypass_required_for_sys_open() {
         // sys_open (nr=5) requires FS_BYPASS. With cap=0 the gate fails.
         assert!(matches!(check_cap(5, 0), Err(DemoErrno::EINVAL)));
-        let proof = check_cap(5, proteus_contracts::caps::FS_BYPASS).expect("Ok");
+        let proof = check_cap(5, cuttle_contracts::caps::FS_BYPASS).expect("Ok");
         proof.consume();
     }
 
@@ -261,8 +261,8 @@ mod tests {
         assert!(matches!(t.check_raw(0, 0, 5), Err(CapError::EPERM)));
         assert!(matches!(t.check(0, 0, 5), Err(CapError::EPERM)));
         // With FS_BYPASS, both succeed.
-        assert!(t.check_raw(0, proteus_contracts::caps::FS_BYPASS, 5).is_ok());
-        let proof = t.check(0, proteus_contracts::caps::FS_BYPASS, 5).expect("Ok");
+        assert!(t.check_raw(0, cuttle_contracts::caps::FS_BYPASS, 5).is_ok());
+        let proof = t.check(0, cuttle_contracts::caps::FS_BYPASS, 5).expect("Ok");
         proof.consume();
     }
 }

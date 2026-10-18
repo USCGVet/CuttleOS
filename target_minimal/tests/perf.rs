@@ -1,4 +1,4 @@
-//! Per-function performance measurement for `proteus-target-minimal`,
+//! Per-function performance measurement for `cuttle-target-minimal`,
 //! TASK-021 edition: proptest-generated 32-input sweeps, per-input
 //! min-of-batches measurement, p95-across-inputs reporting.
 //!
@@ -63,12 +63,12 @@ use proptest::prelude::*;
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
 
-use proteus_contracts::{Hash, SignatureVerify, SyscallDispatch};
-use proteus_target_minimal::{
+use cuttle_contracts::{Hash, SignatureVerify, SyscallDispatch};
+use cuttle_target_minimal::{
     derive_byte, feistel_mix, fletcher32, fletcher_pair, DemoHash, DemoSignatureVerify,
     DemoSyscallDispatch,
 };
-use proteus_verifier::perf::{p95_u64, DEFAULT_PERF_INPUTS_PER_CYCLE};
+use cuttle_verifier::perf::{p95_u64, DEFAULT_PERF_INPUTS_PER_CYCLE};
 
 // ---------------------------------------------------------------------
 // Inner-loop knobs (per-input measurement)

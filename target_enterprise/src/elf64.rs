@@ -4,7 +4,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     Elf64, ElfError, ElfHeader, ElfPhdr, ELF_CLASS64, ELF_DATA_LE, ELF_EHDR_LEN, ELF_EM_X86_64,
     ELF_ET_DYN, ELF_ET_EXEC, ELF_MAGIC, ELF_MAX_PHDRS, ELF_PHDR_LEN, ELF_PT_LOAD,
 };
@@ -183,7 +183,7 @@ pub fn build_banner_fixture(out: &mut [u8]) -> Result<usize, ElfError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::Elf64;
+    use cuttle_contracts::Elf64;
 
     fn fixture() -> [u8; ELF_FIXTURE_LEN] {
         let mut b = [0u8; ELF_FIXTURE_LEN];

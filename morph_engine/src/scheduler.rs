@@ -87,7 +87,7 @@ pub struct ModuleConfig {
 ///    in bundle A directly referencing a private helper in bundle B
 ///    can break when the two bundles rotate at different cadences.
 ///    Unpark when 2+ bundles exist AND modules actually interlock
-///    outside the `proteus_contracts::*` trait surface.
+///    outside the `cuttle_contracts::*` trait surface.
 /// 3. **No `morph rollback-bundle <name>` subcommand.** The
 ///    `<module>.last_good.rs` files exist per member, so manual
 ///    restore works; there's just no atomic command to do them all.

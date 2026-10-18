@@ -1,4 +1,4 @@
-# tools/add_defender_exclusions.ps1 — one-time Defender setup for Proteus dev.
+# tools/add_defender_exclusions.ps1 — one-time Defender setup for Cuttle dev.
 #
 # Adds path exclusions so Microsoft Defender stops scanning cargo build output
 # while it's being written. Without these, the symptoms are:
@@ -13,11 +13,11 @@
 # Two ways to invoke:
 #
 #   1. Open PowerShell as Administrator, then:
-#      cd D:\RustProjects\Proteus
+#      cd D:\RustProjects\Cuttle
 #      powershell -ExecutionPolicy Bypass -File tools\add_defender_exclusions.ps1
 #
 #   2. From a regular PowerShell, spawn an elevated child (triggers UAC):
-#      Start-Process powershell -Verb RunAs -ArgumentList '-ExecutionPolicy','Bypass','-File','D:\RustProjects\Proteus\tools\add_defender_exclusions.ps1'
+#      Start-Process powershell -Verb RunAs -ArgumentList '-ExecutionPolicy','Bypass','-File','D:\RustProjects\Cuttle\tools\add_defender_exclusions.ps1'
 
 [CmdletBinding()]
 param()
@@ -39,7 +39,7 @@ if (-not (Test-Admin)) {
 
 # Paths to exclude. Each is one filesystem subtree Defender will skip.
 $paths = @(
-    'D:\RustProjects\Proteus',
+    'D:\RustProjects\Cuttle',
     'D:\RustProjects\RustOSa',
     "$env:USERPROFILE\.cargo\registry",
     "$env:USERPROFILE\.cargo\git",

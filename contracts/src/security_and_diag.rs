@@ -41,8 +41,8 @@ pub const CRASH_DUMP_BYTES: usize = 16_384;
 pub const CRASH_DUMP_SECTORS: u64 = 32;
 
 /// 8-byte magic prefix every well-formed dump starts with. ASCII
-/// "PROTPAN1".
-pub const CRASH_DUMP_MAGIC: [u8; 8] = *b"PROTPAN1";
+/// "CTTLPAN1".
+pub const CRASH_DUMP_MAGIC: [u8; 8] = *b"CTTLPAN1";
 
 /// Current schema of the on-disk dump layout. The reader uses this to
 /// recognise older dumps (a future revision MAY bump this and emit a

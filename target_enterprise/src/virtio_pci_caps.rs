@@ -2,11 +2,11 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     VirtioPciCap, VirtioPciCapError, VirtioPciCaps, VIRTIO_PCI_CAP_ID, VIRTIO_PCI_CAP_MAX,
 };
 #[cfg(test)]
-use proteus_contracts::{
+use cuttle_contracts::{
     VIRTIO_PCI_CAP_COMMON_CFG, VIRTIO_PCI_CAP_DEVICE_CFG, VIRTIO_PCI_CAP_ISR_CFG,
     VIRTIO_PCI_CAP_NOTIFY_CFG, VIRTIO_PCI_CAP_PCI_CFG,
 };
@@ -114,7 +114,7 @@ pub fn banner_read_dword(off: u8) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::VirtioPciCaps;
+    use cuttle_contracts::VirtioPciCaps;
 
     #[test]
     fn constants() {

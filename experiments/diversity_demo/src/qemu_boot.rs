@@ -17,7 +17,7 @@
 //! Borrowed shape from `factory_builder/tests/qemu_smoke.rs` — same
 //! QEMU command-line (`-drive`, `-serial file:`, `-display none`,
 //! `-no-reboot`, `-m 256M`, `-d cpu_reset`). The wait loop watches
-//! for `PROTEUS-TE HALT` to know the kernel reached its self-test
+//! for `CUTTLE-TE HALT` to know the kernel reached its self-test
 //! exit point, then kills QEMU.
 
 use anyhow::{bail, Context, Result};
@@ -187,7 +187,7 @@ pub fn boot_and_capture(
             nvme_disk.display()
         ))
         .arg("-device")
-        .arg("nvme,drive=nvme0,serial=PROTEUS-NVME-HW")
+        .arg("nvme,drive=nvme0,serial=CUTTLE-NVME-HW")
         .arg("-fw_cfg")
         .arg(format!(
             "name={},file={}",
@@ -213,7 +213,7 @@ pub fn boot_and_capture(
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
         if let Ok(s) = std::fs::read_to_string(&serial_log) {
-            if s.contains("PROTEUS-TE HALT") {
+            if s.contains("CUTTLE-TE HALT") {
                 halted = true;
                 break;
             }
@@ -230,7 +230,7 @@ pub fn boot_and_capture(
             .take(2000)
             .collect();
         bail!(
-            "QEMU cycle {} did not emit PROTEUS-TE HALT within 20s; serial log preview:\n{}",
+            "QEMU cycle {} did not emit CUTTLE-TE HALT within 20s; serial log preview:\n{}",
             cycle,
             preview
         );

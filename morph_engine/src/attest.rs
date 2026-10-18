@@ -72,7 +72,7 @@ pub const ANCHOR_INTERVAL: u64 = 10;
 /// fields and leave the new fields absent.
 ///
 /// **v6 adds the diversifier log** (TASK-031): the
-/// [`DiversifierLog`] captured by `proteus_diversifier::diversify_with_log`
+/// [`DiversifierLog`] captured by `cuttle_diversifier::diversify_with_log`
 /// rides alongside the existing codegen + bundle fields. Carries the
 /// per-function pad sizes and codegen-perturb decisions for the cycle
 /// so a future `morph verify-attest --replay-diversifier` invocation
@@ -173,10 +173,10 @@ pub const ZERO_HEX: &str = "0000000000000000000000000000000000000000000000000000
 /// `attest.log.jsonl` and `merkle_anchors.jsonl` via this env var. When
 /// unset, paths are resolved relative to the process CWD (matches the
 /// pre-existing behaviour of the inline emitter in cycle.rs).
-pub const ATTEST_DIR_ENV: &str = "PROTEUS_ATTEST_DIR";
+pub const ATTEST_DIR_ENV: &str = "CUTTLE_ATTEST_DIR";
 
 /// Per-cycle diversifier decision log embedded in v6+ attestation
-/// entries. Mirrors `proteus_diversifier::DiversifierLog` (which lives
+/// entries. Mirrors `cuttle_diversifier::DiversifierLog` (which lives
 /// in a dep-free crate; this is the serde-bearing copy). Captures the
 /// `stack_pad::apply` and `codegen_perturb::apply` decisions made
 /// during the cycle so a future `verify-attest --replay-diversifier`
@@ -197,7 +197,7 @@ pub const ATTEST_DIR_ENV: &str = "PROTEUS_ATTEST_DIR";
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiversifierLog {
     /// Per-function pad size in bytes (canonical: `u32`, range
-    /// `[32, 224)` — see `proteus_diversifier::stack_pad`). Keyed by
+    /// `[32, 224)` — see `cuttle_diversifier::stack_pad`). Keyed by
     /// `fn_name` for free fns and `"Type::method"` for impl-block
     /// methods. `BTreeMap` so canonical-JSON serialisation sorts keys
     /// deterministically — the chain commits to these bytes.
@@ -236,9 +236,9 @@ impl DiversifierLog {
 }
 
 /// Build a serde-bearing [`DiversifierLog`] from the dep-free
-/// `proteus_diversifier::DiversifierLog`. Pure data marshalling — the
+/// `cuttle_diversifier::DiversifierLog`. Pure data marshalling — the
 /// two types have identical field shapes.
-pub fn diversifier_log_from(src: &proteus_diversifier::DiversifierLog) -> DiversifierLog {
+pub fn diversifier_log_from(src: &cuttle_diversifier::DiversifierLog) -> DiversifierLog {
     DiversifierLog {
         pad_decisions: src.pad_decisions.clone(),
         perturb_decisions: src.perturb_decisions.clone(),
@@ -497,7 +497,7 @@ pub struct AttestEntryFields {
     /// entries. The cycle code populates this in `run_bundle`.
     pub modules: BTreeMap<String, ModuleArtifact>,
     /// Per-cycle diversifier decision log captured by
-    /// `proteus_diversifier::diversify_with_log`. `None` when the
+    /// `cuttle_diversifier::diversify_with_log`. `None` when the
     /// caller path doesn't have a log to record (legacy paths, tests
     /// that don't exercise the diversifier). The morph engine's
     /// `cycle.rs` populates this for every accepted morph cycle in

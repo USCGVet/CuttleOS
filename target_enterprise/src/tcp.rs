@@ -32,7 +32,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{tcp_flags, Tcp, TcpError, TcpSegmentView};
+use cuttle_contracts::{tcp_flags, Tcp, TcpError, TcpSegmentView};
 
 /// Minimum TCP header size in bytes (no options).
 pub const TCP_MIN_HEADER_LEN: usize = 20;
@@ -42,7 +42,7 @@ pub const TCP_DATA_OFFSET_NO_OPTS: u8 = 5;
 pub const IP_PROTO_TCP: u8 = 6;
 
 // ---------------------------------------------------------------------------
-// Wire codec — implements proteus_contracts::Tcp
+// Wire codec — implements cuttle_contracts::Tcp
 // ---------------------------------------------------------------------------
 
 /// Wire codec impl. Pure functions on `&[u8]` / `&mut [u8]`; no state.
@@ -543,7 +543,7 @@ pub fn close(mut tcb: Tcb) -> Result<(Tcb, Reply), TcpProcessError> {
 /// Deterministic ISN. Real TCP uses a CSPRNG seeded with time + the
 /// (src_ip, src_port, dst_ip, dst_port) tuple to defeat off-path
 /// blind-injection attacks. The seed here is a placeholder — a future
-/// task can swap in proteus_contracts-grade randomness without
+/// task can swap in cuttle_contracts-grade randomness without
 /// touching the state machine.
 fn deterministic_isn(local_port: u16, remote_port: u16, now_ticks: u32) -> u32 {
     let mut x = (local_port as u32) << 16 | (remote_port as u32);

@@ -5,7 +5,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{CanaryError, CanaryToken, StackCanary, STACK_CANARY_LEN};
+use cuttle_contracts::{CanaryError, CanaryToken, StackCanary, STACK_CANARY_LEN};
 
 /// Stateless stack-canary impl.
 pub struct StackCanaryImpl;
@@ -79,7 +79,7 @@ pub const BANNER_SEED: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::StackCanary;
+    use cuttle_contracts::StackCanary;
 
     #[test]
     fn len_is_8() {

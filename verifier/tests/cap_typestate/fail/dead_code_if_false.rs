@@ -4,7 +4,7 @@
 //! type-state contract rejects it because the proof never materialises
 //! in a scope that reaches the privileged action.
 
-use proteus_contracts::{CapError, CapProof, SyscallCapTable};
+use cuttle_contracts::{CapError, CapProof, SyscallCapTable};
 
 struct PermissiveTable;
 

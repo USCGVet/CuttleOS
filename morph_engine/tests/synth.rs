@@ -8,7 +8,7 @@
 //! Cargo.toml is constrained to its existing dependencies. We build
 //! unique tempdirs under `std::env::temp_dir()` and clean them up.
 
-use proteus_morph_engine::{
+use cuttle_morph_engine::{
     MutationBudget, PassThrough, PromptBuilder, PromptOnly, SynthRequest, Synthesizer,
 };
 use std::fs;
@@ -75,7 +75,7 @@ fn fresh_tempdir(label: &str) -> PathBuf {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "proteus_synth_test_{}_{}_{}_{}_",
+        "cuttle_synth_test_{}_{}_{}_{}_",
         label,
         std::process::id(),
         nanos,

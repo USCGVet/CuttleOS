@@ -226,7 +226,7 @@ fn parse_cli(args: &[String]) -> Result<(ExperimentArgs, bool)> {
 /// an error if the bundle doesn't exist or the section is malformed.
 ///
 /// Deliberately hand-parses with the `toml` crate so we don't pull in
-/// the heavier `proteus_morph_engine::scheduler` crate-resolution path
+/// the heavier `cuttle_morph_engine::scheduler` crate-resolution path
 /// (which would also work but adds a dep).
 fn resolve_bundle_from_scheduler_toml(name: &str) -> Result<(PathBuf, Vec<String>)> {
     let path = workspace_root().join("scheduler.toml");

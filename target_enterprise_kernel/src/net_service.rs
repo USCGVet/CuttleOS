@@ -106,7 +106,7 @@ pub(crate) fn vn_wr64(v: u64, off: usize, x: u64) {
 /// Find + init the first modern virtio-net (PCI device id 0x1041).
 /// Returns None if absent or init fails (caller falls back / reports).
 pub(crate) fn vnet_modern_init(dma: u64) -> Option<VnetModern> {
-    use proteus_contracts::{
+    use cuttle_contracts::{
         Pci, PciAddress, PciBar, PciConfigBus, PCI_CFG_OFFSET_COMMAND_STATUS,
         PCI_CFG_OFFSET_VENDOR_DEVICE, PCI_COMMAND_BUS_MASTER,
     };
@@ -475,7 +475,7 @@ pub(crate) fn vnet_rx_recycle(n: &mut VnetModern, head_id: u16) {
 // (-netdev user,hostfwd=udp::8080-:8080,hostfwd=tcp::80-:80).
 // Polled virtqueue driver on the FIRST virtio-net device found.
 // `LivedNet` answers ARP, ICMP echo, UDP/8080 status, and TCP/80
-// HTTP GET /status|/healthz|/ with "PROTEUS-STATUS boots=N\n".
+// HTTP GET /status|/healthz|/ with "CUTTLE-STATUS boots=N\n".
 // Bounded loop: the service window is a boot-phase activity, then
 // the kernel proceeds to HALT as usual.
 // ---------------------------------------------------------------------------
@@ -789,7 +789,7 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
 #[inline(never)]
 pub(crate) fn service_udp_status_legacy() {
     use core::sync::atomic::{fence, Ordering};
-    use proteus_contracts::{
+    use cuttle_contracts::{
         Pci, PciAddress, PciBar, PciConfigBus, PCI_CFG_OFFSET_COMMAND_STATUS,
         PCI_CFG_OFFSET_VENDOR_DEVICE, PCI_COMMAND_BUS_MASTER,
     };
@@ -979,7 +979,7 @@ pub(crate) fn service_udp_status_legacy() {
         // slirp→guest delivery.
         const GW_IP: [u8; 4] = [10, 0, 2, 2];
         const GW_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
-        let payload = b"PROTEUS-HELLO\n";
+        let payload = b"CUTTLE-HELLO\n";
         let plen = payload.len();
         let udp_len = (8 + plen) as u16;
         let mut udp_full = [0u8; 128];

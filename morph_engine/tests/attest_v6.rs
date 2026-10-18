@@ -33,9 +33,9 @@
 //!    a real diversifier log captured from `diversify_with_log`.
 //!
 //! Env-var isolation mirrors `tests/attest.rs` / `tests/attest_v4.rs` —
-//! each integration test gets its own `PROTEUS_ATTEST_DIR`.
+//! each integration test gets its own `CUTTLE_ATTEST_DIR`.
 
-use proteus_morph_engine::attest::{
+use cuttle_morph_engine::attest::{
     self, compute_entry_sha256, load_entries, verify_chain, write_attestation, AttestEntry,
     AttestEntryFields, DiversifierLog, ATTEST_DIR_ENV, READABLE_MIN_SCHEMA, SCHEMA_VERSION,
 };
@@ -56,7 +56,7 @@ fn fresh_tempdir(label: &str) -> PathBuf {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "proteus_attest_v6_test_{}_{}_{}_{}",
+        "cuttle_attest_v6_test_{}_{}_{}_{}",
         label,
         std::process::id(),
         nanos,
@@ -471,9 +471,9 @@ fn diversifier_log_from_real_diversifier_round_trips() {
         fn helper() { let x = 1; let _ = x; }
         pub fn entry() { helper(); }
     "#;
-    let seed = proteus_diversifier::Seed::derive(42, "v6_test");
+    let seed = cuttle_diversifier::Seed::derive(42, "v6_test");
     let (_candidate, raw_log) =
-        proteus_diversifier::diversify_with_log(FIXTURE, &seed).expect("diversify");
+        cuttle_diversifier::diversify_with_log(FIXTURE, &seed).expect("diversify");
     let attest_log = attest::diversifier_log_from(&raw_log);
     assert!(
         !attest_log.is_empty(),

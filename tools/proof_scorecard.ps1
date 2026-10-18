@@ -1,4 +1,4 @@
-# tools/proof_scorecard.ps1 — run Proteus proof bars and print a scorecard.
+# tools/proof_scorecard.ps1 — run Cuttle proof bars and print a scorecard.
 #
 # Default (always-on): fast unit/poison gates + seal_baselines + durable_cap_bits
 # (TASK-153/163). Mega-proofs (TASK-110/128): use -Mega or individual switches.
@@ -27,16 +27,16 @@
 # Full operator copy-paste: docs/runbook.md § Task Scheduler install.
 #
 #   # Preferred: wrapper logs exit code under experiments/scorecard_logs/
-#   schtasks /Create /F /TN "ProteusWeeklyMega" `
-#     /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\rustprojects\proteus\tools\run_mega_weekly.ps1" `
+#   schtasks /Create /F /TN "CuttleWeeklyMega" `
+#     /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\rustprojects\cuttle\tools\run_mega_weekly.ps1" `
 #     /SC WEEKLY /D SUN /ST 03:00
 #
 #   # Direct (no log file):
 #   powershell -NoProfile -ExecutionPolicy Bypass `
-#     -File D:\rustprojects\proteus\tools\proof_scorecard.ps1 -Mega
+#     -File D:\rustprojects\cuttle\tools\proof_scorecard.ps1 -Mega
 #
 #   # GitHub Actions-style (pwsh):
-#   - name: Proteus weekly mega
+#   - name: Cuttle weekly mega
 #     run: pwsh -File tools/proof_scorecard.ps1 -Mega
 #
 # -Mega selects (TASK-128):
@@ -49,20 +49,20 @@
 #   always-on only .............. seconds
 #   -Mega (no cold kernel) ...... typically 15–45 minutes
 #   -NorthStarBoot alone ........ ~1–5 minutes warm; longer cold
-# Override soak length: $env:PROTEUS_SOAK_ITERS = "2" (default N=1 under -Mega/-NorthStarBoot).
+# Override soak length: $env:CUTTLE_SOAK_ITERS = "2" (default N=1 under -Mega/-NorthStarBoot).
 #
 # Optional verify gates on production workspace attest (TASK-125/148/151):
-#   $env:PROTEUS_VERIFY_REQUIRE_DIVERSITY = "1"       # fail if accepted lack diversity
-#   $env:PROTEUS_VERIFY_REQUIRE_DURABLE_SEALS = "1"   # fail if accepted lack durable_seals
+#   $env:CUTTLE_VERIFY_REQUIRE_DIVERSITY = "1"       # fail if accepted lack diversity
+#   $env:CUTTLE_VERIFY_REQUIRE_DURABLE_SEALS = "1"   # fail if accepted lack durable_seals
 # Default for both is OFF — Mega stays green without seals attached.
 # To attach seals during morph/daemon/soak first:
 #   powershell -File tools\seal_factory_baselines.ps1
-#   $env:PROTEUS_DURABLE_SEALS_DIR = (Resolve-Path seals).Path
+#   $env:CUTTLE_DURABLE_SEALS_DIR = (Resolve-Path seals).Path
 # See docs/runbook.md § Weekly + seal baselines + seals lived checklist.
 #
 # Optional morph+seals attach bar (TASK-158; ~1 min, not on -Mega default):
 #   powershell -File tools\proof_scorecard.ps1 -SealCycle
-#   # or: $env:PROTEUS_SCORECARD_SEAL_CYCLE = "1"
+#   # or: $env:CUTTLE_SCORECARD_SEAL_CYCLE = "1"
 
 param(
     [switch]$Full,
@@ -113,7 +113,7 @@ if ($Mega) {
 }
 
 # Env override for SealCycle without CLI switch.
-if ($env:PROTEUS_SCORECARD_SEAL_CYCLE -eq "1") {
+if ($env:CUTTLE_SCORECARD_SEAL_CYCLE -eq "1") {
     $SealCycle = $true
 }
 
@@ -150,7 +150,7 @@ function Run-CargoTest {
     }
 }
 
-Write-Host "=== Proteus proof scorecard ==="
+Write-Host "=== Cuttle proof scorecard ==="
 Write-Host "workspace: $Root"
 if ($Mega) {
     Write-Host "mode: -Mega (TASK-128) — includes qemu_smoke, morphed_qemu,"
@@ -158,13 +158,13 @@ if ($Mega) {
     Write-Host "      expected wall: ~15–45 min warm TCG (QEMU required)"
 }
 if ($NorthStarBoot -and -not $Mega) {
-    Write-Host "mode: -NorthStarBoot only (N=1 default unless PROTEUS_SOAK_ITERS set)"
+    Write-Host "mode: -NorthStarBoot only (N=1 default unless CUTTLE_SOAK_ITERS set)"
 }
 Write-Host ""
 
 Write-Host "-- always-on --"
 Run-CargoTest "static_poison_corpus" @(
-    "test", "-p", "proteus-verifier", "--test", "poison_corpus",
+    "test", "-p", "cuttle-verifier", "--test", "poison_corpus",
     "poison_", "--", "--test-threads=1"
 ) $null $null
 
@@ -179,18 +179,18 @@ Run-CargoTest "kernel_churn_gate_unit" @(
 
 # TASK-124/125 / north-star G3+G5: diversity evidence + require gate (no QEMU).
 Run-CargoTest "attest_diversity_v9" @(
-    "test", "-p", "proteus-morph-engine", "--test", "attest_v9",
+    "test", "-p", "cuttle-morph-engine", "--test", "attest_v9",
     "--", "--test-threads=1"
 ) $null $null
 
 Run-CargoTest "semantic_poison_enrolled" @(
-    "test", "-p", "proteus-verifier", "--test", "poison_corpus",
+    "test", "-p", "cuttle-verifier", "--test", "poison_corpus",
     "semantic_poison_files"
 ) $null $null
 
 # TASK-163: durable capability bit KATs (contract only; always-on, ms).
 Run-CargoTest "durable_cap_bits" @(
-    "test", "-p", "proteus-contracts", "durable_cap_bits_kat",
+    "test", "-p", "cuttle-contracts", "durable_cap_bits_kat",
     "--", "--test-threads=1"
 ) $null $null
 
@@ -202,7 +202,7 @@ if (-not (Test-Path $fe) -and -not (Test-Path $sch)) {
     Add-Result "seal_baselines" "SKIP" "no factory_expected.toml or scheduler.toml"
 } else {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $tmpSeals = Join-Path $env:TEMP ("proteus_scorecard_seals_" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+    $tmpSeals = Join-Path $env:TEMP ("cuttle_scorecard_seals_" + [guid]::NewGuid().ToString("N").Substring(0, 8))
     $sealScript = Join-Path $Root "tools\seal_factory_baselines.ps1"
     # Run in-process so exit code is reliable; ignore stderr noise from cargo.
     try {
@@ -238,7 +238,7 @@ if ($MorphedQemu) {
     Run-CargoTest "morphed_qemu_proof" @(
         "test", "-p", "diversity_demo", "--test", "morphed_qemu_proof",
         "--", "--nocapture"
-    ) "PROTEUS_MORPHED_QEMU_PROOF" "1"
+    ) "CUTTLE_MORPHED_QEMU_PROOF" "1"
 } else {
     Add-Result "morphed_qemu_proof" "SKIP" "pass -MorphedQemu, -Mega, or -Full"
 }
@@ -247,14 +247,14 @@ if ($BundleMorphProof) {
     Run-CargoTest "bundle_morph_proof" @(
         "test", "-p", "diversity_demo", "--test", "bundle_morph_proof",
         "--", "--nocapture"
-    ) "PROTEUS_BUNDLE_MORPH_PROOF" "1"
+    ) "CUTTLE_BUNDLE_MORPH_PROOF" "1"
 } else {
     Add-Result "bundle_morph_proof" "SKIP" "pass -BundleMorphProof, -Mega, or -Full"
 }
 
 if ($VerifyAttest) {
     # TASK-130: prove the *workspace* production attest chain (not soak
-    # PROTEUS_ATTEST_DIR). Default requires ext_tlv (v8+). Mixed/legacy
+    # CUTTLE_ATTEST_DIR). Default requires ext_tlv (v8+). Mixed/legacy
     # chains may need --allow-missing-ext-tlv; that is labeled explicitly
     # so Mega never silently treats legacy as strict.
     $attestLog = Join-Path $Root "attest.log.jsonl"
@@ -262,7 +262,7 @@ if ($VerifyAttest) {
         Add-Result "verify_attest" "SKIP" "no workspace attest.log.jsonl (run morph cycles first)"
     } else {
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $out = & cargo run -p proteus-morph-engine --quiet -- verify-attest 2>&1 | Out-String
+        $out = & cargo run -p cuttle-morph-engine --quiet -- verify-attest 2>&1 | Out-String
         $code = $LASTEXITCODE
         $sw.Stop()
         if ($code -eq 0) {
@@ -270,8 +270,8 @@ if ($VerifyAttest) {
             $detail = ($out.Trim() -replace '\s+', ' ')
             $strictExtras = @()
             $strictFail = $null
-            if ($env:PROTEUS_VERIFY_REQUIRE_DIVERSITY -eq "1") {
-                $outD = & cargo run -p proteus-morph-engine --quiet -- verify-attest --require-diversity 2>&1 | Out-String
+            if ($env:CUTTLE_VERIFY_REQUIRE_DIVERSITY -eq "1") {
+                $outD = & cargo run -p cuttle-morph-engine --quiet -- verify-attest --require-diversity 2>&1 | Out-String
                 if ($LASTEXITCODE -eq 0) {
                     $strictExtras += "require-diversity"
                 } else {
@@ -279,8 +279,8 @@ if ($VerifyAttest) {
                 }
             }
             # TASK-148: fleets that always attach seals can opt in.
-            if (-not $strictFail -and $env:PROTEUS_VERIFY_REQUIRE_DURABLE_SEALS -eq "1") {
-                $outS = & cargo run -p proteus-morph-engine --quiet -- verify-attest --require-durable-seals 2>&1 | Out-String
+            if (-not $strictFail -and $env:CUTTLE_VERIFY_REQUIRE_DURABLE_SEALS -eq "1") {
+                $outS = & cargo run -p cuttle-morph-engine --quiet -- verify-attest --require-durable-seals 2>&1 | Out-String
                 if ($LASTEXITCODE -eq 0) {
                     $strictExtras += "require-durable-seals"
                 } else {
@@ -296,7 +296,7 @@ if ($VerifyAttest) {
             }
         } else {
             # Pre-v8 / mixed: explicit legacy path (never silent).
-            $out2 = & cargo run -p proteus-morph-engine --quiet -- verify-attest --allow-missing-ext-tlv 2>&1 | Out-String
+            $out2 = & cargo run -p cuttle-morph-engine --quiet -- verify-attest --allow-missing-ext-tlv 2>&1 | Out-String
             $code2 = $LASTEXITCODE
             if ($code2 -eq 0) {
                 Add-Result "verify_attest" "PASS" "LEGACY allow-missing-ext-tlv (upgrade chain to v8+)" $sw.ElapsedMilliseconds
@@ -332,36 +332,36 @@ if ($Mtd) {
 
 if ($PoisonSemantic) {
     Run-CargoTest "semantic_poison_e2e" @(
-        "test", "-p", "proteus-verifier", "--test", "poison_corpus",
+        "test", "-p", "cuttle-verifier", "--test", "poison_corpus",
         "semantic_poison_e2e_all_reject", "--", "--nocapture"
-    ) "PROTEUS_VERIFIER_POISON_E2E" "1"
+    ) "CUTTLE_VERIFIER_POISON_E2E" "1"
 } else {
     Add-Result "semantic_poison_e2e" "SKIP" "pass -PoisonSemantic or -Full"
 }
 
 if ($SoakShort) {
     Run-CargoTest "soak_short_daemon" @(
-        "test", "-p", "proteus-morph-engine", "--test", "soak_short",
+        "test", "-p", "cuttle-morph-engine", "--test", "soak_short",
         "--", "--nocapture"
-    ) "PROTEUS_SOAK_SHORT" "1"
+    ) "CUTTLE_SOAK_SHORT" "1"
 } else {
     Add-Result "soak_short_daemon" "SKIP" "pass -SoakShort or -Full"
 }
 
 if ($SoakBundleMini) {
     Run-CargoTest "soak_bundle_mini" @(
-        "test", "-p", "proteus-morph-engine", "--test", "soak_bundle_mini",
+        "test", "-p", "cuttle-morph-engine", "--test", "soak_bundle_mini",
         "--", "--nocapture"
-    ) "PROTEUS_SOAK_BUNDLE_MINI" "1"
+    ) "CUTTLE_SOAK_BUNDLE_MINI" "1"
 } else {
     Add-Result "soak_bundle_mini" "SKIP" "pass -SoakBundleMini or -Full"
 }
 
 if ($BundleSoakBoot) {
     Run-CargoTest "bundle_soak_boot" @(
-        "test", "-p", "proteus-morph-engine", "--test", "bundle_soak_boot",
+        "test", "-p", "cuttle-morph-engine", "--test", "bundle_soak_boot",
         "--", "--nocapture"
-    ) "PROTEUS_BUNDLE_SOAK_BOOT" "1"
+    ) "CUTTLE_BUNDLE_SOAK_BOOT" "1"
 } else {
     Add-Result "bundle_soak_boot" "SKIP" "pass -BundleSoakBoot or -Full"
 }
@@ -369,34 +369,34 @@ if ($BundleSoakBoot) {
 # TASK-123 / north-star G6: N× full [bundle.kernel] daemon cadence.
 # Always-on helpers run without the env gate; gated soak needs -NorthStarSoak.
 Run-CargoTest "north_star_soak_helpers" @(
-    "test", "-p", "proteus-morph-engine", "--test", "north_star_soak",
+    "test", "-p", "cuttle-morph-engine", "--test", "north_star_soak",
     "--", "--nocapture"
 ) $null $null
 
 if ($NorthStarSoak) {
-    $env:PROTEUS_SOAK_ITERS = if ($env:PROTEUS_SOAK_ITERS) { $env:PROTEUS_SOAK_ITERS } else { "5" }
-    Remove-Item Env:PROTEUS_NORTH_STAR_BOOT -ErrorAction SilentlyContinue
+    $env:CUTTLE_SOAK_ITERS = if ($env:CUTTLE_SOAK_ITERS) { $env:CUTTLE_SOAK_ITERS } else { "5" }
+    Remove-Item Env:CUTTLE_NORTH_STAR_BOOT -ErrorAction SilentlyContinue
     Run-CargoTest "north_star_soak_daemon" @(
-        "test", "-p", "proteus-morph-engine", "--test", "north_star_soak",
+        "test", "-p", "cuttle-morph-engine", "--test", "north_star_soak",
         "north_star_bundle_kernel_daemon_soak", "--", "--nocapture"
-    ) "PROTEUS_NORTH_STAR_SOAK" "1"
+    ) "CUTTLE_NORTH_STAR_SOAK" "1"
 } else {
     Add-Result "north_star_soak_daemon" "SKIP" "pass -NorthStarSoak"
 }
 
 # TASK-127/128: cadence + boot one path (default 1 cycle under -Mega/-NorthStarBoot).
-# Set PROTEUS_SOAK_ITERS to raise N. Requires QEMU + factory_signing_key.bin.
+# Set CUTTLE_SOAK_ITERS to raise N. Requires QEMU + factory_signing_key.bin.
 if ($NorthStarBoot) {
-    if (-not $env:PROTEUS_SOAK_ITERS) {
-        $env:PROTEUS_SOAK_ITERS = "1"
+    if (-not $env:CUTTLE_SOAK_ITERS) {
+        $env:CUTTLE_SOAK_ITERS = "1"
     }
-    $env:PROTEUS_NORTH_STAR_BOOT = "1"
-    Write-Host "north_star_soak_boot: PROTEUS_SOAK_ITERS=$($env:PROTEUS_SOAK_ITERS) BOOT=1"
+    $env:CUTTLE_NORTH_STAR_BOOT = "1"
+    Write-Host "north_star_soak_boot: CUTTLE_SOAK_ITERS=$($env:CUTTLE_SOAK_ITERS) BOOT=1"
     Run-CargoTest "north_star_soak_boot" @(
-        "test", "-p", "proteus-morph-engine", "--test", "north_star_soak",
+        "test", "-p", "cuttle-morph-engine", "--test", "north_star_soak",
         "north_star_bundle_kernel_daemon_soak", "--", "--nocapture"
-    ) "PROTEUS_NORTH_STAR_SOAK" "1"
-    Remove-Item Env:PROTEUS_NORTH_STAR_BOOT -ErrorAction SilentlyContinue
+    ) "CUTTLE_NORTH_STAR_SOAK" "1"
+    Remove-Item Env:CUTTLE_NORTH_STAR_BOOT -ErrorAction SilentlyContinue
 } else {
     Add-Result "north_star_soak_boot" "SKIP" "pass -NorthStarBoot, -Mega, or -Full"
 }
@@ -405,11 +405,11 @@ if ($NorthStarBoot) {
 if ($SealCycle) {
     Write-Host "seal_cycle: running cycle_durable_seals (~1 min cold verify)"
     Run-CargoTest "seal_cycle" @(
-        "test", "-p", "proteus-morph-engine", "--test", "cycle_durable_seals",
+        "test", "-p", "cuttle-morph-engine", "--test", "cycle_durable_seals",
         "--", "--nocapture"
     ) $null $null
 } else {
-    Add-Result "seal_cycle" "SKIP" "pass -SealCycle or PROTEUS_SCORECARD_SEAL_CYCLE=1"
+    Add-Result "seal_cycle" "SKIP" "pass -SealCycle or CUTTLE_SCORECARD_SEAL_CYCLE=1"
 }
 
 Write-Host ""

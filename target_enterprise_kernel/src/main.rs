@@ -11,28 +11,28 @@
 //! sequence against `kernel_fixtures` on `COM1`, restores sealed `OsShell`
 //! state from AHCI `LBA 1040..=1041`, services the network control plane, and
 //! enters the interactive console shell. In production builds (`--prod` /
-//! `--cfg proteus_prod`), self-test banners and the red-team harness are
+//! `--cfg cuttle_prod`), self-test banners and the red-team harness are
 //! compiled out.
 
 #![no_std]
 #![no_main]
-// Production builds (`--cfg proteus_prod` in RUSTFLAGS, injected by
+// Production builds (`--cfg cuttle_prod` in RUSTFLAGS, injected by
 // `factory_builder build-kernel --prod`) exclude the banner self-proof
 // suite and the red-team attack harness: every `banner_*` definition and
 // call site is cfg-gated except `banner_continuity` / `banner_durable_seal`
 // (real cross-morph durable-state work, not self-tests), and the planted
 // attack surface is compiled out entirely. Prod boots are externally
-// distinguishable by the `PROTEUS-TE PROD` serial line. Helpers left
+// distinguishable by the `CUTTLE-TE PROD` serial line. Helpers left
 // unused once banners are stripped are silenced, not deleted, so the
 // banner build stays byte-for-byte identical in structure.
-#![cfg_attr(proteus_prod, allow(dead_code, unused_imports, unused_mut, unused_variables))]
+#![cfg_attr(cuttle_prod, allow(dead_code, unused_imports, unused_mut, unused_variables))]
 
 use core::arch::asm;
 use core::panic::PanicInfo;
 
 use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::{entry_point, BootInfo};
-use proteus_contracts::{
+use cuttle_contracts::{
     AccessKind, AuditEvent, AuditLog, AuditVerdict, BpfContext, CrashContext, CrashDump, EBpf,
     FilterAction, FilterRule, Filesystem, HandshakeKeys, Hash, Iommu, Ipv4PacketView, NtpReply,
     NtpTimestamp, PacketFilter, PagePerms, Sntp, SymbolResolve, Tls13Client, Tls13Server, Tpm,
@@ -67,7 +67,7 @@ use target_enterprise::tls::{
 };
 use target_enterprise::wal::WalImpl;
 use target_enterprise::HashImpl;
-use proteus_contracts::Kpti;
+use cuttle_contracts::Kpti;
 
 /// Map all physical memory so virtio DMA buffers (kernel statics)
 /// have known guest-physical addresses for QEMU virtio-blk.
@@ -387,8 +387,8 @@ pub(crate) const PCI_CONFIG_DATA: u16 = 0xCFC;
 /// read is a real I/O cycle observed by QEMU's PCI host bridge.
 pub(crate) struct RealPciBus;
 
-impl proteus_contracts::PciConfigBus for RealPciBus {
-    fn read_dword(&mut self, addr: proteus_contracts::PciAddress, offset: u8) -> u32 {
+impl cuttle_contracts::PciConfigBus for RealPciBus {
+    fn read_dword(&mut self, addr: cuttle_contracts::PciAddress, offset: u8) -> u32 {
         let o = (offset as u32) & 0xFC;
         let conf = 0x8000_0000u32
             | ((addr.bus as u32) << 16)
@@ -403,7 +403,7 @@ impl proteus_contracts::PciConfigBus for RealPciBus {
     }
     fn write_dword(
         &mut self,
-        addr: proteus_contracts::PciAddress,
+        addr: cuttle_contracts::PciAddress,
         offset: u8,
         value: u32,
     ) {
@@ -573,167 +573,167 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     set_phys_offset(boot_info);
     fb_register(boot_info);
     serial_init();
-    serial_write_str("PROTEUS-TE OK\n");
+    serial_write_str("CUTTLE-TE OK\n");
     // Distinguishes production boots externally; absent in banner builds.
-    #[cfg(proteus_prod)]
-    serial_write_str("PROTEUS-TE PROD\n");
+    #[cfg(cuttle_prod)]
+    serial_write_str("CUTTLE-TE PROD\n");
 
     // Per-feature proof sequence. Each helper asserts against the
     // locked fixtures (panic on mismatch → handler emits PANIC banner,
     // QEMU smoke fails) and emits one line on success.
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_tls_hkdf();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_tls_server_hello();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_tls_client();
     // Cross-morph session continuity (Class B): RFC 8446 resumption PSK
     // survives a sealed-blob round trip; successor derives the same
     // early secret.
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_tls_resumption();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_wal_replay();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_iommu_translate();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_hash_digest();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_net_build();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_kpti();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_dma();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_ring3_transition();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_nvme();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_tcp();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_http();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_dns();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_icmp();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_eth();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_arp();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_dhcp();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_virtio_net();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_virtio_blk();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_e1000();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_firewall();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_tpm();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_audit();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_sntp();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_vfs();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_ebpf();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_smp();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_tftp();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_pci();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_x509();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_timer();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_kat();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_jfs();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_gdbstub();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_quota();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_hpet();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_canary();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_keyboard();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_fat32();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_watchdog();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_rng();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_power();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_elf();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_serial();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_tick();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_virtio_caps();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_sigkat();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_mb2();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_crc32c();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_rsdp();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_frame();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_ioapic();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_lapic();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_gpt();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_dns_name();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_drbg();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_ahci_fis();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_xhci_trb();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_uefi_gop();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_attest_tlv();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_base64();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_ahci_cmd();
     // Anti-sprawl live composition: codecs wired *together*, not only
     // isolated per-module banners. Proves timer/tick/watchdog,
     // VFS/quota, and AHCI FIS+cmd table call chains survive into the
     // boot image — and (via morphed_qemu_proof) after diversification.
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_timebase_compose();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_vfs_quota_compose();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_ahci_storage_compose();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_net_path_compose();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_block_path_compose();
     // TASK-104/107: real PCI + virtqueue I/O for virtio-blk-pci.
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_virtio_hw();
     // TASK-109/111: real PCI + TX/RX virtqueues for virtio-net-pci.
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_virtio_net_hw();
     // TASK-113/117: real AHCI HBA MMIO + IDENTIFY + sector DMA.
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_ahci_hw();
     // Cross-morph durable-state continuity: real WAL replay + persist
     // on the AHCI disk; a morphed successor boot resumes it.
@@ -743,14 +743,14 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // exits to HALT when the window closes.
     service_udp_status();
     // TASK-116/120: real e1000 PCI + MMIO + EEPROM MAC + TX DD.
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_e1000_hw();
     // TASK-119: real QEMU NVMe admin identify (not MemNvmeController).
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_nvme_hw();
     // TASK-145: guest durable seal of empty audit snapshot header.
     banner_durable_seal();
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     banner_panic_dump();
     // Interactive OS shell + unified VFS/Scheduler/Audit runtime proof.
     banner_shell_compose();
@@ -771,10 +771,10 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // access to the boot console — never via the network stack — and
     // the window closes after a short poll, so normal boots are
     // unaffected.
-    #[cfg(not(proteus_prod))]
+    #[cfg(not(cuttle_prod))]
     attack_iface_pilot();
 
-    serial_write_str("PROTEUS-TE HALT\n");
+    serial_write_str("CUTTLE-TE HALT\n");
     live_os_console_loop();
 }
 
@@ -790,7 +790,7 @@ static CONSOLE_NET_SVC: spin::Mutex<target_enterprise::LivedNet> =
 /// - Serial console (`COM1` `0x3F8`) and PS/2 keyboard (`0x60`/`0x64`)
 /// - Live AHCI disk persistence (`LBA 1040..=1065`) on `sync`, SQL mutations, `halt`, and `reboot`
 pub(crate) fn live_os_console_loop() -> ! {
-    use proteus_contracts::{KeyCode, Keyboard};
+    use cuttle_contracts::{KeyCode, Keyboard};
     use target_enterprise::keyboard::KeyboardImpl;
     use target_enterprise::{ShellAction, SHELL_PROMPT};
 
@@ -838,7 +838,7 @@ pub(crate) fn live_os_console_loop() -> ! {
     smp_hw_tick_and_sync(sh);
     smp_hw_enable_bsp_timer();
     fb_console_start();
-    serial_write_str("Proteus Enterprise OS interactive shell ready.\n");
+    serial_write_str("Cuttle Enterprise OS interactive shell ready.\n");
     serial_write_str("Web UI: http://127.0.0.1:18080/app | SQL: http://127.0.0.1:18080/sql\n");
     serial_write_bytes(SHELL_PROMPT);
 
@@ -950,7 +950,7 @@ pub(crate) fn live_os_console_loop() -> ! {
 
 #[panic_handler]
 pub(crate) fn panic(info: &PanicInfo) -> ! {
-    serial_write_str("PROTEUS-TE PANIC: ");
+    serial_write_str("CUTTLE-TE PANIC: ");
     // Prefer the panic payload so hardware-path failures are diagnosable
     // from the QEMU serial log without a debugger.
     {
@@ -990,11 +990,11 @@ pub(crate) fn halt_forever() -> ! {
 /// kernel stack page ends ~0xD0 above the frame — writes past that
 /// guard boundary fault mid-copy. 176 bytes covers the chain zone
 /// (ret slot + ret-sled + win) while staying mapped.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 pub(crate) const ATTACK_READ_LEN: usize = 176;
 
 /// Blocking read of one byte from COM1 (16550 RBR, polled).
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 pub(crate) fn serial_read_byte() -> u8 {
     // SAFETY: Running at CPL=0; polling 0x3FD until bit 0 (DR) is set guarantees a received byte is latched in RBR (0x3F8).
     unsafe {
@@ -1006,7 +1006,7 @@ pub(crate) fn serial_read_byte() -> u8 {
 }
 
 /// Non-blocking check: is a byte waiting on COM1?
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 pub(crate) fn serial_data_ready() -> bool {
     // SAFETY: Running at CPL=0; port 0x3FD is the read-only COM1 Line Status Register and does not alias memory.
     unsafe { inb(COM1 + 5) & 0x01 != 0 }
@@ -1015,7 +1015,7 @@ pub(crate) fn serial_data_ready() -> bool {
 /// Attack entry point: wait (bounded) for the "ATK!" magic on COM1, then
 /// run the vulnerable service. The bound keeps normal boots fast — if
 /// no attacker shows up, the kernel proceeds to HALT as usual.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 pub(crate) fn attack_iface_pilot() {
     // Keep `attack_win` linked: nothing calls it legitimately (that is
     // the point — only a hijacked return address lands there), so
@@ -1110,7 +1110,7 @@ pub(crate) fn fw_cfg_select(want: &str) -> Option<u16> {
 /// THIS FUNCTION IS INTENTIONALLY INSECURE — it exists to give the red
 /// team a deterministic memory-corruption primitive.
 #[inline(never)]
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 pub(crate) fn attack_vulnerable_service() {
     let Some(sel) = fw_cfg_select("opt/attack.bin") else {
         serial_write_str("ATK NO PAYLOAD FILE\n");
@@ -1126,7 +1126,7 @@ pub(crate) fn attack_vulnerable_service() {
         let b = unsafe { inb(FW_CFG_DATA) };
         // SAFETY: INTENTIONAL RED-TEAM VULNERABILITY — writes `ATTACK_READ_LEN` (176) bytes into a
         // 64-byte stack buffer (`dst`) while remaining within the mapped kernel stack page to test
-        // cross-variant ROP chain survival. Excluded from production (`#[cfg(not(proteus_prod))]`).
+        // cross-variant ROP chain survival. Excluded from production (`#[cfg(not(cuttle_prod))]`).
         unsafe { dst.add(i).write_volatile(b) };
     }
     serial_write_str("ATK RD DONE\n");
@@ -1147,7 +1147,7 @@ pub(crate) fn attack_vulnerable_service() {
 /// table — exactly what a real attacker does with a leaked symbol.
 #[no_mangle]
 #[inline(never)]
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 pub extern "C" fn attack_win() -> ! {
     serial_write_str("PWNED\n");
     halt_forever();

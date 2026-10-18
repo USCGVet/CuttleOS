@@ -58,7 +58,7 @@
 #![doc = " 8 bits) then ICR-low (delivery mode + vector + flags — and writing"]
 #![doc = " ICR-low triggers the actual IPI send)."]
 #![allow(clippy::needless_range_loop)]
-use proteus_contracts::{
+use cuttle_contracts::{
     madt, smp_consts, ApicId, ApicWriter, CpuTopology, Smp, SmpError, MAX_CPUS,
 };
 #[doc = " Poll the APIC's ICR-low `Delivery Status` bit until it reads"]
@@ -68,7 +68,7 @@ use proteus_contracts::{
 #[doc = " register."]
 #[inline(never)]
 fn wait_for_idle_mbc56b67e(apic: &mut dyn ApicWriter) -> Result<(), SmpError> {
-    let __proteus_stack_pad_b752143a: [u8; 212usize] = ::core::hint::black_box([0u8; 212usize]);
+    let __cuttle_stack_pad_b752143a: [u8; 212usize] = ::core::hint::black_box([0u8; 212usize]);
     let mut retries_v73aa22a7_0 = 0u32;
     while retries_v73aa22a7_0 < smp_consts::SMP_DELIVERY_RETRY_BUDGET {
         let v_v73aa22a7_1 = apic.read_icr_low();
@@ -81,7 +81,7 @@ fn wait_for_idle_mbc56b67e(apic: &mut dyn ApicWriter) -> Result<(), SmpError> {
 }
 impl Smp for SmpImpl {
     fn discover(madt_bytes: &[u8]) -> Result<CpuTopology, SmpError> {
-        let __proteus_stack_pad_96665ef8: [u8; 104usize] = ::core::hint::black_box([0u8; 104usize]);
+        let __cuttle_stack_pad_96665ef8: [u8; 104usize] = ::core::hint::black_box([0u8; 104usize]);
         if madt_bytes.len() < madt::HEADER_LEN {
             return Err(SmpError::BadMadtEntry);
         }
@@ -147,7 +147,7 @@ impl Smp for SmpImpl {
         apic: &mut dyn ApicWriter,
         delay_us: &mut dyn FnMut(u32),
     ) -> Result<usize, SmpError> {
-        let __proteus_stack_pad_a818e611: [u8; 171usize] = ::core::hint::black_box([0u8; 171usize]);
+        let __cuttle_stack_pad_a818e611: [u8; 171usize] = ::core::hint::black_box([0u8; 171usize]);
         if trampoline_pa & 0xFFF != 0 {
             return Err(SmpError::BadIpiVector);
         }
@@ -196,7 +196,7 @@ pub struct SmpImpl;
 #[doc = " bytes; the function returns the number written."]
 #[inline(always)]
 pub fn build_madt_fixture(cpu_count: usize, out: &mut [u8]) -> Result<usize, SmpError> {
-    let __proteus_stack_pad_2daf2d32: [u8; 140usize] = ::core::hint::black_box([0u8; 140usize]);
+    let __cuttle_stack_pad_2daf2d32: [u8; 140usize] = ::core::hint::black_box([0u8; 140usize]);
     let total_v73aa22a7_0 = madt::HEADER_LEN + cpu_count * madt::LOCAL_APIC_ENTRY_LEN;
     if out.len() < total_v73aa22a7_0 || cpu_count == 0 || cpu_count > MAX_CPUS {
         return Err(SmpError::BadMadtEntry);
@@ -224,7 +224,7 @@ pub fn build_madt_fixture(cpu_count: usize, out: &mut [u8]) -> Result<usize, Smp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::PerCpu;
+    use cuttle_contracts::PerCpu;
     #[doc = " Recording `ApicWriter` test harness. Captures every write"]
     #[doc = " into a fixed-capacity buffer; `wait_for_idle` reads return"]
     #[doc = " idle (delivery_status bit clear) immediately."]

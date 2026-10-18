@@ -8,7 +8,7 @@
 //!     with `semantic_perturb: true` — and prints semantic-normalized
 //!     survival for both, so the Rung-1 effect is directly measurable.
 //!     Diversify a built-in specimen N ways through the project's real
-//!     `proteus_diversifier` pipeline, compile each with `rustc -O`, and
+//!     `cuttle_diversifier` pipeline, compile each with `rustc -O`, and
 //!     report ROP/JOP gadget survival across the morphs. This is the
 //!     headline measurement: it turns "morphing perturbs the attack
 //!     surface" into a percentage.
@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use proteus_mtd_metrics::chainsim;
-use proteus_mtd_metrics::{churn, extract_gadgets, read_text_section, ChurnReport, DEFAULT_MAX_INSTRS};
+use cuttle_mtd_metrics::chainsim;
+use cuttle_mtd_metrics::{churn, extract_gadgets, read_text_section, ChurnReport, DEFAULT_MAX_INSTRS};
 
 /// Built-in specimen: dependency-free `std` Rust with enough branchy
 /// control flow (loops, a range `match`, pointer arithmetic, a binary
@@ -239,14 +239,14 @@ fn cmd_specimen(args: &[String]) -> Result<()> {
             max_instrs,
             keep,
             "baseline",
-            &proteus_diversifier::DiversifyOptions::default(),
+            &cuttle_diversifier::DiversifyOptions::default(),
         )?;
         let sem = run_specimen_pipeline(
             variants,
             max_instrs,
             keep,
             "semantic",
-            &proteus_diversifier::DiversifyOptions::with_semantic_perturb(),
+            &cuttle_diversifier::DiversifyOptions::with_semantic_perturb(),
         )?;
         println!("\n=== Rung-1 A/B summary ===");
         println!(
@@ -269,7 +269,7 @@ fn cmd_specimen(args: &[String]) -> Result<()> {
         max_instrs,
         keep,
         "run",
-        &proteus_diversifier::DiversifyOptions::default(),
+        &cuttle_diversifier::DiversifyOptions::default(),
     )?;
     Ok(())
 }
@@ -282,10 +282,10 @@ fn run_specimen_pipeline(
     max_instrs: usize,
     keep: bool,
     label: &str,
-    options: &proteus_diversifier::DiversifyOptions,
+    options: &cuttle_diversifier::DiversifyOptions,
 ) -> Result<f64> {
     let work = std::env::temp_dir().join(format!(
-        "proteus_mtd_{}_{}",
+        "cuttle_mtd_{}_{}",
         std::process::id(),
         label
     ));
@@ -300,8 +300,8 @@ fn run_specimen_pipeline(
     // (cycle, module) seed, exactly as a real morph cycle would.
     let mut compiled: Vec<(usize, PathBuf, [u8; 32])> = Vec::new();
     for v in 0..variants {
-        let seed = proteus_diversifier::Seed::derive(v as u64, "mtd_specimen");
-        let (morphed, dlog) = proteus_diversifier::diversify_with_options(SPECIMEN, &seed, options)
+        let seed = cuttle_diversifier::Seed::derive(v as u64, "mtd_specimen");
+        let (morphed, dlog) = cuttle_diversifier::diversify_with_options(SPECIMEN, &seed, options)
             .with_context(|| format!("diversify variant {}", v))?;
         if options.semantic_perturb && v == 0 {
             eprintln!(
@@ -309,7 +309,7 @@ fn run_specimen_pipeline(
                 dlog.semantic_decisions
             );
         }
-        let canon = proteus_diversifier::canonical_hash(&morphed)
+        let canon = cuttle_diversifier::canonical_hash(&morphed)
             .with_context(|| format!("hash variant {}", v))?;
 
         let src = work.join(format!("variant_{}.rs", v));
@@ -442,7 +442,7 @@ fn cmd_churn(args: &[String]) -> Result<()> {
 
     if let Some(n) = flag_value::<usize>(args, "--buckets")? {
         println!("\npositional survival by .text offset ({} buckets):", n);
-        for b in proteus_mtd_metrics::survivor_offset_buckets(&ga, &gb, n) {
+        for b in cuttle_mtd_metrics::survivor_offset_buckets(&ga, &gb, n) {
             let rate = if b.total == 0 {
                 0.0
             } else {

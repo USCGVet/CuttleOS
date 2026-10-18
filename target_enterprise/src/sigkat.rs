@@ -7,7 +7,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     SigKat, SigKatResult, SigKatSuite, SIGKAT_PK_LEN, SIGKAT_SIG_LEN, SIGKAT_SK_LEN,
     SIGKAT_VECTOR_COUNT,
 };
@@ -165,7 +165,7 @@ pub fn run_all_impl() -> SigKatSuite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::SigKat;
+    use cuttle_contracts::SigKat;
 
     #[test]
     fn count() {

@@ -11,17 +11,17 @@
 //! # Invocation
 //!
 //! ```text
-//! $env:PROTEUS_NORTH_STAR_SOAK = "1"
-//! $env:PROTEUS_SOAK_ITERS = "5"   # optional; default 5
-//! cargo test -p proteus-morph-engine --test north_star_soak -- --nocapture
+//! $env:CUTTLE_NORTH_STAR_SOAK = "1"
+//! $env:CUTTLE_SOAK_ITERS = "5"   # optional; default 5
+//! cargo test -p cuttle-morph-engine --test north_star_soak -- --nocapture
 //!
 //! # Cadence + boot (TASK-127):
-//! $env:PROTEUS_NORTH_STAR_BOOT = "1"
+//! $env:CUTTLE_NORTH_STAR_BOOT = "1"
 //! tools\north_star_soak.ps1 -Iters 1 -Boot
 //!
 //! # Optional durable seals gate (TASK-150; needs seals dir attached):
-//! $env:PROTEUS_DURABLE_SEALS_DIR = "path\to\seals"
-//! $env:PROTEUS_SOAK_REQUIRE_DURABLE_SEALS = "1"
+//! $env:CUTTLE_DURABLE_SEALS_DIR = "path\to\seals"
+//! $env:CUTTLE_SOAK_REQUIRE_DURABLE_SEALS = "1"
 //! ```
 //!
 //! Or: `tools/north_star_soak.ps1`
@@ -39,7 +39,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use proteus_morph_engine::{
+use cuttle_morph_engine::{
     daemon::{run_daemon, DaemonArgs, DaemonReport, DAEMON_LOG},
     verify_chain_with_options, SynthesizerKind, VerifyOptions, ATTEST_DIR_ENV,
 };
@@ -57,12 +57,12 @@ const QEMU_BOOT_TIMEOUT_SECS: u64 = 180;
 /// Same high-value set as mini-bundle soak-boot; full enrollment is covered
 /// by separate qemu_smoke / morphed_qemu_proof banner inventories.
 const BOOT_REQUIRED_BANNERS: &[&str] = &[
-    "PROTEUS-TE OK",
+    "CUTTLE-TE OK",
     "TLS hkdf OK prk_sha=",
     "TLS server_hello OK len=",
     "WAL replay OK frames=",
     "NET build OK len=38 ip_cksum=63c7 udp_cksum=fa94",
-    "PROTEUS-TE HALT",
+    "CUTTLE-TE HALT",
 ];
 
 /// Hardware-truth lines reported in REPORT when `-Boot` (TASK-135).
@@ -86,7 +86,7 @@ const BOOT_HW_FORENSIC_BANNERS: &[&str] = &[
     "NVME_HW sector OK first_byte=5a",
 ];
 
-/// Minimal HW subset hard-failed when `PROTEUS_NORTH_STAR_REQUIRE_HW=1`
+/// Minimal HW subset hard-failed when `CUTTLE_NORTH_STAR_REQUIRE_HW=1`
 /// (TASK-139). Default off so cadence+boot stays lean; enable for
 /// ops that want storage+net HW on the north-star path.
 const BOOT_HW_REQUIRED_MIN: &[&str] = &[
@@ -128,7 +128,7 @@ fn find_qemu() -> Option<PathBuf> {
     }
 }
 
-/// Package ELF + boot QEMU until PROTEUS-TE HALT (or timeout).
+/// Package ELF + boot QEMU until CUTTLE-TE HALT (or timeout).
 ///
 /// Device set matches `factory_builder` qemu_smoke / diversity_demo
 /// (virtio-blk, dual virtio-net hub, AHCI, e1000). Without these the
@@ -214,7 +214,7 @@ fn boot_kernel(elf: &Path, results_dir: &Path, cycle: u64) -> Result<PathBuf, St
             nvme_disk.display()
         ))
         .arg("-device")
-        .arg("nvme,drive=nvme0,serial=PROTEUS-NVME-HW")
+        .arg("nvme,drive=nvme0,serial=CUTTLE-NVME-HW")
         .arg("-fw_cfg")
         .arg(format!(
             "name={},file={}",
@@ -240,12 +240,12 @@ fn boot_kernel(elf: &Path, results_dir: &Path, cycle: u64) -> Result<PathBuf, St
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
         if let Ok(s) = fs::read_to_string(&serial) {
-            if s.contains("PROTEUS-TE HALT") {
+            if s.contains("CUTTLE-TE HALT") {
                 halted = true;
                 break;
             }
             // Fail fast on panic so we do not burn the full timeout.
-            if s.contains("PROTEUS-TE PANIC") {
+            if s.contains("CUTTLE-TE PANIC") {
                 let _ = qproc.kill();
                 let _ = qproc.wait();
                 return Err(format!(
@@ -271,7 +271,7 @@ fn boot_kernel(elf: &Path, results_dir: &Path, cycle: u64) -> Result<PathBuf, St
             .take(2000)
             .collect();
         return Err(format!(
-            "no PROTEUS-TE HALT within {}s; serial preview:\n{}",
+            "no CUTTLE-TE HALT within {}s; serial preview:\n{}",
             QEMU_BOOT_TIMEOUT_SECS, preview
         ));
     }
@@ -589,7 +589,7 @@ fn write_report(
     let distinct: BTreeSet<&str> = bundle_hashes.iter().map(|s| s.as_str()).collect();
     let unique_n = distinct.len();
     let image_note = "source-side diversity always; ELF metrics when --emit-image \
-                      / PROTEUS_SOAK_EMIT_IMAGE=1 (TASK-126)";
+                      / CUTTLE_SOAK_EMIT_IMAGE=1 (TASK-126)";
 
     let boot_ok = !boot_requested || boot.is_some();
     let pass = report.cycles_accepted >= iters
@@ -650,7 +650,7 @@ fn write_report(
                 .into()
         }
         None => {
-            "## QEMU boot (TASK-127)\n\n- requested: no (set PROTEUS_NORTH_STAR_BOOT=1 or -Boot)\n\n"
+            "## QEMU boot (TASK-127)\n\n- requested: no (set CUTTLE_NORTH_STAR_BOOT=1 or -Boot)\n\n"
                 .into()
         }
     };
@@ -757,7 +757,7 @@ fn production_bundle_kernel_modules_nonempty() {
 #[test]
 fn write_soak_scheduler_roundtrip() {
     let dir = std::env::temp_dir().join(format!(
-        "proteus_nss_sched_{}",
+        "cuttle_nss_sched_{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -824,7 +824,7 @@ fn soak_require_durable_seals_env_matrix() {
 fn summarize_durable_seals_empty_and_present() {
     // TASK-152: forensics helper — empty vs non-empty durable_seals.
     let dir = std::env::temp_dir().join(format!(
-        "proteus_nss_seals_{}",
+        "cuttle_nss_seals_{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -883,7 +883,7 @@ fn summarize_durable_seals_empty_and_present() {
 #[test]
 fn boot_required_banners_include_halt() {
     assert!(BOOT_REQUIRED_BANNERS.iter().any(|b| b.contains("HALT")));
-    assert!(BOOT_REQUIRED_BANNERS.iter().any(|b| b.contains("PROTEUS-TE OK")));
+    assert!(BOOT_REQUIRED_BANNERS.iter().any(|b| b.contains("CUTTLE-TE OK")));
     assert!(BOOT_REQUIRED_BANNERS.len() >= 4);
 }
 
@@ -923,7 +923,7 @@ fn boot_hw_required_min_is_subset_of_forensic() {
 #[test]
 fn collect_bundle_hashes_distinct_and_accepted_only() {
     let dir = std::env::temp_dir().join(format!(
-        "proteus_nss_attest_{}",
+        "cuttle_nss_attest_{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -952,9 +952,9 @@ fn collect_bundle_hashes_distinct_and_accepted_only() {
 
 #[test]
 fn north_star_bundle_kernel_daemon_soak() {
-    if std::env::var("PROTEUS_NORTH_STAR_SOAK").as_deref() != Ok("1") {
+    if std::env::var("CUTTLE_NORTH_STAR_SOAK").as_deref() != Ok("1") {
         eprintln!(
-            "SKIP: set PROTEUS_NORTH_STAR_SOAK=1 to run the north-star cadence soak \
+            "SKIP: set CUTTLE_NORTH_STAR_SOAK=1 to run the north-star cadence soak \
              (full [bundle.kernel] × N; tens of minutes). Always-on helpers still run."
         );
         return;
@@ -972,13 +972,13 @@ fn north_star_bundle_kernel_daemon_soak() {
         "production [bundle.kernel].modules is empty"
     );
 
-    let iters: u64 = std::env::var("PROTEUS_SOAK_ITERS")
+    let iters: u64 = std::env::var("CUTTLE_SOAK_ITERS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_ITERS);
     assert!(
         (1..=MAX_ITERS).contains(&iters),
-        "PROTEUS_SOAK_ITERS out of range 1..={MAX_ITERS}"
+        "CUTTLE_SOAK_ITERS out of range 1..={MAX_ITERS}"
     );
 
     assert!(
@@ -987,7 +987,7 @@ fn north_star_bundle_kernel_daemon_soak() {
     );
 
     let verify_status = Command::new("cargo")
-        .args(["build", "-p", "proteus-verifier", "--bin", "verify"])
+        .args(["build", "-p", "cuttle-verifier", "--bin", "verify"])
         .current_dir(&root)
         .status()
         .expect("build verify");
@@ -1022,16 +1022,16 @@ fn north_star_bundle_kernel_daemon_soak() {
     std::env::set_current_dir(&root).expect("cd workspace");
 
     // TASK-126: optional kernel ELF emit + churn (expensive). Opt in via
-    // PROTEUS_SOAK_EMIT_IMAGE=1 when measuring positional bps on cadence.
-    let emit_image = std::env::var("PROTEUS_SOAK_EMIT_IMAGE").as_deref() == Ok("1");
+    // CUTTLE_SOAK_EMIT_IMAGE=1 when measuring positional bps on cadence.
+    let emit_image = std::env::var("CUTTLE_SOAK_EMIT_IMAGE").as_deref() == Ok("1");
     if emit_image {
         eprintln!(
-            "north_star_soak: PROTEUS_SOAK_EMIT_IMAGE=1 — each cycle builds \
+            "north_star_soak: CUTTLE_SOAK_EMIT_IMAGE=1 — each cycle builds \
              kernel ELF + binmorph (long wall-clock)"
         );
     }
 
-    // Durable seals attach via PROTEUS_DURABLE_SEALS_DIR (TASK-146/147);
+    // Durable seals attach via CUTTLE_DURABLE_SEALS_DIR (TASK-146/147);
     // DaemonArgs has no separate field.
     let args = DaemonArgs {
         root: soak.clone(),
@@ -1100,19 +1100,19 @@ fn north_star_bundle_kernel_daemon_soak() {
 
     // TASK-125: require ext_tlv + diversity on every accepted entry.
     // TASK-150: optional durable seals (default off). Meaningful only
-    // when PROTEUS_DURABLE_SEALS_DIR was set during soak cycles.
+    // when CUTTLE_DURABLE_SEALS_DIR was set during soak cycles.
     let require_durable_seals = soak_require_durable_seals(
-        std::env::var("PROTEUS_SOAK_REQUIRE_DURABLE_SEALS")
+        std::env::var("CUTTLE_SOAK_REQUIRE_DURABLE_SEALS")
             .ok()
             .as_deref(),
-        std::env::var("PROTEUS_VERIFY_REQUIRE_DURABLE_SEALS")
+        std::env::var("CUTTLE_VERIFY_REQUIRE_DURABLE_SEALS")
             .ok()
             .as_deref(),
     );
     if require_durable_seals {
         eprintln!(
             "north_star_soak: require_durable_seals=ON \
-             (PROTEUS_SOAK_REQUIRE_DURABLE_SEALS or PROTEUS_VERIFY_REQUIRE_DURABLE_SEALS)"
+             (CUTTLE_SOAK_REQUIRE_DURABLE_SEALS or CUTTLE_VERIFY_REQUIRE_DURABLE_SEALS)"
         );
     }
     let attest_ok = match verify_chain_with_options(&VerifyOptions {
@@ -1145,7 +1145,7 @@ fn north_star_bundle_kernel_daemon_soak() {
     };
 
     // TASK-127: optional QEMU boot while sources are still morphed.
-    let boot_requested = std::env::var("PROTEUS_NORTH_STAR_BOOT").as_deref() == Ok("1");
+    let boot_requested = std::env::var("CUTTLE_NORTH_STAR_BOOT").as_deref() == Ok("1");
     let boot_proof: Option<BootProof> = if boot_requested {
         let last_cycle = {
             let state_txt = fs::read_to_string(&state_path).unwrap_or_default();
@@ -1171,7 +1171,7 @@ fn north_star_bundle_kernel_daemon_soak() {
                     None => std::env::remove_var(ATTEST_DIR_ENV),
                 }
             }
-            panic!("PROTEUS_NORTH_STAR_BOOT=1 but target_enterprise_kernel missing");
+            panic!("CUTTLE_NORTH_STAR_BOOT=1 but target_enterprise_kernel missing");
         }
         if find_qemu().is_none() {
             restore_modules(&snaps);
@@ -1182,7 +1182,7 @@ fn north_star_bundle_kernel_daemon_soak() {
                     None => std::env::remove_var(ATTEST_DIR_ENV),
                 }
             }
-            panic!("PROTEUS_NORTH_STAR_BOOT=1 but qemu-system-x86_64 not found");
+            panic!("CUTTLE_NORTH_STAR_BOOT=1 but qemu-system-x86_64 not found");
         }
 
         let elf = match factory_builder::build_kernel_with_layout_seed(
@@ -1241,7 +1241,7 @@ fn north_star_bundle_kernel_daemon_soak() {
             );
         }
         // TASK-139: optional hard-fail on minimal HW subset.
-        let require_hw = std::env::var("PROTEUS_NORTH_STAR_REQUIRE_HW").as_deref() == Ok("1");
+        let require_hw = std::env::var("CUTTLE_NORTH_STAR_REQUIRE_HW").as_deref() == Ok("1");
         if require_hw {
             let mut hw_gate_missing = Vec::new();
             for b in BOOT_HW_REQUIRED_MIN {
@@ -1260,7 +1260,7 @@ fn north_star_bundle_kernel_daemon_soak() {
                 }
                 panic!(
                     "north-star boot REQUIRE_HW missing: {:?} \
-                     (unset PROTEUS_NORTH_STAR_REQUIRE_HW to disable)",
+                     (unset CUTTLE_NORTH_STAR_REQUIRE_HW to disable)",
                     hw_gate_missing
                 );
             }

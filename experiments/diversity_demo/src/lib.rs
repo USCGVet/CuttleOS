@@ -1,6 +1,6 @@
 //! TASK-015 — morph diversity & synthetic-exploit-survival demonstrator.
 //!
-//! Drives the full Proteus morph pipeline (synthesize=passthrough →
+//! Drives the full Cuttle morph pipeline (synthesize=passthrough →
 //! diversify → verify → sign → emit-kernel-ELF) for N cycles, measures
 //! how much the resulting kernel `.text` section actually changes
 //! cycle-to-cycle, and probes whether a fixed synthetic ROP chain keyed
@@ -12,8 +12,8 @@
 //! NOT reimplement it. But it bakes in attestation-log writes, optional
 //! image emission, and other production concerns we don't want for an
 //! experiment that runs 100 cycles in one process. So this crate
-//! composes the same building blocks — `proteus_diversifier::diversify`,
-//! `proteus_diversifier::canonical_hash`, the `verify` sibling binary,
+//! composes the same building blocks — `cuttle_diversifier::diversify`,
+//! `cuttle_diversifier::canonical_hash`, the `verify` sibling binary,
 //! ed25519 signing, `factory_builder::build_kernel` — into a leaner
 //! loop that emits JSONL telemetry rather than attestation entries.
 //!
@@ -68,7 +68,7 @@ pub struct ExperimentArgs {
     /// Number of pipeline cycles to drive.
     pub cycles: u64,
     /// Path to the workspace member containing the module to morph.
-    /// e.g. `D:/RustProjects/Proteus/target_enterprise`.
+    /// e.g. `D:/RustProjects/Cuttle/target_enterprise`.
     pub target_dir: PathBuf,
     /// Single-module mode: the module name. In bundle mode this is
     /// the bundle name (used as a label in summaries/reports). The
@@ -138,7 +138,7 @@ pub struct ExperimentArgs {
     /// without a nightly build — see `synthesize_pseudo_elf_seeded`.
     pub layout_seed_enabled: bool,
     /// When true, the AST diversifier runs with
-    /// [`proteus_diversifier::DiversifyOptions::with_stack_pad`].
+    /// [`cuttle_diversifier::DiversifyOptions::with_stack_pad`].
     /// **Default false**: stack pads inflate gadget count (~+33%
     /// measured) without buying chain-death once layout seeding is
     /// engaged. Opt in only for A/B measurement of the TASK-029 pass.
@@ -978,7 +978,7 @@ impl KernelChurnMeasurement {
     }
 }
 
-/// Compare two compiled kernel artifacts (ELF/PE) with `proteus_mtd_metrics`
+/// Compare two compiled kernel artifacts (ELF/PE) with `cuttle_mtd_metrics`
 /// gadget enumeration. Expensive on large `.text` (full unaligned scan);
 /// intended for env-gated mega proofs, not the always-on unit suite.
 pub fn measure_kernel_elf_churn(
@@ -986,25 +986,25 @@ pub fn measure_kernel_elf_churn(
     variant_elf: &Path,
 ) -> Result<KernelChurnMeasurement> {
     let t0 = Instant::now();
-    let (base_text, base_ip) = proteus_mtd_metrics::read_text_section(base_elf)
+    let (base_text, base_ip) = cuttle_mtd_metrics::read_text_section(base_elf)
         .with_context(|| format!("read .text from base {}", base_elf.display()))?;
-    let (var_text, var_ip) = proteus_mtd_metrics::read_text_section(variant_elf)
+    let (var_text, var_ip) = cuttle_mtd_metrics::read_text_section(variant_elf)
         .with_context(|| format!("read .text from variant {}", variant_elf.display()))?;
 
     let base_text_sha256 = hex_sha256(&base_text);
     let variant_text_sha256 = hex_sha256(&var_text);
 
-    let base_g = proteus_mtd_metrics::extract_gadgets(
+    let base_g = cuttle_mtd_metrics::extract_gadgets(
         &base_text,
         base_ip,
-        proteus_mtd_metrics::DEFAULT_MAX_INSTRS,
+        cuttle_mtd_metrics::DEFAULT_MAX_INSTRS,
     );
-    let var_g = proteus_mtd_metrics::extract_gadgets(
+    let var_g = cuttle_mtd_metrics::extract_gadgets(
         &var_text,
         var_ip,
-        proteus_mtd_metrics::DEFAULT_MAX_INSTRS,
+        cuttle_mtd_metrics::DEFAULT_MAX_INSTRS,
     );
-    let report = proteus_mtd_metrics::churn(&base_g, &var_g);
+    let report = cuttle_mtd_metrics::churn(&base_g, &var_g);
     let scan_ms = t0.elapsed().as_millis();
 
     Ok(KernelChurnMeasurement {
@@ -1225,20 +1225,20 @@ fn run_one_cycle(
         } else {
             member.clone()
         };
-        let seed = proteus_diversifier::Seed::derive(cycle, &seed_label);
+        let seed = cuttle_diversifier::Seed::derive(cycle, &seed_label);
         let div_opts = if args.stack_pad_enabled {
-            proteus_diversifier::DiversifyOptions::with_stack_pad()
+            cuttle_diversifier::DiversifyOptions::with_stack_pad()
         } else {
-            proteus_diversifier::DiversifyOptions::default()
+            cuttle_diversifier::DiversifyOptions::default()
         };
-        let candidate = proteus_diversifier::diversify_with_options(
+        let candidate = cuttle_diversifier::diversify_with_options(
             &synth_source,
             &seed,
             &div_opts,
         )
         .map(|(s, _log)| s)
         .with_context(|| format!("diversify cycle {} member {}", cycle, member))?;
-        let cand_hash: [u8; 32] = proteus_diversifier::canonical_hash(&candidate)
+        let cand_hash: [u8; 32] = cuttle_diversifier::canonical_hash(&candidate)
             .with_context(|| format!("canonical_hash cycle {} member {}", cycle, member))?;
         let cand_hash_hex = factory_builder::hex(&cand_hash);
 
@@ -1518,7 +1518,7 @@ pub fn synthesize_pseudo_elf(cand_hash: &[u8; 32]) -> (Vec<u8>, HashMap<String, 
 /// historical [`synthesize_pseudo_elf`]: symbol offsets scatter
 /// straight from the candidate hash bytes. With `Some(seed)`, the
 /// offsets scatter from
-/// `sha256("proteus-pseudo-layout-v1" || cand_hash || seed_le)`
+/// `sha256("cuttle-pseudo-layout-v1" || cand_hash || seed_le)`
 /// instead — the `.text` bytes stay candidate-hash-derived either
 /// way. That mirrors, at the layer the chain-survival probe measures,
 /// what the real lever does (relocate functions without changing the
@@ -1551,7 +1551,7 @@ pub fn synthesize_pseudo_elf_seeded(
         None => *cand_hash,
         Some(seed) => {
             let mut h = Sha256::new();
-            h.update(b"proteus-pseudo-layout-v1");
+            h.update(b"cuttle-pseudo-layout-v1");
             h.update(cand_hash);
             h.update(seed.to_le_bytes());
             h.finalize().into()
@@ -2013,7 +2013,7 @@ pub fn render_report(summary: &RunSummary, results_dir: &Path) -> Result<PathBuf
     let serial_log_section = render_serial_log_section(summary);
 
     let body = format!(
-        "# Proteus Morph Diversity — Empirical Results\n\n\
+        "# Cuttle Morph Diversity — Empirical Results\n\n\
          Run date: {run_date}\n\
          Cycles requested: {req}\n\
          Cycles completed (accepted): {done}\n\
@@ -2039,7 +2039,7 @@ pub fn render_report(summary: &RunSummary, results_dir: &Path) -> Result<PathBuf
          {serial_log_section}\
          ## Method\n\n\
          Pipeline per cycle: synthesize=passthrough (unchanged source) → \
-         `proteus_diversifier::diversify(prev_source, Seed::derive(cycle, module))` → \
+         `cuttle_diversifier::diversify(prev_source, Seed::derive(cycle, module))` → \
          {verify_note} → ed25519 sign of the candidate's canonical sha256 → \
          {build_note} → parse `.text` and symbol table with the `object` crate.\n\n\
          Hamming distance: zero-pad the shorter `.text` byte slice up to the longer's length, \

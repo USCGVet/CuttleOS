@@ -9,7 +9,7 @@
 //! These tests are `#[ignore]` because each one drives a full
 //! `cargo build` + `cargo test` chain inside an isolated scratch dir
 //! (wall-clock cost is rustc-dominated). Run them explicitly with:
-//!   `cargo test -p proteus-verifier --test reject_fixture -- --ignored`
+//!   `cargo test -p cuttle-verifier --test reject_fixture -- --ignored`
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

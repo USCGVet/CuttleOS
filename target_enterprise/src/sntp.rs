@@ -39,7 +39,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     NtpClockSkew, NtpReply, NtpTimestamp, Sntp, SntpError, SNTP_LEAP_ALARM, SNTP_MAX_STRATUM,
     SNTP_MODE_CLIENT, SNTP_MODE_SERVER, SNTP_OFFSET_ORIGIN_TS, SNTP_OFFSET_RECEIVE_TS,
     SNTP_OFFSET_REFERENCE_TS, SNTP_OFFSET_REF_ID, SNTP_OFFSET_TRANSMIT_TS, SNTP_PACKET_LEN,

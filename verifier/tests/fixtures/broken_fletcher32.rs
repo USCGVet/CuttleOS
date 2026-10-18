@@ -1,4 +1,4 @@
-//! Hand-crafted reject fixture for the Proteus verifier.
+//! Hand-crafted reject fixture for the Cuttle verifier.
 //!
 //! This file is a drop-in replacement for `target_minimal/src/lib.rs` that
 //! is otherwise faithful to the canonical source but contains one subtle
@@ -37,10 +37,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 /// Placeholder hash carrier — the trait impl below is what the verifier
-/// holds against `proteus_contracts::Hash` invariants.
+/// holds against `cuttle_contracts::Hash` invariants.
 pub struct DemoHash;
 
-/// TOY authenticated-encryption carrier. Wired to `proteus_contracts::Aead`
+/// TOY authenticated-encryption carrier. Wired to `cuttle_contracts::Aead`
 /// so the canonical surface is preserved across the morph.
 pub struct DemoAead;
 
@@ -141,7 +141,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     acc == 0
 }
 
-impl proteus_contracts::Hash for DemoHash {
+impl cuttle_contracts::Hash for DemoHash {
     const OUTPUT_LEN: usize = 4;
     fn hash(input: &[u8], out: &mut [u8]) {
         let h = fletcher32(input);
@@ -152,7 +152,7 @@ impl proteus_contracts::Hash for DemoHash {
     }
 }
 
-impl proteus_contracts::Aead for DemoAead {
+impl cuttle_contracts::Aead for DemoAead {
     const KEY_LEN: usize = 16;
     const NONCE_LEN: usize = 8;
     const TAG_LEN: usize = 4;

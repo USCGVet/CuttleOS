@@ -1,4 +1,4 @@
-# Proteus factory scheduler configuration.
+# Cuttle factory scheduler configuration.
 #
 # Entry types:
 # - [modules.NAME]: single-module morph target (`target_minimal` demo path).

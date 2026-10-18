@@ -15,7 +15,7 @@
 //!   keeps the kernel ELF resident in memory and the kernel wants to
 //!   populate its own table.
 //!
-//! Both flavours implement [`proteus_contracts::SymbolResolve`].
+//! Both flavours implement [`cuttle_contracts::SymbolResolve`].
 //!
 //! ## Containment rule
 //!
@@ -40,7 +40,7 @@
 
 #![allow(clippy::manual_range_contains)]
 
-use proteus_contracts::SymbolResolve;
+use cuttle_contracts::SymbolResolve;
 
 /// One entry in the kernel's static symbol table. Constructed at build
 /// time (by build.rs) or at test time (by hand).

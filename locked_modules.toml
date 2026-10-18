@@ -1,4 +1,4 @@
-# Proteus locked modules — workspace-relative paths that `proteus-diversifier`
+# Cuttle locked modules — workspace-relative paths that `cuttle-diversifier`
 # refuses to modify.
 #
 # `diversifier::diversify_path` loads this file from the workspace root before

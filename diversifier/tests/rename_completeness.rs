@@ -63,7 +63,7 @@
 //! 7 fixtures × 8 seeds = 56 round-trips. Comfortably above the
 //! task's `≥ 40` floor.
 
-use proteus_diversifier::{diversify, Seed};
+use cuttle_diversifier::{diversify, Seed};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -76,7 +76,7 @@ static SCRATCH_COUNTER: AtomicU32 = AtomicU32::new(0);
 fn scratch_dir() -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "proteus_rename_completeness_{}",
+        "cuttle_rename_completeness_{}",
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&p);

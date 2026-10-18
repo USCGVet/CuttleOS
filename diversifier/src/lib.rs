@@ -1,4 +1,4 @@
-//! Deterministic, seed-driven Rust AST diversifier (`proteus-diversifier`).
+//! Deterministic, seed-driven Rust AST diversifier (`cuttle-diversifier`).
 //!
 //! Applies semantics-preserving source transformations to Rust modules keyed
 //! by a 256-bit [`Seed`]:
@@ -62,7 +62,7 @@ impl Seed {
     /// for the skeleton and for tests.
     pub fn derive(cycle: u64, module: &str) -> Self {
         let mut h = Sha256::new();
-        h.update(b"proteus-diversifier-v1");
+        h.update(b"cuttle-diversifier-v1");
         h.update(cycle.to_le_bytes());
         h.update(module.as_bytes());
         let out = h.finalize();
@@ -392,10 +392,10 @@ fn derive_suffix(rng: &mut ChaCha20Rng, tag: &str) -> String {
     format!("_{}{:02x}{:02x}{:02x}{:02x}", tag, b[0], b[1], b[2], b[3])
 }
 
-/// Strip any trailing Proteus private-fn rename suffixes (`_m<8 lowercase hex>`)
+/// Strip any trailing Cuttle private-fn rename suffixes (`_m<8 lowercase hex>`)
 /// so repeated morph cycles replace the suffix rather than growing identifier
 /// length without bound.
-pub(crate) fn strip_proteus_fn_suffix(mut name: &str) -> &str {
+pub(crate) fn strip_cuttle_fn_suffix(mut name: &str) -> &str {
     loop {
         if name.len() <= 10 || !name.is_char_boundary(name.len() - 10) {
             break;
@@ -415,10 +415,10 @@ pub(crate) fn strip_proteus_fn_suffix(mut name: &str) -> &str {
     name
 }
 
-/// Strip any trailing Proteus local-var rename suffixes (`_v<8 hex>_<hex>`)
+/// Strip any trailing Cuttle local-var rename suffixes (`_v<8 hex>_<hex>`)
 /// so repeated morph cycles replace the suffix rather than growing local
 /// variable names without bound.
-pub(crate) fn strip_proteus_var_suffix(mut name: &str) -> &str {
+pub(crate) fn strip_cuttle_var_suffix(mut name: &str) -> &str {
     loop {
         let Some(last_u) = name.rfind('_') else {
             break;
@@ -482,7 +482,7 @@ fn build_private_fn_rename_map(file: &File, rng: &mut ChaCha20Rng) -> BTreeMap<S
                 if original == "main" {
                     continue;
                 }
-                let base = strip_proteus_fn_suffix(&original);
+                let base = strip_cuttle_fn_suffix(&original);
                 let renamed = format!("{}{}", base, suffix);
                 map.insert(original, renamed);
             }
@@ -959,7 +959,7 @@ impl<'a> FunctionTransform<'a> {
     fn fresh_name(&mut self, original: &str) -> String {
         let c = self.rename_counter;
         self.rename_counter += 1;
-        let base = strip_proteus_var_suffix(original);
+        let base = strip_cuttle_var_suffix(original);
         format!("{}{}_{:x}", base, self.suffix, c)
     }
 
@@ -2031,7 +2031,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("cycle {} unparseable: {}\n{}", cycle, e, out));
             // Confirm the function still has exactly two `let` bindings
             // for `x`. (Post-TASK-029 the diversifier also injects a
-            // `__proteus_stack_pad_*` let binding; filter it out before
+            // `__cuttle_stack_pad_*` let binding; filter it out before
             // counting — the shadowing semantics we care about are about
             // the source-level locals, not the synthetic pad.)
             let mut let_count = 0;
@@ -2048,7 +2048,7 @@ mod tests {
                                 },
                                 _ => String::new(),
                             };
-                            if name.starts_with("__proteus_stack_pad_") {
+                            if name.starts_with("__cuttle_stack_pad_") {
                                 continue;
                             }
                             let_count += 1;
@@ -3164,7 +3164,7 @@ mod tests {
 
     #[test]
     fn diversifier_default_leaves_stack_pad_off() {
-        // Production default: no `__proteus_stack_pad_*` and empty
+        // Production default: no `__cuttle_stack_pad_*` and empty
         // pad_decisions. Pin this so a future refactor cannot
         // re-enable the gadget-inflating pass by accident.
         let seed = Seed::derive(3, "log_fixture");
@@ -3175,7 +3175,7 @@ mod tests {
             log.pad_decisions
         );
         assert!(
-            !out.contains("__proteus_stack_pad_"),
+            !out.contains("__cuttle_stack_pad_"),
             "default diversify must not inject stack pads: {}",
             &out.chars().take(200).collect::<String>()
         );

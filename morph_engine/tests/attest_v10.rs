@@ -1,10 +1,10 @@
 //! TASK-140 — schema v10 `durable_seals` on attestation entries.
 
-use proteus_morph_engine::attest::{
+use cuttle_morph_engine::attest::{
     load_entries, verify_chain, write_attestation, AttestEntryFields, ATTEST_DIR_ENV,
     SCHEMA_VERSION,
 };
-use proteus_morph_engine::{durable_seals_map_from, DurableSeal};
+use cuttle_morph_engine::{durable_seals_map_from, DurableSeal};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +21,7 @@ fn fresh_tempdir(label: &str) -> PathBuf {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "proteus_attest_v10_{}_{}_{}_{}",
+        "cuttle_attest_v10_{}_{}_{}_{}",
         label,
         std::process::id(),
         nanos,
@@ -105,7 +105,7 @@ fn write_with_durable_seals_and_verify() {
 
 #[test]
 fn empty_durable_seals_omitted_from_json() {
-    use proteus_morph_engine::attest::{compute_entry_sha256, AttestEntry, ZERO_HEX};
+    use cuttle_morph_engine::attest::{compute_entry_sha256, AttestEntry, ZERO_HEX};
     let e = AttestEntry {
         schema_version: SCHEMA_VERSION,
         cycle: 1,
@@ -149,8 +149,8 @@ fn bad_seal_hex_rejected_on_write() {
 
 #[test]
 fn require_durable_seals_rejects_missing() {
-    use proteus_morph_engine::attest::verify_chain_with_options;
-    use proteus_morph_engine::VerifyOptions;
+    use cuttle_morph_engine::attest::verify_chain_with_options;
+    use cuttle_morph_engine::VerifyOptions;
     let _g = EnvGuard::new("req_seals");
     write_attestation(base_fields(1)).unwrap();
     // Default: no require → OK.
@@ -169,8 +169,8 @@ fn require_durable_seals_rejects_missing() {
 
 #[test]
 fn require_durable_seals_accepts_present() {
-    use proteus_morph_engine::attest::verify_chain_with_options;
-    use proteus_morph_engine::VerifyOptions;
+    use cuttle_morph_engine::attest::verify_chain_with_options;
+    use cuttle_morph_engine::VerifyOptions;
     let _g = EnvGuard::new("req_seals_ok");
     let seal = DurableSeal::seal("wal_head", b"lsn=42");
     let mut f = base_fields(1);

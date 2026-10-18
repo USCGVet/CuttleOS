@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     AhciCmd, AhciCmdError, AhciCmdHeader, AhciPrdt, AHCI_CFL_H2D, AHCI_CMD_HDR_LEN, AHCI_PRDT_IOC,
     AHCI_PRDT_LEN,
 };
@@ -145,7 +145,7 @@ pub fn banner_prdtl() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::AhciCmd;
+    use cuttle_contracts::AhciCmd;
 
     #[test]
     fn constants() {

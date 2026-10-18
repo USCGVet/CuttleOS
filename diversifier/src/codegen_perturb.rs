@@ -21,7 +21,7 @@ use crate::Seed;
 /// this string is the contract-versioning lever: if we ever change
 /// the attribute alphabet or the decision logic, bump the tag so
 /// that attestations from before/after the change are distinguishable.
-const HASH_TAG: &[u8] = b"proteus-codegen-perturb-v1";
+const HASH_TAG: &[u8] = b"cuttle-codegen-perturb-v1";
 
 /// Decision made for one function. Public so the unit-test layer can
 /// assert directly on the choice without rebuilding the AST.
@@ -52,7 +52,7 @@ pub enum Reason {
 /// Decide what to do with one function. Pure: no I/O, no rng, no
 /// side effects. Determinism is in `(seed, fn_name)`.
 pub fn decide(seed: &Seed, fn_name: &str, existing_attrs: &[syn::Attribute]) -> PerturbDecision {
-    let base_name = crate::strip_proteus_fn_suffix(fn_name);
+    let base_name = crate::strip_cuttle_fn_suffix(fn_name);
     if base_name == "main" {
         return PerturbDecision::Ineligible(Reason::MainFn);
     }

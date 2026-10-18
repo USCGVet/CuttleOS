@@ -38,9 +38,9 @@ pub const FEDERATION_CONFIG_PATH: &str = "factory_keys.toml";
 
 /// Tests and operators can override the federation config path via this
 /// env var. Mirrors `ATTEST_DIR_ENV` in `attest.rs`.
-pub const FEDERATION_CONFIG_ENV: &str = "PROTEUS_FEDERATION_CONFIG";
+pub const FEDERATION_CONFIG_ENV: &str = "CUTTLE_FEDERATION_CONFIG";
 
-/// Resolve the federation config path. `PROTEUS_FEDERATION_CONFIG`
+/// Resolve the federation config path. `CUTTLE_FEDERATION_CONFIG`
 /// overrides; otherwise we use the workspace-relative
 /// `factory_keys.toml`.
 pub fn resolve_federation_path() -> PathBuf {
@@ -219,7 +219,7 @@ mod tests {
         static C: AtomicU64 = AtomicU64::new(0);
         let n = C.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        let d = std::env::temp_dir().join(format!("proteus_fed_test_{}_{}_{}", label, pid, n));
+        let d = std::env::temp_dir().join(format!("cuttle_fed_test_{}_{}_{}", label, pid, n));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d

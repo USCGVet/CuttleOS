@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Proteus 3-as-1 Triad Hypervisor Controller & RAID-SQL Coordinator
+Cuttle 3-as-1 Triad Hypervisor Controller & RAID-SQL Coordinator
 =================================================================
-Packages 3 independent 4-core Proteus OS VMs into ONE logical appliance:
+Packages 3 independent 4-core Cuttle OS VMs into ONE logical appliance:
   - OS-1 (SQL-Data-A)      : 4x SMP vCPUs, 128 MB RAM, Seed #A, AHCI Disk #1
   - OS-2 (SQL-Data-B)      : 4x SMP vCPUs, 128 MB RAM, Seed #B, AHCI Disk #2
   - OS-3 (SQL-Parity/Check): 4x SMP vCPUs, 128 MB RAM, Seed #C, AHCI Disk #3 + XOR Parity
@@ -12,7 +12,7 @@ Features:
      rewrites ~15,350 instructions and permutes registers across 787 functions in ~250ms,
      splicing the morphed ELF directly into each VM's BIOS boot image.
   2. Triple Modular Redundancy (TMR) 2-of-3 Majority Vote + 4 KiB RAID Parity verification
-     (D1 ^ D2 = P) across the persistent AHCI SQL partitions (`LBA 1058..1065`, `PRTSSQL1`).
+     (D1 ^ D2 = P) across the persistent AHCI SQL partitions (`LBA 1058..1065`, `CTTLSQL1`).
   3. Zero-downtime Rolling MTD Morph: while 1 OS bounces into a freshly scrambled
      kernel binary, the other 2 OSes serve 100% of reads and writes; when the bounced
      OS wakes up (`SHELL resume OK`), it enters `CATCHING_UP` and automatically replays
@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-IMAGES_DIR = ROOT / "target" / "proteus_images"
+IMAGES_DIR = ROOT / "target" / "cuttle_images"
 TRIAD_DIR = IMAGES_DIR / "triad"
 BASE_ELF = (
     ROOT
@@ -128,7 +128,7 @@ class TriadNode:
         # boots with its own seal_key, attest_key, net_auth_key, and initial service ELF variants.
         node_key = hmac.new(
             master_key_bytes,
-            f"proteus-triad-node-v1:{self.node_id}".encode("ascii"),
+            f"cuttle-triad-node-v1:{self.node_id}".encode("ascii"),
             hashlib.sha256,
         ).digest()
         self.device_key_path.write_bytes(node_key)
@@ -274,7 +274,7 @@ class TriadController:
             "-m",
             "128M",
             "-fw_cfg",
-            f"name=opt/proteus_device_key,file={node.device_key_path}",
+            f"name=opt/cuttle_device_key,file={node.device_key_path}",
             "-drive",
             f"format=raw,file={node.bios_img},if=ide",
             "-drive",
@@ -310,7 +310,7 @@ class TriadController:
             "-drive",
             f"if=none,id=nvme0,format=raw,file={node.nvme_img}",
             "-device",
-            f"nvme,drive=nvme0,serial=PROTEUS-NVME-{node.node_id}",
+            f"nvme,drive=nvme0,serial=CUTTLE-NVME-{node.node_id}",
             "-serial",
             "stdio",
             "-no-reboot",
@@ -397,7 +397,7 @@ class TriadController:
                     node.proc.stdin.flush()
                     if i + 8 < len(payload):
                         time.sleep(0.015)
-                # Send a second newline after a brief pause so the trailing `proteus> ` prompt
+                # Send a second newline after a brief pause so the trailing `cuttle> ` prompt
                 # is terminated with `\r\n` and flushed immediately through line-buffered stdout.
                 time.sleep(0.025)
                 node.proc.stdin.write("\n")
@@ -412,8 +412,8 @@ class TriadController:
                 with node.line_cond:
                     while node.response_lines:
                         ln = node.response_lines.pop(0)
-                        while ln.startswith("proteus>"):
-                            rest = ln[len("proteus>") :].lstrip(" ")
+                        while ln.startswith("cuttle>"):
+                            rest = ln[len("cuttle>") :].lstrip(" ")
                             if not rest:
                                 if collected:
                                     saw_prompt_end = True
@@ -629,14 +629,19 @@ class TriadController:
                 "MTD",
                 f"{node.name}: Draining & sealing AHCI disk (peers {peers[0].name.split()[0]} + {peers[1].name.split()[0]} holding 2/3 majority)...",
             )
-            self.send_shell_cmd(node, "sync", timeout=2.0)
+            self.send_shell_cmd(node, "sync", timeout=3.0)
             if node.proc and node.proc.poll() is None:
                 try:
-                    node.proc.stdin.write("halt\n")
+                    node.proc.stdin.write("\nhalt\n")
                     node.proc.stdin.flush()
-                    node.proc.wait(timeout=3.0)
+                    node.proc.wait(timeout=4.0)
                 except Exception:
-                    node.proc.kill()
+                    try:
+                        node.proc.kill()
+                        node.proc.wait(timeout=5.0)
+                    except Exception:
+                        pass
+            time.sleep(0.3)
 
             # 2. MORPHING: Rewrite kernel ELF with fresh seed via binmorph (~250ms)
             node.state = "MORPHING"
@@ -646,9 +651,10 @@ class TriadController:
 
             # 3. Boot freshly morphed VM
             self.start_node_vm(node)
-            ok = self.wait_for_shell_ready(node, timeout=25.0)
+            ok = self.wait_for_shell_ready(node, timeout=35.0)
             if not ok:
-                self.log_event("ERROR", f"{node.name}: Timed out waiting for shell ready after morph.")
+                tail_str = " | ".join(node.serial_tail[-5:])
+                self.log_event("ERROR", f"{node.name}: Timed out waiting for shell ready after morph (tail: {tail_str}).")
                 node.state = "OFFLINE"
                 return False
 
@@ -743,7 +749,7 @@ class TriadController:
         for n in self.nodes:
             self.morph_node_image(n, n.current_seed)
 
-        self.log_event("INIT", "Launching 3 parallel 4-core Proteus VMs (12 vCPUs total, HLT idle)...")
+        self.log_event("INIT", "Launching 3 parallel 4-core Cuttle VMs (12 vCPUs total, HLT idle)...")
         for n in self.nodes:
             self.start_node_vm(n)
 
@@ -788,7 +794,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Proteus 3-as-1 Triad Appliance — RAID-SQL & Moving Target Defense</title>
+<title>Cuttle Triad — Three Hearts. One Appliance. (Cuttle OS RAID-SQL &amp; MTD)</title>
 <style>
   :root {
     --bg: #070b14;
@@ -891,9 +897,9 @@ DASHBOARD_HTML = r"""<!doctype html>
 
 <div class="header">
   <div>
-    <h1>PROTEUS "3-AS-1" TRIAD APPLIANCE (TMR 2-OF-3 MAJORITY + RAID-SQL + ROLLING MTD)</h1>
+    <h1>CUTTLE TRIAD — "THREE HEARTS. ONE APPLIANCE." (TMR 2-OF-3 MAJORITY + RAID-SQL + ROLLING MTD)</h1>
     <div class="sub">
-      One Logical SQL/OS Endpoint (:18080) Backed by 3 Independent 4-Core Proteus Unikernels (12 vCPUs in HLT Idle | D1 ⊕ D2 = P Parity)
+      A New Skin Every Boot | Cuttlebone Verified Core | 3 Independent 4-Core Cuttle OS Unikernels (12 vCPUs in HLT Idle | D1 ⊕ D2 = P Parity)
     </div>
   </div>
   <div style="display:flex; gap:10px; align-items:center;">
@@ -935,17 +941,17 @@ DASHBOARD_HTML = r"""<!doctype html>
 
 <script>
 (function initToken() {
-  const saved = localStorage.getItem('proteus_triad_token') || '';
+  const saved = localStorage.getItem('cuttle_triad_token') || '';
   document.getElementById('tokInput').value = saved;
 })();
 
 function saveToken() {
-  localStorage.setItem('proteus_triad_token', document.getElementById('tokInput').value.trim());
+  localStorage.setItem('cuttle_triad_token', document.getElementById('tokInput').value.trim());
 }
 
 function authHeaders() {
   const t = document.getElementById('tokInput').value.trim();
-  return t ? {'X-Proteus-Session': t} : {};
+  return t ? {'X-Cuttle-Session': t} : {};
 }
 
 async function refresh() {
@@ -1017,7 +1023,7 @@ async function runSh() {
 async function runShCmd(c) {
   document.getElementById('shInput').value = c;
   const out = document.getElementById('consoleOut');
-  out.textContent = `Running '${c}' across all 3 Proteus OS instances...`;
+  out.textContent = `Running '${c}' across all 3 Cuttle OS instances...`;
   const r = await fetch('/api/sh', {method:'POST', headers: authHeaders(), body: c});
   const d = await r.json();
   if (!d.ok) {
@@ -1068,7 +1074,7 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
 
     def _is_authenticated(self) -> bool:
         expected = self.ctrl.coordinator_token
-        for hdr in ("X-Proteus-Session", "X-Session-Token"):
+        for hdr in ("X-Cuttle-Session", "X-Session-Token"):
             val = (self.headers.get(hdr) or "").strip()
             if val and hmac.compare_digest(val, expected):
                 return True
@@ -1142,7 +1148,7 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                 return self._send_text(
                     401,
                     "text/plain; charset=utf-8",
-                    "error: unauthorized (provide valid X-Proteus-Session or Authorization: Bearer token)\n",
+                    "error: unauthorized (provide valid X-Cuttle-Session or Authorization: Bearer token)\n",
                 )
             q = "SELECT * FROM kv"
             if "?" in self.path:
@@ -1178,7 +1184,7 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         if not self._is_authenticated():
             return self._send_json(
                 401,
-                {"ok": False, "error": "unauthorized: provide valid X-Proteus-Session or Authorization: Bearer token"},
+                {"ok": False, "error": "unauthorized: provide valid X-Cuttle-Session or Authorization: Bearer token"},
             )
 
         if self.path in ("/api/sql", "/sql"):
@@ -1244,7 +1250,7 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Proteus 3-as-1 Triad Hypervisor Controller")
+    parser = argparse.ArgumentParser(description="Cuttle 3-as-1 Triad Hypervisor Controller")
     parser.add_argument("--port", type=int, default=18080, help="Unified Triad HTTP port")
     parser.add_argument("--gui", action="store_true", help="Show 3 QEMU VGA windows")
     parser.add_argument(
@@ -1267,112 +1273,114 @@ def main():
     ctrl.boot_all_parallel()
 
     if args.self_test:
-        print("\n=== RUNNING TRIAD 3-AS-1 LIVE SELF-TEST ===", flush=True)
-        # 1. Verify each node received a distinct 256-bit cryptographic key AND booted distinct service ELF variants
-        node_keys = [n.device_key_path.read_bytes() for n in ctrl.nodes]
-        assert len(set(node_keys)) == 3, "Each Triad node must have a distinct 256-bit device key"
-        svc_outputs = [ctrl.send_shell_cmd(n, "service status") for n in ctrl.nodes]
-        assert len(set(svc_outputs)) == 3, f"Each Triad node must boot distinct service ELF variants:\n{svc_outputs}"
-
-        # 2. Verify serial line-editing injection (0x08 backspace / 0x7F DEL) is strictly rejected
         try:
-            ctrl.send_shell_cmd(
-                ctrl.nodes[0],
-                "sql SELECT " + ("\x08" * 11) + "write /var/pwn hacked",
-            )
-            raise AssertionError("send_shell_cmd must reject commands containing 0x08 backspace")
-        except ValueError:
-            pass
+            print("\n=== RUNNING TRIAD 3-AS-1 LIVE SELF-TEST ===", flush=True)
+            # 1. Verify each node received a distinct 256-bit cryptographic key AND booted distinct service ELF variants
+            node_keys = [n.device_key_path.read_bytes() for n in ctrl.nodes]
+            assert len(set(node_keys)) == 3, "Each Triad node must have a distinct 256-bit device key"
+            svc_outputs = [ctrl.send_shell_cmd(n, "service status") for n in ctrl.nodes]
+            assert len(set(svc_outputs)) == 3, f"Each Triad node must boot distinct service ELF variants:\n{svc_outputs}"
 
-        # 3. Verify Coordinator HTTP authentication & control-character rejection:
-        #    unauthenticated reads/writes return 401, control-character payloads return 400, authenticated return 200
-        test_srv = ThreadingHTTPServer(("127.0.0.1", 0), TriadHttpHandler)
-        test_port = test_srv.server_address[1]
-        threading.Thread(target=test_srv.serve_forever, daemon=True).start()
-        try:
-            unauth_read_req = urllib.request.Request(
-                f"http://127.0.0.1:{test_port}/api/sql",
-                data=b"SELECT * FROM kv",
-                method="POST",
-            )
+            # 2. Verify serial line-editing injection (0x08 backspace / 0x7F DEL) is strictly rejected
             try:
-                urllib.request.urlopen(unauth_read_req, timeout=5.0)
-                raise AssertionError("Unauthenticated POST /api/sql SELECT must be refused with 401")
-            except urllib.error.HTTPError as e:
-                assert e.code == 401, f"Expected 401 on unauthenticated POST /api/sql SELECT, got {e.code}"
+                ctrl.send_shell_cmd(
+                    ctrl.nodes[0],
+                    "sql SELECT " + ("\x08" * 11) + "write /var/pwn hacked",
+                )
+                raise AssertionError("send_shell_cmd must reject commands containing 0x08 backspace")
+            except ValueError:
+                pass
 
-            unauth_req = urllib.request.Request(
-                f"http://127.0.0.1:{test_port}/api/sql",
-                data=b"INSERT INTO kv VALUES ('unauth', 'nope', 1)",
-                method="POST",
-            )
+            # 3. Verify Coordinator HTTP authentication & control-character rejection:
+            #    unauthenticated reads/writes return 401, control-character payloads return 400, authenticated return 200
+            test_srv = ThreadingHTTPServer(("127.0.0.1", 0), TriadHttpHandler)
+            test_port = test_srv.server_address[1]
+            threading.Thread(target=test_srv.serve_forever, daemon=True).start()
             try:
-                urllib.request.urlopen(unauth_req, timeout=5.0)
-                raise AssertionError("Unauthenticated POST /api/sql must be refused with 401")
-            except urllib.error.HTTPError as e:
-                assert e.code == 401, f"Expected 401 on unauthenticated POST /api/sql, got {e.code}"
+                unauth_read_req = urllib.request.Request(
+                    f"http://127.0.0.1:{test_port}/api/sql",
+                    data=b"SELECT * FROM kv",
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(unauth_read_req, timeout=5.0)
+                    raise AssertionError("Unauthenticated POST /api/sql SELECT must be refused with 401")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 401, f"Expected 401 on unauthenticated POST /api/sql SELECT, got {e.code}"
 
-            bs_req = urllib.request.Request(
-                f"http://127.0.0.1:{test_port}/api/sql",
-                data=b"SELECT \x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08write /var/pwn hacked",
-                headers={"X-Proteus-Session": ctrl.coordinator_token},
-                method="POST",
-            )
-            try:
-                urllib.request.urlopen(bs_req, timeout=5.0)
-                raise AssertionError("Backspace-injected POST /api/sql must be refused with 400")
-            except urllib.error.HTTPError as e:
-                assert e.code == 400, f"Expected 400 on backspace-injected POST /api/sql, got {e.code}"
+                unauth_req = urllib.request.Request(
+                    f"http://127.0.0.1:{test_port}/api/sql",
+                    data=b"INSERT INTO kv VALUES ('unauth', 'nope', 1)",
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(unauth_req, timeout=5.0)
+                    raise AssertionError("Unauthenticated POST /api/sql must be refused with 401")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 401, f"Expected 401 on unauthenticated POST /api/sql, got {e.code}"
 
-            auth_req = urllib.request.Request(
-                f"http://127.0.0.1:{test_port}/api/sql",
-                data=b"INSERT INTO kv VALUES ('triad.init', 'active', 1)",
-                headers={"X-Proteus-Session": ctrl.coordinator_token},
-                method="POST",
-            )
-            with urllib.request.urlopen(auth_req, timeout=10.0) as resp:
-                assert resp.status == 200
-                r1 = json.loads(resp.read().decode("utf-8"))
-                assert r1["ok"] and "3/3" in r1["quorum"], f"Expected 3/3 majority write: {r1}"
+                bs_req = urllib.request.Request(
+                    f"http://127.0.0.1:{test_port}/api/sql",
+                    data=b"SELECT \x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08write /var/pwn hacked",
+                    headers={"X-Cuttle-Session": ctrl.coordinator_token},
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(bs_req, timeout=5.0)
+                    raise AssertionError("Backspace-injected POST /api/sql must be refused with 400")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 400, f"Expected 400 on backspace-injected POST /api/sql, got {e.code}"
+
+                auth_req = urllib.request.Request(
+                    f"http://127.0.0.1:{test_port}/api/sql",
+                    data=b"INSERT INTO kv VALUES ('triad.init', 'active', 1)",
+                    headers={"X-Cuttle-Session": ctrl.coordinator_token},
+                    method="POST",
+                )
+                with urllib.request.urlopen(auth_req, timeout=10.0) as resp:
+                    assert resp.status == 200
+                    r1 = json.loads(resp.read().decode("utf-8"))
+                    assert r1["ok"] and "3/3" in r1["quorum"], f"Expected 3/3 majority write: {r1}"
+            finally:
+                test_srv.shutdown()
+
+            assert ctrl.wal_file.exists(), "Triad WAL must be persisted to triad_wal.json"
+
+            # 4. Start morphing OS-1 in background thread, and fire a SQL write while OS-1 is MORPHING!
+            t_morph = threading.Thread(target=ctrl.bounce_and_morph_node, args=(1,))
+            t_morph.start()
+            while ctrl.nodes[0].state == "ONLINE":
+                time.sleep(0.05)
+            r2 = ctrl.execute_triad_sql("INSERT INTO kv VALUES ('while.morphing', 'zero_downtime', 2)")
+            print(f"Write during OS-1 morph: {r2['quorum']}", flush=True)
+            t_morph.join()
+
+            # Verify OS-1 caught up automatically!
+            q_out = ctrl.send_shell_cmd(ctrl.nodes[0], "sql SELECT * FROM kv")
+            assert "zero_downtime" in q_out, f"OS-1 failed to catch up missed write! Output:\n{q_out}"
+            print("OS-1 successfully morphed AND caught up missed SQL write from WAL!", flush=True)
+
+            # 5. Simulate single-node tamper on OS-2 and verify automatic 2-of-3 self-healing + 4 KiB XOR parity check
+            old_morphs = ctrl.nodes[1].morph_count
+            ctrl.simulate_byzantine_tamper(2)
+            deadline = time.time() + 45.0
+            while time.time() < deadline:
+                if ctrl.nodes[1].state == "ONLINE" and ctrl.nodes[1].morph_count > old_morphs:
+                    break
+                time.sleep(0.5)
+            q2_out = ctrl.send_shell_cmd(ctrl.nodes[1], "sql SELECT * FROM kv")
+            assert "pwned" not in q2_out and "zero_downtime" in q2_out, f"OS-2 heal failed:\n{q2_out}"
+            print("=== TRIAD 3-AS-1 SELF-TEST PASSED ===", flush=True)
         finally:
-            test_srv.shutdown()
-
-        assert ctrl.wal_file.exists(), "Triad WAL must be persisted to triad_wal.json"
-
-        # 4. Start morphing OS-1 in background thread, and fire a SQL write while OS-1 is MORPHING!
-        t_morph = threading.Thread(target=ctrl.bounce_and_morph_node, args=(1,))
-        t_morph.start()
-        while ctrl.nodes[0].state == "ONLINE":
-            time.sleep(0.05)
-        r2 = ctrl.execute_triad_sql("INSERT INTO kv VALUES ('while.morphing', 'zero_downtime', 2)")
-        print(f"Write during OS-1 morph: {r2['quorum']}", flush=True)
-        t_morph.join()
-
-        # Verify OS-1 caught up automatically!
-        q_out = ctrl.send_shell_cmd(ctrl.nodes[0], "sql SELECT * FROM kv")
-        assert "zero_downtime" in q_out, f"OS-1 failed to catch up missed write! Output:\n{q_out}"
-        print("OS-1 successfully morphed AND caught up missed SQL write from WAL!", flush=True)
-
-        # 5. Simulate single-node tamper on OS-2 and verify automatic 2-of-3 self-healing + 4 KiB XOR parity check
-        old_morphs = ctrl.nodes[1].morph_count
-        ctrl.simulate_byzantine_tamper(2)
-        deadline = time.time() + 35.0
-        while time.time() < deadline:
-            if ctrl.nodes[1].state == "ONLINE" and ctrl.nodes[1].morph_count > old_morphs:
-                break
-            time.sleep(0.5)
-        q2_out = ctrl.send_shell_cmd(ctrl.nodes[1], "sql SELECT * FROM kv")
-        assert "pwned" not in q2_out and "zero_downtime" in q2_out, f"OS-2 heal failed:\n{q2_out}"
-        print("=== TRIAD 3-AS-1 SELF-TEST PASSED ===", flush=True)
-        ctrl.shutdown()
+            ctrl.shutdown()
         return
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), TriadHttpHandler)
     print("\n============================================================================", flush=True)
-    print(f"  PROTEUS 3-AS-1 TRIAD APPLIANCE ONLINE!", flush=True)
+    print(f"  CUTTLE 3-AS-1 TRIAD APPLIANCE ONLINE!", flush=True)
     print(f"  Unified Command Center : http://127.0.0.1:{args.port}/app", flush=True)
     print(f"  Operator Session Token : {ctrl.coordinator_token} (saved to triad/operator_token.txt)", flush=True)
-    print(f"  Unified SQL Endpoint   : POST http://127.0.0.1:{args.port}/api/sql (with X-Proteus-Session header)", flush=True)
+    print(f"  Unified SQL Endpoint   : POST http://127.0.0.1:{args.port}/api/sql (with X-Cuttle-Session header)", flush=True)
     print(f"  Individual OS Ports    : OS-1 :18101 | OS-2 :18102 | OS-3 (Parity) :18103", flush=True)
     print(f"  Press Ctrl+C to shut down all 3 VMs cleanly.", flush=True)
     print("============================================================================\n", flush=True)

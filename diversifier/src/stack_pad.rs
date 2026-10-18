@@ -19,7 +19,7 @@ use crate::Seed;
 /// Domain-separation tag. Bump the version suffix if the decision
 /// logic or the pad-format changes — attestations from before/after
 /// the change are then unambiguously distinguishable.
-const HASH_TAG: &[u8] = b"proteus-stack-pad-v1";
+const HASH_TAG: &[u8] = b"cuttle-stack-pad-v1";
 
 /// Minimum pad size in bytes. Below ~32 the prologue's `sub rsp, N`
 /// encoding tends to fold into existing 16-byte stack alignment and
@@ -134,14 +134,14 @@ fn inject_pad(block: &mut Block, fn_name: &str, bytes: usize) {
     // braces — Rust's local scoping already prevents the issue — but
     // costs nothing.
     let mut h = Sha256::new();
-    h.update(b"proteus-pad-ident-v1");
+    h.update(b"cuttle-pad-ident-v1");
     h.update(fn_name.as_bytes());
     let digest = h.finalize();
     let mut suffix = String::with_capacity(8);
     for byte in &digest[..4] {
         suffix.push_str(&format!("{:02x}", byte));
     }
-    let ident_str = format!("__proteus_stack_pad_{}", suffix);
+    let ident_str = format!("__cuttle_stack_pad_{}", suffix);
     let pad_ident = syn::Ident::new(&ident_str, proc_macro2::Span::call_site());
     // `core::hint::black_box` is stable (Rust 1.66+) and is the
     // canonical compiler-opaque barrier. It prevents the DCE pass from
@@ -154,7 +154,7 @@ fn inject_pad(block: &mut Block, fn_name: &str, bytes: usize) {
     block.stmts.insert(0, stmt);
 }
 
-/// Strip previously-injected Proteus stack pads from a block.
+/// Strip previously-injected Cuttle stack pads from a block.
 ///
 /// Soak finding (2026-07-29, cycle ~244 of the 1000-cycle duration
 /// soak): pads were never removed, so every morph cycle added a fresh
@@ -165,11 +165,11 @@ fn inject_pad(block: &mut Block, fn_name: &str, bytes: usize) {
 /// cycle strips the prior generation's pads before injecting its own.
 fn strip_old_pads(block: &mut Block) {
     block.stmts.retain(|stmt| {
-        // Match: `let __proteus_stack_pad_<hex> ... = ...;`
+        // Match: `let __cuttle_stack_pad_<hex> ... = ...;`
         if let Stmt::Local(local) = stmt {
             if let syn::Pat::Type(pt) = &local.pat {
                 if let syn::Pat::Ident(pi) = &*pt.pat {
-                    if pi.ident.to_string().starts_with("__proteus_stack_pad_") {
+                    if pi.ident.to_string().starts_with("__cuttle_stack_pad_") {
                         return false;
                     }
                 }
@@ -266,10 +266,10 @@ fn beta(b: u32) -> u32 {
             "50 apply cycles must produce the same size as 1 (pads stripped before re-injection)"
         );
         // And it still has pads.
-        assert!(fifty.contains("__proteus_stack_pad_"));
+        assert!(fifty.contains("__cuttle_stack_pad_"));
         // Count pad lets: must equal the per-cycle count, not 50x.
-        let count = fifty.matches("__proteus_stack_pad_").count();
-        let once_count = once.matches("__proteus_stack_pad_").count();
+        let count = fifty.matches("__cuttle_stack_pad_").count();
+        let once_count = once.matches("__cuttle_stack_pad_").count();
         assert_eq!(count, once_count);
     }
 
@@ -331,7 +331,7 @@ fn beta(b: u32) -> u32 {
         assert_eq!(log[0].fn_name, "f");
         let out = quote::quote!(#file).to_string();
         assert!(
-            out.contains("__proteus_stack_pad_"),
+            out.contains("__cuttle_stack_pad_"),
             "pad ident missing in output: {out}"
         );
         assert!(out.contains("core :: hint :: black_box"));
@@ -344,7 +344,7 @@ fn beta(b: u32) -> u32 {
         let log = apply(&mut file, &seed_from(1));
         assert!(log.is_empty(), "unsafe fn should be skipped");
         let out = quote::quote!(#file).to_string();
-        assert!(!out.contains("__proteus_stack_pad_"));
+        assert!(!out.contains("__cuttle_stack_pad_"));
     }
 
     #[test]
@@ -441,7 +441,7 @@ fn beta(b: u32) -> u32 {
         .unwrap()
         .0;
         let _: File = parse_str(&out).expect("diversified output must reparse");
-        assert!(out.contains("__proteus_stack_pad_"));
+        assert!(out.contains("__cuttle_stack_pad_"));
         assert!(out.contains("core :: hint :: black_box"));
     }
 
@@ -457,7 +457,7 @@ fn beta(b: u32) -> u32 {
         let first_stmt_ref = &f.block.stmts[0];
         let first_stmt = quote::quote!(#first_stmt_ref).to_string();
         assert!(
-            first_stmt.contains("__proteus_stack_pad_"),
+            first_stmt.contains("__cuttle_stack_pad_"),
             "first stmt should be the pad, got: {first_stmt}"
         );
     }

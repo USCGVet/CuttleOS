@@ -171,8 +171,8 @@ pub fn evaluate_static(input: &StaticCheckInput<'_>) -> StaticCheckOutcome {
 
         // 4. Canonical-hash dedup.
         match (
-            proteus_diversifier::canonical_hash(input.candidate),
-            proteus_diversifier::canonical_hash(prev_src),
+            cuttle_diversifier::canonical_hash(input.candidate),
+            cuttle_diversifier::canonical_hash(prev_src),
         ) {
             (Ok(cand_h), Ok(prev_h)) if cand_h == prev_h => {
                 return StaticCheckOutcome::Reject {

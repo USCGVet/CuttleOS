@@ -2,12 +2,12 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     Mb2Error, Mb2Tag, Multiboot2, MB2_HEADER_LEN, MB2_MAX_TAGS, MB2_TAG_BASIC_MEMINFO,
     MB2_TAG_END, MB2_TAG_HDR_LEN,
 };
 #[cfg(test)]
-use proteus_contracts::{MB2_TAG_FRAMEBUFFER, MB2_TAG_MMAP};
+use cuttle_contracts::{MB2_TAG_FRAMEBUFFER, MB2_TAG_MMAP};
 
 pub struct Multiboot2Impl;
 
@@ -103,7 +103,7 @@ pub fn build_banner_fixture(out: &mut [u8]) -> Result<usize, Mb2Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::Multiboot2;
+    use cuttle_contracts::Multiboot2;
 
     fn fix() -> [u8; MB2_FIXTURE_LEN] {
         let mut b = [0u8; MB2_FIXTURE_LEN];

@@ -1,18 +1,18 @@
 //! Integration tests for the M-of-N federation (TASK-006).
 //!
 //! Each test isolates itself via per-test tempdirs for both the
-//! attestation log (`PROTEUS_ATTEST_DIR`) and the federation config
-//! (`PROTEUS_FEDERATION_CONFIG`). We serialize env-mutating tests with
+//! attestation log (`CUTTLE_ATTEST_DIR`) and the federation config
+//! (`CUTTLE_FEDERATION_CONFIG`). We serialize env-mutating tests with
 //! a mutex to avoid clobbering each other across the cargo test
 //! worker pool.
 
 use ed25519_dalek::{Signer as _, SigningKey};
-use proteus_morph_engine::attest::{
+use cuttle_morph_engine::attest::{
     self, load_anchors, load_entries, parse_hex32, rebuild_anchors_after_cosign,
     rebuild_chain_after_cosign, verify_chain, verify_chain_with_options, write_attestation,
     write_chain_atomic, AttestEntryFields, VerifyOptions, ATTEST_DIR_ENV,
 };
-use proteus_morph_engine::federation::{
+use cuttle_morph_engine::federation::{
     self, load_federation, verify_cosignatures, Cosignature, FederationConfig,
     Signer as FedSigner, FEDERATION_CONFIG_ENV,
 };
@@ -32,7 +32,7 @@ fn fresh_tempdir(label: &str) -> PathBuf {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "proteus_fed_int_{}_{}_{}_{}",
+        "cuttle_fed_int_{}_{}_{}_{}",
         label,
         std::process::id(),
         nanos,
@@ -459,7 +459,7 @@ fn v3_entry_carries_federation_fields() {
     write_attestation(fields_with_primary_cosig(7, 2)).unwrap();
     let entries = load_entries().unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].schema_version, proteus_morph_engine::attest::LEGACY_SCHEMA_VERSION);
+    assert_eq!(entries[0].schema_version, cuttle_morph_engine::attest::LEGACY_SCHEMA_VERSION);
     assert_eq!(entries[0].federation_threshold, Some(2));
     assert_eq!(entries[0].cosignatures.len(), 1);
     assert_eq!(entries[0].cosignatures[0].signer_id, "primary");
@@ -500,7 +500,7 @@ fn v2_log_is_migrated_aside_to_v2_bak() {
     let entries = load_entries().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].cycle, 5);
-    assert_eq!(entries[0].schema_version, proteus_morph_engine::attest::LEGACY_SCHEMA_VERSION);
+    assert_eq!(entries[0].schema_version, cuttle_morph_engine::attest::LEGACY_SCHEMA_VERSION);
     assert_eq!(entries[0].federation_threshold, Some(2));
 
     unsafe {

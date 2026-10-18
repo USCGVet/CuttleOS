@@ -1,7 +1,7 @@
 //! 1280x720 VESA/GOP Graphical Framebuffer Console (`fb_console`).
 //!
-//! Renders the live Proteus Enterprise OS status bar and interactive terminal
-//! (`proteus>`) onto the hardware linear framebuffer mapped by `bootloader_api`.
+//! Renders the live Cuttle Enterprise OS status bar and interactive terminal
+//! (`cuttle>`) onto the hardware linear framebuffer mapped by `bootloader_api`.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -56,14 +56,14 @@ pub(crate) fn fb_console_start() {
     draw_str_at(
         14,
         9,
-        b"PROTEUS ENTERPRISE MTD OS  //  x86-64 RING-0/3  //  WEB :18080 + SQL",
+        b"CUTTLE ENTERPRISE MTD OS  //  x86-64 RING-0/3  //  WEB :18080 + SQL",
         (255, 255, 255),
         (2, 132, 199),
     );
     draw_str_at(
         14,
         40,
-        b"ONLINE | IP 10.0.2.15 (:18080/app) | VFS PRTSFS01 | DB PRTSSQL1 | TPM2 OK",
+        b"ONLINE | IP 10.0.2.15 (:18080/app) | VFS CTTLFS01 | DB CTTLSQL1 | TPM2 OK",
         (56, 189, 248),
         (30, 41, 59),
     );

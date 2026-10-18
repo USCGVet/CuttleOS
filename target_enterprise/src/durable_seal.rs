@@ -3,7 +3,7 @@
 //! Pure `no_std` SHA-256 and keyed `HMAC-SHA256` over an opaque byte slice —
 //! intended for sealing audit snapshots and WAL/disk state **inside** the
 //! enterprise target. Host-side JSON seals live in
-//! `proteus_morph_engine::durable_seal`; this module is the guest twin.
+//! `cuttle_morph_engine::durable_seal`; this module is the guest twin.
 //!
 //! - Unkeyed [`seal_bytes`] / [`seal_matches`] compute plain SHA-256 digests
 //!   for drift detection and IMA binary hashing.
@@ -20,24 +20,24 @@ pub const DURABLE_DIGEST_LEN: usize = 32;
 /// Deterministic 256-bit seal key fixture used only by in-memory unit tests
 /// (`OsShell::empty`). The live kernel (`target_enterprise_kernel`) never
 /// references this constant; it derives `seal_key` from the out-of-band
-/// provisioned secret (`fw_cfg` `opt/proteus_device_key` backed by gitignored
+/// provisioned secret (`fw_cfg` `opt/cuttle_device_key` backed by gitignored
 /// `device_secret_key.bin`, or x86-64 `RDRAND` hardware entropy at boot).
 pub const DEFAULT_DURABLE_SEAL_KEY: [u8; DURABLE_DIGEST_LEN] =
-    *b"Proteus-Enterprise-DiskSeal-K001";
+    *b"Cuttle-Enterprise-DiskSeal-K0001";
 
 /// Deterministic 256-bit remote attestation key fixture used only by in-memory
 /// unit tests (`OsShell::empty`). The live kernel derives `attest_key` from the
 /// out-of-band provisioned `fw_cfg` secret via [`derive_attest_key`].
 pub const DEFAULT_ATTEST_KEY: [u8; DURABLE_DIGEST_LEN] =
-    *b"Proteus-Enterprise-Attest-Key001";
+    *b"Cuttle-Enterprise-Attest-Key0001";
 
 /// Derive a per-device 256-bit seal key from a root secret and device/node identifier
-/// via `HMAC-SHA256(root_secret, "proteus-durable-seal-v1:" || node_id)`.
+/// via `HMAC-SHA256(root_secret, "cuttle-durable-seal-v1:" || node_id)`.
 pub fn derive_seal_key(
     root_secret: &[u8; DURABLE_DIGEST_LEN],
     node_id: &[u8],
 ) -> [u8; DURABLE_DIGEST_LEN] {
-    const LABEL: &[u8] = b"proteus-durable-seal-v1:";
+    const LABEL: &[u8] = b"cuttle-durable-seal-v1:";
     let mut msg = [0u8; 64];
     let mut pos = 0usize;
     let mut i = 0usize;
@@ -58,12 +58,12 @@ pub fn derive_seal_key(
 }
 
 /// Derive a per-device 256-bit remote attestation quote signing key from a root
-/// secret and context label via `HMAC-SHA256(root_secret, "proteus-remote-attest-v1:" || context)`.
+/// secret and context label via `HMAC-SHA256(root_secret, "cuttle-remote-attest-v1:" || context)`.
 pub fn derive_attest_key(
     root_secret: &[u8; DURABLE_DIGEST_LEN],
     context: &[u8],
 ) -> [u8; DURABLE_DIGEST_LEN] {
-    const LABEL: &[u8] = b"proteus-remote-attest-v1:";
+    const LABEL: &[u8] = b"cuttle-remote-attest-v1:";
     let mut msg = [0u8; 64];
     let mut pos = 0usize;
     let mut i = 0usize;
@@ -132,7 +132,7 @@ fn constant_time_eq(a: &[u8; DURABLE_DIGEST_LEN], b: &[u8; DURABLE_DIGEST_LEN]) 
 mod tests {
     use super::*;
     use crate::audit::AuditLogImpl;
-    use proteus_contracts::{
+    use cuttle_contracts::{
         AuditEvent, AuditLog, AuditVerdict, AUDIT_MESSAGE_LEN, AUDIT_SNAPSHOT_HEADER_LEN,
     };
 

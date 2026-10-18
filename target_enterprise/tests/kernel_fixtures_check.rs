@@ -14,7 +14,7 @@
 //! corresponding `EXPECTED_*` constant and rely on these tests to
 //! verify the new value is consistent with the algorithm.
 
-use proteus_contracts::{
+use cuttle_contracts::{
     AccessKind, Hash, Iommu, NetStack, PagePerms, Tls13Server, WriteAheadLog,
 };
 use target_enterprise::iommu::{DeviceId, IommuImpl};
@@ -223,7 +223,7 @@ fn net_parse_recovers_fixture_inputs() {
 
 #[test]
 fn panic_dump_crc_matches_expected_locked_value() {
-    use proteus_contracts::{CrashContext, CrashDump};
+    use cuttle_contracts::{CrashContext, CrashDump};
     use target_enterprise::panic_dump::PanicDumpImpl;
 
     let ctx = CrashContext {
@@ -235,7 +235,7 @@ fn panic_dump_crc_matches_expected_locked_value() {
         backtrace: &kf::CRASH_BACKTRACE,
         kmsg: kf::CRASH_KMSG,
     };
-    let mut buf = [0u8; proteus_contracts::CRASH_DUMP_BYTES];
+    let mut buf = [0u8; cuttle_contracts::CRASH_DUMP_BYTES];
     PanicDumpImpl::build_dump(&ctx, &mut buf).expect("build_dump");
 
     // The CRC slot was written to the header by build_dump.
@@ -252,7 +252,7 @@ fn panic_dump_crc_matches_expected_locked_value() {
 
 #[test]
 fn symbol_resolver_recovers_expected_name_and_offset() {
-    use proteus_contracts::SymbolResolve;
+    use cuttle_contracts::SymbolResolve;
     use target_enterprise::symbols::{StaticSymbolResolver, SymbolEntry};
 
     // Hand-built kernel symbol fixture matching CRASH_BACKTRACE.

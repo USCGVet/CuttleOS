@@ -22,7 +22,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     bpf_op, caps, AuditEvent, AuditLog, AuditVerdict, BpfContext, BpfInstr, CanaryToken, EBpf,
     Elf64, ElfPhdr, Kpti, StackCanary, Tpm, AUDIT_MESSAGE_LEN, BPF_STACK_SIZE, ELF_CLASS64,
     ELF_DATA_LE, ELF_EHDR_LEN, ELF_EM_X86_64, ELF_ET_EXEC, ELF_MAGIC, ELF_MAX_PHDRS, ELF_PHDR_LEN,
@@ -158,7 +158,7 @@ impl NodeRole {
 pub enum ServiceId {
     /// Web server, TLS/HTTP router, and dashboard renderer (`/sbin/svc-http`).
     Http = 0,
-    /// Embedded relational SQL engine and `PRTSSQL1` storage service (`/sbin/svc-sql`).
+    /// Embedded relational SQL engine and `CTTLSQL1` storage service (`/sbin/svc-sql`).
     Sql = 1,
     /// Authenticated remote shell and measured user ELF sandbox (`/sbin/svc-sh`).
     Shell = 2,
@@ -542,10 +542,10 @@ pub fn derive_service_base_seed_for_boot(
     seal_key: &[u8; DURABLE_DIGEST_LEN],
     boot_gen: u64,
 ) -> u64 {
-    let mut label = [0u8; 36];
-    let prefix = b"proteus-svc-variant-seed-v1:";
-    label[..28].copy_from_slice(prefix);
-    label[28..36].copy_from_slice(&boot_gen.to_le_bytes());
+    let mut label = [0u8; 35];
+    let prefix = b"cuttle-svc-variant-seed-v1:";
+    label[..27].copy_from_slice(prefix);
+    label[27..35].copy_from_slice(&boot_gen.to_le_bytes());
     let mut dig = [0u8; DURABLE_DIGEST_LEN];
     seal_bytes_keyed(seal_key, &label, &mut dig);
     let raw = u64::from_le_bytes([

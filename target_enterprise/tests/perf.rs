@@ -25,7 +25,7 @@
 //! p95 across the resulting per-input ns/call measurements.
 //!
 //! The verifier does not currently auto-run this perf test (it pins
-//! `-p proteus-target-minimal` in `run_perf`), so the values printed
+//! `-p cuttle-target-minimal` in `run_perf`), so the values printed
 //! here are observation infrastructure — surfaced by `cargo test
 //! --workspace -- --nocapture` and consumed manually until TASK-022
 //! wires in a per-target perf path. The TESTS themselves still run
@@ -39,9 +39,9 @@ use proptest::prelude::*;
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
 
-use proteus_contracts::SignatureVerify;
+use cuttle_contracts::SignatureVerify;
 use target_enterprise::{feistel_mix, fletcher32, sig_digest, sig_sign, SignatureVerifyImpl};
-use proteus_verifier::perf::{p95_u64, DEFAULT_PERF_INPUTS_PER_CYCLE};
+use cuttle_verifier::perf::{p95_u64, DEFAULT_PERF_INPUTS_PER_CYCLE};
 
 // ---------------------------------------------------------------------
 // Knobs (parallel structure to target_minimal/tests/perf.rs)

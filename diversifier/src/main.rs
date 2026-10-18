@@ -16,19 +16,19 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let (cycle, module, input, stack_pad) = parse_args(&args)?;
 
-    let seed = proteus_diversifier::Seed::derive(cycle, &module);
+    let seed = cuttle_diversifier::Seed::derive(cycle, &module);
     // Path-aware entry point enforces `locked_modules.toml`. Stack-pad
     // is OFF by default (gadget-count inflation vs layout seeding);
     // `--stack-pad` re-enables the TASK-029 pass for A/B measurement.
     let options = if stack_pad {
-        proteus_diversifier::DiversifyOptions::with_stack_pad()
+        cuttle_diversifier::DiversifyOptions::with_stack_pad()
     } else {
-        proteus_diversifier::DiversifyOptions::default()
+        cuttle_diversifier::DiversifyOptions::default()
     };
     let (out, _log) =
-        proteus_diversifier::diversify_path_with_log_and_options(&input, &seed, &options)
+        cuttle_diversifier::diversify_path_with_log_and_options(&input, &seed, &options)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let hash = proteus_diversifier::canonical_hash(&out)?;
+    let hash = cuttle_diversifier::canonical_hash(&out)?;
 
     eprintln!(
         "diversified module={} cycle={} stack_pad={} canonical_sha256={}",

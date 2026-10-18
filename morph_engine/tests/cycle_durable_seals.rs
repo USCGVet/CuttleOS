@@ -1,4 +1,4 @@
-//! TASK-155 — one morph cycle with `PROTEUS_DURABLE_SEALS_DIR` attaches
+//! TASK-155 — one morph cycle with `CUTTLE_DURABLE_SEALS_DIR` attaches
 //! seals onto the attestation entry.
 //!
 //! Always-on (not env-gated): single-module `target_minimal` cycle is
@@ -11,7 +11,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use proteus_morph_engine::{
+use cuttle_morph_engine::{
     run_cycle, verify_chain_with_options, CycleArgs, DurableSeal, SynthesizerKind, VerifyOptions,
     ATTEST_DIR_ENV, DURABLE_SEALS_DIR_ENV,
 };
@@ -58,7 +58,7 @@ fn cycle_attaches_durable_seals_from_dir() {
 
     // Ensure verify binary exists (cycle stage 3 shells out).
     let st = Command::new("cargo")
-        .args(["build", "-p", "proteus-verifier", "--bin", "verify"])
+        .args(["build", "-p", "cuttle-verifier", "--bin", "verify"])
         .current_dir(&root)
         .status()
         .expect("cargo build verify");

@@ -175,7 +175,7 @@ OPTIONAL:
                          <workspace>/target_enterprise/src/<module>,
                          run `cargo rustc --emit=mir`, sha256 the result,
                          compare. Requires --workspace-root.
-  --workspace-root <P>   Path to the Proteus workspace root. Required
+  --workspace-root <P>   Path to the Cuttle workspace root. Required
                          when --mir-check is set.
   --module-filename <N>  Source filename inside target_enterprise/src/
                          that the diversifier rewrites. Default `tls.rs`.

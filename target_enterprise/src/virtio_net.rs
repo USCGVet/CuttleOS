@@ -8,12 +8,12 @@
 //!
 //! # Locked surface
 //!
-//! - [`proteus_contracts::VirtqDesc`] — 16-byte descriptor entry (spec §2.6.5)
-//! - [`proteus_contracts::VirtioNetHdr`] — 12-byte packet header (spec §5.1.6)
-//! - [`proteus_contracts::virtio_net_feature`] — feature bit constants
-//! - [`proteus_contracts::virtio_status`] — `device_status` bit constants
-//! - [`proteus_contracts::virtio_common_cfg`] — common-cfg field offsets
-//! - [`proteus_contracts::NetDevice`] — the trait surface
+//! - [`cuttle_contracts::VirtqDesc`] — 16-byte descriptor entry (spec §2.6.5)
+//! - [`cuttle_contracts::VirtioNetHdr`] — 12-byte packet header (spec §5.1.6)
+//! - [`cuttle_contracts::virtio_net_feature`] — feature bit constants
+//! - [`cuttle_contracts::virtio_status`] — `device_status` bit constants
+//! - [`cuttle_contracts::virtio_common_cfg`] — common-cfg field offsets
+//! - [`cuttle_contracts::NetDevice`] — the trait surface
 //!
 //! # What this port covers
 //!
@@ -38,7 +38,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     virtio_common_cfg as ccfg, virtio_net_feature as feat, virtio_net_status, virtio_status,
     virtq_desc_flags, MmioBus, NetDevice, NetDeviceError, VirtioNetHdr, VirtqDesc,
     VIRTIO_NET_HDR_LEN, VIRTIO_NET_QUEUE_RX, VIRTIO_NET_QUEUE_TX,
@@ -1208,7 +1208,7 @@ impl MmioBus for MemVirtioBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::{virtio_net_feature, virtio_status};
+    use cuttle_contracts::{virtio_net_feature, virtio_status};
 
     /// Compile-time guarantee: the locked structs are exactly the
     /// spec-mandated sizes. Re-asserted in the contracts crate; we

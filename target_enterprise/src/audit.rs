@@ -1,6 +1,6 @@
 //! Kernel audit-log subsystem — [`AuditLogImpl`].
 //!
-//! This module is the [`proteus_contracts::AuditLog`] contract impl. It
+//! This module is the [`cuttle_contracts::AuditLog`] contract impl. It
 //! closes the observability gap left by the existing cap-table / IOMMU /
 //! packet-filter denial paths (which today refuse silently): every
 //! denial becomes an [`AuditEvent`] the offline parser can correlate to
@@ -16,7 +16,7 @@
 //! - [`AUDIT_DEFAULT_CAPACITY`] — kernel-banner default. Operators
 //!   with denser streams instantiate with a larger `N`.
 //! - Byte-exact `snapshot` emission matching the layout documented
-//!   on [`proteus_contracts::AuditLog::snapshot`]: a 20-byte big-
+//!   on [`cuttle_contracts::AuditLog::snapshot`]: a 20-byte big-
 //!   endian header followed by N × 96-byte records.
 //!
 //! # What this does NOT implement
@@ -39,7 +39,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     AuditError, AuditEvent, AuditIter, AuditLog, AuditVerdict, AUDIT_EVENT_WIRE_LEN,
     AUDIT_MESSAGE_LEN, AUDIT_SNAPSHOT_HEADER_LEN, AUDIT_SNAPSHOT_MAGIC,
 };

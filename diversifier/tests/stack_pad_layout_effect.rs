@@ -9,7 +9,7 @@
 //! synthetic-chain survival. This test asserts the necessary
 //! source-level precondition.
 
-use proteus_diversifier::{diversify_with_options, DiversifyOptions, Seed};
+use cuttle_diversifier::{diversify_with_options, DiversifyOptions, Seed};
 
 fn diversify_padded(src: &str, seed: &Seed) -> String {
     diversify_with_options(src, seed, &DiversifyOptions::with_stack_pad())
@@ -41,7 +41,7 @@ fn pad_size_varies_across_seeds() {
         let seed = Seed([seed_byte; 32]);
         let out = diversify_padded(src, &seed);
         let size = extract_first_pad_size(&out)
-            .unwrap_or_else(|| panic!("no __proteus_stack_pad_ in seed {}: {}", seed_byte, out));
+            .unwrap_or_else(|| panic!("no __cuttle_stack_pad_ in seed {}: {}", seed_byte, out));
         sizes.insert(size);
     }
     // 32 seeds against 192 buckets: collisions possible, but the
@@ -111,11 +111,11 @@ fn extract_first_pad_size(out: &str) -> Option<usize> {
 }
 
 fn extract_all_pad_sizes(out: &str) -> Vec<usize> {
-    // Look for `__proteus_stack_pad_<hex> : [u8 ; <N>usize]` in the
+    // Look for `__cuttle_stack_pad_<hex> : [u8 ; <N>usize]` in the
     // emitted token stream. The `quote` crate emits `[u8 ; 100usize]`
     // for parse_quote'd `[u8; 100]` because the literal is a usize.
     let mut sizes = Vec::new();
-    let needle = "__proteus_stack_pad_";
+    let needle = "__cuttle_stack_pad_";
     let mut cursor = 0usize;
     while let Some(idx) = out[cursor..].find(needle) {
         let abs = cursor + idx;

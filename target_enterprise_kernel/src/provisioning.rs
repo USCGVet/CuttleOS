@@ -6,9 +6,9 @@
 //!   source tree or from build seeds embedded in the kernel binary.
 //! - On provisioned guests, the host/hypervisor supplies a 32-byte OS-CSPRNG
 //!   secret (`device_secret_key.bin`, ignored by `.gitignore`) via the QEMU
-//!   `fw_cfg` channel (`opt/proteus_device_key`). This secret resides outside
+//!   `fw_cfg` channel (`opt/cuttle_device_key`). This secret resides outside
 //!   both the kernel ELF image and the guest AHCI disk image.
-//! - On unprovisioned boots (where `opt/proteus_device_key` is absent from
+//! - On unprovisioned boots (where `opt/cuttle_device_key` is absent from
 //!   `fw_cfg`), the kernel harvests 256 bits of hardware entropy directly
 //!   from the CPU (`RDRAND` when supported by CPUID.01H:ECX[30], mixed with
 //!   `RDTSC` jitter and CMOS RTC counter bytes through `HMAC-SHA256`) and
@@ -18,13 +18,13 @@
 pub(crate) use crate::*;
 
 /// QEMU `fw_cfg` selector path carrying the 32-byte CSPRNG device master key.
-pub(crate) const FW_CFG_DEVICE_KEY_PATH: &str = "opt/proteus_device_key";
+pub(crate) const FW_CFG_DEVICE_KEY_PATH: &str = "opt/cuttle_device_key";
 
 /// Cached `(master_key, is_fw_cfg_provisioned)` resolved once on first use during boot.
 static PROVISIONED_MASTER_KEY: spin::Mutex<Option<([u8; 32], bool)>> = spin::Mutex::new(None);
 
 /// Attempt to read a 32-byte out-of-band device secret key from QEMU `fw_cfg`
-/// (`opt/proteus_device_key`). Returns `None` if the entry is absent, shorter
+/// (`opt/cuttle_device_key`). Returns `None` if the entry is absent, shorter
 /// than 32 bytes, or all zeros.
 fn read_fw_cfg_device_key() -> Option<[u8; 32]> {
     let sel = fw_cfg_select(FW_CFG_DEVICE_KEY_PATH)?;
@@ -256,12 +256,12 @@ pub(crate) fn derive_runtime_net_auth_key(mac: [u8; 6]) -> Option<[u8; 32]> {
 /// key on unprovisioned boots).
 pub(crate) fn derive_runtime_seal_key() -> [u8; 32] {
     let (master, _) = device_master_key_state();
-    target_enterprise::durable_seal::derive_seal_key(&master, b"proteus-ahci-wal-seal-v1")
+    target_enterprise::durable_seal::derive_seal_key(&master, b"cuttle-ahci-wal-seal-v1")
 }
 
 /// Derive the 256-bit `HMAC-SHA256` remote attestation quote key from the
 /// out-of-band provisioned device master key (or boot-ephemeral hardware key).
 pub(crate) fn derive_runtime_attest_key() -> [u8; 32] {
     let (master, _) = device_master_key_state();
-    target_enterprise::durable_seal::derive_attest_key(&master, b"proteus-quote-v1")
+    target_enterprise::durable_seal::derive_attest_key(&master, b"cuttle-quote-v1")
 }

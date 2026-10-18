@@ -3,7 +3,7 @@
 //! where a dispatcher loops over a batch of syscalls and calls
 //! `check_cap` once per iteration.
 
-use proteus_contracts::{CapError, CapProof, SyscallCapTable};
+use cuttle_contracts::{CapError, CapProof, SyscallCapTable};
 
 struct PermissiveTable;
 

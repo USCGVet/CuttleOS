@@ -6,7 +6,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     Fat32, FatBpb, FatDirent, FatError, FAT_ATTR_DIR, FAT_ATTR_LFN, FAT_ATTR_VOLUME,
     FAT_BPB_BYTES_PER_SECTOR, FAT_BPB_FAT_SIZE_32, FAT_BPB_FS_TYPE, FAT_BPB_NUM_FATS,
     FAT_BPB_RESERVED, FAT_BPB_ROOT_CLUSTER, FAT_BPB_SEC_PER_CLUS, FAT_CLUS_MASK, FAT_DIR_ATTR,
@@ -339,7 +339,7 @@ pub fn build_banner_fixture(out: &mut [u8]) -> Result<usize, FatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::Fat32;
+    use cuttle_contracts::Fat32;
 
     fn fixture() -> [u8; FAT_FIXTURE_BYTES] {
         let mut img = [0u8; FAT_FIXTURE_BYTES];

@@ -91,7 +91,7 @@ pub struct CycleArgs {
     pub no_perf_check: bool,
     /// Optional directory of DurableSeal JSON files to attach as
     /// `durable_seals` on the attestation entry (TASK-146). When
-    /// `None`, falls back to `PROTEUS_DURABLE_SEALS_DIR` if set.
+    /// `None`, falls back to `CUTTLE_DURABLE_SEALS_DIR` if set.
     pub durable_seals_dir: Option<PathBuf>,
 }
 
@@ -285,15 +285,15 @@ fn prepare_candidate(args: &CycleArgs) -> Result<PreparedCandidate> {
     // operates on the synthesizer's output string, so the path-based lock
     // check can't live inside `diversify_with_log` — enforce it here.
     ensure_not_locked(&source_path)?;
-    let seed = proteus_diversifier::Seed::derive(args.cycle, &args.module);
+    let seed = cuttle_diversifier::Seed::derive(args.cycle, &args.module);
     // Phase 1 lived defense: Rung-1 semantic perturbation is ON for
     // production cycles (instruction-mix diversity, not just layout).
-    let (candidate, div_log) = proteus_diversifier::diversify_with_log_and_options(
+    let (candidate, div_log) = cuttle_diversifier::diversify_with_log_and_options(
         &synth_source,
         &seed,
-        &proteus_diversifier::DiversifyOptions::with_semantic_perturb(),
+        &cuttle_diversifier::DiversifyOptions::with_semantic_perturb(),
     )?;
-    let cand_hash = proteus_diversifier::canonical_hash(&candidate)?;
+    let cand_hash = cuttle_diversifier::canonical_hash(&candidate)?;
     // TASK-031: persist the diversifier's per-cycle decision log on the
     // attestation entry so a future `verify-attest --replay-diversifier`
     // can reconstruct the candidate from `(seed, pad_log, perturb_log)`
@@ -403,7 +403,7 @@ pub fn run_cycle(args: &CycleArgs) -> Result<()> {
     // attest if they differ from what was verified and signed.
     let installed = fs::read_to_string(&source_path)
         .with_context(|| format!("re-read installed {}", source_path.display()))?;
-    let installed_hash = proteus_diversifier::canonical_hash(&installed)
+    let installed_hash = cuttle_diversifier::canonical_hash(&installed)
         .context("hash installed candidate")?;
     if installed_hash != cand_hash {
         bail!(
@@ -611,7 +611,7 @@ fn emit_attestation(
             (None, Vec::new())
         };
 
-    // TASK-146: load operator seal directory (or PROTEUS_DURABLE_SEALS_DIR).
+    // TASK-146: load operator seal directory (or CUTTLE_DURABLE_SEALS_DIR).
     let durable_seals = crate::durable_seal::resolve_durable_seals(durable_seals_dir)?;
     if !durable_seals.is_empty() {
         eprintln!(
@@ -672,7 +672,7 @@ struct BootImageEmit {
 /// Always includes diversifier decision counts when a log is present.
 /// When `emit` is Some, records variant `.text` sha and layout seed;
 /// when a prior-cycle diversified ELF is found on disk (or
-/// `PROTEUS_DIVERSITY_BASE_ELF` is set), also records base sha +
+/// `CUTTLE_DIVERSITY_BASE_ELF` is set), also records base sha +
 /// positional/semantic survival bps.
 fn build_cycle_diversity(
     div_log: Option<&attest::DiversifierLog>,
@@ -704,7 +704,7 @@ fn build_cycle_diversity(
         }
 
         // Resolve base ELF: explicit env wins, else previous cycle's .div.elf.
-        let base_path = std::env::var_os("PROTEUS_DIVERSITY_BASE_ELF")
+        let base_path = std::env::var_os("CUTTLE_DIVERSITY_BASE_ELF")
             .map(PathBuf::from)
             .or_else(|| {
                 if cycle == 0 {
@@ -775,7 +775,7 @@ fn is_bootable_module(module: &str) -> bool {
 /// Build the kernel ELF for `target_enterprise` and run
 /// `factory_builder` against it to produce a BIOS image. Returns the
 /// hex sha256 of the produced image, parsed out of `factory_builder`'s
-/// stdout. The image lands under `<workspace>/target/proteus_images/`.
+/// stdout. The image lands under `<workspace>/target/cuttle_images/`.
 ///
 /// We deliberately call `factory_builder` as a subprocess (rather than
 /// linking against its library) so a failure inside the bootloader
@@ -794,7 +794,7 @@ fn emit_kernel_image(label: &str, cycle: u64) -> Result<BootImageEmit> {
     // back to CWD if discovery fails.
     let workspace_root = workspace_root_guess()?;
     let kernel_crate = workspace_root.join("target_enterprise_kernel");
-    let images_dir = workspace_root.join("target").join("proteus_images");
+    let images_dir = workspace_root.join("target").join("cuttle_images");
     fs::create_dir_all(&images_dir).ok();
     let bios_out = images_dir.join(format!("{}-cycle{}-bios.img", label, cycle));
 
@@ -949,7 +949,7 @@ fn prune_old_kernel_images(images_dir: &Path, label: &str, current_cycle: u64) {
     }
 }
 
-/// Best-effort: discover the Proteus workspace root from the current
+/// Best-effort: discover the Cuttle workspace root from the current
 /// exe path. Used by image emission to locate sibling crates without
 /// hard-coding an absolute path.
 fn workspace_root_guess() -> Result<PathBuf> {
@@ -971,7 +971,7 @@ fn workspace_root_guess() -> Result<PathBuf> {
 
 /// Enforce the locked-modules policy (TASK-017) before morphing a file.
 ///
-/// `proteus_diversifier::diversify_path` performs this check when it owns
+/// `cuttle_diversifier::diversify_path` performs this check when it owns
 /// the file read, but the morph engine diversifies the *synthesizer's
 /// output string* (`diversify_with_log`), not the on-disk source, so it
 /// must run the same check itself against the module's real source path.
@@ -982,7 +982,7 @@ fn workspace_root_guess() -> Result<PathBuf> {
 /// is fatal: no silent fallback (an attacker must not be able to disable
 /// the protection by deleting one file).
 fn ensure_not_locked(source_path: &Path) -> Result<()> {
-    let lock = proteus_diversifier::load_locked_modules(source_path)
+    let lock = cuttle_diversifier::load_locked_modules(source_path)
         .map_err(|e| anyhow::anyhow!("locked-modules policy: {}", e))?;
     if lock.is_locked(source_path) {
         bail!(
@@ -1254,12 +1254,12 @@ pub fn run_bundle(args: &BundleCycleArgs) -> Result<()> {
         // `[bundle.experimental]` with `tls` won't collide with
         // `[bundle.kernel]` with `tls`).
         let seed_label = format!("{}::{}", args.bundle_name, module);
-        let seed = proteus_diversifier::Seed::derive(args.cycle, &seed_label);
+        let seed = cuttle_diversifier::Seed::derive(args.cycle, &seed_label);
         let (candidate, member_div_log) =
-            proteus_diversifier::diversify_with_log_and_options(
+            cuttle_diversifier::diversify_with_log_and_options(
                 &synth_source,
                 &seed,
-                &proteus_diversifier::DiversifyOptions::with_semantic_perturb(),
+                &cuttle_diversifier::DiversifyOptions::with_semantic_perturb(),
             )
             .with_context(|| format!("diversify bundle member {}", module))?;
         // Merge this member's log into the bundle log, prefixing keys
@@ -1281,7 +1281,7 @@ pub fn run_bundle(args: &BundleCycleArgs) -> Result<()> {
         // `canonical_hash` returns a 32-byte SHA-256; we use the bytes
         // directly to compute the bundle hash and emit the hex form
         // only when writing the attestation entry.
-        let cand_hash: [u8; 32] = proteus_diversifier::canonical_hash(&candidate)?;
+        let cand_hash: [u8; 32] = cuttle_diversifier::canonical_hash(&candidate)?;
         // Stage on disk so the verifier can read it back.
         fs::write(&candidate_path, &candidate).with_context(|| {
             format!("write staging candidate {}", candidate_path.display())
@@ -1403,7 +1403,7 @@ pub fn run_bundle(args: &BundleCycleArgs) -> Result<()> {
         let installed = fs::read_to_string(&s.source_path).with_context(|| {
             format!("re-read installed {}", s.source_path.display())
         })?;
-        let installed_hash = proteus_diversifier::canonical_hash(&installed)
+        let installed_hash = cuttle_diversifier::canonical_hash(&installed)
             .context("hash installed bundle candidate")?;
         if installed_hash != s.candidate_hash {
             bail!(
@@ -1729,7 +1729,7 @@ pub fn attest_proposal(args: &CycleArgs, proposal_path: &Path) -> Result<()> {
     let cand_path = PathBuf::from(&proposal.candidate_path);
     let candidate = fs::read_to_string(&cand_path)
         .with_context(|| format!("read candidate {}", cand_path.display()))?;
-    let cand_hash = proteus_diversifier::canonical_hash(&candidate)?;
+    let cand_hash = cuttle_diversifier::canonical_hash(&candidate)?;
     if hex(&cand_hash) != proposal.candidate_sha256 {
         bail!(
             "proposer tamper: candidate on disk hashes to {} but proposal records {}",
@@ -1761,7 +1761,7 @@ pub fn attest_proposal(args: &CycleArgs, proposal_path: &Path) -> Result<()> {
         .with_context(|| format!("install candidate at {}", source_path.display()))?;
     let installed = fs::read_to_string(&source_path)
         .with_context(|| format!("re-read installed {}", source_path.display()))?;
-    let installed_hash = proteus_diversifier::canonical_hash(&installed)?;
+    let installed_hash = cuttle_diversifier::canonical_hash(&installed)?;
     if installed_hash != cand_hash {
         bail!(
             "deploy corruption: installed bytes differ from the verified candidate"

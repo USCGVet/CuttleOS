@@ -1,11 +1,11 @@
 //! TPM 2.0 client-side wire codec.
 //!
-//! Concrete [`proteus_contracts::Tpm`] implementation. Builds TCG-spec
+//! Concrete [`cuttle_contracts::Tpm`] implementation. Builds TCG-spec
 //! command frames for `TPM2_Startup`, `TPM2_GetRandom`, `TPM2_PCR_Read`,
 //! and `TPM2_PCR_Extend`, and parses the TPM 2.0 response header. The
 //! codec is intentionally transport-agnostic — every function takes a
 //! caller-supplied byte slice and returns the number of bytes written
-//! or a [`proteus_contracts::TpmError`]; nothing here touches MMIO,
+//! or a [`cuttle_contracts::TpmError`]; nothing here touches MMIO,
 //! ACPI, the CRB/TIS control area, or any other device.
 //!
 //! Where the RustOSa donor `src/tpm.rs` couples the codec with the CRB
@@ -17,18 +17,18 @@
 //!
 //! ## Why a separate trait
 //!
-//! Measured boot is one of Proteus's hard requirements — every cycle's
+//! Measured boot is one of Cuttle's hard requirements — every cycle's
 //! kernel ELF must be PCR-extended into a TPM bank before the
 //! attestation log can vouch for the image. The wire codec is the
 //! contract-locked half of that flow because every byte of every
 //! command and every response is hashed into PCR 8 by the TPM itself;
 //! a per-cycle morph that perturbs even one byte of the wire-format
 //! would invalidate the PCR chain. Keeping the codec under the
-//! [`proteus_contracts::Tpm`] surface means the verifier can reject
+//! [`cuttle_contracts::Tpm`] surface means the verifier can reject
 //! such a morph at the *trait* boundary rather than waiting for a
 //! mismatched attestation quote at deploy time.
 
-use proteus_contracts::{
+use cuttle_contracts::{
     Tpm, TpmError, TpmResponseView, TPM_ALG_SHA1, TPM_ALG_SHA256, TPM_CC_GET_RANDOM,
     TPM_CC_PCR_EXTEND, TPM_CC_PCR_READ, TPM_CC_STARTUP, TPM_HEADER_LEN, TPM_MAX_PCR_INDEX,
     TPM_RS_PW, TPM_SHA1_DIGEST_LEN, TPM_SHA256_DIGEST_LEN, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS,
@@ -85,7 +85,7 @@ pub const TPM_MAX_CMD_LEN: usize = TPM_PCR_EXTEND_SHA256_CMD_LEN;
 // Concrete impl
 // ---------------------------------------------------------------------
 
-/// Zero-sized concrete implementation of [`proteus_contracts::Tpm`].
+/// Zero-sized concrete implementation of [`cuttle_contracts::Tpm`].
 ///
 /// The codec is stateless — every function in the trait is associated,
 /// not method, so `TpmImpl` is a marker type whose value never needs
@@ -678,7 +678,7 @@ impl<B: TpmTisBus> TpmTisDriver<B> {
         let mut resp = [0u8; 32];
         let resp_len = self.transceive(&cmd[..cmd_len], &mut resp)?;
         let view = parse_response(&resp[..resp_len])?;
-        if view.response_code != proteus_contracts::TPM_RC_SUCCESS {
+        if view.response_code != cuttle_contracts::TPM_RC_SUCCESS {
             return Err(TpmError::BadTag);
         }
         Ok(())
@@ -691,7 +691,7 @@ impl<B: TpmTisBus> TpmTisDriver<B> {
         let mut resp = [0u8; 64];
         let resp_len = self.transceive(&cmd[..cmd_len], &mut resp)?;
         let view = parse_response(&resp[..resp_len])?;
-        if view.response_code != proteus_contracts::TPM_RC_SUCCESS {
+        if view.response_code != cuttle_contracts::TPM_RC_SUCCESS {
             return Err(TpmError::BadTag);
         }
         Ok(())
@@ -709,7 +709,7 @@ impl<B: TpmTisBus> TpmTisDriver<B> {
         let mut resp = [0u8; 96];
         let resp_len = self.transceive(&cmd[..cmd_len], &mut resp)?;
         let view = parse_response(&resp[..resp_len])?;
-        if view.response_code != proteus_contracts::TPM_RC_SUCCESS {
+        if view.response_code != cuttle_contracts::TPM_RC_SUCCESS {
             return Err(TpmError::BadTag);
         }
         // Body layout: pcrUpdateCounter(4) + pcrSelectionOut(10) + count(4) + size(2) + digest(32) = 52 bytes.
@@ -737,7 +737,7 @@ impl<B: TpmTisBus> TpmTisDriver<B> {
         let mut resp = [0u8; 64];
         let resp_len = self.transceive(&cmd[..cmd_len], &mut resp)?;
         let view = parse_response(&resp[..resp_len])?;
-        if view.response_code != proteus_contracts::TPM_RC_SUCCESS {
+        if view.response_code != cuttle_contracts::TPM_RC_SUCCESS {
             return Err(TpmError::BadTag);
         }
         let rnd = extract_get_random_bytes(view.body)?;
@@ -825,7 +825,7 @@ impl MemTpmTisBus {
                     return;
                 }
                 let st_type = read_u16_be(&self.cmd_fifo, 10);
-                if st_type == proteus_contracts::TPM_SU_CLEAR {
+                if st_type == cuttle_contracts::TPM_SU_CLEAR {
                     self.pcrs_sha256 = [[0u8; 32]; 24];
                     self.pcr_update_counter = 0;
                 }
@@ -834,7 +834,7 @@ impl MemTpmTisBus {
                     &mut self.resp_fifo,
                     TPM_ST_NO_SESSIONS,
                     TPM_HEADER_LEN as u32,
-                    proteus_contracts::TPM_RC_SUCCESS,
+                    cuttle_contracts::TPM_RC_SUCCESS,
                 );
                 self.resp_len = TPM_HEADER_LEN;
             }
@@ -866,7 +866,7 @@ impl MemTpmTisBus {
                     &mut self.resp_fifo,
                     TPM_ST_SESSIONS,
                     19,
-                    proteus_contracts::TPM_RC_SUCCESS,
+                    cuttle_contracts::TPM_RC_SUCCESS,
                 );
                 self.resp_len = 19;
             }
@@ -900,7 +900,7 @@ impl MemTpmTisBus {
                     &mut self.resp_fifo,
                     TPM_ST_NO_SESSIONS,
                     TPM_PCR_READ_SHA256_RESP_LEN as u32,
-                    proteus_contracts::TPM_RC_SUCCESS,
+                    cuttle_contracts::TPM_RC_SUCCESS,
                 );
                 // pcrUpdateCounter
                 let _ = put_u32_be(&mut self.resp_fifo, 10, self.pcr_update_counter);
@@ -928,7 +928,7 @@ impl MemTpmTisBus {
                     &mut self.resp_fifo,
                     TPM_ST_NO_SESSIONS,
                     total_len as u32,
-                    proteus_contracts::TPM_RC_SUCCESS,
+                    cuttle_contracts::TPM_RC_SUCCESS,
                 );
                 let _ = put_u16_be(&mut self.resp_fifo, 10, req as u16);
                 self.resp_fifo[12..12 + req].copy_from_slice(&digest[..req]);
@@ -1021,7 +1021,7 @@ impl TpmTisBus for MemTpmTisBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::{
+    use cuttle_contracts::{
         Tpm, TpmError, TPM_RC_SUCCESS, TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_SU_CLEAR,
         TPM_SU_STATE,
     };

@@ -24,7 +24,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{icmp_type, Icmp, IcmpEchoView, IcmpError};
+use cuttle_contracts::{icmp_type, Icmp, IcmpEchoView, IcmpError};
 
 /// Length of the ICMP echo header on the wire.
 pub const ICMP_HEADER_LEN: usize = 8;

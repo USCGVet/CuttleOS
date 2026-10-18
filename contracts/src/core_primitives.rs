@@ -158,7 +158,7 @@ pub enum CapError {
 /// # Example
 ///
 /// ```
-/// use proteus_contracts::{CapError, CapProof, SyscallCapTable, caps};
+/// use cuttle_contracts::{CapError, CapProof, SyscallCapTable, caps};
 ///
 /// // A trivial impl that always permits.
 /// struct AllowAll;
@@ -193,7 +193,7 @@ impl CapProof {
     /// but reads better at the privileged-action call site:
     ///
     /// ```no_run
-    /// # use proteus_contracts::{CapError, CapProof, SyscallCapTable, caps};
+    /// # use cuttle_contracts::{CapError, CapProof, SyscallCapTable, caps};
     /// # struct T;
     /// # impl SyscallCapTable for T {
     /// #     type Cap = u64;
@@ -358,7 +358,7 @@ pub mod caps {
 /// (TASK-161) and tests that need a proof without a full syscall table.
 ///
 /// ```no_run
-/// # use proteus_contracts::{mint_cap_proof, caps};
+/// # use cuttle_contracts::{mint_cap_proof, caps};
 /// let proof = mint_cap_proof(caps::DURABLE_WAL_WRITE, caps::DURABLE_WAL_WRITE)
 ///     .expect("self-grant");
 /// proof.consume();
@@ -536,8 +536,8 @@ pub mod harness {
         // into its initial state.
         key2[0] ^= 0xFF;
         let nonce: std::vec::Vec<u8> = (0..A::NONCE_LEN as u8).map(|b| b.wrapping_add(7)).collect();
-        let aad1: &[u8] = b"proteus-harness-aad-v1";
-        let aad2: &[u8] = b"proteus-harness-aad-v2-different";
+        let aad1: &[u8] = b"cuttle-harness-aad-v1";
+        let aad2: &[u8] = b"cuttle-harness-aad-v2-different";
 
         // Test plaintexts spanning empty, single byte, block-aligned,
         // block-unaligned, and a long input.

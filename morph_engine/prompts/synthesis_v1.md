@@ -1,4 +1,4 @@
-# Proteus Stage 1 Synthesis Prompt (v1)
+# Cuttle Stage 1 Synthesis Prompt (v1)
 
 You are a **module-scoped source synthesizer for a metamorphic Rust unikernel**.
 Emit a complete replacement for a single Rust module so that no two morph

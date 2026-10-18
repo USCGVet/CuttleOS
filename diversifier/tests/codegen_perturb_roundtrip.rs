@@ -25,7 +25,7 @@
 //! `target_enterprise/src/tls.rs`, the donor file the cycle pipeline
 //! actually morphs in production runs.
 
-use proteus_diversifier::{diversify, Seed};
+use cuttle_diversifier::{diversify, Seed};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -118,7 +118,7 @@ impl Op for Inner {
 
 fn rustc_check(src: &str, label: &str) {
     let tmp = std::env::temp_dir().join(format!(
-        "proteus_perturb_rt_{}_{}",
+        "cuttle_perturb_rt_{}_{}",
         label,
         std::process::id()
     ));
@@ -143,7 +143,7 @@ fn rustc_check(src: &str, label: &str) {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
         // Persist the failing source for postmortem.
-        let persist = std::env::temp_dir().join(format!("proteus_perturb_rt_{}_FAIL.rs", label));
+        let persist = std::env::temp_dir().join(format!("cuttle_perturb_rt_{}_FAIL.rs", label));
         let _ = std::fs::write(&persist, src);
         panic!(
             "rustc rejected diversifier output ({}). exit={:?}\nsource persisted at: {}\nstderr:\n{}\nstdout:\n{}",

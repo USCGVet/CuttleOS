@@ -13,10 +13,10 @@
 //! ## On-disk layout (locked)
 //!
 //! Total size: **16 384 bytes** (32 × 512-byte sectors). All byte
-//! offsets are defined in [`proteus_contracts::crash_offsets`]:
+//! offsets are defined in [`cuttle_contracts::crash_offsets`]:
 //!
 //! - Sector 0 (header, 512 bytes):
-//!   - 0..8     magic                = `"PROTPAN1"` ([`CRASH_DUMP_MAGIC`])
+//!   - 0..8     magic                = `"CTTLPAN1"` ([`CRASH_DUMP_MAGIC`])
 //!   - 8..12    schema       (u32 LE) = [`CRASH_DUMP_SCHEMA`]
 //!   - 12..16   reserved
 //!   - 16..24   wall_unix    (u64 LE)
@@ -51,7 +51,7 @@
 //! Panic dumps run after the heap may already be corrupt. Every scratch
 //! buffer in this module is either:
 //! - a caller-supplied `&mut [u8]` (the dump buffer itself); or
-//! - a stack array sized at compile time from a `proteus_contracts`
+//! - a stack array sized at compile time from a `cuttle_contracts`
 //!   constant.
 //!
 //! No `extern crate alloc`; no global state mutated by `build_dump`.
@@ -73,7 +73,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use proteus_contracts::{
+use cuttle_contracts::{
     crash_offsets, CrashContext, CrashDump, CrashDumpError, CrashDumpHeader,
     CRASH_BACKTRACE_MAX, CRASH_DUMP_BYTES, CRASH_DUMP_MAGIC, CRASH_DUMP_SCHEMA, CRASH_KMSG_MAX,
     CRASH_LOC_MAX, CRASH_MSG_MAX, CRASH_REG_COUNT,
@@ -86,7 +86,7 @@ use proteus_contracts::{
 pub const DUMP_START_LBA: u64 = 1024;
 
 /// Sector size in bytes. Locked at 512 across all morph cycles
-/// (matches [`proteus_contracts::BlockDevice::BLOCK_SIZE`]).
+/// (matches [`cuttle_contracts::BlockDevice::BLOCK_SIZE`]).
 pub const SECTOR_BYTES: usize = 512;
 
 /// One-shot re-entry latch. A panic handler that calls
@@ -140,7 +140,7 @@ pub struct MemorySectorSink {
     pub recorded: usize,
 }
 
-/// `usize` form of `proteus_contracts::CRASH_DUMP_SECTORS`. Module-level
+/// `usize` form of `cuttle_contracts::CRASH_DUMP_SECTORS`. Module-level
 /// because the contract const is `u64`.
 pub const CRASH_DUMP_SECTORS_USIZE: usize = 32;
 
@@ -206,14 +206,14 @@ impl PanicDumpImpl {
         <Self as CrashDump>::build_dump(ctx, buf)?;
         let mut sec_buf = [0u8; SECTOR_BYTES];
         let mut sec = 0u64;
-        while sec < proteus_contracts::CRASH_DUMP_SECTORS {
+        while sec < cuttle_contracts::CRASH_DUMP_SECTORS {
             let off = (sec as usize) * SECTOR_BYTES;
             sec_buf.copy_from_slice(&buf[off..off + SECTOR_BYTES]);
             sink.write_sector(DUMP_START_LBA + sec, &sec_buf)
                 .map_err(|_| CrashDumpError::LayoutOverflow)?;
             sec += 1;
         }
-        Ok((DUMP_START_LBA, DUMP_START_LBA + proteus_contracts::CRASH_DUMP_SECTORS))
+        Ok((DUMP_START_LBA, DUMP_START_LBA + cuttle_contracts::CRASH_DUMP_SECTORS))
     }
 }
 
@@ -500,7 +500,7 @@ fn read_nul_terminated_str(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::CrashRegisters;
+    use cuttle_contracts::CrashRegisters;
 
     fn sample_registers() -> CrashRegisters {
         let mut r = [0u64; CRASH_REG_COUNT];
@@ -873,7 +873,7 @@ mod tests {
         let mut sink = MemorySectorSink::new();
         let (start, end) = PanicDumpImpl::dump_to_sink(&ctx, &mut buf, &mut sink).unwrap();
         assert_eq!(start, DUMP_START_LBA);
-        assert_eq!(end, DUMP_START_LBA + proteus_contracts::CRASH_DUMP_SECTORS);
+        assert_eq!(end, DUMP_START_LBA + cuttle_contracts::CRASH_DUMP_SECTORS);
         assert_eq!(sink.recorded, CRASH_DUMP_SECTORS_USIZE);
         // LBAs must be strictly increasing.
         let mut prev = sink.recorded_lbas[0];
@@ -940,7 +940,7 @@ mod tests {
     #[test]
     fn header_offsets_are_locked() {
         // Compile-time assertion via const evaluation that the locked
-        // offsets in proteus_contracts::crash_offsets land exactly
+        // offsets in cuttle_contracts::crash_offsets land exactly
         // where this module's layout expects them.
         const _: () = assert!(crash_offsets::MAGIC == 0);
         const _: () = assert!(crash_offsets::SCHEMA == 8);

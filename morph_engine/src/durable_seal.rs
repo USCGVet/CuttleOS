@@ -11,7 +11,7 @@
 //!
 //! Attest binding: schema v10 `durable_seals` (TASK-140); morph cycle
 //! can load a seals directory via `--durable-seals-dir` /
-//! `PROTEUS_DURABLE_SEALS_DIR` (TASK-146).
+//! `CUTTLE_DURABLE_SEALS_DIR` (TASK-146).
 //!
 //! Wire format of a seal file (JSON, one object):
 //! ```json
@@ -258,7 +258,7 @@ pub fn validate_seals_map(m: &std::collections::BTreeMap<String, String>) -> Res
 
 /// Env var: directory of `*.json` DurableSeal files to attach on morph
 /// (TASK-146). Used when CLI `--durable-seals-dir` is omitted.
-pub const DURABLE_SEALS_DIR_ENV: &str = "PROTEUS_DURABLE_SEALS_DIR";
+pub const DURABLE_SEALS_DIR_ENV: &str = "CUTTLE_DURABLE_SEALS_DIR";
 
 /// Load every `*.json` seal under `dir` into a label → sha256 map.
 /// Non-JSON files are skipped. Empty directory → empty map.
@@ -299,7 +299,7 @@ pub fn load_seals_dir(dir: &Path) -> Result<std::collections::BTreeMap<String, S
 
 /// Resolve seals for a morph cycle (TASK-146):
 /// 1. explicit `dir` if `Some`
-/// 2. else `PROTEUS_DURABLE_SEALS_DIR` if set
+/// 2. else `CUTTLE_DURABLE_SEALS_DIR` if set
 /// 3. else empty map (legacy / no seals)
 ///
 /// If a path is configured but missing, returns Err (operator intent).
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn seal_file_roundtrip() {
         let dir = std::env::temp_dir().join(format!(
-            "proteus_durable_{}",
+            "cuttle_durable_{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn load_seals_dir_roundtrip() {
         let dir = std::env::temp_dir().join(format!(
-            "proteus_seals_dir_{}",
+            "cuttle_seals_dir_{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn resolve_durable_seals_empty_dir() {
         let dir = std::env::temp_dir().join(format!(
-            "proteus_seals_empty_{}",
+            "cuttle_seals_empty_{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn resolve_durable_seals_missing_dir_errs() {
         let missing = std::env::temp_dir().join(format!(
-            "proteus_seals_missing_{}",
+            "cuttle_seals_missing_{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())

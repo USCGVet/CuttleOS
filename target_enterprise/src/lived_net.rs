@@ -11,7 +11,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     icmp_type, tcp_flags, Aead, AuditVerdict, HandshakeKeys, Http, HttpMethod, Icmp,
     Ipv4PacketView, PacketFilter, Tcp, Verdict, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP,
 };
@@ -60,7 +60,7 @@ const SLOT_BUF: usize = 1024;
 /// tests (`LivedNet::new`). Limited to `#[cfg(test)]` so production and kernel
 /// code can never fall back to a public constant.
 #[cfg(test)]
-pub const DEFAULT_NET_AUTH_KEY: [u8; 32] = *b"Proteus-Enterprise-NetAuth-Key01";
+pub const DEFAULT_NET_AUTH_KEY: [u8; 32] = *b"Cuttle-Enterprise-NetAuth-Key001";
 
 /// Outgoing Ethernet frames produced by [`LivedNet::handle_frame`].
 pub struct ReplySet {
@@ -284,12 +284,12 @@ impl LivedNet {
     }
 
     /// Derive a unique per-device 256-bit `HMAC-SHA256` control-plane key from a fleet/factory
-    /// root secret and the device's hardware MAC address (`HMAC-SHA256(root_secret, "proteus-net-auth-v1:" || mac)`).
+    /// root secret and the device's hardware MAC address (`HMAC-SHA256(root_secret, "cuttle-net-auth-v1:" || mac)`).
     pub fn derive_node_key(root_secret: &[u8; 32], mac: [u8; 6]) -> [u8; 32] {
-        const LABEL: &[u8] = b"proteus-net-auth-v1:";
-        let mut msg = [0u8; 26];
-        msg[..20].copy_from_slice(LABEL);
-        msg[20..26].copy_from_slice(&mac);
+        const LABEL: &[u8] = b"cuttle-net-auth-v1:";
+        let mut msg = [0u8; 25];
+        msg[..19].copy_from_slice(LABEL);
+        msg[19..25].copy_from_slice(&mac);
         let mut out = [0u8; 32];
         hmac_sha256(root_secret, &msg, &mut out);
         out
@@ -315,7 +315,7 @@ impl LivedNet {
         hmac_sha256(key, &msg[..pos], out);
     }
 
-    /// Compute the 32-byte HMAC-SHA256 tag over `"proteus-triad-prep-v1:<seq>:<node_id>:<sql>"`
+    /// Compute the 32-byte HMAC-SHA256 tag over `"cuttle-triad-prep-v1:<seq>:<node_id>:<sql>"`
     /// for in-guest Peer-to-Peer Triad replication (`TRIAD_PREPARE`) datagrams on UDP `:8081`.
     pub fn compute_triad_prepare_tag(
         key: &[u8; 32],
@@ -326,7 +326,7 @@ impl LivedNet {
     ) {
         let mut msg = [0u8; 384];
         let mut pos = 0usize;
-        pos += copy_msg(b"proteus-triad-prep-v1:", &mut msg[pos..]);
+        pos += copy_msg(b"cuttle-triad-prep-v1:", &mut msg[pos..]);
         pos += copy_msg(&seq_ascii[..seq_ascii.len().min(24)], &mut msg[pos..]);
         pos += copy_msg(b":", &mut msg[pos..]);
         pos += copy_msg(&node_ascii[..node_ascii.len().min(8)], &mut msg[pos..]);
@@ -335,7 +335,7 @@ impl LivedNet {
         hmac_sha256(key, &msg[..pos], out);
     }
 
-    /// Compute the 32-byte HMAC-SHA256 tag over `"proteus-triad-ack-v1:<seq>:<peer_id>:<hash_hex16>"`
+    /// Compute the 32-byte HMAC-SHA256 tag over `"cuttle-triad-ack-v1:<seq>:<peer_id>:<hash_hex16>"`
     /// for in-guest Peer-to-Peer Triad quorum acknowledgment (`TRIAD_ACK`) datagrams on UDP `:8081`.
     pub fn compute_triad_ack_tag(
         key: &[u8; 32],
@@ -346,7 +346,7 @@ impl LivedNet {
     ) {
         let mut msg = [0u8; 160];
         let mut pos = 0usize;
-        pos += copy_msg(b"proteus-triad-ack-v1:", &mut msg[pos..]);
+        pos += copy_msg(b"cuttle-triad-ack-v1:", &mut msg[pos..]);
         pos += copy_msg(&seq_ascii[..seq_ascii.len().min(24)], &mut msg[pos..]);
         pos += copy_msg(b":", &mut msg[pos..]);
         pos += copy_msg(&peer_ascii[..peer_ascii.len().min(8)], &mut msg[pos..]);
@@ -566,7 +566,7 @@ impl LivedNet {
         let payload_len = ulen.saturating_sub(8).min(udp.len().saturating_sub(8));
         let payload = &udp[8..8 + payload_len];
         // slirp bounce guard (same as the original UDP service).
-        if payload_len >= 8 && payload.starts_with(b"PROTEUS-") {
+        if payload_len >= 7 && payload.starts_with(b"CUTTLE-") {
             return;
         }
         let _ = src_ip;
@@ -1250,7 +1250,7 @@ impl LivedNet {
         out: &mut [u8],
     ) -> usize {
         use crate::svc_runtime::IpcOp;
-        use proteus_contracts::{FS_O_CREATE, FS_O_RDONLY, FS_O_RDWR, FS_O_TRUNC, Filesystem};
+        use cuttle_contracts::{FS_O_CREATE, FS_O_RDONLY, FS_O_RDWR, FS_O_TRUNC, Filesystem};
 
         let view = match HttpImpl::parse_request(req) {
             Ok(v) => v,
@@ -1339,7 +1339,7 @@ impl LivedNet {
             let mut html = [0u8; 1310];
             let mut pos = 0usize;
             pos += copy_msg(
-                b"<!doctype html><html><head><meta charset=utf-8><title>Proteus</title><style>body{background:#0b1020;color:#e2e8f0;font:14px monospace}h1{color:#38bdf8}p,pre,input,button{background:#1e293b;color:#38bdf8;border:1px solid #475569;padding:4px}button{background:#0284c7;color:#fff}</style></head><body><h1>Proteus MTD OS</h1><p>boots=",
+                b"<!doctype html><html><head><meta charset=utf-8><title>Cuttle</title><style>body{background:#0b1020;color:#e2e8f0;font:14px monospace}h1{color:#38bdf8}p,pre,input,button{background:#1e293b;color:#38bdf8;border:1px solid #475569;padding:4px}button{background:#0284c7;color:#fff}</style></head><body><h1>Cuttle MTD OS</h1><p>boots=",
                 &mut html[pos..],
             );
             pos += dec_u64(boots, &mut html[pos..]);
@@ -1362,7 +1362,7 @@ impl LivedNet {
             pos += copy_msg(b"<div>SID:<input id=t size=33 value=\"", &mut html[pos..]);
             pos += copy_msg(default_tok, &mut html[pos..]);
             pos += copy_msg(
-                b"\"><br>Sh:<input id=c size=22 value=\"status\"><button onclick=\"S(c.value)\">Run</button><button onclick=\"S('smp')\">smp</button><button onclick=\"S('ps')\">ps</button><button onclick=\"S('ls')\">ls</button><button onclick=\"S('audit')\">audit</button><br>SQL:<input id=q size=30 value=\"SELECT * FROM kv\"><button onclick=\"R('/sql?'+encodeURIComponent(q.value))\">Query</button><button onclick=\"P('/sql',q.value)\">Mutate</button><br>ELF:<input id=x size=14 value=\"/bin/fib 10\"><button onclick=\"P('/exec',x.value)\">Exec</button> VFS:<input id=f size=10 value=\"etc/motd\"><button onclick=\"R('/fs/'+f.value)\">Cat</button></div><pre id=o>proteus&gt; ready</pre><script>R=async(u,b)=>{o.textContent=await(await fetch(u,{method:b?'POST':'GET',headers:{'X-Session-Token':t.value},body:b})).text()};P=R;S=x=>P('/sh',x)</script></body></html>\n",
+                b"\"><br>Sh:<input id=c size=22 value=\"status\"><button onclick=\"S(c.value)\">Run</button><button onclick=\"S('smp')\">smp</button><button onclick=\"S('ps')\">ps</button><button onclick=\"S('ls')\">ls</button><button onclick=\"S('audit')\">audit</button><br>SQL:<input id=q size=30 value=\"SELECT * FROM kv\"><button onclick=\"R('/sql?'+encodeURIComponent(q.value))\">Query</button><button onclick=\"P('/sql',q.value)\">Mutate</button><br>ELF:<input id=x size=14 value=\"/bin/fib 10\"><button onclick=\"P('/exec',x.value)\">Exec</button> VFS:<input id=f size=10 value=\"etc/motd\"><button onclick=\"R('/fs/'+f.value)\">Cat</button></div><pre id=o>cuttle&gt; ready</pre><script>R=async(u,b)=>{o.textContent=await(await fetch(u,{method:b?'POST':'GET',headers:{'X-Session-Token':t.value},body:b})).text()};P=R;S=x=>P('/sh',x)</script></body></html>\n",
                 &mut html[pos..],
             );
             return HttpImpl::build_response(200, b"text/html", &html[..pos], out).unwrap_or(0);
@@ -1867,7 +1867,7 @@ pub fn nat_reply_ip(src: [u8; 4]) -> [u8; 4] {
 }
 
 fn status_body(boots: u64, out: &mut [u8]) -> usize {
-    let p = b"PROTEUS-STATUS boots=";
+    let p = b"CUTTLE-STATUS boots=";
     if out.len() < p.len() + 22 {
         return 0;
     }
@@ -2107,7 +2107,7 @@ fn dec_u64(mut v: u64, out: &mut [u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::{tcp_flags, Icmp, Tcp};
+    use cuttle_contracts::{tcp_flags, Icmp, Tcp};
 
     const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
     const PEER_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
@@ -2203,7 +2203,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         let r = out.get(0).unwrap();
         let body = core::str::from_utf8(&r[42..]).unwrap();
-        assert!(body.starts_with("PROTEUS-STATUS boots=279"), "got {body:?}");
+        assert!(body.starts_with("CUTTLE-STATUS boots=279"), "got {body:?}");
     }
 
     #[test]
@@ -2260,7 +2260,7 @@ mod tests {
         let seg = TcpImpl::parse_segment(&resp[34..], GUEST_IP, PEER_IP).unwrap();
         let body = core::str::from_utf8(seg.payload).unwrap();
         assert!(body.starts_with("HTTP/1.1 200"), "got {body:?}");
-        assert!(body.contains("PROTEUS-STATUS boots=4"), "got {body:?}");
+        assert!(body.contains("CUTTLE-STATUS boots=4"), "got {body:?}");
     }
 
     #[test]
@@ -2303,7 +2303,7 @@ mod tests {
             let r = out.get(i).unwrap();
             if let Ok(seg) = TcpImpl::parse_segment(&r[34..], GUEST_IP, PEER_IP) {
                 if let Ok(s) = core::str::from_utf8(seg.payload) {
-                    if s.contains("HTTP/1.1 200") && s.contains("PROTEUS-STATUS boots=1") {
+                    if s.contains("HTTP/1.1 200") && s.contains("CUTTLE-STATUS boots=1") {
                         saw_200 = true;
                     }
                 }
@@ -2344,7 +2344,7 @@ mod tests {
         net.handle_frame_with_shell(&frame[..flen], 3, &mut sh, &mut out);
         assert_eq!(out.len(), 1);
         let r = out.get(0).unwrap();
-        assert_eq!(&r[42..], b"proteus-te\n");
+        assert_eq!(&r[42..], b"cuttle-te\n");
 
         // 2. HTTP GET /uname over TCP/80
         let client_isn: u32 = 0x3000_0000;
@@ -2390,7 +2390,7 @@ mod tests {
         let seg = TcpImpl::parse_segment(&resp[34..], GUEST_IP, PEER_IP).unwrap();
         let body = core::str::from_utf8(seg.payload).unwrap();
         assert!(body.contains("HTTP/1.1 200"));
-        assert!(body.contains("Proteus-TE x86_64 1.0-mtd"));
+        assert!(body.contains("Cuttle-TE x86_64 1.0-mtd"));
     }
 
     #[test]
@@ -2764,7 +2764,7 @@ mod tests {
             &mut plain_status,
         )
         .unwrap();
-        assert_eq!(&plain_status[..plen], b"PROTEUS-STATUS boots=9\n");
+        assert_eq!(&plain_status[..plen], b"CUTTLE-STATUS boots=9\n");
 
         // 4. Send an encrypted HTTP GET /uname inside a TLS ApplicationData record:
         let req_http = b"GET /uname HTTP/1.1\r\nHost: x\r\n\r\n";
@@ -2824,7 +2824,7 @@ mod tests {
         .unwrap();
         let http_str = core::str::from_utf8(&dec_http[..dlen]).unwrap();
         assert!(http_str.starts_with("HTTP/1.1 200"));
-        assert!(http_str.contains("Proteus-TE x86_64 1.0-mtd"));
+        assert!(http_str.contains("Cuttle-TE x86_64 1.0-mtd"));
 
         // 5. Open a second TLS 1.3 connection on port 443 and verify it generates a
         //    distinct ephemeral server_random, distinct server_pubkey, and distinct AEAD record key:
@@ -3152,7 +3152,7 @@ mod tests {
         let mut ppos = 0usize;
         ppos += copy_msg(b"PUT /fs/var/index.html HTTP/1.1\r\nCookie: sid=", &mut put_req[ppos..]);
         ppos += copy_msg(sid, &mut put_req[ppos..]);
-        ppos += copy_msg(b"\r\n\r\n<h1>Hello Proteus</h1>", &mut put_req[ppos..]);
+        ppos += copy_msg(b"\r\n\r\n<h1>Hello Cuttle</h1>", &mut put_req[ppos..]);
         let n = net.handle_http_request(&put_req[..ppos], 4, Some(&mut sh), &mut out);
         assert!(out[..n].starts_with(b"HTTP/1.1 201 Created\r\n"));
 
@@ -3164,7 +3164,7 @@ mod tests {
         );
         let s = core::str::from_utf8(&out[..n]).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"));
-        assert!(s.ends_with("\r\n\r\n<h1>Hello Proteus</h1>"));
+        assert!(s.ends_with("\r\n\r\n<h1>Hello Cuttle</h1>"));
     }
 
     #[test]

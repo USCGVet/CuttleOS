@@ -9,7 +9,7 @@
 //! legacy `BPF_LD_ABS` modes are not in this seed).
 //!
 //! The implementation lives behind the locked [`EBpf`] surface defined
-//! in `proteus-contracts`. The contract holds the wire shape of
+//! in `cuttle-contracts`. The contract holds the wire shape of
 //! [`BpfInstr`] (4-bit register fields packed in `regs`, signed
 //! 16-bit `offset`, signed 32-bit `imm`), the discriminants of
 //! [`BpfError`], and the behavioural invariants of [`EBpf::run`]
@@ -51,8 +51,8 @@
 //! No allocator. No `extern crate alloc`. Every buffer is on the
 //! caller-supplied `&mut BpfContext`.
 
-use proteus_contracts::bpf_op;
-use proteus_contracts::{
+use cuttle_contracts::bpf_op;
+use cuttle_contracts::{
     BpfContext, BpfError, BpfInstr, EBpf, BPF_MAX_BRANCH_DEPTH, BPF_MAX_INSTRUCTIONS, BPF_REG_FP,
     BPF_STACK_SIZE,
 };
@@ -651,7 +651,7 @@ pub fn run_reference_program(input: u8, ctx: &mut BpfContext) -> Result<u64, Bpf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::{
+    use cuttle_contracts::{
         bpf_op::*, BPF_MAX_INSTRUCTIONS, BPF_REG_COUNT, BPF_STACK_SIZE,
     };
 

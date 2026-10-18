@@ -11,7 +11,7 @@
 //! - `morph tick` — combined `next` + `run`. Runs the picked cycle
 //!   in-process and updates `scheduler_state.json` on success.
 //!
-//! The library half (`proteus_morph_engine`) exposes the cycle logic
+//! The library half (`cuttle_morph_engine`) exposes the cycle logic
 //! and the scheduler so both `run` and `tick` use the same code path
 //! without re-spawning a process.
 
@@ -20,7 +20,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use proteus_morph_engine::{
+use cuttle_morph_engine::{
     attest::{
         load_anchors, load_entries, parse_hex32, rebuild_anchors_after_cosign,
         rebuild_chain_after_cosign, write_chain_atomic,
@@ -53,13 +53,13 @@ fn main() -> Result<()> {
         "propose" => {
             // Proposer role (no signing key): stages 1–3, write proposal.
             let (cargs, out) = parse_propose_cli(&args[2..])?;
-            proteus_morph_engine::propose_cycle(&cargs, &out)
+            cuttle_morph_engine::propose_cycle(&cargs, &out)
         }
         "attest-proposal" => {
             // Verifier role (holds the key): independent re-verify,
             // deploy, sign, attest.
             let (cargs, file) = parse_attest_proposal_cli(&args[2..])?;
-            proteus_morph_engine::attest_proposal(&cargs, &file)
+            cuttle_morph_engine::attest_proposal(&cargs, &file)
         }
         "init-key" => init_signing_key(),
         "next" => cmd_next(),
@@ -89,7 +89,7 @@ fn usage() {
            --emit-image: for bootable targets (target_enterprise), package a BIOS image\n    \
                           via factory_builder + record image_sha256 in attestation\n    \
            --durable-seals-dir: attach DurableSeal JSON files as durable_seals on attest (TASK-146);\n    \
-                          or set PROTEUS_DURABLE_SEALS_DIR (daemon uses env only)\n  \
+                          or set CUTTLE_DURABLE_SEALS_DIR (daemon uses env only)\n  \
          morph run-bundle --cycle <N> --bundle <NAME> --workspace <DIR> --module <M1> [--module <M2> ...] [--manifest <FILE>] [--synthesizer <KIND>] [--durable-seals-dir DIR]\n    \
            atomic multi-module morph cycle. Every member diversifies under its own seed,\n    \
            the whole set verifies as one workspace build, the attestation entry records\n    \
@@ -298,7 +298,7 @@ fn cmd_tui(args: &[String]) -> Result<()> {
             other => bail!("unknown argument to tui: {}", other),
         }
     }
-    proteus_morph_engine::tui::run_tui_with_options(&root, ticks)
+    cuttle_morph_engine::tui::run_tui_with_options(&root, ticks)
 }
 
 /// `morph verify-attest`: walk the attestation log + Merkle-anchor log

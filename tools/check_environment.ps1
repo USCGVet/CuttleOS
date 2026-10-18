@@ -1,7 +1,7 @@
-# tools/check_environment.ps1 — verify the Proteus dev environment is sane.
+# tools/check_environment.ps1 — verify the Cuttle dev environment is sane.
 #
 # Reports GREEN/RED status for each item the hourly loop depends on:
-#   - Defender path exclusions for Proteus + RustOSa + cargo registry + Temp
+#   - Defender path exclusions for Cuttle + RustOSa + cargo registry + Temp
 #   - PowerShell execution policy (CurrentUser scope)
 #   - QEMU on PATH or at the known fallback location
 #   - cargo + rustc available
@@ -31,7 +31,7 @@ $pr = New-Object Security.Principal.WindowsPrincipal($id)
 $elevated = $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 $required = @(
-    'D:\RustProjects\Proteus',
+    'D:\RustProjects\Cuttle',
     'D:\RustProjects\RustOSa',
     "$env:USERPROFILE\.cargo\registry",
     "$env:LOCALAPPDATA\Temp"
@@ -92,7 +92,7 @@ if ($cargo) {
 
 # 6. Workspace builds (cheap sanity, ~1s if already built).
 if ($cargo) {
-    Push-Location 'D:\RustProjects\Proteus'
+    Push-Location 'D:\RustProjects\Cuttle'
     try {
         $null = cargo build --workspace 2>&1
         $buildOk = ($LASTEXITCODE -eq 0)
@@ -107,7 +107,7 @@ if ($Json) {
     $results | ConvertTo-Json -Compress
 } else {
     Write-Host ""
-    Write-Host "Proteus environment check" -ForegroundColor Cyan
+    Write-Host "Cuttle environment check" -ForegroundColor Cyan
     Write-Host "=========================="
     $green = 0; $red = 0
     foreach ($r in $results) {

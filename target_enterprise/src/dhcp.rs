@@ -50,7 +50,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     dhcp_msg_type, dhcp_option, Dhcp, DhcpClientState, DhcpError, DhcpMessageView,
     DHCP_FIXED_HEADER_LEN, DHCP_FLAG_BROADCAST, DHCP_HLEN_ETHERNET, DHCP_HTYPE_ETHERNET,
     DHCP_MAGIC_COOKIE, DHCP_OP_BOOTREPLY, DHCP_OP_BOOTREQUEST,
@@ -73,7 +73,7 @@ pub const FIXED_HEADER_LEN: usize = DHCP_FIXED_HEADER_LEN;
 /// options are written, the scratch-buffer layout, the option-parser
 /// state machine) are intentionally diversifiable — the verifier
 /// proves wire equivalence against the locked invariants in
-/// `proteus_contracts::Dhcp`.
+/// `cuttle_contracts::Dhcp`.
 pub struct DhcpImpl;
 
 impl Dhcp for DhcpImpl {

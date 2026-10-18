@@ -5,7 +5,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{Crc32c, CRC32C_POLY_REV};
+use cuttle_contracts::{Crc32c, CRC32C_POLY_REV};
 
 pub struct Crc32cImpl;
 
@@ -30,7 +30,7 @@ pub fn hash_impl(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::Crc32c;
+    use cuttle_contracts::Crc32c;
 
     #[test]
     fn poly() {
@@ -135,8 +135,8 @@ mod tests {
     }
     #[test]
     fn h10() {
-        let a = Crc32cImpl::hash(b"proteus");
-        let b = Crc32cImpl::hash(b"proteus");
+        let a = Crc32cImpl::hash(b"cuttle");
+        let b = Crc32cImpl::hash(b"cuttle");
         assert_eq!(a, b);
     }
     #[test]

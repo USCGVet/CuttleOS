@@ -2,7 +2,7 @@
 //! expected. Both are zero-sized; a confused candidate-author might
 //! assume they are interchangeable. The type checker rejects.
 
-use proteus_contracts::CapProof;
+use cuttle_contracts::CapProof;
 
 fn privileged_action(_proof: CapProof, input: u64) -> u64 {
     input + 1

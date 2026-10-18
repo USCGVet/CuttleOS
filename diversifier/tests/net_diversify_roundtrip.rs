@@ -19,7 +19,7 @@
 //! inherits the same invariants by symmetry of the diversifier's
 //! AST-level transforms.
 
-use proteus_diversifier::{diversify, Seed};
+use cuttle_diversifier::{diversify, Seed};
 use syn::File;
 
 const NET_SRC: &str = include_str!("../../target_enterprise/src/net.rs");

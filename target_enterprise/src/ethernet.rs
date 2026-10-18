@@ -41,7 +41,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{Eth, EthError, EthFrameView, MacAddr};
+use cuttle_contracts::{Eth, EthError, EthFrameView, MacAddr};
 
 /// Length of the Ethernet II header (untagged).
 pub const ETH_HEADER_LEN: usize = 14;
@@ -250,7 +250,7 @@ fn write_mac(out: &mut [u8], m: &MacAddr) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::ether_type;
+    use cuttle_contracts::ether_type;
 
     const DST: MacAddr = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
     const SRC: MacAddr = [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn is_broadcast_detects_all_ones() {
-        assert!(is_broadcast(&proteus_contracts::ETH_BROADCAST_MAC));
+        assert!(is_broadcast(&cuttle_contracts::ETH_BROADCAST_MAC));
         assert!(is_broadcast(&[0xFF; 6]));
         assert!(!is_broadcast(&DST));
         assert!(!is_broadcast(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]));
@@ -413,7 +413,7 @@ mod tests {
         // Multicast (group bit set in first byte).
         let multicast: MacAddr = [0x01, 0x00, 0x5E, 0x00, 0x00, 0x01]; // IPv4 multicast
         let ipv6_multi: MacAddr = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01]; // IPv6 multicast
-        let bcast = proteus_contracts::ETH_BROADCAST_MAC;
+        let bcast = cuttle_contracts::ETH_BROADCAST_MAC;
         // Unicast.
         let unicast: MacAddr = [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
 

@@ -6,8 +6,8 @@
 #![allow(missing_docs)]
 
 #[cfg(test)]
-use proteus_contracts::WATCHDOG_DEFAULT_DEADLINE_TICKS;
-use proteus_contracts::{Watchdog, WatchdogError};
+use cuttle_contracts::WATCHDOG_DEFAULT_DEADLINE_TICKS;
+use cuttle_contracts::{Watchdog, WatchdogError};
 
 /// Software watchdog state.
 pub struct WatchdogImpl {
@@ -116,7 +116,7 @@ pub const BANNER_DEADLINE: u32 = 5;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::Watchdog;
+    use cuttle_contracts::Watchdog;
 
     #[test]
     fn default_deadline_constant() {

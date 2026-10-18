@@ -2,7 +2,7 @@
 //!
 //! This module is the `target_enterprise` seed of a network stack for
 //! the morph engine to drive. It implements the
-//! [`proteus_contracts::NetStack`] trait with the wire layout RFC 791
+//! [`cuttle_contracts::NetStack`] trait with the wire layout RFC 791
 //! (IPv4) and RFC 768 (UDP) specify, byte-for-byte.
 //!
 //! # Locked surface
@@ -55,7 +55,7 @@
 //! module has NO `alloc` use and NO `Vec`. The TLS module in this
 //! crate established this pattern; TASK-011 carries it forward.
 
-use proteus_contracts::{
+use cuttle_contracts::{
     ipv4_flags, Ipv4HeaderView, IP_PROTO_UDP, NetError, NetStack, UdpDatagramView,
 };
 
@@ -1021,7 +1021,7 @@ mod tests {
             [203, 0, 113, 2],
             5555,
             5555,
-            b"proteus",
+            b"cuttle",
             48,
             0xABCD,
             &mut a,
@@ -1032,7 +1032,7 @@ mod tests {
             [203, 0, 113, 2],
             5555,
             5555,
-            b"proteus",
+            b"cuttle",
             48,
             0xABCD,
             &mut b,

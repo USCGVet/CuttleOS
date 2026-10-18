@@ -3,7 +3,7 @@
 //! The proof is gone after the move; the privileged-action call
 //! cannot satisfy its `CapProof` parameter.
 
-use proteus_contracts::{CapError, CapProof, SyscallCapTable};
+use cuttle_contracts::{CapError, CapProof, SyscallCapTable};
 
 struct PermissiveTable;
 

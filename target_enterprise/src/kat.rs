@@ -25,7 +25,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     KatId, KatResult, KatRunner, KatSuiteResult, KAT_DIGEST_LEN, KAT_VECTOR_COUNT,
 };
 use sha2::{Digest, Sha256};
@@ -318,7 +318,7 @@ fn hkdf_vector(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::{KatPrimitive, KatRunner, KAT_VECTOR_COUNT};
+    use cuttle_contracts::{KatPrimitive, KatRunner, KAT_VECTOR_COUNT};
 
     #[test]
     fn suite_cardinality_locked() {

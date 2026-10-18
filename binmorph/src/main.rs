@@ -12,7 +12,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
-use proteus_binmorph::{rewrite_function, Prng, Stats};
+use cuttle_binmorph::{rewrite_function, Prng, Stats};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();

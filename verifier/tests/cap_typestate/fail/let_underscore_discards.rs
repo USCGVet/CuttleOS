@@ -6,7 +6,7 @@
 //! requires a `CapProof` by value, and `let _ = ...` consumed the
 //! proof on the unrelated discard binding.
 
-use proteus_contracts::{CapError, CapProof, SyscallCapTable};
+use cuttle_contracts::{CapError, CapProof, SyscallCapTable};
 
 struct PermissiveTable;
 

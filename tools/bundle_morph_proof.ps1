@@ -11,6 +11,6 @@
 # Wall-clock: typically 1–3 minutes depending on module count and cold caches.
 
 $ErrorActionPreference = 'Continue'
-$env:PROTEUS_BUNDLE_MORPH_PROOF = '1'
+$env:CUTTLE_BUNDLE_MORPH_PROOF = '1'
 cargo test -p diversity_demo --test bundle_morph_proof -- --nocapture
 exit $LASTEXITCODE

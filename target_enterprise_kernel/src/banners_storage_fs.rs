@@ -5,7 +5,7 @@ pub(crate) use crate::*;
 
 /// WAL: instantiate a 4 KiB WalImpl, append 16 fixture frames, flush,/// replay, assert the frame count and final LSN match the fixture
 /// constants, emit `WAL replay OK frames=16 lsn=<N>\n`.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_wal_replay() {
     let mut wal: WalImpl<{ kf::WAL_CAPACITY }> = WalImpl::new();
@@ -73,7 +73,7 @@ pub(crate) fn banner_wal_replay() {
 // `MemNvmeController` emulator, drive an `NvmeImpl` through the
 // spec-mandated bring-up + IO-queue creation + Identify Controller
 // + write+read round-trip, emit:
-//   `NVMe init OK ctrl=PROTEUS-NVME-EMU\n`
+//   `NVMe init OK ctrl=CUTTLE-NVME-EMU\n`
 //   `NVMe read_lba(7) OK first_byte=A5\n`
 //
 // The emulator runs in-kernel because the QEMU smoke test boots
@@ -84,7 +84,7 @@ pub(crate) fn banner_wal_replay() {
 // driver pipeline is functionally correct without requiring real
 // hardware.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_nvme() {
     use target_enterprise::nvme::{
@@ -103,13 +103,13 @@ pub(crate) fn banner_nvme() {
         panic!("NVMe create_io_queues failed");
     }
 
-    // Identify Controller — emulator stamps "PROTEUS-NVME-EMU" into
+    // Identify Controller — emulator stamps "CUTTLE-NVME-EMU" into
     // bytes [4..24] of the response. Confirm.
     let mut ident = [0u8; IDENTIFY_BUF_SIZE];
     if drv.identify_controller(0x5000, &mut ident).is_err() {
         panic!("NVMe identify_controller failed");
     }
-    if &ident[4..20] != b"PROTEUS-NVME-EMU" {
+    if &ident[4..19] != b"CUTTLE-NVME-EMU" {
         panic!("NVMe identify_controller SN mismatch");
     }
 
@@ -117,7 +117,7 @@ pub(crate) fn banner_nvme() {
     {
         let mut line = [0u8; 64];
         let mut pos = 0usize;
-        let prefix = b"NVMe init OK ctrl=PROTEUS-NVME-EMU";
+        let prefix = b"NVMe init OK ctrl=CUTTLE-NVME-EMU";
         line[..prefix.len()].copy_from_slice(prefix);
         pos += prefix.len();
         line[pos] = b'\n';
@@ -192,10 +192,10 @@ pub(crate) fn banner_nvme() {
 // byte order, or the 3-descriptor chain shape panics here and
 // these banners never appear.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_virtio_blk() {
-    use proteus_contracts::{BlockDeviceVirtio, VIRTIO_BLK_SECTOR_SIZE};
+    use cuttle_contracts::{BlockDeviceVirtio, VIRTIO_BLK_SECTOR_SIZE};
     use target_enterprise::virtio_blk::{MemVirtioBlkBus, VirtioBlk};
 
     // Same static-storage pattern as banner_virtio_net — the bus
@@ -300,7 +300,7 @@ pub(crate) fn banner_virtio_blk() {
 ///
 /// Exercises the locked [`Vfs`] + [`Filesystem`] surfaces: instantiates a
 /// `MemRamFs` in a static-mut arena, seeds `/etc/hostname` with the
-/// locked byte fixture `b"proteus-te\n"`, mounts it at `/`, opens the
+/// locked byte fixture `b"cuttle-te\n"`, mounts it at `/`, opens the
 /// path through `VfsImpl`, reads the bytes back, and asserts the
 /// recovered contents byte-for-byte against the locked expectation.
 /// A morph that perturbs the mount-table dispatch, the path
@@ -309,13 +309,13 @@ pub(crate) fn banner_virtio_blk() {
 ///
 /// Emits two banners:
 /// - `VFS mount OK fs=ramfs root=/`
-/// - `VFS read OK path=/etc/hostname bytes=11`
-#[cfg(not(proteus_prod))]
+/// - `VFS read OK path=/etc/hostname bytes=10`
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_vfs() {
     // Locked fixture matching the kernel-banner expectation.
-    const HOSTNAME_BYTES: &[u8] = b"proteus-te\n";
-    const HOSTNAME_LEN: usize = 11;
+    const HOSTNAME_BYTES: &[u8] = b"cuttle-te\n";
+    const HOSTNAME_LEN: usize = 10;
 
     // Storage backing the ramfs lives in a static-mut arena. The
     // VFS holds a `'static mut` borrow for the lifetime of the
@@ -375,7 +375,7 @@ pub(crate) fn banner_vfs() {
         Err(_) => panic!("vfs: close returned Err"),
     }
 
-    // Second banner — bytes=11 is the locked length.
+    // Second banner — bytes=10 is the locked length.
     {
         let mut line = [0u8; 64];
         let prefix = b"VFS read OK path=/etc/hostname bytes=";
@@ -405,10 +405,10 @@ impl VfsRamFsArena {
 }
 
 // TASK-085 GPT
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_gpt() {
-    use proteus_contracts::Gpt;
+    use cuttle_contracts::Gpt;
     use target_enterprise::gpt::{build_banner_fixture, GPT_FIXTURE_BYTES, GptImpl};
 
     let mut img = [0u8; GPT_FIXTURE_BYTES];
@@ -421,10 +421,10 @@ pub(crate) fn banner_gpt() {
 }
 
 // TASK-088 AHCI Register H2D FIS
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_ahci_fis() {
-    use proteus_contracts::{AhciFis, ATA_CMD_IDENTIFY, AHCI_FIS_H2D_LEN};
+    use cuttle_contracts::{AhciFis, ATA_CMD_IDENTIFY, AHCI_FIS_H2D_LEN};
     use target_enterprise::ahci_fis::AhciFisImpl;
 
     let p = match AhciFisImpl::identify(0) {
@@ -446,10 +446,10 @@ pub(crate) fn banner_ahci_fis() {
 }
 
 // TASK-093 AHCI command header + PRDT
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_ahci_cmd() {
-    use proteus_contracts::AhciCmd;
+    use cuttle_contracts::AhciCmd;
     use target_enterprise::ahci_cmd::AhciCmdImpl;
 
     let (h, p) = match AhciCmdImpl::identify_slot(0x1000, 0x2000) {
@@ -471,10 +471,10 @@ pub(crate) fn banner_ahci_cmd() {
 
 
 // TASK-070: FAT32 mount + HELLO.TXT read.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_fat32() {
-    use proteus_contracts::Fat32;
+    use cuttle_contracts::Fat32;
     use target_enterprise::fat32::{
         build_banner_fixture, FAT_FIXTURE_BYTES, FAT_HELLO_83, FAT_HELLO_BODY, FAT_HELLO_LEN,
         Fat32Impl,
@@ -540,10 +540,10 @@ pub(crate) fn banner_fat32() {
 // Banners: `QUOTA scan OK records=3` +
 // `QUOTA reject OK uid=1001 reason=block_limit`.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_quota() {
-    use proteus_contracts::{Quota, QuotaReject};
+    use cuttle_contracts::{Quota, QuotaReject};
     use target_enterprise::quota::{build_banner_fixture, BANNER_NOW_UNIX, QuotaImpl};
 
     let mut buf = [0u8; 96];
@@ -590,10 +590,10 @@ pub(crate) fn banner_quota() {
 // Banners: `JFS mount OK root_ino=1 inodes=3` and
 // `JFS read OK path=/hello.txt bytes=16 sha=aa3ce1c0`.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_jfs() {
-    use proteus_contracts::{JournalFs, JFS_ROOT_INODE};
+    use cuttle_contracts::{JournalFs, JFS_ROOT_INODE};
     use target_enterprise::jfs::{
         build_banner_fixture, fletcher32_body, FIXTURE_BYTES, HELLO_BODY, HELLO_BODY_FLETCHER32,
         HELLO_BODY_LEN, JfsImpl,

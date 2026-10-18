@@ -8,12 +8,12 @@
 //! 5. pre-v9 entries without diversity still verify (legacy)
 //! 6. None is skip_serialized (pre-v9 hash stability)
 
-use proteus_morph_engine::attest::{
+use cuttle_morph_engine::attest::{
     self, compute_entry_sha256, load_entries, verify_chain, verify_chain_with_options,
     write_attestation, AttestEntry, AttestEntryFields, DiversityEvidence, DiversifierLog,
     VerifyOptions, ATTEST_DIR_ENV, READABLE_MIN_SCHEMA, SCHEMA_VERSION, ZERO_HEX,
 };
-use proteus_morph_engine::{
+use cuttle_morph_engine::{
     diversity_from_diversifier_log, diversity_from_elf_pair, diversity_merge, rate_to_bps,
 };
 use std::collections::BTreeMap;
@@ -33,7 +33,7 @@ fn fresh_tempdir(label: &str) -> PathBuf {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "proteus_attest_v9_test_{}_{}_{}_{}",
+        "cuttle_attest_v9_test_{}_{}_{}_{}",
         label,
         std::process::id(),
         nanos,
@@ -186,7 +186,7 @@ fn verify_rejects_malformed_diversity_bps() {
         diversifier_log: None,
         kernel_layout_seed: None,
         ext_tlv_b64: Some(
-            proteus_morph_engine::build_ext_tlv_b64(
+            cuttle_morph_engine::build_ext_tlv_b64(
                 1,
                 "lib",
                 "39b94ac83ca00c15a2f4c292e41717f9e390b3c3157bb6428a519c9b42b0a7d8",
@@ -240,7 +240,7 @@ fn legacy_without_diversity_still_verifies() {
         diversifier_log: None,
         kernel_layout_seed: None,
         ext_tlv_b64: Some(
-            proteus_morph_engine::build_ext_tlv_b64(
+            cuttle_morph_engine::build_ext_tlv_b64(
                 1,
                 "lib",
                 "39b94ac83ca00c15a2f4c292e41717f9e390b3c3157bb6428a519c9b42b0a7d8",
@@ -329,7 +329,7 @@ fn require_diversity_rejects_missing() {
         diversifier_log: None,
         kernel_layout_seed: None,
         ext_tlv_b64: Some(
-            proteus_morph_engine::build_ext_tlv_b64(
+            cuttle_morph_engine::build_ext_tlv_b64(
                 1,
                 "lib",
                 "39b94ac83ca00c15a2f4c292e41717f9e390b3c3157bb6428a519c9b42b0a7d8",
@@ -403,7 +403,7 @@ fn require_diversity_skips_rejected_entries() {
         diversifier_log: None,
         kernel_layout_seed: None,
         ext_tlv_b64: Some(
-            proteus_morph_engine::build_ext_tlv_b64(1, "lib", &"aa".repeat(32)).unwrap(),
+            cuttle_morph_engine::build_ext_tlv_b64(1, "lib", &"aa".repeat(32)).unwrap(),
         ),
         diversity: None,
         durable_seals: std::collections::BTreeMap::new(),

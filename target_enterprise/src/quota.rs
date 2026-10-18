@@ -24,7 +24,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     Quota, QuotaError, QuotaRecord, QuotaReject, QUOTA_MAX_RECORDS, QUOTA_OFF_BLOCK_LIMIT,
     QUOTA_OFF_BLOCK_USED, QUOTA_OFF_GRACE, QUOTA_OFF_INODE_LIMIT, QUOTA_OFF_INODE_USED,
     QUOTA_OFF_UID, QUOTA_RECORD_LEN, QUOTA_UNLIMITED,
@@ -365,7 +365,7 @@ pub fn build_banner_fixture(out: &mut [u8]) -> Result<usize, QuotaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::Quota;
+    use cuttle_contracts::Quota;
 
     #[test]
     fn constants_locked() {

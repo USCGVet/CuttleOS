@@ -56,8 +56,8 @@ use std::sync::OnceLock;
 /// Workspace-relative default location for the expected-factory TOML.
 pub const FACTORY_EXPECTED_PATH: &str = "factory_expected.toml";
 
-/// Override env var (mirrors `PROTEUS_FEDERATION_CONFIG`).
-pub const FACTORY_EXPECTED_ENV: &str = "PROTEUS_FACTORY_EXPECTED";
+/// Override env var (mirrors `CUTTLE_FEDERATION_CONFIG`).
+pub const FACTORY_EXPECTED_ENV: &str = "CUTTLE_FACTORY_EXPECTED";
 
 /// The component-name keys recorded in the `factory_binaries` map.
 /// Stable strings — changing one of these is a schema-affecting move
@@ -71,7 +71,7 @@ pub const COMPONENT_RUSTC: &str = "rustc";
 /// uses the directory pointed to as the search root for sibling
 /// executables instead of probing relative to the morph binary's own
 /// path. Lets the integration tests inject pre-built fixtures.
-pub const FACTORY_BIN_DIR_ENV: &str = "PROTEUS_FACTORY_BIN_DIR";
+pub const FACTORY_BIN_DIR_ENV: &str = "CUTTLE_FACTORY_BIN_DIR";
 
 /// Override env var: when set, [`fingerprint`] returns a copy of the
 /// `factory_binaries` map *from this var's parsed JSON*. Used by the
@@ -80,7 +80,7 @@ pub const FACTORY_BIN_DIR_ENV: &str = "PROTEUS_FACTORY_BIN_DIR";
 /// would produce a hash dependent on cargo's incremental output).
 ///
 /// Format: standard JSON object, e.g. `{"morph":"aa..","rustc":"bb.."}`.
-pub const FACTORY_OVERRIDE_ENV: &str = "PROTEUS_FACTORY_FINGERPRINT_JSON";
+pub const FACTORY_OVERRIDE_ENV: &str = "CUTTLE_FACTORY_FINGERPRINT_JSON";
 
 /// Resolve the path to `factory_expected.toml`. Env var override wins
 /// over the workspace-relative default.
@@ -105,8 +105,8 @@ static FINGERPRINT_CACHE: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 /// configured one).
 ///
 /// Override priority:
-///   1. `PROTEUS_FACTORY_FINGERPRINT_JSON` env var (tests only).
-///   2. `PROTEUS_FACTORY_BIN_DIR` env var (controls sibling search root).
+///   1. `CUTTLE_FACTORY_FINGERPRINT_JSON` env var (tests only).
+///   2. `CUTTLE_FACTORY_BIN_DIR` env var (controls sibling search root).
 ///   3. The directory of `current_exe()` (production default).
 pub fn fingerprint() -> &'static BTreeMap<String, String> {
     FINGERPRINT_CACHE.get_or_init(compute_fingerprint)
@@ -129,7 +129,7 @@ fn compute_fingerprint() -> BTreeMap<String, String> {
                 Ok(m) => return m,
                 Err(e) => {
                     eprintln!(
-                        "morph: PROTEUS_FACTORY_FINGERPRINT_JSON parse failed ({}); \
+                        "morph: CUTTLE_FACTORY_FINGERPRINT_JSON parse failed ({}); \
                          falling back to live hashing",
                         e
                     );

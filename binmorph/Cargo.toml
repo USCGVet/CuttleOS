@@ -1,5 +1,5 @@
 [package]
-name = "proteus-binmorph"
+name = "cuttle-binmorph"
 edition.workspace = true
 version.workspace = true
 authors.workspace = true

@@ -1,7 +1,7 @@
 //! TASK-005 — windowed-median perf-gate property tests.
 //!
 //! These tests exercise the pure perf-gate functions from
-//! `proteus_verifier::perf` directly. They do NOT spin up a scratch
+//! `cuttle_verifier::perf` directly. They do NOT spin up a scratch
 //! `cargo build + cargo test` chain, so they are fast (millisecond
 //! range) and run as part of the default `cargo test --workspace`
 //! sweep — no `#[ignore]`.
@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use proteus_verifier::cli::parse_args;
-use proteus_verifier::perf::{
+use cuttle_verifier::cli::parse_args;
+use cuttle_verifier::perf::{
     evaluate_perf_gate, parse_window_arg, parse_threshold_arg, read_baseline_window,
     PerfGateOutcome, PerfMetrics, DEFAULT_PERF_THRESHOLD_PCT, DEFAULT_PERF_WINDOW,
     MIN_BASELINE_ENTRIES,
@@ -34,7 +34,7 @@ fn unique_dir(tag: &str) -> PathBuf {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "proteus-perf-gate-{}-{}-{}-{}",
+        "cuttle-perf-gate-{}-{}-{}-{}",
         tag, pid, nanos, n
     ));
     std::fs::create_dir_all(&dir).expect("create scratch dir");

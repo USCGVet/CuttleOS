@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     DnsName, DnsNameError, DNS_MAX_LABEL_LEN, DNS_MAX_LABELS, DNS_PTR_MASK,
 };
 
@@ -107,7 +107,7 @@ pub fn make_pointer_impl(target_offset: u16) -> [u8; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::DnsName;
+    use cuttle_contracts::DnsName;
 
     #[test]
     fn encode_two_labels() {
@@ -247,13 +247,13 @@ mod tests {
     #[test]
     fn end_to_end() {
         let mut wire = [0u8; 32];
-        let n = DnsNameImpl::encode(&[b"proteus", b"os"], &mut wire).unwrap();
+        let n = DnsNameImpl::encode(&[b"cuttle", b"os"], &mut wire).unwrap();
         let mut labs = [[0u8; 64]; DNS_MAX_LABELS];
         let mut lens = [0usize; DNS_MAX_LABELS];
         let (c, cons) = DnsNameImpl::decode(&wire, 0, &mut labs, &mut lens).unwrap();
         assert_eq!(c, 2);
         assert_eq!(cons, n);
-        assert_eq!(&labs[0][..lens[0]], b"proteus");
+        assert_eq!(&labs[0][..lens[0]], b"cuttle");
     }
 
     #[test]

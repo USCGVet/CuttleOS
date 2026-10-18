@@ -9,7 +9,7 @@
 //! and the kernel ran without an enforced cap gate at all.
 //!
 //! TASK-020 replaces the AST walker with a Rust **type-state**
-//! contract. `proteus_contracts::CapProof` is a zero-sized type with
+//! contract. `cuttle_contracts::CapProof` is a zero-sized type with
 //! a private constructor (sealed via a `pub(crate)` mint helper in
 //! the contracts crate). The privileged dispatch surface in
 //! `target_minimal` and `target_enterprise` declares

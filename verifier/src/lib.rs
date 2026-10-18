@@ -1,4 +1,4 @@
-//! Library surface of the `proteus-verifier` crate. The binary
+//! Library surface of the `cuttle-verifier` crate. The binary
 //! (`src/main.rs`) is the user-facing CLI; this lib exists so external
 //! tests (`tests/perf_gate.rs`, `tests/cap_typestate.rs`, etc.) can
 //! exercise individual verifier properties in isolation without
@@ -10,7 +10,7 @@
 //! purpose — confirming that a morph candidate's dispatcher body
 //! syntactically references `check_cap` — is now enforced by the
 //! Rust compiler via a type-state proof carried in
-//! `proteus_contracts::CapProof`. A privileged dispatch handler
+//! `cuttle_contracts::CapProof`. A privileged dispatch handler
 //! declares `_proof: CapProof` in its signature; safe code cannot
 //! mint a `CapProof` outside the contracts crate, so the only path
 //! to the handler is through a successful `check_cap` call. The

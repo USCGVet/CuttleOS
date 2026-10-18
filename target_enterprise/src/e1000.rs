@@ -43,7 +43,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     EthernetController, E1000Error, LinkState, MmioRegBus,
     // CTRL / STATUS / EERD / RCTL / TCTL / IMC bit flags + offsets
     E1000_CTRL_RST, E1000_CTRL_SLU, E1000_DESC_STA_DD, E1000_EEPROM_MAC_WORD0,
@@ -473,7 +473,7 @@ impl E1000Impl {
 /// `E1000_REG_ICR` but the driver uses it as a `usize` for the bus
 /// read in `reset`; keeping the alias local lets us avoid a fully-
 /// qualified path in the call.
-const E1000_REG_ICR_OFFSET: usize = proteus_contracts::E1000_REG_ICR;
+const E1000_REG_ICR_OFFSET: usize = cuttle_contracts::E1000_REG_ICR;
 
 impl EthernetController for E1000Impl {
     fn init(

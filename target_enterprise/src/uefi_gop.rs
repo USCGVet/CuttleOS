@@ -2,9 +2,9 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{GopError, GopModeInfo, UefiGop, GOP_MODE_INFO_LEN, GOP_PIXEL_BGR};
+use cuttle_contracts::{GopError, GopModeInfo, UefiGop, GOP_MODE_INFO_LEN, GOP_PIXEL_BGR};
 #[cfg(test)]
-use proteus_contracts::{GOP_PIXEL_BITMASK, GOP_PIXEL_BLT_ONLY, GOP_PIXEL_RGB};
+use cuttle_contracts::{GOP_PIXEL_BITMASK, GOP_PIXEL_BLT_ONLY, GOP_PIXEL_RGB};
 
 pub struct UefiGopImpl;
 
@@ -93,7 +93,7 @@ pub fn mode_1280x720_impl() -> GopModeInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::UefiGop;
+    use cuttle_contracts::UefiGop;
 
     #[test]
     fn constants() {

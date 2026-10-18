@@ -3,8 +3,8 @@
 #![allow(missing_docs)]
 
 #[cfg(test)]
-use proteus_contracts::ICR_DELIVERY_FIXED;
-use proteus_contracts::{
+use cuttle_contracts::ICR_DELIVERY_FIXED;
+use cuttle_contracts::{
     IcrCommand, LapicIcr, ICR_DELIVERY_INIT, ICR_DELIVERY_SIPI, ICR_DEST_NONE, ICR_HIGH_DEST_SHIFT,
     ICR_LEVEL_ASSERT, ICR_LEVEL_DEASSERT, ICR_TRIGGER_LEVEL,
 };
@@ -46,7 +46,7 @@ pub fn init_deassert(apic_id: u8) -> IcrCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::LapicIcr;
+    use cuttle_contracts::LapicIcr;
 
     #[test]
     fn init_delivery() {

@@ -200,6 +200,92 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuttle-binmorph"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "iced-x86",
+ "object",
+]
+
+[[package]]
+name = "cuttle-contracts"
+version = "0.0.1"
+
+[[package]]
+name = "cuttle-diversifier"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "proc-macro2",
+ "quote",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "sha2",
+ "syn",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "cuttle-morph-engine"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "cuttle-contracts",
+ "cuttle-diversifier",
+ "cuttle-mtd-metrics",
+ "ed25519-dalek",
+ "factory_builder",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "sha2",
+ "target_enterprise",
+ "toml 0.8.23",
+ "ureq",
+]
+
+[[package]]
+name = "cuttle-mtd-metrics"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "cuttle-diversifier",
+ "iced-x86",
+ "object",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "cuttle-target-minimal"
+version = "0.0.1"
+dependencies = [
+ "cuttle-contracts",
+ "cuttle-verifier",
+ "proptest",
+]
+
+[[package]]
+name = "cuttle-verifier"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "cuttle-contracts",
+ "cuttle-diversifier",
+ "proptest",
+ "quote",
+ "sha2",
+ "syn",
+ "trybuild",
+]
+
+[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -280,11 +366,11 @@ name = "diversity_demo"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "cuttle-diversifier",
+ "cuttle-mtd-metrics",
  "ed25519-dalek",
  "factory_builder",
  "object",
- "proteus-diversifier",
- "proteus-mtd-metrics",
  "rustc-demangle",
  "serde",
  "serde_json",
@@ -861,92 +947,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proteus-binmorph"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "iced-x86",
- "object",
-]
-
-[[package]]
-name = "proteus-contracts"
-version = "0.0.1"
-
-[[package]]
-name = "proteus-diversifier"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "proc-macro2",
- "quote",
- "rand 0.8.6",
- "rand_chacha 0.3.1",
- "sha2",
- "syn",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "proteus-morph-engine"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "crossterm",
- "ed25519-dalek",
- "factory_builder",
- "proteus-contracts",
- "proteus-diversifier",
- "proteus-mtd-metrics",
- "rand 0.8.6",
- "rand_chacha 0.3.1",
- "ratatui",
- "serde",
- "serde_json",
- "sha2",
- "target_enterprise",
- "toml 0.8.23",
- "ureq",
-]
-
-[[package]]
-name = "proteus-mtd-metrics"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "iced-x86",
- "object",
- "proteus-diversifier",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "proteus-target-minimal"
-version = "0.0.1"
-dependencies = [
- "proptest",
- "proteus-contracts",
- "proteus-verifier",
-]
-
-[[package]]
-name = "proteus-verifier"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "proptest",
- "proteus-contracts",
- "proteus-diversifier",
- "quote",
- "sha2",
- "syn",
- "trybuild",
-]
-
-[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1436,9 +1436,9 @@ checksum = "591ef38edfb78ca4771ee32cf494cb8771944bee237a9b91fc9c1424ac4b777b"
 name = "target_enterprise"
 version = "0.0.1"
 dependencies = [
+ "cuttle-contracts",
+ "cuttle-verifier",
  "proptest",
- "proteus-contracts",
- "proteus-verifier",
  "sha2",
  "spin",
 ]

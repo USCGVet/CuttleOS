@@ -7,7 +7,7 @@
 # comparison is always satisfied). priority is high so this entry wins
 # if an operator accidentally points the daemon at a fuller config.
 #
-# Paths are workspace-relative; run `morph daemon` from the Proteus root
+# Paths are workspace-relative; run `morph daemon` from the Cuttle root
 # with `--root experiments/soak_short`.
 
 [modules.lib]

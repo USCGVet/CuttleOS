@@ -43,6 +43,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuttle-contracts"
+version = "0.0.1"
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -69,10 +73,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
-name = "proteus-contracts"
-version = "0.0.1"
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -93,7 +93,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 name = "target_enterprise"
 version = "0.0.1"
 dependencies = [
- "proteus-contracts",
+ "cuttle-contracts",
  "sha2",
  "spin",
 ]
@@ -103,7 +103,7 @@ name = "target_enterprise_kernel"
 version = "0.0.1"
 dependencies = [
  "bootloader_api",
- "proteus-contracts",
+ "cuttle-contracts",
  "spin",
  "target_enterprise",
 ]

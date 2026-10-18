@@ -2,12 +2,12 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     IoApic, IoApicRedir, IOAPIC_DELIVERY_FIXED, IOAPIC_DEST_PHYSICAL, IOAPIC_POLARITY_HIGH,
     IOAPIC_TRIGGER_EDGE,
 };
 #[cfg(test)]
-use proteus_contracts::{
+use cuttle_contracts::{
     IOAPIC_DELIVERY_EXTINT, IOAPIC_DELIVERY_INIT, IOAPIC_DELIVERY_LOWEST, IOAPIC_DELIVERY_NMI,
     IOAPIC_DELIVERY_SMI, IOAPIC_DEST_LOGICAL, IOAPIC_MASKED, IOAPIC_POLARITY_LOW,
     IOAPIC_TRIGGER_LEVEL,
@@ -66,7 +66,7 @@ pub fn banner_entry() -> IoApicRedir {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::IoApic;
+    use cuttle_contracts::IoApic;
 
     #[test]
     fn round_trip_banner() {

@@ -1,10 +1,10 @@
 //! One-shot generator for DemoAead golden vectors. Run with
-//! `cargo run -p proteus-target-minimal --example gen_aead_goldens`.
+//! `cargo run -p cuttle-target-minimal --example gen_aead_goldens`.
 //! Prints lines suitable for appending to `golden.txt`. NOT part of
 //! the morph contract — this file is build-system scaffolding.
 
-use proteus_contracts::Aead;
-use proteus_target_minimal::DemoAead;
+use cuttle_contracts::Aead;
+use cuttle_target_minimal::DemoAead;
 
 fn hex(bytes: &[u8]) -> String {
     if bytes.is_empty() {
@@ -34,7 +34,7 @@ fn main() {
         ("onebyte",   b"A",                                                      b""),
         ("aligned16", b"ABCDEFGHIJKLMNOP",                                       b"ad-A"),
         ("unaligned", b"the quick brown fox jumps over",                         b"ad-2"),
-        ("long",      b"Proteus morphs every cycle; the contract survives.--END", b"final-aad"),
+        ("long",      b"Cuttle morphs every cycle; the contract survives.--END", b"final-aad"),
     ];
 
     for (_name, pt, aad) in cases {

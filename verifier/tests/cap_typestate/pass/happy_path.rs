@@ -4,7 +4,7 @@
 //! value into a privileged action. This is what every legitimate
 //! morph candidate's dispatcher will look like under TASK-020.
 
-use proteus_contracts::{CapError, CapProof, SyscallCapTable};
+use cuttle_contracts::{CapError, CapProof, SyscallCapTable};
 
 struct PermissiveTable;
 
@@ -22,7 +22,7 @@ fn privileged_action(_proof: CapProof, input: u64) -> u64 {
 fn main() {
     let table = PermissiveTable;
     let proof = table
-        .check(0, proteus_contracts::caps::POWER, 0)
+        .check(0, cuttle_contracts::caps::POWER, 0)
         .expect("permissive impl always succeeds");
     let result = privileged_action(proof, 41);
     assert_eq!(result, 42);

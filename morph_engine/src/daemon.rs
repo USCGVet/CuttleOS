@@ -288,7 +288,7 @@ impl WorkRunner for ProductionWorkRunner {
         no_perf_check: bool,
     ) -> Result<()> {
         // TASK-146: daemon inherits seals dir from env only
-        // (PROTEUS_DURABLE_SEALS_DIR); no separate DaemonArgs flag.
+        // (CUTTLE_DURABLE_SEALS_DIR); no separate DaemonArgs flag.
         let cargs = CycleArgs {
             cycle: choice.next_cycle,
             module: choice.module.clone(),
@@ -841,7 +841,7 @@ mod tests {
     #[test]
     fn from_cli_parses_all_flags() {
         let raw = cli(&[
-            "--root", "/tmp/proteus",
+            "--root", "/tmp/cuttle",
             "--max-iters", "5",
             "--max-cycle-secs", "120",
             "--heartbeat-secs", "30",
@@ -850,7 +850,7 @@ mod tests {
             "--emit-image",
         ]);
         let a = DaemonArgs::from_cli(&raw).unwrap();
-        assert_eq!(a.root, PathBuf::from("/tmp/proteus"));
+        assert_eq!(a.root, PathBuf::from("/tmp/cuttle"));
         assert_eq!(a.max_iters, 5);
         assert_eq!(a.max_cycle_secs, 120);
         assert_eq!(a.heartbeat_secs, 30);
@@ -978,7 +978,7 @@ mod tests {
 
     fn tempdir(label: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
-            "proteus-daemon-test-{}-{}",
+            "cuttle-daemon-test-{}-{}",
             label,
             std::process::id()
         ));

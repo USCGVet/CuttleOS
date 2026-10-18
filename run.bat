@@ -1,6 +1,6 @@
 @echo off
 REM ===========================================================================
-REM run.bat -- fire up the Proteus enterprise unikernel under QEMU.
+REM run.bat -- fire up the Cuttle OS enterprise unikernel under QEMU.
 REM
 REM No cargo-test gating, no banner-asserts, no bundle-morph dance. Just:
 REM   1. build the kernel ELF
@@ -16,7 +16,7 @@ REM   - Nightly Rust toolchain -- target_enterprise_kernel/rust-toolchain.toml
 REM     pins the required version.
 REM
 REM Exit QEMU: press Ctrl+C in this window after the kernel emits
-REM            PROTEUS-TE HALT.
+REM            CUTTLE-TE HALT.
 REM
 REM Note: keep echo strings inside if-blocks free of parentheses; cmd.exe
 REM       parses the entire if-block lazily and an unescaped paren inside an
@@ -29,9 +29,9 @@ set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
 set "KERNEL_CRATE=%ROOT%\target_enterprise_kernel"
-set "IMAGES_DIR=%ROOT%\target\proteus_images"
+set "IMAGES_DIR=%ROOT%\target\cuttle_images"
 set "BIOS_IMG=%IMAGES_DIR%\run_bios.img"
-set "KERNEL_PATH_FILE=%TEMP%\proteus_kernel_elf_path.txt"
+set "KERNEL_PATH_FILE=%TEMP%\cuttle_kernel_elf_path.txt"
 
 REM ----- locate QEMU --------------------------------------------------------
 set "QEMU="
@@ -85,12 +85,12 @@ echo [3/3] Launching QEMU (4x SMP vCPUs + 1280x720 console + HTTP :18080 / HTTPS
 echo        Dashboard:   http://127.0.0.1:18080/app
 echo        SQL Server:  http://127.0.0.1:18080/sql?SELECT+*+FROM+kv
 echo        Serial log:  %SERIAL_LOG%
-echo        Exit:        type 'halt' at proteus^> prompt or close QEMU window
+echo        Exit:        type 'halt' at cuttle^> prompt or close QEMU window
 echo ============================================================================
 "%QEMU%" ^
     -accel tcg ^
     -smp 4 ^
-    -fw_cfg name=opt/proteus_device_key,file="%ROOT%\device_secret_key.bin" ^
+    -fw_cfg name=opt/cuttle_device_key,file="%ROOT%\device_secret_key.bin" ^
     -drive format=raw,file="%BIOS_IMG%",if=ide ^
     -drive if=none,id=vd0,format=raw,file="%VIRTIO_IMG%" ^
     -device virtio-blk-pci,drive=vd0,disable-legacy=off,disable-modern=on ^
@@ -108,7 +108,7 @@ echo ===========================================================================
     -netdev hubport,id=e1,hubid=2 ^
     -device e1000,netdev=e1 ^
     -drive if=none,id=nvme0,format=raw,file="%NVME_IMG%" ^
-    -device nvme,drive=nvme0,serial=PROTEUS-NVME-HW ^
+    -device nvme,drive=nvme0,serial=CUTTLE-NVME-HW ^
     -chardev stdio,id=ch0,logfile="%SERIAL_LOG%" ^
     -serial chardev:ch0 ^
     -no-reboot ^

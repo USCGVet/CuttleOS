@@ -209,8 +209,8 @@ fn main() -> Result<()> {
         .arg("-netdev").arg("hubport,id=e1,hubid=2")
         .arg("-device").arg("e1000,netdev=e1")
         .arg("-drive").arg(format!("if=none,id=nvme0,format=raw,file={}", nvm.display()))
-        .arg("-device").arg("nvme,drive=nvme0,serial=PROTEUS-NVME-HW")
-        .arg("-fw_cfg").arg(format!("name=opt/proteus_device_key,file={}", device_key_path.display()))
+        .arg("-device").arg("nvme,drive=nvme0,serial=CUTTLE-NVME-HW")
+        .arg("-fw_cfg").arg(format!("name=opt/cuttle_device_key,file={}", device_key_path.display()))
         .arg("-fw_cfg").arg(format!("name=opt/attack.bin,file={}", payload_path.display()))
         .arg("-serial").arg(format!("tcp:127.0.0.1:{},server=on,wait=off", port))
         .arg("-monitor").arg(format!("tcp:127.0.0.1:{},server=on,wait=off", port + 100))
@@ -304,7 +304,7 @@ fn main() -> Result<()> {
                 verdict = "PWNED_AFTER_TOPUP";
             } else if wait_for(&buf, "ATK SVC SURVIVED", Duration::from_secs(5)) {
                 verdict = "SURVIVED";
-            } else if wait_for(&buf, "PROTEUS-TE HALT", Duration::from_secs(5)) {
+            } else if wait_for(&buf, "CUTTLE-TE HALT", Duration::from_secs(5)) {
                 verdict = "HALTED_NO_PWN";
             }
         }

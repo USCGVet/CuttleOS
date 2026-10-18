@@ -29,7 +29,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     dns_class, dns_flags, Dns, DnsError, DnsHeader, DnsMessageView, DnsRecordType,
 };
 

@@ -1,4 +1,4 @@
-//! `verify` CLI — candidate verification gate for the Proteus morph pipeline.
+//! `verify` CLI — candidate verification gate for the Cuttle morph pipeline.
 //!
 //! Runs static and dynamic checks against a candidate Rust source file:
 //! 1. **Syntax & public surface**: Parses the candidate AST, verifies that all
@@ -25,11 +25,11 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use syn::File;
 
-use proteus_verifier::cli::parse_args;
-use proteus_verifier::perf::{
+use cuttle_verifier::cli::parse_args;
+use cuttle_verifier::perf::{
     evaluate_perf_gate, read_baseline_window, unmatched_fields, PerfGateOutcome, PerfMetrics,
 };
-use proteus_verifier::static_checks::{
+use cuttle_verifier::static_checks::{
     evaluate_static, parse_manifest_str, StaticCheckInput, StaticCheckOutcome,
 };
 
@@ -123,7 +123,7 @@ fn run() -> Result<bool> {
     //       follow-up task can extend these to per-module manifests
     //       within a bundle.
     //
-    //       Logic lives in `proteus_verifier::static_checks` so the
+    //       Logic lives in `cuttle_verifier::static_checks` so the
     //       poison corpus can unit-test every reject class without
     //       spawning cargo.
     if parsed.bundle.is_empty() {
@@ -147,7 +147,7 @@ fn run() -> Result<bool> {
 
     // 5b. (Removed in TASK-020.) The cap-check AST property is
     //     replaced by a compile-time type-state proof carried in
-    //     `proteus_contracts::CapProof`. A morph candidate that
+    //     `cuttle_contracts::CapProof`. A morph candidate that
     //     attempts to bypass the cap gate fails to *compile* in the
     //     scratch workspace below, which the existing compile-and-
     //     test stage already catches. The dedicated trybuild suite
@@ -161,7 +161,7 @@ fn run() -> Result<bool> {
     //    cargo is invoked to (a) build the test target, then (b) run the
     //    `golden` integration test. Either step's non-zero exit rejects
     //    the candidate. This is the real semantic-preservation check —
-    //    the trait-level harness from `proteus_contracts::harness` runs
+    //    the trait-level harness from `cuttle_contracts::harness` runs
     //    inside that test binary, against the candidate, in a real Rust
     //    runtime.
     //
@@ -274,18 +274,18 @@ fn compile_and_test(
 
         // For non-target_minimal crates, strip `[dev-dependencies]`
         // from the scratch Cargo.toml. target_enterprise's dev-deps
-        // reference `proteus-verifier = { path = "../verifier" }` and
+        // reference `cuttle-verifier = { path = "../verifier" }` and
         // similar workspace siblings we don't copy into the scratch
         // dir. We're not running tests in bundle mode (the compile
         // IS the verification), so dev-deps are dead weight that just
         // make cargo's manifest loader fail to resolve a path.
         //
         // target_minimal keeps its dev-deps (golden + perf). After
-        // TASK-021 those include `proteus-verifier` (for `p95_u64`).
+        // TASK-021 those include `cuttle-verifier` (for `p95_u64`).
         // Copy diversifier + verifier into the scratch as workspace
         // members so `path = "../verifier"` resolves without the
         // package-collision that an absolute path into the live
-        // workspace would create (two copies of proteus-contracts).
+        // workspace would create (two copies of cuttle-contracts).
         if !is_target_minimal {
             strip_dev_dependencies(&scratch_target.join("Cargo.toml"))?;
         } else {
@@ -323,7 +323,7 @@ fn compile_and_test(
         // build cheap.
         write_scratch_workspace(&scratch, target_crate, &workspace_root)?;
 
-        // The dev-dep on `proteus-contracts` in target_minimal already
+        // The dev-dep on `cuttle-contracts` in target_minimal already
         // points at `../contracts` — that resolves correctly inside the
         // scratch root because we copied both crates side-by-side.
 
@@ -350,7 +350,7 @@ fn compile_and_test(
         let target_dir = scratch.join("build-target");
         let cargo = cargo_binary();
         // DEBUG instrumentation (temporary): list scratch contents.
-        if std::env::var("PROTEUS_VERIFY_DEBUG_SCRATCH").is_ok() {
+        if std::env::var("CUTTLE_VERIFY_DEBUG_SCRATCH").is_ok() {
             for entry in fs::read_dir(&scratch)? {
                 let e = entry?;
                 eprintln!("scratch entry: {:?}", e.file_name());
@@ -362,7 +362,7 @@ fn compile_and_test(
         }
         // The `-p` value is the *package name* declared in the target
         // crate's Cargo.toml, which is conventionally
-        // `proteus-target-<crate>` for target_minimal but plain
+        // `cuttle-target-<crate>` for target_minimal but plain
         // `target_enterprise` (no prefix) for target_enterprise. We
         // resolve the actual package name from the scratch crate's
         // Cargo.toml so the build command always names the right
@@ -376,7 +376,7 @@ fn compile_and_test(
         // `--tests` pulls in dev-deps. For target_minimal we need the
         // `golden` integration test, so we keep it. For other crates
         // (target_enterprise et al) the dev-deps include things like
-        // `proteus-verifier` that aren't copied into the scratch dir
+        // `cuttle-verifier` that aren't copied into the scratch dir
         // (we only copy `contracts/` + the target crate); pulling
         // those would fail to resolve. Bundle-mode verification is the
         // library build itself — no test step needed.
@@ -531,7 +531,7 @@ fn compile_and_test(
 /// Locate the workspace root containing the candidate. The candidate
 /// path may be inside any workspace member crate; we walk upward
 /// looking for a directory whose `contracts/Cargo.toml` exists — that
-/// is the unambiguous Proteus root marker. We do NOT require
+/// is the unambiguous Cuttle root marker. We do NOT require
 /// `target_minimal` to be present, because bundle-mode invocations
 /// target other crates (e.g. `target_enterprise`) and the search must
 /// succeed without assuming the legacy target is the live one.
@@ -556,7 +556,7 @@ fn locate_workspace_root(candidate: &Path) -> Result<PathBuf> {
         }
     }
     bail!(
-        "could not locate Proteus workspace root from candidate path {} or verifier binary",
+        "could not locate Cuttle workspace root from candidate path {} or verifier binary",
         candidate.display()
     );
 }
@@ -564,7 +564,7 @@ fn locate_workspace_root(candidate: &Path) -> Result<PathBuf> {
 /// Read the `name = "..."` field out of a `Cargo.toml`. Used to resolve
 /// the cargo package name for a target crate independently of how the
 /// directory is named — `target_minimal/`'s Cargo.toml declares
-/// `name = "proteus-target-minimal"` (with prefix), `target_enterprise/`'s
+/// `name = "cuttle-target-minimal"` (with prefix), `target_enterprise/`'s
 /// declares `name = "target_enterprise"` (no prefix).
 fn read_package_name(cargo_toml: &Path) -> Result<String> {
     let text = fs::read_to_string(cargo_toml)
@@ -606,7 +606,7 @@ fn read_package_name(cargo_toml: &Path) -> Result<String> {
 /// freshly-built binaries out of the user's `%TEMP%` (Windows
 /// AppLocker / Smart App Control / corporate WDAC profiles all do this
 /// for unsigned exes under `C:\Users\*\AppData\Local\Temp\`), the
-/// caller can override via the `PROTEUS_VERIFY_SCRATCH_ROOT` env var.
+/// caller can override via the `CUTTLE_VERIFY_SCRATCH_ROOT` env var.
 /// Pointing it at a directory under the project workspace (which the
 /// policy already allows because that is where rustc itself runs)
 /// sidesteps the issue without weakening the policy.
@@ -625,7 +625,7 @@ fn make_scratch_dir() -> Result<PathBuf> {
         *b = ((mix >> (i * 8)) & 0xFF) as u8;
     }
     let suffix: String = nonce_bytes.iter().map(|b| format!("{:02x}", b)).collect();
-    let root: PathBuf = match env::var_os("PROTEUS_VERIFY_SCRATCH_ROOT") {
+    let root: PathBuf = match env::var_os("CUTTLE_VERIFY_SCRATCH_ROOT") {
         Some(s) => {
             let p = PathBuf::from(s);
             // Ensure the override directory exists so the caller does
@@ -636,7 +636,7 @@ fn make_scratch_dir() -> Result<PathBuf> {
         None => env::temp_dir(),
     };
     sweep_stale_scratch_dirs(&root);
-    let dir = root.join(format!("proteus-verify-{}", suffix));
+    let dir = root.join(format!("cuttle-verify-{}", suffix));
     fs::create_dir_all(&dir).with_context(|| format!("create scratch dir {}", dir.display()))?;
     Ok(dir)
 }
@@ -652,7 +652,7 @@ fn remove_scratch_dir_with_retry(scratch: &Path) {
     }
 }
 
-/// Sweep any orphaned `proteus-verify-*` directories in `root` older than
+/// Sweep any orphaned `cuttle-verify-*` directories in `root` older than
 /// 15 minutes (e.g. left behind by a killed cycle or transient file lock).
 fn sweep_stale_scratch_dirs(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
@@ -665,7 +665,7 @@ fn sweep_stale_scratch_dirs(root: &Path) {
         let Some(s) = name.to_str() else {
             continue;
         };
-        if !s.starts_with("proteus-verify-") {
+        if !s.starts_with("cuttle-verify-") {
             continue;
         }
         let stale = entry
@@ -749,7 +749,7 @@ fn write_scratch_workspace(scratch: &Path, target_crate: &str, workspace_root: &
     };
     let toml = format!(
         "[workspace]\nresolver = \"2\"\nmembers = [{members}]\n\n\
-[workspace.package]\nedition = \"2024\"\nversion = \"0.0.1\"\nauthors = [\"Proteus Verifier Scratch\"]\nlicense = \"Apache-2.0\"\n\n\
+[workspace.package]\nedition = \"2024\"\nversion = \"0.0.1\"\nauthors = [\"Cuttle Verifier Scratch\"]\nlicense = \"Apache-2.0\"\n\n\
 {deps}",
         members = members,
         deps = workspace_deps_block,
@@ -877,7 +877,7 @@ fn run_perf(
         .arg("--test")
         .arg("perf")
         .arg("-p")
-        .arg("proteus-target-minimal")
+        .arg("cuttle-target-minimal")
         .arg("--target-dir")
         .arg(target_dir)
         .arg("--")
@@ -1012,5 +1012,5 @@ fn append_perf_record(perf_log_path: &Path, metrics: &PerfMetrics) -> Result<()>
 
 // `PerfMetrics`, `parse_jsonl_metrics`, `read_baseline`,
 // `read_baseline_window`, and the new `evaluate_perf_gate` all live in
-// `proteus_verifier::perf` (in `lib.rs`). Static reject stages live in
-// `proteus_verifier::static_checks`. The binary just calls them.
+// `cuttle_verifier::perf` (in `lib.rs`). Static reject stages live in
+// `cuttle_verifier::static_checks`. The binary just calls them.

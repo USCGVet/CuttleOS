@@ -1,10 +1,10 @@
-//! Proteus enterprise OS subsystem library (`target_enterprise`).
+//! Cuttle enterprise OS subsystem library (`target_enterprise`).
 //!
 //! Pure `no_std`, zero-allocation implementations of the kernel's cryptography,
 //! networking, storage, filesystem, hardware driver, memory isolation, task
 //! scheduling, capability/Seccomp enforcement, and interactive shell
 //! ([`shell::OsShell`]) subsystems. Every module implements its corresponding
-//! trait in [`proteus_contracts`] over fixed-capacity buffers so it can be
+//! trait in [`cuttle_contracts`] over fixed-capacity buffers so it can be
 //! verified on the host and linked directly into the bare-metal unikernel
 //! (`target_enterprise_kernel`).
 
@@ -117,10 +117,10 @@ pub use crate::wal::{
 };
 
 // ============================================================
-// Contract: proteus_contracts::Hash
+// Contract: cuttle_contracts::Hash
 // ============================================================
 
-/// Concrete [`proteus_contracts::Hash`] impl: a Fletcher-32-based
+/// Concrete [`cuttle_contracts::Hash`] impl: a Fletcher-32-based
 /// chained construction emitting 32 output bytes. **NOT cryptographic**
 /// — exists so the verifier has a real `impl Hash` to exercise against
 /// the harness invariants (determinism + avalanche on a fixed corpus).
@@ -193,7 +193,7 @@ fn fletcher32_three(a: &[u8], b: &[u8], c: &[u8]) -> u32 {
     (sum2 << 16) | sum1
 }
 
-impl proteus_contracts::Hash for HashImpl {
+impl cuttle_contracts::Hash for HashImpl {
     const OUTPUT_LEN: usize = 32;
 
     fn hash(input: &[u8], out: &mut [u8]) {
@@ -214,7 +214,7 @@ impl proteus_contracts::Hash for HashImpl {
 }
 
 // ============================================================
-// Contract: proteus_contracts::Aead
+// Contract: cuttle_contracts::Aead
 // ============================================================
 
 /// Error returned by [`AeadImpl::decrypt`] on authentication failure.
@@ -227,7 +227,7 @@ impl core::fmt::Debug for AeadError {
     }
 }
 
-/// Concrete [`proteus_contracts::Aead`] impl: a Feistel-keystream +
+/// Concrete [`cuttle_contracts::Aead`] impl: a Feistel-keystream +
 /// Fletcher-tag construction. **NOT cryptographic** — exists so the
 /// verifier has a real `impl Aead` to exercise against the harness
 /// invariants (round-trip, ciphertext-tamper, tag-tamper, AAD-tamper,
@@ -298,7 +298,7 @@ fn aead_tag(ciphertext: &[u8], aad: &[u8], key: &[u8]) -> u32 {
     fletcher32_three(ciphertext, aad, key)
 }
 
-impl proteus_contracts::Aead for AeadImpl {
+impl cuttle_contracts::Aead for AeadImpl {
     const KEY_LEN: usize = 16;
     const NONCE_LEN: usize = 8;
     const TAG_LEN: usize = 4;
@@ -387,15 +387,15 @@ impl proteus_contracts::Aead for AeadImpl {
 }
 
 // ============================================================
-// Contract: proteus_contracts::SyscallDispatch
+// Contract: cuttle_contracts::SyscallDispatch
 // ============================================================
 
-/// Concrete [`proteus_contracts::SyscallDispatch`] impl exposed at the
+/// Concrete [`cuttle_contracts::SyscallDispatch`] impl exposed at the
 /// crate root. Wraps [`crate::syscall::SyscallDispatchImpl`]. The
 /// integration test asserts that this type implements the contract.
 pub struct SyscallDispatch;
 
-impl proteus_contracts::SyscallDispatch for SyscallDispatch {
+impl cuttle_contracts::SyscallDispatch for SyscallDispatch {
     type Result = core::result::Result<u64, Errno>;
 
     fn dispatch(
@@ -407,17 +407,17 @@ impl proteus_contracts::SyscallDispatch for SyscallDispatch {
         a4: u64,
         a5: u64,
     ) -> Self::Result {
-        <SyscallDispatchImpl as proteus_contracts::SyscallDispatch>::dispatch(
+        <SyscallDispatchImpl as cuttle_contracts::SyscallDispatch>::dispatch(
             nr, a0, a1, a2, a3, a4, a5,
         )
     }
 }
 
 // ============================================================
-// Contract: proteus_contracts::SignatureVerify
+// Contract: cuttle_contracts::SignatureVerify
 // ============================================================
 
-/// Concrete [`proteus_contracts::SignatureVerify`] impl. **TOY scheme —
+/// Concrete [`cuttle_contracts::SignatureVerify`] impl. **TOY scheme —
 /// NOT CRYPTOGRAPHIC.** Exists so the verifier has a real `impl
 /// SignatureVerify` to exercise against the harness invariants (accept
 /// legitimate sig, reject single-byte tamper, reject wrong message,
@@ -470,7 +470,7 @@ pub fn sig_sign(pubkey: &[u8], message: &[u8]) -> [u8; 64] {
     out
 }
 
-impl proteus_contracts::SignatureVerify for SignatureVerifyImpl {
+impl cuttle_contracts::SignatureVerify for SignatureVerifyImpl {
     const PUBKEY_LEN: usize = 32;
     const SIGNATURE_LEN: usize = 64;
 
@@ -507,7 +507,7 @@ impl proteus_contracts::SignatureVerify for SignatureVerifyImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::{Aead, Hash, SignatureVerify, SyscallDispatch as SD};
+    use cuttle_contracts::{Aead, Hash, SignatureVerify, SyscallDispatch as SD};
 
     #[test]
     fn fletcher32_known_vectors() {
@@ -520,8 +520,8 @@ mod tests {
     fn hash_impl_is_deterministic() {
         let mut a = [0u8; 32];
         let mut b = [0u8; 32];
-        HashImpl::hash(b"proteus", &mut a);
-        HashImpl::hash(b"proteus", &mut b);
+        HashImpl::hash(b"cuttle", &mut a);
+        HashImpl::hash(b"cuttle", &mut b);
         assert_eq!(a, b);
     }
 
@@ -529,7 +529,7 @@ mod tests {
     fn hash_impl_avalanche_on_one_bit() {
         let mut a = [0u8; 32];
         let mut b = [0u8; 32];
-        HashImpl::hash(b"proteus", &mut a);
+        HashImpl::hash(b"cuttle", &mut a);
         HashImpl::hash(b"proteut", &mut b);
         assert_ne!(a, b);
     }

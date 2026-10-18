@@ -1,12 +1,12 @@
 //! TASK-013 integration tests: the rolling Merkle root sidecar
 //! (`attest.merkle_root`).
 //!
-//! Each test isolates itself via `PROTEUS_ATTEST_DIR` pointing at a
+//! Each test isolates itself via `CUTTLE_ATTEST_DIR` pointing at a
 //! fresh per-test tempdir. The env var is shared process-wide, so all
 //! tests in this file serialise on a module-local mutex — matches the
 //! pattern used by `tests/attest.rs`.
 
-use proteus_morph_engine::attest::{
+use cuttle_morph_engine::attest::{
     self, compute_merkle_root, load_entries, load_merkle_root, parse_hex32,
     recompute_merkle_root_from_disk, verify_chain, verify_chain_with_options,
     write_attestation, write_merkle_root, AttestEntryFields, MerkleRootStatus, VerifyOptions,
@@ -28,7 +28,7 @@ fn fresh_tempdir(label: &str) -> PathBuf {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "proteus_merkle_test_{}_{}_{}_{}",
+        "cuttle_merkle_test_{}_{}_{}_{}",
         label,
         std::process::id(),
         nanos,
@@ -324,7 +324,7 @@ fn rolling_root_catches_tamper_when_chain_was_recomputed() {
     // TASK-102 TLV check does not fire first — this test isolates
     // rolling-root detection after a fully re-hashed chain rewrite.
     entries[2].ext_tlv_b64 = Some(
-        proteus_morph_engine::build_ext_tlv_b64(
+        cuttle_morph_engine::build_ext_tlv_b64(
             entries[2].cycle,
             &entries[2].module,
             &entries[2].candidate_sha256,

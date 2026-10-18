@@ -8,7 +8,7 @@ pub(crate) use crate::*;
 ///
 /// Returns the PRK so a follow-on banner could chain off it; the kernel
 /// does not need it again here.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_tls_hkdf() {
     let mut prk = [0u8; 32];
@@ -43,7 +43,7 @@ pub(crate) fn banner_tls_hkdf() {
 
 /// TLS: build a ServerHello against the locked ClientHello fixture,
 /// assert byte length and prefix, emit `TLS server_hello OK len=<N>\n`.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_tls_server_hello() {
     let mut out = [0u8; 256];
@@ -92,7 +92,7 @@ pub(crate) fn banner_tls_server_hello() {
 /// A kernel that perturbs the ClientHello layout, the ServerHello
 /// parser, the key-schedule label or chaining order, or the Finished
 /// MAC construction panics here and the banners never appear.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_tls_client() {
     // 1) ClientHello build — length + prefix lock.
@@ -219,7 +219,7 @@ pub(crate) fn banner_tls_client() {
 /// that a corrupted durable PSK is rejected rather than silently
 /// producing a wrong early secret. Emits
 /// `TLS RESUME OK psk=<hex8>\n`.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_tls_resumption() {
     use target_enterprise::tls::{
@@ -230,7 +230,7 @@ pub(crate) fn banner_tls_resumption() {
     // Fixture handshake output (a real deployment takes these from the
     // completed handshake; the banner exercises the derivation path).
     let master_secret = [0x42u8; 32];
-    let transcript = b"proteus kernel resumption banner transcript";
+    let transcript = b"cuttle kernel resumption banner transcript";
     let ticket_nonce = [0xA5u8; 32];
 
     let mut rms = [0u8; 32];
@@ -291,9 +291,9 @@ pub(crate) fn banner_tls_resumption() {
 /// The byte-equality check against `NET_EXPECTED_DATAGRAM` is the
 /// load-bearing wire-equivalence proof inside the kernel: a morph
 /// candidate that produces different bytes panics here rather than
-/// reaching the trailing PROTEUS-TE HALT banner — the QEMU smoke test
+/// reaching the trailing CUTTLE-TE HALT banner — the QEMU smoke test
 /// then surfaces the missing banner as a failure.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_net_build() {
     let mut buf = [0u8; kf::NET_EXPECTED_LEN];
@@ -369,10 +369,10 @@ pub(crate) fn banner_net_build() {
 //   `TCP handshake OK state=ESTABLISHED seq=<hex8>\n`
 //   `TCP teardown OK state=CLOSED snd_nxt=<hex8>\n`
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_tcp() {
-    use proteus_contracts::{tcp_flags, Tcp};
+    use cuttle_contracts::{tcp_flags, Tcp};
     use target_enterprise::tcp::{close, process_segment, Tcb, TcpImpl, TcpState};
 
     let server_ip: [u8; 4] = [10, 0, 0, 2];
@@ -571,12 +571,12 @@ pub(crate) fn banner_tcp() {
 //
 // A morph that perturbs the request-line tokenizer, the header-block
 // scanner, or the response status-line emitter panics inside this
-// banner and the trailing `PROTEUS-TE HALT` is suppressed.
+// banner and the trailing `CUTTLE-TE HALT` is suppressed.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_http() {
-    use proteus_contracts::{Http, HttpMethod};
+    use cuttle_contracts::{Http, HttpMethod};
     use target_enterprise::http::HttpImpl;
 
     // --- parse ---
@@ -629,38 +629,38 @@ pub(crate) fn banner_http() {
 }
 
 // ============================================================
-// DNS/RFC 1035: build an A-record query for `proteus.local`, parse it
+// DNS/RFC 1035: build an A-record query for `cuttle.local`, parse it
 // to recover the question name byte-for-byte, then build a response
 // pointing to 10.0.0.42 and assert the resulting bytes match the
 // locked golden encoding. Emits:
-//   `DNS query OK id=<hex4> qname=proteus.local\n`
+//   `DNS query OK id=<hex4> qname=cuttle.local\n`
 //   `DNS response OK id=<hex4> ans=10.0.0.42 bytes=<N>\n`
 //
 // A morph that perturbs name encoding, header byte order, or the
 // answer-section assembly panics here and the trailing banners are
 // suppressed.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_dns() {
-    use proteus_contracts::{dns_class, dns_flags, Dns, DnsRecordType};
+    use cuttle_contracts::{dns_class, dns_flags, Dns, DnsRecordType};
     use target_enterprise::dns::DnsImpl;
 
     let qid: u16 = 0xC0DE;
 
     // --- query build ---
     let mut qbuf = [0u8; 64];
-    let qn = match DnsImpl::build_a_query(qid, b"proteus.local", &mut qbuf) {
+    let qn = match DnsImpl::build_a_query(qid, b"cuttle.local", &mut qbuf) {
         Ok(n) => n,
         Err(_) => panic!("DNS build_a_query returned Err"),
     };
-    // Byte-exact assertion: known canonical encoding of "proteus.local"
+    // Byte-exact assertion: known canonical encoding of "cuttle.local"
     // as an A query with RD set.
     let qexpected: &[u8] = &[
         0xC0, 0xDE, // id
         0x01, 0x00, // flags (RD)
         0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // qd=1, an/ns/ar=0
-        7, b'p', b'r', b'o', b't', b'e', b'u', b's',
+        6, b'c', b'u', b't', b't', b'l', b'e',
         5, b'l', b'o', b'c', b'a', b'l', 0, // QNAME
         0x00, 0x01, 0x00, 0x01, // QTYPE=A, QCLASS=IN
     ];
@@ -701,7 +701,7 @@ pub(crate) fn banner_dns() {
     hex_encode(&id_be, 2, &mut hex);
     line[pos..pos + 4].copy_from_slice(&hex);
     pos += 4;
-    let mid = b" qname=proteus.local";
+    let mid = b" qname=cuttle.local";
     line[pos..pos + mid.len()].copy_from_slice(mid);
     pos += mid.len();
     line[pos] = b'\n';
@@ -760,7 +760,7 @@ pub(crate) fn banner_dns() {
 
 // ============================================================
 // ICMP/RFC 792: build an echo request (ping) with id=0x4242, seq=7,
-// payload "proteus-ping", parse it (which verifies the RFC 1071
+// payload "cuttle-ping", parse it (which verifies the RFC 1071
 // checksum), then build the matching echo reply and confirm the
 // reply parses with type=ECHO_REPLY and identical id/seq. Emits:
 //   `ICMP echo_req OK id=4242 seq=7 cksum=<hex4>\n`
@@ -770,15 +770,15 @@ pub(crate) fn banner_dns() {
 // the identifier/sequence byte order panics inside `banner_icmp` and
 // these banners never appear.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_icmp() {
-    use proteus_contracts::{icmp_type, Icmp};
+    use cuttle_contracts::{icmp_type, Icmp};
     use target_enterprise::icmp::IcmpImpl;
 
     let id: u16 = 0x4242;
     let seq: u16 = 7;
-    let payload: &[u8] = b"proteus-ping";
+    let payload: &[u8] = b"cuttle-ping";
 
     // --- build + parse echo request ---
     let mut qbuf = [0u8; 32];
@@ -876,10 +876,10 @@ pub(crate) fn banner_icmp() {
 // encoding, VLAN TCI field packing, or the header byte layout
 // panics in `banner_eth` and the banners never appear.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_eth() {
-    use proteus_contracts::{ether_type, Eth};
+    use cuttle_contracts::{ether_type, Eth};
     use target_enterprise::ethernet::{
         is_broadcast, pack_vlan_tci, vlan_pcp, vlan_vid, EthImpl, ETH_HEADER_LEN,
     };
@@ -928,7 +928,7 @@ pub(crate) fn banner_eth() {
 
     // Broadcast detection sanity — used by the eventual NIC driver to
     // short-circuit the unicast-filter path.
-    let bcast = proteus_contracts::ETH_BROADCAST_MAC;
+    let bcast = cuttle_contracts::ETH_BROADCAST_MAC;
     if !is_broadcast(&bcast) {
         panic!("ETH is_broadcast(ETH_BROADCAST_MAC) returned false");
     }
@@ -1060,10 +1060,10 @@ pub(crate) fn banner_eth() {
 // poison-defence routine panics inside `banner_arp` and the
 // banners never appear.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_arp() {
-    use proteus_contracts::{arp_op, Arp};
+    use cuttle_contracts::{arp_op, Arp};
     use target_enterprise::arp::{ArpCache, ArpImpl, PACKET_LEN};
 
     let sender_mac: [u8; 6] = [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
@@ -1212,10 +1212,10 @@ pub(crate) fn banner_arp() {
 // magic-cookie offset, or breaks the option TLV scan panics here
 // and the trailing banners never appear.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_dhcp() {
-    use proteus_contracts::{dhcp_msg_type, Dhcp, DhcpClientState, DHCP_FIXED_HEADER_LEN};
+    use cuttle_contracts::{dhcp_msg_type, Dhcp, DhcpClientState, DHCP_FIXED_HEADER_LEN};
     use target_enterprise::dhcp::{DhcpClient, DhcpImpl, DHCP_MAX_MESSAGE_LEN};
 
     let mac: [u8; 6] = [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
@@ -1383,7 +1383,7 @@ pub(crate) fn build_dhcp_reply_fixture(
     dns: Option<[u8; 4]>,
     lease_secs: Option<u32>,
 ) -> usize {
-    use proteus_contracts::{
+    use cuttle_contracts::{
         dhcp_option, DHCP_FIXED_HEADER_LEN, DHCP_HLEN_ETHERNET, DHCP_HTYPE_ETHERNET,
         DHCP_MAGIC_COOKIE, DHCP_OP_BOOTREPLY,
     };
@@ -1454,7 +1454,7 @@ pub(crate) fn build_dhcp_reply_fixture(
 //
 // A kernel that perturbs the dump layout (sector offsets, CRC poly,
 // header byte order) or the symbol-resolver binary search panics in
-// this banner and the trailing `PROTEUS-TE HALT` is suppressed.
+// this banner and the trailing `CUTTLE-TE HALT` is suppressed.
 // ============================================================
 // ============================================================
 // TASK-048: VirtIO-net driver (VirtIO 1.0 §5.1). Drive a complete
@@ -1476,10 +1476,10 @@ pub(crate) fn build_dhcp_reply_fixture(
 // status sequence, the feature-bit constants, or the TX/RX ring
 // arithmetic panics here and these banners never appear.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_virtio_net() {
-    use proteus_contracts::NetDevice;
+    use cuttle_contracts::NetDevice;
     use target_enterprise::virtio_net::{MemVirtioBus, VirtioNet, MAX_FRAME_LEN};
 
     // The MemVirtioBus carries a 64 KiB shadow + observation/pending
@@ -1645,7 +1645,7 @@ pub(crate) fn banner_virtio_net() {
 ///   timestamp raw value (decimal) recovered from the planted u64.
 /// - `SNTP reply OK offset_ns=0 delay_ns=1000000000` — the locked
 ///   skew computed from the symmetric reply timestamps.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_sntp() {
     // ------------------------------------------------------------------
@@ -1824,7 +1824,7 @@ pub(crate) fn banner_sntp() {
 /// the descriptor STATUS/CMD constants, or the register-offset
 /// constants intact will preserve the banner; a morph that perturbs
 /// the wire surface will fail the in-order sweep on this banner.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_e1000() {
     // The driver embeds two 16-slot ring arrays of 1518-byte buffers
@@ -1833,7 +1833,7 @@ pub(crate) fn banner_e1000() {
     // Park BOTH in static storage initialised through `const fn`
     // constructors guarded by spin::Mutex so no large value ever lives on the stack.
     use target_enterprise::e1000::{build_banner_frame, E1000Impl, MemMmioBus};
-    use proteus_contracts::{EthernetController, LinkState};
+    use cuttle_contracts::{EthernetController, LinkState};
 
     static DRIVER_STORAGE: spin::Mutex<E1000Impl> = spin::Mutex::new(E1000Impl::new());
     static BUS_STORAGE: spin::Mutex<MemMmioBus> = spin::Mutex::new(MemMmioBus::zeroed());
@@ -1938,7 +1938,7 @@ pub(crate) fn banner_e1000() {
 
 // ============================================================
 // TFTP / TASK-058: RFC 1350 client-side wire codec. The kernel
-// builds an RRQ for `/proteus-boot.img` in octet mode, asserts
+// builds an RRQ for `/cuttle-boot.img` in octet mode, asserts
 // the byte-exact request; parses a locked ACK(1) reply, recovers
 // block=1; parses a locked DATA(2, "0123456789") packet, recovers
 // block=2 + 10-byte payload byte-for-byte. Emits:
@@ -1950,27 +1950,27 @@ pub(crate) fn banner_e1000() {
 // order panics inside `banner_tftp` and these banners never
 // appear.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_tftp() {
-    use proteus_contracts::{Tftp, TftpMode, TftpPacket};
+    use cuttle_contracts::{Tftp, TftpMode, TftpPacket};
     use target_enterprise::tftp::TftpImpl;
 
     // --- build RRQ ---
     let mut rrq_buf = [0u8; 64];
     let rrq_n =
-        match TftpImpl::build_rrq(b"/proteus-boot.img", TftpMode::Octet, &mut rrq_buf) {
+        match TftpImpl::build_rrq(b"/cuttle-boot.img", TftpMode::Octet, &mut rrq_buf) {
             Ok(n) => n,
             Err(_) => panic!("TFTP banner: build_rrq failed"),
         };
-    // Expected: opcode(0x0001) + "/proteus-boot.img"(17) + NUL +
+    // Expected: opcode(0x0001) + "/cuttle-boot.img"(17) + NUL +
     // "octet"(5) + NUL = 2 + 17 + 1 + 5 + 1 = 26.
-    // Wait, /proteus-boot.img is 17 chars. So 2+17+1+5+1 = 26.
+    // Wait, /cuttle-boot.img is 17 chars. So 2+17+1+5+1 = 26.
     // The banner text uses dec_u64 so we just need consistency.
     // Locked expected bytes:
     let expected_rrq: &[u8] = &[
         0x00, 0x01, // opcode = RRQ
-        b'/', b'p', b'r', b'o', b't', b'e', b'u', b's', b'-', b'b', b'o', b'o', b't', b'.',
+        b'/', b'c', b'u', b't', b't', b'l', b'e', b'-', b'b', b'o', b'o', b't', b'.',
         b'i', b'm', b'g', // filename (17 bytes)
         0x00, // NUL
         b'o', b'c', b't', b'e', b't', // mode
@@ -2056,10 +2056,10 @@ pub(crate) fn banner_tftp() {
 }
 
 // TASK-086 DNS name
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_dns_name() {
-    use proteus_contracts::{DnsName, DNS_MAX_LABELS};
+    use cuttle_contracts::{DnsName, DNS_MAX_LABELS};
     use target_enterprise::dns_name::DnsNameImpl;
 
     let mut wire = [0u8; 32];

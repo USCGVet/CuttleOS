@@ -6,7 +6,7 @@ pub(crate) use crate::*;
 /// IOMMU: instantiate `IommuImpl<4, 8, 16>`, create a domain, bind one
 /// device, map one page, translate, assert the host PA matches the
 /// locked fixture, emit `IOMMU translate OK pa=<hex8>\n`.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_iommu_translate() {
     let mut iommu: IommuImpl<
@@ -74,11 +74,11 @@ pub(crate) fn banner_iommu_translate() {
 // banners is missing from the serial log and the QEMU smoke test
 // surfaces it.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_dma() {
-    use proteus_contracts::Iommu;
-    use proteus_contracts::caps::NET_RAW;
+    use cuttle_contracts::Iommu;
+    use cuttle_contracts::caps::NET_RAW;
     use target_enterprise::iommu::{DeviceId as IommuDeviceId, IommuImpl as DmaIommuImpl};
     use target_enterprise::scheduler::{Task, TaskId};
     use target_enterprise::syscall::{dispatch_dma, SYS_DMA_MAP, SYS_DMA_UNMAP};
@@ -387,7 +387,7 @@ pub(crate) fn exec_service_ring3_stub(
             "sidt [r10]",
             "mov r13d, cs",
             "mov r14d, ss",
-            // Load Proteus GDT, reload CS=0x08 and SS/DS/ES=0x10, load TR=0x28, load IDT.
+            // Load Cuttle GDT, reload CS=0x08 and SS/DS/ES=0x10, load TR=0x28, load IDT.
             "lgdt [r11]",
             "push {k_cs}",
             "lea rax, [rip + 2f]",
@@ -507,7 +507,7 @@ pub(crate) fn exec_service_ring3_stub(
     pid == 1 && pid.wrapping_add(sys_arg0) == 1u64.wrapping_add(expected_resp)
 }
 
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_ring3_transition() {
     let ring3_code: [u8; 32] = [
@@ -549,10 +549,10 @@ pub(crate) fn banner_ring3_transition() {
 // inside `banner_smp` and the trailing banners are
 // suppressed.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_smp() {
-    use proteus_contracts::{smp_consts, ApicWriter, Smp};
+    use cuttle_contracts::{smp_consts, ApicWriter, Smp};
     use target_enterprise::smp::{build_madt_fixture, SmpImpl};
 
     // 1. Build a 4-CPU MADT in a stack buffer + parse it.
@@ -701,10 +701,10 @@ pub(crate) fn banner_smp() {
 // vendor-none sentinel panics inside `banner_pci` and these banners
 // never appear.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_pci() {
-    use proteus_contracts::{pci_class, Pci, PciAddress, PciBar};
+    use cuttle_contracts::{pci_class, Pci, PciAddress, PciBar};
     use target_enterprise::pci::{PciImpl, RecordingBus};
 
     // 1. Build the in-RAM bus with two QEMU-canonical devices +
@@ -842,10 +842,10 @@ pub(crate) fn banner_pci() {
 // dance, BCD decode, or Gregorian conversion panics inside
 // `banner_timer` and these banners never appear.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_timer() {
-    use proteus_contracts::{
+    use cuttle_contracts::{
         PicTimer, Rtc, PIT_CH0_PORT, PIT_CMD_CH0_LOHI_MODE3_BIN, PIT_CMD_PORT, RTC_REG_DAY,
         RTC_REG_HOURS, RTC_REG_MINUTES, RTC_REG_MONTH, RTC_REG_SECONDS, RTC_REG_STATUS_A,
         RTC_REG_STATUS_B, RTC_REG_YEAR, RTC_STATUS_B_24H,
@@ -942,10 +942,10 @@ pub(crate) fn banner_timer() {
 }
 
 // TASK-089 xHCI No-Op TRB
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_xhci_trb() {
-    use proteus_contracts::{XhciTrb, XHCI_TRB_TYPE_NOOP};
+    use cuttle_contracts::{XhciTrb, XHCI_TRB_TYPE_NOOP};
     use target_enterprise::xhci_trb::XhciTrbImpl;
 
     let w = XhciTrbImpl::encode_noop(true);
@@ -956,10 +956,10 @@ pub(crate) fn banner_xhci_trb() {
 }
 
 // TASK-090 UEFI GOP mode
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_uefi_gop() {
-    use proteus_contracts::UefiGop;
+    use cuttle_contracts::UefiGop;
     use target_enterprise::uefi_gop::UefiGopImpl;
 
     let m = UefiGopImpl::mode_1280x720();
@@ -978,10 +978,10 @@ pub(crate) fn banner_uefi_gop() {
 }
 
 // TASK-083 IOAPIC
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_ioapic() {
-    use proteus_contracts::IoApic;
+    use cuttle_contracts::IoApic;
     use target_enterprise::ioapic::{banner_entry, IoApicImpl};
 
     let e = banner_entry();
@@ -994,10 +994,10 @@ pub(crate) fn banner_ioapic() {
 }
 
 // TASK-084 LAPIC ICR
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_lapic() {
-    use proteus_contracts::{LapicIcr, ICR_DELIVERY_INIT};
+    use cuttle_contracts::{LapicIcr, ICR_DELIVERY_INIT};
     use target_enterprise::lapic_icr::LapicIcrImpl;
 
     let c = LapicIcrImpl::init(0);
@@ -1008,10 +1008,10 @@ pub(crate) fn banner_lapic() {
 }
 
 // TASK-079 Multiboot2
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_mb2() {
-    use proteus_contracts::{Mb2Tag, Multiboot2, MB2_MAX_TAGS};
+    use cuttle_contracts::{Mb2Tag, Multiboot2, MB2_MAX_TAGS};
     use target_enterprise::multiboot2::{build_banner_fixture, MB2_FIXTURE_LEN, Multiboot2Impl};
 
     let mut img = [0u8; MB2_FIXTURE_LEN];
@@ -1029,10 +1029,10 @@ pub(crate) fn banner_mb2() {
 }
 
 // TASK-081 RSDP
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_rsdp() {
-    use proteus_contracts::AcpiRsdp;
+    use cuttle_contracts::AcpiRsdp;
     use target_enterprise::acpi_rsdp::{build_banner_fixture, AcpiRsdpImpl};
 
     let mut b = [0u8; 20];
@@ -1045,10 +1045,10 @@ pub(crate) fn banner_rsdp() {
 }
 
 // TASK-082 frame bitmap
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_frame() {
-    use proteus_contracts::FrameBitmap;
+    use cuttle_contracts::FrameBitmap;
     use target_enterprise::frame_bitmap::FrameBitmapImpl;
 
     let mut b = FrameBitmapImpl::new();
@@ -1061,10 +1061,10 @@ pub(crate) fn banner_frame() {
 }
 
 // TASK-075: 16550 init sequence
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_serial() {
-    use proteus_contracts::{Serial16550, SERIAL_COM1, SERIAL_INIT_WRITES};
+    use cuttle_contracts::{Serial16550, SERIAL_COM1, SERIAL_INIT_WRITES};
     use target_enterprise::serial16550::{expected_com1_init, RecordingSerialPort, Serial16550Impl};
 
     let mut p = RecordingSerialPort::new();
@@ -1084,10 +1084,10 @@ pub(crate) fn banner_serial() {
 }
 
 // TASK-076: tick source mux
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_tick() {
-    use proteus_contracts::{TickKind, TickSource};
+    use cuttle_contracts::{TickKind, TickSource};
     use target_enterprise::tick_source::TickSourceImpl;
 
     let mut t = TickSourceImpl::new();
@@ -1103,10 +1103,10 @@ pub(crate) fn banner_tick() {
 }
 
 // TASK-077: virtio pci caps
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_virtio_caps() {
-    use proteus_contracts::{
+    use cuttle_contracts::{
         VirtioPciCap, VirtioPciCaps, VIRTIO_PCI_CAP_COMMON_CFG, VIRTIO_PCI_CAP_MAX,
     };
     use target_enterprise::virtio_pci_caps::{banner_read_dword, VirtioPciCapsImpl};
@@ -1129,10 +1129,10 @@ pub(crate) fn banner_virtio_caps() {
 }
 
 // TASK-071: Watchdog arm/pet/fire.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_watchdog() {
-    use proteus_contracts::{Watchdog, WatchdogError};
+    use cuttle_contracts::{Watchdog, WatchdogError};
     use target_enterprise::watchdog::{BANNER_DEADLINE, WatchdogImpl};
 
     let mut w = WatchdogImpl::new();
@@ -1165,10 +1165,10 @@ pub(crate) fn banner_watchdog() {
 }
 
 // TASK-073: Power S5
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_power() {
-    use proteus_contracts::{Power, SLP_TYP_S5};
+    use cuttle_contracts::{Power, SLP_TYP_S5};
     use target_enterprise::power::PowerImpl;
 
     let p = PowerImpl::encode_s5(SLP_TYP_S5);
@@ -1179,10 +1179,10 @@ pub(crate) fn banner_power() {
 }
 
 // TASK-074: ELF64
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_elf() {
-    use proteus_contracts::{Elf64, ELF_MAX_PHDRS, ElfPhdr};
+    use cuttle_contracts::{Elf64, ELF_MAX_PHDRS, ElfPhdr};
     use target_enterprise::elf64::{
         build_banner_fixture, ELF_BANNER_ENTRY, ELF_BANNER_PHNUM, ELF_FIXTURE_LEN, Elf64Impl,
     };
@@ -1232,10 +1232,10 @@ pub(crate) fn banner_elf() {
 }
 
 // TASK-067: HPET — program 1 ms periodic timer0 against recording bus.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_hpet() {
-    use proteus_contracts::Hpet;
+    use cuttle_contracts::Hpet;
     use target_enterprise::hpet::{
         BANNER_PERIOD_FS, BANNER_PERIOD_MS, HpetImpl, RecordingHpetBus,
     };
@@ -1278,10 +1278,10 @@ pub(crate) fn banner_hpet() {
 }
 
 // TASK-069: Keyboard set-1 stream a/b.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_keyboard() {
-    use proteus_contracts::{KeyCode, Keyboard, KBD_BREAK_A, KBD_BREAK_B, KBD_MAKE_A, KBD_MAKE_B};
+    use cuttle_contracts::{KeyCode, Keyboard, KBD_BREAK_A, KBD_BREAK_B, KBD_MAKE_A, KBD_MAKE_B};
     use target_enterprise::keyboard::KeyboardImpl;
 
     let mut kbd = KeyboardImpl::new();

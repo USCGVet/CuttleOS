@@ -1,6 +1,6 @@
 //! `factory_builder_pkg` — heavy packager binary.
 //!
-//! This crate lives OUT of the Proteus workspace because the
+//! This crate lives OUT of the Cuttle workspace because the
 //! `bootloader = "0.11"` build.rs spawns nested cargo invocations with
 //! `-Z` flags that require nightly. Keeping it isolated lets the main
 //! workspace stay on stable.

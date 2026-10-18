@@ -9,9 +9,9 @@
 //! # Invocation
 //!
 //! ```text
-//! $env:PROTEUS_SOAK_BUNDLE_MINI = "1"
-//! $env:PROTEUS_SOAK_ITERS = "2"   # optional; default 2
-//! cargo test -p proteus-morph-engine --test soak_bundle_mini -- --nocapture
+//! $env:CUTTLE_SOAK_BUNDLE_MINI = "1"
+//! $env:CUTTLE_SOAK_ITERS = "2"   # optional; default 2
+//! cargo test -p cuttle-morph-engine --test soak_bundle_mini -- --nocapture
 //! ```
 
 use std::fs;
@@ -20,7 +20,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use proteus_morph_engine::{
+use cuttle_morph_engine::{
     daemon::{run_daemon, DaemonArgs, DaemonReport, DAEMON_LOG},
     verify_chain_with_options, SynthesizerKind, VerifyOptions, ATTEST_DIR_ENV,
 };
@@ -145,9 +145,9 @@ fn write_report(
 
 #[test]
 fn mini_bundle_daemon_soak() {
-    if std::env::var("PROTEUS_SOAK_BUNDLE_MINI").as_deref() != Ok("1") {
+    if std::env::var("CUTTLE_SOAK_BUNDLE_MINI").as_deref() != Ok("1") {
         eprintln!(
-            "SKIP: set PROTEUS_SOAK_BUNDLE_MINI=1 to run the mini-bundle soak \
+            "SKIP: set CUTTLE_SOAK_BUNDLE_MINI=1 to run the mini-bundle soak \
              (target_enterprise compile × N cycles; several minutes)"
         );
         return;
@@ -162,7 +162,7 @@ fn mini_bundle_daemon_soak() {
         soak.join("scheduler.toml").display()
     );
 
-    let iters: u64 = std::env::var("PROTEUS_SOAK_ITERS")
+    let iters: u64 = std::env::var("CUTTLE_SOAK_ITERS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
@@ -174,7 +174,7 @@ fn mini_bundle_daemon_soak() {
     );
 
     let verify_status = Command::new("cargo")
-        .args(["build", "-p", "proteus-verifier", "--bin", "verify"])
+        .args(["build", "-p", "cuttle-verifier", "--bin", "verify"])
         .current_dir(&root)
         .status()
         .expect("build verify");

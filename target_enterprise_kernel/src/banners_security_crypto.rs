@@ -6,7 +6,7 @@ pub(crate) use crate::*;
 /// HASH: hash the locked fixture input through `HashImpl`, assert the
 /// 32-byte digest matches the locked expected bytes, emit
 /// `HASH OK digest_sha=<hex16>\n`.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_hash_digest() {
     let mut got = [0u8; 32];
@@ -39,7 +39,7 @@ pub(crate) fn banner_hash_digest() {
 // the validate path exercises a realistic separation, not a contrived
 // minimum.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_kpti() {
     let mut kernel: PageTable<32> = PageTable::new();
@@ -106,13 +106,13 @@ pub(crate) fn banner_kpti() {
         // least surfaces the violation kind.
         serial_write_str("KPTI VALIDATE FAIL: ");
         match violation {
-            proteus_contracts::KptiViolation::SecretLeaked { .. } => {
+            cuttle_contracts::KptiViolation::SecretLeaked { .. } => {
                 serial_write_str("SecretLeaked\n")
             }
-            proteus_contracts::KptiViolation::UserPageMissing { .. } => {
+            cuttle_contracts::KptiViolation::UserPageMissing { .. } => {
                 serial_write_str("UserPageMissing\n")
             }
-            proteus_contracts::KptiViolation::KernelBitsSetOnUserPage { .. } => {
+            cuttle_contracts::KptiViolation::KernelBitsSetOnUserPage { .. } => {
                 serial_write_str("KernelBitsSetOnUserPage\n")
             }
         }
@@ -157,7 +157,7 @@ pub(crate) fn banner_kpti() {
 /// mask-score ordering invariant, the first-match-wins semantics, or
 /// the proto-byte equality check panics inside `banner_firewall` and
 /// the two banners never appear.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_firewall() {
     // ------------------------------------------------------------------
@@ -355,7 +355,7 @@ pub(crate) fn banner_firewall() {
 /// constant (header endianness, command codes, the auth-session
 /// constants, the PCR bitmap arithmetic, the response size-field
 /// check) panics here and the two banners never appear.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_tpm() {
     // ------------------------------------------------------------------
@@ -649,7 +649,7 @@ pub(crate) fn banner_tpm() {
 ///   `AUDIT_SNAPSHOT_HEADER_LEN + 3 * AUDIT_EVENT_WIRE_LEN = 308`
 ///   bytes; offline-parser round-trips every record's verdict +
 ///   message; the recorded magic == 'AUDT' and high_watermark == 3.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_audit() {
     // Three locked events — one per verdict variant. The kernel uses
@@ -820,9 +820,9 @@ pub(crate) fn banner_audit() {
 /// or the EXIT terminator path panics inside `banner_ebpf` and the
 /// banners never appear. The stack-size banner also fails if the
 /// contract's [`BPF_STACK_SIZE`] constant drifts — surfacing a
-/// schema-incompatible change before the trailing `PROTEUS-TE
+/// schema-incompatible change before the trailing `CUTTLE-TE
 /// HALT` line.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_ebpf() {
     // Run the reference program three times. The context is
@@ -847,8 +847,8 @@ pub(crate) fn banner_ebpf() {
     // Also validate the trait-direct path against a 1-instruction
     // EXIT program — exercises `EBpfImpl::run` directly so a morph
     // that breaks the trait dispatch is caught here.
-    let exit_only = [proteus_contracts::BpfInstr::new(
-        proteus_contracts::bpf_op::BPF_OP_EXIT,
+    let exit_only = [cuttle_contracts::BpfInstr::new(
+        cuttle_contracts::bpf_op::BPF_OP_EXIT,
         0,
         0,
         0,
@@ -894,10 +894,10 @@ pub(crate) fn banner_ebpf() {
 }
 
 // TASK-087 DRBG
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_drbg() {
-    use proteus_contracts::HmacDrbg;
+    use cuttle_contracts::HmacDrbg;
     use target_enterprise::hmac_drbg::{banner_out16, BANNER_LABEL, BANNER_SEED, HmacDrbgImpl};
 
     let mut o = [0u8; 16];
@@ -909,10 +909,10 @@ pub(crate) fn banner_drbg() {
 }
 
 // TASK-091 Attest TLV
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_attest_tlv() {
-    use proteus_contracts::AttestTlv;
+    use cuttle_contracts::AttestTlv;
     use target_enterprise::attest_tlv::{banner_three_tags, AttestTlvImpl};
 
     let mut b = [0u8; 64];
@@ -928,7 +928,7 @@ pub(crate) fn banner_attest_tlv() {
 }
 
 // TASK-092 Base64
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_base64() {
     use target_enterprise::base64::banner_roundtrip;
@@ -940,10 +940,10 @@ pub(crate) fn banner_base64() {
 }
 
 // TASK-080 CRC32C
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_crc32c() {
-    use proteus_contracts::Crc32c;
+    use cuttle_contracts::Crc32c;
     use target_enterprise::crc32c::Crc32cImpl;
 
     if Crc32cImpl::hash(b"123456789") != 0xE306_9283 {
@@ -953,10 +953,10 @@ pub(crate) fn banner_crc32c() {
 }
 
 // TASK-078: sig kat
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_sigkat() {
-    use proteus_contracts::{SigKat, SIGKAT_VECTOR_COUNT};
+    use cuttle_contracts::{SigKat, SIGKAT_VECTOR_COUNT};
     use target_enterprise::sigkat::SigKatImpl;
 
     let s = SigKatImpl::run_all();
@@ -977,10 +977,10 @@ pub(crate) fn banner_sigkat() {
 }
 
 // TASK-072: RNG KAT
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_rng() {
-    use proteus_contracts::Random;
+    use cuttle_contracts::Random;
     use target_enterprise::random::{banner_expected_prefix8, BANNER_SEED, RandomImpl};
 
     let mut r = RandomImpl::new();
@@ -1023,10 +1023,10 @@ pub(crate) fn banner_rng() {
 }
 
 // TASK-068: Stack canary mint + mismatch fingerprint.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_canary() {
-    use proteus_contracts::StackCanary;
+    use cuttle_contracts::StackCanary;
     use target_enterprise::stack_canary::{BANNER_SEED, StackCanaryImpl};
 
     let tok = match StackCanaryImpl::mint(&BANNER_SEED) {
@@ -1075,10 +1075,10 @@ pub(crate) fn banner_canary() {
 // reply, re-frames it, and asserts the checksum digits are `00`.
 // Banner: `GDBSTUB parse OK cmd=g cksum=67`.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_gdbstub() {
-    use proteus_contracts::{GdbCommand, GdbStub};
+    use cuttle_contracts::{GdbCommand, GdbStub};
     use target_enterprise::gdbstub::GdbStubImpl;
 
     let frame = b"$g#67";
@@ -1148,10 +1148,10 @@ pub(crate) fn banner_gdbstub() {
 // HKDF arithmetic panics inside `banner_kat` and the banner never
 // appears.
 // ============================================================
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_kat() {
-    use proteus_contracts::{KatRunner, KAT_VECTOR_COUNT};
+    use cuttle_contracts::{KatRunner, KAT_VECTOR_COUNT};
     use target_enterprise::kat::KatImpl;
 
     let suite = KatImpl::run_all();
@@ -1186,10 +1186,10 @@ pub(crate) fn banner_kat() {
 // morph that perturbs any byte position in the TLV walker, the
 // SPKI BIT STRING decode, or the UTCTime arithmetic panics inside
 // `banner_x509` and the banners never appear.
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_x509() {
-    use proteus_contracts::{X509PubKey, X509PubKeyAlg, X509Time, X509};
+    use cuttle_contracts::{X509PubKey, X509PubKeyAlg, X509Time, X509};
     use target_enterprise::x509::X509Impl;
 
     let cert = match X509Impl::parse(kf::X509_FIXTURE_DER) {
@@ -1275,7 +1275,7 @@ pub(crate) fn banner_x509() {
 /// into the boot image. Does **not** claim implant immunity.
 #[inline(never)]
 pub(crate) fn banner_durable_seal() {
-    use proteus_contracts::{AUDIT_SNAPSHOT_HEADER_LEN, AUDIT_SNAPSHOT_MAGIC};
+    use cuttle_contracts::{AUDIT_SNAPSHOT_HEADER_LEN, AUDIT_SNAPSHOT_MAGIC};
     use target_enterprise::durable_seal::{
         seal_bytes, seal_bytes_keyed, seal_matches_keyed, DURABLE_DIGEST_LEN,
     };
@@ -1316,7 +1316,7 @@ pub(crate) fn banner_durable_seal() {
     serial_write_bytes(&line[..pos]);
 }
 
-#[cfg(not(proteus_prod))]
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_panic_dump() {
     // Build the canonical CrashContext.
@@ -1330,7 +1330,7 @@ pub(crate) fn banner_panic_dump() {
         kmsg: kf::CRASH_KMSG,
     };
 
-    let mut buf = [0u8; proteus_contracts::CRASH_DUMP_BYTES];
+    let mut buf = [0u8; cuttle_contracts::CRASH_DUMP_BYTES];
     let mut sink = MemorySectorSink::new();
     let (lba_start, lba_end) = match PanicDumpImpl::dump_to_sink(&ctx, &mut buf, &mut sink) {
         Ok(t) => t,
@@ -1339,7 +1339,7 @@ pub(crate) fn banner_panic_dump() {
     if lba_start != DUMP_START_LBA {
         panic!("panic_dump: lba_start drift");
     }
-    if lba_end - lba_start != proteus_contracts::CRASH_DUMP_SECTORS {
+    if lba_end - lba_start != cuttle_contracts::CRASH_DUMP_SECTORS {
         panic!("panic_dump: lba range size drift");
     }
 
@@ -1362,7 +1362,7 @@ pub(crate) fn banner_panic_dump() {
     if header.backtrace_count as usize != kf::CRASH_BACKTRACE.len() {
         panic!("panic_dump: backtrace_count drift");
     }
-    if header.register_count as usize != proteus_contracts::CRASH_REG_COUNT {
+    if header.register_count as usize != cuttle_contracts::CRASH_REG_COUNT {
         panic!("panic_dump: register_count drift");
     }
     // Header strings must round-trip.
@@ -1387,7 +1387,7 @@ pub(crate) fn banner_panic_dump() {
 
     // Disk bytes received by the sink must equal the build_dump output.
     let mut i = 0usize;
-    while i < proteus_contracts::CRASH_DUMP_BYTES {
+    while i < cuttle_contracts::CRASH_DUMP_BYTES {
         if sink.disk[i] != buf[i] {
             panic!("panic_dump: sink/buf byte drift");
         }
@@ -1395,7 +1395,7 @@ pub(crate) fn banner_panic_dump() {
     }
 
     // Backtrace recovery must round-trip.
-    let mut extracted_bt = [0u64; proteus_contracts::CRASH_BACKTRACE_MAX];
+    let mut extracted_bt = [0u64; cuttle_contracts::CRASH_BACKTRACE_MAX];
     let bt_n = match PanicDumpImpl::extract_backtrace(&buf, &mut extracted_bt) {
         Ok(n) => n,
         Err(_) => panic!("panic_dump: extract_backtrace failed"),

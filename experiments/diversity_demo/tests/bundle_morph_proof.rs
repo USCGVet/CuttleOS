@@ -18,7 +18,7 @@
 //! # Invocation
 //!
 //! ```text
-//! $env:PROTEUS_BUNDLE_MORPH_PROOF = "1"
+//! $env:CUTTLE_BUNDLE_MORPH_PROOF = "1"
 //! cargo test -p diversity_demo --test bundle_morph_proof -- --nocapture
 //! ```
 //!
@@ -40,7 +40,7 @@ const PROOF_CYCLE: u64 = 9103;
 /// are load-bearing; the rest sample each major enrolled subsystem so
 /// a silent morph regression is not limited to the 17-module needle.
 const REQUIRED_BANNERS: &[&str] = &[
-    "PROTEUS-TE OK",
+    "CUTTLE-TE OK",
     // crypto / transport
     "TLS hkdf OK prk_sha=",
     "TLS server_hello OK len=",
@@ -48,11 +48,11 @@ const REQUIRED_BANNERS: &[&str] = &[
     "NET build OK len=38 ip_cksum=63c7 udp_cksum=fa94",
     "TCP handshake OK state=ESTABLISHED seq=",
     "HTTP parse OK method=GET path=/healthz",
-    "DNS query OK id=c0de qname=proteus.local",
+    "DNS query OK id=c0de qname=cuttle.local",
     "ICMP echo_req OK id=4242",
     // durability + block
     "WAL replay OK frames=",
-    "NVMe init OK ctrl=PROTEUS-NVME-EMU",
+    "NVMe init OK ctrl=CUTTLE-NVME-EMU",
     "NVMe read_lba(7) OK first_byte=a5",
     "VIRTIO_BLK init OK capacity=32 blk_size=512",
     "VIRTIO_BLK roundtrip OK reqs=2 sector=3 first_byte=a5",
@@ -97,7 +97,7 @@ const REQUIRED_BANNERS: &[&str] = &[
     "NVME_HW identify OK sn=",
     "NVME_HW sector OK first_byte=5a",
     "DURABLE seal OK dig=",
-    "PROTEUS-TE HALT",
+    "CUTTLE-TE HALT",
 ];
 
 fn workspace_root() -> PathBuf {
@@ -154,9 +154,9 @@ impl Drop for SourceBackup {
 
 #[test]
 fn full_bundle_kernel_modules_boot_under_qemu() {
-    if std::env::var("PROTEUS_BUNDLE_MORPH_PROOF").as_deref() != Ok("1") {
+    if std::env::var("CUTTLE_BUNDLE_MORPH_PROOF").as_deref() != Ok("1") {
         eprintln!(
-            "SKIP: set PROTEUS_BUNDLE_MORPH_PROOF=1 to run the full-bundle \
+            "SKIP: set CUTTLE_BUNDLE_MORPH_PROOF=1 to run the full-bundle \
              morph QEMU proof (requires QEMU + nightly; diversifies all \
              [bundle.kernel] modules)"
         );
@@ -216,18 +216,18 @@ fn full_bundle_kernel_modules_boot_under_qemu() {
     for m in &modules {
         let path = enterprise.join("src").join(format!("{}.rs", m));
         let src = std::fs::read_to_string(&path).expect("read for diversify");
-        let seed = proteus_diversifier::Seed::derive(PROOF_CYCLE, m);
-        let opts = proteus_diversifier::DiversifyOptions::default();
+        let seed = cuttle_diversifier::Seed::derive(PROOF_CYCLE, m);
+        let opts = cuttle_diversifier::DiversifyOptions::default();
         assert!(!opts.stack_pad, "production diversify leaves stack_pad off");
-        let (candidate, log) = proteus_diversifier::diversify_with_options(&src, &seed, &opts)
+        let (candidate, log) = cuttle_diversifier::diversify_with_options(&src, &seed, &opts)
             .unwrap_or_else(|e| panic!("diversify {} failed: {:#}", m, e));
         assert!(
             log.pad_decisions.is_empty(),
             "{}: pad_decisions non-empty under production options",
             m
         );
-        let h_src = proteus_diversifier::canonical_hash(&src).expect("hash src");
-        let h_cand = proteus_diversifier::canonical_hash(&candidate).expect("hash cand");
+        let h_src = cuttle_diversifier::canonical_hash(&src).expect("hash src");
+        let h_cand = cuttle_diversifier::canonical_hash(&candidate).expect("hash cand");
         if h_src == h_cand {
             zero_diversity.push(m.clone());
             eprintln!(

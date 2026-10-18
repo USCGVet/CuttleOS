@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use proteus_verifier::perf::{
+use cuttle_verifier::perf::{
     evaluate_perf_gate, p95_u64, PerfGateOutcome, PerfMetrics,
     DEFAULT_PERF_INPUTS_PER_CYCLE, DEFAULT_PERF_THRESHOLD_PCT, DEFAULT_PERF_WINDOW,
 };
@@ -36,7 +36,7 @@ fn unique_dir(tag: &str) -> PathBuf {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "proteus-perf-pathological-{}-{}-{}-{}",
+        "cuttle-perf-pathological-{}-{}-{}-{}",
         tag, pid, nanos, n
     ));
     std::fs::create_dir_all(&dir).expect("create scratch dir");

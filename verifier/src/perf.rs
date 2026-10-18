@@ -300,7 +300,7 @@ pub fn read_baseline_window(path: &Path, n: usize) -> Result<Option<PerfMetrics>
 /// Percentile-95 across a slice of ns/call measurements, returning the
 /// integer ns value at the p95 position. This is the centralised
 /// definition the perf integration tests in `target_minimal` and
-/// `target_enterprise` import via the `proteus_verifier` dev-dep — any
+/// `target_enterprise` import via the `cuttle_verifier` dev-dep — any
 /// future change to the percentile formula propagates from one place to
 /// both ends of the measurement pipeline.
 ///

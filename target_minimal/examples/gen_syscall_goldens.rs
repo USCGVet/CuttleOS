@@ -1,10 +1,10 @@
 //! One-shot generator for DemoSyscallDispatch golden vectors. Run with
-//! `cargo run -p proteus-target-minimal --example gen_syscall_goldens`.
+//! `cargo run -p cuttle-target-minimal --example gen_syscall_goldens`.
 //! Prints lines suitable for appending to `golden.txt`. NOT part of the
 //! morph contract — this file is build-system scaffolding.
 
-use proteus_contracts::SyscallDispatch;
-use proteus_target_minimal::{DemoErrno, DemoSyscallDispatch};
+use cuttle_contracts::SyscallDispatch;
+use cuttle_target_minimal::{DemoErrno, DemoSyscallDispatch};
 
 fn fmt_res(r: &Result<u64, DemoErrno>) -> String {
     match r {

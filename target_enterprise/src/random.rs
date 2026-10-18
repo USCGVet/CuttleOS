@@ -7,8 +7,8 @@
 #![allow(missing_docs)]
 
 #[cfg(test)]
-use proteus_contracts::RANDOM_BLOCK_LEN;
-use proteus_contracts::{Random, RandomError, RANDOM_SEED_LEN};
+use cuttle_contracts::RANDOM_BLOCK_LEN;
+use cuttle_contracts::{Random, RandomError, RANDOM_SEED_LEN};
 
 /// Mixer state.
 pub struct RandomImpl {
@@ -164,7 +164,7 @@ pub fn banner_expected_prefix8() -> [u8; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::Random;
+    use cuttle_contracts::Random;
 
     #[test]
     fn constants() {

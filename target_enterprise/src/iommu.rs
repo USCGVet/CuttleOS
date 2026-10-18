@@ -12,7 +12,7 @@
 //! device-to-domain binding table, a per-domain page table, and a
 //! `translate` verb that walks the page table for a device's bound
 //! domain and either returns the host physical address or rejects
-//! the access with a [`proteus_contracts::IommuError`].
+//! the access with a [`cuttle_contracts::IommuError`].
 //!
 //! The donor's DMAR walker is preserved in [`dmar`] (a sibling
 //! sub-module). It is rewritten to take a raw byte buffer instead of
@@ -41,7 +41,7 @@
 //! morph engine will later swap this flat table for a multi-level
 //! tree; the public surface does not change.
 
-use proteus_contracts::{AccessKind, Iommu, IommuError, PagePerms};
+use cuttle_contracts::{AccessKind, Iommu, IommuError, PagePerms};
 
 /// Log-base-2 of the IOMMU page size. Locked at 12 (4 KiB), matching
 /// Intel VT-d's smallest second-level entry size.

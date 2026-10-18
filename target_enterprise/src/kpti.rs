@@ -15,7 +15,7 @@
 //! 1. The **algorithmic core** of KPTI — `build_user_view` and
 //!    `validate_user_view`. These are pure, host-testable, work on a
 //!    representation-agnostic `PageTable<N>` abstraction, and implement
-//!    the [`proteus_contracts::Kpti`] trait. They are the load-bearing
+//!    the [`cuttle_contracts::Kpti`] trait. They are the load-bearing
 //!    invariant boundary the contract guarantees: a per-task user view
 //!    of memory does not translate kernel `.text`, kernel heap, IDT,
 //!    or signing-key pages.
@@ -70,7 +70,7 @@
 
 #![allow(clippy::needless_range_loop)] // Index-based loops are clearer for table walks.
 
-use proteus_contracts::{Kpti, KptiViolation};
+use cuttle_contracts::{Kpti, KptiViolation};
 
 // ---------------------------------------------------------------------------
 // PTE bit definitions (x86_64 page table entry layout, locked)
@@ -315,7 +315,7 @@ impl<'a, const N: usize> Iterator for PageTableIter<'a, N> {
 }
 
 // ---------------------------------------------------------------------------
-// KptiImpl — implements proteus_contracts::Kpti
+// KptiImpl — implements cuttle_contracts::Kpti
 // ---------------------------------------------------------------------------
 
 /// Concrete KPTI implementation. Stateless — every operation is pure.

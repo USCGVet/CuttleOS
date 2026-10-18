@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     XhciTrb, XhciTrbError, XhciTrbWords, XHCI_TRB_CYCLE, XHCI_TRB_LEN, XHCI_TRB_TOGGLE_CYCLE,
     XHCI_TRB_TYPE_LINK, XHCI_TRB_TYPE_NOOP, XHCI_TRB_TYPE_SHIFT,
 };
@@ -103,7 +103,7 @@ pub fn banner_noop_type() -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::XhciTrb;
+    use cuttle_contracts::XhciTrb;
 
     #[test]
     fn constants() {

@@ -2,7 +2,7 @@
 //!
 //! Builds [`DiversityEvidence`](crate::attest::DiversityEvidence) from:
 //! 1. Source-side diversifier decision logs (always available on morph).
-//! 2. Pairwise kernel ELF gadget churn via `proteus_mtd_metrics` when
+//! 2. Pairwise kernel ELF gadget churn via `cuttle_mtd_metrics` when
 //!    base + variant binaries exist on disk.
 
 use std::path::Path;
@@ -29,7 +29,7 @@ pub fn rate_to_bps(rate: f64) -> u32 {
 
 /// SHA-256 of the `.text` section of an ELF/PE/COFF at `path`.
 pub fn text_sha256_of_elf(path: &Path) -> Result<String> {
-    let (text, _ip) = proteus_mtd_metrics::read_text_section(path)
+    let (text, _ip) = cuttle_mtd_metrics::read_text_section(path)
         .with_context(|| format!("read .text from {}", path.display()))?;
     Ok(hex_sha256(&text))
 }
@@ -79,25 +79,25 @@ pub fn from_diversifier_log(
 /// survival in basis points. Does not set diversifier counts or
 /// layout_seed — callers merge with [`from_diversifier_log`].
 pub fn from_elf_pair(base_elf: &Path, variant_elf: &Path) -> Result<DiversityEvidence> {
-    let (base_text, base_ip) = proteus_mtd_metrics::read_text_section(base_elf)
+    let (base_text, base_ip) = cuttle_mtd_metrics::read_text_section(base_elf)
         .with_context(|| format!("read .text from base {}", base_elf.display()))?;
-    let (var_text, var_ip) = proteus_mtd_metrics::read_text_section(variant_elf)
+    let (var_text, var_ip) = cuttle_mtd_metrics::read_text_section(variant_elf)
         .with_context(|| format!("read .text from variant {}", variant_elf.display()))?;
 
     let base_text_sha256 = hex_sha256(&base_text);
     let variant_text_sha256 = hex_sha256(&var_text);
 
-    let base_g = proteus_mtd_metrics::extract_gadgets(
+    let base_g = cuttle_mtd_metrics::extract_gadgets(
         &base_text,
         base_ip,
-        proteus_mtd_metrics::DEFAULT_MAX_INSTRS,
+        cuttle_mtd_metrics::DEFAULT_MAX_INSTRS,
     );
-    let var_g = proteus_mtd_metrics::extract_gadgets(
+    let var_g = cuttle_mtd_metrics::extract_gadgets(
         &var_text,
         var_ip,
-        proteus_mtd_metrics::DEFAULT_MAX_INSTRS,
+        cuttle_mtd_metrics::DEFAULT_MAX_INSTRS,
     );
-    let report = proteus_mtd_metrics::churn(&base_g, &var_g);
+    let report = cuttle_mtd_metrics::churn(&base_g, &var_g);
 
     Ok(DiversityEvidence {
         base_text_sha256: Some(base_text_sha256),
@@ -263,11 +263,11 @@ mod tests {
         // tiny hand-built x86-64 .text blob via a temp object is heavy.
         // Instead unit-test churn rates through mtd_metrics gadget sets
         // and bps conversion consistency.
-        use proteus_mtd_metrics::GadgetSet;
+        use cuttle_mtd_metrics::GadgetSet;
         let mut g = GadgetSet::default();
         g.by_offset.insert(0, "pop rax ; ret".into());
         g.by_offset.insert(8, "pop rbx ; ret".into());
-        let r = proteus_mtd_metrics::churn(&g, &g);
+        let r = cuttle_mtd_metrics::churn(&g, &g);
         assert_eq!(rate_to_bps(r.positional_survival()), 10_000);
         let _ = BTreeMap::<String, u32>::new();
     }

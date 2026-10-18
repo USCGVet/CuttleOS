@@ -1,4 +1,4 @@
-//! Post-link size-preserving x86-64 binary rewriter (`proteus-binmorph`).
+//! Post-link size-preserving x86-64 binary rewriter (`cuttle-binmorph`).
 //!
 //! Rewrites compiled ELF `.text` functions in place using a deterministic
 //! seed while preserving exact instruction-window byte lengths and execution

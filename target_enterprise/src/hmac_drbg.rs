@@ -5,8 +5,8 @@
 #![allow(missing_docs)]
 
 #[cfg(test)]
-use proteus_contracts::DRBG_OUT_LEN;
-use proteus_contracts::{HmacDrbg, DRBG_SEED_LEN};
+use cuttle_contracts::DRBG_OUT_LEN;
+use cuttle_contracts::{HmacDrbg, DRBG_SEED_LEN};
 
 use crate::tls::hmac_sha256;
 
@@ -37,7 +37,7 @@ pub fn expand_impl(seed: &[u8; DRBG_SEED_LEN], label: &[u8], out: &mut [u8]) {
 
 /// Banner seed + label.
 pub const BANNER_SEED: [u8; 32] = [0x0B; 32];
-pub const BANNER_LABEL: &[u8] = b"proteus-drbg";
+pub const BANNER_LABEL: &[u8] = b"cuttle-drbg";
 
 pub fn banner_out16() -> [u8; 16] {
     let mut o = [0u8; 16];
@@ -48,7 +48,7 @@ pub fn banner_out16() -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::HmacDrbg;
+    use cuttle_contracts::HmacDrbg;
 
     #[test]
     fn constants() {
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn label() {
-        assert_eq!(BANNER_LABEL, b"proteus-drbg");
+        assert_eq!(BANNER_LABEL, b"cuttle-drbg");
     }
 
     #[test]
@@ -157,8 +157,8 @@ mod tests {
     fn avalanche_one_bit_label() {
         let mut a = [0u8; 16];
         let mut b = [0u8; 16];
-        HmacDrbgImpl::expand(&BANNER_SEED, b"proteus-drbg", &mut a);
-        HmacDrbgImpl::expand(&BANNER_SEED, b"proteus-drbh", &mut b);
+        HmacDrbgImpl::expand(&BANNER_SEED, b"cuttle-drbg", &mut a);
+        HmacDrbgImpl::expand(&BANNER_SEED, b"cuttle-drbh", &mut b);
         assert_ne!(a, b);
     }
 

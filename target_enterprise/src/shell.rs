@@ -19,7 +19,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     bpf_op, caps, AuditEvent, AuditLog, AuditVerdict, BpfContext, BpfInstr, CanaryToken, EBpf,
     Elf64, ElfPhdr, Filesystem, FilterAction, FilterRule, Kpti, StackCanary, Tpm, WriteAheadLog,
     AUDIT_MESSAGE_LEN, BPF_MAX_INSTRUCTIONS, BPF_STACK_SIZE, ELF_CLASS64, ELF_DATA_LE,
@@ -58,8 +58,8 @@ pub const SHELL_FS_POOL: usize = 4096;
 pub const SHELL_FS_PART_SECTORS: usize = 16;
 /// Total byte size of the 16-sector block-backed filesystem partition (`8192` bytes).
 pub const SHELL_FS_PART_BYTES: usize = SHELL_FS_PART_SECTORS * 512;
-/// 8-byte superblock magic for the block-backed filesystem partition (`PRTSFS01`).
-pub const SHELL_FS_MAGIC: &[u8; 8] = b"PRTSFS01";
+/// 8-byte superblock magic for the block-backed filesystem partition (`CTTLFS01`).
+pub const SHELL_FS_MAGIC: &[u8; 8] = b"CTTLFS01";
 /// Maximum number of tasks in the live OS shell scheduler table.
 pub const SHELL_MAX_TASKS: usize = 16;
 /// Number of audit events retained in the live OS shell audit ring.
@@ -69,7 +69,7 @@ pub const SHELL_IMA_CAP: usize = 8;
 /// Maximum number of concurrent authenticated web/control-plane sessions.
 pub const SHELL_MAX_SESSIONS: usize = 4;
 /// Interactive console prompt string.
-pub const SHELL_PROMPT: &[u8] = b"proteus> ";
+pub const SHELL_PROMPT: &[u8] = b"cuttle> ";
 
 /// Authenticated dynamic web/control-plane session entry.
 #[derive(Copy, Clone, Debug)]
@@ -271,11 +271,11 @@ impl OsShell {
     /// Construct and seed a fresh live OS shell environment.
     ///
     /// Pre-populates:
-    /// - `/etc/hostname` (`"proteus-te\n"`)
-    /// - `/etc/os-release` (`"NAME=\"Proteus MTD OS\"\nVERSION=\"1.0-enterprise\"\nARCH=\"x86_64\"\n"`)
-    /// - `/etc/motd` (`"Proteus Enterprise Moving-Target-Defense OS\nType 'help' for commands.\n"`)
+    /// - `/etc/hostname` (`"cuttle-te\n"`)
+    /// - `/etc/os-release` (`"NAME=\"Cuttle MTD OS\"\nVERSION=\"1.0-enterprise\"\nARCH=\"x86_64\"\n"`)
+    /// - `/etc/motd` (`"Cuttle Enterprise Moving-Target-Defense OS\nType 'help' for commands.\n"`)
     /// - `/proc/net` (`"iface=virtio-net0 ip=10.0.2.15 udp=8080 tcp=80 icmp=echo\n"`)
-    /// - System tasks: PID 1 (`init`), PID 2 (`kthreadd-net`), PID 3 (`kthreadd-wal`), PID 4 (`proteus-sh`)
+    /// - System tasks: PID 1 (`init`), PID 2 (`kthreadd-net`), PID 3 (`kthreadd-wal`), PID 4 (`cuttle-sh`)
     pub fn new() -> Self {
         let mut s = Self::empty();
         s.seed_defaults();
@@ -302,16 +302,16 @@ impl OsShell {
     /// the Ring-3 service runtime mixing both `self.seal_key` and `boot_gen` into the
     /// initial service variant seed so reboots automatically rotate initial service ELFs.
     pub fn seed_defaults_for_boot(&mut self, boot_gen: u64) {
-        let _ = self.fs.seed_file(b"/etc/hostname", b"proteus-te\n", 64, 1);
+        let _ = self.fs.seed_file(b"/etc/hostname", b"cuttle-te\n", 64, 1);
         let _ = self.fs.seed_file(
             b"/etc/os-release",
-            b"NAME=\"Proteus MTD OS\"\nVERSION=\"1.0-enterprise\"\nARCH=\"x86_64\"\n",
+            b"NAME=\"Cuttle MTD OS\"\nVERSION=\"1.0-enterprise\"\nARCH=\"x86_64\"\n",
             128,
             1,
         );
         let _ = self.fs.seed_file(
             b"/etc/motd",
-            b"Proteus Enterprise Moving-Target-Defense OS\nType 'help' for commands.\n",
+            b"Cuttle Enterprise Moving-Target-Defense OS\nType 'help' for commands.\n",
             128,
             1,
         );
@@ -344,7 +344,7 @@ impl OsShell {
         self.kthread_switches[2] = 1;
         self.kthread_switches[3] = 1;
         self.kthread_switches[4] = 1;
-        // Advance scheduler so PID 4 (proteus-sh) is active after boot init/daemons.
+        // Advance scheduler so PID 4 (cuttle-sh) is active after boot init/daemons.
         let _ = self.sched.pick_next();
         let _ = self.sched.pick_next();
         let _ = self.sched.pick_next();
@@ -498,7 +498,7 @@ impl OsShell {
     }
 
     /// Mint a new 128-bit (`32` hex character) authenticated session token for `user`
-    /// derived via `HMAC-SHA256(self.attest_key, "proteus-session-v1:" || user || seq || challenge)`.
+    /// derived via `HMAC-SHA256(self.attest_key, "cuttle-session-v1:" || user || seq || challenge)`.
     pub fn create_session(&mut self, user: &[u8], challenge: &[u8]) -> [u8; 32] {
         self.failed_login_streak = 0;
         self.login_cooldown_ticks = 0;
@@ -524,7 +524,7 @@ impl OsShell {
 
         let mut msg = [0u8; 128];
         let mut pos = 0usize;
-        pos += copy_into(b"proteus-session-v1:", &mut msg[pos..]);
+        pos += copy_into(b"cuttle-session-v1:", &mut msg[pos..]);
         pos += copy_into(&uname[..ulen], &mut msg[pos..]);
         pos += copy_into(b":", &mut msg[pos..]);
         pos += dec_u64(self.cmd_seq, &mut msg[pos..]);
@@ -667,7 +667,7 @@ impl OsShell {
     /// plus their capability and eBPF Seccomp masks, stateless firewall CIDR
     /// rules (`W`), custom enrolled IMA binary digests (`I`), and the monotonic
     /// UDP anti-replay sequence watermark (`Q`) into `wal`, flushing with a
-    /// `DURABLE_WAL_WRITE` [`proteus_contracts::CapProof`].
+    /// `DURABLE_WAL_WRITE` [`cuttle_contracts::CapProof`].
     ///
     /// Returns the number of WAL records written.
     pub fn checkpoint_wal<const C: usize>(&mut self, wal: &mut WalImpl<C>) -> Result<usize, WalError> {
@@ -936,7 +936,7 @@ impl OsShell {
     }
 
     /// Pack the live shell state into two 512-byte disk sectors (`hdr_sector`
-    /// and `wal_sector`) protected by a 32-byte SHA-256 seal (`PRTSSHL1` magic).
+    /// and `wal_sector`) protected by a 32-byte SHA-256 seal (`CTTLSHL1` magic).
     ///
     /// Designed for crash-atomic persistence on AHCI / VirtIO-Blk: write
     /// `wal_sector` to `LBA + 1` first, then `hdr_sector` to `LBA` last.
@@ -957,7 +957,7 @@ impl OsShell {
             hdr_sector[i] = 0;
             i += 1;
         }
-        let magic = b"PRTSSHL1";
+        let magic = b"CTTLSHL1";
         let mut m = 0usize;
         while m < 8 {
             hdr_sector[m] = magic[m];
@@ -984,7 +984,7 @@ impl OsShell {
 
     /// Unpack and verify a two-sector (`hdr_sector`, `wal_sector`) disk image
     /// written by [`OsShell::pack_disk_image`], restoring files, worker tasks,
-    /// and capabilities only if the `PRTSSHL1` magic and 32-byte SHA-256 seal
+    /// and capabilities only if the `CTTLSHL1` magic and 32-byte SHA-256 seal
     /// match in constant time.
     ///
     /// Returns `Ok((saved_boots, applied_records))`.
@@ -993,7 +993,7 @@ impl OsShell {
         hdr_sector: &[u8; 512],
         wal_sector: &[u8; 512],
     ) -> Result<(u64, usize), WalError> {
-        if !bytes_eq(&hdr_sector[0..8], b"PRTSSHL1") {
+        if !bytes_eq(&hdr_sector[0..8], b"CTTLSHL1") {
             self.record_audit(21, AuditVerdict::Denied, b"shell:wal:header-corrupt");
             return Err(WalError::PayloadTooLarge);
         }
@@ -1030,7 +1030,7 @@ impl OsShell {
 
     /// Pack all mutable/user files (`!is_default_system_file`) from `self.fs`
     /// into a 16-sector (`8 KiB`) block-backed filesystem partition image
-    /// (`PRTSFS01` magic + 2-sector inode directory + 8-sector `4 KiB` data pool +
+    /// (`CTTLFS01` magic + 2-sector inode directory + 8-sector `4 KiB` data pool +
     /// 5 reserved sectors) sealed with a chained keyed `HMAC-SHA256` (`self.seal_key`).
     ///
     /// Returns `Ok((file_count, data_bytes))`.
@@ -1139,7 +1139,7 @@ impl OsShell {
     /// Verify and unpack a 16-sector (`8 KiB`) block-backed filesystem partition
     /// written by [`OsShell::pack_fs_partition`].
     ///
-    /// Verifies the `PRTSFS01` superblock magic and the chained keyed `HMAC-SHA256`
+    /// Verifies the `CTTLFS01` superblock magic and the chained keyed `HMAC-SHA256`
     /// seal over all 16 sectors in constant time before mounting/restoring files
     /// (including multi-sector files up to `SHELL_FS_POOL = 4096` bytes).
     /// Returns `Ok((generation, file_count, data_bytes))`.
@@ -1320,7 +1320,7 @@ impl OsShell {
     /// Feed a single raw console byte (from COM1 16550 or PS/2 keyboard).
     ///
     /// - `echo_out` receives any terminal echo bytes (e.g., character echo,
-    ///   backspace erase sequence, or trailing `proteus> ` prompt).
+    ///   backspace erase sequence, or trailing `cuttle> ` prompt).
     /// - When `\r` or `\n` completes a command line, the command is executed
     ///   and its output + next prompt are written to `reply_out`.
     /// - Returns `(echo_len, ShellAction)`.
@@ -1416,7 +1416,7 @@ impl OsShell {
         if bytes_eq(cmd, b"uname") {
             self.record_audit(2, AuditVerdict::Allowed, b"shell:uname");
             let n = copy_into(
-                b"Proteus-TE x86_64 1.0-mtd (Moving Target Defense Kernel)\n",
+                b"Cuttle-TE x86_64 1.0-mtd (Moving Target Defense Kernel)\n",
                 out,
             );
             return ShellAction::Continue(n);
@@ -1641,7 +1641,7 @@ impl OsShell {
         let ev = AuditEvent {
             event_id: 0,
             wall_unix: self.cmd_seq,
-            task_id: 4, // proteus-sh
+            task_id: 4, // cuttle-sh
             syscall_nr: op_nr,
             verdict,
             message,
@@ -1705,7 +1705,7 @@ impl OsShell {
                         1 => b"init\n",
                         2 => b"kthreadd-net\n",
                         3 => b"kthreadd-wal\n",
-                        4 => b"proteus-sh\n",
+                        4 => b"cuttle-sh\n",
                         _ => b"worker\n",
                     };
                     pos += copy_into(name, &mut out[pos..]);
@@ -1834,7 +1834,7 @@ impl OsShell {
                         1 => b"init\n",
                         2 => b"kthreadd-net\n",
                         3 => b"kthreadd-wal\n",
-                        4 => b"proteus-sh\n",
+                        4 => b"cuttle-sh\n",
                         _ => b"worker\n",
                     };
                     pos += copy_into(name, &mut out[pos..]);
@@ -2335,7 +2335,7 @@ impl OsShell {
     fn cmd_df(&mut self, out: &mut [u8]) -> usize {
         self.record_audit(28, AuditVerdict::Allowed, b"shell:df");
         let mut pos = 0usize;
-        pos += copy_into(b"fs: magic=PRTSFS01 inodes=", &mut out[pos..]);
+        pos += copy_into(b"fs: magic=CTTLFS01 inodes=", &mut out[pos..]);
         pos += dec_u64(self.fs.inode_count() as u64, &mut out[pos..]);
         pos += copy_into(b"/", &mut out[pos..]);
         pos += dec_u64(SHELL_FS_INODES as u64, &mut out[pos..]);
@@ -3740,7 +3740,7 @@ fn sanitize_nonce(raw: &[u8]) -> &[u8] {
 }
 
 /// Dynamically compile and evaluate a per-PID Seccomp-BPF filter program
-/// inside the verified [`EBpfImpl`] interpreter (`proteus_contracts::EBpf`).
+/// inside the verified [`EBpfImpl`] interpreter (`cuttle_contracts::EBpf`).
 ///
 /// Filter program layout:
 /// 1. `ST_MEM_DW [r1 + 0], syscall_nr` — writes `seccomp_data.nr` (`u64`) to stack `[0..8]`
@@ -3837,7 +3837,7 @@ mod tests {
 
         let act = sh.exec_line(b"uname", 7, 10, 20, &mut out);
         let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
-        assert!(s.starts_with("Proteus-TE x86_64"));
+        assert!(s.starts_with("Cuttle-TE x86_64"));
 
         let act = sh.exec_line(b"status", 7, 10, 20, &mut out);
         let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
@@ -3853,14 +3853,14 @@ mod tests {
         let mut out = [0u8; 512];
 
         let act = sh.exec_line(b"cat /etc/hostname", 1, 0, 0, &mut out);
-        assert_eq!(&out[..act.bytes_written()], b"proteus-te\n");
+        assert_eq!(&out[..act.bytes_written()], b"cuttle-te\n");
 
-        let act = sh.exec_line(b"write /var/note hello-proteus", 1, 0, 0, &mut out);
+        let act = sh.exec_line(b"write /var/note hello-cuttle", 1, 0, 0, &mut out);
         let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
-        assert_eq!(s, "wrote 14 bytes to /var/note\n");
+        assert_eq!(s, "wrote 13 bytes to /var/note\n");
 
         let act = sh.exec_line(b"cat /var/note", 1, 0, 0, &mut out);
-        assert_eq!(&out[..act.bytes_written()], b"hello-proteus\n");
+        assert_eq!(&out[..act.bytes_written()], b"hello-cuttle\n");
 
         // Protected file cannot be overwritten or removed.
         let act = sh.exec_line(b"rm /etc/os-release", 1, 0, 0, &mut out);
@@ -3957,8 +3957,8 @@ mod tests {
         let _ = sh.feed_byte(b'e', 1, 0, 0, &mut echo, &mut reply);
         let (_, act) = sh.feed_byte(b'\n', 1, 0, 0, &mut echo, &mut reply);
         let out_str = core::str::from_utf8(&reply[..act.bytes_written()]).unwrap();
-        assert!(out_str.starts_with("Proteus-TE x86_64"));
-        assert!(out_str.ends_with("proteus> "));
+        assert!(out_str.starts_with("Cuttle-TE x86_64"));
+        assert!(out_str.ends_with("cuttle> "));
 
         // Type "halt\r"
         for &b in b"halt" {
@@ -4317,7 +4317,7 @@ mod tests {
         let act_df = sh.exec_line(b"df", 1, 0, 0, &mut out);
         assert_eq!(
             &out[..act_df.bytes_written()],
-            b"fs: magic=PRTSFS01 inodes=5/16 pool_bytes=704/4096 part_sectors=16\n"
+            b"fs: magic=CTTLFS01 inodes=5/16 pool_bytes=704/4096 part_sectors=16\n"
         );
 
         let act_sync = sh.exec_line(b"sync", 1, 0, 0, &mut out);

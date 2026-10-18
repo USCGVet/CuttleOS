@@ -5,15 +5,15 @@
 //!
 //! 1. `DaemonReport.cycles_accepted >= N` and `cycles_rejected == 0`
 //! 2. `daemon.log` has ≥ N `cycle_accept` events and 0 `cycle_reject`
-//! 3. Attestation chain under the soak `PROTEUS_ATTEST_DIR` verifies
+//! 3. Attestation chain under the soak `CUTTLE_ATTEST_DIR` verifies
 //! 4. `target_minimal/src/lib.rs` is restored from `.last_good.rs`
 //!
 //! # Invocation
 //!
 //! ```text
-//! $env:PROTEUS_SOAK_SHORT = "1"
-//! # optional: $env:PROTEUS_SOAK_ITERS = "5"
-//! cargo test -p proteus-morph-engine --test soak_short -- --nocapture
+//! $env:CUTTLE_SOAK_SHORT = "1"
+//! # optional: $env:CUTTLE_SOAK_ITERS = "5"
+//! cargo test -p cuttle-morph-engine --test soak_short -- --nocapture
 //! ```
 //!
 //! Or: `tools/soak_short.ps1`
@@ -28,7 +28,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use proteus_morph_engine::{
+use cuttle_morph_engine::{
     daemon::{run_daemon, DaemonArgs, DaemonReport, DAEMON_LOG},
     verify_chain_with_options, SynthesizerKind, VerifyOptions, ATTEST_DIR_ENV,
 };
@@ -119,9 +119,9 @@ fn write_report(
 
 #[test]
 fn short_daemon_soak_three_accepts() {
-    if std::env::var("PROTEUS_SOAK_SHORT").as_deref() != Ok("1") {
+    if std::env::var("CUTTLE_SOAK_SHORT").as_deref() != Ok("1") {
         eprintln!(
-            "SKIP: set PROTEUS_SOAK_SHORT=1 to run the short morph-daemon soak \
+            "SKIP: set CUTTLE_SOAK_SHORT=1 to run the short morph-daemon soak \
              (real cargo verify × N cycles; several minutes)"
         );
         return;
@@ -136,11 +136,11 @@ fn short_daemon_soak_three_accepts() {
         soak.join("scheduler.toml").display()
     );
 
-    let iters: u64 = std::env::var("PROTEUS_SOAK_ITERS")
+    let iters: u64 = std::env::var("CUTTLE_SOAK_ITERS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
-    assert!(iters >= 1 && iters <= 20, "PROTEUS_SOAK_ITERS out of range 1..=20");
+    assert!(iters >= 1 && iters <= 20, "CUTTLE_SOAK_ITERS out of range 1..=20");
 
     // Ensure signing key exists (morph stage 4).
     let key = root.join("factory_signing_key.bin");
@@ -152,7 +152,7 @@ fn short_daemon_soak_three_accepts() {
 
     // Ensure verify binary is buildable / present for cycle stage 3.
     let verify_status = Command::new("cargo")
-        .args(["build", "-p", "proteus-verifier", "--bin", "verify"])
+        .args(["build", "-p", "cuttle-verifier", "--bin", "verify"])
         .current_dir(&root)
         .status()
         .expect("cargo build verify");
@@ -267,7 +267,7 @@ fn short_daemon_soak_three_accepts() {
         accepts, rejects
     );
 
-    // Attestation chain under PROTEUS_ATTEST_DIR.
+    // Attestation chain under CUTTLE_ATTEST_DIR.
     let attest_ok = match verify_chain_with_options(&VerifyOptions {
         require_threshold: false,
         require_merkle_root: false,

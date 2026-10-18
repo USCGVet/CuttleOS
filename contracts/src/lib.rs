@@ -1,4 +1,4 @@
-//! Proteus contracts — the immutable kernel API and wire-format surface.
+//! Cuttle contracts — the immutable kernel API and wire-format surface.
 //!
 //! Every morph candidate produced by the factory must satisfy the traits and
 //! invariants defined in this crate. This crate is locked by
@@ -49,7 +49,7 @@ pub use virtio_and_nic::*;
 #[cfg(test)]
 mod cap_proof_tests {
     //! Unit tests for the type-state `CapProof` (TASK-020). These run
-    //! under `cargo test -p proteus-contracts` with the
+    //! under `cargo test -p cuttle-contracts` with the
     //! `property_tests` feature enabled (which switches the crate to
     //! `std` mode); the type-state behaviour itself is independent of
     //! that feature.

@@ -8,12 +8,12 @@
 //! 5. --require-ext-tlv rejects missing field
 //! 6. None is skip_serialized (pre-v8 hash stability)
 
-use proteus_morph_engine::attest::{
+use cuttle_morph_engine::attest::{
     self, compute_entry_sha256, load_entries, verify_chain, verify_chain_with_options,
     write_attestation, AttestEntry, AttestEntryFields, VerifyOptions, ATTEST_DIR_ENV,
     READABLE_MIN_SCHEMA, SCHEMA_VERSION,
 };
-use proteus_morph_engine::{build_ext_tlv_b64, verify_ext_tlv_b64, EXT_TLV_TAG_COUNT};
+use cuttle_morph_engine::{build_ext_tlv_b64, verify_ext_tlv_b64, EXT_TLV_TAG_COUNT};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -31,7 +31,7 @@ fn fresh_tempdir(label: &str) -> PathBuf {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "proteus_attest_v8_test_{}_{}_{}_{}",
+        "cuttle_attest_v8_test_{}_{}_{}_{}",
         label,
         std::process::id(),
         nanos,

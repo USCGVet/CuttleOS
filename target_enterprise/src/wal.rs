@@ -52,14 +52,14 @@
 //! hands it to the caller's callback. There is no `alloc`, no
 //! `heapless::Vec`, no implicit allocation anywhere in this module.
 
-use proteus_contracts::{CapProof, WriteAheadLog};
+use cuttle_contracts::{CapProof, WriteAheadLog};
 
-/// Mint a [`CapProof`] for [`proteus_contracts::caps::DURABLE_WAL_WRITE`]
+/// Mint a [`CapProof`] for [`cuttle_contracts::caps::DURABLE_WAL_WRITE`]
 /// when `held` includes that bit (TASK-161). Prefer this at call sites
 /// that already know the caller's capability mask.
 #[inline]
-pub fn durable_wal_proof(held: u64) -> Result<CapProof, proteus_contracts::CapError> {
-    proteus_contracts::mint_cap_proof(held, proteus_contracts::caps::DURABLE_WAL_WRITE)
+pub fn durable_wal_proof(held: u64) -> Result<CapProof, cuttle_contracts::CapError> {
+    cuttle_contracts::mint_cap_proof(held, cuttle_contracts::caps::DURABLE_WAL_WRITE)
 }
 
 /// Privileged self-grant for tests / banner / init (holds only the WAL
@@ -67,7 +67,7 @@ pub fn durable_wal_proof(held: u64) -> Result<CapProof, proteus_contracts::CapEr
 /// pass their real held mask through [`durable_wal_proof`].
 #[inline]
 pub fn durable_wal_proof_init() -> CapProof {
-    durable_wal_proof(proteus_contracts::caps::DURABLE_WAL_WRITE)
+    durable_wal_proof(cuttle_contracts::caps::DURABLE_WAL_WRITE)
         .expect("DURABLE_WAL_WRITE self-grant must succeed")
 }
 
@@ -346,9 +346,9 @@ mod tests {
     fn flush_requires_durable_wal_cap_proof() {
         // TASK-161: unprivileged held mask cannot mint proof.
         assert!(durable_wal_proof(0).is_err());
-        assert!(durable_wal_proof(proteus_contracts::caps::BLOCK_WRITE).is_err());
-        assert!(durable_wal_proof(proteus_contracts::caps::AUDIT_WRITE).is_err());
-        let p = durable_wal_proof(proteus_contracts::caps::DURABLE_WAL_WRITE).unwrap();
+        assert!(durable_wal_proof(cuttle_contracts::caps::BLOCK_WRITE).is_err());
+        assert!(durable_wal_proof(cuttle_contracts::caps::AUDIT_WRITE).is_err());
+        let p = durable_wal_proof(cuttle_contracts::caps::DURABLE_WAL_WRITE).unwrap();
         let mut wal: WalImpl<64> = WalImpl::new();
         wal.append(b"x").unwrap();
         wal.flush(p).unwrap();

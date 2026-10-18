@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{
+use cuttle_contracts::{
     AttestTlv, AttestTlvError, AttestTlvRecord, ATTEST_TLV_HDR_LEN, ATTEST_TLV_MAX_TAGS,
     ATTEST_TLV_MAX_VAL, ATTEST_TLV_TAG_CYCLE, ATTEST_TLV_TAG_MODULE, ATTEST_TLV_TAG_SEED,
 };
@@ -90,7 +90,7 @@ pub fn banner_three_tags(out: &mut [u8]) -> Result<usize, AttestTlvError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::AttestTlv;
+    use cuttle_contracts::AttestTlv;
 
     #[test]
     fn constants() {

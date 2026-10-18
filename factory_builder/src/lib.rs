@@ -10,7 +10,7 @@
 //! ## Why packaging shells out
 //!
 //! The `bootloader = "0.11"` crate's build.rs spawns nested cargo
-//! invocations with `-Z` flags that require nightly. The Proteus
+//! invocations with `-Z` flags that require nightly. The Cuttle
 //! workspace builds on stable, so we keep the heavy bootloader
 //! dependency out of the workspace entirely: the sibling crate
 //! `factory_builder_pkg/` (excluded from the workspace, pinned to
@@ -322,7 +322,7 @@ pub fn kernel_llvm_codegen_rustflags(seed: u64) -> String {
     const CSR_COSTS: [u32; 8] = [0, 3, 7, 12, 18, 25, 35, 50];
 
     let mut hasher = Sha256::new();
-    hasher.update(b"proteus-llvm-codegen-v1");
+    hasher.update(b"cuttle-llvm-codegen-v1");
     hasher.update(seed.to_le_bytes());
     let d = hasher.finalize();
 
@@ -357,7 +357,7 @@ pub fn build_kernel_with_layout_seed(
 }
 
 /// Like [`build_kernel_with_layout_seed`], but `prod = true` appends
-/// `--cfg proteus_prod` to RUSTFLAGS, compiling out the kernel's banner
+/// `--cfg cuttle_prod` to RUSTFLAGS, compiling out the kernel's banner
 /// self-proof suite and the planted red-team attack harness (see the
 /// crate header in `target_enterprise_kernel/src/main.rs`). The kernel
 /// crate's `[lints.rust] unexpected_cfgs` check-cfg entry already
@@ -411,16 +411,16 @@ pub fn build_kernel_with_layout_seed_and_prod(
         rustflags = format!("{rustflags} {llvm_flags}").trim().to_string();
         // Public variant label only (the kernel's `ATTEST: OK seed=` banner);
         // no key material is derived from it.
-        cmd.env("PROTEUS_VARIANT_SEED", seed.to_string());
+        cmd.env("CUTTLE_VARIANT_SEED", seed.to_string());
         eprintln!(
             "factory_builder: kernel codegen diversity enabled (seed={seed}: layout-randomize + function-shuffle + llvm-codegen [{llvm_flags}])"
         );
     } else {
         // Don't let an inherited value mislabel an unseeded build.
-        cmd.env_remove("PROTEUS_VARIANT_SEED");
+        cmd.env_remove("CUTTLE_VARIANT_SEED");
     }
     if prod {
-        rustflags = format!("{rustflags} --cfg proteus_prod").trim().to_string();
+        rustflags = format!("{rustflags} --cfg cuttle_prod").trim().to_string();
         eprintln!("factory_builder: production kernel build (banner suite + attack harness stripped)");
     }
     if layout_seed.is_some() || prod {
@@ -474,8 +474,8 @@ pub fn build_kernel_with_layout_seed_and_prod(
 pub const DEVICE_SECRET_KEY_FILENAME: &str = "device_secret_key.bin";
 
 /// QEMU `fw_cfg` selector path used to provision the 32-byte device secret
-/// key to the guest kernel out-of-band (`-fw_cfg name=opt/proteus_device_key,file=...`).
-pub const FW_CFG_DEVICE_KEY_NAME: &str = "opt/proteus_device_key";
+/// key to the guest kernel out-of-band (`-fw_cfg name=opt/cuttle_device_key,file=...`).
+pub const FW_CFG_DEVICE_KEY_NAME: &str = "opt/cuttle_device_key";
 
 /// Load an existing 32-byte device secret key from `path`, or generate a
 /// fresh 256-bit cryptographically random key via OS CSPRNG (`OsRng`) and
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn validate_elf_rejects_missing_file() {
         let bogus = PathBuf::from(
-            "D:/RustProjects/Proteus/factory_builder/__definitely_missing_test_fixture__.elf",
+            "D:/RustProjects/Cuttle/factory_builder/__definitely_missing_test_fixture__.elf",
         );
         let r = validate_elf(&bogus);
         assert!(r.is_err(), "expected missing-file error");
@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn format_and_parse_image_line_round_trip_bios() {
-        let path = PathBuf::from("D:/img/proteus-bios.img");
+        let path = PathBuf::from("D:/img/cuttle-bios.img");
         let sha = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
         let line = format_image_line(ImageKind::Bios, &path, sha);
         assert!(line.starts_with(STDOUT_BIOS_PREFIX));
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn format_and_parse_image_line_round_trip_uefi_with_spaces() {
-        let path = PathBuf::from("C:/Program Files/Proteus/uefi image.img");
+        let path = PathBuf::from("C:/Program Files/Cuttle/uefi image.img");
         let sha = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         let line = format_image_line(ImageKind::Uefi, &path, sha);
         let (k, p, s) = parse_image_line(&line).expect("parse");
@@ -684,7 +684,7 @@ mod tests {
     #[test]
     fn parseable_stdout_format_regex() {
         // Pinned format: `^(bios|uefi) .+ [0-9a-f]{64}$`.
-        let path = PathBuf::from("D:/proteus/target/bios.img");
+        let path = PathBuf::from("D:/cuttle/target/bios.img");
         let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let line = format_image_line(ImageKind::Bios, &path, sha);
         assert!(line.starts_with("bios ") || line.starts_with("uefi "));

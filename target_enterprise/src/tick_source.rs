@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use proteus_contracts::{TickKind, TickSource};
+use cuttle_contracts::{TickKind, TickSource};
 
 /// Dual-counter tick mux for tests / watchdog composition.
 pub struct TickSourceImpl {
@@ -55,7 +55,7 @@ impl TickSource for TickSourceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proteus_contracts::TickSource;
+    use cuttle_contracts::TickSource;
 
     #[test]
     fn default_pit() {

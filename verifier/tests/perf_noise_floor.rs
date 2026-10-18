@@ -24,7 +24,7 @@
 //! Run with:
 //!
 //! ```text
-//! cargo test -p proteus-verifier --test perf_noise_floor -- --ignored
+//! cargo test -p cuttle-verifier --test perf_noise_floor -- --ignored
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -136,7 +136,7 @@ fn perf_max_min_spread_under_40_percent() {
     // the point is to keep verify from touching the real
     // workspace `perf.jsonl`.
     let baseline = std::env::temp_dir().join(format!(
-        "proteus-noise-floor-baseline-{}.jsonl",
+        "cuttle-noise-floor-baseline-{}.jsonl",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&baseline);

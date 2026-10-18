@@ -9,7 +9,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$env:PROTEUS_SOAK_SHORT = '1'
-$env:PROTEUS_SOAK_ITERS = "$Iters"
-cargo test -p proteus-morph-engine --test soak_short -- --nocapture
+$env:CUTTLE_SOAK_SHORT = '1'
+$env:CUTTLE_SOAK_ITERS = "$Iters"
+cargo test -p cuttle-morph-engine --test soak_short -- --nocapture
 exit $LASTEXITCODE

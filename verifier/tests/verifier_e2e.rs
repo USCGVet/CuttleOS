@@ -10,12 +10,12 @@
 //! Each test invokes a real `cargo build` + `cargo test` chain inside an
 //! isolated scratch dir, so wall-clock cost is dominated by rustc. They
 //! are marked `#[ignore]` so `cargo test` stays fast; run them explicitly
-//! with `cargo test -p proteus-verifier -- --ignored`.
+//! with `cargo test -p cuttle-verifier -- --ignored`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Find the Proteus workspace root (where `Cargo.toml` declares the
+/// Find the Cuttle workspace root (where `Cargo.toml` declares the
 /// workspace members) and the `verify` binary that cargo built for us.
 fn workspace_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is the verifier crate's directory at test build
@@ -58,7 +58,7 @@ fn run_verify(candidate: &Path, previous: Option<&Path>) -> i32 {
 
 fn scratch_file(name: &str, contents: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "proteus-verifier-test-{}-{}",
+        "cuttle-verifier-test-{}-{}",
         name,
         std::process::id()
     ));
@@ -132,7 +132,7 @@ fn feistel_round(half: u32, round: u32) -> u32 {
     mixed.rotate_left(13) ^ mixed.rotate_right(7)
 }
 
-impl proteus_contracts::Hash for DemoHash {
+impl cuttle_contracts::Hash for DemoHash {
     const OUTPUT_LEN: usize = 4;
     fn hash(input: &[u8], out: &mut [u8]) {
         let h = fletcher32(input);

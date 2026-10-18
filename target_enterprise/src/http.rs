@@ -27,7 +27,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::{Http, HttpError, HttpMethod, HttpRequestView};
+use cuttle_contracts::{Http, HttpError, HttpMethod, HttpRequestView};
 
 /// Minimum length of a well-formed request: `GET / HTTP/1.0\r\n\r\n`.
 pub const MIN_REQUEST_LEN: usize = 18;

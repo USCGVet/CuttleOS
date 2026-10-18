@@ -1,4 +1,4 @@
-//! Operator TUI dashboard for the Proteus morph factory.
+//! Operator TUI dashboard for the Cuttle morph factory.
 //!
 //! Entry point: [`run_tui`]. Renders a four-tab live view of factory
 //! state by polling files under `root` every 500ms — no daemon process,
@@ -1092,14 +1092,14 @@ mod tests {
 
     #[test]
     fn load_attest_rows_tolerates_missing_file() {
-        let tmp = std::env::temp_dir().join("proteus_tui_test_missing");
+        let tmp = std::env::temp_dir().join("cuttle_tui_test_missing");
         let rows = load_attest_rows(&tmp.join("nope.jsonl")).unwrap();
         assert!(rows.is_empty());
     }
 
     #[test]
     fn load_perf_rows_skips_garbage_lines() {
-        let dir = tempdir_for_test("proteus_tui_perf");
+        let dir = tempdir_for_test("cuttle_tui_perf");
         let p = dir.join("perf.jsonl");
         fs::write(
             &p,
@@ -1116,7 +1116,7 @@ mod tests {
 
     #[test]
     fn load_attest_rows_extracts_cosig_count_and_image_flag() {
-        let dir = tempdir_for_test("proteus_tui_attest");
+        let dir = tempdir_for_test("cuttle_tui_attest");
         let p = dir.join("attest.log.jsonl");
         fs::write(
             &p,
@@ -1140,7 +1140,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        p.push(format!("proteus_tui_{}_{}", tag, nonce));
+        p.push(format!("cuttle_tui_{}_{}", tag, nonce));
         fs::create_dir_all(&p).unwrap();
         p
     }

@@ -41,7 +41,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use proteus_contracts::BlockDevice;
+use cuttle_contracts::BlockDevice;
 
 // ---------------------------------------------------------------------------
 // NVMe register offsets (BAR0)
@@ -687,7 +687,7 @@ impl MemNvmeController {
                     let mut buf = [0u8; IDENTIFY_BUF_SIZE];
                     if cns == 0x01 {
                         // Identify Controller: stamp a recognisable SN.
-                        let sn = b"PROTEUS-NVME-EMU\0\0\0\0\0";
+                        let sn = b"CUTTLE-NVME-EMU\0\0\0\0\0\0";
                         let n = core::cmp::min(sn.len(), 20);
                         buf[4..4 + n].copy_from_slice(&sn[..n]);
                     } else if cns == 0x00 {
@@ -941,8 +941,8 @@ mod tests {
         let mut drv = ready_driver();
         let mut buf = [0u8; IDENTIFY_BUF_SIZE];
         drv.identify_controller(0x5000, &mut buf).unwrap();
-        // The emulator stamps "PROTEUS-NVME-EMU" into bytes [4..24].
-        let needle = b"PROTEUS-NVME-EMU";
+        // The emulator stamps "CUTTLE-NVME-EMU" into bytes [4..24].
+        let needle = b"CUTTLE-NVME-EMU";
         assert!(
             buf[4..4 + needle.len()] == *needle,
             "expected emulator SN signature, got {:?}",

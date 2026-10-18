@@ -13,11 +13,11 @@
 //! still works.
 
 use ed25519_dalek::{Signer as _, SigningKey};
-use proteus_morph_engine::attest::{
+use cuttle_morph_engine::attest::{
     self, load_entries, rebuild_chain_after_cosign, verify_chain, write_attestation,
     write_chain_atomic, AttestEntryFields, ATTEST_DIR_ENV,
 };
-use proteus_morph_engine::federation::FEDERATION_CONFIG_ENV;
+use cuttle_morph_engine::federation::FEDERATION_CONFIG_ENV;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ fn fresh_tempdir(label: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static C: AtomicU64 = AtomicU64::new(0);
     let n = C.fetch_add(1, Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("proteus_v11_{}_{}_{}", label, std::process::id(), n));
+    let d = std::env::temp_dir().join(format!("cuttle_v11_{}_{}_{}", label, std::process::id(), n));
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
     d
@@ -66,7 +66,7 @@ fn fields(cycle: u64, module: &str, key: SigningKey) -> AttestEntryFields {
     let cand = [cycle as u8; 32];
     // Primary cosig keeps its historical semantics: signature over the
     // candidate hash. (Not exercised by these tests; shape only.)
-    let cosig = proteus_morph_engine::federation::Cosignature {
+    let cosig = cuttle_morph_engine::federation::Cosignature {
         signer_id: "primary".to_string(),
         sig_ed25519: key
             .sign(&cand)
@@ -250,7 +250,7 @@ fn unsigned_v11_entry_fails_closed_even_with_valid_hashes() {
         diversifier_log: None,
         kernel_layout_seed: None,
         ext_tlv_b64: Some(
-            proteus_morph_engine::build_ext_tlv_b64(1, "lib", &"aa".repeat(32)).unwrap(),
+            cuttle_morph_engine::build_ext_tlv_b64(1, "lib", &"aa".repeat(32)).unwrap(),
         ),
         diversity: None,
         durable_seals: BTreeMap::new(),
@@ -308,7 +308,7 @@ fn cosign_appended_post_mint_does_not_invalidate_primary_sig() {
     let cand = attest::parse_hex32(&entries[0].candidate_sha256).unwrap();
     entries[0]
         .cosignatures
-        .push(proteus_morph_engine::federation::Cosignature {
+        .push(cuttle_morph_engine::federation::Cosignature {
             signer_id: "placeholder-a".to_string(),
             sig_ed25519: other
                 .sign(&cand)

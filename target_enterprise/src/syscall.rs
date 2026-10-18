@@ -29,7 +29,7 @@ use crate::scheduler;
 // `map` / `unmap` / `translate` on the `IommuImpl` it borrows. These
 // are trait methods — without the trait in scope rustc can't resolve
 // them.
-use proteus_contracts::Iommu as _;
+use cuttle_contracts::Iommu as _;
 
 // ---------- syscall numbers ----------
 //
@@ -153,14 +153,14 @@ pub static SYS_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// — moving a syscall from "no caps" to "caps required" is a contract
 /// break, not a routine morph.
 ///
-/// The values are drawn from `proteus_contracts::caps::*`. Locked.
+/// The values are drawn from `cuttle_contracts::caps::*`. Locked.
 pub const SYSCALL_REQUIRED_CAPS: [u64; SYS_MAX as usize] = [
     0,                                          // SYS_EXIT
     0,                                          // SYS_WRITE
     0,                                          // SYS_GETPID
     0,                                          // SYS_GETTIME_NS
     0,                                          // SYS_READ_KEY
-    proteus_contracts::caps::FS_BYPASS,         // SYS_OPEN
+    cuttle_contracts::caps::FS_BYPASS,         // SYS_OPEN
     0,                                          // SYS_READ
     0,                                          // SYS_CLOSE
     0,                                          // SYS_SLEEP_MS
@@ -173,8 +173,8 @@ pub const SYSCALL_REQUIRED_CAPS: [u64; SYS_MAX as usize] = [
     // schema bump for marginal naming clarity — deferred until a
     // future iteration that touches contracts/lib.rs for a more
     // substantive reason.
-    proteus_contracts::caps::NET_RAW,           // SYS_DMA_MAP
-    proteus_contracts::caps::NET_RAW,           // SYS_DMA_UNMAP
+    cuttle_contracts::caps::NET_RAW,           // SYS_DMA_MAP
+    cuttle_contracts::caps::NET_RAW,           // SYS_DMA_UNMAP
 ];
 
 // ---------- TASK-020: SyscallCapTable contract impl with type-state proof ----------
@@ -192,7 +192,7 @@ pub const SYSCALL_REQUIRED_CAPS: [u64; SYS_MAX as usize] = [
 // `dispatch_inner_with_sink`) take `_proof: CapProof` by value. No
 // safe code outside the contracts crate can construct a `CapProof`
 // (its inner field is private and the mint helper lives in a
-// `pub(crate)` module of `proteus_contracts`), so the only way to
+// `pub(crate)` module of `cuttle_contracts`), so the only way to
 // reach the privileged region is through a successful `check_cap`.
 // The compiler — not the verifier — is the enforcer.
 
@@ -207,12 +207,12 @@ pub const CAP_TABLE_TASKS: usize = 32;
 /// downstream tests can confirm the seed is permissive.
 pub const PERMISSIVE_CAP_TABLE: [u64; CAP_TABLE_TASKS] = [u64::MAX; CAP_TABLE_TASKS];
 
-/// Concrete [`proteus_contracts::SyscallCapTable`] impl backed by the
+/// Concrete [`cuttle_contracts::SyscallCapTable`] impl backed by the
 /// permissive seed table. Overrides `check_raw`; the trait's provided
-/// `check` is the sole site that mints a [`proteus_contracts::CapProof`].
+/// `check` is the sole site that mints a [`cuttle_contracts::CapProof`].
 pub struct CapTableImpl;
 
-impl proteus_contracts::SyscallCapTable for CapTableImpl {
+impl cuttle_contracts::SyscallCapTable for CapTableImpl {
     type Cap = u64;
 
     fn check_raw(
@@ -220,12 +220,12 @@ impl proteus_contracts::SyscallCapTable for CapTableImpl {
         task_id: u64,
         cap: u64,
         syscall_nr: u32,
-    ) -> Result<(), proteus_contracts::CapError> {
+    ) -> Result<(), cuttle_contracts::CapError> {
         if (task_id as usize) >= CAP_TABLE_TASKS {
-            return Err(proteus_contracts::CapError::EPERM);
+            return Err(cuttle_contracts::CapError::EPERM);
         }
         if (syscall_nr as u64) >= SYS_MAX {
-            return Err(proteus_contracts::CapError::ENOSYS);
+            return Err(cuttle_contracts::CapError::ENOSYS);
         }
         let task_mask = PERMISSIVE_CAP_TABLE[task_id as usize];
         let effective = task_mask & cap;
@@ -234,13 +234,13 @@ impl proteus_contracts::SyscallCapTable for CapTableImpl {
             Ok(())
         } else {
             DENIED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            Err(proteus_contracts::CapError::EPERM)
+            Err(cuttle_contracts::CapError::EPERM)
         }
     }
 }
 
 /// Top-level dispatcher. Calls [`check_cap`] to obtain a
-/// [`proteus_contracts::CapProof`], then hands it to [`dispatch_inner`]
+/// [`cuttle_contracts::CapProof`], then hands it to [`dispatch_inner`]
 /// by value. The compiler enforces that no caller can reach the
 /// privileged region without a fresh proof.
 pub fn dispatch_syscall(
@@ -264,18 +264,18 @@ pub fn dispatch_syscall(
 }
 
 /// Capability check: return a freshly-minted
-/// [`proteus_contracts::CapProof`] iff the caller's `cap_mask`
+/// [`cuttle_contracts::CapProof`] iff the caller's `cap_mask`
 /// includes every bit required by syscall `nr`.
 ///
 /// Routes through `CapTableImpl::check`, which is the trait's
 /// provided default method and the sole sealed mint site for
-/// `CapProof` in `proteus_contracts`. A morph candidate cannot mint
+/// `CapProof` in `cuttle_contracts`. A morph candidate cannot mint
 /// a proof by other means: the inner field is private and the seal
 /// helper lives in a `pub(crate)` module of the contracts crate. The
 /// verifier's old AST walker is therefore obsolete; the compiler
 /// itself enforces the type-state.
-pub fn check_cap(nr: u64, cap_mask: u64) -> Result<proteus_contracts::CapProof, Errno> {
-    use proteus_contracts::{CapError, SyscallCapTable};
+pub fn check_cap(nr: u64, cap_mask: u64) -> Result<cuttle_contracts::CapProof, Errno> {
+    use cuttle_contracts::{CapError, SyscallCapTable};
     let table = CapTableImpl;
     match table.check(0, cap_mask, nr as u32) {
         Ok(proof) => Ok(proof),
@@ -355,7 +355,7 @@ impl<'a> WriteSink for BufferSink<'a> {
 /// Privileged dispatch. Routes syscall `nr` to its handler with the six
 /// register-passed arguments. The `_proof` parameter is the type-state
 /// witness that a successful [`check_cap`] has already minted a
-/// [`proteus_contracts::CapProof`]; the compiler enforces that this
+/// [`cuttle_contracts::CapProof`]; the compiler enforces that this
 /// function cannot be reached without one.
 ///
 /// Returns the value userspace will see in `RAX`, encoded as
@@ -370,7 +370,7 @@ pub fn dispatch_inner(
     a3: u64,
     a4: u64,
     a5: u64,
-    proof: proteus_contracts::CapProof,
+    proof: cuttle_contracts::CapProof,
 ) -> Result<u64, Errno> {
     // Consume the proof. From here on, every handler runs under the
     // type-state assurance that the cap check has succeeded.
@@ -453,7 +453,7 @@ fn sys_write_privileged<S: WriteSink>(
     fd: u64,
     buf: u64,
     len: u64,
-    proof: proteus_contracts::CapProof,
+    proof: cuttle_contracts::CapProof,
 ) -> Result<u64, Errno> {
     proof.consume();
     sys_write_with_sink(sink, fd, buf, len)
@@ -527,7 +527,7 @@ fn sys_dma_map<const D: usize, const V: usize, const E: usize>(
     dma_addr: u64,
     host_phys: u64,
     perms_byte: u64,
-    proof: proteus_contracts::CapProof,
+    proof: cuttle_contracts::CapProof,
 ) -> Result<u64, Errno> {
     // The proof must be consumed by value on every path through the
     // handler — including error paths. We consume it AT the top so
@@ -536,12 +536,12 @@ fn sys_dma_map<const D: usize, const V: usize, const E: usize>(
 
     let domain = task.iommu_domain.ok_or(Errno::EPERM)?;
     // perms is encoded as a low byte: bit 0 = READ, bit 1 = WRITE.
-    // Mirror `proteus_contracts::PagePerms`. Reject anything outside
+    // Mirror `cuttle_contracts::PagePerms`. Reject anything outside
     // the 2-bit range — preserves the locked perms encoding.
     if perms_byte & !0b11 != 0 {
         return Err(Errno::EINVAL);
     }
-    let perms = proteus_contracts::PagePerms(perms_byte as u8);
+    let perms = cuttle_contracts::PagePerms(perms_byte as u8);
     match iommu.map(domain, dma_addr, host_phys, perms) {
         Ok(()) => Ok(0),
         Err(e) => Err(map_iommu_error(e)),
@@ -553,7 +553,7 @@ fn sys_dma_unmap<const D: usize, const V: usize, const E: usize>(
     iommu: &mut crate::iommu::IommuImpl<D, V, E>,
     task: &crate::scheduler::Task,
     dma_addr: u64,
-    proof: proteus_contracts::CapProof,
+    proof: cuttle_contracts::CapProof,
 ) -> Result<u64, Errno> {
     proof.consume();
 
@@ -569,8 +569,8 @@ fn sys_dma_unmap<const D: usize, const V: usize, const E: usize>(
 /// "we don't know that address" → `EINVAL`; anything that's
 /// "permission/binding state" → `EPERM`; anything that exceeds the
 /// fixed table capacities → `EFAULT`.
-fn map_iommu_error(e: proteus_contracts::IommuError) -> Errno {
-    use proteus_contracts::IommuError as I;
+fn map_iommu_error(e: cuttle_contracts::IommuError) -> Errno {
+    use cuttle_contracts::IommuError as I;
     match e {
         I::DomainTableFull | I::DeviceTableFull => Errno::EFAULT,
         I::UnknownDomain | I::DeviceNotBound => Errno::EPERM,
@@ -714,7 +714,7 @@ fn sys_cap_check(required: u64, set: u64) -> Result<u64, Errno> {
 /// integration test can assert the contract.
 pub struct SyscallDispatchImpl;
 
-impl proteus_contracts::SyscallDispatch for SyscallDispatchImpl {
+impl cuttle_contracts::SyscallDispatch for SyscallDispatchImpl {
     type Result = core::result::Result<u64, Errno>;
 
     fn dispatch(
@@ -747,7 +747,7 @@ mod tests {
     /// `dispatch_inner` directly. The unwrap is hot-path local; if the
     /// underlying cap-check ever fails for these test inputs that is a
     /// regression worth panicking on.
-    fn proof_for(nr: u64) -> proteus_contracts::CapProof {
+    fn proof_for(nr: u64) -> cuttle_contracts::CapProof {
         // Use a permissive mask so every test syscall succeeds the gate.
         check_cap(nr, u64::MAX).expect("permissive cap-check must succeed")
     }
@@ -803,7 +803,7 @@ mod tests {
         // EPERM and no `CapProof` is minted.
         assert!(matches!(check_cap(SYS_OPEN, 0), Err(Errno::EPERM)));
         // With FS_BYPASS the gate succeeds and mints a proof.
-        let proof = check_cap(SYS_OPEN, proteus_contracts::caps::FS_BYPASS).expect("Ok");
+        let proof = check_cap(SYS_OPEN, cuttle_contracts::caps::FS_BYPASS).expect("Ok");
         proof.consume();
         // SYS_GETPID requires nothing.
         check_cap(SYS_GETPID, 0).expect("Ok").consume();
@@ -826,7 +826,7 @@ mod tests {
         // and returns ENOENT (no VFS in seed).
         let r = dispatch_with_cap(
             SYS_OPEN,
-            proteus_contracts::caps::FS_BYPASS,
+            cuttle_contracts::caps::FS_BYPASS,
             0xCAFE,
             5,
             0, 0, 0, 0,
@@ -840,15 +840,15 @@ mod tests {
         // contract correctly: `check_raw` returns unit on success;
         // `check` (provided method) wraps that with a `CapProof`
         // mint and is the sole path safe code can use to obtain one.
-        use proteus_contracts::SyscallCapTable;
+        use cuttle_contracts::SyscallCapTable;
         let table = CapTableImpl;
         // Out-of-range syscall → ENOSYS.
-        assert!(matches!(table.check_raw(0, u64::MAX, 9_999), Err(proteus_contracts::CapError::ENOSYS)));
+        assert!(matches!(table.check_raw(0, u64::MAX, 9_999), Err(cuttle_contracts::CapError::ENOSYS)));
         // SYS_OPEN with no caps → EPERM via check_raw.
-        assert!(matches!(table.check_raw(0, 0, SYS_OPEN as u32), Err(proteus_contracts::CapError::EPERM)));
+        assert!(matches!(table.check_raw(0, 0, SYS_OPEN as u32), Err(cuttle_contracts::CapError::EPERM)));
         // Provided `check` mints proof on success.
         let proof = table
-            .check(0, proteus_contracts::caps::FS_BYPASS, SYS_OPEN as u32)
+            .check(0, cuttle_contracts::caps::FS_BYPASS, SYS_OPEN as u32)
             .expect("Ok");
         proof.consume();
     }
@@ -878,7 +878,7 @@ mod tests {
     fn dispatch_with_sink_routes_write() {
         let mut buf = [0u8; 32];
         let mut sink = BufferSink::new(&mut buf);
-        let msg = b"proteus";
+        let msg = b"cuttle";
         let r = dispatch_with_sink(
             &mut sink,
             SYS_WRITE,
@@ -890,8 +890,8 @@ mod tests {
             0,
             0,
         );
-        assert_eq!(r, Ok(7));
-        assert_eq!(sink.as_slice(), b"proteus");
+        assert_eq!(r, Ok(6));
+        assert_eq!(sink.as_slice(), b"cuttle");
     }
 
     #[test]
@@ -918,7 +918,7 @@ mod tests {
 
     use crate::iommu::{DeviceId, IommuImpl};
     use crate::scheduler::{Task, TaskId};
-    use proteus_contracts::{AccessKind, Iommu};
+    use cuttle_contracts::{AccessKind, Iommu};
 
     /// Build a 4-domain / 8-device / 16-entry IOMMU and a privileged
     /// task pre-bound to a freshly-created domain. The bound device is
@@ -966,7 +966,7 @@ mod tests {
         let r = dispatch_dma(
             &mut iommu,
             &task,
-            proteus_contracts::caps::NET_RAW, // has cap
+            cuttle_contracts::caps::NET_RAW, // has cap
             SYS_DMA_MAP,
             0x10_0000,
             0xC000_0000,
@@ -986,7 +986,7 @@ mod tests {
         let r = dispatch_dma(
             &mut iommu,
             &task,
-            proteus_contracts::caps::NET_RAW,
+            cuttle_contracts::caps::NET_RAW,
             SYS_DMA_MAP,
             dma_addr,
             host_phys,
@@ -1015,7 +1015,7 @@ mod tests {
         let phys1 = 0xC000_0000u64;
         let phys2 = 0xD000_0000u64;
         let perms = 0b11u64;
-        let caps = proteus_contracts::caps::NET_RAW;
+        let caps = cuttle_contracts::caps::NET_RAW;
 
         // First map.
         assert_eq!(
@@ -1050,7 +1050,7 @@ mod tests {
         let (mut iommu, task, device) = dma_test_setup();
         let dma_addr = 0x4000u64;
         let host_phys = 0xC000_0000u64;
-        let caps = proteus_contracts::caps::NET_RAW;
+        let caps = cuttle_contracts::caps::NET_RAW;
 
         // Map.
         assert_eq!(
@@ -1069,7 +1069,7 @@ mod tests {
         // Re-translate fails with Unmapped.
         let r = iommu.translate(device, dma_addr, AccessKind::Read);
         assert!(
-            matches!(r, Err(proteus_contracts::IommuError::Unmapped)),
+            matches!(r, Err(cuttle_contracts::IommuError::Unmapped)),
             "expected Unmapped, got {:?}",
             r
         );
@@ -1084,7 +1084,7 @@ mod tests {
         let r = dispatch_dma(
             &mut iommu,
             &task,
-            proteus_contracts::caps::NET_RAW,
+            cuttle_contracts::caps::NET_RAW,
             SYS_DMA_UNMAP,
             0x4000,
             0,
@@ -1118,7 +1118,7 @@ mod tests {
         let r = dispatch_dma(
             &mut iommu,
             &task,
-            proteus_contracts::caps::NET_RAW,
+            cuttle_contracts::caps::NET_RAW,
             SYS_DMA_MAP,
             0x4001, // NOT page-aligned
             0xC000_0000,
@@ -1137,7 +1137,7 @@ mod tests {
         let r = dispatch_dma(
             &mut iommu,
             &task,
-            proteus_contracts::caps::NET_RAW,
+            cuttle_contracts::caps::NET_RAW,
             SYS_DMA_MAP,
             0x4000,
             0xC000_0000,
@@ -1153,11 +1153,11 @@ mod tests {
     fn task014_dma_syscalls_require_net_raw() {
         assert_eq!(
             SYSCALL_REQUIRED_CAPS[SYS_DMA_MAP as usize],
-            proteus_contracts::caps::NET_RAW
+            cuttle_contracts::caps::NET_RAW
         );
         assert_eq!(
             SYSCALL_REQUIRED_CAPS[SYS_DMA_UNMAP as usize],
-            proteus_contracts::caps::NET_RAW
+            cuttle_contracts::caps::NET_RAW
         );
     }
 }

@@ -5,7 +5,7 @@ edition = "2021"
 description = "Bootable kernel ELF for target_enterprise. Out-of-workspace because it builds for x86_64-unknown-none with build-std (nightly + rust-src)."
 
 # Empty workspace marker — same reason as factory_builder_pkg: keep the
-# main Proteus workspace on stable / std-host while this crate uses
+# main Cuttle workspace on stable / std-host while this crate uses
 # nightly + bare-metal target.
 [workspace]
 
@@ -13,16 +13,16 @@ description = "Bootable kernel ELF for target_enterprise. Out-of-workspace becau
 bootloader_api = "0.11"
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 target_enterprise = { path = "../target_enterprise" }
-proteus-contracts = { path = "../contracts" }
+cuttle-contracts = { path = "../contracts" }
 
 [[bin]]
 name = "target_enterprise_kernel"
 path = "src/main.rs"
 
-# `proteus_prod` is injected via RUSTFLAGS by
+# `cuttle_prod` is injected via RUSTFLAGS by
 # `factory_builder build-kernel --prod` (see src/main.rs crate header).
 [lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ["cfg(proteus_prod)"] }
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(cuttle_prod)"] }
 
 [profile.release]
 opt-level = "s"

@@ -30,11 +30,11 @@ object = { version = "0.36", default-features = false, features = ["read", "std"
 # rather than landing on whichever bottom-offset kernel helper happens
 # to come first in the symbol table — see TASK-025 / iteration 16.
 rustc-demangle = "0.1"
-proteus-diversifier = { path = "../../diversifier" }
+cuttle-diversifier = { path = "../../diversifier" }
 factory_builder = { path = "../../factory_builder" }
 # TASK-122: gadget positional/semantic survival on real kernel ELFs
 # (north-star G5 — measured binary diversity, not prose).
-proteus-mtd-metrics = { path = "../../mtd_metrics" }
+cuttle-mtd-metrics = { path = "../../mtd_metrics" }
 # `--bundle <name>` (TASK-036 Phase B) reads scheduler.toml to resolve
 # bundle membership. Same `toml = "0.8"` the diversifier already pulls
 # in for locked_modules.toml — keeps the version surface uniform.

@@ -7,8 +7,8 @@
 # Or on failure:
 #     boot=FAIL reason=<message> log=<path>
 #
-# Banner-required: the log must contain "PROTEUS-TE OK" (boot) and
-# "PROTEUS-TE HALT" (clean exit). Counts both; "banners=2" means both present.
+# Banner-required: the log must contain "CUTTLE-TE OK" (boot) and
+# "CUTTLE-TE HALT" (clean exit). Counts both; "banners=2" means both present.
 #
 # Usage:
 #   powershell -File tools\qemu_smoke.ps1
@@ -36,8 +36,8 @@ $exit = $LASTEXITCODE
 # The smoke test prints lines like:
 #   image_bytes=2589696 image_sha256=abc...
 #   serial_log=<path>
-#   observed: PROTEUS-TE OK
-#   observed: PROTEUS-TE HALT
+#   observed: CUTTLE-TE OK
+#   observed: CUTTLE-TE HALT
 # We extract the values.
 
 $imageSha = ($out | Select-String -Pattern 'image_sha256=([0-9a-f]+)' | Select-Object -First 1).Matches.Groups[1].Value
@@ -53,8 +53,8 @@ $missingBanners = @()
 if ($logPath -ne 'unknown' -and (Test-Path $logPath)) {
     $logSha = (Get-FileHash -Algorithm SHA256 -Path $logPath).Hash.ToLower().Substring(0, 16)
     $logText = Get-Content -Raw -Path $logPath -ErrorAction SilentlyContinue
-    if ($logText -match 'PROTEUS-TE OK')   { $bannerCount++ } else { $missingBanners += 'PROTEUS-TE OK' }
-    if ($logText -match 'PROTEUS-TE HALT') { $bannerCount++ } else { $missingBanners += 'PROTEUS-TE HALT' }
+    if ($logText -match 'CUTTLE-TE OK')   { $bannerCount++ } else { $missingBanners += 'CUTTLE-TE OK' }
+    if ($logText -match 'CUTTLE-TE HALT') { $bannerCount++ } else { $missingBanners += 'CUTTLE-TE HALT' }
     foreach ($b in $ExpectedBanners) {
         if ($logText -match [regex]::Escape($b)) { $bannerCount++ } else { $missingBanners += $b }
     }
