@@ -13,6 +13,10 @@ farm_port_base = 18900  # client farm in slot i listens on 127.0.0.1:(farm_port_
 vm_port_base = 20000    # slot i, Triad t, node n -> HTTP vm_port_base + i*100 + t*10 + n (HTTPS +50)
 boot_stagger_s = 8      # seconds between client farm launches
 synthetic_load = true   # farms start with labelled synthetic traffic so the stats move
+# QEMU accelerator for every VM (a plan may override it):
+#   auto = WHPX (Hyper-V hardware virtualization) when this host can start it, else TCG
+#   whpx = WHPX only;  tcg = software emulation only
+accelerator = "auto"
 
 # ---- Jobs: what a Triad serves, and which kernel role it runs ----------------------------
 # role: wfe (svc-http only) | sql (svc-sql only) | shell (svc-sh only) | full (all three)

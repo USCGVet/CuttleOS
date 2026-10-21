@@ -1064,6 +1064,7 @@ function renderControls() {
    overview
    ====================================================================== */
 const HEART_D = 'M0,13 C-21,-1 -25,-16 -13,-22 C-7,-25 -1,-21 0,-15 C1,-21 7,-25 13,-22 C25,-16 21,-1 0,13 Z';
+const accelLabel = a => (a === 'whpx' ? 'WHPX · Hyper-V hardware virtualization' : a === 'tcg' ? 'TCG · software emulation' : '–');
 function heartSvg(color) {
   const svg = s('svg', { viewBox: '-28 -28 56 50' });
   svg.append(s('path', { d: HEART_D, fill: color }));
@@ -1085,7 +1086,8 @@ function buildNodeCards(d) {
         h('dt', { text: 'Morphs' }), h('dd', { 'data-k': 'morphs' }),
         h('dt', { text: 'Boot gen' }), h('dd', { 'data-k': 'boot' }),
         h('dt', { text: 'WAL tx' }), h('dd', { 'data-k': 'tx' }),
-        h('dt', { text: 'CPUs' }), h('dd', { 'data-k': 'smp' })),
+        h('dt', { text: 'CPUs' }), h('dd', { 'data-k': 'smp' }),
+        h('dt', { text: 'Accelerator' }), h('dd', { 'data-k': 'accel' })),
       h('div', { class: 'n-stats', 'data-k': 'stats' }),
       h('footer', {},
         h('button', { class: 'btn sm magenta', 'data-morph': n.node_id, text: '🧬 Morph now' }),
@@ -1142,6 +1144,7 @@ function renderOverview(d, fresh, first) {
     const tx = g('tx'); tx.textContent = '#' + n.tx_seq + (lag > 0 ? ' (' + lag + ' behind the controller’s WAL)' : '');
     tx.classList.toggle('lag', lag > 0);
     g('smp').textContent = n.last_smp;
+    g('accel').textContent = accelLabel(n.accel || d.accel);
     g('stats').textContent = n.morph_stats;
     c.querySelector('footer a').hidden = !!d.role && d.role !== 'wfe' && d.role !== 'full'; // no svc-http
   }
@@ -2013,7 +2016,7 @@ function triadCard(c, t) {
   const color = healthColor(t.online, t.parity_ok);
   return h('article', { class: 'card tcard', style: '--c:' + color, 'data-job': t.job },
     h('div', { class: 'card-h', style: 'margin-bottom:4px' }, h('h3', { text: t.label }), h('span', { class: 'sp' }), h('span', { class: 'badge', style: '--c:' + color, text: t.online + '/3' })),
-    h('div', { class: 'role', text: 'kernel role ' + t.role + ' · ' + (ROLE_DESC[t.role] || '') + ' · ' + t.morphs + ' morphs' }),
+    h('div', { class: 'role', text: 'kernel role ' + t.role + ' · ' + (ROLE_DESC[t.role] || '') + ' · ' + t.morphs + ' morphs' + (t.accel ? ' · ' + t.accel.toUpperCase() : '') }),
     h('div', { class: 'hearts3' }, ...t.nodes.map(n => {
       const sx = st(n.state);
       return h('div', { style: '--c:' + sx.hex, title: n.name + ' · ' + sx.label + ' · binary ' + n.elf }, heartSvg(sx.hex), h('small', { text: 'OS-' + n.node_id + ' · ' + sx.label }));

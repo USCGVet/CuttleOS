@@ -49,6 +49,20 @@ fn find_qemu() -> Option<PathBuf> {
     None
 }
 
+/// QEMU accelerator arguments for the smoke boots. Default TCG: slower but deterministic,
+/// and on some Windows hosts WHPX accepts the guest but never advances the BIOS past reset
+/// (serial stays empty and the banner sweep fails). `CUTTLE_QEMU_ACCEL=whpx` runs the same
+/// assertions under Hyper-V hardware virtualization; `auto` tries WHPX, then QEMU falls
+/// back to TCG if WHPX cannot initialize.
+fn smoke_accel_args() -> Vec<&'static str> {
+    match std::env::var("CUTTLE_QEMU_ACCEL").as_deref() {
+        Err(_) | Ok("") | Ok("tcg") => vec!["-accel", "tcg"],
+        Ok("whpx") => vec!["-accel", "whpx"],
+        Ok("auto") => vec!["-accel", "whpx", "-accel", "tcg"],
+        Ok(other) => panic!("CUTTLE_QEMU_ACCEL must be tcg, whpx or auto, got {other:?}"),
+    }
+}
+
 fn factory_builder_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_factory_builder"))
 }
@@ -746,7 +760,10 @@ fn boots_under_qemu_and_emits_banner() {
         "SMP_HW init OK cpus=4 threads=4 ctx_sw=4",
         "CUTTLE-TE HALT",
     ];
-    eprintln!("smoke: launching QEMU (+4x SMP +virtio-blk +2x net hub +ahci +nvme +fw_cfg device key)...");
+    eprintln!(
+        "smoke: launching QEMU {:?} (+4x SMP +virtio-blk +2x net hub +ahci +nvme +fw_cfg device key)...",
+        smoke_accel_args()
+    );
     let (log_contents, all_seen) =
         vm.boot(&serial_log, |s| required_banners.iter().all(|b| s.contains(b)));
     if !all_seen {
@@ -827,15 +844,11 @@ impl SmokeVm<'_> {
     /// log and whether `done` was reached.
     fn boot(&self, serial_log: &Path, done: impl Fn(&str) -> bool) -> (String, bool) {
         let _ = std::fs::remove_file(serial_log);
-        // Force TCG. On some Windows hosts the default accelerator
-        // (WHPX) accepts the guest but never advances the BIOS past
-        // reset — serial stays empty and the 10s banner sweep fails.
-        // TCG is slower but deterministic for smoke.
+        // Accelerator: TCG unless CUTTLE_QEMU_ACCEL says otherwise (see `smoke_accel_args`).
         // Boot image on IDE so virtio-blk-pci is a *second* disk the
         // kernel can discover without fighting the bootloader drive.
         let mut qproc = Command::new(self.qemu)
-            .arg("-accel")
-            .arg("tcg")
+            .args(smoke_accel_args())
             .arg("-smp")
             .arg("4")
             .arg("-fw_cfg")

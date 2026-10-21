@@ -10,6 +10,10 @@ REM
 REM For the full bundle-morph + verifier flow, use the QEMU smoke test:
 REM     cargo test -p factory_builder --test qemu_smoke -- --ignored
 REM
+REM Accelerator: run.bat [auto^|whpx^|tcg]  (or set CUTTLE_ACCEL). Default auto:
+REM   WHPX (Hyper-V hardware virtualization) when it can start, else QEMU falls
+REM   back to TCG software emulation by itself.
+REM
 REM Requirements:
 REM   - QEMU on PATH, or at C:\Program Files\qemu\qemu-system-x86_64.exe
 REM   - Nightly Rust toolchain -- target_enterprise_kernel/rust-toolchain.toml
@@ -32,6 +36,16 @@ set "KERNEL_CRATE=%ROOT%\target_enterprise_kernel"
 set "IMAGES_DIR=%ROOT%\target\cuttle_images"
 set "BIOS_IMG=%IMAGES_DIR%\run_bios.img"
 set "KERNEL_PATH_FILE=%TEMP%\cuttle_kernel_elf_path.txt"
+
+REM ----- accelerator ---------------------------------------------------------
+set "ACCEL=%CUTTLE_ACCEL%"
+if not "%~1"=="" set "ACCEL=%~1"
+if "%ACCEL%"=="" set "ACCEL=auto"
+set "ACCEL_ARGS="
+if /i "%ACCEL%"=="auto" set "ACCEL_ARGS=-accel whpx -accel tcg"
+if /i "%ACCEL%"=="whpx" set "ACCEL_ARGS=-accel whpx"
+if /i "%ACCEL%"=="tcg" set "ACCEL_ARGS=-accel tcg"
+if not defined ACCEL_ARGS goto :bad_accel
 
 REM ----- locate QEMU --------------------------------------------------------
 set "QEMU="
@@ -85,10 +99,11 @@ echo [3/3] Launching QEMU (4x SMP vCPUs + 1280x720 console + HTTP :18080 / HTTPS
 echo        Dashboard:   http://127.0.0.1:18080/app
 echo        SQL Server:  http://127.0.0.1:18080/sql?SELECT+*+FROM+kv
 echo        Serial log:  %SERIAL_LOG%
+echo        Accelerator: %ACCEL% [%ACCEL_ARGS%]
 echo        Exit:        type 'halt' at cuttle^> prompt or close QEMU window
 echo ============================================================================
 "%QEMU%" ^
-    -accel tcg ^
+    %ACCEL_ARGS% ^
     -smp 4 ^
     -fw_cfg name=opt/cuttle_device_key,file="%ROOT%\device_secret_key.bin" ^
     -drive format=raw,file="%BIOS_IMG%",if=ide ^
@@ -117,6 +132,11 @@ echo ===========================================================================
 goto :eof
 
 REM ----- error paths --------------------------------------------------------
+:bad_accel
+echo.
+echo ERROR: unknown accelerator "%ACCEL%". Use auto, whpx or tcg.
+exit /b 1
+
 :no_qemu
 echo.
 echo ERROR: qemu-system-x86_64 not found on PATH or at C:\Program Files\qemu\.

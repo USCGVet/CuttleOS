@@ -8,6 +8,9 @@ REM   Provider console        : http://127.0.0.1:18888/fleet
 REM   Provider token          : printed below, also target\cuttle_images\fleet\provider_token.txt
 REM   Client tokens           : target\cuttle_images\fleet\<client>\client_token.txt
 REM
+REM QEMU accelerator: `accelerator` in fleet.toml (default auto = WHPX when it
+REM works here, else TCG); override with --accel auto|whpx|tcg or CUTTLE_ACCEL.
+REM
 REM Ctrl+C stops every client farm and its VMs cleanly.
 REM ===========================================================================
 

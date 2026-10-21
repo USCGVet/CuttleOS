@@ -170,6 +170,12 @@ Plans `basic` (web + SQL) and `pro` (web + SQL + index + cron) ship with seven s
 python tools/cuttle_fleet.py --self-test      # 2-client fleet: auth, scoping, roles, data/key isolation
 ```
 
+### QEMU accelerator: WHPX (Hyper-V) or TCG
+Every launcher takes an accelerator: `auto` (default), `whpx` or `tcg`. `auto` uses **WHPX**, the Windows Hypervisor Platform's hardware virtualization, when this host can run it, and **TCG** software emulation otherwise. With WHPX, guest code runs natively, so boots and morphs are faster and an idle VM barely costs host CPU. Under TCG, every timer tick is emulated.
+- `triad.bat --accel tcg`, `fleet.bat --accel tcg` or `run.bat tcg`; or set `CUTTLE_ACCEL`. The fleet also reads `accelerator` in `tools/fleet.toml`, globally or per plan.
+- `auto` probes WHPX once at startup. Because some Windows hosts accept a WHPX guest but never let its BIOS leave reset, a VM that prints nothing within 8 s under WHPX is relaunched on TCG, and that Triad stays on TCG.
+- The QEMU smoke test stays on TCG by default (deterministic reference). `CUTTLE_QEMU_ACCEL=whpx` runs the same assertions under WHPX.
+
 ### 2. Boot a Single 4-Core VM Under QEMU
 Run `run.bat` to build the kernel ELF, package a BIOS disk image, and boot a single 4-core VM in QEMU (`http://127.0.0.1:18080/app`), or run the automated multi-boot + tamper-rejection QEMU smoke suite:
 ```powershell

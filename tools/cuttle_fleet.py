@@ -70,6 +70,11 @@ def load_fleet_config(path: Path = FLEET_CONFIG) -> dict:
                 raise ValueError(f"plan '{plan_id}' uses unknown job '{job_id}'")
         if not 1 <= len(plan.get("jobs", [])) <= 9:
             raise ValueError(f"plan '{plan_id}' must have 1-9 jobs (port block is 100 per client)")
+    for where, value in [("provider", cfg.get("provider", {}).get("accelerator"))] + [
+        (f"plan '{p}'", v.get("accelerator")) for p, v in plans.items()
+    ]:
+        if value is not None and value not in tc.ACCELERATORS:
+            raise ValueError(f"{where}: accelerator must be one of {tc.ACCELERATORS}")
     seen = set()
     for c in clients:
         if not CLIENT_ID_RE.match(c.get("id", "")):
@@ -104,6 +109,8 @@ def triad_specs(cfg: dict, client: dict) -> list:
     slot = client_slot(cfg, client["id"])
     prov, plan = cfg["provider"], cfg["plans"][client["plan"]]
     cdir = fleet_dir() / client["id"]
+    # CUTTLE_ACCEL (set by `--accel` on the provider) overrides the plan, then the fleet default.
+    accel = os.environ.get("CUTTLE_ACCEL") or plan.get("accelerator") or prov.get("accelerator", "auto")
     specs = []
     for t, job_id in enumerate(plan["jobs"]):
         job = cfg["jobs"][job_id]
@@ -121,6 +128,7 @@ def triad_specs(cfg: dict, client: dict) -> list:
                 https_base=base + 50,
                 smp=int(plan.get("vcpus", 2)),
                 memory=str(plan.get("memory", "128M")),
+                accel=accel,
                 node_names=tuple(f"OS-{i} ({short}-{x})" for i, x in ((1, "A"), (2, "B"), (3, "C"))),
                 node_roles=tuple(f"{job.get('label', job_id).upper()} · REPLICA {x}" for x in "ABC"),
                 base_seeds=tuple(_seed(client["id"], job_id, i) for i in (1, 2, 3)),
@@ -311,6 +319,7 @@ class Farm:
                     "label": jcfg.get("label", job),
                     "role": ctrl.spec.role,
                     "name": ctrl.spec.name,
+                    "accel": ctrl.accel,
                     "has_sql": ctrl.spec.has_sql,
                     "online": sum(1 for n in ctrl.nodes if n.state == "ONLINE"),
                     "nodes": [
@@ -442,6 +451,10 @@ class Provider:
         self.cfg = cfg
         self.config_path = config_path
         self.clients = {c["id"]: c for c in cfg["clients"]}
+        # Probe WHPX once here; farms inherit the answer instead of each probing (~2.5 s apiece).
+        self.whpx = tc.whpx_available(tc.find_qemu())
+        os.environ["CUTTLE_WHPX_AVAILABLE"] = "1" if self.whpx else "0"
+        self.accel_setting = os.environ.get("CUTTLE_ACCEL") or cfg["provider"].get("accelerator", "auto")
         fd = fleet_dir()
         fd.mkdir(parents=True, exist_ok=True)
         # Fresh provider token every start; client tokens persist so clients keep their credentials.
@@ -681,6 +694,7 @@ def run_provider(config_path: Path = FLEET_CONFIG):
     print(f"  Client tokens  : {fleet_dir()}\\<client>\\client_token.txt", flush=True)
     vms = sum(3 * len(cfg["plans"][c["plan"]]["jobs"]) for c in cfg["clients"])
     print(f"  Clients        : {len(cfg['clients'])} farms, {vms} VMs; farm logs in {fleet_dir()}\\<client>\\farm.log", flush=True)
+    print(f"  Accelerator    : {provider.accel_setting} (WHPX available: {'yes' if provider.whpx else 'no, using TCG'})", flush=True)
     print("  Press Ctrl+C to stop every farm cleanly.", flush=True)
     print("============================================================================\n", flush=True)
 
@@ -855,6 +869,15 @@ def run_self_test() -> int:
         assert "SERVED CONTENT VERIFIED" in wt["quorum_status"], wt["quorum_status"]
         print("roles: web=wfe, sql=sql, index=sql, cron=full on every node", flush=True)
 
+        # 3b. Every Triad runs on the accelerator the fleet setting resolves to on this host.
+        setting = provider.accel_setting
+        expected_accel = setting if setting != "auto" else ("whpx" if provider.whpx else "tcg")
+        for cid in ("alpha", "bravo"):
+            code, fm = call("GET", f"/api/c/{cid}/farm", P)
+            accels = {t["job"]: t["accel"] for t in fm["farm"]["triads"]}
+            assert set(accels.values()) == {expected_accel}, f"{cid}: expected every Triad on {expected_accel}: {accels}"
+        print(f"accelerator: every Triad runs on {expected_accel} (setting {setting})", flush=True)
+
         # 4. Data isolation: a row written to alpha's SQL Triad never appears in bravo's.
         code, r = call("POST", "/api/c/alpha/t/sql/api/sql", A, b"INSERT INTO kv VALUES ('isolation.probe', 'alpha-only', 1)")
         assert code == 200 and r["ok"], r
@@ -918,7 +941,10 @@ def main():
     ap.add_argument("--client", help="client id (farm mode)")
     ap.add_argument("--config", default=str(FLEET_CONFIG), help="fleet config (provider mode)")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--accel", choices=tc.ACCELERATORS, help="override every plan's QEMU accelerator")
     args = ap.parse_args()
+    if args.accel:
+        os.environ["CUTTLE_ACCEL"] = args.accel  # read by triad_specs; inherited by farm processes
     if args.self_test:
         sys.exit(run_self_test())
     if args.mode == "farm":

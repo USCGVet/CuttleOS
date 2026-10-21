@@ -12,6 +12,8 @@ REM   http://127.0.0.1:18080/app
 REM   http://127.0.0.1:18080/sql?SELECT+*+FROM+kv
 REM
 REM Pass --gui to also open the 3 native QEMU 1280x720 console windows.
+REM Pass --accel auto|whpx|tcg (or set CUTTLE_ACCEL) to pick the QEMU accelerator;
+REM auto = WHPX (Hyper-V hardware virtualization) when it works here, else TCG.
 REM ===========================================================================
 
 setlocal enabledelayedexpansion

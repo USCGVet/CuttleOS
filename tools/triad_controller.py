@@ -86,6 +86,7 @@ class TriadSpec:
     https_base: int = 18500
     smp: int = 4
     memory: str = "128M"
+    accel: str = "auto"  # QEMU accelerator: auto (WHPX, else TCG) | whpx | tcg
     node_names: tuple = ("OS-1 (SQL-Data-A)", "OS-2 (SQL-Data-B)", "OS-3 (SQL-Parity)")
     node_roles: tuple = ("ACTIVE DATA STRIPE A", "ACTIVE DATA STRIPE B", "RAID PARITY & WITNESS")
     base_seeds: tuple = (100101, 200202, 300303)
@@ -185,6 +186,61 @@ def find_qemu() -> str:
     raise RuntimeError("qemu-system-x86_64 not found on PATH or C:\\Program Files\\qemu")
 
 
+ACCELERATORS = ("auto", "whpx", "tcg")
+# Under `auto`, a WHPX VM that prints nothing of its own this long after launch is relaunched on TCG.
+WHPX_FIRST_OUTPUT_S = 8.0
+_whpx_cache: dict = {}
+
+
+def whpx_available(qemu_bin: str) -> bool:
+    """
+    True if QEMU can start a WHPX (Windows Hypervisor Platform) partition on this host.
+    Probes once per process with a paused, device-less x86 machine; a parent process can
+    pass its answer down in CUTTLE_WHPX_AVAILABLE=0/1 to skip the ~2 s probe.
+    """
+    env = os.environ.get("CUTTLE_WHPX_AVAILABLE")
+    if env in ("0", "1"):
+        return env == "1"
+    if qemu_bin not in _whpx_cache:
+        available = False
+        if sys.platform == "win32":
+            try:
+                p = subprocess.Popen(
+                    [qemu_bin, "-accel", "whpx", "-M", "pc", "-display", "none", "-nodefaults",
+                     "-S", "-no-reboot", "-monitor", "none", "-serial", "none"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                try:
+                    p.wait(timeout=2.5)  # exiting this early means WHPX failed to initialize
+                except subprocess.TimeoutExpired:
+                    available = True
+                    p.kill()
+                    p.wait(timeout=5.0)
+            except OSError:
+                pass
+        _whpx_cache[qemu_bin] = available
+    return _whpx_cache[qemu_bin]
+
+
+def resolve_accelerator(qemu_bin: str, requested: str) -> tuple:
+    """
+    Map a requested accelerator to (effective name, QEMU arguments).
+      tcg  : software emulation, always available.
+      whpx : Windows Hypervisor Platform (hardware virtualization); QEMU fails if unavailable.
+      auto : WHPX when this host can start it, else TCG. WHPX launches also list TCG second,
+             so QEMU itself falls back if a single VM's WHPX partition fails to initialize.
+    """
+    if requested not in ACCELERATORS:
+        raise ValueError(f"accelerator must be one of {ACCELERATORS}, got {requested!r}")
+    if requested == "tcg":
+        return "tcg", ["-accel", "tcg"]
+    if requested == "whpx":
+        return "whpx", ["-accel", "whpx"]
+    if whpx_available(qemu_bin):
+        return "whpx", ["-accel", "whpx", "-accel", "tcg"]
+    return "tcg", ["-accel", "tcg"]
+
+
 def extract_text_sha256(elf_bytes: bytes) -> str:
     """Compute SHA-256 of the ELF binary to fingerprint the morphed machine code."""
     return hashlib.sha256(elf_bytes).hexdigest()
@@ -229,6 +285,7 @@ class TriadNode:
         self.line_cond = threading.Condition()
         self.serial_tail: list[str] = []
 
+        self.accel = "pending"  # accelerator this node's VM was launched with
         self.elf_sha256 = "pending"
         self.morph_stats = "pending"
         self.morph_count = 0
@@ -271,6 +328,7 @@ class TriadController:
     def __init__(self, show_gui: bool = False, spec: TriadSpec | None = None):
         self.spec = spec or TriadSpec()
         self.qemu_bin = find_qemu()
+        self.accel, self.accel_args = resolve_accelerator(self.qemu_bin, self.spec.accel)
         self.show_gui = show_gui
         state_dir = self.spec.state_dir
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -492,11 +550,11 @@ class TriadController:
 
     def start_node_vm(self, node: TriadNode):
         node.ensure_disks(self.master_key_bytes)
+        node.accel = self.accel
         mac_last = f"{0x50 + node.node_id:02x}"
         cmd = [
             self.qemu_bin,
-            "-accel",
-            "tcg",
+            *self.accel_args,
             "-smp",
             str(self.spec.smp),
             "-m",
@@ -585,6 +643,40 @@ class TriadController:
 
                 node.response_lines.append(line)
                 node.line_cond.notify_all()
+
+    def _guest_started(self, node: TriadNode, timeout: float) -> bool:
+        """True once the guest prints anything of its own (the bootloader's `INFO :` lines come
+        first). QEMU's own warnings carry the binary name and do not count."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with node.line_cond:
+                if any("qemu-system" not in ln for ln in node.serial_tail):
+                    return True
+                if not node.proc or node.proc.poll() is not None:
+                    return False
+                node.line_cond.wait(timeout=0.2)
+        return False
+
+    def await_boot(self, node: TriadNode, timeout: float) -> bool:
+        """
+        Wait for a just-launched node's shell. Under `auto`, a VM that WHPX accepts but never
+        runs (seen on some Windows hosts: the BIOS never leaves reset and serial stays empty)
+        is relaunched on TCG, and this Triad stays on TCG from then on.
+        """
+        if node.accel == "whpx" and self.spec.accel == "auto" and not self._guest_started(node, WHPX_FIRST_OUTPUT_S):
+            self.log_event(
+                "WARN",
+                f"{node.name}: no guest output under WHPX after {WHPX_FIRST_OUTPUT_S:.0f}s; relaunching on TCG "
+                f"and keeping this Triad on TCG.",
+            )
+            try:
+                node.proc.kill()
+                node.proc.wait(timeout=5.0)
+            except Exception:
+                pass
+            self.accel, self.accel_args = "tcg", ["-accel", "tcg"]
+            self.start_node_vm(node)
+        return self.wait_for_shell_ready(node, timeout=timeout)
 
     def wait_for_shell_ready(self, node: TriadNode, timeout: float = 25.0) -> bool:
         deadline = time.time() + timeout
@@ -1127,7 +1219,7 @@ class TriadController:
 
             # 3. Boot freshly morphed VM
             self.start_node_vm(node)
-            ok = self.wait_for_shell_ready(node, timeout=35.0)
+            ok = self.await_boot(node, timeout=35.0)
             if not ok:
                 tail_str = " | ".join(node.serial_tail[-5:])
                 self.log_event("ERROR", f"{node.name}: Timed out waiting for shell ready after morph (tail: {tail_str}).")
@@ -1296,13 +1388,14 @@ class TriadController:
 
         self.log_event(
             "INIT",
-            f"Launching 3 parallel {self.spec.smp}-core Cuttle VMs ({3 * self.spec.smp} vCPUs total, HLT idle, role={self.spec.role})...",
+            f"Launching 3 parallel {self.spec.smp}-core Cuttle VMs ({3 * self.spec.smp} vCPUs total, HLT idle, "
+            f"role={self.spec.role}, accel={self.accel})...",
         )
         for n in self.nodes:
             self.start_node_vm(n)
 
         for n in self.nodes:
-            ok = self.wait_for_shell_ready(n, timeout=30.0)
+            ok = self.await_boot(n, timeout=30.0)
             if ok:
                 self.apply_node_profile(n)
                 n.state = "ONLINE"
@@ -1731,6 +1824,7 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                 "role": c.spec.role,
                 "has_sql": c.spec.has_sql,
                 "has_shell": c.spec.has_shell,
+                "accel": c.accel,
                 "desired_cron": [{"every": t, "cmd": cmd} for t, cmd in c.desired_cron],
                 "nodes": [
                     {
@@ -1739,6 +1833,7 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                         "role": n.role,
                         "state": n.state,
                         "http_port": n.http_port,
+                        "accel": n.accel,
                         "seed": n.current_seed,
                         "elf_sha256": n.elf_sha256,
                         "morph_stats": n.morph_stats,
@@ -1913,12 +2008,18 @@ def main():
         action="store_true",
         help="Boot the 3-node Triad, test SQL RAID writes during a live node morph, test 2-of-3 self-healing, and exit",
     )
+    parser.add_argument(
+        "--accel",
+        choices=ACCELERATORS,
+        default=os.environ.get("CUTTLE_ACCEL") or "auto",
+        help="QEMU accelerator: auto (WHPX if available, else TCG), whpx, or tcg. Default: $CUTTLE_ACCEL or auto",
+    )
     args = parser.parse_args()
 
     if args.self_test and (TRIAD_DIR / "triad_wal.json").exists():
         (TRIAD_DIR / "triad_wal.json").unlink()
 
-    ctrl = TriadController(show_gui=args.gui)
+    ctrl = TriadController(show_gui=args.gui, spec=TriadSpec(accel=args.accel))
     if args.self_test:
         for n in ctrl.nodes:
             for img in (n.ahci_img, n.virtio_img, n.nvme_img):
@@ -1930,6 +2031,40 @@ def main():
     if args.self_test:
         try:
             print("\n=== RUNNING TRIAD 3-AS-1 LIVE SELF-TEST ===", flush=True)
+            print(f"accelerator: {ctrl.accel} (requested {args.accel})", flush=True)
+            # 0. Accelerator fallback: a host where WHPX cannot start resolves `auto` to TCG.
+            #    sys.executable stands in for a QEMU whose WHPX probe exits immediately.
+            saved_whpx_env = os.environ.pop("CUTTLE_WHPX_AVAILABLE", None)
+            try:
+                _whpx_cache.pop(sys.executable, None)
+                assert resolve_accelerator(sys.executable, "auto") == ("tcg", ["-accel", "tcg"]), \
+                    "auto must fall back to TCG when the WHPX probe fails"
+                assert resolve_accelerator(sys.executable, "tcg")[0] == "tcg"
+            finally:
+                if saved_whpx_env is not None:
+                    os.environ["CUTTLE_WHPX_AVAILABLE"] = saved_whpx_env
+            print("accelerator: auto falls back to TCG when WHPX cannot start", flush=True)
+
+            # 0b. A VM that WHPX accepts but never runs (BIOS stuck in reset on some hosts) is
+            #     relaunched on TCG. Simulated on one extra VM with its own state and ports.
+            if ctrl.accel == "whpx":
+                probe = TriadController(
+                    show_gui=False,
+                    spec=TriadSpec(name="accel-fallback-probe", state_dir=TRIAD_DIR / "accel_fallback_probe",
+                                   http_base=18190, https_base=18590, smp=2, accel="auto"),
+                )
+                probe._guest_started = lambda node, timeout: False  # "no guest output under WHPX"
+                pn = probe.nodes[0]
+                try:
+                    probe.morph_node_image(pn, pn.current_seed)
+                    probe.start_node_vm(pn)
+                    assert pn.accel == "whpx", f"probe VM should start on WHPX, got {pn.accel}"
+                    assert probe.await_boot(pn, timeout=40.0), "fallback VM did not reach its shell on TCG"
+                    assert pn.accel == "tcg" and probe.accel == "tcg", (pn.accel, probe.accel)
+                    assert any(e["level"] == "WARN" and "relaunching on TCG" in e["msg"] for e in probe.events)
+                finally:
+                    probe.shutdown()
+                print("accelerator: a WHPX VM with no guest output is relaunched on TCG and boots", flush=True)
             # 1. Verify each node received a distinct 256-bit cryptographic key AND booted distinct service ELF variants
             node_keys = [n.device_key_path.read_bytes() for n in ctrl.nodes]
             assert len(set(node_keys)) == 3, "Each Triad node must have a distinct 256-bit device key"
@@ -2206,7 +2341,7 @@ def main():
                 time.sleep(1.0)
                 if before_boot:
                     before_boot()
-                new = TriadController(show_gui=args.gui)
+                new = TriadController(show_gui=args.gui, spec=TriadSpec(accel=args.accel))
                 TriadHttpHandler.ctrl = new
                 new.boot_all_parallel()
                 return new
@@ -2273,6 +2408,7 @@ def main():
     print(f"  Operator Session Token : {ctrl.coordinator_token} (saved to triad/operator_token.txt)", flush=True)
     print(f"  Unified SQL Endpoint   : POST http://127.0.0.1:{args.port}/api/sql (with X-Cuttle-Session header)", flush=True)
     print(f"  Individual OS Ports    : OS-1 :18101 | OS-2 :18102 | OS-3 (Parity) :18103", flush=True)
+    print(f"  Accelerator            : {ctrl.accel} (requested {args.accel})", flush=True)
     print(f"  Press Ctrl+C to shut down all 3 VMs cleanly.", flush=True)
     print("============================================================================\n", flush=True)
     try:
