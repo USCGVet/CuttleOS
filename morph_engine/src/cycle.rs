@@ -528,15 +528,13 @@ fn locate_sibling_bin(name: &str) -> Result<PathBuf> {
         name.to_string()
     };
     let self_exe = env::current_exe().context("locate current exe for sibling lookup")?;
-    let dir = self_exe
-        .parent()
-        .context("current exe has no parent directory")?;
-    // Examples (and test harnesses) live one level down from the real
-    // binaries (`<profile>/examples/` → `<profile>/`): check both.
-    let candidates: Vec<PathBuf> = std::iter::once(dir.to_path_buf())
-        .chain(dir.parent().map(|p| p.to_path_buf()))
+    let candidates: Vec<PathBuf> = sibling_search_dirs(&self_exe)
+        .into_iter()
         .map(|d| d.join(&exe_name))
         .collect();
+    if candidates.is_empty() {
+        bail!("current exe has no parent directory");
+    }
     for candidate in &candidates {
         if candidate.exists() {
             return Ok(candidate.clone());
@@ -548,6 +546,32 @@ fn locate_sibling_bin(name: &str) -> Result<PathBuf> {
         name,
         candidates[0].display()
     )
+}
+
+/// Directories [`locate_sibling_bin`] searches, derived only from the
+/// running exe's own path (never PATH, never an open-ended ancestor walk).
+///
+/// - `<profile>/morph(.exe)`: production — the exe's own directory.
+/// - `<profile>/deps/` or `<profile>/examples/` (classic cargo layout for
+///   test harnesses and examples): one level up.
+/// - `<profile>/build/<pkg>/<hash>/<kind>/` (cargo's newer build-dir
+///   layout, where test harnesses no longer live in `deps/`): the
+///   `<profile>` directory four levels up, only when that shape matches.
+fn sibling_search_dirs(self_exe: &Path) -> Vec<PathBuf> {
+    let Some(dir) = self_exe.parent() else {
+        return Vec::new();
+    };
+    let mut dirs = vec![dir.to_path_buf()];
+    if let Some(up) = dir.parent() {
+        dirs.push(up.to_path_buf());
+    }
+    let mut ancestors = dir.ancestors();
+    if ancestors.nth(3).and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new("build")) {
+        if let Some(profile) = ancestors.next() {
+            dirs.push(profile.to_path_buf());
+        }
+    }
+    dirs
 }
 
 /// Append one v2 attestation entry. Thin wrapper around
@@ -1828,6 +1852,35 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn sibling_search_dirs_production_exe_dir_first() {
+        let dirs = sibling_search_dirs(Path::new("/w/target/release/morph.exe"));
+        assert_eq!(dirs[0], Path::new("/w/target/release"));
+    }
+
+    #[test]
+    fn sibling_search_dirs_classic_deps_layout() {
+        let dirs = sibling_search_dirs(Path::new("/w/target/debug/deps/cycle_x-0123abcd.exe"));
+        assert!(dirs.contains(&PathBuf::from("/w/target/debug")), "{dirs:?}");
+    }
+
+    #[test]
+    fn sibling_search_dirs_new_build_dir_layout() {
+        // Cargo's newer build-dir layout puts test harnesses here; the
+        // pipeline binaries (`verify`, ...) stay in `<profile>/`.
+        let dirs = sibling_search_dirs(Path::new(
+            "/w/target/debug/build/cuttle-morph-engine/06ec4af14dd67749/out/cycle_x-06ec4af14dd67749.exe",
+        ));
+        assert!(dirs.contains(&PathBuf::from("/w/target/debug")), "{dirs:?}");
+    }
+
+    #[test]
+    fn sibling_search_dirs_no_open_ended_ancestor_walk() {
+        // Without the build-dir shape, only the exe dir and its parent.
+        let dirs = sibling_search_dirs(Path::new("/a/b/c/d/e/f.exe"));
+        assert_eq!(dirs, vec![PathBuf::from("/a/b/c/d/e"), PathBuf::from("/a/b/c/d")]);
     }
 
     #[test]
