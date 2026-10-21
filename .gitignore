@@ -35,3 +35,7 @@ perf.jsonl
 # OS / Editor files
 .DS_Store
 Thumbs.db
+
+# Python bytecode (tools/cuttle_fleet.py imports tools/triad_controller.py)
+__pycache__/
+*.pyc

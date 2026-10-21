@@ -1,0 +1,100 @@
+# Cuttle fleet: one provider managing isolated client farms.
+#
+#   provider -> client farm (own process, master key, tokens, state, ports)
+#            -> Triads by job (each a kernel role profile) -> 3 VMs per Triad
+#
+# Grow the fleet here: add a job, add it to a plan, add a plan, or append a client.
+# Started by `fleet.bat` (python tools/cuttle_fleet.py). State lives under
+# target/cuttle_images/fleet/<client>/ (gitignored).
+
+[provider]
+port = 18888            # provider console + API: http://127.0.0.1:18888/fleet
+farm_port_base = 18900  # client farm in slot i listens on 127.0.0.1:(farm_port_base + i)
+vm_port_base = 20000    # slot i, Triad t, node n -> HTTP vm_port_base + i*100 + t*10 + n (HTTPS +50)
+boot_stagger_s = 8      # seconds between client farm launches
+synthetic_load = true   # farms start with labelled synthetic traffic so the stats move
+
+# ---- Jobs: what a Triad serves, and which kernel role it runs ----------------------------
+# role: wfe (svc-http only) | sql (svc-sql only) | shell (svc-sh only) | full (all three)
+
+[jobs.web]
+label = "Web front end"
+short = "Web"
+role = "wfe"
+
+[jobs.sql]
+label = "SQL database"
+short = "SQL"
+role = "sql"
+provision_sql = ["INSERT INTO kv VALUES ('load.counter', '0', 1)"]
+
+[jobs.index]
+label = "Search index"
+short = "Index"
+role = "sql"
+vote_tables = ["kv", "idx"]
+provision_sql = [
+  "CREATE TABLE idx (term TEXT, doc TEXT, rank INT)",
+  "CREATE INDEX idx_term ON idx (term)",
+  "INSERT INTO idx VALUES ('cuttle', 'doc-1', 1)",
+  "INSERT INTO idx VALUES ('triad', 'doc-2', 1)",
+  "INSERT INTO idx VALUES ('morph', 'doc-3', 1)",
+]
+
+[jobs.cron]
+label = "Business jobs (cron)"
+short = "Cron"
+# Running jobs needs svc-sh and listing them needs svc-http; the kernel has no cron-only role.
+role = "full"
+cron = [[40, "status"], [90, "seal"]]
+
+# ---- Plans --------------------------------------------------------------------------------
+
+[plans.basic]
+label = "Basic"
+jobs = ["web", "sql"]
+vcpus = 2
+memory = "128M"
+
+[plans.pro]
+label = "Pro"
+jobs = ["web", "sql", "index", "cron"]
+vcpus = 2
+memory = "128M"
+
+# ---- Clients (append new ones; a client's slot is its position in this list) --------------
+
+[[clients]]
+id = "bluefin"
+name = "Bluefin Logistics"
+plan = "pro"
+
+[[clients]]
+id = "cedar"
+name = "Cedar Health"
+plan = "basic"
+
+[[clients]]
+id = "granite"
+name = "Granite Credit Union"
+plan = "pro"
+
+[[clients]]
+id = "harbor"
+name = "Harbor Retail"
+plan = "basic"
+
+[[clients]]
+id = "juniper"
+name = "Juniper Labs"
+plan = "pro"
+
+[[clients]]
+id = "kestrel"
+name = "Kestrel Media"
+plan = "basic"
+
+[[clients]]
+id = "orchid"
+name = "Orchid Travel"
+plan = "basic"

@@ -1,0 +1,2207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cuttle Triad Console</title>
+<!--
+  Cuttle Triad live operations console. Served by tools/triad_controller.py at /console.
+  Self-contained (no external assets) so it works on an offline host.
+  Reads GET /api/triad (public status). Every action POSTs with the operator session
+  token the operator pastes in; the page itself never receives the token from the server.
+-->
+<style>
+:root{
+  --bg:#05070d; --panel:#0a1020; --panel2:#0e162a; --line:#1a2540; --line2:#24324f;
+  --text:#e6edf7; --muted:#8b9bb4; --dim:#56657e;
+  --accent:#22d3ee; --accent2:#a78bfa;
+  --ok:#2ee6a8; --warn:#fbbf24; --bad:#fb7185;
+  --s-online:#2ee6a8; --s-draining:#fbbf24; --s-morphing:#e879f9; --s-catching:#38bdf8;
+  --s-healing:#fb7185; --s-offline:#64748b; --s-init:#a78bfa;
+  --mono:"Cascadia Code","JetBrains Mono",Consolas,ui-monospace,monospace;
+  --sans:"Segoe UI Variable Text","Segoe UI",Inter,system-ui,-apple-system,sans-serif;
+  --r:14px;
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{
+  min-height:100vh;color:var(--text);font:14px/1.45 var(--sans);
+  background:
+    radial-gradient(1100px 650px at 75% -15%,#10265a55,transparent 60%),
+    radial-gradient(900px 600px at -10% 110%,#4a0f6a3d,transparent 60%),
+    var(--bg);
+}
+button,input,select,textarea{font:inherit;color:inherit}
+.mono{font-family:var(--mono)}
+.muted{color:var(--muted)}
+[hidden]{display:none!important}
+
+/* ---------- header ---------- */
+.top{
+  position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:18px;
+  padding:10px 20px;background:#05070dcc;backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--line);
+}
+.brand{display:flex;align-items:center;gap:10px;min-width:0}
+.logo{width:38px;height:38px;flex:none}
+.brand-name{font-weight:700;letter-spacing:.14em;font-size:15px}
+.brand-sub{color:var(--muted);font-size:12px;letter-spacing:.04em}
+.tabs{display:flex;gap:4px;margin-left:12px;background:#0b1224;border:1px solid var(--line);border-radius:12px;padding:4px}
+.tabs button{
+  border:0;background:none;padding:7px 14px;border-radius:9px;cursor:pointer;color:var(--muted);
+  font-weight:600;font-size:13px;white-space:nowrap;
+}
+.tabs button:hover{color:var(--text)}
+.tabs button[aria-selected="true"]{background:linear-gradient(180deg,#1b2a4d,#14203c);color:var(--text);box-shadow:inset 0 0 0 1px #2b3d66}
+.top-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;border:1px solid var(--line2);font-size:12px;color:var(--muted);white-space:nowrap}
+.pill .dot{width:8px;height:8px;border-radius:50%;background:var(--dim)}
+.pill.live .dot{background:var(--ok);box-shadow:0 0 0 0 #2ee6a8aa;animation:ping 1.6s infinite}
+.pill.down .dot{background:var(--bad)}
+@keyframes ping{0%{box-shadow:0 0 0 0 #2ee6a8aa}80%,100%{box-shadow:0 0 0 7px #2ee6a800}}
+.iconbtn{border:1px solid var(--line2);background:#0b1224;border-radius:10px;padding:6px 10px;cursor:pointer;font-size:15px;line-height:1}
+.iconbtn:hover{border-color:#3a4f7d}
+.btn-lock{border:1px solid #3b2f66;background:linear-gradient(180deg,#221a45,#170f33);border-radius:10px;padding:7px 12px;cursor:pointer;font-weight:600;font-size:13px}
+.btn-lock.on{border-color:#1f6b55;background:linear-gradient(180deg,#0f3a2f,#0a2a22);color:#b9f8e2}
+
+main{max-width:1440px;margin:0 auto;padding:20px}
+.tabpanel{animation:fadein .25s ease}
+@keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* ---------- cards & controls ---------- */
+.card{background:linear-gradient(180deg,#0c1326,#0a1020);border:1px solid var(--line);border-radius:var(--r);padding:16px}
+.card-h{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.card-h h3{margin:0;font-size:14px;letter-spacing:.04em}
+.card-h .sp{flex:1}
+h3 .sub{color:var(--muted);font-weight:500;letter-spacing:0;margin-left:6px;font-size:12px}
+.btn{
+  border:1px solid var(--line2);background:#101a31;border-radius:9px;padding:7px 12px;cursor:pointer;
+  font-weight:600;font-size:13px;transition:border-color .15s,background .15s,transform .05s;white-space:nowrap
+}
+.btn:hover:not(:disabled){border-color:#3d5384;background:#14213f}
+.btn:active:not(:disabled){transform:translateY(1px)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.primary{border-color:#1b6d8a;background:linear-gradient(180deg,#0f4a63,#0b3549);color:#d6f6ff}
+.btn.primary:hover:not(:disabled){border-color:#2aa3c9;background:linear-gradient(180deg,#126081,#0d425c)}
+.btn.magenta{border-color:#7a2d86;background:linear-gradient(180deg,#4b1656,#350f3d);color:#fbe2ff}
+.btn.magenta:hover:not(:disabled){border-color:#b54bc6}
+.btn.danger{border-color:#7f2433;background:linear-gradient(180deg,#4a1320,#360d17);color:#ffe0e6}
+.btn.danger:hover:not(:disabled){border-color:#d1435c}
+.btn.sm{padding:4px 9px;font-size:12px;border-radius:7px}
+.link{background:none;border:0;color:var(--accent);cursor:pointer;font-weight:600;font-size:12px;padding:0}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{border:1px solid var(--line2);background:#0d162b;border-radius:999px;padding:3px 10px;font-size:12px;cursor:pointer;font-family:var(--mono);color:#c7d3e6}
+.chip:hover{border-color:#3d5384;color:#fff}
+.tag{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line2);color:var(--muted);white-space:nowrap}
+.tag.r{border-color:#1b5d73;color:#8fe3ff}
+.tag.w{border-color:#5a3b8a;color:#d7c2ff}
+.tag.x{border-color:#7f2433;color:#ffb3c0}
+input[type=text],input[type=password],input[type=number],select,textarea{
+  background:#070c18;border:1px solid var(--line2);border-radius:9px;padding:8px 10px;outline:none;min-width:0
+}
+input:focus,select:focus,textarea:focus{border-color:#2aa3c9;box-shadow:0 0 0 3px #22d3ee22}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.row > input[type=text]{flex:1 1 220px}
+.badge{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  padding:3px 9px;border-radius:999px;color:var(--c,#94a3b8);background:color-mix(in srgb,var(--c,#94a3b8) 14%,transparent);border:1px solid color-mix(in srgb,var(--c,#94a3b8) 45%,transparent)}
+.badge::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--c,#94a3b8);box-shadow:0 0 8px var(--c,#94a3b8)}
+
+/* ---------- overview ---------- */
+.hero{display:grid;grid-template-columns:minmax(300px,1fr) 2fr;gap:16px;margin-bottom:16px}
+.hero-q{display:flex;flex-direction:column;justify-content:center;gap:10px;position:relative;overflow:hidden}
+.hero-q::after{content:"";position:absolute;inset:auto -40px -60px auto;width:220px;height:220px;border-radius:50%;background:radial-gradient(#22d3ee22,transparent 70%)}
+.hearts{display:flex;gap:10px}
+.hearts svg{width:46px;height:46px;transition:opacity .3s}
+.hearts svg.off{opacity:.18}
+.hearts svg.beat path{animation:heartbeat 1.2s ease-in-out infinite;transform-box:fill-box;transform-origin:center}
+.hq-num{font-size:44px;font-weight:800;line-height:1;letter-spacing:-.02em}
+.hq-num small{font-size:15px;font-weight:600;color:var(--muted);margin-left:6px;letter-spacing:0}
+.hq-text{font-family:var(--mono);font-size:12px;color:#a9f5dc;line-height:1.5}
+.hq-text.warn{color:#ffe08a}.hq-text.bad{color:#ffb3c0}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.kpi-l{color:var(--muted);font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+.kpi-v{font-size:28px;font-weight:800;margin:6px 0 2px;letter-spacing:-.01em}
+.kpi-v.ok{color:var(--ok)}.kpi-v.bad{color:var(--bad)}.kpi-v.on{color:var(--s-morphing)}
+.kpi-s{color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.nodes{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:16px}
+.node{position:relative;overflow:hidden;transition:border-color .4s,box-shadow .4s}
+.node::before{content:"";position:absolute;inset:0 0 auto 0;height:3px;background:var(--c);box-shadow:0 0 18px var(--c);transition:background .4s}
+.node header{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.n-name{font-size:18px;font-weight:800;letter-spacing:.02em}
+.n-role{color:var(--muted);font-size:12px}
+.ecg{display:block;width:100%;height:58px;margin:10px 0;border-radius:10px;background:linear-gradient(180deg,#060b17,#081026);border:1px solid #121c33}
+.n-grid{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0;font-size:12px}
+.n-grid dt{color:var(--muted)}
+.n-grid dd{margin:0;font-family:var(--mono);overflow-wrap:anywhere;color:#d5e1f3}
+.n-stats{margin-top:10px;font-size:11px;color:var(--muted);font-family:var(--mono);overflow-wrap:anywhere;min-height:2.6em}
+.node footer{display:flex;gap:8px;margin-top:12px;align-items:center}
+.node footer a{margin-left:auto;color:var(--accent);font-size:12px;font-weight:600;text-decoration:none}
+.lag{color:var(--warn)}
+
+/* ---------- events ---------- */
+.evlist{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:2px}
+.ev{display:grid;grid-template-columns:62px 92px 1fr;gap:10px;align-items:baseline;padding:6px 8px;border-radius:8px;font-size:12px}
+.ev:hover{background:#0f182e}
+.ev .t{font-family:var(--mono);color:var(--dim)}
+.ev .l{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.06em;color:var(--lc);
+  border:1px solid color-mix(in srgb,var(--lc) 40%,transparent);background:color-mix(in srgb,var(--lc) 12%,transparent);
+  border-radius:6px;padding:1px 6px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ev .m{color:#cdd8ea;overflow-wrap:anywhere}
+.ev.fresh{animation:slidein .5s ease}
+@keyframes slidein{from{opacity:0;transform:translateX(-8px);background:#1b2a4d}to{opacity:1;transform:none}}
+.empty{color:var(--dim);font-size:12px;padding:10px 8px}
+
+/* ---------- operations ---------- */
+.ops-intro{display:grid;grid-template-columns:1.2fr 2fr;gap:20px;margin-bottom:16px;align-items:center}
+.ops-intro h2{margin:0 0 6px;font-size:18px}
+.ops-intro p{margin:0;color:var(--muted)}
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.step{border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:#0b1326}
+.step b{display:block;font-size:12px;letter-spacing:.06em;color:var(--accent);margin-bottom:2px}
+.step span{font-size:12px;color:var(--muted)}
+.ops-grid{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:16px;align-items:start}
+.ops-col{display:flex;flex-direction:column;gap:16px}
+.op .desc{color:var(--muted);font-size:13px;margin:0 0 10px}
+.op .flow{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:11px;color:var(--dim);margin:0 0 12px;font-family:var(--mono)}
+.op .flow span{border:1px dashed var(--line2);border-radius:6px;padding:1px 6px;color:#9fb0ca}
+.op .flow i{font-style:normal;color:var(--dim)}
+.op .sect{margin-top:10px}
+.op .sect + .sect{border-top:1px dashed var(--line);padding-top:10px}
+.op label.small{font-size:11px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;font-weight:700;display:block;margin-bottom:6px}
+.ico{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;font-size:15px;flex:none;background:#12203d;border:1px solid #22355e}
+.inspector{position:sticky;top:76px;max-height:calc(100vh - 96px);display:flex;flex-direction:column}
+.insp-body{overflow:auto;min-height:0}
+.insp-cmd{font-family:var(--mono);font-size:12px;color:#d9e6f7;background:#070c18;border:1px solid var(--line);border-radius:8px;padding:7px 9px;margin-bottom:10px;overflow-wrap:anywhere}
+.insp-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+pre.out{margin:0;font:12px/1.5 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;background:#060a15;border:1px solid var(--line);border-radius:10px;padding:10px;color:#cfe3ff;max-height:260px;overflow:auto}
+pre.out.err{color:#ffc2cc;border-color:#5a1f2c}
+.pernode{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}
+.pn{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#070c18}
+.pn h4{margin:0;padding:6px 8px;font-size:11px;display:flex;justify-content:space-between;gap:6px;border-bottom:1px solid var(--line);letter-spacing:.04em}
+.pn pre{margin:0;padding:8px;font:11px/1.45 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;max-height:190px;overflow:auto;color:#c4d4ea}
+.pn.agree{border-color:#1f6b55}.pn.agree h4{color:#a8f3d8}
+.pn.differ{border-color:#7f2433}.pn.differ h4{color:#ffb3c0}
+.pn.queued{border-color:#5a4a1a}.pn.queued h4{color:#ffe08a}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid #22d3ee55;border-top-color:#22d3ee;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px}
+.drill{border:1px solid var(--line);border-radius:12px;padding:12px;background:#0a1224}
+.drill + .drill{margin-top:10px}
+.drill h4{margin:0 0 4px;font-size:13px}
+.drill p{margin:0 0 10px;color:var(--muted);font-size:12px}
+.stepper{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}
+.stepper li{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--dim)}
+.stepper li::before{content:"";width:10px;height:10px;border-radius:50%;border:2px solid #2b3a5c;flex:none}
+.stepper li.run{color:var(--text)}.stepper li.run::before{border-color:#22d3ee;border-top-color:transparent;animation:spin .8s linear infinite}
+.stepper li.ok{color:#a8f3d8}.stepper li.ok::before{background:var(--ok);border-color:var(--ok)}
+.stepper li.fail{color:#ffb3c0}.stepper li.fail::before{background:var(--bad);border-color:var(--bad)}
+.stepper li small{color:var(--muted);margin-left:auto;font-family:var(--mono);font-size:11px;text-align:right}
+
+/* ---------- live cycle ---------- */
+.cycle-grid{display:grid;grid-template-columns:minmax(0,2.1fr) minmax(300px,1fr);gap:16px;margin-bottom:16px}
+.stage-wrap{position:relative}
+#stage{display:block;width:100%;height:auto;max-height:68vh}
+.now{display:flex;gap:12px;align-items:flex-start;background:#0a1328;border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:10px}
+.now .ico{background:#122a3d;border-color:#1d4a63}
+.now b{display:block;font-size:13px;margin-bottom:1px}
+.now span{color:var(--muted);font-size:12.5px}
+.pipeline{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin-top:6px}
+.stg{position:relative;border:1px solid var(--line);border-radius:12px;padding:8px 10px;background:#0a1224;min-height:84px;transition:border-color .3s,background .3s}
+.stg.active{border-color:color-mix(in srgb,var(--c) 60%,transparent);background:color-mix(in srgb,var(--c) 9%,#0a1224)}
+.stg b{display:block;font-size:12px;color:var(--c)}
+.stg span{display:block;font-size:11px;color:var(--muted);line-height:1.3}
+.stg .slot{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.stg:not(:last-child)::after{content:"›";position:absolute;right:-9px;top:50%;transform:translateY(-50%);color:var(--dim);font-size:16px}
+.nchip{font:700 10.5px var(--mono);padding:2px 7px;border-radius:999px;color:#04131a;background:var(--c);box-shadow:0 0 10px var(--c)}
+.side{display:flex;flex-direction:column;gap:16px;min-width:0}
+.mini-ecg{display:grid;grid-template-columns:44px 1fr auto;gap:8px;align-items:center}
+.mini-ecg + .mini-ecg{margin-top:8px}
+.mini-ecg b{font:700 12px var(--mono)}
+.mini-ecg canvas{width:100%;height:40px;display:block;border-radius:8px;background:#060b17;border:1px solid #121c33}
+.mini-ecg .st{font:600 10.5px var(--mono);color:var(--c);min-width:84px;text-align:right}
+#feed{max-height:340px;overflow:auto}
+.toggle{display:inline-flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);cursor:pointer;user-select:none}
+.toggle input{accent-color:#e879f9}
+#timeline{display:block;width:100%;height:118px}
+.legend{display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--muted)}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px;background:var(--c)}
+
+/* SVG stage */
+.peer{stroke:#1a2540;stroke-width:1.5;stroke-dasharray:2 7;transition:stroke .4s}
+.peer.on{stroke:#2ee6a8;stroke-opacity:.35;stroke-dasharray:none}
+.spoke{stroke:#1d2a44;stroke-width:2;transition:stroke .4s}
+.spoke.on{stroke:var(--c);stroke-opacity:.6;stroke-dasharray:4 10;animation:flow 1.1s linear infinite}
+.spoke.in{stroke:var(--c);stroke-opacity:.8;stroke-dasharray:6 8;animation:flowin .6s linear infinite}
+@keyframes flow{to{stroke-dashoffset:-28}}
+@keyframes flowin{to{stroke-dashoffset:28}}
+.core-ring{fill:none;stroke:#22d3ee;stroke-opacity:.45;stroke-width:2;stroke-dasharray:3 9;animation:spin 22s linear infinite;transform-box:fill-box;transform-origin:center}
+.core-hex{fill:#0b1530;stroke:#22d3ee;stroke-width:2.5}
+.core-t1{fill:#e6edf7;font:800 17px var(--sans);letter-spacing:.2em;text-anchor:middle}
+.core-t2{fill:#8b9bb4;font:600 10px var(--sans);letter-spacing:.25em;text-anchor:middle}
+.core-q{fill:#2ee6a8;font:800 22px var(--mono);text-anchor:middle}
+.core-tx{fill:#c3d0e4;font:700 13px var(--mono);text-anchor:middle}
+.cd-arc{fill:none;stroke:#e879f9;stroke-width:4;stroke-linecap:round;filter:url(#glow);transition:opacity .4s}
+.cd-track{fill:none;stroke:#1a2540;stroke-width:4}
+#pointer{transform-box:view-box;transform-origin:0 0;transition:transform .9s cubic-bezier(.5,1.6,.4,1)}
+.pointer{fill:#e879f9;filter:url(#glow)}
+.vnode .halo{fill:var(--c);opacity:.1;transform-box:fill-box;transform-origin:center;transition:fill .4s}
+.vnode[data-state="ONLINE"] .halo{animation:halo 1.2s ease-in-out infinite}
+.vnode[data-state="CATCHING_UP"] .halo{animation:halo .55s ease-in-out infinite}
+.vnode[data-state="HEALING"] .halo{animation:alarm .5s ease-in-out infinite}
+@keyframes halo{0%,100%{transform:scale(.9);opacity:.08}12%{transform:scale(1.07);opacity:.24}24%{transform:scale(.95);opacity:.12}36%{transform:scale(1.03);opacity:.19}}
+@keyframes alarm{0%,100%{opacity:.08}50%{opacity:.35}}
+.vnode .ring{fill:#0a1020;stroke:var(--c);stroke-width:3;transition:stroke .4s}
+.vnode .ring-spin{fill:none;stroke:var(--c);stroke-width:2.5;stroke-dasharray:5 11;opacity:0;transform-box:fill-box;transform-origin:center}
+.vnode[data-state="MORPHING"] .ring-spin,.vnode[data-state="HEALING"] .ring-spin,.vnode[data-state="INITIALIZING"] .ring-spin,.vnode[data-state="DRAINING"] .ring-spin{opacity:1;animation:spin 1.3s linear infinite}
+.vnode .heart{fill:var(--c);filter:url(#glow);transform-box:fill-box;transform-origin:center;transition:fill .4s}
+.vnode[data-state="ONLINE"] .heart{animation:heartbeat 1.2s ease-in-out infinite}
+.vnode[data-state="CATCHING_UP"] .heart{animation:heartbeat .55s ease-in-out infinite}
+.vnode[data-state="MORPHING"] .heart{animation:glitch .22s steps(2) infinite}
+.vnode[data-state="OFFLINE"] .heart{opacity:.25;filter:none}
+.vnode[data-state="DRAINING"] .heart{opacity:.6;animation:heartbeat 2.4s ease-in-out infinite}
+@keyframes heartbeat{0%,100%{transform:scale(1)}12%{transform:scale(1.15)}24%{transform:scale(.97)}36%{transform:scale(1.08)}}
+@keyframes glitch{0%{transform:translate(-3px,1px) scale(1.04) skewX(6deg)}50%{transform:translate(3px,-1px) scale(.95) skewX(-6deg)}100%{transform:none}}
+@keyframes spin{to{transform:rotate(360deg)}}
+.vn-name{fill:#e6edf7;font:800 18px var(--sans);letter-spacing:.04em}
+.vn-sub{fill:#8b9bb4;font:600 11px var(--sans);letter-spacing:.04em}
+.vn-state{fill:var(--c);font:800 12px var(--mono);letter-spacing:.12em}
+.vn-hash{fill:#9fb0ca;font:500 12px var(--mono)}
+.vnode[data-state="MORPHING"] .vn-hash{fill:#f5b8ff}
+.mbadge circle{fill:#0b1530;stroke:var(--c);stroke-width:1.5}
+.mbadge text{fill:#e6edf7;font:700 11px var(--mono);text-anchor:middle}
+.lagb rect{fill:#2a2208;stroke:#fbbf24;stroke-width:1}
+.lagb text{fill:#ffe08a;font:700 10px var(--mono);text-anchor:middle}
+.disk ellipse,.disk path{fill:#0c1428;stroke:#2b3d66;stroke-width:1.5}
+.disk text{fill:#56657e;font:700 9px var(--mono);text-anchor:middle;letter-spacing:.1em}
+.disk.hot ellipse,.disk.hot path{stroke:#fbbf24}
+.disk.hot text{fill:#fbbf24}
+.pkt{filter:url(#glow)}
+.pkt-l{font:700 9px var(--mono);text-anchor:middle}
+.fx-ring{fill:none;stroke-width:3}
+.fx-text{font:800 14px var(--sans);text-anchor:middle;letter-spacing:.08em}
+
+/* ---------- log tab ---------- */
+.log-tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.fchip{border:1px solid var(--line2);background:#0d162b;border-radius:999px;padding:4px 11px;font-size:12px;cursor:pointer;color:var(--muted);font-weight:600}
+.fchip[aria-pressed="true"]{color:var(--text);border-color:var(--lc,#3d5384);background:color-mix(in srgb,var(--lc,#3d5384) 18%,#0d162b)}
+#logList{max-height:calc(100vh - 220px);overflow:auto}
+
+/* ---------- dialogs, toasts, fireworks ---------- */
+dialog{border:1px solid var(--line2);border-radius:16px;background:#0b1224;color:var(--text);padding:20px;max-width:520px;width:calc(100% - 32px);box-shadow:0 30px 80px #000c}
+dialog::backdrop{background:#02040acc;backdrop-filter:blur(3px)}
+dialog h3{margin:0 0 8px;font-size:16px}
+dialog p{margin:0 0 14px;color:var(--muted);font-size:13px;white-space:pre-line;overflow-wrap:anywhere}
+dialog code{font-family:var(--mono);font-size:12px;background:#070c18;border:1px solid var(--line);padding:1px 6px;border-radius:6px;color:#cfe3ff}
+.dlg-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+.tokrow{display:flex;gap:8px}.tokrow input{flex:1}
+.dlg-msg{font-size:12px;margin-top:8px;min-height:1.2em}
+#toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:50;max-width:min(420px,calc(100vw - 32px))}
+.toast{background:#0d1730;border:1px solid var(--line2);border-left:3px solid var(--accent);border-radius:10px;padding:10px 12px;font-size:13px;box-shadow:0 10px 30px #0008;animation:tin .3s ease}
+.toast.ok{border-left-color:var(--ok)}.toast.warn{border-left-color:var(--warn)}.toast.bad{border-left-color:var(--bad)}.toast.party{border-left-color:#e879f9;background:linear-gradient(90deg,#2a1240,#0d1730)}
+.toast.out{opacity:0;transform:translateY(6px);transition:all .35s}
+@keyframes tin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+#fw{position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;z-index:40}
+.banner{position:fixed;left:50%;top:22%;transform:translate(-50%,-50%);z-index:41;pointer-events:none;text-align:center;
+  font:900 clamp(22px,4vw,46px)/1.1 var(--sans);letter-spacing:.06em;color:#fff;text-shadow:0 0 24px #e879f9,0 0 48px #22d3ee;animation:banner 3.6s ease forwards}
+.banner small{display:block;font:600 clamp(12px,1.4vw,16px) var(--sans);letter-spacing:.2em;color:#cfe3ff;margin-top:8px;text-shadow:0 0 12px #22d3ee}
+@keyframes banner{0%{opacity:0;transform:translate(-50%,-40%) scale(.9)}12%{opacity:1;transform:translate(-50%,-50%) scale(1)}80%{opacity:1}100%{opacity:0;transform:translate(-50%,-60%)}}
+
+/* ---------- fleet mode (served at /fleet by tools/cuttle_fleet.py) ---------- */
+.crumbs{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);flex-wrap:wrap}
+.crumbs a{color:var(--accent);text-decoration:none;font-weight:600}
+.crumbs a:hover{text-decoration:underline}
+.crumbs i{font-style:normal;color:var(--dim)}
+.login{max-width:520px;margin:8vh auto 0;text-align:center;padding:28px}
+.login h2{margin:8px 0 6px;font-size:22px}
+.login p{color:var(--muted);margin:0 0 16px}
+.login .tokrow{margin-top:8px}
+.login .who{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0 4px;text-align:left}
+.login .who div{border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:#0b1326;font-size:12px;color:var(--muted);min-width:0;overflow-wrap:anywhere}
+.login .who b{display:block;color:var(--text);font-size:13px;margin-bottom:2px}
+.fkpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px;margin-bottom:16px}
+.fkpis .card{padding:14px}
+.grid-clients{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:16px}
+.ccard{cursor:pointer;position:relative;overflow:hidden;transition:border-color .2s,transform .1s}
+.ccard:hover{border-color:#34507f}
+.ccard:active{transform:translateY(1px)}
+.ccard::before{content:"";position:absolute;inset:0 0 auto 0;height:3px;background:var(--c,#334155);box-shadow:0 0 16px var(--c,#334155)}
+.ccard h3{margin:0;font-size:16px;letter-spacing:.01em}
+.ccard .sub{color:var(--muted);font-size:12px}
+.plan{font:800 10.5px var(--sans);letter-spacing:.12em;text-transform:uppercase;padding:3px 8px;border-radius:6px;border:1px solid}
+.plan.pro{color:#f5c2ff;border-color:#7a2d86;background:#2a0f33}
+.plan.basic{color:#bfe9ff;border-color:#1b5d73;background:#0b2533}
+.fstatus{font:700 10.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--c);border:1px solid color-mix(in srgb,var(--c) 45%,transparent);background:color-mix(in srgb,var(--c) 12%,transparent);padding:2px 8px;border-radius:999px}
+.tchips{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}
+.tchip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line2);background:#0b1326;border-radius:9px;padding:4px 8px;font-size:12px}
+.tchip i{width:8px;height:8px;border-radius:50%;background:var(--c);box-shadow:0 0 8px var(--c)}
+.tchip small{font-family:var(--mono);color:var(--muted)}
+.cstats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:6px}
+.cstats div{background:#0a1224;border:1px solid var(--line);border-radius:10px;padding:6px 8px}
+.cstats b{display:block;font-size:16px}
+.cstats span{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.spark{display:block;width:100%;height:36px;margin-top:10px}
+.cfoot{display:flex;gap:8px;margin-top:12px;align-items:center}
+.cfoot .sp{flex:1}
+.grid-triads{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px}
+.tcard .role{font:600 11px var(--mono);color:var(--muted)}
+.tcard .hearts3{display:flex;gap:10px;margin:12px 0 6px}
+.tcard .hearts3 div{flex:1;border:1px solid var(--line);border-radius:10px;padding:6px;text-align:center;background:#0a1224}
+.tcard .hearts3 svg{width:28px;height:28px}
+.tcard .hearts3 small{display:block;font:600 10px var(--mono);color:var(--c)}
+.tcard .q{font:11px/1.4 var(--mono);color:#a9f5dc;min-height:2.8em}
+.tcard .q.warn{color:#ffe08a}.tcard .q.bad{color:#ffb3c0}
+.tcard .lastev{font-size:11.5px;color:var(--muted);margin-top:8px;min-height:2.8em;overflow-wrap:anywhere}
+.farmhead{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:16px}
+.farmhead h2{margin:0;font-size:22px}
+.farmhead .sp{flex:1}
+.synth{font-size:11px;color:#ffe08a;border:1px dashed #6b5a1a;border-radius:999px;padding:2px 8px}
+[data-needs]{transition:opacity .2s}
+
+/* ---------- responsive ---------- */
+@media (max-width:1180px){
+  .kpis{grid-template-columns:repeat(2,1fr)}
+  .fkpis{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .pipeline{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .stg::after{display:none}
+}
+@media (max-width:980px){
+  .hero,.ops-intro,.ops-grid,.cycle-grid{grid-template-columns:1fr}
+  .nodes{grid-template-columns:1fr}
+  .inspector{position:static;max-height:none}
+  .top{flex-wrap:wrap}
+  .tabs{order:3;margin-left:0;width:100%;overflow-x:auto}
+}
+@media (max-width:640px){
+  main{padding:12px}
+  .kpis{grid-template-columns:1fr 1fr}
+  .steps{grid-template-columns:1fr}
+  .pernode{grid-template-columns:1fr}
+  .pipeline{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .ev{grid-template-columns:56px 1fr}.ev .m{grid-column:1/-1}
+  .brand-sub{display:none}
+}
+@media (prefers-reduced-motion:reduce){
+  *{animation-duration:0s!important;animation-iteration-count:1!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+<canvas id="fw" aria-hidden="true"></canvas>
+
+<header class="top">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+      <defs><linearGradient id="lg" x1="0" x2="1"><stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#e879f9"/></linearGradient></defs>
+      <path d="M32 50C18 40 15 31 19 26c3-4 9-3 13 2 4-5 10-6 13-2 4 5 1 14-13 24z" fill="url(#lg)"/>
+      <path d="M15 30C6 23 5 17 8 14c2-2 6-2 8 1 2-3 6-3 8-1" fill="none" stroke="#22d3ee" stroke-width="2.5" stroke-linecap="round"/>
+      <path d="M49 30c9-7 10-13 7-16-2-2-6-2-8 1-2-3-6-3-8-1" fill="none" stroke="#e879f9" stroke-width="2.5" stroke-linecap="round"/>
+    </svg>
+    <div>
+      <div class="brand-name" id="brandName">CUTTLE TRIAD</div>
+      <div class="brand-sub" id="brandSub">Three hearts · one appliance</div>
+    </div>
+  </div>
+  <nav class="crumbs" id="crumbs" aria-label="Location" hidden></nav>
+  <nav class="tabs" role="tablist" aria-label="Console sections">
+    <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+    <button role="tab" data-tab="ops" aria-selected="false">Operations</button>
+    <button role="tab" data-tab="cycle" aria-selected="false">Live Cycle</button>
+    <button role="tab" data-tab="log" aria-selected="false">Event Log</button>
+  </nav>
+  <div class="top-right">
+    <span id="livePill" class="pill"><i class="dot"></i><span>Connecting…</span></span>
+    <button id="fwBtn" class="iconbtn" title="Launch fireworks" aria-label="Launch fireworks">🎆</button>
+    <button id="lockBtn" class="btn-lock">🔒 Connect</button>
+  </div>
+</header>
+
+<main>
+<!-- ================= FLEET MODE (/fleet) ================= -->
+<section id="view-login" class="fview" hidden>
+  <div class="card login">
+    <svg class="logo" viewBox="0 0 64 64" aria-hidden="true" style="width:54px;height:54px"><path d="M32 50C18 40 15 31 19 26c3-4 9-3 13 2 4-5 10-6 13-2 4 5 1 14-13 24z" fill="url(#lg)"/></svg>
+    <h2>Sign in to the Cuttle fleet</h2>
+    <p>Everything here is scoped to your token. Nothing is shown before you sign in.</p>
+    <div class="who">
+      <div><b>Provider</b>Sees and manages every client. A new token each start: <code>target\cuttle_images\fleet\provider_token.txt</code></div>
+      <div><b>Client</b>Sees only its own farm: <code>…\fleet\&lt;client&gt;\client_token.txt</code></div>
+    </div>
+    <div class="tokrow"><input type="password" id="loginTok" class="mono" placeholder="32 hex characters" autocomplete="off" spellcheck="false" aria-label="Fleet token"><button class="btn primary" id="loginGo">Sign in</button></div>
+    <div class="dlg-msg" id="loginMsg"></div>
+  </div>
+</section>
+
+<section id="view-clients" class="fview" hidden>
+  <div class="fkpis" id="fleetKpis"></div>
+  <div class="grid-clients" id="clientGrid"></div>
+</section>
+
+<section id="view-farm" class="fview" hidden>
+  <div class="farmhead" id="farmHead"></div>
+  <div class="grid-triads" id="triadGrid"></div>
+</section>
+
+<!-- ================= OVERVIEW ================= -->
+<section id="tab-overview" class="tabpanel tpanel" role="tabpanel">
+  <div class="hero">
+    <div class="card hero-q">
+      <div class="hearts" id="heroHearts"></div>
+      <div class="hq-num"><span id="hqNum">–</span><small>of 3 hearts in the pool</small></div>
+      <div id="hqText" class="hq-text">Waiting for the Triad controller…</div>
+    </div>
+    <div class="kpis">
+      <div class="card kpi"><div class="kpi-l">WAL transactions</div><div class="kpi-v" id="kTx">–</div><div class="kpi-s">committed writes (tx_seq)</div></div>
+      <div class="card kpi"><div class="kpi-l">RAID parity</div><div class="kpi-v" id="kPar">–</div><div class="kpi-s mono" id="kParHash">P = D1 ⊕ D2</div></div>
+      <div class="card kpi"><div class="kpi-l">Auto-morph</div><div class="kpi-v" id="kAuto">–</div><div class="kpi-s" id="kAutoS">rolling MTD every 45 s</div></div>
+      <div class="card kpi"><div class="kpi-l">Kernels morphed</div><div class="kpi-v" id="kMorphs">–</div><div class="kpi-s" id="kMorphS">binmorph rewrites</div></div>
+    </div>
+  </div>
+  <div class="nodes" id="nodeCards"></div>
+  <div class="card">
+    <div class="card-h"><h3>Recent activity</h3><span class="sp"></span><button class="link" data-goto="log">Full event log →</button></div>
+    <ol id="recentList" class="evlist"></ol>
+  </div>
+</section>
+
+<!-- ================= OPERATIONS ================= -->
+<section id="tab-ops" class="tabpanel tpanel" role="tabpanel" hidden>
+  <div class="card ops-intro">
+    <div>
+      <h2>Drive the appliance</h2>
+      <p>Every operation goes through the Triad controller, never to one VM directly. That's what keeps the three hearts consistent.</p>
+    </div>
+    <div class="steps">
+      <div class="step"><b>1 · CONNECT</b><span>Paste the operator token from the controller's terminal. <button class="link" id="introConnect">Connect →</button></span></div>
+      <div class="step"><b>2 · LOOK</b><span>Reads and inspections are safe: they run on every online node and you see all three answers.</span></div>
+      <div class="step"><b>3 · CHANGE</b><span>Writes go through the WAL so a node that's morphing catches up. Try a drill to watch it happen.</span></div>
+    </div>
+  </div>
+
+  <div class="ops-grid">
+    <div class="ops-col">
+
+      <div class="card op" id="roleNote" hidden>
+        <div class="card-h"><span class="ico">🧩</span><h3>Kernel role: <span class="mono" id="roleName"></span></h3></div>
+        <p class="desc" id="roleText" style="margin:0"></p>
+      </div>
+
+      <div class="card op" data-needs="sql">
+        <div class="card-h"><span class="ico">🗄️</span><h3>SQL<span class="sub">one database, three copies</span></h3><span class="sp"></span><span class="tag r">read · 2-of-3 vote</span><span class="tag w">write · WAL + parity</span></div>
+        <p class="desc">Reads run on every online node, and the controller returns the answer the majority agrees on. A write gets the next transaction number, lands in the write-ahead log, runs on every online node, and refreshes the XOR parity block. A node that's mid-morph replays it from the log when it wakes.</p>
+        <div class="flow"><span>you</span><i>→</i><span>controller</span><i>→</i><span>OS-1 · OS-2 · OS-3</span><i>→</i><span>majority / WAL</span><i>→</i><span>you</span></div>
+        <div class="chips" id="sqlPresets"></div>
+        <div class="row" style="margin-top:10px">
+          <input type="text" id="sqlIn" class="mono" spellcheck="false" autocomplete="off" value="SELECT * FROM kv" aria-label="SQL statement">
+          <button class="btn primary" id="sqlRun">Run SQL</button>
+        </div>
+      </div>
+
+      <div class="card op">
+        <div class="card-h"><span class="ico">🔎</span><h3>Inspect<span class="sub">read-only shell on each node</span></h3><span class="sp"></span><span class="tag r">read-only</span></div>
+        <p class="desc">Runs an inspection command on every online node and puts the three answers side by side. Each node has its own keys and kernel binary, so some answers are <em>supposed</em> to differ. The controller refuses state-changing commands here; those have to go through SQL or the apps below.</p>
+        <div class="chips" id="shPresets"></div>
+        <div class="row" style="margin-top:10px">
+          <input type="text" id="shIn" class="mono" spellcheck="false" autocomplete="off" value="status" aria-label="Shell command">
+          <button class="btn primary" id="shRun">Inspect</button>
+        </div>
+      </div>
+
+      <div class="card op" data-needs="shell">
+        <div class="card-h"><span class="ico">🔐</span><h3>Vault<span class="sub">sealed secrets</span></h3><span class="sp"></span><span class="tag r">get · 2-of-3 vote</span><span class="tag w">put/del · encrypted WAL</span></div>
+        <p class="desc">Each node seals the value under its own hardware-derived key. The log stores puts encrypted, so a node that missed one re-seals it while it catches up.</p>
+        <div class="row">
+          <input type="text" id="vKey" class="mono" placeholder="key, e.g. cluster.secret" spellcheck="false" autocomplete="off" aria-label="Vault key" style="flex:1 1 160px">
+          <input type="text" id="vVal" class="mono" placeholder="value" spellcheck="false" autocomplete="off" aria-label="Vault value" style="flex:1 1 160px">
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn primary" data-vault="put">Put</button>
+          <button class="btn" data-vault="get">Get</button>
+          <button class="btn" data-vault="list">List</button>
+          <button class="btn danger" data-vault="del">Delete</button>
+        </div>
+      </div>
+
+      <div class="card op" data-needs="full">
+        <div class="card-h"><span class="ico">🛡️</span><h3>Guard &amp; Cron<span class="sub">posture and scheduled jobs</span></h3></div>
+        <div class="sect">
+          <label class="small">Guard: blue-team posture on all three</label>
+          <div class="row">
+            <button class="btn" data-app="guard status">Status</button>
+            <button class="btn" data-app="guard alerts">Alerts</button>
+            <button class="btn danger" data-app="guard lockdown" data-confirm="lockdown">Lockdown</button>
+            <button class="btn" data-app="guard unlock">Unlock</button>
+          </div>
+        </div>
+        <div class="sect">
+          <label class="small">Cron: deterministic jobs on all three</label>
+          <div class="row">
+            <button class="btn" data-app="cron list">List</button>
+            <button class="btn" data-app="cron run">Run due jobs</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <input type="number" id="cTicks" min="1" value="100" aria-label="Ticks" style="width:90px">
+            <input type="text" id="cCmd" class="mono" placeholder="command, e.g. seal" spellcheck="false" autocomplete="off" aria-label="Cron command">
+            <button class="btn primary" id="cAdd">Add job</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <input type="number" id="cDel" min="0" placeholder="id" aria-label="Cron job id" style="width:90px">
+            <button class="btn danger" id="cDelBtn">Delete job</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card op">
+        <div class="card-h"><span class="ico">🧬</span><h3>Moving-target defense<span class="sub">rotate the kernel binaries</span></h3><span class="sp"></span><span class="tag w">one node at a time</span></div>
+        <p class="desc">A morph drains a node and seals its disk, rewrites its kernel with <span class="mono">binmorph</span> under a fresh seed, and reboots it. Then it replays any writes it missed. Only one node morphs at a time, so two hearts always hold the majority. The <b>Live Cycle</b> tab shows each stage.</p>
+        <div class="row" id="morphBtns"></div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn magenta" id="waveBtn">🌊 Rolling wave: all three</button>
+          <button class="btn" id="autoBtn">Auto-morph: –</button>
+          <button class="link" data-goto="cycle">Watch it live →</button>
+        </div>
+      </div>
+
+      <div class="card op" data-needs="sql">
+        <div class="card-h"><span class="ico">🎯</span><h3>Guided drills<span class="sub">prove the guarantees, step by step</span></h3></div>
+        <div class="drill">
+          <h4>Zero-downtime write</h4>
+          <p>Morphs one node, writes a row while it's away (only 2/3 get it), waits for the node to rejoin, then checks it replayed the write from the WAL.</p>
+          <div class="row"><select id="d1Node" aria-label="Node to morph"><option value="1">OS-1</option><option value="2">OS-2</option><option value="3">OS-3</option></select><button class="btn primary" id="d1Run">Run drill</button></div>
+          <ol class="stepper" id="d1Steps"></ol>
+        </div>
+        <div class="drill">
+          <h4>Tamper &amp; self-heal</h4>
+          <p>Plants a rogue row on one node only. The 2-of-3 vote outvotes it, the controller rebuilds it from the majority plus the WAL, and it gets an emergency re-morph.</p>
+          <div class="row"><select id="d2Node" aria-label="Node to tamper"><option value="2">OS-2</option><option value="1">OS-1</option><option value="3">OS-3</option></select><button class="btn danger" id="d2Run">Run drill</button></div>
+          <ol class="stepper" id="d2Steps"></ol>
+        </div>
+      </div>
+
+    </div>
+
+    <aside class="card inspector" aria-live="polite">
+      <div class="card-h"><h3>Response inspector</h3><span class="sp"></span><span class="muted" style="font-size:12px" id="inspTime"></span></div>
+      <div class="insp-body" id="insp">
+        <div class="empty">Run an operation and the controller's verdict appears here, with each node's own answer side by side. Agreeing answers are green, outvoted ones red, queued ones amber.</div>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<!-- ================= LIVE CYCLE ================= -->
+<section id="tab-cycle" class="tabpanel tpanel" role="tabpanel" hidden>
+  <div class="cycle-grid">
+    <div class="card">
+      <div class="card-h">
+        <h3>Rolling MTD: the controller at work</h3><span class="sp"></span>
+        <label class="toggle"><input type="checkbox" id="fwToggle" checked> fireworks on rejoin</label>
+        <button class="btn sm" id="cAuto">Auto-morph: –</button>
+        <button class="btn sm magenta" id="cWave">🌊 Rolling wave</button>
+      </div>
+      <div class="now"><span class="ico" id="nowIco">💓</span><div><b id="nowTitle">Connecting…</b><span id="nowText">Waiting for the first status from the controller.</span></div></div>
+      <div class="stage-wrap"><svg id="stage" viewBox="0 0 1000 660" role="img" aria-label="Triad controller and its three nodes. Click a node to morph it."></svg></div>
+      <div class="pipeline" id="pipeline"></div>
+    </div>
+    <div class="side">
+      <div class="card">
+        <div class="card-h"><h3>Heartbeats</h3><span class="sp"></span><span class="muted" style="font-size:12px">one trace per VM</span></div>
+        <div id="miniEcgs"></div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h3>Controller narration</h3></div>
+        <ol id="feed" class="evlist"></ol>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-h"><h3>State timeline<span class="sub">last 5 minutes, since this page opened</span></h3><span class="sp"></span><div class="legend" id="legend"></div></div>
+    <canvas id="timeline"></canvas>
+  </div>
+</section>
+
+<!-- ================= EVENT LOG ================= -->
+<section id="tab-log" class="tabpanel tpanel" role="tabpanel" hidden>
+  <div class="card">
+    <div class="card-h">
+      <h3>Event log<span class="sub" id="logCount"></span></h3><span class="sp"></span>
+      <div class="log-tools">
+        <div class="chips" id="logFilters"></div>
+        <input type="text" id="logSearch" placeholder="Search events…" aria-label="Search events" style="width:220px">
+      </div>
+    </div>
+    <ol id="logList" class="evlist"></ol>
+  </div>
+</section>
+</main>
+
+<dialog id="dlgConnect">
+  <h3>Connect as operator</h3>
+  <p>The controller makes a fresh token every time it starts. Copy it from the line <code>Operator Session Token</code> in the terminal running the Triad, or from <code>target\cuttle_images\triad\operator_token.txt</code>.</p>
+  <div class="tokrow"><input type="password" id="tokIn" class="mono" placeholder="32 hex characters" autocomplete="off" spellcheck="false" aria-label="Operator token"><button class="btn primary" id="tokGo">Unlock</button></div>
+  <div class="dlg-msg" id="tokMsg"></div>
+  <div class="dlg-actions"><button class="btn" id="tokForget" hidden>Forget token</button><button class="btn" id="tokClose">Close</button></div>
+</dialog>
+
+<dialog id="dlgConfirm">
+  <h3 id="cfTitle">Are you sure?</h3>
+  <p id="cfBody"></p>
+  <div class="dlg-actions"><button class="btn" id="cfCancel">Cancel</button><button class="btn primary" id="cfOk">Proceed</button></div>
+</dialog>
+
+<div id="toasts" aria-live="polite"></div>
+
+<script>
+(() => {
+'use strict';
+
+/* ======================================================================
+   helpers
+   ====================================================================== */
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+function h(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') e.className = v;
+    else if (k === 'text') e.textContent = v;
+    else if (k === 'style') e.style.cssText = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v === true ? '' : v);
+  }
+  for (const kid of kids) if (kid != null) e.append(kid);
+  return e;
+}
+const SVGNS = 'http://www.w3.org/2000/svg';
+function s(tag, attrs) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+  return e;
+}
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : v; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch { /* storage unavailable */ } },
+  del(k) { try { localStorage.removeItem(k); } catch { /* storage unavailable */ } },
+};
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// Standalone (/console on a Triad controller) or fleet (/fleet on tools/cuttle_fleet.py).
+// Fleet views: no ?c -> clients grid (provider), ?c=<client> -> farm, ?c=..&t=<job> -> one Triad.
+const FLEET = location.pathname.startsWith('/fleet');
+const QS = new URLSearchParams(location.search);
+const SAFE_ID = /^[a-z0-9][a-z0-9-]{0,40}$/;
+const CLIENT = FLEET && SAFE_ID.test(QS.get('c') || '') ? QS.get('c') : null;
+const JOB = CLIENT && SAFE_ID.test(QS.get('t') || '') ? QS.get('t') : null;
+const VIEW = !FLEET || JOB ? 'triad' : CLIENT ? 'farm' : 'clients';
+const API_BASE = FLEET && JOB ? '/api/c/' + CLIENT + '/t/' + JOB : '';
+const TOKEN_KEY = FLEET ? 'cuttle_fleet_token' : 'cuttle_triad_token'; // the latter is shared with /app
+const fleetUrl = (c, t) => '/fleet' + (c ? '?c=' + encodeURIComponent(c) + (t ? '&t=' + encodeURIComponent(t) : '') : '');
+const AUTO_INTERVAL = 45;               // TriadController.auto_morph_interval
+const WINDOW_MS = 5 * 60 * 1000;
+
+const ST = {
+  ONLINE:       { hex: '#2ee6a8', label: 'Online' },
+  DRAINING:     { hex: '#fbbf24', label: 'Draining' },
+  MORPHING:     { hex: '#e879f9', label: 'Morphing' },
+  CATCHING_UP:  { hex: '#38bdf8', label: 'Catching up' },
+  HEALING:      { hex: '#fb7185', label: 'Healing' },
+  OFFLINE:      { hex: '#64748b', label: 'Offline' },
+  INITIALIZING: { hex: '#a78bfa', label: 'Booting' },
+};
+const st = x => ST[x] || { hex: '#64748b', label: x || 'Unknown' };
+const AWAY = new Set(['DRAINING', 'MORPHING', 'CATCHING_UP', 'HEALING', 'INITIALIZING', 'OFFLINE']);
+
+const CATS = {
+  mtd:  { label: 'Morphs',   color: '#e879f9', levels: ['MTD', 'MORPH', 'AUTO-MTD', 'RESYNC', 'ONLINE'] },
+  data: { label: 'Data',     color: '#22d3ee', levels: ['SQL-RAID'] },
+  sec:  { label: 'Security', color: '#fb7185', levels: ['TAMPER', 'ALERT', 'HEAL'] },
+  sys:  { label: 'System',   color: '#a78bfa', levels: ['INIT', 'READY', 'CONFIG'] },
+  bad:  { label: 'Problems', color: '#fbbf24', levels: ['WARN', 'ERROR'] },
+};
+function catOf(level) {
+  if ((level || '').startsWith('APP-')) return 'data';
+  for (const [k, c] of Object.entries(CATS)) if (c.levels.includes(level)) return k;
+  return 'sys';
+}
+
+const shortName = n => (n.name || '').split(' ')[0] || ('OS-' + n.node_id);
+const subName = n => { const m = /\(([^)]+)\)/.exec(n.name || ''); return m ? m[1] : ''; };
+const titleCase = x => (x || '').toLowerCase().replace(/\b\w/g, c => c.toUpperCase()).replace(/\bRaid\b/, 'RAID');
+const nodeOf = (d, nid) => d && d.nodes ? d.nodes.find(n => n.node_id === nid) : null;
+const nidFromMsg = msg => { const m = /OS-(\d)/.exec(msg || ''); return m ? +m[1] : null; };
+function parseTs(ts) {
+  const m = /^(\d\d):(\d\d):(\d\d)$/.exec(ts || '');
+  if (!m) return Date.now();
+  const d = new Date(); d.setHours(+m[1], +m[2], +m[3], 0);
+  let t = d.getTime();
+  if (t - Date.now() > 60000) t -= 86400000;
+  return t;
+}
+
+/* ======================================================================
+   state
+   ====================================================================== */
+const S = {
+  data: null, live: false, lastOk: 0, fails: 0, polls: 0,
+  token: '', unlocked: false,
+  events: [], eventKeys: new Set(),
+  hist: { 1: [], 2: [], 3: [] },
+  marks: [],
+  prev: {}, pendingCelebrate: {},
+  wave: new Set(), waveT0: 0, waveUntil: 0,
+  lastAuto: null,
+  fireworks: store.get('triad_fw', '1') !== '0',
+  tab: 'overview',
+  logFilter: 'all', logQuery: '',
+  welcomed: false,
+  busy: false,
+  // fleet mode
+  scope: null, scopeClient: null, scopeName: null,
+  fleet: null, fleetPrev: {}, fleetWelcomed: false, fleetPolls: 0, lastBurst: {},
+};
+const authHeaders = () => (S.token ? { 'X-Cuttle-Session': S.token } : {});
+
+/* ======================================================================
+   toasts & dialogs
+   ====================================================================== */
+function toast(msg, kind = 'info', ms = 4200) {
+  const t = h('div', { class: 'toast ' + kind, text: msg });
+  $('#toasts').append(t);
+  setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 400); }, ms);
+}
+function confirmBox(title, body, okLabel = 'Proceed', danger = false) {
+  return new Promise(res => {
+    const d = $('#dlgConfirm');
+    $('#cfTitle').textContent = title;
+    $('#cfBody').textContent = body;
+    const ok = $('#cfOk');
+    ok.textContent = okLabel;
+    ok.className = 'btn ' + (danger ? 'danger' : 'primary');
+    let settled = false;
+    const done = v => { if (settled) return; settled = true; if (d.open) d.close(); res(v); };
+    ok.onclick = () => done(true);
+    $('#cfCancel').onclick = () => done(false);
+    d.onclose = () => done(false);
+    d.showModal();
+  });
+}
+
+/* ======================================================================
+   operator token
+   ====================================================================== */
+async function probeToken(tok) {
+  // POST /api/whoami: 200 with a valid token, 401 without. No side effects on the VMs.
+  // The fleet provider also says whose token it is: {scope: provider|client, client, name}.
+  try {
+    const r = await fetch('/api/whoami', { method: 'POST', headers: { 'X-Cuttle-Session': tok }, body: '' });
+    if (r.status === 401) return false;
+    if (!r.ok) return null;
+    const j = await r.json().catch(() => ({}));
+    S.scope = j.scope || 'operator'; S.scopeClient = j.client || null; S.scopeName = j.name || null;
+    return true;
+  } catch { return null; }
+}
+function setUnlocked(on) {
+  S.unlocked = on;
+  const b = $('#lockBtn');
+  b.classList.toggle('on', on);
+  if (FLEET) b.textContent = on ? (S.scope === 'provider' ? '🔓 Provider' : '🔓 ' + (S.scopeName || S.scopeClient)) : '🔒 Sign in';
+  else b.textContent = on ? '🔓 Operator' : '🔒 Connect';
+  $('#tokForget').hidden = !on;
+  renderControls();
+}
+function openConnect() {
+  $('#tokMsg').textContent = S.unlocked ? 'Connected. Operations are enabled.' : '';
+  $('#tokMsg').style.color = S.unlocked ? 'var(--ok)' : '';
+  if (!$('#dlgConnect').open) $('#dlgConnect').showModal();
+  setTimeout(() => $('#tokIn').focus(), 50);
+}
+async function tryToken(inputSel = '#tokIn', msgSel = '#tokMsg') {
+  const tok = $(inputSel).value.trim();
+  const msg = $(msgSel);
+  if (!/^[0-9a-fA-F]{16,128}$/.test(tok)) { msg.textContent = 'That doesn’t look like a token: expected hex characters.'; msg.style.color = 'var(--bad)'; return; }
+  msg.textContent = 'Checking…'; msg.style.color = '';
+  const ok = await probeToken(tok);
+  if (ok === null) { msg.textContent = 'Controller not reachable.'; msg.style.color = 'var(--bad)'; return; }
+  if (!ok) { msg.textContent = 'Rejected. The controller may have restarted with a new token.'; msg.style.color = 'var(--bad)'; return; }
+  S.token = tok; store.set(TOKEN_KEY, tok);
+  $(inputSel).value = '';
+  setUnlocked(true);
+  if ($('#dlgConnect').open) $('#dlgConnect').close();
+  if (FLEET) { enterFleet(); toast(S.scope === 'provider' ? 'Signed in as the provider.' : 'Signed in as ' + (S.scopeName || S.scopeClient) + '.', 'ok'); }
+  else toast('Connected as operator. Operations are unlocked.', 'ok');
+}
+async function restoreToken() {
+  const tok = store.get(TOKEN_KEY, '');
+  const ok = tok ? await probeToken(tok) : false;
+  if (ok) { S.token = tok; setUnlocked(true); }
+  if (FLEET) enterFleet();
+}
+function lockOut(message) {
+  S.token = ''; setUnlocked(false);
+  if (FLEET) { showView('login'); $('#loginMsg').textContent = message || ''; $('#loginMsg').style.color = 'var(--bad)'; }
+  else openConnect();
+}
+
+/* ======================================================================
+   polling & ingest
+   ====================================================================== */
+async function poll() {
+  let delay = 1000;
+  try {
+    if (FLEET && !S.unlocked) return;
+    if (VIEW !== 'triad') { delay = 2000; await pollFleet(); return; }
+    const r = await fetch(API_BASE + '/api/triad', { cache: 'no-store', headers: authHeaders() });
+    if (FLEET && r.status === 401) { lockOut('Your token is no longer valid. The provider may have restarted.'); return; }
+    if (FLEET && r.status === 403) { location.replace(fleetUrl(S.scopeClient)); return; }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    S.lastOk = Date.now(); S.fails = 0; S.live = true;
+    ingest(d);
+  } catch {
+    S.fails++;
+    if (S.fails >= 3) S.live = false;
+    renderLive();
+  } finally {
+    setTimeout(poll, delay);
+  }
+}
+
+function ingest(d) {
+  const now = Date.now();
+  const first = S.polls === 0;
+  S.polls++;
+
+  // events: API returns newest-first (max 25); keep our own longer history
+  const fresh = [];
+  for (const e of (d.events || []).slice().reverse()) {
+    const key = e.ts + '|' + e.level + '|' + e.msg;
+    if (S.eventKeys.has(key)) continue;
+    S.eventKeys.add(key);
+    const ev = { ts: e.ts, level: e.level, msg: e.msg, t: parseTs(e.ts), key, nid: nidFromMsg(e.msg) };
+    S.events.push(ev);
+    fresh.push(ev);
+    if (e.level === 'AUTO-MTD' && ev.nid) S.lastAuto = { t: ev.t, nid: ev.nid };
+  }
+  if (S.events.length > 600) {
+    for (const ev of S.events.splice(0, S.events.length - 600)) S.eventKeys.delete(ev.key);
+  }
+
+  // node transitions
+  for (const n of d.nodes || []) {
+    const id = n.node_id;
+    const hist = S.hist[id] || (S.hist[id] = []);
+    if (!hist.length || hist[hist.length - 1].state !== n.state) hist.push({ t: now, state: n.state });
+    while (hist.length > 2 && hist[1].t < now - WINDOW_MS) hist.shift();
+
+    const p = S.prev[id];
+    if (p) {
+      if (n.morph_count > p.morph_count) S.pendingCelebrate[id] = true;
+      if (p.state !== n.state) onStateChange(n, p.state);
+      if (n.state === 'ONLINE' && p.state !== 'ONLINE' && (S.pendingCelebrate[id] || AWAY.has(p.state))) {
+        delete S.pendingCelebrate[id];
+        onRejoin(n, p.state);
+      }
+    }
+    S.prev[id] = { state: n.state, morph_count: n.morph_count };
+  }
+  S.marks = S.marks.filter(m => m.t > now - WINDOW_MS);
+
+  S.data = d;
+  if (!first) for (const ev of fresh) onEvent(ev);
+
+  const online = (d.nodes || []).filter(n => n.state === 'ONLINE').length;
+  if (!S.welcomed && online === 3) {
+    S.welcomed = true;
+    setTimeout(() => { if (S.fireworks) { for (const id of [1, 2, 3]) setTimeout(() => celebrateAt(nodePos(id), hueFor(id), 'heart'), id * 380); } }, 500);
+  }
+  render(fresh, first);
+}
+
+function onStateChange(n, from) {
+  const id = n.node_id;
+  if (n.state === 'DRAINING') vizFlows.drain(id);
+  if (n.state === 'MORPHING') vizFx.morphStart(id);
+  if (n.state === 'CATCHING_UP') vizFlows.catchup(id, Math.max(1, (S.data ? S.data.triad_tx_seq : 0) - n.tx_seq));
+  if (n.state === 'HEALING') vizFlows.heal(id);
+  if (n.state === 'OFFLINE' && from !== 'OFFLINE') toast(shortName(n) + ' went OFFLINE. Check the controller terminal.', 'bad', 7000);
+}
+
+function onRejoin(n, from) {
+  const id = n.node_id;
+  S.marks.push({ t: Date.now(), nid: id, kind: from === 'HEALING' ? 'heal' : 'morph' });
+  const now = Date.now();
+  if (now - S.waveT0 > 4 * 60 * 1000) { S.wave.clear(); S.waveT0 = now; }
+  S.wave.add(id);
+  const sha = (n.elf_sha256 || '').slice(0, 12);
+  if (S.wave.size === 3) {
+    S.wave.clear();
+    S.waveUntil = 0;
+    finale('3 / 3 HEARTS REBORN', 'every kernel binary rotated, zero downtime');
+    toast('Full rolling wave complete: all three nodes are on fresh binaries. 🎆', 'party', 6000);
+  } else {
+    if (S.fireworks) celebrateAt(nodePos(id), hueFor(id), 'heart', 2);
+    toast(shortName(n) + ' rejoined on a fresh binary ' + sha + '…', 'ok');
+  }
+}
+
+function onEvent(ev) {
+  const id = ev.nid;
+  if (ev.level === 'SQL-RAID') vizFlows.replicate();
+  if (ev.level.startsWith('APP-')) vizFlows.replicate('#a78bfa');
+  if (ev.level === 'TAMPER' && id) vizFx.tamper(id);
+  if (ev.level === 'ALERT' && id) vizFx.alert(id);
+  if (ev.level === 'MORPH' && id) vizFx.morphDone(id);
+  if (ev.level === 'ERROR') toast(ev.msg, 'bad', 8000);
+}
+
+/* ======================================================================
+   rendering: shared
+   ====================================================================== */
+const ROLE_TEXT = {
+  wfe: 'Web front end: only svc-http is loaded. The kernel refuses SQL, vault, guard control and cron changes on this Triad, so those panels are hidden. Its 2-of-3 vote compares the content it serves.',
+  sql: 'SQL storage: only svc-sql is loaded. Vault, guard and cron belong to other services, so those panels are hidden.',
+  shell: 'Bastion / exec: only svc-sh is loaded. SQL and the read side of guard and cron belong to other services.',
+};
+function applyRoleGates(d) {
+  const role = d.role || 'full';
+  const allowed = need => (need === 'sql' ? d.has_sql !== false : need === 'shell' ? d.has_shell !== false : role === 'full');
+  $$('[data-needs]').forEach(el => { el.hidden = !allowed(el.dataset.needs); });
+  $('#roleNote').hidden = role === 'full';
+  if (role !== 'full') {
+    $('#roleName').textContent = role + (d.job ? ' · ' + d.job + ' job' : '');
+    $('#roleText').textContent = ROLE_TEXT[role] || '';
+  }
+}
+
+function render(fresh, first) {
+  renderLive();
+  renderControls();
+  const d = S.data; if (!d) return;
+  applyRoleGates(d);
+  renderOverview(d, fresh, first);
+  renderCycle(d, fresh, first);
+  if (S.tab === 'log') renderLog();
+  else $('#logCount').textContent = ' · ' + S.events.length + ' events';
+}
+
+function renderLive() {
+  const p = $('#livePill');
+  const label = p.querySelector('span');
+  p.classList.toggle('live', S.live);
+  p.classList.toggle('down', !S.live && S.polls + S.fails > 0);
+  if (S.live && FLEET && VIEW !== 'triad' && S.fleet) {
+    const t = fleetTotals(S.fleet);
+    label.textContent = 'LIVE · ' + t.vmsOnline + '/' + t.vmsTotal + ' VMs';
+  } else if (S.live) {
+    const online = S.data ? S.data.nodes.filter(n => n.state === 'ONLINE').length : 0;
+    label.textContent = 'LIVE · ' + online + '/3 online';
+  } else label.textContent = FLEET && !S.unlocked ? 'Signed out' : S.fails ? 'Controller unreachable' : 'Connecting…';
+}
+
+function evItem(ev, fresh) {
+  const c = CATS[catOf(ev.level)].color;
+  return h('li', { class: 'ev' + (fresh ? ' fresh' : '') },
+    h('span', { class: 't', text: ev.ts }),
+    h('span', { class: 'l', style: '--lc:' + c, text: ev.level, title: ev.level }),
+    h('span', { class: 'm', text: ev.msg }));
+}
+function fillList(ol, evs, freshSet) {
+  ol.replaceChildren(...evs.map(ev => evItem(ev, freshSet && freshSet.has(ev.key))));
+  if (!evs.length) ol.append(h('li', { class: 'empty', text: 'No events yet.' }));
+}
+
+function autoInfo(d) {
+  if (!d || !d.auto_morph) return { on: false };
+  const last = S.lastAuto;
+  const nextNid = last ? (last.nid % 3) + 1 : 1;
+  if (!last) return { on: true, nextNid, secs: null, frac: 0 };
+  const el = (Date.now() - last.t) / 1000;
+  return { on: true, nextNid, secs: Math.max(0, Math.round(AUTO_INTERVAL - el)), frac: clamp(el / AUTO_INTERVAL, 0, 1) };
+}
+function autoText(a) {
+  if (!a.on) return 'off: morphs run only when you start them';
+  if (a.secs == null) return 'next: OS-' + a.nextNid + ' within ~' + AUTO_INTERVAL + ' s';
+  return a.secs > 0 ? 'next: OS-' + a.nextNid + ' in ~' + a.secs + ' s' : 'next: OS-' + a.nextNid + ' any moment';
+}
+
+function morphBlockReason(d, nid) {
+  if (!S.unlocked) return 'Connect with the operator token first';
+  if (!d) return 'No status yet';
+  const n = nodeOf(d, nid);
+  if (!n || n.state !== 'ONLINE') return shortName(n || { node_id: nid }) + ' is not online';
+  const busy = d.nodes.find(x => x.node_id !== nid && x.state !== 'ONLINE');
+  if (busy) return shortName(busy) + ' is ' + st(busy.state).label.toLowerCase() + '; one morph at a time keeps 2/3 in the pool';
+  return '';
+}
+
+function renderControls() {
+  const d = S.data;
+  const auto = d && d.auto_morph;
+  for (const b of [$('#autoBtn'), $('#cAuto')]) {
+    b.textContent = 'Auto-morph: ' + (d ? (auto ? 'ON · 45 s' : 'OFF') : '–');
+    b.classList.toggle('magenta', !!auto);
+    b.disabled = !S.unlocked;
+    b.title = S.unlocked ? 'Toggle the controller’s automatic rolling morph' : 'Connect with the operator token first';
+  }
+  const allOnline = d && d.nodes.every(n => n.state === 'ONLINE');
+  const waving = Date.now() < S.waveUntil;
+  for (const b of [$('#waveBtn'), $('#cWave')]) {
+    b.disabled = !S.unlocked || !allOnline || waving;
+    b.title = !S.unlocked ? 'Connect with the operator token first' : waving ? 'A rolling wave is in progress' : (allOnline ? 'Morph OS-1, OS-2, OS-3 one after another' : 'Wait until all three nodes are online');
+  }
+  for (const b of $$('[data-morph]')) {
+    const why = morphBlockReason(d, +b.dataset.morph);
+    b.disabled = !!why; b.title = why || 'Drain, binmorph, reboot and catch up this node';
+  }
+  for (const id of ['#d1Run', '#d2Run']) {
+    const b = $(id);
+    b.disabled = S.busy || !S.unlocked || !allOnline;
+    b.title = S.busy ? 'A drill is running' : (!S.unlocked ? 'Connect with the operator token first' : (allOnline ? '' : 'Needs all three nodes online'));
+  }
+}
+
+/* ======================================================================
+   overview
+   ====================================================================== */
+const HEART_D = 'M0,13 C-21,-1 -25,-16 -13,-22 C-7,-25 -1,-21 0,-15 C1,-21 7,-25 13,-22 C25,-16 21,-1 0,13 Z';
+function heartSvg(color) {
+  const svg = s('svg', { viewBox: '-28 -28 56 50' });
+  svg.append(s('path', { d: HEART_D, fill: color }));
+  return svg;
+}
+const nodeCards = {};
+function buildNodeCards(d) {
+  const wrap = $('#nodeCards');
+  for (const n of d.nodes) {
+    const ecg = h('canvas', { class: 'ecg', 'aria-hidden': 'true' });
+    const card = h('article', { class: 'card node', 'data-nid': n.node_id },
+      h('header', {},
+        h('div', {}, h('div', { class: 'n-name', text: shortName(n) }), h('div', { class: 'n-role', text: subName(n) + ' · ' + titleCase(n.role) })),
+        h('span', { class: 'badge', 'data-k': 'state' })),
+      ecg,
+      h('dl', { class: 'n-grid' },
+        h('dt', { text: 'Kernel .text' }), h('dd', { 'data-k': 'sha' }),
+        h('dt', { text: 'Morph seed' }), h('dd', { 'data-k': 'seed' }),
+        h('dt', { text: 'Morphs' }), h('dd', { 'data-k': 'morphs' }),
+        h('dt', { text: 'Boot gen' }), h('dd', { 'data-k': 'boot' }),
+        h('dt', { text: 'WAL tx' }), h('dd', { 'data-k': 'tx' }),
+        h('dt', { text: 'CPUs' }), h('dd', { 'data-k': 'smp' })),
+      h('div', { class: 'n-stats', 'data-k': 'stats' }),
+      h('footer', {},
+        h('button', { class: 'btn sm magenta', 'data-morph': n.node_id, text: '🧬 Morph now' }),
+        h('a', { href: 'http://127.0.0.1:' + n.http_port + '/app', target: '_blank', rel: 'noopener', text: 'Node UI :' + n.http_port + ' ↗' })));
+    wrap.append(card);
+    nodeCards[n.node_id] = card;
+    ECGS.push(new ECG(ecg, n.node_id));
+  }
+  const hh = $('#heroHearts');
+  for (const n of d.nodes) hh.append(heartSvg(st('ONLINE').hex));
+}
+function renderOverview(d, fresh, first) {
+  if (!Object.keys(nodeCards).length) buildNodeCards(d);
+  const online = d.nodes.filter(n => n.state === 'ONLINE');
+  $('#hqNum').textContent = online.length;
+  const q = $('#hqText');
+  q.textContent = d.quorum_status;
+  q.className = 'hq-text' + (!d.parity_syndrome_ok ? ' bad' : online.length < 3 ? ' warn' : '');
+  $$('#heroHearts svg').forEach((svg, i) => {
+    const n = d.nodes[i];
+    svg.classList.toggle('off', n.state !== 'ONLINE');
+    svg.classList.toggle('beat', n.state === 'ONLINE');
+    svg.querySelector('path').setAttribute('fill', st(n.state).hex);
+  });
+  $('#kTx').textContent = '#' + d.triad_tx_seq;
+  const kp = $('#kPar');
+  if (d.has_sql === false) {
+    kp.textContent = d.parity_syndrome_ok ? '✓ Agree' : '✗ Mismatch';
+    $('#kParHash').textContent = '2-of-3 vote on served content (no SQL parity on role ' + d.role + ')';
+  } else {
+    kp.textContent = d.parity_syndrome_ok ? '✓ Verified' : '✗ Fault';
+    $('#kParHash').textContent = 'P = D1 ⊕ D2 · ' + d.parity_sha256;
+  }
+  kp.className = 'kpi-v ' + (d.parity_syndrome_ok ? 'ok' : 'bad');
+  const a = autoInfo(d);
+  const ka = $('#kAuto'); ka.textContent = a.on ? 'ON' : 'OFF'; ka.className = 'kpi-v' + (a.on ? ' on' : '');
+  $('#kAutoS').textContent = autoText(a);
+  const total = d.nodes.reduce((t, n) => t + (n.morph_count || 0), 0);
+  const fastest = Math.min(...d.nodes.map(n => n.last_morph_ms || Infinity));
+  $('#kMorphs').textContent = total;
+  $('#kMorphS').textContent = isFinite(fastest) ? 'fastest binmorph pass: ' + fastest + ' ms' : 'binmorph rewrites';
+
+  for (const n of d.nodes) {
+    const c = nodeCards[n.node_id]; if (!c) continue;
+    const sx = st(n.state);
+    c.style.setProperty('--c', sx.hex);
+    const g = k => c.querySelector('[data-k="' + k + '"]');
+    const b = g('state'); b.textContent = sx.label; b.style.setProperty('--c', sx.hex);
+    g('sha').textContent = n.state === 'MORPHING' ? scrambleHex(12) + '…' : (n.elf_sha256 || '–').slice(0, 16) + '…';
+    g('seed').textContent = n.seed;
+    g('morphs').textContent = n.morph_count + (n.last_morph_ms ? ' · last ' + n.last_morph_ms + ' ms' : '');
+    g('boot').textContent = '#' + n.boot_gen;
+    const lag = d.triad_tx_seq - n.tx_seq;
+    const tx = g('tx'); tx.textContent = '#' + n.tx_seq + (lag > 0 ? ' (' + lag + ' behind the controller’s WAL)' : '');
+    tx.classList.toggle('lag', lag > 0);
+    g('smp').textContent = n.last_smp;
+    g('stats').textContent = n.morph_stats;
+    c.querySelector('footer a').hidden = !!d.role && d.role !== 'wfe' && d.role !== 'full'; // no svc-http
+  }
+  if (S.tab === 'overview' || first) {
+    const freshSet = new Set(fresh.map(e => e.key));
+    fillList($('#recentList'), S.events.slice(-7).reverse(), first ? null : freshSet);
+  }
+}
+
+/* ======================================================================
+   ECG heartbeat traces
+   ====================================================================== */
+const ECGS = [];
+class ECG {
+  constructor(canvas, nid) { this.cv = canvas; this.ctx = canvas.getContext('2d'); this.nid = nid; this.buf = []; this.phase = Math.random(); this.last = performance.now(); }
+  fit() {
+    const r = this.cv.getBoundingClientRect();
+    if (!r.width) return false;
+    const dpr = Math.min(2, devicePixelRatio || 1);
+    const w = Math.round(r.width * dpr), hh = Math.round(r.height * dpr);
+    if (this.cv.width !== w || this.cv.height !== hh) { this.cv.width = w; this.cv.height = hh; }
+    this.w = r.width; this.h = r.height; this.dpr = dpr;
+    return true;
+  }
+  sample(state, dt) {
+    const bpm = { ONLINE: 72, DRAINING: 40, CATCHING_UP: 138, HEALING: 104 }[state] || 0;
+    if (state === 'MORPHING') return (Math.random() - 0.5) * 0.9 + Math.sin(performance.now() / 41) * 0.25;
+    if (state === 'INITIALIZING') return (Math.random() - 0.5) * 0.25;
+    if (!bpm) return (Math.random() - 0.5) * 0.03;
+    this.phase = (this.phase + dt * bpm / 60) % 1;
+    const p = this.phase;
+    const g = (c, w, a) => a * Math.exp(-((p - c) ** 2) / (2 * w * w));
+    let y = g(0.12, 0.025, 0.12) + g(0.27, 0.008, -0.18) + g(0.3, 0.011, 1) + g(0.335, 0.011, -0.32) + g(0.56, 0.045, 0.26);
+    if (state === 'HEALING') y *= 0.5 + Math.random();
+    if (state === 'DRAINING') y *= 0.55;
+    return y + (Math.random() - 0.5) * 0.02;
+  }
+  frame(now) {
+    if (!this.fit()) { this.last = now; return; }
+    const n = nodeOf(S.data, this.nid);
+    const state = n ? n.state : 'INITIALIZING';
+    const color = st(state).hex;
+    const dt = Math.min(0.5, (now - this.last) / 1000); this.last = now;
+    const speed = 64;
+    const count = Math.max(1, Math.round(dt * speed));
+    for (let i = 0; i < count; i++) this.buf.push(this.sample(state, 1 / speed));
+    const max = Math.ceil(this.w); if (this.buf.length > max) this.buf.splice(0, this.buf.length - max);
+    const c = this.ctx, w = this.w, hh = this.h;
+    c.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    c.clearRect(0, 0, w, hh);
+    c.strokeStyle = '#11203a'; c.lineWidth = 1;
+    c.beginPath();
+    for (let x = 0; x < w; x += 16) { c.moveTo(x + 0.5, 0); c.lineTo(x + 0.5, hh); }
+    c.stroke();
+    const base = hh * 0.62, amp = hh * 0.5, x0 = w - this.buf.length;
+    const path = () => { c.beginPath(); this.buf.forEach((v, i) => { const x = x0 + i, y = base - v * amp; i ? c.lineTo(x, y) : c.moveTo(x, y); }); };
+    c.lineJoin = 'round';
+    path(); c.strokeStyle = color + '40'; c.lineWidth = 4; c.stroke();
+    path(); c.strokeStyle = color; c.lineWidth = 1.6; c.stroke();
+    const lastV = this.buf[this.buf.length - 1] || 0;
+    c.fillStyle = color; c.beginPath(); c.arc(w - 1.5, base - lastV * amp, 2.5, 0, Math.PI * 2); c.fill();
+  }
+}
+
+/* ======================================================================
+   live cycle: SVG stage
+   ====================================================================== */
+const C = { x: 500, y: 330 };
+const NP = { 1: { x: 500, y: 140 }, 2: { x: 232, y: 498 }, 3: { x: 768, y: 498 } };
+function outward(p, dist) { const dx = p.x - C.x, dy = p.y - C.y, L = Math.hypot(dx, dy); return { x: p.x + dx / L * dist, y: p.y + dy / L * dist }; }
+const DP = { 1: outward(NP[1], 104), 2: outward(NP[2], 104), 3: outward(NP[3], 104) };
+const LABEL = { 1: { x: 96, y: -26, a: 'start' }, 2: { x: 0, y: 90, a: 'middle' }, 3: { x: 0, y: 90, a: 'middle' } };
+const V = {};
+
+function buildStage() {
+  const svg = $('#stage');
+  svg.innerHTML = `
+  <defs>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="4.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <radialGradient id="coreGrad"><stop offset="0" stop-color="#22d3ee" stop-opacity=".28"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/></radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#132039" stroke-width="1"/></pattern>
+  </defs>
+  <rect width="1000" height="660" fill="url(#grid)" opacity=".55"/>
+  <g id="g-peers"></g><g id="g-spokes"></g><g id="g-disks"></g><g id="g-flows"></g>
+  <g id="core" transform="translate(${C.x},${C.y})">
+    <circle r="130" fill="url(#coreGrad)"/>
+    <circle r="100" class="core-ring"/>
+    <circle r="82" class="cd-track"/>
+    <path id="cdArc" class="cd-arc" d=""/>
+    <g id="pointer"><path class="pointer" d="M0,-112 l-10,17 h20 z"/></g>
+    <polygon class="core-hex" points="${hexPts(74)}"/>
+    <text class="core-t1" y="-22">TRIAD</text>
+    <text class="core-t2" y="-7">CONTROLLER</text>
+    <text class="core-q" id="coreQ" y="19">–/3</text>
+    <text class="core-tx" id="coreTx" y="38">tx #–</text>
+  </g>
+  <g id="g-nodes"></g><g id="g-fx"></g>`;
+  const peers = $('#g-peers', svg), spokes = $('#g-spokes', svg), disks = $('#g-disks', svg), nodes = $('#g-nodes', svg);
+  for (const [a, b] of [[1, 2], [2, 3], [1, 3]]) {
+    const l = s('line', { x1: NP[a].x, y1: NP[a].y, x2: NP[b].x, y2: NP[b].y, class: 'peer' });
+    peers.append(l); V['peer' + a + b] = l;
+  }
+  for (const id of [1, 2, 3]) {
+    const sp = s('line', { x1: C.x, y1: C.y, x2: NP[id].x, y2: NP[id].y, class: 'spoke' });
+    spokes.append(sp); V['spoke' + id] = sp;
+
+    const dk = s('g', { class: 'disk', transform: `translate(${DP[id].x},${DP[id].y})` });
+    dk.append(s('path', { d: 'M-20,-10 v20 a20,7 0 0 0 40,0 v-20' }), s('ellipse', { cx: 0, cy: -10, rx: 20, ry: 7 }));
+    const dt = s('text', { y: 30 }); dt.textContent = 'AHCI ' + id; dk.append(dt);
+    disks.append(dk); V['disk' + id] = dk;
+
+    const g = s('g', { class: 'vnode', id: 'vn-' + id, transform: `translate(${NP[id].x},${NP[id].y})`, 'data-state': 'INITIALIZING' });
+    g.append(s('circle', { r: 80, class: 'halo' }), s('circle', { r: 58, class: 'ring' }), s('circle', { r: 66, class: 'ring-spin' }));
+    const hg = s('g', { transform: 'scale(1.75) translate(0,4)' }); hg.append(s('path', { d: HEART_D, class: 'heart' })); g.append(hg);
+    const L = LABEL[id];
+    const mk = (cls, dy) => { const t = s('text', { class: cls, x: L.x, y: L.y + dy, 'text-anchor': L.a }); g.append(t); return t; };
+    V['name' + id] = mk('vn-name', 0);
+    V['sub' + id] = mk('vn-sub', 17);
+    V['state' + id] = mk('vn-state', 37);
+    V['hash' + id] = mk('vn-hash', 55);
+    const mb = s('g', { class: 'mbadge', transform: 'translate(46,-46)' });
+    mb.append(s('circle', { r: 15 })); const mt = s('text', { y: 4 }); mb.append(mt); g.append(mb); V['mb' + id] = mt;
+    const lb = s('g', { class: 'lagb', transform: 'translate(-50,50)', opacity: 0 });
+    lb.append(s('rect', { x: -30, y: -10, width: 60, height: 19, rx: 9 })); const lt = s('text', { y: 4 }); lb.append(lt); g.append(lb);
+    V['lagg' + id] = lb; V['lag' + id] = lt;
+    g.style.cursor = 'pointer';
+    g.addEventListener('click', () => morphFromStage(id));
+    nodes.append(g); V['node' + id] = g;
+  }
+  V.flows = $('#g-flows', svg); V.fx = $('#g-fx', svg);
+  V.coreQ = $('#coreQ', svg); V.coreTx = $('#coreTx', svg); V.cdArc = $('#cdArc', svg); V.pointer = $('#pointer', svg);
+}
+async function morphFromStage(id) {
+  if (needUnlock()) return;
+  const why = morphBlockReason(S.data, id);
+  if (why) { toast(why + '.', 'warn'); return; }
+  const n = nodeOf(S.data, id);
+  const ok = await confirmBox('Morph ' + shortName(n) + ' now?', 'Drain → binmorph a fresh kernel binary → reboot → replay missed WAL writes → rejoin. The other two nodes keep the 2/3 majority the whole time.', '🧬 Morph it');
+  if (ok && await action('/api/morph/' + id, 'Morph started for ' + shortName(n) + '.')) vizFx.morphStart(id);
+}
+// Flat-top hexagon: widest across the middle, where the core's text lines sit.
+function hexPts(r) {
+  const pts = [];
+  for (let i = 0; i < 6; i++) {
+    const a = i * Math.PI / 3;
+    pts.push((r * Math.cos(a)).toFixed(1) + ',' + (r * Math.sin(a)).toFixed(1));
+  }
+  return pts.join(' ');
+}
+const HEX = '0123456789abcdef';
+function scrambleHex(n) { let o = ''; for (let i = 0; i < n; i++) o += HEX[(Math.random() * 16) | 0]; return o; }
+function hueFor(id) { return { 1: 158, 2: 292, 3: 192 }[id] || 200; }
+
+function renderCycle(d, fresh, first) {
+  const byId = {}; for (const n of d.nodes) byId[n.node_id] = n;
+  const online = d.nodes.filter(n => n.state === 'ONLINE').length;
+  V.coreQ.textContent = online + '/3';
+  V.coreQ.style.fill = online === 3 ? '#2ee6a8' : online === 2 ? '#fbbf24' : '#fb7185';
+  V.coreTx.textContent = 'tx #' + d.triad_tx_seq + (d.parity_syndrome_ok ? ' · P ✓' : ' · P ✗');
+  for (const id of [1, 2, 3]) {
+    const n = byId[id]; if (!n) continue;
+    const sx = st(n.state);
+    const g = V['node' + id];
+    g.setAttribute('data-state', n.state);
+    g.style.setProperty('--c', sx.hex);
+    V['name' + id].textContent = shortName(n);
+    V['sub' + id].textContent = subName(n);
+    V['state' + id].textContent = sx.label.toUpperCase();
+    if (n.state !== 'MORPHING') V['hash' + id].textContent = 'sha ' + (n.elf_sha256 || '').slice(0, 12);
+    V['mb' + id].textContent = '×' + n.morph_count;
+    const lag = d.triad_tx_seq - n.tx_seq;
+    V['lagg' + id].setAttribute('opacity', lag > 0 ? 1 : 0);
+    V['lag' + id].textContent = '−' + lag + ' tx';
+    const sp = V['spoke' + id];
+    sp.style.setProperty('--c', sx.hex);
+    sp.setAttribute('class', 'spoke' + (n.state === 'ONLINE' ? ' on' : n.state === 'CATCHING_UP' || n.state === 'HEALING' ? ' in' : ''));
+    V['disk' + id].classList.toggle('hot', n.state === 'DRAINING');
+  }
+  for (const [a, b] of [[1, 2], [2, 3], [1, 3]]) {
+    V['peer' + a + b].classList.toggle('on', !!(byId[a] && byId[b] && byId[a].state === 'ONLINE' && byId[b].state === 'ONLINE'));
+  }
+  // rotation pointer: next auto-morph target, else the next node after the last one that morphed
+  const a = autoInfo(d);
+  let target = a.on ? a.nextNid : null;
+  const moving = d.nodes.find(n => n.state !== 'ONLINE');
+  if (moving) target = moving.node_id;
+  if (!target) {
+    const lastMorph = [...S.events].reverse().find(e => e.level === 'MORPH' && e.nid);
+    target = lastMorph ? (lastMorph.nid % 3) + 1 : 1;
+  }
+  const ang = Math.atan2(NP[target].y - C.y, NP[target].x - C.x) * 180 / Math.PI + 90;
+  const cur = V.pointer._ang ?? ang;
+  let next = ang; while (next - cur > 180) next -= 360; while (next - cur < -180) next += 360;
+  V.pointer._ang = next;
+  V.pointer.style.transform = 'rotate(' + next + 'deg)';
+  renderPipeline(d);
+  renderNarration(d, a);
+  fillList($('#feed'), S.events.slice(-14).reverse(), first ? null : new Set(fresh.map(e => e.key)));
+}
+
+function arcPath(r, frac) {
+  if (frac <= 0) return '';
+  if (frac >= 0.999) return `M0,${-r} A${r},${r} 0 1 1 0,${r} A${r},${r} 0 1 1 0,${-r}`;
+  const a = frac * Math.PI * 2 - Math.PI / 2;
+  return `M0,${-r} A${r},${r} 0 ${frac > 0.5 ? 1 : 0} 1 ${(r * Math.cos(a)).toFixed(2)},${(r * Math.sin(a)).toFixed(2)}`;
+}
+
+const STAGES = [
+  { key: 'ONLINE', label: 'Online', desc: 'In the pool: votes on reads, takes writes' },
+  { key: 'DRAINING', label: 'Drain', desc: 'sync + seal disk, halt VM' },
+  { key: 'MORPHING', label: 'Morph + boot', desc: 'binmorph rewrites the kernel; VM reboots' },
+  { key: 'CATCHING_UP', label: 'Catch up', desc: 'replays missed WAL transactions' },
+  { key: 'HEALING', label: 'Heal', desc: 'rebuilt from 2/3 majority + WAL' },
+  { key: 'OFFLINE', label: 'Offline', desc: 'failed to boot; needs attention' },
+];
+function renderPipeline(d) {
+  const p = $('#pipeline');
+  if (!p.children.length) {
+    for (const sg of STAGES) {
+      p.append(h('div', { class: 'stg', 'data-k': sg.key, style: '--c:' + st(sg.key).hex },
+        h('b', { text: sg.label }), h('span', { text: sg.desc }), h('div', { class: 'slot' })));
+    }
+  }
+  for (const box of p.children) {
+    const key = box.dataset.k;
+    const here = d.nodes.filter(n => n.state === key || (key === 'MORPHING' && n.state === 'INITIALIZING'));
+    box.classList.toggle('active', here.length > 0);
+    box.querySelector('.slot').replaceChildren(...here.map(n => h('span', { class: 'nchip', style: '--c:' + st(n.state).hex, text: shortName(n) })));
+  }
+}
+
+function renderNarration(d, a) {
+  const by = k => d.nodes.filter(n => n.state === k);
+  const names = arr => arr.map(shortName).join(' + ');
+  const others = n => names(d.nodes.filter(x => x.node_id !== n.node_id && x.state === 'ONLINE'));
+  let ico = '💓', title, text;
+  const heal = by('HEALING')[0], drain = by('DRAINING')[0], morph = by('MORPHING')[0], catchup = by('CATCHING_UP')[0], off = by('OFFLINE'), init = by('INITIALIZING');
+  if (!d.parity_syndrome_ok && !heal) { ico = '🚨'; title = 'Majority mismatch detected'; text = d.quorum_status; }
+  else if (heal) { ico = '🩹'; title = shortName(heal) + ' is being healed'; text = 'It was outvoted 2-to-1. The controller is rebuilding its tables from the healthy majority and the WAL; an emergency re-morph follows.'; }
+  else if (drain) { ico = '💧'; title = shortName(drain) + ' is draining'; text = 'Flushing and sealing its AHCI disk before shutdown. ' + others(drain) + ' hold the 2/3 majority, so reads and writes keep working.'; }
+  else if (morph) { ico = '🧬'; title = shortName(morph) + ' is morphing'; text = 'binmorph rewrote its kernel under seed ' + morph.seed + ' and the VM is booting the new binary. ' + others(morph) + ' are serving every request meanwhile.'; }
+  else if (catchup) { ico = '🔁'; title = shortName(catchup) + ' is catching up'; text = 'Replaying ' + Math.max(0, d.triad_tx_seq - catchup.tx_seq) + ' missed transaction(s) from the WAL before rejoining the pool.'; }
+  else if (off.length) { ico = '⚠️'; title = names(off) + ' offline'; text = 'The node did not reach its shell. Check the controller terminal for the serial tail.'; }
+  else if (init.length) { ico = '🚀'; title = 'Booting the Triad'; text = 'binmorph is producing three distinct kernel binaries and the VMs are starting.'; }
+  else { title = 'All three hearts in sync'; text = a.on ? 'Auto-morph is on: ' + autoText(a) + '. The pointer on the controller shows who goes next.' : 'Auto-morph is off. Start a morph or a rolling wave and watch the cycle run.'; }
+  $('#nowIco').textContent = ico; $('#nowTitle').textContent = title; $('#nowText').textContent = text;
+}
+
+/* ---------- flows (packets along links) ---------- */
+const FLOWS = [];
+function addFlow(from, to, color, opts = {}) {
+  FLOWS.push({ from, to, color, t0: performance.now() + (opts.delay || 0), dur: opts.dur || 900, r: opts.r || 5, label: opts.label || '', el: null, tl: null });
+}
+const vizFlows = {
+  replicate(color = '#22d3ee') {
+    const d = S.data; if (!d) return;
+    for (const n of d.nodes) if (n.state === 'ONLINE') addFlow(C, NP[n.node_id], color, { dur: 800 });
+  },
+  read() {
+    const d = S.data; if (!d) return;
+    for (const n of d.nodes) if (n.state === 'ONLINE') { addFlow(C, NP[n.node_id], '#2ee6a8', { dur: 600, r: 4 }); addFlow(NP[n.node_id], C, '#2ee6a8', { dur: 600, r: 4, delay: 650 }); }
+  },
+  drain(id) { for (let i = 0; i < 6; i++) addFlow(NP[id], DP[id], '#fbbf24', { delay: i * 170, dur: 600, r: 4 }); },
+  catchup(id, count) {
+    const tx = S.data ? S.data.triad_tx_seq : 0;
+    const k = Math.min(10, Math.max(1, count));
+    for (let i = 0; i < k; i++) addFlow(C, NP[id], '#38bdf8', { delay: i * 220, dur: 900, r: 6, label: 'tx' + (tx - k + 1 + i) });
+  },
+  heal(id) {
+    for (const p of [1, 2, 3]) if (p !== id) for (let i = 0; i < 4; i++) addFlow(NP[p], NP[id], '#fb7185', { delay: i * 260, dur: 900 });
+  },
+};
+const vizFx = {
+  ring(id, color, maxR = 120, dur = 900) {
+    const c = s('circle', { cx: NP[id].x, cy: NP[id].y, r: 60, class: 'fx-ring', stroke: color });
+    V.fx.append(c);
+    const t0 = performance.now();
+    const step = now => { const p = (now - t0) / dur; if (p >= 1) { c.remove(); return; } c.setAttribute('r', 60 + (maxR - 60) * p); c.setAttribute('opacity', 1 - p); requestAnimationFrame(step); };
+    requestAnimationFrame(step);
+  },
+  text(id, txt, color) {
+    const t = s('text', { x: NP[id].x, y: NP[id].y - 92, class: 'fx-text', fill: color }); t.textContent = txt; V.fx.append(t);
+    const t0 = performance.now();
+    const step = now => { const p = (now - t0) / 2200; if (p >= 1) { t.remove(); return; } t.setAttribute('y', NP[id].y - 92 - p * 30); t.setAttribute('opacity', p < 0.7 ? 1 : 1 - (p - 0.7) / 0.3); requestAnimationFrame(step); };
+    requestAnimationFrame(step);
+  },
+  tamper(id) {
+    this.ring(id, '#fb7185', 150, 700); setTimeout(() => this.ring(id, '#fb7185', 150, 700), 250);
+    this.text(id, '⚡ ROGUE WRITE', '#fb7185');
+  },
+  alert(id) { this.ring(id, '#fbbf24', 170, 1200); this.text(id, 'OUTVOTED 2–1', '#fbbf24'); },
+  morphStart(id) { this.ring(id, '#e879f9', 140, 900); },
+  morphDone(id) { this.ring(id, '#e879f9', 110, 600); this.text(id, 'NEW BINARY', '#e879f9'); },
+};
+function stepFlows(now) {
+  for (let i = FLOWS.length - 1; i >= 0; i--) {
+    const f = FLOWS[i];
+    if (now < f.t0) continue;
+    const p = (now - f.t0) / f.dur;
+    if (p >= 1) { if (f.el) f.el.remove(); if (f.tl) f.tl.remove(); FLOWS.splice(i, 1); continue; }
+    if (!f.el) {
+      f.el = s('circle', { r: f.r, fill: f.color, class: 'pkt' }); V.flows.append(f.el);
+      if (f.label) { f.tl = s('text', { class: 'pkt-l', fill: f.color }); f.tl.textContent = f.label; V.flows.append(f.tl); }
+    }
+    const e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+    const x = f.from.x + (f.to.x - f.from.x) * e, y = f.from.y + (f.to.y - f.from.y) * e;
+    f.el.setAttribute('cx', x.toFixed(1)); f.el.setAttribute('cy', y.toFixed(1));
+    f.el.setAttribute('opacity', p > 0.85 ? (1 - p) / 0.15 : 1);
+    if (f.tl) { f.tl.setAttribute('x', x.toFixed(1)); f.tl.setAttribute('y', (y - 10).toFixed(1)); }
+  }
+}
+
+/* ---------- timeline canvas ---------- */
+function buildLegend() {
+  const lg = $('#legend');
+  for (const k of ['ONLINE', 'DRAINING', 'MORPHING', 'CATCHING_UP', 'HEALING', 'OFFLINE']) {
+    lg.append(h('span', {}, h('i', { style: '--c:' + st(k).hex }), st(k).label));
+  }
+}
+function drawTimeline() {
+  const cv = $('#timeline'); const r = cv.getBoundingClientRect(); if (!r.width) return;
+  const dpr = Math.min(2, devicePixelRatio || 1);
+  if (cv.width !== Math.round(r.width * dpr)) { cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr); }
+  const c = cv.getContext('2d'); c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const W = r.width, H = r.height, L = 52, top = 6, lane = 28, gap = 6;
+  c.clearRect(0, 0, W, H);
+  const now = Date.now(), t0 = now - WINDOW_MS, xOf = t => L + (t - t0) / WINDOW_MS * (W - L - 8);
+  c.font = '600 10px ' + getComputedStyle(document.body).getPropertyValue('--mono');
+  c.fillStyle = '#56657e'; c.strokeStyle = '#16213a'; c.lineWidth = 1;
+  for (let m = 0; m <= 5; m++) {
+    const x = xOf(now - m * 60000);
+    c.beginPath(); c.moveTo(x + 0.5, top); c.lineTo(x + 0.5, top + 3 * (lane + gap)); c.stroke();
+    c.fillText(m ? '−' + m + ' min' : 'now', x - (m ? 18 : 10), H - 4);
+  }
+  for (const id of [1, 2, 3]) {
+    const y = top + (id - 1) * (lane + gap);
+    c.fillStyle = '#8b9bb4'; c.font = '700 11px ' + getComputedStyle(document.body).getPropertyValue('--mono');
+    c.fillText('OS-' + id, 4, y + lane / 2 + 4);
+    c.fillStyle = '#0b1326'; c.fillRect(L, y, W - L - 8, lane);
+    const hist = S.hist[id] || [];
+    for (let i = 0; i < hist.length; i++) {
+      const a = Math.max(hist[i].t, t0), b = i + 1 < hist.length ? hist[i + 1].t : now;
+      if (b < t0) continue;
+      const x1 = xOf(a), x2 = xOf(b);
+      c.fillStyle = st(hist[i].state).hex + (hist[i].state === 'ONLINE' ? '55' : 'dd');
+      c.fillRect(x1, y, Math.max(1.5, x2 - x1), lane);
+    }
+    for (const m of S.marks) {
+      if (m.nid !== id || m.t < t0) continue;
+      const x = xOf(m.t);
+      c.fillStyle = m.kind === 'heal' ? '#fb7185' : '#ffffff';
+      c.font = '13px ' + getComputedStyle(document.body).getPropertyValue('--sans');
+      c.fillText('♥', x - 5, y + lane / 2 + 5);
+    }
+  }
+}
+
+/* ======================================================================
+   event log tab
+   ====================================================================== */
+function buildLogFilters() {
+  const wrap = $('#logFilters');
+  const mk = (key, label, color) => {
+    const b = h('button', { class: 'fchip', 'aria-pressed': String(key === S.logFilter), style: color ? '--lc:' + color : null, text: label });
+    b.addEventListener('click', () => { S.logFilter = key; $$('.fchip', wrap).forEach(x => x.setAttribute('aria-pressed', 'false')); b.setAttribute('aria-pressed', 'true'); renderLog(); });
+    wrap.append(b);
+  };
+  mk('all', 'All');
+  for (const [k, c] of Object.entries(CATS)) mk(k, c.label, c.color);
+}
+function renderLog() {
+  const q = S.logQuery.toLowerCase();
+  const evs = S.events.filter(e => (S.logFilter === 'all' || catOf(e.level) === S.logFilter) && (!q || (e.level + ' ' + e.msg).toLowerCase().includes(q)));
+  fillList($('#logList'), evs.slice().reverse());
+  $('#logCount').textContent = ' · ' + evs.length + ' of ' + S.events.length;
+}
+
+/* ======================================================================
+   operations
+   ====================================================================== */
+async function post(path, body = '', absolute = false) {
+  const r = await fetch((absolute ? '' : API_BASE) + path, { method: 'POST', headers: { 'X-Cuttle-Session': S.token, 'Content-Type': 'text/plain' }, body });
+  let j;
+  try { j = await r.json(); } catch { j = { ok: false, error: 'unexpected response (HTTP ' + r.status + ')' }; }
+  if (r.status === 401) {
+    toast('The token was rejected. The controller may have restarted; paste the new one.', 'bad', 7000);
+    lockOut('Token rejected.');
+  }
+  return { status: r.status, j };
+}
+function needUnlock() {
+  if (S.unlocked) return false;
+  openConnect();
+  toast('Connect with the operator token to run operations.', 'warn');
+  return true;
+}
+const printable = x => /^[\x20-\x7e]+$/.test(x);
+
+function inspectorPending(label, cmd, reveal) {
+  const box = $('.inspector'), r = box.getBoundingClientRect();
+  if (reveal && r.height && (r.top > innerHeight - 80 || r.bottom < 80)) box.scrollIntoView({ behavior: REDUCED ? 'auto' : 'smooth', block: 'start' });
+  $('#inspTime').textContent = '';
+  $('#insp').replaceChildren(h('div', { class: 'insp-cmd' }, h('span', { class: 'spin' }), ' ', label + ': ', cmd || ''));
+}
+function inspectorShow(label, cmd, res, ms) {
+  const { status, j } = res;
+  $('#inspTime').textContent = Math.round(ms) + ' ms · ' + new Date().toLocaleTimeString();
+  const body = [h('div', { class: 'insp-cmd', text: label + (cmd ? ': ' + cmd : '') })];
+  const chips = h('div', { class: 'insp-chips' });
+  chips.append(h('span', { class: 'tag ' + (j.ok ? 'r' : 'x'), text: (j.ok ? 'OK' : 'REFUSED') + ' · HTTP ' + status }));
+  if (j.mode) chips.append(h('span', { class: 'tag w', text: j.mode }));
+  if (j.quorum) chips.append(h('span', { class: 'tag', text: j.quorum }));
+  if (j.tx_seq != null) chips.append(h('span', { class: 'tag', text: 'tx_seq ' + j.tx_seq }));
+  body.push(chips);
+  const main = j.ok ? (j.output != null ? j.output : '') : (j.error || j.output || 'error');
+  if (main !== '' || !j.per_node) body.push(h('pre', { class: 'out' + (j.ok ? '' : ' err'), text: String(main).trim() || '(empty output)' }));
+  if (j.per_node && S.data) {
+    const grid = h('div', { class: 'pernode' });
+    const vals = Object.values(j.per_node);
+    for (const n of S.data.nodes) {
+      const out = j.per_node[n.name];
+      if (out == null) continue;
+      let cls = '', tag = '';
+      if (/^\[(QUEUED|[A-Z_]+\])/.test(out.trim())) { cls = 'queued'; tag = /QUEUED/.test(out) ? 'queued' : out.trim().replace(/[\[\]]/g, '').toLowerCase(); }
+      else if (j.output != null && j.mode && /READ/.test(j.mode)) { cls = out === j.output ? 'agree' : 'differ'; tag = out === j.output ? 'majority' : 'outvoted'; }
+      else { const same = vals.filter(v => v === out).length; tag = same > 1 ? 'same as ' + (same - 1) + ' other' + (same > 2 ? 's' : '') : 'unique'; }
+      grid.append(h('div', { class: 'pn ' + cls }, h('h4', {}, h('span', { text: shortName(n) }), h('span', { text: tag })), h('pre', { text: String(out).trim() || '(empty)' })));
+    }
+    body.push(grid);
+  }
+  $('#insp').replaceChildren(...body);
+}
+async function runOp(label, path, body, opts = {}) {
+  if (needUnlock()) return null;
+  if (body !== '' && !printable(body)) { toast('Only printable ASCII is allowed: the controller rejects control characters.', 'warn'); return null; }
+  if (opts.confirm && !(await confirmBox(...opts.confirm))) return null;
+  inspectorPending(label, body, !S.busy);
+  if (opts.viz) opts.viz();
+  const t0 = performance.now();
+  try {
+    const res = await post(path, body);
+    inspectorShow(label, body, res, performance.now() - t0);
+    return res.j;
+  } catch (e) {
+    inspectorShow(label, body, { status: 0, j: { ok: false, error: 'request failed: ' + e.message } }, performance.now() - t0);
+    return null;
+  }
+}
+async function action(path, okMsg) {
+  if (needUnlock()) return null;
+  try {
+    const { status, j } = await post(path, '');
+    if (status === 200 && j.ok !== false) { if (okMsg) toast(okMsg, 'ok'); return j; }
+    if (status !== 401) toast('Refused: ' + (j.error || 'HTTP ' + status), 'bad');
+  } catch (e) { toast('Request failed: ' + e.message, 'bad'); }
+  return null;
+}
+
+const SQL_PRESETS = [
+  'SELECT * FROM kv', 'SELECT * FROM services', '.tables', '.schema',
+  "INSERT INTO kv VALUES ('demo.hello', 'world', 1)",
+  "UPDATE kv SET v = 'cuttle' WHERE k = 'demo.hello'",
+  "DELETE FROM kv WHERE k = 'demo.hello'",
+];
+const SH_PRESETS = ['status', 'uptime', 'smp', 'attest', 'seal', 'ps', 'threads', 'net', 'df', 'audit', 'service status', 'triad status', 'seccomp status', 'ima status', 'fw status', 'session status', 'caps', 'uname'];
+function runSql() {
+  const q = $('#sqlIn').value.trim(); if (!q) return;
+  const isRead = /^\s*(\/\*triad\*\/\s*)?(SELECT|\.TABLES|SHOW|\.SCHEMA|DESCRIBE)/i.test(q);
+  const destructive = /^\s*(DROP|DELETE)\b/i.test(q);
+  runOp(isRead ? 'SQL read' : 'SQL write', '/api/sql', q, {
+    confirm: destructive ? ['Run a destructive statement?', 'This replicates to every online node and is recorded in the WAL. Nodes that are away will replay it when they wake.\n\n' + q, 'Run it', true] : null,
+    viz: isRead ? vizFlows.read : null,
+  });
+}
+function runSh() {
+  const cmd = $('#shIn').value.trim(); if (!cmd) return;
+  runOp('Inspect', '/api/sh', cmd, { viz: vizFlows.read });
+}
+function vaultOp(kind) {
+  const k = $('#vKey').value.trim(), v = $('#vVal').value.trim();
+  if (kind !== 'list' && !k) { toast('Enter a vault key first.', 'warn'); $('#vKey').focus(); return; }
+  if (/\s/.test(k)) { toast('Vault keys can’t contain spaces.', 'warn'); return; }
+  if (kind === 'put' && !v) { toast('Enter a value to seal.', 'warn'); $('#vVal').focus(); return; }
+  const cmd = kind === 'list' ? 'vault list' : kind === 'put' ? 'vault put ' + k + ' ' + v : 'vault ' + kind + ' ' + k;
+  const label = kind === 'put' ? 'Vault put' : kind === 'del' ? 'Vault delete' : kind === 'get' ? 'Vault get' : 'Vault list';
+  runOp(label, '/api/vault', cmd, {
+    confirm: kind === 'del' ? ['Delete this vault key?', 'Removes ' + k + ' from all online nodes and records the delete in the WAL.', 'Delete', true] : null,
+    viz: kind === 'put' || kind === 'del' ? null : vizFlows.read,
+  });
+}
+
+/* ---------- drills ---------- */
+function stepper(ol, labels) {
+  ol.replaceChildren(...labels.map(l => h('li', {}, h('span', { text: l }), h('small'))));
+  const items = Array.from(ol.children);
+  return {
+    run(i, note) { items[i].className = 'run'; if (note != null) items[i].querySelector('small').textContent = note; },
+    ok(i, note) { items[i].className = 'ok'; if (note != null) items[i].querySelector('small').textContent = note; },
+    fail(i, note) { items[i].className = 'fail'; if (note != null) items[i].querySelector('small').textContent = note; },
+  };
+}
+function waitFor(pred, ms) {
+  return new Promise((res, rej) => {
+    const t0 = Date.now();
+    const tick = () => {
+      let v = false; try { v = pred(); } catch { /* status not ready yet */ }
+      if (v) return res(v);
+      if (Date.now() - t0 > ms) return rej(new Error('timed out after ' + Math.round(ms / 1000) + ' s'));
+      setTimeout(tick, 300);
+    };
+    tick();
+  });
+}
+async function drillGuard(fn) {
+  if (needUnlock() || S.busy) return;
+  if (!S.data || !S.data.nodes.every(n => n.state === 'ONLINE')) { toast('Drills need all three nodes online.', 'warn'); return; }
+  S.busy = true; renderControls();
+  try { await fn(); } finally { S.busy = false; renderControls(); }
+}
+function drillZeroDowntime() {
+  return drillGuard(async () => {
+    const nid = +$('#d1Node').value;
+    const name = 'OS-' + nid;
+    const key = 'drill.' + Date.now().toString(36);
+    const sp = stepper($('#d1Steps'), ['Start the morph of ' + name, 'Wait for ' + name + ' to leave the pool', 'Write a row while it’s away', 'Wait for ' + name + ' to rejoin', 'Check ' + name + ' replayed the write']);
+    let i = 0;
+    try {
+      const before = nodeOf(S.data, nid).morph_count;
+      sp.run(i); if (!(await action('/api/morph/' + nid))) throw new Error('morph refused'); sp.ok(i++);
+      sp.run(i); await waitFor(() => nodeOf(S.data, nid).state !== 'ONLINE', 20000); sp.ok(i++, st(nodeOf(S.data, nid).state).label);
+      sp.run(i);
+      const w = await runOp('Drill write', '/api/sql', "INSERT INTO kv VALUES ('" + key + "', 'written-while-" + name.toLowerCase() + "-morphed', 1)");
+      if (!w || !w.ok) throw new Error('write refused');
+      sp.ok(i++, (w.quorum || '').replace(/ online nodes.*/, ''));
+      sp.run(i, 'booting new binary…');
+      await waitFor(() => { const n = nodeOf(S.data, nid); return n.state === 'ONLINE' && n.morph_count > before; }, 120000);
+      sp.ok(i++, 'sha ' + nodeOf(S.data, nid).elf_sha256.slice(0, 10) + '…');
+      sp.run(i);
+      const r = await runOp('Drill verify', '/api/sql', 'SELECT * FROM kv', { viz: vizFlows.read });
+      const mine = r && r.per_node ? r.per_node[nodeOf(S.data, nid).name] || '' : '';
+      if (!mine.includes(key)) throw new Error(name + ' is missing the row');
+      sp.ok(i, 'row present on ' + name);
+      toast('Drill passed: ' + name + ' missed the write while morphing and replayed it from the WAL. 🎉', 'party', 7000);
+      if (S.fireworks) celebrateAt(nodePos(nid), 50, 'peony', 3);
+    } catch (e) { sp.fail(i, e.message); toast('Drill stopped: ' + e.message, 'bad', 7000); }
+  });
+}
+function drillTamper() {
+  return drillGuard(async () => {
+    const nid = +$('#d2Node').value;
+    const name = 'OS-' + nid;
+    const ok = await confirmBox('Plant a rogue row on ' + name + '?', 'The drill writes "hacked.backdoor" to ' + name + ' only, bypassing the controller. Expected result: the majority vote catches it, ' + name + ' is rebuilt from its peers plus the WAL, then emergency-morphed.', 'Run the drill', true);
+    if (!ok) return;
+    const sp = stepper($('#d2Steps'), ['Inject the rogue row on ' + name + ' only', 'Majority vote spots the mismatch', name + ' is isolated and rebuilt', 'Emergency re-morph completes', 'Check the rogue row is gone']);
+    let i = 0;
+    try {
+      const before = nodeOf(S.data, nid).morph_count;
+      const evMark = S.events.length;
+      sp.run(i); if (!(await action('/api/tamper/' + nid))) throw new Error('tamper refused'); sp.ok(i++);
+      sp.run(i);
+      await waitFor(() => S.events.slice(evMark).some(e => e.level === 'ALERT' && e.nid === nid) || nodeOf(S.data, nid).state !== 'ONLINE', 30000);
+      sp.ok(i++, 'outvoted 2–1');
+      sp.run(i);
+      await waitFor(() => S.events.slice(evMark).some(e => e.level === 'HEAL' && e.nid === nid) || nodeOf(S.data, nid).morph_count > before, 60000);
+      sp.ok(i++, 'XOR parity + WAL');
+      sp.run(i, 'booting new binary…');
+      await waitFor(() => { const n = nodeOf(S.data, nid); return n.state === 'ONLINE' && n.morph_count > before; }, 120000);
+      sp.ok(i++, 'sha ' + nodeOf(S.data, nid).elf_sha256.slice(0, 10) + '…');
+      sp.run(i);
+      const r = await runOp('Drill verify', '/api/sql', 'SELECT * FROM kv', { viz: vizFlows.read });
+      const mine = r && r.per_node ? r.per_node[nodeOf(S.data, nid).name] || '' : '';
+      if (mine.includes('pwned')) throw new Error('rogue row still on ' + name);
+      sp.ok(i, 'clean on ' + name);
+      toast('Drill passed: ' + name + ' was outvoted, healed and re-morphed. 🛡️', 'party', 7000);
+    } catch (e) { sp.fail(i, e.message); toast('Drill stopped: ' + e.message, 'bad', 7000); }
+  });
+}
+
+/* ======================================================================
+   fireworks
+   ====================================================================== */
+const FW = { cv: $('#fw'), parts: [], rockets: [], flashes: [], running: false, w: 0, h: 0, dpr: 1 };
+FW.ctx = FW.cv.getContext('2d');
+function fwSize() { FW.dpr = Math.min(2, devicePixelRatio || 1); FW.w = innerWidth; FW.h = innerHeight; FW.cv.width = Math.round(FW.w * FW.dpr); FW.cv.height = Math.round(FW.h * FW.dpr); }
+addEventListener('resize', fwSize); fwSize();
+const GRAV = 0.06;
+function rocket(x, y, hue, kind = 'peony') {
+  if (REDUCED) { explode(x, y, hue, kind); return; }
+  const sx = x + (Math.random() - 0.5) * 140, sy = FW.h + 10;
+  const rise = Math.max(60, sy - y);
+  const vy = -Math.sqrt(2 * 0.12 * rise), tA = -vy / 0.12;
+  FW.rockets.push({ x: sx, y: sy, vx: (x - sx) / tA, vy, hue, kind, trail: [] });
+  fwStart();
+}
+function explode(x, y, hue, kind) {
+  const N = REDUCED ? 36 : kind === 'heart' ? 120 : kind === 'ring' ? 90 : 140;
+  for (let i = 0; i < N; i++) {
+    let vx, vy;
+    if (kind === 'heart') {
+      const t = i / N * Math.PI * 2, k = 0.21 * (0.9 + Math.random() * 0.2);
+      vx = 16 * Math.sin(t) ** 3 * k;
+      vy = -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t)) * k;
+    } else if (kind === 'ring') {
+      const a = i / N * Math.PI * 2; vx = Math.cos(a) * 4.4; vy = Math.sin(a) * 4.4;
+    } else {
+      const a = Math.random() * Math.PI * 2, sp = Math.sqrt(Math.random()) * 5.4; vx = Math.cos(a) * sp; vy = Math.sin(a) * sp;
+    }
+    FW.parts.push({ x, y, px: x, py: y, vx, vy, life: 0, max: 55 + Math.random() * 45, hue: hue + (Math.random() - 0.5) * 34, sparkle: Math.random() < 0.3, g: kind === 'heart' ? 0.35 : 1 });
+  }
+  FW.flashes.push({ x, y, life: 0, hue });
+  fwStart();
+}
+function fwStart() { if (!FW.running) { FW.running = true; requestAnimationFrame(fwLoop); } }
+function fwLoop() {
+  const c = FW.ctx;
+  c.setTransform(FW.dpr, 0, 0, FW.dpr, 0, 0);
+  c.clearRect(0, 0, FW.w, FW.h);
+  c.globalCompositeOperation = 'lighter';
+  for (let i = FW.rockets.length - 1; i >= 0; i--) {
+    const r = FW.rockets[i];
+    r.trail.push([r.x, r.y]); if (r.trail.length > 10) r.trail.shift();
+    r.x += r.vx; r.y += r.vy; r.vy += 0.12;
+    c.beginPath(); r.trail.forEach(([x, y], j) => (j ? c.lineTo(x, y) : c.moveTo(x, y))); c.lineTo(r.x, r.y);
+    c.strokeStyle = `hsla(${r.hue},100%,75%,.85)`; c.lineWidth = 2; c.stroke();
+    if (r.vy >= -0.4) { explode(r.x, r.y, r.hue, r.kind); FW.rockets.splice(i, 1); }
+  }
+  for (let i = FW.flashes.length - 1; i >= 0; i--) {
+    const f = FW.flashes[i]; f.life++;
+    const a = 1 - f.life / 14; if (a <= 0) { FW.flashes.splice(i, 1); continue; }
+    const g = c.createRadialGradient(f.x, f.y, 0, f.x, f.y, 90);
+    g.addColorStop(0, `hsla(${f.hue},100%,80%,${0.45 * a})`); g.addColorStop(1, `hsla(${f.hue},100%,60%,0)`);
+    c.fillStyle = g; c.fillRect(f.x - 90, f.y - 90, 180, 180);
+  }
+  for (let i = FW.parts.length - 1; i >= 0; i--) {
+    const p = FW.parts[i];
+    p.px = p.x; p.py = p.y;
+    p.vx *= 0.975; p.vy = p.vy * 0.975 + GRAV * p.g;
+    p.x += p.vx; p.y += p.vy; p.life++;
+    if (p.life > p.max) { FW.parts.splice(i, 1); continue; }
+    const a = 1 - p.life / p.max;
+    if (p.sparkle && Math.random() < 0.35) continue;
+    c.strokeStyle = `hsla(${p.hue},100%,${60 + 25 * a}%,${a})`;
+    c.lineWidth = 2.2;
+    c.beginPath(); c.moveTo(p.px, p.py); c.lineTo(p.x, p.y); c.stroke();
+  }
+  c.globalCompositeOperation = 'source-over';
+  if (FW.parts.length || FW.rockets.length || FW.flashes.length) requestAnimationFrame(fwLoop);
+  else { FW.running = false; c.clearRect(0, 0, FW.w, FW.h); }
+}
+function celebrateAt(pos, hue, kind = 'heart', n = 1) {
+  for (let i = 0; i < n; i++) setTimeout(() => rocket(pos.x + (i ? (Math.random() - 0.5) * 160 : 0), pos.y - 40 - (i ? Math.random() * 60 : 0), hue + i * 40, i ? 'peony' : kind), i * 320);
+}
+function finale(title, sub) {
+  if (!S.fireworks) return;
+  const b = h('div', { class: 'banner' }, title, h('small', { text: sub || '' }));
+  document.body.append(b); setTimeout(() => b.remove(), 3700);
+  const kinds = ['heart', 'peony', 'ring', 'peony'];
+  const shots = REDUCED ? 4 : 16;
+  for (let i = 0; i < shots; i++) {
+    setTimeout(() => rocket(FW.w * (0.12 + Math.random() * 0.76), FW.h * (0.15 + Math.random() * 0.3), [158, 292, 192, 48, 340][i % 5], kinds[i % kinds.length]), i * 210);
+  }
+}
+function nodePos(id) {
+  let el = null;
+  if (S.tab === 'cycle') el = document.querySelector('#vn-' + id + ' .ring');
+  else if (S.tab === 'overview') el = nodeCards[id];
+  if (el) { const r = el.getBoundingClientRect(); if (r.width && r.bottom > 0 && r.top < innerHeight) return { x: r.left + r.width / 2, y: r.top + Math.min(r.height / 2, 120) }; }
+  return { x: innerWidth * (0.25 + 0.25 * (id - 1)), y: innerHeight * 0.32 };
+}
+
+/* ======================================================================
+   fleet mode: sign-in, breadcrumbs, clients grid, farm view
+   ====================================================================== */
+const ROLE_DESC = { wfe: 'svc-http only', sql: 'svc-sql only', shell: 'svc-sh only', full: 'http + sql + sh' };
+const FSTATUS = { running: '#2ee6a8', booting: '#a78bfa', starting: '#a78bfa', stopping: '#fbbf24', stopped: '#64748b', error: '#fb7185', unreachable: '#fb7185' };
+const fmtRate = x => (x >= 100 ? String(Math.round(x)) : (x || 0).toFixed(1));
+const fmtDur = sec => (sec >= 3600 ? Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm' : sec >= 60 ? Math.floor(sec / 60) + 'm ' + (sec % 60) + 's' : sec + 's');
+
+function showView(v) {
+  for (const id of ['login', 'clients', 'farm']) $('#view-' + id).hidden = v !== id;
+  const triad = v === 'triad';
+  $('.tabs').hidden = !triad;
+  if (triad) setTab(S.tab);
+  else $$('.tpanel').forEach(p => { p.hidden = true; });
+}
+
+async function enterFleet() {
+  $('#brandName').textContent = 'CUTTLE FLEET';
+  if (!S.unlocked) {
+    $('#brandSub').textContent = 'Sign in to continue';
+    renderCrumbs(); showView('login'); renderLive();
+    setTimeout(() => $('#loginTok').focus(), 50);
+    return;
+  }
+  $('#brandSub').textContent = S.scope === 'provider' ? 'Provider console' : 'Client console';
+  if (S.scope === 'client' && CLIENT !== S.scopeClient) { location.replace(fleetUrl(S.scopeClient)); return; }
+  showView(VIEW);
+  await pollFleet(); // client and job names for the breadcrumbs, and the first render
+}
+
+async function pollFleet() {
+  try {
+    const r = await fetch('/api/fleet', { cache: 'no-store', headers: authHeaders() });
+    if (r.status === 401) { lockOut('Your token is no longer valid. The provider may have restarted.'); return; }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    S.fleet = await r.json();
+    S.lastOk = Date.now(); S.fails = 0; S.live = true; S.fleetPolls++;
+    renderCrumbs();
+    if (VIEW === 'clients') renderClients(S.fleet);
+    else if (VIEW === 'farm') renderFarm(S.fleet);
+    fleetCelebrations(S.fleet);
+  } catch {
+    S.fails++;
+    if (S.fails >= 3) S.live = false;
+  }
+  renderLive();
+}
+
+function renderCrumbs() {
+  const nav = $('#crumbs');
+  nav.hidden = !FLEET || !S.unlocked;
+  if (nav.hidden) return;
+  const cl = S.fleet && S.fleet.clients.find(c => c.id === CLIENT);
+  const parts = [];
+  if (S.scope === 'provider') parts.push(['All clients', VIEW === 'clients' ? null : fleetUrl()]);
+  if (CLIENT) parts.push([(cl && cl.name) || CLIENT, JOB ? fleetUrl(CLIENT) : null]);
+  if (JOB) parts.push([(S.fleet && S.fleet.jobs[JOB] && S.fleet.jobs[JOB].label) || JOB, null]);
+  nav.replaceChildren();
+  parts.forEach(([label, href], i) => {
+    if (i) nav.append(h('i', { text: '›' }));
+    nav.append(href ? h('a', { href, text: label }) : h('span', { text: label }));
+  });
+}
+
+function farmStats(c) {
+  const ts = (c.farm && c.farm.triads) || [];
+  const sum = f => ts.reduce((a, t) => a + (f(t) || 0), 0);
+  const len = Math.max(0, ...ts.map(t => ((t.history && t.history.reqs_rate) || []).length));
+  const hist = Array.from({ length: len }, (_, i) => ts.reduce((a, t) => {
+    const series = (t.history && t.history.reqs_rate) || [];
+    return a + (series[series.length - len + i] || 0);
+  }, 0));
+  return {
+    triads: c.jobs.length,
+    vmsTotal: c.jobs.length * 3,
+    vmsOnline: sum(t => t.online),
+    rate: sum(t => t.kpi && t.kpi.reqs_rate),
+    alerts: sum(t => t.alerts),
+    morphs: sum(t => t.morphs),
+    healthy: ts.filter(t => t.online === 3 && t.parity_ok).length,
+    worst: ts.length ? Math.min(...ts.map(t => t.online)) : 0,
+    hist,
+  };
+}
+function fleetTotals(f) {
+  const tot = { clients: f.clients.length, running: 0, triads: 0, healthy: 0, vmsOnline: 0, vmsTotal: 0, rate: 0, alerts: 0, morphs: 0 };
+  for (const c of f.clients) {
+    const fs = farmStats(c);
+    if (c.status === 'running') tot.running++;
+    for (const k of ['triads', 'healthy', 'vmsOnline', 'vmsTotal', 'rate', 'alerts', 'morphs']) tot[k] += fs[k];
+  }
+  return tot;
+}
+const healthColor = (online, parityOk) => (online === 3 && parityOk !== false ? '#2ee6a8' : online === 2 ? '#fbbf24' : '#fb7185');
+function clientColor(c, fs) {
+  if (c.status !== 'running') return FSTATUS[c.status] || '#64748b';
+  return fs.worst === 3 && !fs.alerts ? '#2ee6a8' : fs.worst >= 2 ? '#fbbf24' : '#fb7185';
+}
+
+function spark(values, color) {
+  const W = 300, H = 36;
+  const svg = s('svg', { viewBox: '0 0 ' + W + ' ' + H, preserveAspectRatio: 'none', class: 'spark', 'aria-hidden': 'true' });
+  const v = values.length > 1 ? values : [0, ...(values.length ? values : [0])];
+  const max = Math.max(1e-9, ...v);
+  const line = v.map((y, i) => (i / (v.length - 1) * W).toFixed(1) + ',' + (H - 3 - (y / max) * (H - 8)).toFixed(1)).join(' ');
+  svg.append(s('polygon', { points: '0,' + H + ' ' + line + ' ' + W + ',' + H, fill: color, opacity: '0.12' }));
+  svg.append(s('polyline', { points: line, fill: 'none', stroke: color, 'stroke-width': '2', 'vector-effect': 'non-scaling-stroke' }));
+  return svg;
+}
+
+function renderClients(f) {
+  const t = fleetTotals(f);
+  const kpi = (label, value, sub, cls) => h('div', { class: 'card' }, h('div', { class: 'kpi-l', text: label }), h('div', { class: 'kpi-v' + (cls ? ' ' + cls : ''), text: value }), h('div', { class: 'kpi-s', text: sub }));
+  $('#fleetKpis').replaceChildren(
+    kpi('Clients', t.running + '/' + t.clients, 'farms running', t.running === t.clients ? 'ok' : ''),
+    kpi('Triads', t.healthy + '/' + t.triads, 'healthy: 3/3 and vote agrees', t.healthy === t.triads ? 'ok' : ''),
+    kpi('VMs', t.vmsOnline + '/' + t.vmsTotal, 'online right now', t.vmsOnline === t.vmsTotal ? 'ok' : ''),
+    kpi('Requests', fmtRate(t.rate) + '/s', 'across every client'),
+    kpi('Morphs', String(t.morphs), 'kernel binaries rotated'),
+    kpi('Alerts', String(t.alerts), 'recent TMR alerts and errors', t.alerts ? 'bad' : 'ok'));
+  $('#clientGrid').replaceChildren(...f.clients.map(clientCard));
+}
+
+function clientCard(c) {
+  const fs = farmStats(c);
+  const color = clientColor(c, fs);
+  const byJob = Object.fromEntries(((c.farm && c.farm.triads) || []).map(t => [t.job, t]));
+  const card = h('article', { class: 'card ccard', style: '--c:' + color, 'data-cid': c.id, tabindex: '0', role: 'link', 'aria-label': 'Open ' + c.name },
+    h('div', { class: 'row', style: 'justify-content:space-between;align-items:flex-start' },
+      h('div', {}, h('h3', { text: c.name }), h('div', { class: 'sub', text: c.id + ' · ' + fs.triads + ' triads · ' + fs.vmsTotal + ' VMs' })),
+      h('span', { class: 'plan ' + c.plan, text: c.plan_label })),
+    h('div', { class: 'row', style: 'margin-top:8px' },
+      h('span', { class: 'fstatus', style: '--c:' + (FSTATUS[c.status] || '#64748b'), text: c.status }),
+      c.farm && c.farm.load ? h('span', { class: 'synth', text: 'synthetic load' }) : null,
+      c.farm ? h('span', { class: 'sub', text: 'up ' + fmtDur(c.farm.uptime_s) }) : null),
+    h('div', { class: 'tchips' }, ...c.jobs.map(j => {
+      const t = byJob[j];
+      const tcol = t ? healthColor(t.online, t.parity_ok) : FSTATUS[c.status] || '#64748b';
+      return h('span', { class: 'tchip', style: '--c:' + tcol, title: t ? t.quorum_status : c.status },
+        h('i'), (S.fleet.jobs[j] || {}).label || j, h('small', { text: t ? t.online + '/3' : '–' }));
+    })),
+    h('div', { class: 'cstats' },
+      h('div', {}, h('b', { text: fs.vmsOnline + '/' + fs.vmsTotal }), h('span', { text: 'VMs online' })),
+      h('div', {}, h('b', { text: fmtRate(fs.rate) }), h('span', { text: 'req/s' })),
+      h('div', {}, h('b', { text: String(fs.alerts), style: fs.alerts ? 'color:var(--bad)' : null }), h('span', { text: 'alerts' }))),
+    spark(fs.hist, color),
+    h('div', { class: 'cfoot' }, ...providerFarmButtons(c), h('span', { class: 'sp' }), h('a', { class: 'link', href: fleetUrl(c.id), text: 'Open farm ›' })));
+  card.addEventListener('click', e => { if (!e.target.closest('button,a')) location.href = fleetUrl(c.id); });
+  card.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target === card) location.href = fleetUrl(c.id); });
+  return card;
+}
+
+function providerFarmButtons(c) {
+  if (S.scope !== 'provider') return [];
+  const up = !['stopped', 'error'].includes(c.status);
+  const btns = [h('button', { class: 'btn sm ' + (up ? 'danger' : 'primary'), text: up ? 'Stop' : 'Start', onclick: e => { e.stopPropagation(); farmAction(c, up ? 'stop' : 'start'); } })];
+  if (c.farm) btns.push(h('button', { class: 'btn sm', text: 'Load: ' + (c.farm.load ? 'on' : 'off'), title: 'Toggle labelled synthetic traffic for this client', onclick: e => { e.stopPropagation(); farmAction(c, 'load'); } }));
+  return btns;
+}
+async function farmAction(c, act) {
+  if (act === 'stop' && !(await confirmBox('Stop ' + c.name + '’s farm?', 'Shuts down all ' + c.jobs.length * 3 + ' VMs of this client. Its disks, WALs and keys are kept, and Start brings the farm back.', 'Stop farm', true))) return;
+  const { status, j } = await post('/api/c/' + c.id + '/' + act, '', true);
+  if (status === 200) toast(act === 'load' ? c.name + ': synthetic load ' + (j.load ? 'on' : 'off') + '.' : c.name + ': ' + (act === 'stop' ? 'stopping…' : 'starting…'), 'ok');
+  else if (status !== 401) toast('Refused: ' + (j.error || 'HTTP ' + status), 'bad');
+  pollFleet();
+}
+
+function renderFarm(f) {
+  const c = f.clients.find(x => x.id === CLIENT);
+  if (!c) { $('#farmHead').replaceChildren(h('div', { class: 'empty', text: 'Unknown client.' })); $('#triadGrid').replaceChildren(); return; }
+  const fs = farmStats(c);
+  $('#farmHead').replaceChildren(
+    h('div', {}, h('h2', { text: c.name }), h('div', { class: 'muted', style: 'font-size:12px', text: c.id + ' · ' + fs.triads + ' triads · ' + fs.vmsTotal + ' VMs · own keys, WALs, ports and process' })),
+    h('span', { class: 'plan ' + c.plan, text: c.plan_label }),
+    h('span', { class: 'fstatus', style: '--c:' + (FSTATUS[c.status] || '#64748b'), text: c.status }),
+    c.farm && c.farm.load ? h('span', { class: 'synth', text: 'synthetic load' }) : null,
+    h('span', { class: 'sp' }),
+    ...providerFarmButtons(c));
+  const triads = (c.farm && c.farm.triads) || [];
+  if (!triads.length) {
+    $('#triadGrid').replaceChildren(h('div', { class: 'card empty', text: c.status === 'running' ? 'No Triads reported yet.' : 'Farm is ' + c.status + '…' }));
+    return;
+  }
+  $('#triadGrid').replaceChildren(...triads.map(t => triadCard(c, t)));
+}
+
+function triadKpis(t) {
+  const k = t.kpi || {};
+  const tile = (v, label) => h('div', {}, h('b', { text: v == null ? '–' : String(v) }), h('span', { text: label }));
+  const rate = k.reqs_rate == null ? null : fmtRate(k.reqs_rate);
+  if (t.job === 'web') return [tile(rate, 'http req/s'), tile(k.reqs_total, 'http requests'), tile(k.denials, 'denials')];
+  if (t.job === 'index') return [tile(rate, 'sql req/s'), tile(k.index_rows, 'index rows'), tile('#' + t.tx_seq, 'WAL tx')];
+  if (t.job === 'cron') return [tile(k.cron_active, 'jobs active'), tile(k.cron_runs, 'job runs'), tile(rate, 'sh req/s')];
+  if (t.has_sql) return [tile(rate, 'sql req/s'), tile(k.rows, 'kv rows'), tile('#' + t.tx_seq, 'WAL tx')];
+  return [tile(rate, 'req/s'), tile(k.reqs_total, 'requests'), tile(k.denials, 'denials')];
+}
+
+function triadCard(c, t) {
+  const color = healthColor(t.online, t.parity_ok);
+  return h('article', { class: 'card tcard', style: '--c:' + color, 'data-job': t.job },
+    h('div', { class: 'card-h', style: 'margin-bottom:4px' }, h('h3', { text: t.label }), h('span', { class: 'sp' }), h('span', { class: 'badge', style: '--c:' + color, text: t.online + '/3' })),
+    h('div', { class: 'role', text: 'kernel role ' + t.role + ' · ' + (ROLE_DESC[t.role] || '') + ' · ' + t.morphs + ' morphs' }),
+    h('div', { class: 'hearts3' }, ...t.nodes.map(n => {
+      const sx = st(n.state);
+      return h('div', { style: '--c:' + sx.hex, title: n.name + ' · ' + sx.label + ' · binary ' + n.elf }, heartSvg(sx.hex), h('small', { text: 'OS-' + n.node_id + ' · ' + sx.label }));
+    })),
+    h('div', { class: 'q' + (!t.parity_ok ? ' bad' : t.online < 3 ? ' warn' : ''), text: t.quorum_status || '' }),
+    h('div', { class: 'cstats' }, ...triadKpis(t)),
+    spark((t.history && t.history.reqs_rate) || [], color),
+    h('div', { class: 'lastev', text: t.last_event ? t.last_event.ts + ' · ' + t.last_event.level + ' · ' + t.last_event.msg : 'No events yet.' }),
+    h('div', { class: 'cfoot' },
+      h('button', { class: 'btn sm magenta', text: '🌊 Rolling wave', disabled: t.online < 3 ? true : null, onclick: () => triadWave(c, t) }),
+      h('span', { class: 'sp' }),
+      h('a', { class: 'link', href: fleetUrl(c.id, t.job), text: 'Open triad ›' })));
+}
+async function triadWave(c, t) {
+  if (!(await confirmBox('Rolling wave on ' + c.name + ' · ' + t.label + '?', 'Morphs this Triad’s three nodes one after another. The other two keep the 2/3 majority throughout.', 'Start the wave'))) return;
+  const { status, j } = await post('/api/c/' + c.id + '/t/' + t.job + '/api/rolling_wave', '', true);
+  if (status === 200) toast('Rolling wave started on ' + c.name + ' · ' + t.label + '.', 'ok');
+  else if (status !== 401) toast('Refused: ' + (j.error || 'HTTP ' + status), 'bad');
+}
+
+function fleetCelebrations(f) {
+  if (VIEW === 'triad') return;
+  const first = S.fleetPolls <= 1;
+  for (const c of f.clients) {
+    for (const t of (c.farm && c.farm.triads) || []) {
+      const key = c.id + '/' + t.job;
+      const prev = S.fleetPrev[key];
+      S.fleetPrev[key] = { morphs: t.morphs, online: t.online };
+      if (first || !prev || !S.fireworks || !(t.morphs > prev.morphs && t.online === 3)) continue;
+      const now = Date.now();
+      if (now - (S.lastBurst[key] || 0) < 2500) continue;
+      S.lastBurst[key] = now;
+      const el = document.querySelector(VIEW === 'clients' ? '.ccard[data-cid="' + c.id + '"]' : '.tcard[data-job="' + t.job + '"]');
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.bottom > 0 && r.top < innerHeight) rocket(r.left + r.width / 2, Math.max(60, r.top + 30), [158, 292, 192, 48][key.length % 4], 'heart');
+    }
+  }
+  const tot = fleetTotals(f);
+  if (!S.fleetWelcomed && tot.vmsTotal && tot.vmsOnline === tot.vmsTotal && f.clients.every(c => c.status === 'running')) {
+    S.fleetWelcomed = true;
+    finale(tot.vmsOnline + ' HEARTS BEATING', f.clients.length + ' clients · ' + tot.triads + ' triads · every farm isolated');
+  }
+}
+
+/* ======================================================================
+   tabs & frame loop
+   ====================================================================== */
+function setTab(name) {
+  if (!document.getElementById('tab-' + name)) name = 'overview';
+  if (S.tab !== name) window.scrollTo(0, 0);
+  S.tab = name;
+  if (VIEW !== 'triad' || (FLEET && !S.unlocked)) return;
+  $$('[role=tab]').forEach(b => b.setAttribute('aria-selected', String(b.dataset.tab === name)));
+  $$('.tpanel').forEach(p => { p.hidden = p.id !== 'tab-' + name; });
+  if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
+  store.set('triad_tab', name);
+  if (S.data) render([], false);
+  if (name === 'log') renderLog();
+}
+
+let lastTimeline = 0, lastScramble = 0;
+function frame(now) {
+  for (const e of ECGS) e.frame(now);
+  if (S.tab === 'cycle') {
+    stepFlows(now);
+    for (const m of $$('.mini-ecg canvas')) m._ecg && m._ecg.frame(now);
+    if (now - lastScramble > 70 && S.data) {
+      lastScramble = now;
+      for (const n of S.data.nodes) if (n.state === 'MORPHING') V['hash' + n.node_id].textContent = 'sha ' + scrambleHex(12);
+    }
+    const a = autoInfo(S.data);
+    V.cdArc.setAttribute('d', a.on && a.secs != null ? arcPath(82, a.frac) : a.on ? arcPath(82, 0.02) : '');
+    V.cdArc.style.opacity = a.on ? 1 : 0;
+    if (now - lastTimeline > 500) { lastTimeline = now; drawTimeline(); }
+  } else if (FLOWS.length) {
+    for (const f of FLOWS) { if (f.el) f.el.remove(); if (f.tl) f.tl.remove(); }
+    FLOWS.length = 0;
+  }
+  requestAnimationFrame(frame);
+}
+function buildMiniEcgs() {
+  const wrap = $('#miniEcgs');
+  for (const id of [1, 2, 3]) {
+    const cv = h('canvas', { 'aria-hidden': 'true' });
+    const stEl = h('span', { class: 'st', 'data-nid': id });
+    wrap.append(h('div', { class: 'mini-ecg' }, h('b', { text: 'OS-' + id }), cv, stEl));
+    cv._ecg = new ECG(cv, id);
+  }
+  setInterval(() => {
+    if (!S.data) return;
+    for (const el of $$('.mini-ecg .st')) {
+      const n = nodeOf(S.data, +el.dataset.nid); if (!n) continue;
+      const sx = st(n.state); el.textContent = sx.label.toUpperCase(); el.style.setProperty('--c', sx.hex);
+    }
+  }, 500);
+}
+
+/* ======================================================================
+   wiring
+   ====================================================================== */
+function wire() {
+  $$('[role=tab]').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));
+  document.addEventListener('click', e => { const g = e.target.closest('[data-goto]'); if (g) setTab(g.dataset.goto); });
+  addEventListener('hashchange', () => setTab(location.hash.slice(1)));
+
+  $('#lockBtn').addEventListener('click', openConnect);
+  $('#introConnect').addEventListener('click', openConnect);
+  $('#tokGo').addEventListener('click', tryToken);
+  $('#tokIn').addEventListener('keydown', e => { if (e.key === 'Enter') tryToken(); });
+  $('#tokClose').addEventListener('click', () => $('#dlgConnect').close());
+  $('#tokForget').addEventListener('click', () => {
+    store.del(TOKEN_KEY); S.token = ''; setUnlocked(false); $('#dlgConnect').close();
+    toast(FLEET ? 'Signed out on this browser.' : 'Token forgotten on this browser.');
+    if (FLEET) enterFleet();
+  });
+  $('#loginGo').addEventListener('click', () => tryToken('#loginTok', '#loginMsg'));
+  $('#loginTok').addEventListener('keydown', e => { if (e.key === 'Enter') tryToken('#loginTok', '#loginMsg'); });
+
+  $('#fwBtn').addEventListener('click', () => { const was = S.fireworks; S.fireworks = true; finale('THREE HEARTS · ONE APPLIANCE', 'cuttle triad'); S.fireworks = was; });
+  const fwT = $('#fwToggle'); fwT.checked = S.fireworks;
+  fwT.addEventListener('change', () => { S.fireworks = fwT.checked; store.set('triad_fw', S.fireworks ? '1' : '0'); });
+
+  const sp = $('#sqlPresets');
+  for (const q of SQL_PRESETS) sp.append(h('button', { class: 'chip', text: q, onclick: () => { $('#sqlIn').value = q; $('#sqlIn').focus(); } }));
+  $('#sqlRun').addEventListener('click', runSql);
+  $('#sqlIn').addEventListener('keydown', e => { if (e.key === 'Enter') runSql(); });
+  const shp = $('#shPresets');
+  for (const c of SH_PRESETS) shp.append(h('button', { class: 'chip', text: c, onclick: () => { $('#shIn').value = c; runSh(); } }));
+  $('#shRun').addEventListener('click', runSh);
+  $('#shIn').addEventListener('keydown', e => { if (e.key === 'Enter') runSh(); });
+  $$('[data-vault]').forEach(b => b.addEventListener('click', () => vaultOp(b.dataset.vault)));
+  $$('[data-app]').forEach(b => b.addEventListener('click', () => {
+    const cmd = b.dataset.app, path = '/api/' + cmd.split(' ')[0];
+    runOp(titleCase(cmd), path, cmd, {
+      confirm: b.dataset.confirm === 'lockdown' ? ['Lock down all three nodes?', 'Guard lockdown tightens the security posture on every online node at once. Use Unlock to return to normal.', 'Lock down', true] : null,
+    });
+  }));
+  $('#cAdd').addEventListener('click', () => {
+    const t = parseInt($('#cTicks').value, 10), c = $('#cCmd').value.trim();
+    if (!(t > 0) || !c) { toast('Enter ticks (> 0) and a command.', 'warn'); return; }
+    runOp('Cron add', '/api/cron', 'cron add ' + t + ' ' + c);
+  });
+  $('#cDelBtn').addEventListener('click', () => {
+    const id = $('#cDel').value.trim(); if (!/^\d+$/.test(id)) { toast('Enter a job id.', 'warn'); return; }
+    runOp('Cron delete', '/api/cron', 'cron del ' + id);
+  });
+
+  const mb = $('#morphBtns');
+  for (const id of [1, 2, 3]) mb.append(h('button', { class: 'btn magenta', 'data-morph': id, text: '🧬 Morph OS-' + id }));
+  document.addEventListener('click', async e => {
+    const b = e.target.closest('[data-morph]'); if (!b || b.disabled) return;
+    const id = +b.dataset.morph;
+    if (await action('/api/morph/' + id, 'Morph started for OS-' + id + '. Watch the Live Cycle tab.')) vizFx.morphStart(id);
+  });
+  const wave = async () => {
+    const ok = await confirmBox('Start a rolling wave?', 'Morphs OS-1, then OS-2, then OS-3, one at a time (about a minute or two in total). The appliance keeps a 2/3 majority throughout. Fireworks when all three are reborn.', 'Start the wave');
+    if (ok && await action('/api/rolling_wave', 'Rolling wave started.')) { S.wave.clear(); S.waveT0 = Date.now(); S.waveUntil = Date.now() + 3 * 60 * 1000; setTab('cycle'); }
+  };
+  $('#waveBtn').addEventListener('click', wave);
+  $('#cWave').addEventListener('click', wave);
+  const toggleAuto = async () => { const j = await action('/api/toggle_auto'); if (j) toast('Auto-morph ' + (j.auto_morph ? 'ON: one node every 45 s, round-robin.' : 'OFF.'), j.auto_morph ? 'ok' : 'info'); };
+  $('#autoBtn').addEventListener('click', toggleAuto);
+  $('#cAuto').addEventListener('click', toggleAuto);
+  $('#d1Run').addEventListener('click', drillZeroDowntime);
+  $('#d2Run').addEventListener('click', drillTamper);
+
+  $('#logSearch').addEventListener('input', e => { S.logQuery = e.target.value; renderLog(); });
+}
+
+buildStage();
+buildLegend();
+buildLogFilters();
+buildMiniEcgs();
+wire();
+if (FLEET) {
+  // Show nothing until the token check decides between sign-in, clients, farm or Triad view.
+  $$('.tpanel').forEach(p => { p.hidden = true; });
+  $('.tabs').hidden = true;
+  $('#lockBtn').textContent = '🔒 Sign in';
+  $('#brandName').textContent = 'CUTTLE FLEET';
+  document.title = 'Cuttle Fleet Console';
+}
+setTab((location.hash || '').slice(1) || store.get('triad_tab', 'overview'));
+restoreToken();
+poll();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

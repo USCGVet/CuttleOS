@@ -57,6 +57,8 @@ BASE_ELF = (
 BASE_BIOS = IMAGES_DIR / "run_bios.img"
 BINMORPH_EXE = ROOT / "target" / "release" / "binmorph.exe"
 DEVICE_KEY = ROOT / "device_secret_key.bin"
+# Tabbed live operations console served at /console (static page; actions use the operator token).
+CONSOLE_HTML = ROOT / "tools" / "triad_console.html"
 
 # AHCI SQL partition layout (LBA 1058..1065 = 8 sectors = 4096 bytes)
 SQL_PART_OFFSET = 1058 * 512
@@ -1708,6 +1710,14 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         if base_path in ("/", "/app", "/dashboard", "/triad"):
             return self._send_text(200, "text/html; charset=utf-8", DASHBOARD_HTML)
 
+        if base_path == "/console":
+            # Read per request so the page can be edited without restarting the Triad.
+            try:
+                page = CONSOLE_HTML.read_text(encoding="utf-8")
+            except OSError:
+                return self._send_text(404, "text/plain", "console page not found\n")
+            return self._send_text(200, "text/html; charset=utf-8", page)
+
         if base_path == "/api/triad":
             c = self.ctrl
             data = {
@@ -1794,6 +1804,10 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                 401,
                 {"ok": False, "error": "unauthorized: provide valid X-Cuttle-Session or Authorization: Bearer token"},
             )
+
+        if self.path == "/api/whoami":
+            # Side-effect-free token check for the /console page's Connect dialog.
+            return self._send_json(200, {"ok": True, "role": "operator"})
 
         if self.path in ("/api/sql", "/sql"):
             if not is_printable_ascii_command(body):
@@ -1971,6 +1985,32 @@ def main():
                     raise AssertionError("Backspace-injected POST /api/sql must be refused with 400")
                 except urllib.error.HTTPError as e:
                     assert e.code == 400, f"Expected 400 on backspace-injected POST /api/sql, got {e.code}"
+
+                # 3-console. The /console page is served without credentials but must never embed
+                # the operator token, and its actions stay behind auth (unauthenticated POSTs above are 401).
+                with urllib.request.urlopen(f"http://127.0.0.1:{test_port}/console", timeout=5.0) as resp:
+                    assert resp.status == 200, f"Expected 200 on GET /console, got {resp.status}"
+                    console_page = resp.read().decode("utf-8")
+                assert "Cuttle Triad Console" in console_page, "GET /console did not serve the console page"
+                assert ctrl.coordinator_token not in console_page, "GET /console must not embed the operator token"
+                for unauth_path in ("/api/whoami", "/api/morph/1", "/api/tamper/1", "/api/toggle_auto", "/api/rolling_wave"):
+                    try:
+                        urllib.request.urlopen(
+                            urllib.request.Request(f"http://127.0.0.1:{test_port}{unauth_path}", data=b"", method="POST"),
+                            timeout=5.0,
+                        )
+                        raise AssertionError(f"Unauthenticated POST {unauth_path} must be refused with 401")
+                    except urllib.error.HTTPError as e:
+                        assert e.code == 401, f"Expected 401 on unauthenticated POST {unauth_path}, got {e.code}"
+                whoami_req = urllib.request.Request(
+                    f"http://127.0.0.1:{test_port}/api/whoami",
+                    data=b"",
+                    headers={"X-Cuttle-Session": ctrl.coordinator_token},
+                    method="POST",
+                )
+                with urllib.request.urlopen(whoami_req, timeout=5.0) as resp:
+                    assert resp.status == 200, f"Expected 200 on authenticated POST /api/whoami, got {resp.status}"
+                    assert json.loads(resp.read().decode("utf-8")).get("ok") is True
 
                 auth_req = urllib.request.Request(
                     f"http://127.0.0.1:{test_port}/api/sql",
@@ -2229,6 +2269,7 @@ def main():
     print("\n============================================================================", flush=True)
     print(f"  CUTTLE 3-AS-1 TRIAD APPLIANCE ONLINE!", flush=True)
     print(f"  Unified Command Center : http://127.0.0.1:{args.port}/app", flush=True)
+    print(f"  Live Ops Console       : http://127.0.0.1:{args.port}/console", flush=True)
     print(f"  Operator Session Token : {ctrl.coordinator_token} (saved to triad/operator_token.txt)", flush=True)
     print(f"  Unified SQL Endpoint   : POST http://127.0.0.1:{args.port}/api/sql (with X-Cuttle-Session header)", flush=True)
     print(f"  Individual OS Ports    : OS-1 :18101 | OS-2 :18102 | OS-3 (Parity) :18103", flush=True)

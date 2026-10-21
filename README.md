@@ -152,7 +152,23 @@ Evaluated via `cuttle-binmorph` and `cuttle-mtd-metrics` (`churn` and `chainsim`
 # Run the automated 3-VM live morph + WAL catch-up + 2-of-3 self-healing test:
 python tools/triad_controller.py --self-test
 ```
-Then open **`http://127.0.0.1:18080/app`** in your browser.
+Then open **`http://127.0.0.1:18080/app`** in your browser, or **`http://127.0.0.1:18080/console`** for the tabbed live ops console ([`tools/triad_console.html`](tools/triad_console.html)): Overview, Operations (SQL, read-only inspection, vault, guard/cron, morph controls, guided drills), Live Cycle (animated view of rolling morphs, WAL catch-up and self-healing) and Event Log. Operations need the operator session token the controller prints at startup.
+
+### 1b. Run a Multi-Client Fleet (provider + isolated client farms)
+[`fleet.bat`](fleet.bat) starts [`tools/cuttle_fleet.py`](tools/cuttle_fleet.py), a provider that manages one isolated **farm** per client. Each farm is a set of Triads chosen by the client's plan in [`tools/fleet.toml`](tools/fleet.toml), and each job runs a real kernel role profile:
+
+| Job | Kernel role | 2-of-3 vote compares |
+| :--- | :--- | :--- |
+| Web front end | `wfe` (svc-http only) | served content |
+| SQL database | `sql` (svc-sql only) | `kv` table + XOR parity |
+| Search index | `sql` | `kv` + `idx` tables (schema provisioned through the WAL) |
+| Business jobs (cron) | `full` (jobs need svc-sh, listing needs svc-http) | `kv` table; the desired cron jobs are re-applied after every boot |
+
+Plans `basic` (web + SQL) and `pro` (web + SQL + index + cron) ship with seven sample clients (60 VMs). Every farm runs in its own process with its own random master key (all node device keys derive from it), state directory, WALs and port block. The provider token sees every client; a client token sees only its own farm. Farms bind `127.0.0.1` and accept only a per-run secret held by the provider.
+```powershell
+.\fleet.bat                                   # console: http://127.0.0.1:18888/fleet
+python tools/cuttle_fleet.py --self-test      # 2-client fleet: auth, scoping, roles, data/key isolation
+```
 
 ### 2. Boot a Single 4-Core VM Under QEMU
 Run `run.bat` to build the kernel ELF, package a BIOS disk image, and boot a single 4-core VM in QEMU (`http://127.0.0.1:18080/app`), or run the automated multi-boot + tamper-rejection QEMU smoke suite:
