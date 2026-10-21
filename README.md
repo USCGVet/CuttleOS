@@ -204,3 +204,14 @@ cargo test --workspace --lib
 cargo run --release -p cuttle-mtd-metrics -- churn <base.elf> <variant.elf>
 cargo run --release -p cuttle-mtd-metrics -- chainsim <base.elf> <variant.elf>
 ```
+
+## License
+
+CuttleOS is licensed under the [Apache License 2.0](LICENSE) (see also [NOTICE](NOTICE)). You may use, modify and redistribute it, including inside commercial and closed-source products; keep the license and notices, and state your changes. The CuttleOS name and logo are not licensed for use as another product's name.
+
+Every dependency must be permissively licensed, so CuttleOS stays open source while software built on top of it can stay proprietary. [`deny.toml`](deny.toml) holds the policy; the license check fails on any copyleft dependency. [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) lists every third-party component inside a boot image with its license text, and must ship with any distributed image. Check both with:
+```powershell
+powershell -File tools\license_check.ps1     # cargo deny on all 3 Cargo workspaces + notices up to date
+python tools/third_party_notices.py         # regenerate THIRD_PARTY_NOTICES.md after a dependency change
+```
+The one non-permissive component is `ucs2` (MPL-2.0, file-level copyleft), and only in the optional UEFI loader (`factory_builder --uefi`); see the notes in THIRD_PARTY_NOTICES.md.

@@ -1,0 +1,14 @@
+CuttleOS
+Copyright 2026 Cuttle Research
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Bootable CuttleOS images also contain third-party open-source components
+under permissive licenses (MIT, Apache-2.0, ISC, BSD-3-Clause and similar).
+Their copyright notices and license texts are listed in THIRD_PARTY_NOTICES.md,
+which must accompany any distributed image.
+
+Trademarks: the CuttleOS name and logo are not licensed under the Apache
+License (see Section 6 of LICENSE). Forks and redistributions may describe
+themselves as "based on CuttleOS" but must not use the name or logo as their
+own product name.

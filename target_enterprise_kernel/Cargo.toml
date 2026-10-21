@@ -3,6 +3,7 @@ name = "target_enterprise_kernel"
 version = "0.0.1"
 edition = "2021"
 description = "Bootable kernel ELF for target_enterprise. Out-of-workspace because it builds for x86_64-unknown-none with build-std (nightly + rust-src)."
+license = "Apache-2.0"
 
 # Empty workspace marker — same reason as factory_builder_pkg: keep the
 # main Cuttle workspace on stable / std-host while this crate uses
