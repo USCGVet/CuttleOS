@@ -249,6 +249,8 @@ class TriadController:
         self.wal_file = TRIAD_DIR / "triad_wal.json"
         self.triad_tx_seq = 0
         self.wal_entries: list[tuple[int, str]] = []  # (tx_seq, sql_stmt)
+        # Nodes whose applied tx_seq was restored from the WAL file (see `_load_wal_from_disk`).
+        self.restored_tx_seq_nodes: set[int] = set()
         self._load_wal_from_disk()
         self.events: list[dict] = []
         self.parity_Buffer = b"\x00" * SQL_PART_SIZE
@@ -272,14 +274,30 @@ class TriadController:
                 for tid, stmt in data.get("wal_entries", [])
                 if is_printable_ascii_command(str(stmt))
             ]
+            # Each node's AHCI SQL partition survives a controller restart, so restore the
+            # tx_seq each node had applied. Assuming 0 would make its next morph replay the
+            # whole WAL onto data it already holds and trip a false 2-of-3 TMR mismatch.
+            # WAL files written before per-node tracking have no `node_tx_seq`; those nodes
+            # are reconciled at boot by `_adopt_tx_seq_from_majority`.
+            node_seqs = data.get("node_tx_seq", {})
+            if isinstance(node_seqs, dict):
+                for n in self.nodes:
+                    v = node_seqs.get(str(n.node_id))
+                    if isinstance(v, int) and 0 <= v <= self.triad_tx_seq:
+                        n.tx_seq = v
+                        self.restored_tx_seq_nodes.add(n.node_id)
         except Exception:
             self.triad_tx_seq = 0
             self.wal_entries = []
+            self.restored_tx_seq_nodes.clear()
+            for n in self.nodes:
+                n.tx_seq = 0
 
     def _save_wal_to_disk(self):
         payload = {
             "triad_tx_seq": self.triad_tx_seq,
             "wal_entries": self.wal_entries,
+            "node_tx_seq": {str(n.node_id): n.tx_seq for n in self.nodes},
         }
         tmp = self.wal_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -787,6 +805,7 @@ class TriadController:
             for n in accepted_nodes:
                 self.send_shell_cmd(n, "sync")
                 n.tx_seq = tx_id
+            self._save_wal_to_disk()  # persist each node's applied tx_seq
 
             for n in self.nodes:
                 if n.state != "ONLINE":
@@ -893,6 +912,7 @@ class TriadController:
                 for n in accepted_nodes:
                     self.send_shell_cmd(n, "sync")
                     n.tx_seq = tx_id
+                self._save_wal_to_disk()  # persist each node's applied tx_seq
 
         if app == "vault" and sub in ("put", "del"):
             self.compute_and_verify_raid_parity()
@@ -995,6 +1015,7 @@ class TriadController:
                             self.log_event("WARN", f"{node.name}: Error replaying WAL entry #{tid}: {e}")
                         node.tx_seq = tid
                     self.send_shell_cmd(node, "sync")
+                    self._save_wal_to_disk()  # persist the node's caught-up tx_seq
                 else:
                     self.log_event(
                         "RESYNC",
@@ -1050,6 +1071,7 @@ class TriadController:
                         self.log_event("WARN", f"{node.name}: Error replaying WAL entry #{tid} during heal: {e}")
                     node.tx_seq = tid
                 self.send_shell_cmd(node, "sync")
+                self._save_wal_to_disk()  # persist the rebuilt node's tx_seq
                 node.tampered = False
 
         # Now force an immediate binary re-morph so the exploit can never work again
@@ -1070,6 +1092,47 @@ class TriadController:
         )
         # Immediately run the RAID parity & 2-of-3 majority check so the controller catches and heals it
         self.compute_and_verify_raid_parity()
+
+    def _adopt_tx_seq_from_majority(self):
+        """
+        Reconcile nodes whose applied tx_seq could not be restored from the WAL file (files
+        written before per-node tracking). A node whose kv table matches the 2-of-3 majority
+        already holds every committed write on its persistent AHCI partition, so it adopts the
+        Triad's tx_seq instead of replaying the whole WAL on its next morph. A node that
+        disagrees with the majority keeps tx_seq=0 and is healed by the parity check that follows.
+        """
+        pending = [
+            n for n in self.nodes
+            if n.node_id not in self.restored_tx_seq_nodes and n.state == "ONLINE"
+        ]
+        if not pending or self.triad_tx_seq == 0:
+            return
+        tables = {}
+        for n in self.nodes:
+            if n.state != "ONLINE":
+                continue
+            out = self.send_shell_cmd(n, "sql /*triad*/ SELECT * FROM kv", timeout=4.0)
+            if out and "k|v|rev" in out:
+                tables[n.node_id] = self._normalize_kv_for_tmr(out)
+        vals = list(tables.values())
+        if len(vals) < 2:
+            return
+        majority = max(set(vals), key=vals.count)
+        if vals.count(majority) < 2:
+            return
+        with self.wal_lock:
+            adopted = [n for n in pending if tables.get(n.node_id) == majority]
+            for n in adopted:
+                n.tx_seq = self.triad_tx_seq
+                self.restored_tx_seq_nodes.add(n.node_id)
+            if adopted:
+                self._save_wal_to_disk()
+        if adopted:
+            names = " + ".join(n.name.split()[0] for n in adopted)
+            self.log_event(
+                "RESYNC",
+                f"WAL had no per-node tx_seq: {names} match the 2/3 majority, adopting tx_seq={self.triad_tx_seq} (no replay needed).",
+            )
 
     def boot_all_parallel(self):
         self.log_event("INIT", "Morphing 3 independent x86-64 kernel binaries via binmorph...")
@@ -1093,6 +1156,7 @@ class TriadController:
                 n.state = "OFFLINE"
                 self.log_event("ERROR", f"{n.name} failed to reach interactive shell ready.")
 
+        self._adopt_tx_seq_from_majority()
         self.compute_and_verify_raid_parity()
         threading.Thread(target=self._background_scheduler, daemon=True).start()
 
@@ -1908,6 +1972,76 @@ def main():
             # Also verify OS-2 reconstructed and re-sealed `cluster.secret` from the WAL during heal!
             v2_out = ctrl.send_shell_cmd(ctrl.nodes[1], "vault get cluster.secret")
             assert "value=ThreeHearts9 verified=true" in v2_out, f"OS-2 vault heal failed:\n{v2_out}"
+
+            # 6. Controller restart: each node's AHCI SQL partition survives a restart, so the
+            #    controller must restore every node's applied tx_seq instead of assuming 0.
+            #    Otherwise a node's first morph replays the whole WAL onto data it already holds
+            #    and the 2-of-3 vote raises a false mismatch (ALERT + HEAL + emergency morph).
+            def restart_controller(old, before_boot=None):
+                old.shutdown()
+                for n in old.nodes:
+                    if n.proc:
+                        try:
+                            n.proc.wait(timeout=10.0)
+                        except Exception:
+                            pass
+                time.sleep(1.0)
+                if before_boot:
+                    before_boot()
+                new = TriadController(show_gui=args.gui)
+                TriadHttpHandler.ctrl = new
+                new.boot_all_parallel()
+                return new
+
+            def kv_of(c, n):
+                return c._normalize_kv_for_tmr(c.send_shell_cmd(n, "sql /*triad*/ SELECT * FROM kv"))
+
+            def tmr_alarms(c):
+                return [e for e in c.events if e["level"] in ("ALERT", "HEAL")]
+
+            # 6a. Restart with the per-node tx_seq map, then morph a node: nothing to replay.
+            tx_before = ctrl.triad_tx_seq
+            ctrl = restart_controller(ctrl)
+            assert all(n.state == "ONLINE" for n in ctrl.nodes), "All nodes must be ONLINE after restart"
+            assert ctrl.triad_tx_seq == tx_before, f"Triad tx_seq lost across restart: {ctrl.triad_tx_seq} != {tx_before}"
+            seqs = [n.tx_seq for n in ctrl.nodes]
+            assert seqs == [tx_before] * 3, f"Node tx_seq must survive a restart: got {seqs}, Triad at {tx_before}"
+            assert ctrl.bounce_and_morph_node(2), "OS-2 morph after restart failed"
+            assert not tmr_alarms(ctrl), f"False TMR alarm after restart + morph: {tmr_alarms(ctrl)}"
+            assert kv_of(ctrl, ctrl.nodes[1]) == kv_of(ctrl, ctrl.nodes[0]), "OS-2 diverged from OS-1 after restart + morph"
+            print("Restart: node tx_seq restored, morph replayed nothing, no false TMR alarm", flush=True)
+
+            # 6b. WAL file from before per-node tracking: nodes that match the 2/3 majority adopt
+            #     the Triad's tx_seq at boot instead of replaying the whole WAL.
+            wal_path = TRIAD_DIR / "triad_wal.json"
+
+            def strip_node_tx_seq():
+                data = json.loads(wal_path.read_text(encoding="utf-8"))
+                data.pop("node_tx_seq", None)
+                wal_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+            ctrl = restart_controller(ctrl, before_boot=strip_node_tx_seq)
+            seqs = [n.tx_seq for n in ctrl.nodes]
+            assert seqs == [ctrl.triad_tx_seq] * 3, f"Legacy WAL: majority nodes must adopt tx_seq, got {seqs}"
+            assert any(e["level"] == "RESYNC" and "adopting tx_seq" in e["msg"] for e in ctrl.events), "Legacy WAL adoption not logged"
+            assert not tmr_alarms(ctrl), f"False TMR alarm after legacy-WAL restart: {tmr_alarms(ctrl)}"
+            print("Restart with legacy WAL: majority nodes adopted tx_seq without replay", flush=True)
+
+            # 6c. A restored tx_seq must not hide real divergence: wipe OS-3's disk while the Triad
+            #     is down. The WAL still says OS-3 is current, but the boot parity check must outvote
+            #     it, rebuild it from the majority + WAL, and emergency-morph it.
+            ctrl = restart_controller(ctrl, before_boot=lambda: (TRIAD_DIR / "node3" / "ahci_node3.img").unlink())
+            os3 = ctrl.nodes[2]
+            deadline = time.time() + 60.0
+            while time.time() < deadline:
+                if os3.state == "ONLINE" and os3.morph_count >= 2:
+                    break
+                time.sleep(0.5)
+            assert any(e["level"] == "ALERT" and "OS-3" in e["msg"] for e in ctrl.events), "Wiped OS-3 disk not detected at boot"
+            assert any(e["level"] == "HEAL" and "OS-3" in e["msg"] for e in ctrl.events), "Wiped OS-3 disk not healed"
+            assert os3.state == "ONLINE" and os3.morph_count >= 2, f"OS-3 did not rejoin after heal (state={os3.state})"
+            assert kv_of(ctrl, os3) == kv_of(ctrl, ctrl.nodes[0]), "OS-3 not rebuilt to match the majority"
+            print("Restart with a wiped OS-3 disk: divergence detected, healed and re-morphed", flush=True)
             print("=== TRIAD 3-AS-1 SELF-TEST PASSED ===", flush=True)
         finally:
             ctrl.shutdown()
