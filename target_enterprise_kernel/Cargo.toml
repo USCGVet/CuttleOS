@@ -12,6 +12,8 @@ description = "Bootable kernel ELF for target_enterprise. Out-of-workspace becau
 [dependencies]
 bootloader_api = "0.11"
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+# Global heap for rustls (HTTPS on port 443). Apache-2.0/MIT.
+linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"] }
 target_enterprise = { path = "../target_enterprise" }
 cuttle-contracts = { path = "../contracts" }
 

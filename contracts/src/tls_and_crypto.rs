@@ -1,275 +1,9 @@
-//! TLS 1.3 (RFC 8446), X.509 DER (RFC 5280), DRBG, KAT, SigKAT, Random, AttestTlv, Base64, and CRC32-C contracts.
+//! X.509 DER (RFC 5280), DRBG, KAT, SigKAT, Random, AttestTlv, Base64, and CRC32-C contracts.
+//!
+//! TLS 1.3 itself is not a contract here: HTTPS uses rustls (see
+//! `target_enterprise::https`), whose wire behaviour is pinned by the
+//! golden-transcript replay instead.
 
-
-/// helpers (key derivation intermediates, parsing utilities, scratch
-/// buffer management) but the wire-format outputs of the methods below
-/// are locked across all morph cycles.
-///
-/// Invariants the verifier checks:
-///
-/// - **Wire equivalence.** Given an identical (`client_hello`,
-///   `server_random`, `server_pubkey`, `selected_alpn`) tuple, every
-///   morph candidate's [`build_server_hello`](Self::build_server_hello)
-///   produces the same bytes byte-for-byte.
-/// - **HKDF KAT compliance.** [`hkdf_extract`](Self::hkdf_extract) and
-///   [`hkdf_expand_label`](Self::hkdf_expand_label) match RFC 5869 +
-///   RFC 8446 §7.1 published vectors byte-for-byte. Tested in
-///   `target_enterprise/tests/tls_kat.rs`.
-/// - **Buffer discipline.** Every method writes only into the caller-
-///   supplied output buffer. Implementations may not heap-allocate
-///   (`target_enterprise` is `no_std` without `alloc`).
-///
-/// The trait is **conservative**: only the minimum surface the morph
-/// engine needs to lock is declared here. Cipher-suite selection logic,
-/// extension parsing internals, and key-schedule chaining live in the
-/// impl crate and are free to morph.
-pub trait Tls13Server {
-    /// Length of the outer TLS record header in bytes: `content_type` (1) +
-    /// `legacy_version` (2) + `length` (2) = 5. Locked across all morph
-    /// cycles per RFC 8446 §5.1.
-    const RECORD_HEADER_LEN: usize = 5;
-
-    /// Output length of the underlying hash (SHA-256) in bytes. TLS 1.3
-    /// with TLS_AES_128_GCM_SHA256 or TLS_CHACHA20_POLY1305_SHA256 both
-    /// use SHA-256, so this is fixed at 32 for the supported suite set.
-    const HASH_LEN: usize = 32;
-
-    /// Error type returned by fallible methods on this trait. Typically
-    /// a small enum identifying which parse step or buffer check failed;
-    /// the contract does not lock the discriminants because the verifier
-    /// only inspects success-path outputs.
-    type Error;
-
-    /// Build the handshake-message-encoded ServerHello in response to
-    /// `client_hello`. The output is the Handshake message (type byte +
-    /// uint24 length + body) — the caller is responsible for wrapping
-    /// it in a record header if a wire-level record is needed.
-    ///
-    /// # Preconditions
-    /// - `client_hello` is the handshake-typed payload (no outer record
-    ///   header). Implementations parse it strictly; any malformed input
-    ///   returns `Err`.
-    /// - `server_random` is 32 caller-supplied bytes (typically from a
-    ///   CSPRNG; the trait does not lock the source).
-    /// - `server_pubkey` is a 32-byte X25519 public key matching the
-    ///   ephemeral private key the server holds for this handshake.
-    /// - `selected_alpn`, if `Some`, names an ALPN protocol ID the
-    ///   server selected from the client's offer (e.g. `b"h2"`,
-    ///   `b"http/1.1"`). The encoded length must be 1..=255.
-    /// - `out` must be at least 256 bytes long to hold any legal
-    ///   ServerHello this trait emits. Implementations MAY require less;
-    ///   the verifier asserts byte-exactness only on the prefix.
-    ///
-    /// # Returns
-    /// Number of bytes written to `out`. The valid prefix is
-    /// `out[..returned]`.
-    fn build_server_hello(
-        client_hello: &[u8],
-        server_random: &[u8; 32],
-        server_pubkey: &[u8; 32],
-        selected_alpn: Option<&[u8]>,
-        out: &mut [u8],
-    ) -> Result<usize, Self::Error>;
-
-    /// HKDF-Extract over SHA-256 per RFC 5869 §2.2. Writes 32 bytes to
-    /// `out`. `salt` may be empty (treated as 32 zero bytes per RFC).
-    /// `ikm` is arbitrary-length input keying material.
-    ///
-    /// # Preconditions
-    /// `out` is a fixed `&mut [u8; 32]` so length is statically correct;
-    /// no runtime length check is needed.
-    fn hkdf_extract(salt: &[u8], ikm: &[u8], out: &mut [u8; 32]);
-
-    /// HKDF-Expand-Label per RFC 8446 §7.1. The encoded `HkdfLabel`
-    /// uses the implicit `"tls13 "` prefix so labels derived under
-    /// different protocols can never collide.
-    ///
-    /// # Preconditions
-    /// - `secret` is a 32-byte pseudorandom key (typically the output
-    ///   of `hkdf_extract` or a previous expand-label step).
-    /// - `label.len() + 6` (the `"tls13 "` prefix) must fit in a u8
-    ///   (≤ 255). `context.len()` must fit in a u8.
-    /// - `out.len()` must be ≤ `255 * 32` (the HKDF-Expand cap).
-    ///   Behaviour for over-length `out` is implementation-defined
-    ///   panic; the verifier does not exercise this path.
-    fn hkdf_expand_label(secret: &[u8; 32], label: &[u8], context: &[u8], out: &mut [u8]);
-}
-
-// ============================================================
-// TLS 1.3 client (RFC 8446) — TASK-049
-// ============================================================
-
-/// Parsed view of a TLS 1.3 ServerHello returned by
-/// [`Tls13Client::parse_server_hello`].
-///
-/// The shape is intentionally minimal: only fields needed to drive the
-/// key schedule forward (server_random for transcript binding, the
-/// chosen `cipher_suite`, the server's x25519 ephemeral public key).
-/// Extensions other than `supported_versions` (asserted = 0x0304) and
-/// `key_share` (x25519) are tolerated but discarded.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct ParsedServerHello {
-    /// Server-supplied 32 bytes of randomness (TLS 1.3 §4.1.3). Used
-    /// in the transcript-hash that feeds Derive-Secret.
-    pub server_random: [u8; 32],
-    /// Server's selected cipher suite. The client locks to the offered
-    /// suite set and rejects an unrecognised pick. TASK-049 ships with
-    /// `TLS_AES_128_GCM_SHA256` (0x1301) as the sole accepted value;
-    /// the field is stored verbatim so a future suite addition is a
-    /// pure schema extension.
-    pub cipher_suite: u16,
-    /// Server's ephemeral x25519 public key recovered from the
-    /// `key_share` extension. Combined with the client's ephemeral
-    /// secret (out-of-band) to produce the (EC)DHE shared secret that
-    /// feeds the handshake-secret HKDF-Extract step.
-    pub server_pubkey: [u8; 32],
-}
-
-/// Handshake-layer traffic secrets derived by
-/// [`Tls13Client::derive_handshake_keys`]. RFC 8446 §7.1 ("Key
-/// Schedule").
-///
-/// The three fields are the locked outputs of the schedule:
-///
-/// - `handshake_secret`  = HKDF-Extract(derived_early, shared_secret)
-/// - `client_handshake_traffic_secret`
-///                       = Derive-Secret(HS, "c hs traffic", CH..SH)
-/// - `server_handshake_traffic_secret`
-///                       = Derive-Secret(HS, "s hs traffic", CH..SH)
-///
-/// Each is 32 bytes (SHA-256 output length). The downstream key/iv
-/// derivation (HKDF-Expand-Label with `"key"` / `"iv"`) is performed
-/// out-of-band by the caller — this trait's responsibility is the
-/// schedule prefix that locks every morph cycle to the same bytes.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct HandshakeKeys {
-    /// HKDF-Extract output that anchors every subsequent client/server
-    /// handshake-traffic derivation. 32 bytes (HMAC-SHA-256 output).
-    pub handshake_secret: [u8; 32],
-    /// Client-direction handshake traffic secret. Used by the client
-    /// to encrypt its Finished message and any 0-RTT early-data record
-    /// (early data is out of scope for TASK-049).
-    pub client_handshake_traffic_secret: [u8; 32],
-    /// Server-direction handshake traffic secret. Used by the client
-    /// to decrypt the server's EncryptedExtensions + Certificate +
-    /// CertificateVerify + Finished records.
-    pub server_handshake_traffic_secret: [u8; 32],
-}
-
-/// TLS 1.3 client primitives — the outbound counterpart to
-/// [`Tls13Server`]. **Locked surface** for the morph engine.
-///
-/// The four methods together cover the handshake-message layer of an
-/// outbound TLS 1.3 connection through ClientFinished. AEAD record-
-/// layer encryption + certificate-chain validation + curve25519
-/// scalar-multiplication are out of scope for TASK-049 (and are bound
-/// to the existing [`Aead`] / [`SignatureVerify`] surfaces or are
-/// future tasks).
-///
-/// Invariants the verifier checks:
-///
-/// - **Wire equivalence on ClientHello.** Given an identical
-///   (`client_random`, `client_pubkey`) tuple, every morph candidate's
-///   [`build_client_hello`](Self::build_client_hello) produces the same
-///   bytes byte-for-byte. The cipher_suites list MUST be the singleton
-///   `[TLS_AES_128_GCM_SHA256]`; the extension order MUST be
-///   `[supported_versions, signature_algorithms, key_share]` (RFC 8446
-///   §4.1.2 does not lock extension order on the wire, but the
-///   contract does so morph runs are byte-comparable).
-/// - **Parse correctness on ServerHello.** Given a byte-identical
-///   ServerHello, every candidate's
-///   [`parse_server_hello`](Self::parse_server_hello) returns the same
-///   [`ParsedServerHello`].
-/// - **Key-schedule KAT.** Given an identical
-///   (`shared_secret`, `client_hello`, `server_hello`) tuple,
-///   [`derive_handshake_keys`](Self::derive_handshake_keys) writes the
-///   same [`HandshakeKeys`] bytes. The schedule MUST follow RFC 8446
-///   §7.1 to the letter: early_secret = HKDF-Extract(0, 0); derived =
-///   Derive-Secret(early_secret, "derived", ""); handshake_secret =
-///   HKDF-Extract(derived, shared_secret); the two traffic secrets are
-///   Derive-Secret(HS, "c hs traffic" | "s hs traffic", CH || SH).
-/// - **Finished MAC.** Given an identical
-///   (`client_handshake_traffic_secret`, `transcript_hash`) pair,
-///   [`build_client_finished`](Self::build_client_finished) writes the
-///   same 32-byte HMAC-SHA-256 verify_data per RFC 8446 §4.4.4.
-/// - **Buffer discipline.** Every method writes only into the caller-
-///   supplied output buffer. Implementations may not heap-allocate
-///   (`target_enterprise` is `no_std` without `alloc`).
-pub trait Tls13Client {
-    /// Length of the outer TLS record header in bytes. Locked at 5
-    /// (content_type + legacy_version + length) — same as
-    /// [`Tls13Server::RECORD_HEADER_LEN`].
-    const RECORD_HEADER_LEN: usize = 5;
-
-    /// Output length of the underlying hash (SHA-256). Locked at 32.
-    const HASH_LEN: usize = 32;
-
-    /// Error type returned by fallible methods on this trait.
-    /// Discriminants are not locked by the contract; only the success-
-    /// path output bytes are part of the verifier's wire-equivalence
-    /// check.
-    type Error;
-
-    /// Build the handshake-message-encoded ClientHello into `out`.
-    /// Returns the number of bytes written. The output is the Handshake
-    /// message (`type(1) | length(3) | body`) — the caller wraps it in
-    /// a record header for wire transmission.
-    ///
-    /// # Preconditions
-    /// - `client_random` is 32 caller-supplied bytes (typically from a
-    ///   CSPRNG; the trait does not lock the source).
-    /// - `client_pubkey` is a 32-byte x25519 ephemeral public key. The
-    ///   matching scalar private key lives in the caller for the
-    ///   subsequent (EC)DHE step.
-    /// - `out` must be at least 256 bytes long. The actual emitted
-    ///   length is comfortably under 200 bytes for the locked
-    ///   extension set, but the caller is required to size the buffer
-    ///   so a future ALPN/SNI extension does not require an API break.
-    fn build_client_hello(
-        client_random: &[u8; 32],
-        client_pubkey: &[u8; 32],
-        out: &mut [u8],
-    ) -> Result<usize, Self::Error>;
-
-    /// Parse a Handshake-typed ServerHello payload (no outer record
-    /// header). Strict on every length field; any over-read returns
-    /// `Err`. Returns the locked [`ParsedServerHello`] view.
-    fn parse_server_hello(server_hello: &[u8]) -> Result<ParsedServerHello, Self::Error>;
-
-    /// Run the TLS 1.3 key schedule prefix (RFC 8446 §7.1) through the
-    /// two handshake-traffic secrets. Writes the result into `out`.
-    ///
-    /// `client_hello` and `server_hello` are the Handshake-message
-    /// encodings (the same byte slices the caller passed to / received
-    /// from [`build_client_hello`] / [`parse_server_hello`]). The
-    /// transcript-hash input to the two Derive-Secret calls is
-    /// SHA-256(client_hello || server_hello).
-    fn derive_handshake_keys(
-        shared_secret: &[u8; 32],
-        client_hello: &[u8],
-        server_hello: &[u8],
-        out: &mut HandshakeKeys,
-    );
-
-    /// Compute the client Finished `verify_data` per RFC 8446 §4.4.4:
-    ///
-    /// ```text
-    /// finished_key = HKDF-Expand-Label(client_handshake_traffic_secret,
-    ///                                  "finished", "", 32)
-    /// verify_data  = HMAC-SHA-256(finished_key, transcript_hash)
-    /// ```
-    ///
-    /// `transcript_hash` is SHA-256 over every handshake message from
-    /// ClientHello through the server's Finished (inclusive). The
-    /// caller is responsible for accumulating that hash; the trait
-    /// surface keeps the responsibility separation between the schedule
-    /// (this trait) and the transcript log (caller).
-    fn build_client_finished(
-        client_handshake_traffic_secret: &[u8; 32],
-        transcript_hash: &[u8; 32],
-        out: &mut [u8; 32],
-    );
-}
 // ============================================================
 // X.509 DER certificate parser (TASK-060)
 //
@@ -665,9 +399,9 @@ pub trait X509 {
 /// a VirtIO 1.0 network-device driver. Pure addition — same
 /// trait-set-addition rationale.
 ///
-/// Bumped to **14** by TASK-049: introduces the [`Tls13Client`] trait
-/// alongside the existing [`Tls13Server`], plus the locked
-/// [`ParsedServerHello`] + [`HandshakeKeys`] structs that carry the
+/// Bumped to **14** by TASK-049: introduces the `Tls13Client` trait
+/// alongside the existing `Tls13Server`, plus the locked
+/// `ParsedServerHello` + `HandshakeKeys` structs that carry the
 /// trait's parse/derive outputs. Closes the symmetric gap left by the
 /// server-only port from TASK-007 — the kernel can now build a
 /// ClientHello, parse a ServerHello, run the RFC 8446 §7.1 key
@@ -981,7 +715,13 @@ pub trait X509 {
 /// Bumped to **57** by TASK-092: [`Base64`] + RFC 4648 codec.
 ///
 /// Bumped to **58** by TASK-093: [`AhciCmd`] + command header + PRDT.
-pub const CONTRACTS_SCHEMA_VERSION: u32 = 58;
+///
+/// Bumped to **59** when HTTPS moved to rustls: removes `Tls13Server`,
+/// `Tls13Client`, `ParsedServerHello` and `HandshakeKeys`. They described the
+/// hand-written TLS 1.3 handshake, which no longer exists; the rustls-based
+/// server in `target_enterprise::https` is pinned by known-answer vectors and
+/// a golden-transcript replay instead. A breaking removal, not an addition.
+pub const CONTRACTS_SCHEMA_VERSION: u32 = 59;
 
 // ============================================================
 // HmacDrbg — one-step HMAC-SHA256 expand KAT (TASK-087)

@@ -1,7 +1,19 @@
 # Bare-metal target + build-std settings. `unstable` requires nightly.
 [build]
 target = "x86_64-unknown-none"
+# The target is soft-float (no SSE state is saved by the kernel). These cfgs
+# select the RustCrypto backends that use only general-purpose registers, so no
+# SIMD instructions are emitted for TLS: AES (bitsliced), GHASH/POLYVAL,
+# ChaCha20, Poly1305 and Curve25519 (serial field arithmetic).
+rustflags = [
+    "--cfg", "aes_force_soft",
+    "--cfg", "polyval_force_soft",
+    "--cfg", "chacha20_force_soft",
+    "--cfg", "poly1305_force_soft",
+    "--cfg", 'curve25519_dalek_backend="serial"',
+]
 
 [unstable]
-build-std = ["core", "compiler_builtins"]
+# `alloc` backs rustls (TLS on port 443); the kernel provides the global heap.
+build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]

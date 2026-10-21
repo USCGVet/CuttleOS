@@ -10,12 +10,13 @@
 //!
 //! Locked surface: every `pub const` in this module is part of the
 //! contract surface the diversifier MUST NOT mutate. The values are
-//! either RFC vectors (HKDF) or hand-computed against the locked
-//! algorithm contract (HashImpl, WAL framing, IOMMU walk).
+//! either RFC vectors (HKDF), hand-computed against the locked
+//! algorithm contract (HashImpl, WAL framing, IOMMU walk), or recorded
+//! from a real TLS session (the HTTPS golden transcript).
 //!
-//! The kernel does not allocate, does not link the host std library,
-//! and runs under `panic=abort`. Every check the kernel performs is
-//! a `==` against one of the `EXPECTED_*` arrays here; failure path
+//! The kernel does not link the host std library and runs under
+//! `panic=abort`; its only heap user is the HTTPS stack. Every check
+//! the kernel performs is a `==` against a value here; failure path
 //! is `panic!`, which the kernel's `panic_handler` writes to serial
 //! before halting. The QEMU smoke test then sees the absent banner.
 
@@ -58,175 +59,21 @@ pub const HKDF_EXPECTED_EXPAND_PREFIX8: [u8; 8] = [
 ];
 
 // ============================================================
-// TLS — ServerHello golden round-trip
+// HTTPS — golden TLS 1.3 session (rustls + RustCrypto provider)
+//
+// The client side of one real TLS 1.3 session, recorded from a rustls
+// client (ring crypto) talking to the golden LivedNet server
+// (`https::golden_server`: deterministic RNG, fixture identity). The
+// boot self-test and `tests/https_interop.rs` replay these flights
+// through `LivedNet::handle_frame` and require the server's entire
+// byte stream to hash to HTTPS_GOLDEN_SERVER_SHA256.
+//
+// Regenerate (only after a deliberate change to rustls, the provider,
+// the certificate, or the HTTP response) with:
+//   cargo test -p target_enterprise --test https_interop -- --ignored --nocapture record_golden
 // ============================================================
 
-/// Hand-constructed ClientHello matching the shape that
-/// `target_enterprise::tls::parse_client_hello` accepts: legacy
-/// version 0x0303, 32-byte zero random, empty session_id, single
-/// cipher suite TLS_AES_128_GCM_SHA256, supported_versions advertising
-/// TLS 1.3, key_share carrying a 32-byte x25519 public of `[7u8; 32]`.
-///
-/// Layout (96 bytes total):
-/// - handshake header: `01 00 00 5C` (ClientHello, body_len=92)
-/// - body (92 bytes): see comments at end-of-file.
-pub const CLIENT_HELLO: [u8; 96] = [
-    // handshake header: ClientHello, body_len = 92 = 0x5C
-    0x01, 0x00, 0x00, 0x5C,
-    // legacy_version
-    0x03, 0x03,
-    // random (32)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    // session_id_len, cipher_suites_len, suites
-    0x00,
-    0x00, 0x02, 0x13, 0x01,
-    // compression: count + null
-    0x01, 0x00,
-    // extensions_total_len = 49
-    0x00, 0x31,
-    // ext: supported_versions (type=0x002B, ext_len=3, body=[0x02, 0x03, 0x04])
-    0x00, 0x2B, 0x00, 0x03, 0x02, 0x03, 0x04,
-    // ext: key_share (type=0x0033, ext_len=38)
-    //   client_shares_len(u16)=36, entry { group=x25519(0x001D), key_len=32, key=[7u8; 32] }
-    0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1D, 0x00, 0x20,
-    0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
-    0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
-];
-
-/// Deterministic 32-byte server-random the kernel passes to
-/// `build_server_hello`. Locked at all-zero for byte stability.
-pub const SERVER_RANDOM: [u8; 32] = [0u8; 32];
-
-/// Deterministic 32-byte server x25519 public key. Locked at all `0x09`.
-pub const SERVER_PUBKEY: [u8; 32] = [0x09u8; 32];
-
-/// Byte length the kernel expects from `build_server_hello` against
-/// the above fixtures with `selected_alpn = None`.
-pub const SERVER_HELLO_EXPECTED_LEN: usize = 90;
-
-/// First 8 bytes of the ServerHello produced from the above fixtures.
-pub const SERVER_HELLO_EXPECTED_PREFIX8: [u8; 8] = [
-    0x02, 0x00, 0x00, 0x56, 0x03, 0x03, 0x00, 0x00,
-];
-
-// ============================================================
-// TLS 1.3 client (TASK-049) — outbound handshake fixtures
-// ============================================================
-
-/// Locked client_random fed to `build_client_hello`. All-zero for byte
-/// stability (paired with TLS_CLIENT_PUBKEY below).
-pub const TLS_CLIENT_RANDOM: [u8; 32] = [0u8; 32];
-
-/// Locked client x25519 ephemeral public key. Locked at all `0x07`.
-pub const TLS_CLIENT_PUBKEY: [u8; 32] = [0x07u8; 32];
-
-/// Locked ECDHE shared secret feeding the handshake_secret derivation.
-/// In a real session this is `x25519(client_priv, server_pub)`. We
-/// stand it in with `[0x42; 32]` so the entire key schedule is
-/// byte-deterministic without dragging in a curve25519 implementation
-/// (that is a future task).
-pub const TLS_SHARED_SECRET: [u8; 32] = [0x42u8; 32];
-
-/// Byte length the kernel expects from `build_client_hello` against
-/// `(TLS_CLIENT_RANDOM, TLS_CLIENT_PUBKEY)`.
-///
-/// Breakdown:
-///   handshake header 4 +
-///   legacy_version 2 + random 32 + sid_len 1 +
-///   cipher_suites (2+2) + compression (1+1) +
-///   ext_len 2 +
-///   extensions (sv 7 + sa 12 + ks 42) = 108
-pub const TLS_CLIENT_HELLO_EXPECTED_LEN: usize = 108;
-
-/// First 8 bytes of the ClientHello produced from the locked fixtures.
-/// `01 00 00 68 03 03 00 00` — handshake type 0x01 (ClientHello), body
-/// length 0x000068 = 104, legacy_version 0x0303, first two of 32
-/// random bytes.
-pub const TLS_CLIENT_HELLO_EXPECTED_PREFIX8: [u8; 8] = [
-    0x01, 0x00, 0x00, 0x68, 0x03, 0x03, 0x00, 0x00,
-];
-
-/// Hand-constructed ServerHello matching the shape the client parses.
-/// Locked at 90 bytes: same layout as the test fixture in
-/// `tls::tests::TEST_SERVER_HELLO`. Mirrored here so the kernel and
-/// the test suite share the byte-exact input.
-///
-/// Layout (90 bytes total):
-/// - handshake header: `02 00 00 56` (ServerHello, body_len = 86)
-/// - legacy_version: `03 03`
-/// - server_random (32 × `0x00`)
-/// - legacy_session_id_echo: empty (`00`)
-/// - cipher_suite: `13 01`
-/// - legacy_compression_method: `00`
-/// - extensions length: `00 2E` (46)
-/// - supported_versions ext: `00 2B 00 02 03 04` (6 bytes)
-/// - key_share ext: `00 33 00 24 00 1D 00 20` + 32 × `0x09`
-pub const TLS_SERVER_HELLO_FIXTURE: [u8; 90] = [
-    0x02, 0x00, 0x00, 0x56,
-    0x03, 0x03,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00,
-    0x00,
-    0x13, 0x01,
-    0x00,
-    0x00, 0x2E,
-    0x00, 0x2B, 0x00, 0x02, 0x03, 0x04,
-    0x00, 0x33, 0x00, 0x24, 0x00, 0x1D, 0x00, 0x20,
-    0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09,
-    0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09,
-    0x09, 0x09,
-];
-
-/// Locked HKDF-Extract output that anchors the TLS 1.3 handshake
-/// secret. Mirrors `HANDSHAKE_SECRET_GOLDEN` in
-/// `tls::tests`; reproduced here so the kernel assertion targets the
-/// byte-exact value without crossing the test-module boundary.
-pub const TLS_HANDSHAKE_SECRET_EXPECTED: [u8; 32] = [
-    0xbb, 0x51, 0x8f, 0x06, 0x1c, 0x91, 0x10, 0x17,
-    0xf1, 0xd2, 0x64, 0x03, 0x16, 0x55, 0x41, 0x25,
-    0xae, 0xc1, 0x21, 0x03, 0x60, 0xff, 0x49, 0xb8,
-    0x91, 0x94, 0x57, 0xef, 0x57, 0xae, 0xce, 0xc1,
-];
-
-/// First 8 bytes of [`TLS_HANDSHAKE_SECRET_EXPECTED`], emitted on the
-/// kernel banner as `prk=<hex16>` for quick post-mortem inspection.
-pub const TLS_HANDSHAKE_SECRET_PREFIX8: [u8; 8] = [
-    0xbb, 0x51, 0x8f, 0x06, 0x1c, 0x91, 0x10, 0x17,
-];
-
-/// Client handshake-traffic secret. Mirrors `CLIENT_HS_TRAFFIC_GOLDEN`.
-pub const TLS_CLIENT_HS_TRAFFIC_EXPECTED: [u8; 32] = [
-    0x52, 0xf3, 0xd2, 0x06, 0x34, 0x12, 0x0d, 0x17,
-    0xc4, 0x62, 0x28, 0x39, 0x9b, 0x69, 0x69, 0x2d,
-    0x69, 0x96, 0x54, 0x4a, 0x64, 0x5f, 0xc1, 0x48,
-    0x2e, 0x0b, 0xe8, 0x4c, 0x60, 0x4c, 0xf7, 0xa2,
-];
-
-/// Server handshake-traffic secret. Mirrors `SERVER_HS_TRAFFIC_GOLDEN`.
-pub const TLS_SERVER_HS_TRAFFIC_EXPECTED: [u8; 32] = [
-    0x85, 0x91, 0x69, 0x4b, 0x50, 0xd6, 0x4a, 0x5f,
-    0x0f, 0x8f, 0x23, 0xf6, 0x1f, 0x10, 0x62, 0xb4,
-    0xa9, 0xa9, 0xe0, 0xad, 0xa0, 0x58, 0x1b, 0xc1,
-    0xe7, 0x3a, 0x6f, 0x61, 0x17, 0x46, 0x6f, 0xfd,
-];
-
-/// Synthetic transcript hash for the client Finished MAC banner. The
-/// real protocol uses SHA-256 over CH..server_Finished; this fixture
-/// is a constant 32 × `0xAB` byte block so the verify_data is
-/// reproducible without packaging the full handshake transcript.
-pub const TLS_FINISHED_TRANSCRIPT_HASH: [u8; 32] = [0xABu8; 32];
-
-/// Client Finished verify_data computed against
-/// `(TLS_CLIENT_HS_TRAFFIC_EXPECTED, TLS_FINISHED_TRANSCRIPT_HASH)`.
-/// Mirrors `CLIENT_FINISHED_GOLDEN` in the tls test module.
-pub const TLS_CLIENT_FINISHED_EXPECTED: [u8; 32] = [
-    0xf6, 0xd3, 0x7f, 0x34, 0x5e, 0xe9, 0x64, 0xd2,
-    0x52, 0x7d, 0xed, 0x19, 0x7f, 0xb0, 0x7e, 0x62,
-    0x7d, 0x44, 0x56, 0x5b, 0x6a, 0x26, 0x16, 0xb5,
-    0x52, 0xc7, 0xca, 0x0e, 0xb2, 0xfd, 0xad, 0x65,
-];
+include!("https_golden_fixture.rs");
 
 // ============================================================
 // WAL — 16 fixture frames

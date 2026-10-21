@@ -86,11 +86,12 @@ fn hash_impl_round_trip_kat() {
 
 #[test]
 fn aead_impl_round_trip() {
+    // AES-128-GCM: 16-byte key, 12-byte nonce, 16-byte tag.
     let key = b"a-16-byte-key!!!";
     assert_eq!(AeadImpl::KEY_LEN, 16);
-    assert_eq!(AeadImpl::NONCE_LEN, 8);
-    assert_eq!(AeadImpl::TAG_LEN, 4);
-    let nonce = b"nonce123";
+    assert_eq!(AeadImpl::NONCE_LEN, 12);
+    assert_eq!(AeadImpl::TAG_LEN, 16);
+    let nonce = b"nonce-12byte";
     let pt = b"the eagle has landed";
     let aad = b"meta";
     let mut ct = [0u8; 64];
@@ -107,6 +108,16 @@ fn aead_impl_round_trip() {
     tampered[..n].copy_from_slice(&ct[..n]);
     tampered[0] ^= 1;
     assert!(AeadImpl::decrypt(key, nonce, &tampered[..n], aad, &mut recovered).is_err());
+}
+
+#[test]
+fn aead_impl_passes_contract_invariant_battery() {
+    use cuttle_contracts::harness::{check_aead, Verdict};
+    match check_aead::<AeadImpl>() {
+        Verdict::Pass => {}
+        Verdict::Fail(why) => panic!("AES-128-GCM AeadImpl failed harness invariant: {why}"),
+        Verdict::Invalid(why) => panic!("AES-128-GCM AeadImpl was invalid: {why}"),
+    }
 }
 
 #[test]

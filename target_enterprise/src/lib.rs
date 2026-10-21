@@ -1,16 +1,21 @@
 //! Cuttle enterprise OS subsystem library (`target_enterprise`).
 //!
-//! Pure `no_std`, zero-allocation implementations of the kernel's cryptography,
-//! networking, storage, filesystem, hardware driver, memory isolation, task
-//! scheduling, capability/Seccomp enforcement, and interactive shell
-//! ([`shell::OsShell`]) subsystems. Every module implements its corresponding
-//! trait in [`cuttle_contracts`] over fixed-capacity buffers so it can be
-//! verified on the host and linked directly into the bare-metal unikernel
-//! (`target_enterprise_kernel`).
+//! Pure `no_std` implementations of the kernel's cryptography, networking,
+//! storage, filesystem, hardware driver, memory isolation, task scheduling,
+//! capability/Seccomp enforcement, and interactive shell ([`shell::OsShell`])
+//! subsystems. Every module implements its corresponding trait in
+//! [`cuttle_contracts`] over fixed-capacity buffers so it can be verified on
+//! the host and linked directly into the bare-metal unikernel
+//! (`target_enterprise_kernel`). The one exception to "fixed-capacity" is
+//! HTTPS ([`https`], [`tls_provider`]): rustls allocates, from the kernel heap.
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
+
+// rustls (HTTPS on port 443) needs a heap; the kernel supplies the global
+// allocator (`target_enterprise_kernel/src/heap.rs`), host tests use std's.
+extern crate alloc;
 
 pub mod acpi_rsdp;
 pub mod ahci_cmd;
@@ -79,6 +84,8 @@ pub mod svc_runtime;
 pub mod syscall;
 pub mod tick_source;
 pub mod tls;
+pub mod tls_provider;
+pub mod https;
 pub mod uefi_gop;
 pub mod wal;
 pub mod x509;
@@ -110,7 +117,6 @@ pub use crate::syscall::{
     PERMISSIVE_CAP_TABLE, SYS_CAP_CHECK, SYS_CLOSE, SYS_EXIT, SYS_GETPID, SYS_GETTIME_NS, SYS_OPEN,
     SYS_READ, SYS_READ_KEY, SYS_REALTIME_S, SYS_SLEEP_MS, SYS_WRITE, SYS_YIELD,
 };
-pub use crate::tls::Tls13ServerImpl;
 pub use crate::wal::{
     durable_wal_proof, durable_wal_proof_init, WalError, WalImpl, FRAME_HEADER_BYTES,
     MAX_PAYLOAD_LEN,
@@ -227,21 +233,13 @@ impl core::fmt::Debug for AeadError {
     }
 }
 
-/// Concrete [`cuttle_contracts::Aead`] impl: a Feistel-keystream +
-/// Fletcher-tag construction. **NOT cryptographic** — exists so the
-/// verifier has a real `impl Aead` to exercise against the harness
-/// invariants (round-trip, ciphertext-tamper, tag-tamper, AAD-tamper,
-/// wrong-key rejection).
-///
-/// Construction (locked across morph cycles):
-///
-/// 1. Initial state: `state = feistel_mix(u64_le(key[0..8]) ^ u64_le(nonce))`.
-/// 2. Keystream: repeatedly `state = feistel_mix(state)`, emit 8 bytes
-///    little-endian. XOR with plaintext to produce ciphertext.
-/// 3. Tag: `fletcher32(ciphertext || aad || key)` written big-endian
-///    as 4 bytes appended to the ciphertext. The key is folded into
-///    the tag so wrong-key decryption is rejected (necessary because
-///    the Fletcher tag is otherwise key-independent).
+/// Concrete [`cuttle_contracts::Aead`] impl: AES-128-GCM (NIST SP
+/// 800-38D) via the RustCrypto `aes-gcm` crate — 16-byte key, 12-byte
+/// nonce, 16-byte tag appended to the ciphertext. Keys or nonces of any
+/// other length are refused (`encrypt` writes nothing and returns 0,
+/// `decrypt` returns `Err`). Callers must never reuse a (key, nonce)
+/// pair. Pinned to the GCM specification's test cases in this crate's
+/// unit tests and in `tls_provider::self_test`.
 pub struct AeadImpl;
 
 /// Mix `state` using a 4-round fixed-key Feistel construction. Pure;
@@ -266,42 +264,15 @@ fn feistel_round_fn(half: u32, round: u32) -> u32 {
     mixed.rotate_left(13) ^ mixed.rotate_right(7)
 }
 
-fn u64_le_from(bytes: &[u8]) -> u64 {
-    let mut acc: u64 = 0;
-    let mut i = 0usize;
-    while i < 8 && i < bytes.len() {
-        acc |= (bytes[i] as u64) << (i * 8);
-        i += 1;
-    }
-    acc
-}
-
-/// Constant-time-style bytewise compare. Loop runs over every byte
-/// regardless of mismatch to avoid leaking the first-differing-index
-/// via timing.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut acc: u8 = 0;
-    let mut i = 0usize;
-    while i < a.len() {
-        acc |= a[i] ^ b[i];
-        i += 1;
-    }
-    acc == 0
-}
-
-/// Compute the AEAD tag over `(ciphertext || aad || key)`, allocation-
-/// free.
-fn aead_tag(ciphertext: &[u8], aad: &[u8], key: &[u8]) -> u32 {
-    fletcher32_three(ciphertext, aad, key)
+fn aes128_gcm(key: &[u8]) -> Option<aes_gcm::Aes128Gcm> {
+    use aes_gcm::KeyInit;
+    aes_gcm::Aes128Gcm::new_from_slice(key).ok()
 }
 
 impl cuttle_contracts::Aead for AeadImpl {
     const KEY_LEN: usize = 16;
-    const NONCE_LEN: usize = 8;
-    const TAG_LEN: usize = 4;
+    const NONCE_LEN: usize = 12;
+    const TAG_LEN: usize = 16;
     type Error = AeadError;
 
     fn encrypt(
@@ -311,32 +282,27 @@ impl cuttle_contracts::Aead for AeadImpl {
         aad: &[u8],
         out: &mut [u8],
     ) -> usize {
-        let key_lo = u64_le_from(&key[..8.min(key.len())]);
-        let nonce_word = u64_le_from(&nonce[..8.min(nonce.len())]);
-        let mut state = feistel_mix(key_lo ^ nonce_word);
-        let mut ks: [u8; 8] = [0; 8];
-        let mut pos = 8usize;
-        let mut i = 0usize;
-        while i < plaintext.len() {
-            if pos == 8 {
-                state = feistel_mix(state);
-                let mut j = 0usize;
-                while j < 8 {
-                    ks[j] = (state >> (j * 8)) as u8;
-                    j += 1;
-                }
-                pos = 0;
-            }
-            out[i] = plaintext[i] ^ ks[pos];
-            pos += 1;
-            i += 1;
+        use aes_gcm::aead::AeadInPlace;
+        let total = plaintext.len() + Self::TAG_LEN;
+        let Some(cipher) = aes128_gcm(key) else {
+            return 0;
+        };
+        if nonce.len() != Self::NONCE_LEN || out.len() < total {
+            return 0;
         }
-        let tag = aead_tag(&out[..plaintext.len()], aad, key);
-        out[plaintext.len()] = (tag >> 24) as u8;
-        out[plaintext.len() + 1] = (tag >> 16) as u8;
-        out[plaintext.len() + 2] = (tag >> 8) as u8;
-        out[plaintext.len() + 3] = tag as u8;
-        plaintext.len() + 4
+        let (body, tail) = out.split_at_mut(plaintext.len());
+        body.copy_from_slice(plaintext);
+        let nonce = aes_gcm::Nonce::from_slice(nonce);
+        match cipher.encrypt_in_place_detached(nonce, aad, body) {
+            Ok(tag) => {
+                tail[..Self::TAG_LEN].copy_from_slice(&tag);
+                total
+            }
+            Err(_) => {
+                body.fill(0);
+                0
+            }
+        }
     }
 
     fn decrypt(
@@ -346,43 +312,27 @@ impl cuttle_contracts::Aead for AeadImpl {
         aad: &[u8],
         out: &mut [u8],
     ) -> Result<usize, Self::Error> {
-        if ciphertext.len() < 4 {
+        use aes_gcm::aead::AeadInPlace;
+        let cipher = aes128_gcm(key).ok_or(AeadError)?;
+        if nonce.len() != Self::NONCE_LEN || ciphertext.len() < Self::TAG_LEN {
             return Err(AeadError);
         }
-        let body_len = ciphertext.len() - 4;
-        let body = &ciphertext[..body_len];
-        let recv_tag = &ciphertext[body_len..];
-        let expect_u32 = aead_tag(body, aad, key);
-        let expect_tag = [
-            (expect_u32 >> 24) as u8,
-            (expect_u32 >> 16) as u8,
-            (expect_u32 >> 8) as u8,
-            expect_u32 as u8,
-        ];
-        if !ct_eq(recv_tag, &expect_tag) {
+        let body_len = ciphertext.len() - Self::TAG_LEN;
+        if out.len() < body_len {
             return Err(AeadError);
         }
-        let key_lo = u64_le_from(&key[..8.min(key.len())]);
-        let nonce_word = u64_le_from(&nonce[..8.min(nonce.len())]);
-        let mut state = feistel_mix(key_lo ^ nonce_word);
-        let mut ks: [u8; 8] = [0; 8];
-        let mut pos = 8usize;
-        let mut i = 0usize;
-        while i < body_len {
-            if pos == 8 {
-                state = feistel_mix(state);
-                let mut j = 0usize;
-                while j < 8 {
-                    ks[j] = (state >> (j * 8)) as u8;
-                    j += 1;
-                }
-                pos = 0;
+        let (body, tag) = ciphertext.split_at(body_len);
+        let plain = &mut out[..body_len];
+        plain.copy_from_slice(body);
+        let nonce = aes_gcm::Nonce::from_slice(nonce);
+        match cipher.decrypt_in_place_detached(nonce, aad, plain, aes_gcm::Tag::from_slice(tag)) {
+            Ok(()) => Ok(body_len),
+            Err(_) => {
+                // Never release unauthenticated plaintext.
+                plain.fill(0);
+                Err(AeadError)
             }
-            out[i] = body[i] ^ ks[pos];
-            pos += 1;
-            i += 1;
         }
-        Ok(body_len)
     }
 }
 
@@ -535,9 +485,34 @@ mod tests {
     }
 
     #[test]
+    fn aead_is_aes128_gcm_spec_test_case_2() {
+        // McGrew & Viega, "The Galois/Counter Mode of Operation", test case 2.
+        let mut ct = [0u8; 32];
+        let n = AeadImpl::encrypt(&[0u8; 16], &[0u8; 12], &[0u8; 16], b"", &mut ct);
+        assert_eq!(n, 32);
+        assert_eq!(
+            ct,
+            [
+                0x03, 0x88, 0xda, 0xce, 0x60, 0xb6, 0xa3, 0x92, 0xf3, 0x28, 0xc2, 0xb9, 0x71, 0xb2,
+                0xfe, 0x78, 0xab, 0x6e, 0x47, 0xd4, 0x2c, 0xec, 0x13, 0xbd, 0xf5, 0x3a, 0x67, 0xb2,
+                0x12, 0x57, 0xbd, 0xdf,
+            ]
+        );
+    }
+
+    #[test]
+    fn aead_refuses_wrong_key_or_nonce_length() {
+        let mut ct = [0u8; 64];
+        assert_eq!(AeadImpl::encrypt(&[0u8; 8], &[0u8; 12], b"x", b"", &mut ct), 0);
+        assert_eq!(AeadImpl::encrypt(&[0u8; 16], &[0u8; 8], b"x", b"", &mut ct), 0);
+        let mut out = [0u8; 64];
+        assert!(AeadImpl::decrypt(&[0u8; 16], &[0u8; 8], &ct[..17], b"", &mut out).is_err());
+    }
+
+    #[test]
     fn aead_roundtrip_small() {
         let key = [0u8; 16];
-        let nonce = [0u8; 8];
+        let nonce = [0u8; 12];
         let pt = b"hello-aead";
         let mut ct = [0u8; 64];
         let n = AeadImpl::encrypt(&key, &nonce, pt, b"aad", &mut ct);
@@ -550,7 +525,7 @@ mod tests {
     #[test]
     fn aead_rejects_tampered_tag() {
         let key = [0u8; 16];
-        let nonce = [0u8; 8];
+        let nonce = [0u8; 12];
         let pt = b"hello-aead";
         let mut ct = [0u8; 64];
         let n = AeadImpl::encrypt(&key, &nonce, pt, b"aad", &mut ct);
@@ -562,7 +537,7 @@ mod tests {
     #[test]
     fn aead_rejects_wrong_aad() {
         let key = [0u8; 16];
-        let nonce = [0u8; 8];
+        let nonce = [0u8; 12];
         let pt = b"hello-aead";
         let mut ct = [0u8; 64];
         let n = AeadImpl::encrypt(&key, &nonce, pt, b"aad", &mut ct);
@@ -575,7 +550,7 @@ mod tests {
         let key1 = [0u8; 16];
         let mut key2 = [0u8; 16];
         key2[0] = 0xFF;
-        let nonce = [0u8; 8];
+        let nonce = [0u8; 12];
         let pt = b"hello-aead";
         let mut ct = [0u8; 64];
         let n = AeadImpl::encrypt(&key1, &nonce, pt, b"aad", &mut ct);

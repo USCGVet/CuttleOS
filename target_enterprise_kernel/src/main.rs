@@ -27,6 +27,9 @@
 // banner build stays byte-for-byte identical in structure.
 #![cfg_attr(cuttle_prod, allow(dead_code, unused_imports, unused_mut, unused_variables))]
 
+// rustls (HTTPS on :443) allocates; `heap.rs` provides the global allocator.
+extern crate alloc;
+
 use core::arch::asm;
 use core::panic::PanicInfo;
 
@@ -34,9 +37,8 @@ use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::{entry_point, BootInfo};
 use cuttle_contracts::{
     AccessKind, AuditEvent, AuditLog, AuditVerdict, BpfContext, CrashContext, CrashDump, EBpf,
-    FilterAction, FilterRule, Filesystem, HandshakeKeys, Hash, Iommu, Ipv4PacketView, NtpReply,
-    NtpTimestamp, PacketFilter, PagePerms, Sntp, SymbolResolve, Tls13Client, Tls13Server, Tpm,
-    TpmResponseView, Verdict, Vfs, WriteAheadLog, AUDIT_EVENT_WIRE_LEN, AUDIT_SNAPSHOT_HEADER_LEN,
+    FilterAction, FilterRule, Filesystem, Hash, Iommu, Ipv4PacketView, NtpReply, NtpTimestamp,
+    PacketFilter, PagePerms, Sntp, SymbolResolve, Tpm, TpmResponseView, Verdict, Vfs, WriteAheadLog, AUDIT_EVENT_WIRE_LEN, AUDIT_SNAPSHOT_HEADER_LEN,
     AUDIT_SNAPSHOT_MAGIC, BPF_STACK_SIZE, FS_O_RDONLY, FW_PORT_ANY, IP_PROTO_ICMP, IP_PROTO_TCP,
     IP_PROTO_UDP, SNTP_MODE_CLIENT, SNTP_MODE_SERVER, SNTP_PACKET_LEN, SNTP_VERSION,
     TPM_ALG_SHA256, TPM_CC_GET_RANDOM, TPM_RC_SUCCESS, TPM_SHA256_DIGEST_LEN, TPM_ST_NO_SESSIONS,
@@ -61,10 +63,7 @@ use target_enterprise::panic_dump::{MemorySectorSink, PanicDumpImpl, DUMP_START_
 use target_enterprise::sntp::SntpImpl;
 use target_enterprise::vfs::{MemRamFs, VfsImpl};
 use target_enterprise::symbols::{StaticSymbolResolver, SymbolEntry};
-use target_enterprise::tls::{
-    build_client_finished, build_client_hello, build_server_hello, derive_handshake_keys,
-    hkdf_expand_label, hkdf_extract, parse_server_hello, Tls13ClientImpl, Tls13ServerImpl,
-};
+use target_enterprise::tls::{hkdf_expand_label, hkdf_extract};
 use target_enterprise::wal::WalImpl;
 use target_enterprise::HashImpl;
 use cuttle_contracts::Kpti;
@@ -547,6 +546,7 @@ mod banners_security_crypto;
 mod banners_storage_fs;
 mod banners_tls_net;
 mod fb_console;
+mod heap;
 mod hw_net_drivers;
 mod hw_storage_drivers;
 mod net_service;
@@ -570,6 +570,7 @@ pub(crate) use smp_hw::*;
 // ============================================================
 
 pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    heap::init(); // before anything allocates (rustls on port 443)
     set_phys_offset(boot_info);
     fb_register(boot_info);
     serial_init();
@@ -583,15 +584,12 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // QEMU smoke fails) and emits one line on success.
     #[cfg(not(cuttle_prod))]
     banner_tls_hkdf();
+    // HTTPS building blocks: the RustCrypto provider's known-answer
+    // vectors, then a generated certificate parsed and verified.
     #[cfg(not(cuttle_prod))]
-    banner_tls_server_hello();
+    banner_tls_kat();
     #[cfg(not(cuttle_prod))]
-    banner_tls_client();
-    // Cross-morph session continuity (Class B): RFC 8446 resumption PSK
-    // survives a sealed-blob round trip; successor derives the same
-    // early secret.
-    #[cfg(not(cuttle_prod))]
-    banner_tls_resumption();
+    banner_tls_cert();
     #[cfg(not(cuttle_prod))]
     banner_wal_replay();
     #[cfg(not(cuttle_prod))]
@@ -786,7 +784,7 @@ static CONSOLE_NET_SVC: spin::Mutex<target_enterprise::LivedNet> =
     spin::Mutex::new(target_enterprise::LivedNet::empty());
 
 /// Unified continuous OS event loop multiplexing:
-/// - VirtIO-Net (`VnetModern`) + [`target_enterprise::LivedNet`] (`HTTP :80`, `TLS 1.3 :443`, `UDP :8080`, `UDP :8081`, `ICMP`, `ARP`)
+/// - VirtIO-Net (`VnetModern`) + [`target_enterprise::LivedNet`] (`HTTP :80`, `HTTPS :443` (rustls TLS 1.3), `UDP :8080`, `UDP :8081`, `ICMP`, `ARP`)
 /// - Serial console (`COM1` `0x3F8`) and PS/2 keyboard (`0x60`/`0x64`)
 /// - Live AHCI disk persistence (`LBA 1040..=1065`) on `sync`, SQL mutations, `halt`, and `reboot`
 pub(crate) fn live_os_console_loop() -> ! {
@@ -830,6 +828,7 @@ pub(crate) fn live_os_console_loop() -> ! {
             Some(k) => target_enterprise::LivedNet::with_auth_key(vn.mac, k),
             None => target_enterprise::LivedNet::new_unprovisioned(vn.mac),
         };
+        enable_https(svc, vn.mac);
     }
     let mut net_rx: u64 = 0;
     let mut net_tx: u64 = 0;

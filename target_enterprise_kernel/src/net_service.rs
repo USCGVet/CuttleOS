@@ -501,6 +501,33 @@ pub(crate) fn service_udp_status() {
     service_udp_status_legacy();
 }
 
+/// Serve HTTPS on port 443 from `svc`: seed the TLS CSPRNG from hardware
+/// entropy, derive this node's TLS identity, build the rustls server
+/// configuration and hand it to the service. Emits
+/// `HTTPS UP port=443 tls13=rustls cert_sha256=<hex64>`; clients pin that
+/// certificate (fetch it once, compare this fingerprint out of band).
+pub(crate) fn enable_https(svc: &mut target_enterprise::LivedNet, mac: [u8; 6]) {
+    use target_enterprise::https::{server_config, ServerIdentity};
+    use target_enterprise::tls_provider::{seed_system_rng, system_provider};
+
+    seed_system_rng(tls_rng_seed());
+    let identity = ServerIdentity::derive(&derive_runtime_tls_identity_secret(mac), mac);
+    match server_config(&identity, system_provider()) {
+        Ok(config) => {
+            svc.enable_tls(config);
+            let mut line = [0u8; 128];
+            let prefix = b"HTTPS UP port=443 tls13=rustls cert_sha256=";
+            line[..prefix.len()].copy_from_slice(prefix);
+            let mut pos = prefix.len();
+            pos += hex_encode(&identity.fingerprint(), 32, &mut line[pos..]);
+            line[pos] = b'\n';
+            pos += 1;
+            serial_write_bytes(&line[..pos]);
+        }
+        Err(_) => serial_write_str("HTTPS DISABLED: TLS configuration rejected\n"),
+    }
+}
+
 /// Service loop over the modern virtio-net driver.
 #[inline(never)]
 pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
@@ -509,6 +536,7 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
         Some(k) => target_enterprise::LivedNet::with_auth_key(mac, k),
         None => target_enterprise::LivedNet::new_unprovisioned(mac),
     };
+    enable_https(&mut svc, mac);
     serial_write_str("UDP SVC UP modern ip=10.0.2.15 port=8080\n");
     serial_write_str("NET SVC UP ip=10.0.2.15 udp=8080 tcp=80 icmp=echo\n");
     {
@@ -1106,6 +1134,7 @@ pub(crate) fn service_udp_status_legacy() {
         Some(k) => target_enterprise::LivedNet::with_auth_key(mac, k),
         None => target_enterprise::LivedNet::new_unprovisioned(mac),
     };
+    enable_https(&mut svc, mac);
 
     // Bounded service window.
     {

@@ -503,8 +503,8 @@ pub enum HttpError {
 ///   handled standalone.
 /// - URL-decoding / query-string parsing. `path` is the raw bytes;
 ///   the caller decodes if needed.
-/// - HTTPS — this is the HTTP layer. TLS protection is the `Tls13Server`
-///   contract; the kernel composes them.
+/// - HTTPS — this is the HTTP layer. TLS (rustls, in
+///   `target_enterprise::https`) wraps it on port 443.
 pub trait Http {
     /// Parse an HTTP/1.1 request from `bytes`. The returned view
     /// borrows from `bytes`.

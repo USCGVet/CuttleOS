@@ -12,15 +12,8 @@ pub(crate) use crate::*;
 #[inline(never)]
 pub(crate) fn banner_tls_hkdf() {
     let mut prk = [0u8; 32];
-    <Tls13ServerImpl as Tls13Server>::hkdf_extract(&kf::HKDF_SALT, &kf::HKDF_IKM, &mut prk);
+    hkdf_extract(&kf::HKDF_SALT, &kf::HKDF_IKM, &mut prk);
     assert_eq_bytes(&prk, &kf::HKDF_EXPECTED_PRK, "TLS HKDF-Extract");
-
-    // Also exercise the freestanding fn so the diversifier-renamed
-    // local bindings in hkdf_extract (`total_label_len`, `sid_len`,
-    // etc., per iteration 12) all show in the live call graph.
-    let mut prk2 = [0u8; 32];
-    hkdf_extract(&kf::HKDF_SALT, &kf::HKDF_IKM, &mut prk2);
-    assert_eq_bytes(&prk2, &kf::HKDF_EXPECTED_PRK, "TLS HKDF-Extract(2)");
 
     let mut expanded = [0u8; kf::HKDF_EXPAND_OUT_LEN];
     hkdf_expand_label(&prk, kf::HKDF_EXPAND_LABEL, &kf::HKDF_INFO, &mut expanded);
@@ -41,240 +34,76 @@ pub(crate) fn banner_tls_hkdf() {
     serial_write_bytes(&line[..pos]);
 }
 
-/// TLS: build a ServerHello against the locked ClientHello fixture,
-/// assert byte length and prefix, emit `TLS server_hello OK len=<N>\n`.
+/// TLS: run the RustCrypto provider's known-answer self-test — AES-128-GCM
+/// (GCM spec cases 1–2), ChaCha20-Poly1305 (RFC 8439 §2.8.2), X25519
+/// (RFC 7748 §6.1), ECDSA P-256 / SHA-256 (RFC 6979 §A.2.5), P-256 ECDH and a
+/// record-layer round trip with tamper rejection — then emit
+/// `TLS kat OK aead=2 kx=2 sig=1\n`. These are the exact primitives rustls
+/// calls for HTTPS on port 443; a morph that perturbs any of them panics
+/// here and the banner never appears.
 #[cfg(not(cuttle_prod))]
 #[inline(never)]
-pub(crate) fn banner_tls_server_hello() {
-    let mut out = [0u8; 256];
-    let n = match build_server_hello(
-        &kf::CLIENT_HELLO,
-        &kf::SERVER_RANDOM,
-        &kf::SERVER_PUBKEY,
-        None,
-        &mut out,
-    ) {
-        Ok(n) => n,
-        Err(_) => panic!("TLS build_server_hello returned Err"),
+pub(crate) fn banner_tls_kat() {
+    let report = match target_enterprise::tls_provider::self_test() {
+        Ok(r) => r,
+        Err(why) => {
+            serial_write_str("TLS kat FAIL ");
+            serial_write_str(why);
+            serial_write_str("\n");
+            panic!("TLS provider known-answer test failed");
+        }
     };
-    if n != kf::SERVER_HELLO_EXPECTED_LEN {
-        panic!("TLS ServerHello length drift");
-    }
-    assert_eq_bytes(
-        &out[..8],
-        &kf::SERVER_HELLO_EXPECTED_PREFIX8,
-        "TLS ServerHello prefix",
-    );
-
     let mut line = [0u8; 48];
     let mut pos = 0usize;
-    let prefix = b"TLS server_hello OK len=";
-    line[..prefix.len()].copy_from_slice(prefix);
-    pos += prefix.len();
-    pos += dec_u64(n as u64, &mut line[pos..]);
+    for (label, n) in [(&b"TLS kat OK aead="[..], report.aead), (b" kx=", report.kx), (b" sig=", report.sig)] {
+        line[pos..pos + label.len()].copy_from_slice(label);
+        pos += label.len();
+        pos += dec_u64(n as u64, &mut line[pos..]);
+    }
     line[pos] = b'\n';
     pos += 1;
     serial_write_bytes(&line[..pos]);
 }
 
-/// TLS 1.3 client (TASK-049): build a ClientHello against the locked
-/// fixtures, assert byte length + prefix; parse the locked
-/// ServerHello fixture, assert the recovered server_pubkey matches;
-/// run the RFC 8446 §7.1 key schedule against the locked shared
-/// secret, assert all three secrets match the locked goldens; build
-/// the client Finished verify_data against a synthetic transcript
-/// hash, assert byte-equality.
-///
-/// Emits:
-///   `TLS client_hello OK len=<dec>\n`
-///   `TLS client handshake_keys OK prk=<hex16>\n`
-///
-/// A kernel that perturbs the ClientHello layout, the ServerHello
-/// parser, the key-schedule label or chaining order, or the Finished
-/// MAC construction panics here and the banners never appear.
+/// TLS: derive the golden node identity, generate its self-signed X.509 v3
+/// certificate, parse it back with the in-tree DER parser, check the
+/// subject/issuer, validity window and ECDSA P-256 public key, and verify the
+/// certificate's self-signature. Emits
+/// `TLS cert OK alg=ecdsa-p256 sha=<hex16>\n` (first 8 bytes of the DER
+/// SHA-256 fingerprint; RFC 6979 signing makes it identical every boot).
 #[cfg(not(cuttle_prod))]
 #[inline(never)]
-pub(crate) fn banner_tls_client() {
-    // 1) ClientHello build — length + prefix lock.
-    let mut ch = [0u8; 256];
-    let ch_len = match build_client_hello(
-        &kf::TLS_CLIENT_RANDOM,
-        &kf::TLS_CLIENT_PUBKEY,
-        &mut ch,
-    ) {
-        Ok(n) => n,
-        Err(_) => panic!("TLS build_client_hello returned Err"),
+pub(crate) fn banner_tls_cert() {
+    use cuttle_contracts::{X509PubKey, X509};
+    use target_enterprise::https::{golden, ServerIdentity};
+    use target_enterprise::x509::X509Impl;
+
+    let identity = ServerIdentity::derive(&golden::IDENTITY_SECRET, golden::MAC);
+    let cert = match X509Impl::parse(identity.cert_der()) {
+        Ok(c) => c,
+        Err(_) => panic!("TLS cert: generated certificate does not parse"),
     };
-    if ch_len != kf::TLS_CLIENT_HELLO_EXPECTED_LEN {
-        panic!("TLS ClientHello length drift");
+    if cert.subject != cert.issuer {
+        panic!("TLS cert: not self-issued");
     }
-    assert_eq_bytes(
-        &ch[..8],
-        &kf::TLS_CLIENT_HELLO_EXPECTED_PREFIX8,
-        "TLS ClientHello prefix",
-    );
-
-    // Also exercise the trait surface so the diversifier-renamed
-    // helpers inside the impl all show in the live call graph.
-    let mut ch2 = [0u8; 256];
-    let ch2_len = match <Tls13ClientImpl as Tls13Client>::build_client_hello(
-        &kf::TLS_CLIENT_RANDOM,
-        &kf::TLS_CLIENT_PUBKEY,
-        &mut ch2,
-    ) {
-        Ok(n) => n,
-        Err(_) => panic!("Tls13Client::build_client_hello returned Err"),
-    };
-    if ch2_len != ch_len {
-        panic!("TLS ClientHello length differs between free fn + trait");
+    if cert.not_before.unix != 1_735_689_600 || cert.not_after.unix != 4_102_444_799 {
+        panic!("TLS cert: validity window drift");
     }
-    assert_eq_bytes(&ch2[..ch2_len], &ch[..ch_len], "TLS ClientHello bytes");
-
-    // Emit the first banner now that the ClientHello is locked.
-    {
-        let mut line = [0u8; 48];
-        let mut pos = 0usize;
-        let prefix = b"TLS client_hello OK len=";
-        line[..prefix.len()].copy_from_slice(prefix);
-        pos += prefix.len();
-        pos += dec_u64(ch_len as u64, &mut line[pos..]);
-        line[pos] = b'\n';
-        pos += 1;
-        serial_write_bytes(&line[..pos]);
+    let public = identity.public_key_sec1();
+    match cert.pubkey {
+        X509PubKey::EcdsaP256 { point } if point == &public[..] => {}
+        _ => panic!("TLS cert: SPKI is not the identity's P-256 key"),
     }
-
-    // 2) ServerHello parse — recover server_pubkey + assert.
-    let parsed = match parse_server_hello(&kf::TLS_SERVER_HELLO_FIXTURE) {
-        Ok(p) => p,
-        Err(_) => panic!("TLS parse_server_hello returned Err"),
-    };
-    // Expect server_pubkey = 32 × 0x09.
-    let mut i = 0usize;
-    while i < 32 {
-        if parsed.server_pubkey[i] != 0x09 {
-            panic!("TLS parsed server_pubkey drift");
-        }
-        i += 1;
+    if !target_enterprise::tls_provider::ecdsa_p256_sha256_verify(&public, cert.tbs, cert.signature) {
+        panic!("TLS cert: self-signature does not verify");
     }
-    if parsed.cipher_suite != 0x1301 {
-        panic!("TLS parsed cipher_suite drift");
-    }
+    assert_eq_bytes(&identity.fingerprint(), &kf::HTTPS_GOLDEN_CERT_SHA256, "TLS cert fingerprint");
 
-    // 3) Key schedule — derive + lock the three secrets.
-    let mut keys = HandshakeKeys {
-        handshake_secret: [0u8; 32],
-        client_handshake_traffic_secret: [0u8; 32],
-        server_handshake_traffic_secret: [0u8; 32],
-    };
-    derive_handshake_keys(
-        &kf::TLS_SHARED_SECRET,
-        &ch[..ch_len],
-        &kf::TLS_SERVER_HELLO_FIXTURE,
-        &mut keys,
-    );
-    assert_eq_bytes(
-        &keys.handshake_secret,
-        &kf::TLS_HANDSHAKE_SECRET_EXPECTED,
-        "TLS handshake_secret",
-    );
-    assert_eq_bytes(
-        &keys.client_handshake_traffic_secret,
-        &kf::TLS_CLIENT_HS_TRAFFIC_EXPECTED,
-        "TLS c_hs_traffic",
-    );
-    assert_eq_bytes(
-        &keys.server_handshake_traffic_secret,
-        &kf::TLS_SERVER_HS_TRAFFIC_EXPECTED,
-        "TLS s_hs_traffic",
-    );
-
-    // 4) Client Finished MAC — lock verify_data bytes.
-    let mut vd = [0u8; 32];
-    build_client_finished(
-        &keys.client_handshake_traffic_secret,
-        &kf::TLS_FINISHED_TRANSCRIPT_HASH,
-        &mut vd,
-    );
-    assert_eq_bytes(&vd, &kf::TLS_CLIENT_FINISHED_EXPECTED, "TLS client Finished");
-
-    // Emit the second banner: `TLS client handshake_keys OK prk=<hex16>`.
-    {
-        let mut line = [0u8; 64];
-        let mut pos = 0usize;
-        let prefix = b"TLS client handshake_keys OK prk=";
-        line[..prefix.len()].copy_from_slice(prefix);
-        pos += prefix.len();
-        pos += hex_encode(&keys.handshake_secret, 8, &mut line[pos..]);
-        line[pos] = b'\n';
-        pos += 1;
-        serial_write_bytes(&line[..pos]);
-    }
-}
-
-/// TLS 1.3 session resumption (RFC 8446 §4.6.1) — cross-morph session
-/// continuity (Class B). Full chain: master secret → resumption master
-/// secret → resumption PSK → sealed blob → [morph boundary] → open blob
-/// → early secret from the RELOADED PSK. The banner proves the reloaded
-/// early secret is byte-identical to the continuous-process one, and
-/// that a corrupted durable PSK is rejected rather than silently
-/// producing a wrong early secret. Emits
-/// `TLS RESUME OK psk=<hex8>\n`.
-#[cfg(not(cuttle_prod))]
-#[inline(never)]
-pub(crate) fn banner_tls_resumption() {
-    use target_enterprise::tls::{
-        derive_resumption_master_secret, derive_resumption_psk, early_secret_from_psk,
-        open_resumption_psk, seal_resumption_psk, RESUMPTION_BLOB_LEN,
-    };
-
-    // Fixture handshake output (a real deployment takes these from the
-    // completed handshake; the banner exercises the derivation path).
-    let master_secret = [0x42u8; 32];
-    let transcript = b"cuttle kernel resumption banner transcript";
-    let ticket_nonce = [0xA5u8; 32];
-
-    let mut rms = [0u8; 32];
-    derive_resumption_master_secret(&master_secret, transcript, &mut rms);
-    let mut psk = [0u8; 32];
-    derive_resumption_psk(&rms, &ticket_nonce, &mut psk);
-    let mut early_direct = [0u8; 32];
-    early_secret_from_psk(&psk, &mut early_direct);
-
-    // Sealed blob = the durable artifact that crosses a morph cycle.
-    let mut blob = [0u8; RESUMPTION_BLOB_LEN];
-    seal_resumption_psk(&psk, &ticket_nonce, &mut blob);
-
-    // --- simulated morph boundary: parse back as the successor kernel ---
-    let (nonce2, psk2) = match open_resumption_psk(&blob) {
-        Ok(t) => t,
-        Err(_) => panic!("TLS RESUME: sealed blob rejected own PSK"),
-    };
-    if nonce2 != ticket_nonce || psk2 != psk {
-        panic!("TLS RESUME: blob round-trip drift");
-    }
-    let mut early_reloaded = [0u8; 32];
-    early_secret_from_psk(&psk2, &mut early_reloaded);
-    if early_reloaded != early_direct {
-        panic!("TLS RESUME: early secret drift across boundary");
-    }
-
-    // Corrupt durable PSK must fail closed, not yield a wrong secret.
-    let mut bad = blob;
-    bad[50] ^= 0x80;
-    if open_resumption_psk(&bad).is_ok() {
-        panic!("TLS RESUME: corrupted blob accepted");
-    }
-
-    let mut line = [0u8; 48];
-    let mut pos = 0usize;
-    let prefix = b"TLS RESUME OK psk=";
+    let mut line = [0u8; 64];
+    let prefix = b"TLS cert OK alg=ecdsa-p256 sha=";
     line[..prefix.len()].copy_from_slice(prefix);
-    pos += prefix.len();
-    let be: [u8; 4] = [psk[0], psk[1], psk[2], psk[3]];
-    let mut hx = [0u8; 8];
-    hex_encode(&be, 4, &mut hx);
-    line[pos..pos + 8].copy_from_slice(&hx);
-    pos += 8;
+    let mut pos = prefix.len();
+    pos += hex_encode(&identity.fingerprint(), 8, &mut line[pos..]);
     line[pos] = b'\n';
     pos += 1;
     serial_write_bytes(&line[..pos]);

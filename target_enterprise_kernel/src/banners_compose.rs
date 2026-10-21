@@ -956,7 +956,7 @@ pub(crate) fn banner_shell_compose() {
         panic!("SHELL compose: sync output drift");
     }
     serial_write_str("FS partition OK lba=1042..1057 sectors=16 files=1 magic=CTTLFS01\n");
-    verify_https_and_concurrent_tcp_compose(boots, seal_key);
+    verify_https_and_concurrent_tcp_compose();
     verify_service_runtime_compose(vsh);
     let mut s_idx = 0usize;
     while s_idx < target_enterprise::svc_runtime::SERVICE_COUNT {
@@ -1100,68 +1100,39 @@ fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
     );
 }
 
+/// HTTPS compose: fill fifteen of LivedNet's sixteen TCP slots with plain
+/// HTTP connections, open the sixteenth on port 443, and replay the recorded
+/// golden TLS 1.3 session (rustls server, RustCrypto provider, generated
+/// certificate) through `handle_frame`. Every server byte — ServerHello,
+/// encrypted Certificate/CertificateVerify/Finished, the encrypted
+/// `/healthz` response and the closing `close_notify` — must hash to the
+/// locked fixture. Emits
+/// `HTTPS compose OK slots=16 port=443 tls13=rustls bytes=<n> sha=<hex8>`.
 #[inline(never)]
-fn verify_https_and_concurrent_tcp_compose(boots: u64, auth_key: [u8; 32]) {
-    use cuttle_contracts::{tcp_flags, Aead, Tcp, IP_PROTO_TCP};
-    use target_enterprise::lived_net::{
-        GUEST_IP, HTTPS_PORT, HTTP_PORT, TCP_MAX_SLOTS, TLS_CONTENT_APPLICATION_DATA,
-        TLS_SERVER_PUBKEY,
-    };
+fn verify_https_and_concurrent_tcp_compose() {
+    use cuttle_contracts::{tcp_flags, Tcp, IP_PROTO_TCP};
+    use target_enterprise::https::{golden, golden_server, replay_golden_flights, LoopbackClient};
+    use target_enterprise::lived_net::{GUEST_IP, HTTP_PORT, TCP_MAX_SLOTS};
     use target_enterprise::tcp::TcpImpl;
-    use target_enterprise::tls::{
-        build_client_hello, decode_record_header, encode_record_header, parse_server_hello,
-        x25519_basepoint, CONTENT_TYPE_HANDSHAKE, LEGACY_VERSION, RECORD_HEADER_LEN,
-    };
 
-    const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
     const PEER_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
     const PEER_IP: [u8; 4] = [10, 0, 2, 2];
 
-    static COMPOSE_REPLIES: spin::Mutex<target_enterprise::ReplySet> =
-        spin::Mutex::new(target_enterprise::ReplySet::new());
-    static COMPOSE_NET: spin::Mutex<target_enterprise::LivedNet> =
-        spin::Mutex::new(target_enterprise::LivedNet::empty());
-
-    let mut net_guard = COMPOSE_NET.lock();
-    let net: &mut target_enterprise::LivedNet = &mut *net_guard;
-    *net = target_enterprise::LivedNet::with_auth_key(MAC, auth_key);
-    let mut tls_server_isn = 0u32;
-
-    let wrap_eth_ip = |tcp_seg: &[u8], frame_out: &mut [u8; 384]| -> usize {
-        let ip_len = 20 + tcp_seg.len();
-        let eth_len = 14 + ip_len;
-        frame_out[..6].copy_from_slice(&MAC);
-        frame_out[6..12].copy_from_slice(&PEER_MAC);
-        frame_out[12] = 0x08;
-        frame_out[13] = 0x00;
-        frame_out[14] = 0x45;
-        frame_out[15] = 0;
-        frame_out[16..18].copy_from_slice(&(ip_len as u16).to_be_bytes());
-        frame_out[18..22].copy_from_slice(&[0, 0, 0x40, 0]);
-        frame_out[22] = 64;
-        frame_out[23] = IP_PROTO_TCP;
-        frame_out[24..26].copy_from_slice(&[0, 0]);
-        frame_out[26..30].copy_from_slice(&PEER_IP);
-        frame_out[30..34].copy_from_slice(&GUEST_IP);
-        let ck = target_enterprise::net::ipv4_header_checksum(&frame_out[14..34]);
-        frame_out[24..26].copy_from_slice(&ck.to_be_bytes());
-        frame_out[34..eth_len].copy_from_slice(tcp_seg);
-        eth_len
+    let _golden = target_enterprise::tls_provider::GOLDEN_LOCK.lock();
+    let mut net = match golden_server() {
+        Ok(n) => n,
+        Err(why) => panic!("HTTPS compose: {}", why),
     };
+    let mut replies = alloc::boxed::Box::new(target_enterprise::ReplySet::new());
 
     let mut slot = 0usize;
-    while slot < TCP_MAX_SLOTS {
-        let dst_port = if slot + 1 == TCP_MAX_SLOTS {
-            HTTPS_PORT
-        } else {
-            HTTP_PORT
-        };
+    while slot + 1 < TCP_MAX_SLOTS {
         let cport = 52000 + (slot as u16);
         let cisn = 0x5000_0000 + ((slot as u32) << 16);
-        let mut syn = [0u8; 40];
+        let mut frame = [0u8; 74];
         let n = TcpImpl::build_segment(
             cport,
-            dst_port,
+            HTTP_PORT,
             cisn,
             0,
             tcp_flags::SYN,
@@ -1169,108 +1140,60 @@ fn verify_https_and_concurrent_tcp_compose(boots: u64, auth_key: [u8; 32]) {
             b"",
             PEER_IP,
             GUEST_IP,
-            &mut syn,
+            &mut frame[34..],
         )
         .unwrap();
-        let mut frame = [0u8; 384];
-        let flen = wrap_eth_ip(&syn[..n], &mut frame);
-        let mut rep = COMPOSE_REPLIES.lock();
-        *rep = target_enterprise::ReplySet::new();
-        net.handle_frame(&frame[..flen], boots, &mut *rep);
-        if rep.len() != 1 {
-            panic!("HTTPS+TCP4 compose: expected SYN-ACK");
-        }
-        let sa = TcpImpl::parse_segment(&rep.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
-        if sa.flags != (tcp_flags::SYN | tcp_flags::ACK) {
-            panic!("HTTPS+TCP4 compose: unexpected SYN-ACK flags");
-        }
-        if dst_port == HTTPS_PORT {
-            tls_server_isn = sa.seq;
+        let ip_len = 20 + n;
+        frame[..6].copy_from_slice(&golden::MAC);
+        frame[6..12].copy_from_slice(&PEER_MAC);
+        frame[12] = 0x08;
+        frame[13] = 0x00;
+        frame[14] = 0x45;
+        frame[16..18].copy_from_slice(&(ip_len as u16).to_be_bytes());
+        frame[20] = 0x40;
+        frame[22] = 64;
+        frame[23] = IP_PROTO_TCP;
+        frame[26..30].copy_from_slice(&PEER_IP);
+        frame[30..34].copy_from_slice(&GUEST_IP);
+        let ck = target_enterprise::net::ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&ck.to_be_bytes());
+        *replies = target_enterprise::ReplySet::new();
+        net.handle_frame(&frame[..14 + ip_len], golden::BOOTS, &mut replies);
+        let synack = match replies.get(0) {
+            Some(f) => TcpImpl::parse_segment(&f[34..], GUEST_IP, PEER_IP).unwrap(),
+            None => panic!("HTTPS compose: expected SYN-ACK on port 80"),
+        };
+        if synack.flags != (tcp_flags::SYN | tcp_flags::ACK) {
+            panic!("HTTPS compose: unexpected SYN-ACK flags");
         }
         slot += 1;
     }
 
-    if net.active_tcp_slots() != TCP_MAX_SLOTS {
-        panic!("HTTPS+TCP4 compose: expected all 16 concurrent TCP slots active");
+    let mut client = match LoopbackClient::connect(net, None, golden::CLIENT_PORT, golden::BOOTS) {
+        Ok(c) => c,
+        Err(why) => panic!("HTTPS compose: {}", why),
+    };
+    if client.net().active_tcp_slots() != TCP_MAX_SLOTS {
+        panic!("HTTPS compose: expected all 16 concurrent TCP slots active");
+    }
+    let report = match replay_golden_flights(&mut client) {
+        Ok(r) => r,
+        Err(why) => panic!("HTTPS compose: {}", why),
+    };
+    if client.net().tls_sessions_started != 1 {
+        panic!("HTTPS compose: expected exactly one TLS session");
     }
 
-    let client_random = [0x33u8; 32];
-    let client_scalar = [0x77u8; 32];
-    let client_pubkey = x25519_basepoint(&client_scalar);
-    let mut ch_msg = [0u8; 256];
-    let ch_len = build_client_hello(&client_random, &client_pubkey, &mut ch_msg).unwrap();
-    let mut tls_rec = [0u8; 264];
-    let _ = encode_record_header(
-        CONTENT_TYPE_HANDSHAKE,
-        LEGACY_VERSION,
-        ch_len as u16,
-        &mut tls_rec,
-    );
-    tls_rec[RECORD_HEADER_LEN..RECORD_HEADER_LEN + ch_len].copy_from_slice(&ch_msg[..ch_len]);
-    let rec_total = RECORD_HEADER_LEN + ch_len;
-
-    let tls_cport = 52000 + ((TCP_MAX_SLOTS - 1) as u16);
-    let tls_cisn = 0x5000_0000 + (((TCP_MAX_SLOTS - 1) as u32) << 16);
-    let mut ch_seg = [0u8; 320];
-    let n = TcpImpl::build_segment(
-        tls_cport,
-        HTTPS_PORT,
-        tls_cisn.wrapping_add(1),
-        tls_server_isn.wrapping_add(1),
-        tcp_flags::ACK | tcp_flags::PSH,
-        65535,
-        &tls_rec[..rec_total],
-        PEER_IP,
-        GUEST_IP,
-        &mut ch_seg,
-    )
-    .unwrap();
-    let mut frame = [0u8; 384];
-    let flen = wrap_eth_ip(&ch_seg[..n], &mut frame);
-    let mut rep = COMPOSE_REPLIES.lock();
-    *rep = target_enterprise::ReplySet::new();
-    net.handle_frame(&frame[..flen], boots, &mut *rep);
-    if rep.len() != 1 {
-        panic!("HTTPS+TCP4 compose: expected TLS 1.3 ServerHello + ApplicationData segment");
-    }
-    let resp_seg = TcpImpl::parse_segment(&rep.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
-    let payload = resp_seg.payload;
-    let (r1_type, _, r1_len_u16) = decode_record_header(payload).unwrap();
-    if r1_type != CONTENT_TYPE_HANDSHAKE {
-        panic!("HTTPS+TCP4 compose: expected Handshake record");
-    }
-    let r1_len = r1_len_u16 as usize;
-    let sh_slice = &payload[RECORD_HEADER_LEN..RECORD_HEADER_LEN + r1_len];
-    let parsed_sh = parse_server_hello(sh_slice).unwrap();
-    if parsed_sh.server_pubkey == TLS_SERVER_PUBKEY || parsed_sh.server_pubkey == [0u8; 32] {
-        panic!("HTTPS+TCP4 compose: ServerHello pubkey must be ephemeral");
-    }
-    let mut record_key = [0u8; 16];
-    let _ = target_enterprise::LivedNet::derive_tls13_record_key(
-        &client_scalar,
-        &ch_msg[..ch_len],
-        sh_slice,
-        &mut record_key,
-    );
-    let r2_slice = &payload[RECORD_HEADER_LEN + r1_len..];
-    let (r2_type, _, r2_len_u16) = decode_record_header(r2_slice).unwrap();
-    if r2_type != TLS_CONTENT_APPLICATION_DATA {
-        panic!("HTTPS+TCP4 compose: expected ApplicationData record");
-    }
-    let r2_len = r2_len_u16 as usize;
-    let mut plain_status = [0u8; 64];
-    let plen = target_enterprise::AeadImpl::decrypt(
-        &record_key,
-        &[0u8; 8],
-        &r2_slice[RECORD_HEADER_LEN..RECORD_HEADER_LEN + r2_len],
-        &r2_slice[..RECORD_HEADER_LEN],
-        &mut plain_status,
-    )
-    .unwrap();
-    if !plain_status[..plen].starts_with(b"CUTTLE-STATUS boots=") {
-        panic!("HTTPS+TCP4 compose: decrypted TLS 1.3 status payload drift");
-    }
-
-    serial_write_str("HTTPS+TCP4 compose OK slots=4 port=443 tls13=ok\n");
+    let mut line = [0u8; 96];
+    let prefix = b"HTTPS compose OK slots=16 port=443 tls13=rustls bytes=";
+    line[..prefix.len()].copy_from_slice(prefix);
+    let mut pos = prefix.len();
+    pos += dec_u64(report.server_bytes as u64, &mut line[pos..]);
+    line[pos..pos + 5].copy_from_slice(b" sha=");
+    pos += 5;
+    pos += hex_encode(&report.sha256, 4, &mut line[pos..]);
+    line[pos] = b'\n';
+    pos += 1;
+    serial_write_bytes(&line[..pos]);
 }
 

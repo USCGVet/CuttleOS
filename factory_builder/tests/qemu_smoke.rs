@@ -196,7 +196,7 @@ fn boots_under_qemu_and_emits_banner() {
     };
 
     // TASK-023: the kernel now exercises every morphed surface
-    // (TLS hkdf, TLS ServerHello, WAL replay, IOMMU translate,
+    // (TLS hkdf, TLS KAT + cert, WAL replay, IOMMU translate,
     // HashImpl digest) BEFORE emitting `CUTTLE-TE HALT`. Waiting for
     // the HALT line is the gate: if it appears, every preceding
     // banner is also present because the kernel panics on any drift
@@ -204,26 +204,17 @@ fn boots_under_qemu_and_emits_banner() {
     let required_banners: &[&str] = &[
         "CUTTLE-TE OK",
         "TLS hkdf OK prk_sha=",
-        "TLS server_hello OK len=",
-        // TASK-049: TLS 1.3 client. The kernel builds a ClientHello
-        // against the locked client_random + client_pubkey fixtures,
-        // asserts the byte-exact prefix + length; parses the locked
-        // ServerHello fixture, asserts the recovered server_pubkey
-        // matches; runs the RFC 8446 §7.1 key schedule against the
-        // locked shared_secret, asserts all three handshake-traffic
-        // secrets match the locked goldens; builds the client Finished
-        // verify_data against a synthetic transcript hash, asserts
-        // byte-equality. Both banners appearing means: the
-        // ClientHello extension order + length encoding, the
-        // ServerHello parser's strict supported_versions + key_share
-        // checks, the HKDF-Extract → Derive-Secret → HKDF-Extract
-        // chain, and the Finished MAC construction (HKDF-Expand-Label
-        // + HMAC-SHA-256) are all wired correctly. A morph that
-        // perturbs the cipher_suites singleton, the extension order,
-        // any key-schedule label, or the Finished derivation panics
-        // here and these banners never appear.
-        "TLS client_hello OK len=108",
-        "TLS client handshake_keys OK prk=bb518f061c911017",
+        // HTTPS building blocks. The kernel runs the RustCrypto
+        // provider's known-answer vectors (AES-128-GCM, ChaCha20-
+        // Poly1305 RFC 8439, X25519 RFC 7748, ECDSA P-256 RFC 6979,
+        // P-256 ECDH, record round trip + tamper rejection), then
+        // generates the golden node certificate, parses it with the
+        // in-tree X.509 parser, verifies its self-signature and pins
+        // its SHA-256. A morph that perturbs any primitive or the
+        // certificate encoder panics here and these banners never
+        // appear.
+        "TLS kat OK aead=2 kx=2 sig=1",
+        "TLS cert OK alg=ecdsa-p256 sha=c1a5d92d1e129087",
         "WAL replay OK frames=",
         "IOMMU translate OK pa=",
         "HASH OK digest_sha=",
@@ -754,7 +745,7 @@ fn boots_under_qemu_and_emits_banner() {
         "SECCOMP: OK engine=ebpf filter=enforced",
         "ATTEST: OK seed=",
         "FS partition OK lba=1042..1057 sectors=16 files=1 magic=CTTLFS01",
-        "HTTPS+TCP4 compose OK slots=4 port=443 tls13=ok",
+        "HTTPS compose OK slots=16 port=443 tls13=rustls bytes=882 sha=83e47624",
         "SVC_RUNTIME: OK role=full->wfe->full svcs=3 kpti=isolated seccomp=deny-default rot=1",
         "SHELL compose OK tasks=5 files=5 audit=5",
         "SMP_HW init OK cpus=4 threads=4 ctx_sw=4",
@@ -1007,7 +998,7 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
         "TPM2_TIS driver OK did_vid=000115d1 locality=0 pcr10=extended",
         "WEB+SQL+SESSION compose OK tables=2 rows=6 magic=CTTLSQL1",
         "FS partition OK lba=1042..1057 sectors=16 files=1 magic=CTTLFS01",
-        "HTTPS+TCP4 compose OK slots=4 port=443 tls13=ok",
+        "HTTPS compose OK slots=16 port=443 tls13=rustls bytes=882 sha=83e47624",
         "SHELL compose OK tasks=5 files=5 audit=5",
     ] {
         assert!(

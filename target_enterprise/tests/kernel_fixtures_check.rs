@@ -14,15 +14,11 @@
 //! corresponding `EXPECTED_*` constant and rely on these tests to
 //! verify the new value is consistent with the algorithm.
 
-use cuttle_contracts::{
-    AccessKind, Hash, Iommu, NetStack, PagePerms, Tls13Server, WriteAheadLog,
-};
+use cuttle_contracts::{AccessKind, Hash, Iommu, NetStack, PagePerms, WriteAheadLog};
 use target_enterprise::iommu::{DeviceId, IommuImpl};
 use target_enterprise::kernel_fixtures as kf;
 use target_enterprise::net::{build_udp_datagram, parse_ipv4_header, parse_udp_datagram};
-use target_enterprise::tls::{
-    build_server_hello, hkdf_expand_label, hkdf_extract, Tls13ServerImpl,
-};
+use target_enterprise::tls::{hkdf_expand_label, hkdf_extract};
 use target_enterprise::wal::WalImpl;
 use target_enterprise::{HashImpl, NetStackImpl};
 
@@ -34,13 +30,6 @@ fn hkdf_extract_matches_expected_prk() {
         prk, kf::HKDF_EXPECTED_PRK,
         "HKDF-Extract drift — RFC 5869 §A.1 case 1 vector regressed"
     );
-}
-
-#[test]
-fn hkdf_extract_via_trait_matches_expected_prk() {
-    let mut prk = [0u8; 32];
-    <Tls13ServerImpl as Tls13Server>::hkdf_extract(&kf::HKDF_SALT, &kf::HKDF_IKM, &mut prk);
-    assert_eq!(prk, kf::HKDF_EXPECTED_PRK);
 }
 
 #[test]
@@ -58,27 +47,21 @@ fn hkdf_expand_label_matches_expected_prefix() {
 }
 
 #[test]
-fn server_hello_matches_expected_len_and_prefix() {
-    let mut out = [0u8; 256];
-    let n = build_server_hello(
-        &kf::CLIENT_HELLO,
-        &kf::SERVER_RANDOM,
-        &kf::SERVER_PUBKEY,
-        None,
-        &mut out,
-    )
-    .expect("ServerHello build against locked fixture");
-    assert_eq!(
-        n,
-        kf::SERVER_HELLO_EXPECTED_LEN,
-        "ServerHello length drift"
+fn https_golden_certificate_matches_fixture() {
+    // The kernel's `TLS cert` banner asserts this fingerprint.
+    let identity = target_enterprise::https::ServerIdentity::derive(
+        &target_enterprise::https::golden::IDENTITY_SECRET,
+        target_enterprise::https::golden::MAC,
     );
-    assert_eq!(
-        &out[..8],
-        &kf::SERVER_HELLO_EXPECTED_PREFIX8,
-        "ServerHello prefix drift — actual = {:02x?}",
-        &out[..8]
-    );
+    assert_eq!(identity.fingerprint(), kf::HTTPS_GOLDEN_CERT_SHA256);
+}
+
+#[test]
+fn https_golden_session_replays_against_fixture() {
+    // The kernel's `HTTPS compose` banner runs exactly this replay.
+    let report = target_enterprise::https::replay_golden_session().expect("golden TLS session drift");
+    assert_eq!(report.server_bytes, kf::HTTPS_GOLDEN_SERVER_LEN);
+    assert_eq!(report.sha256, kf::HTTPS_GOLDEN_SERVER_SHA256);
 }
 
 #[test]

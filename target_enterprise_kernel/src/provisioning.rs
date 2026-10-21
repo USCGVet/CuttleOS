@@ -251,6 +251,43 @@ pub(crate) fn derive_runtime_net_auth_key(mac: [u8; 6]) -> Option<[u8; 32]> {
     }
 }
 
+/// Derive the 32-byte secret behind this node's TLS identity (P-256 key and
+/// self-signed certificate, see `target_enterprise::https::ServerIdentity`)
+/// from the device master key and `mac`. On a provisioned device the result is
+/// stable across reboots and morph cycles, so clients can pin the
+/// certificate; on an unprovisioned boot the master key is boot-ephemeral and
+/// so is the certificate.
+pub(crate) fn derive_runtime_tls_identity_secret(mac: [u8; 6]) -> [u8; 32] {
+    let (master, _) = device_master_key_state();
+    let mut msg = [0u8; 29];
+    msg[..23].copy_from_slice(b"cuttle-tls-identity-v1:");
+    msg[23..].copy_from_slice(&mac);
+    let mut out = [0u8; 32];
+    target_enterprise::tls::hmac_sha256(&master, &msg, &mut out);
+    out
+}
+
+/// 32 bytes of seed material for the TLS CSPRNG
+/// (`target_enterprise::tls_provider::SYSTEM_RNG`): sixteen hardware-entropy
+/// words (RDRAND, or the TSC/CMOS/PIT jitter fallback) plus TPM randomness
+/// when a TPM is present, condensed with HMAC-SHA256.
+pub(crate) fn tls_rng_seed() -> [u8; 32] {
+    let mut raw = [0u8; 144];
+    let mut r = 0usize;
+    while r < 16 {
+        let w = read_hw_entropy_u64(0x544c_5300 + r as u64);
+        raw[r * 8..r * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        r += 1;
+    }
+    if let Some((_, tpm_rnd)) = probe_hw_tpm_random_16() {
+        raw[128..144].copy_from_slice(&tpm_rnd);
+    }
+    let mut out = [0u8; 32];
+    target_enterprise::tls::hmac_sha256(b"cuttle-tls-rng-seed-v1", &raw, &mut out);
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut raw);
+    out
+}
+
 /// Derive the 256-bit `HMAC-SHA256` durable-state seal key from the
 /// out-of-band provisioned device master key (or the boot-ephemeral hardware
 /// key on unprovisioned boots).

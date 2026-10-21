@@ -19,6 +19,23 @@ spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 # debug builds.
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 
+# HTTPS on port 443: the TLS 1.3 protocol is rustls (no_std + alloc, driven
+# through its unbuffered API) and the cryptography is RustCrypto, wired in by
+# `tls_provider.rs`. No C or assembly, so it builds for soft-float
+# `x86_64-unknown-none`; the kernel's .cargo/config.toml sets the
+# `*_force_soft` / serial-backend cfgs so no SIMD code is emitted.
+# Licenses: rustls Apache-2.0/ISC/MIT; RustCrypto MIT/Apache-2.0; dalek BSD-3-Clause.
+rustls = { version = "0.23", default-features = false }
+hmac = { version = "0.12", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+chacha20poly1305 = { version = "0.10", default-features = false }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh"] }
+rand_chacha = { version = "0.3", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+zeroize = { version = "1", default-features = false }
+
 # Integration tests run as std targets and exercise both the contract
 # property-test harness and the no_std skeleton modules (memory bitmap,
 # scheduler, etc.). Dev-deps do NOT leak std into the library build.
@@ -30,3 +47,7 @@ cuttle-contracts = { path = "../contracts", features = ["property_tests"] }
 # a retrofit.
 proptest = { workspace = true }
 cuttle-verifier = { path = "../verifier" }
+# Independent TLS client for the HTTPS interop tests: rustls with *ring*
+# crypto, so the server's RustCrypto provider is checked against a different
+# implementation. Test-only; never part of the kernel image.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging"] }

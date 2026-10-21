@@ -19,8 +19,8 @@
 //!   `StackCanary`, `CrashDump`, `SymbolResolve`, and `GdbStub`.
 //! - [`storage_and_fs`]: `WriteAheadLog`, `Filesystem`, `Vfs`, `JournalFs`,
 //!   `Fat32`, `Quota`, `Gpt`, `AhciFis`, and `AhciCmd`.
-//! - [`tls_and_crypto`]: `Tls13Server`, `Tls13Client`, `X509`, `HmacDrbg`,
-//!   `KatRunner`, `SigKat`, `Random`, `AttestTlv`, `Base64`, and `Crc32c`.
+//! - [`tls_and_crypto`]: `X509`, `HmacDrbg`, `KatRunner`, `SigKat`, `Random`,
+//!   `AttestTlv`, `Base64`, and `Crc32c`.
 //! - [`virtio_and_nic`]: `MmioBus`, `NetDevice`, `BlockDeviceVirtio`,
 //!   `VirtioPciCaps`, `MmioRegBus`, and `EthernetController`.
 
@@ -172,7 +172,7 @@ mod cap_proof_tests {
     }
 
     #[test]
-    fn schema_version_bumped_for_task_020_through_070_hpet_canary_kbd_fat() {
-        assert_eq!(CONTRACTS_SCHEMA_VERSION, 58);
+    fn schema_version_bumped_for_rustls_tls_contract_removal() {
+        assert_eq!(CONTRACTS_SCHEMA_VERSION, 59);
     }
 }

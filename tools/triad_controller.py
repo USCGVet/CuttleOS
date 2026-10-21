@@ -32,6 +32,8 @@ import random
 import re
 import secrets
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -295,6 +297,8 @@ class TriadNode:
         self.last_sql_table = ""
         self.last_morph_ms = 0
         self.tampered = False
+        # SHA-256 of the node's HTTPS certificate, from its `HTTPS UP ... cert_sha256=` serial line.
+        self.tls_cert_sha256 = ""
 
     def ensure_disks(self, master_key_bytes: bytes):
         for img in (self.ahci_img, self.virtio_img, self.nvme_img):
@@ -634,6 +638,10 @@ class TriadController:
                 if len(node.serial_tail) > 40:
                     node.serial_tail.pop(0)
 
+                if line.startswith("HTTPS UP "):
+                    m = re.search(r"cert_sha256=([0-9a-f]{64})", line)
+                    if m:
+                        node.tls_cert_sha256 = m.group(1)
                 if "CONTINUITY genesis" in line:
                     node.boot_gen = 1
                 elif "CONTINUITY resume OK" in line:
@@ -1999,6 +2007,28 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         return self._send_json(404, {"error": "unknown endpoint"})
 
 
+def https_probe(node: TriadNode, path: str = "/healthz") -> tuple[str, str, str]:
+    """GET `path` from the node's HTTPS port with Python's ssl (OpenSSL) over TLS 1.3,
+    trusting only the certificate whose SHA-256 the node printed on its serial console.
+    Returns (certificate sha256, TLS version, cipher)."""
+    assert node.tls_cert_sha256, f"{node.name}: no HTTPS UP line on its serial console"
+    pem = ssl.get_server_certificate(("127.0.0.1", node.https_port), timeout=10)
+    sha = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
+    assert sha == node.tls_cert_sha256, f"{node.name}: served certificate {sha} != serial {node.tls_cert_sha256}"
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.load_verify_locations(cadata=pem)
+    with socket.create_connection(("127.0.0.1", node.https_port), timeout=10) as raw:
+        with ctx.wrap_socket(raw, server_hostname="localhost") as tls:
+            tls.sendall(f"GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".encode())
+            resp = b""
+            while chunk := tls.recv(4096):
+                resp += chunk
+            version, cipher = tls.version(), tls.cipher()[0]
+    assert resp.startswith(b"HTTP/1.1 200") and b"CUTTLE-STATUS" in resp, f"{node.name}: {resp[:120]!r}"
+    return sha, version, cipher
+
+
 def main():
     parser = argparse.ArgumentParser(description="Cuttle 3-as-1 Triad Hypervisor Controller")
     parser.add_argument("--port", type=int, default=18080, help="Unified Triad HTTP port")
@@ -2302,6 +2332,16 @@ def main():
                 f"Replicas do not match final WAL entry ({last_wal_stmt}):\n{replica_tables[0]}"
             )
 
+            # 3d. HTTPS on every node: TLS 1.3 from an independent client (OpenSSL via Python ssl),
+            #     pinned to the certificate fingerprint each node printed at boot. Distinct device
+            #     keys give distinct certificates.
+            tls_before = {}
+            for n in ctrl.nodes:
+                sha, version, cipher = https_probe(n)
+                tls_before[n.node_id] = sha
+                print(f"HTTPS {n.name} :{n.https_port}: {version} {cipher} cert={sha[:16]} (pinned)", flush=True)
+            assert len(set(tls_before.values())) == 3, "Each Triad node must present its own certificate"
+
             # 4. Start morphing OS-1 in background thread, and fire a SQL write while OS-1 is MORPHING!
             t_morph = threading.Thread(target=ctrl.bounce_and_morph_node, args=(1,))
             t_morph.start()
@@ -2315,6 +2355,12 @@ def main():
             q_out = ctrl.send_shell_cmd(ctrl.nodes[0], "sql SELECT * FROM kv")
             assert "zero_downtime" in q_out, f"OS-1 failed to catch up missed write! Output:\n{q_out}"
             print("OS-1 successfully morphed AND caught up missed SQL write from WAL!", flush=True)
+
+            # 4a. The morphed OS-1 serves HTTPS again with the SAME certificate: its TLS identity
+            #     derives from the device key, so pinned clients survive a morph cycle.
+            sha, version, cipher = https_probe(ctrl.nodes[0])
+            assert sha == tls_before[1], "OS-1 certificate changed across a morph cycle"
+            print(f"HTTPS after OS-1 morph: {version} {cipher}, same pinned certificate", flush=True)
 
             # 5. Simulate single-node tamper on OS-2 and verify automatic 2-of-3 self-healing + 4 KiB XOR parity check
             old_morphs = ctrl.nodes[1].morph_count

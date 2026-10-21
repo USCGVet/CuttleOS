@@ -11,22 +11,22 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+
 use cuttle_contracts::{
-    icmp_type, tcp_flags, Aead, AuditVerdict, HandshakeKeys, Http, HttpMethod, Icmp,
-    Ipv4PacketView, PacketFilter, Tcp, Verdict, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP,
+    icmp_type, tcp_flags, AuditVerdict, Http, HttpMethod, Icmp, Ipv4PacketView, PacketFilter,
+    Tcp, Verdict, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP,
 };
+use rustls::server::ServerConfig;
 
 use crate::firewall::FirewallImpl;
 use crate::http::HttpImpl;
 use crate::icmp::IcmpImpl;
 use crate::net::ipv4_header_checksum;
 use crate::tcp::{close, process_segment, send_payload, Tcb, TcpImpl, TcpState};
-use crate::tls::{
-    build_server_hello, decode_record_header, derive_handshake_keys, encode_record_header,
-    hkdf_expand_label, hmac_sha256, parse_client_hello, parse_server_hello, x25519_basepoint,
-    x25519_scalarmult, CONTENT_TYPE_HANDSHAKE, LEGACY_VERSION, MAX_SERVER_HELLO_LEN,
-    RECORD_HEADER_LEN,
-};
+use crate::https::TlsSession;
+use crate::tls::hmac_sha256;
 
 /// Guest IPv4 the service claims (QEMU slirp default guest).
 pub const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
@@ -40,12 +40,6 @@ pub const HTTP_PORT: u16 = 80;
 pub const HTTPS_PORT: u16 = 443;
 /// Maximum number of concurrent TCP connections tracked in [`LivedNet`].
 pub const TCP_MAX_SLOTS: usize = 16;
-/// TLS 1.3 content-type byte for encrypted `ApplicationData` records (RFC 8446 §5.1).
-pub const TLS_CONTENT_APPLICATION_DATA: u8 = 23;
-/// Domain-separation root seed for per-connection TLS 1.3 `server_random` derivation on port 443.
-pub const TLS_SERVER_RANDOM: [u8; 32] = [0x53u8; 32];
-/// Domain-separation root seed for per-connection ephemeral X25519 `server_pubkey` derivation in `ServerHello`.
-pub const TLS_SERVER_PUBKEY: [u8; 32] = [0xA5u8; 32];
 /// Ethernet II header length.
 pub const ETH_HEADER_LEN: usize = 14;
 /// IPv4 header length (no options).
@@ -54,8 +48,11 @@ pub const IPV4_HEADER_LEN: usize = 20;
 pub const MAX_FRAME: usize = 1514;
 /// Max replies produced from one inbound frame.
 pub const MAX_REPLIES: usize = 3;
-/// Per-slot scratch buffer for an in-progress HTTP or TLS 1.3 request.
+/// Per-slot scratch buffer for an in-progress plain-HTTP request (HTTPS slots
+/// buffer inside their [`TlsSession`]).
 const SLOT_BUF: usize = 1024;
+/// Largest TCP payload emitted per segment.
+const TCP_SEGMENT_PAYLOAD: usize = 1380;
 /// Deterministic 256-bit HMAC-SHA256 fixture key used only by in-memory unit
 /// tests (`LivedNet::new`). Limited to `#[cfg(test)]` so production and kernel
 /// code can never fall back to a public constant.
@@ -112,7 +109,9 @@ impl ReplySet {
 
 /// Multi-connection guest network service supporting ARP, ICMP echo,
 /// authenticated UDP control plane (`8080`), Peer-to-Peer Triad replication (`8081`),
-/// HTTP/1.1 (`80`), and TLS 1.3 (`443`) across a 16-slot concurrent TCP table.
+/// HTTP/1.1 (`80`), and HTTPS (`443`, TLS 1.3 via rustls once
+/// [`enable_tls`](LivedNet::enable_tls) is called) across a 16-slot
+/// concurrent TCP table.
 pub struct LivedNet {
     /// Guest MAC (copied into Ethernet source).
     pub mac: [u8; 6],
@@ -125,8 +124,8 @@ pub struct LivedNet {
     pub auth_enabled: bool,
     /// Highest accepted monotonic sequence number for anti-replay protection.
     pub last_auth_seq: u64,
-    /// Monotonic counter of TLS 1.3 handshakes used to derive fresh per-connection keyshares.
-    pub tls_handshake_seq: u64,
+    /// TLS connections started on port 443 since boot.
+    pub tls_sessions_started: u64,
     /// Total TCP retransmission / half-open reclamation events triggered by RTO timers.
     pub rto_retransmits: u64,
     tcbs: [Tcb; TCP_MAX_SLOTS],
@@ -136,8 +135,8 @@ pub struct LivedNet {
     ip_ident: u16,
     http_bufs: [[u8; SLOT_BUF]; TCP_MAX_SLOTS],
     http_lens: [usize; TCP_MAX_SLOTS],
-    tls_keys: [[u8; 16]; TCP_MAX_SLOTS],
-    tls_ready: [bool; TCP_MAX_SLOTS],
+    tls_config: Option<Arc<ServerConfig>>,
+    tls: [Option<Box<TlsSession>>; TCP_MAX_SLOTS],
 }
 
 impl LivedNet {
@@ -149,7 +148,7 @@ impl LivedNet {
             auth_key: [0u8; 32],
             auth_enabled: false,
             last_auth_seq: 0,
-            tls_handshake_seq: 0,
+            tls_sessions_started: 0,
             rto_retransmits: 0,
             tcbs: [Tcb::EMPTY; TCP_MAX_SLOTS],
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
@@ -158,8 +157,8 @@ impl LivedNet {
             ip_ident: 1,
             http_bufs: [[0u8; SLOT_BUF]; TCP_MAX_SLOTS],
             http_lens: [0usize; TCP_MAX_SLOTS],
-            tls_keys: [[0u8; 16]; TCP_MAX_SLOTS],
-            tls_ready: [false; TCP_MAX_SLOTS],
+            tls_config: None,
+            tls: [const { None }; TCP_MAX_SLOTS],
         }
     }
 
@@ -177,7 +176,7 @@ impl LivedNet {
             auth_key,
             auth_enabled: true,
             last_auth_seq: 0,
-            tls_handshake_seq: 0,
+            tls_sessions_started: 0,
             rto_retransmits: 0,
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
@@ -186,8 +185,8 @@ impl LivedNet {
             ip_ident: 1,
             http_bufs: [[0u8; SLOT_BUF]; TCP_MAX_SLOTS],
             http_lens: [0usize; TCP_MAX_SLOTS],
-            tls_keys: [[0u8; 16]; TCP_MAX_SLOTS],
-            tls_ready: [false; TCP_MAX_SLOTS],
+            tls_config: None,
+            tls: [const { None }; TCP_MAX_SLOTS],
         }
     }
 
@@ -200,7 +199,7 @@ impl LivedNet {
             auth_key: [0u8; 32],
             auth_enabled: false,
             last_auth_seq: 0,
-            tls_handshake_seq: 0,
+            tls_sessions_started: 0,
             rto_retransmits: 0,
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
@@ -209,8 +208,8 @@ impl LivedNet {
             ip_ident: 1,
             http_bufs: [[0u8; SLOT_BUF]; TCP_MAX_SLOTS],
             http_lens: [0usize; TCP_MAX_SLOTS],
-            tls_keys: [[0u8; 16]; TCP_MAX_SLOTS],
-            tls_ready: [false; TCP_MAX_SLOTS],
+            tls_config: None,
+            tls: [const { None }; TCP_MAX_SLOTS],
         }
     }
 
@@ -245,8 +244,7 @@ impl LivedNet {
                     if self.ticks.wrapping_sub(self.slot_last_tick[i]) >= 16 {
                         self.tcbs[i] = Tcb::EMPTY;
                         self.http_lens[i] = 0;
-                        self.tls_ready[i] = false;
-                        self.tls_keys[i] = [0u8; 16];
+                        self.tls[i] = None;
                     } else {
                         self.slot_rto_ticks[i] = self.ticks;
                     }
@@ -257,30 +255,15 @@ impl LivedNet {
         actions
     }
 
-    /// Derive the 32-byte RFC 7748 X25519 ECDHE shared secret and 16-byte record AEAD key
-    /// for a TLS 1.3 handshake (`ClientHello` + `ServerHello`) against [`LivedNet`] on port 443,
-    /// extracting the ephemeral Curve25519 `server_pubkey` from `server_hello` and performing
-    /// `X25519(client_scalar, server_pubkey)`.
-    pub fn derive_tls13_record_key(
-        client_scalar: &[u8; 32],
-        client_hello: &[u8],
-        server_hello: &[u8],
-        key_out: &mut [u8; 16],
-    ) -> HandshakeKeys {
-        let server_pub = match parse_server_hello(server_hello) {
-            Ok(sh) => sh.server_pubkey,
-            Err(_) => TLS_SERVER_PUBKEY,
-        };
-        let mut shared_secret = [0u8; 32];
-        let _ = x25519_scalarmult(client_scalar, &server_pub, &mut shared_secret);
-        let mut hs = HandshakeKeys {
-            handshake_secret: [0u8; 32],
-            client_handshake_traffic_secret: [0u8; 32],
-            server_handshake_traffic_secret: [0u8; 32],
-        };
-        derive_handshake_keys(&shared_secret, client_hello, server_hello, &mut hs);
-        hkdf_expand_label(&hs.server_handshake_traffic_secret, b"key", b"", key_out);
-        hs
+    /// Serve HTTPS on port 443 with `config` (see [`crate::https::server_config`]).
+    /// Until this is called, connections to 443 are not accepted.
+    pub fn enable_tls(&mut self, config: Arc<ServerConfig>) {
+        self.tls_config = Some(config);
+    }
+
+    /// True once [`enable_tls`](Self::enable_tls) has been called.
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_config.is_some()
     }
 
     /// Derive a unique per-device 256-bit `HMAC-SHA256` control-plane key from a fleet/factory
@@ -973,8 +956,7 @@ impl LivedNet {
         self.tcbs[idx] = Tcb::listen(self.ip, dst_port, 65535);
         self.slot_rto_ticks[idx] = self.ticks;
         self.http_lens[idx] = 0;
-        self.tls_ready[idx] = false;
-        self.tls_keys[idx] = [0u8; 16];
+        self.tls[idx] = None;
         Some(idx)
     }
 
@@ -996,6 +978,9 @@ impl LivedNet {
         if seg.dst_port != HTTP_PORT && seg.dst_port != HTTPS_PORT {
             return;
         }
+        if seg.dst_port == HTTPS_PORT && self.tls_config.is_none() {
+            return;
+        }
         let idx = match self.select_tcp_slot(src_ip, seg.src_port, seg.dst_port, seg.flags) {
             Some(i) => i,
             None => return,
@@ -1012,6 +997,11 @@ impl LivedNet {
             self.tcbs[idx].remote_ip = src_ip;
         }
 
+        if seg.dst_port == HTTPS_PORT {
+            self.handle_https_slot(idx, inbound_payload, hint, dst_mac, reply_ip, boots, shell, out);
+            return;
+        }
+
         if !inbound_payload.is_empty() && self.tcbs[idx].state != TcpState::Listen {
             let cur = self.http_lens[idx];
             let room = SLOT_BUF.saturating_sub(cur);
@@ -1020,18 +1010,14 @@ impl LivedNet {
             self.http_lens[idx] = cur + n;
         }
 
-        let mut app_out = [0u8; 1380];
+        let mut app_out = [0u8; TCP_SEGMENT_PAYLOAD];
         let mut app_n = 0usize;
-        if seg.dst_port == HTTP_PORT {
-            let cur = self.http_lens[idx];
-            if cur >= 18 && http_request_complete(&self.http_bufs[idx][..cur]) {
-                let mut req_copy = [0u8; SLOT_BUF];
-                req_copy[..cur].copy_from_slice(&self.http_bufs[idx][..cur]);
-                self.http_lens[idx] = 0;
-                app_n = self.handle_http_request(&req_copy[..cur], boots, shell, &mut app_out);
-            }
-        } else {
-            app_n = self.process_tls13_slot(idx, boots, shell, &mut app_out);
+        let cur = self.http_lens[idx];
+        if cur >= 18 && http_request_complete(&self.http_bufs[idx][..cur]) {
+            let mut req_copy = [0u8; SLOT_BUF];
+            req_copy[..cur].copy_from_slice(&self.http_bufs[idx][..cur]);
+            self.http_lens[idx] = 0;
+            app_n = self.handle_http_request(&req_copy[..cur], boots, shell, &mut app_out);
         }
 
         let local_port = self.tcbs[idx].local_port;
@@ -1073,215 +1059,171 @@ impl LivedNet {
         }
 
         if self.tcbs[idx].state == TcpState::CloseWait {
-            if let Ok((next, fin_hint)) = close(self.tcbs[idx]) {
-                self.tcbs[idx] = next;
-                if fin_hint.present {
-                    self.emit_tcp(
-                        local_port,
-                        remote_port,
-                        dst_mac,
-                        reply_ip,
-                        fin_hint.seq,
-                        fin_hint.ack,
-                        fin_hint.flags,
-                        fin_hint.window,
-                        b"",
-                        out,
-                    );
-                }
+            self.emit_fin(idx, dst_mac, reply_ip, out);
+        }
+    }
+
+    /// Send our FIN from `CloseWait` (the peer already closed its side).
+    fn emit_fin(&mut self, idx: usize, dst_mac: [u8; 6], reply_ip: [u8; 4], out: &mut ReplySet) {
+        let local_port = self.tcbs[idx].local_port;
+        let remote_port = self.tcbs[idx].remote_port;
+        if let Ok((next, fin_hint)) = close(self.tcbs[idx]) {
+            self.tcbs[idx] = next;
+            if fin_hint.present {
+                self.emit_tcp(
+                    local_port,
+                    remote_port,
+                    dst_mac,
+                    reply_ip,
+                    fin_hint.seq,
+                    fin_hint.ack,
+                    fin_hint.flags,
+                    fin_hint.window,
+                    b"",
+                    out,
+                );
             }
         }
     }
 
+    /// Port 443: feed the segment's payload to the slot's [`TlsSession`],
+    /// answer each complete decrypted HTTP request exactly as port 80 would,
+    /// and transmit queued TLS bytes as TCP segments (as many as this reply
+    /// set has room for; the rest go out as the peer ACKs).
     #[inline(never)]
-    fn process_tls13_slot(
+    #[allow(clippy::too_many_arguments)]
+    fn handle_https_slot(
         &mut self,
         idx: usize,
+        inbound: &[u8],
+        hint: crate::tcp::Reply,
+        dst_mac: [u8; 6],
+        reply_ip: [u8; 4],
         boots: u64,
         mut shell: Option<&mut crate::shell::OsShell>,
-        out: &mut [u8],
-    ) -> usize {
-        let cur = self.http_lens[idx];
-        if cur < RECORD_HEADER_LEN {
-            return 0;
-        }
-        let Some((ctype, _ver, frag_len_u16)) =
-            decode_record_header(&self.http_bufs[idx][..cur])
-        else {
-            return 0;
-        };
-        let frag_len = frag_len_u16 as usize;
-        let total_rec = RECORD_HEADER_LEN + frag_len;
-        if total_rec > SLOT_BUF {
-            self.http_lens[idx] = 0;
-            return 0;
-        }
-        if cur < total_rec {
-            return 0;
-        }
-
-        if ctype == CONTENT_TYPE_HANDSHAKE {
-            let mut ch_copy = [0u8; SLOT_BUF];
-            ch_copy[..frag_len].copy_from_slice(&self.http_bufs[idx][RECORD_HEADER_LEN..total_rec]);
-            self.http_lens[idx] = 0;
-            let ch_msg = &ch_copy[..frag_len];
-            let Ok(ch_view) = parse_client_hello(ch_msg) else {
-                return 0;
-            };
-            let Some(client_pub) = ch_view.x25519_pub else {
-                return 0;
-            };
-            // Derive a fresh per-handshake secret PRK (`conn_prk`) keyed by the node's private
-            // `self.auth_key` mixed with `sh.seal_key` (never from public constants!), and expand
-            // `ephemeral_random` (`ServerHello.random`) and `ephemeral_scalar` (server X25519 private key)
-            // via domain-separated HKDF labels (`"cuttle-srv-rand"` vs `"cuttle-x25519-sk"`) so
-            // observing `ServerHello.random` on the wire leaks zero bits of `ephemeral_scalar`.
-            self.tls_handshake_seq = self.tls_handshake_seq.wrapping_add(1);
-            let seal_material: [u8; 32] = match shell.as_deref() {
-                Some(sh) => sh.seal_key,
-                None => TLS_SERVER_RANDOM,
-            };
-            let mut node_tls_secret = [0u8; 32];
-            hmac_sha256(&self.auth_key, &seal_material, &mut node_tls_secret);
-            let mut ctx_buf = [0u8; 96];
-            ctx_buf[..32].copy_from_slice(&client_pub);
-            if ch_msg.len() >= 38 {
-                ctx_buf[32..64].copy_from_slice(&ch_msg[6..38]);
-            }
-            ctx_buf[64..72].copy_from_slice(&self.tls_handshake_seq.to_le_bytes());
-            ctx_buf[72..80].copy_from_slice(&(self.ticks as u64).to_le_bytes());
-            ctx_buf[80..88].copy_from_slice(&boots.to_le_bytes());
-            ctx_buf[88..94].copy_from_slice(&self.mac);
-            ctx_buf[94] = idx as u8;
-            ctx_buf[95] = if self.auth_enabled { 1 } else { 0 };
-            let mut conn_prk = [0u8; 32];
-            hmac_sha256(&node_tls_secret, &ctx_buf, &mut conn_prk);
-            crate::durable_seal::zeroize_secret_bytes(&mut node_tls_secret);
-
-            let mut ephemeral_random = [0u8; 32];
-            hkdf_expand_label(&conn_prk, b"cuttle-srv-rand", &client_pub, &mut ephemeral_random);
-            let mut ephemeral_scalar = [0u8; 32];
-            hkdf_expand_label(&conn_prk, b"cuttle-x25519-sk", &client_pub, &mut ephemeral_scalar);
-            crate::durable_seal::zeroize_secret_bytes(&mut conn_prk);
-            let ephemeral_pubkey = x25519_basepoint(&ephemeral_scalar);
-
-            let mut shared_secret = [0u8; 32];
-            let ok_ecdh = x25519_scalarmult(&ephemeral_scalar, &client_pub, &mut shared_secret);
-            crate::durable_seal::zeroize_secret_bytes(&mut ephemeral_scalar);
-            if !ok_ecdh {
-                crate::durable_seal::zeroize_secret_bytes(&mut shared_secret);
-                if let Some(sh) = shell.as_deref_mut() {
-                    sh.record_net_audit(AuditVerdict::Denied, b"net:tls:low-order-pub");
+        out: &mut ReplySet,
+    ) {
+        let state = self.tcbs[idx].state;
+        let open = state == TcpState::Established || state == TcpState::CloseWait;
+        if self.tls[idx].is_none() && open && !inbound.is_empty() {
+            if let Some(config) = self.tls_config.clone() {
+                if let Ok(session) = TlsSession::new(config) {
+                    self.tls[idx] = Some(Box::new(session));
+                    self.tls_sessions_started = self.tls_sessions_started.wrapping_add(1);
                 }
-                return 0;
             }
+        }
 
-            let mut sh_msg = [0u8; MAX_SERVER_HELLO_LEN];
-            let Ok(sh_len) = build_server_hello(
-                ch_msg,
-                &ephemeral_random,
-                &ephemeral_pubkey,
-                None,
-                &mut sh_msg,
-            ) else {
-                crate::durable_seal::zeroize_secret_bytes(&mut shared_secret);
-                return 0;
-            };
-            let mut hs = HandshakeKeys {
-                handshake_secret: [0u8; 32],
-                client_handshake_traffic_secret: [0u8; 32],
-                server_handshake_traffic_secret: [0u8; 32],
-            };
-            derive_handshake_keys(&shared_secret, ch_msg, &sh_msg[..sh_len], &mut hs);
-            crate::durable_seal::zeroize_secret_bytes(&mut shared_secret);
-            hkdf_expand_label(
-                &hs.server_handshake_traffic_secret,
-                b"key",
+        if let Some(mut session) = self.tls[idx].take() {
+            if !inbound.is_empty() && session.receive(inbound).is_err() {
+                if let Some(sh) = shell.as_deref_mut() {
+                    sh.record_net_audit(AuditVerdict::Denied, b"net:tls:rejected");
+                }
+            }
+            let mut responses = 0usize;
+            while !session.is_failed() && responses < 8 {
+                let Some(len) = http_request_len(session.plaintext()) else {
+                    break;
+                };
+                let request: alloc::vec::Vec<u8> = session.plaintext().drain(..len).collect();
+                let mut response = [0u8; TCP_SEGMENT_PAYLOAD];
+                let n = self.handle_http_request(&request, boots, shell.as_deref_mut(), &mut response);
+                if n > 0 && session.send(&response[..n]).is_err() {
+                    break;
+                }
+                responses += 1;
+                // `Connection: close`: end the TLS session after this
+                // response; the client then closes TCP and we FIN back.
+                if http_wants_close(&request) {
+                    session.close();
+                    break;
+                }
+            }
+            // Answer the peer's close_notify, or its FIN, with ours.
+            if session.peer_closed() || state == TcpState::CloseWait {
+                session.close();
+            }
+            self.tls[idx] = Some(session);
+        }
+
+        let sent = self.flush_https_tx(idx, dst_mac, reply_ip, out);
+        if !sent && hint.present {
+            let (local_port, remote_port) = (self.tcbs[idx].local_port, self.tcbs[idx].remote_port);
+            self.emit_tcp(
+                local_port,
+                remote_port,
+                dst_mac,
+                reply_ip,
+                hint.seq,
+                hint.ack,
+                hint.flags,
+                hint.window,
                 b"",
-                &mut self.tls_keys[idx],
+                out,
             );
-            crate::durable_seal::zeroize_secret_bytes(&mut hs.handshake_secret);
-            crate::durable_seal::zeroize_secret_bytes(&mut hs.client_handshake_traffic_secret);
-            crate::durable_seal::zeroize_secret_bytes(&mut hs.server_handshake_traffic_secret);
-            self.tls_ready[idx] = true;
-
-            let mut pos = 0usize;
-            pos += encode_record_header(
-                CONTENT_TYPE_HANDSHAKE,
-                LEGACY_VERSION,
-                sh_len as u16,
-                &mut out[pos..],
-            );
-            out[pos..pos + sh_len].copy_from_slice(&sh_msg[..sh_len]);
-            pos += sh_len;
-
-            let mut plain = [0u8; 48];
-            let plen = status_body(boots, &mut plain);
-            let ctext_len = plen + crate::AeadImpl::TAG_LEN;
-            let mut app_hdr = [0u8; RECORD_HEADER_LEN];
-            let _ = encode_record_header(
-                TLS_CONTENT_APPLICATION_DATA,
-                LEGACY_VERSION,
-                ctext_len as u16,
-                &mut app_hdr,
-            );
-            out[pos..pos + RECORD_HEADER_LEN].copy_from_slice(&app_hdr);
-            pos += RECORD_HEADER_LEN;
-            let written = crate::AeadImpl::encrypt(
-                &self.tls_keys[idx],
-                &[0u8; 8],
-                &plain[..plen],
-                &app_hdr,
-                &mut out[pos..],
-            );
-            pos += written;
-            return pos;
         }
+        let drained = match &self.tls[idx] {
+            Some(session) => session.pending_tx().is_empty(),
+            None => true,
+        };
+        if self.tcbs[idx].state == TcpState::CloseWait && drained && out.len() < MAX_REPLIES {
+            self.emit_fin(idx, dst_mac, reply_ip, out);
+        }
+    }
 
-        if ctype == TLS_CONTENT_APPLICATION_DATA && self.tls_ready[idx] {
-            let mut rec_hdr = [0u8; RECORD_HEADER_LEN];
-            rec_hdr.copy_from_slice(&self.http_bufs[idx][..RECORD_HEADER_LEN]);
-            let mut ctext = [0u8; SLOT_BUF];
-            ctext[..frag_len].copy_from_slice(&self.http_bufs[idx][RECORD_HEADER_LEN..total_rec]);
-            self.http_lens[idx] = 0;
-
-            let mut req_plain = [0u8; SLOT_BUF];
-            let Ok(req_len) = crate::AeadImpl::decrypt(
-                &self.tls_keys[idx],
-                &[1u8; 8],
-                &ctext[..frag_len],
-                &rec_hdr,
-                &mut req_plain,
-            ) else {
-                return 0;
+    /// Move queued TLS bytes for slot `idx` into TCP segments while the reply
+    /// set has room, keeping one frame free for a FIN. Returns whether any data
+    /// segment was emitted.
+    fn flush_https_tx(
+        &mut self,
+        idx: usize,
+        dst_mac: [u8; 6],
+        reply_ip: [u8; 4],
+        out: &mut ReplySet,
+    ) -> bool {
+        let mut sent = false;
+        let local_port = self.tcbs[idx].local_port;
+        let remote_port = self.tcbs[idx].remote_port;
+        let mut chunk = [0u8; TCP_SEGMENT_PAYLOAD];
+        while out.len() + 1 < MAX_REPLIES {
+            let n = match &self.tls[idx] {
+                Some(session) => {
+                    let n = session.pending_tx().len().min(TCP_SEGMENT_PAYLOAD);
+                    chunk[..n].copy_from_slice(&session.pending_tx()[..n]);
+                    n
+                }
+                None => 0,
             };
-            let mut http_resp = [0u8; 480];
-            let resp_len =
-                self.handle_http_request(&req_plain[..req_len], boots, shell, &mut http_resp);
-            if resp_len == 0 {
-                return 0;
+            if n == 0 {
+                break;
             }
-            let out_ctext_len = resp_len + crate::AeadImpl::TAG_LEN;
-            let mut resp_hdr = [0u8; RECORD_HEADER_LEN];
-            let _ = encode_record_header(
-                TLS_CONTENT_APPLICATION_DATA,
-                LEGACY_VERSION,
-                out_ctext_len as u16,
-                &mut resp_hdr,
+            let Ok((next, data_hint)) = send_payload(self.tcbs[idx], n as u32) else {
+                break;
+            };
+            let before = out.len();
+            self.emit_tcp(
+                local_port,
+                remote_port,
+                dst_mac,
+                reply_ip,
+                data_hint.seq,
+                data_hint.ack,
+                data_hint.flags,
+                data_hint.window,
+                &chunk[..n],
+                out,
             );
-            out[..RECORD_HEADER_LEN].copy_from_slice(&resp_hdr);
-            let written = crate::AeadImpl::encrypt(
-                &self.tls_keys[idx],
-                &[2u8; 8],
-                &http_resp[..resp_len],
-                &resp_hdr,
-                &mut out[RECORD_HEADER_LEN..],
-            );
-            return RECORD_HEADER_LEN + written;
+            if out.len() == before {
+                // Not emitted: leave the TCB and the queue untouched.
+                break;
+            }
+            self.tcbs[idx] = next;
+            if let Some(session) = self.tls[idx].as_mut() {
+                session.consume_tx(n);
+            }
+            sent = true;
         }
-
-        self.http_lens[idx] = 0;
-        0
+        sent
     }
 
     #[inline(never)]
@@ -2180,6 +2122,40 @@ fn http_request_complete(buf: &[u8]) -> bool {
     true
 }
 
+/// Length of the first complete HTTP request in `buf`, or `None` while it is
+/// still incomplete. Used on HTTPS connections, where several requests may
+/// arrive back to back. The body is `Content-Length` bytes; without that
+/// header, GET/HEAD have no body and any other method takes everything
+/// buffered (what port 80 passes to [`LivedNet::handle_http_request`]).
+fn http_request_len(buf: &[u8]) -> Option<usize> {
+    let hdr_end = find_double_crlf(buf)?;
+    let body_start = hdr_end + 4;
+    let mut total = buf.len();
+    if let Ok(view) = HttpImpl::parse_request(&buf[..body_start]) {
+        let content_length = HttpImpl::find_header(view.headers_raw, b"Content-Length")
+            .and_then(|raw| parse_u64_dec(trim_ws(raw)));
+        total = match (content_length, view.method) {
+            (Some(cl), _) => body_start.saturating_add(cl as usize),
+            (None, HttpMethod::Get | HttpMethod::Head) => body_start,
+            (None, _) => buf.len(),
+        };
+    }
+    if buf.len() >= total {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+/// True if the request carries `Connection: close` (RFC 9112 §9.6).
+fn http_wants_close(req: &[u8]) -> bool {
+    match HttpImpl::parse_request(req) {
+        Ok(view) => HttpImpl::find_header(view.headers_raw, b"Connection")
+            .is_some_and(|v| trim_ws(v).eq_ignore_ascii_case(b"close")),
+        Err(_) => false,
+    }
+}
+
 fn extract_session_token(headers_raw: &[u8]) -> Option<&[u8]> {
     if let Some(tok) = HttpImpl::find_header(headers_raw, b"X-Session-Token") {
         let tok = trim_ws(tok);
@@ -2879,278 +2855,19 @@ mod tests {
     }
 
     #[test]
-    fn tls13_port_443_handshake_and_encrypted_application_data_roundtrip() {
+    fn https_port_is_closed_until_tls_is_enabled() {
         let mut net = LivedNet::new(MAC);
-        let mut sh = crate::shell::OsShell::new();
-        let client_port: u16 = 54443;
-        let client_isn: u32 = 0x4430_0000;
-
-        // 1. TCP SYN on HTTPS_PORT (443):
         let mut syn = [0u8; 40];
         let n = TcpImpl::build_segment(
-            client_port,
-            HTTPS_PORT,
-            client_isn,
-            0,
-            tcp_flags::SYN,
-            65535,
-            b"",
-            PEER_IP,
-            GUEST_IP,
-            &mut syn,
+            54443, HTTPS_PORT, 0x4430_0000, 0, tcp_flags::SYN, 65535, b"", PEER_IP, GUEST_IP, &mut syn,
         )
         .unwrap();
         let (frame, flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn[..n]);
         let mut out = ReplySet::new();
-        net.handle_frame_with_shell(&frame[..flen], 9, &mut sh, &mut out);
-        assert_eq!(out.len(), 1);
-        let sa = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
-        assert_eq!(sa.flags, tcp_flags::SYN | tcp_flags::ACK);
-        let server_isn = sa.seq;
-
-        // 1b. Red Team Low-Order Torsion Point Rejection: sending a ClientHello with an
-        //     all-zero X25519 keyshare (`[0u8; 32]`) must be rejected by RFC 7748 check!
-        let mut bad_ch = [0u8; 256];
-        let bad_ch_len =
-            crate::tls::build_client_hello(&[0x99u8; 32], &[0u8; 32], &mut bad_ch).unwrap();
-        let mut bad_rec = [0u8; 264];
-        let _ = encode_record_header(
-            CONTENT_TYPE_HANDSHAKE,
-            LEGACY_VERSION,
-            bad_ch_len as u16,
-            &mut bad_rec,
-        );
-        bad_rec[RECORD_HEADER_LEN..RECORD_HEADER_LEN + bad_ch_len]
-            .copy_from_slice(&bad_ch[..bad_ch_len]);
-        let bad_total = RECORD_HEADER_LEN + bad_ch_len;
-        let mut bad_seg = [0u8; 320];
-        let bad_n = TcpImpl::build_segment(
-            client_port,
-            HTTPS_PORT,
-            client_isn.wrapping_add(1),
-            server_isn.wrapping_add(1),
-            tcp_flags::ACK | tcp_flags::PSH,
-            65535,
-            &bad_rec[..bad_total],
-            PEER_IP,
-            GUEST_IP,
-            &mut bad_seg,
-        )
-        .unwrap();
-        let (bad_frame, bad_flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &bad_seg[..bad_n]);
-        let mut bad_out = ReplySet::new();
-        net.handle_frame_with_shell(&bad_frame[..bad_flen], 9, &mut sh, &mut bad_out);
-        let bad_resp =
-            TcpImpl::parse_segment(&bad_out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
-        assert!(
-            bad_resp.payload.is_empty(),
-            "Red Team low-order X25519 ClientHello must be rejected with zero ServerHello bytes"
-        );
-
-        // 2. Build a valid RFC 7748 X25519 ClientHello record and send over TCP/443:
-        let client_random = [0x11u8; 32];
-        let client_scalar = [0x22u8; 32];
-        let client_pubkey = crate::tls::x25519_basepoint(&client_scalar);
-        let mut ch_msg = [0u8; 256];
-        let ch_len =
-            crate::tls::build_client_hello(&client_random, &client_pubkey, &mut ch_msg).unwrap();
-        let mut tls_rec = [0u8; 264];
-        let _ = encode_record_header(
-            CONTENT_TYPE_HANDSHAKE,
-            LEGACY_VERSION,
-            ch_len as u16,
-            &mut tls_rec,
-        );
-        tls_rec[RECORD_HEADER_LEN..RECORD_HEADER_LEN + ch_len].copy_from_slice(&ch_msg[..ch_len]);
-        let rec_total = RECORD_HEADER_LEN + ch_len;
-
-        let mut ch_seg = [0u8; 320];
-        let c_seq_after_bad = client_isn.wrapping_add(1 + (bad_total as u32));
-        let n = TcpImpl::build_segment(
-            client_port,
-            HTTPS_PORT,
-            c_seq_after_bad,
-            server_isn.wrapping_add(1),
-            tcp_flags::ACK | tcp_flags::PSH,
-            65535,
-            &tls_rec[..rec_total],
-            PEER_IP,
-            GUEST_IP,
-            &mut ch_seg,
-        )
-        .unwrap();
-        let (frame, flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &ch_seg[..n]);
-        let mut out = ReplySet::new();
-        net.handle_frame_with_shell(&frame[..flen], 9, &mut sh, &mut out);
-        assert_eq!(out.len(), 1);
-        let resp_seg =
-            TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
-        let payload = resp_seg.payload;
-
-        // 3. Parse ServerHello record + decrypt ApplicationData status record via X25519 ECDHE:
-        let (r1_type, r1_ver, r1_len_u16) = decode_record_header(payload).unwrap();
-        assert_eq!(r1_type, CONTENT_TYPE_HANDSHAKE);
-        assert_eq!(r1_ver, LEGACY_VERSION);
-        let r1_len = r1_len_u16 as usize;
-        let sh_slice = &payload[RECORD_HEADER_LEN..RECORD_HEADER_LEN + r1_len];
-        let parsed_sh = crate::tls::parse_server_hello(sh_slice).unwrap();
-        assert_ne!(
-            parsed_sh.server_pubkey, TLS_SERVER_PUBKEY,
-            "TLS 1.3 ServerHello must advertise a fresh ephemeral X25519 keyshare"
-        );
-        assert_ne!(
-            parsed_sh.server_random, TLS_SERVER_RANDOM,
-            "TLS 1.3 ServerHello must advertise a fresh per-handshake server_random"
-        );
-
-        let mut record_key = [0u8; 16];
-        let _ = LivedNet::derive_tls13_record_key(
-            &client_scalar,
-            &ch_msg[..ch_len],
-            sh_slice,
-            &mut record_key,
-        );
-
-        let r2_slice = &payload[RECORD_HEADER_LEN + r1_len..];
-        let (r2_type, _r2_ver, r2_len_u16) = decode_record_header(r2_slice).unwrap();
-        assert_eq!(r2_type, TLS_CONTENT_APPLICATION_DATA);
-        let r2_len = r2_len_u16 as usize;
-        let mut plain_status = [0u8; 64];
-        let plen = crate::AeadImpl::decrypt(
-            &record_key,
-            &[0u8; 8],
-            &r2_slice[RECORD_HEADER_LEN..RECORD_HEADER_LEN + r2_len],
-            &r2_slice[..RECORD_HEADER_LEN],
-            &mut plain_status,
-        )
-        .unwrap();
-        assert_eq!(&plain_status[..plen], b"CUTTLE-STATUS boots=9\n");
-
-        // 4. Send an encrypted HTTP GET /uname inside a TLS ApplicationData record:
-        let req_http = b"GET /uname HTTP/1.1\r\nHost: x\r\n\r\n";
-        let req_ctext_len = req_http.len() + crate::AeadImpl::TAG_LEN;
-        let mut req_rec = [0u8; 128];
-        let _ = encode_record_header(
-            TLS_CONTENT_APPLICATION_DATA,
-            LEGACY_VERSION,
-            req_ctext_len as u16,
-            &mut req_rec,
-        );
-        let mut aad_hdr = [0u8; RECORD_HEADER_LEN];
-        aad_hdr.copy_from_slice(&req_rec[..RECORD_HEADER_LEN]);
-        let w = crate::AeadImpl::encrypt(
-            &record_key,
-            &[1u8; 8],
-            req_http,
-            &aad_hdr,
-            &mut req_rec[RECORD_HEADER_LEN..],
-        );
-        let req_rec_total = RECORD_HEADER_LEN + w;
-
-        let next_c_seq = c_seq_after_bad.wrapping_add(rec_total as u32);
-        let next_s_seq = server_isn.wrapping_add(1 + (payload.len() as u32));
-        let mut app_seg = [0u8; 192];
-        let n = TcpImpl::build_segment(
-            client_port,
-            HTTPS_PORT,
-            next_c_seq,
-            next_s_seq,
-            tcp_flags::ACK | tcp_flags::PSH,
-            65535,
-            &req_rec[..req_rec_total],
-            PEER_IP,
-            GUEST_IP,
-            &mut app_seg,
-        )
-        .unwrap();
-        let (frame, flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &app_seg[..n]);
-        let mut out = ReplySet::new();
-        net.handle_frame_with_shell(&frame[..flen], 9, &mut sh, &mut out);
-        assert_eq!(out.len(), 1);
-        let app_resp_seg =
-            TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
-        let r3 = app_resp_seg.payload;
-        let (r3_type, _, r3_len_u16) = decode_record_header(r3).unwrap();
-        assert_eq!(r3_type, TLS_CONTENT_APPLICATION_DATA);
-        let r3_len = r3_len_u16 as usize;
-        let mut dec_http = [0u8; 256];
-        let dlen = crate::AeadImpl::decrypt(
-            &record_key,
-            &[2u8; 8],
-            &r3[RECORD_HEADER_LEN..RECORD_HEADER_LEN + r3_len],
-            &r3[..RECORD_HEADER_LEN],
-            &mut dec_http,
-        )
-        .unwrap();
-        let http_str = core::str::from_utf8(&dec_http[..dlen]).unwrap();
-        assert!(http_str.starts_with("HTTP/1.1 200"));
-        assert!(http_str.contains("Cuttle-TE x86_64 1.0-mtd"));
-
-        // 5. Open a second TLS 1.3 connection on port 443 and verify it generates a
-        //    distinct ephemeral server_random, distinct server_pubkey, and distinct AEAD record key:
-        let client_port2 = 51002u16;
-        let client_isn2 = 0x2000_0000u32;
-        let mut syn2 = [0u8; 40];
-        let n = TcpImpl::build_segment(
-            client_port2,
-            HTTPS_PORT,
-            client_isn2,
-            0,
-            tcp_flags::SYN,
-            65535,
-            b"",
-            PEER_IP,
-            GUEST_IP,
-            &mut syn2,
-        )
-        .unwrap();
-        let (frame2, flen2) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn2[..n]);
-        let mut out2 = ReplySet::new();
-        net.handle_frame_with_shell(&frame2[..flen2], 9, &mut sh, &mut out2);
-        let sa2 = TcpImpl::parse_segment(&out2.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
-        let mut ch_seg2 = [0u8; 320];
-        let n = TcpImpl::build_segment(
-            client_port2,
-            HTTPS_PORT,
-            client_isn2.wrapping_add(1),
-            sa2.seq.wrapping_add(1),
-            tcp_flags::ACK | tcp_flags::PSH,
-            65535,
-            &tls_rec[..rec_total],
-            PEER_IP,
-            GUEST_IP,
-            &mut ch_seg2,
-        )
-        .unwrap();
-        let (frame2b, flen2b) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &ch_seg2[..n]);
-        let mut out2b = ReplySet::new();
-        net.handle_frame_with_shell(&frame2b[..flen2b], 9, &mut sh, &mut out2b);
-        let resp_seg2 =
-            TcpImpl::parse_segment(&out2b.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
-        let (_, _, r1_len2_u16) = decode_record_header(resp_seg2.payload).unwrap();
-        let sh_slice2 = &resp_seg2.payload[RECORD_HEADER_LEN..RECORD_HEADER_LEN + (r1_len2_u16 as usize)];
-        let parsed_sh2 = crate::tls::parse_server_hello(sh_slice2).unwrap();
-        assert_ne!(parsed_sh2.server_pubkey, parsed_sh.server_pubkey);
-        assert_ne!(parsed_sh2.server_random, parsed_sh.server_random);
-        let mut record_key2 = [0u8; 16];
-        let _ = LivedNet::derive_tls13_record_key(
-            &client_scalar,
-            &ch_msg[..ch_len],
-            sh_slice2,
-            &mut record_key2,
-        );
-        assert_ne!(record_key2, record_key);
-
-        // 6. Red Team Cryptographic Check: verify that a passive eavesdropper who observes
-        //    `ServerHello.random` (`parsed_sh.server_random`) on the wire cannot derive the
-        //    server's private X25519 scalar from `TLS_SERVER_PUBKEY` or any public constant!
-        let mut guessed_scalar = [0u8; 32];
-        hmac_sha256(&TLS_SERVER_PUBKEY, &parsed_sh.server_random, &mut guessed_scalar);
-        let guessed_pubkey = x25519_basepoint(&guessed_scalar);
-        assert_ne!(
-            guessed_pubkey, parsed_sh.server_pubkey,
-            "server ephemeral X25519 private scalar must never be derivable from ServerHello.random and public constants"
-        );
+        net.handle_frame(&frame[..flen], 1, &mut out);
+        assert!(out.is_empty(), "no SYN-ACK on 443 before enable_tls");
+        assert_eq!(net.active_tcp_slots(), 0);
+        assert!(!net.tls_enabled());
     }
 
     #[test]

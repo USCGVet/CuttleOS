@@ -23,8 +23,17 @@ locked = [
     # KPTI trampoline byte sequences and page-table isolation invariants.
     "target_enterprise/src/kpti.rs",
 
+    # HTTPS: rustls integration (RustCrypto provider, certificate encoder,
+    # per-connection driver, golden replay) and its recorded fixture. These
+    # implement external rustls traits whose method names and byte-exact
+    # outputs (KAT vectors, golden transcript) are pinned.
+    "target_enterprise/src/tls_provider.rs",
+    "target_enterprise/src/https.rs",
+    "target_enterprise/src/https_golden_fixture.rs",
+
     # Bare-metal kernel entry point, hardware drivers, key provisioning, and boot banners.
     "target_enterprise_kernel/src/main.rs",
+    "target_enterprise_kernel/src/heap.rs",
     "target_enterprise_kernel/src/provisioning.rs",
     "target_enterprise_kernel/src/banners_tls_net.rs",
     "target_enterprise_kernel/src/banners_storage_fs.rs",
