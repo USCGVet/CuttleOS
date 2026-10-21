@@ -2016,8 +2016,12 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.self_test and (TRIAD_DIR / "triad_wal.json").exists():
-        (TRIAD_DIR / "triad_wal.json").unlink()
+    if args.self_test:
+        # Start from a clean Triad: the WAL and the desired cron jobs (restored onto every
+        # node at boot) would otherwise accumulate across self-test runs.
+        for stale in (TRIAD_DIR / "triad_wal.json", TRIAD_DIR / "cron_jobs.json"):
+            if stale.exists():
+                stale.unlink()
 
     ctrl = TriadController(show_gui=args.gui, spec=TriadSpec(accel=args.accel))
     if args.self_test:
