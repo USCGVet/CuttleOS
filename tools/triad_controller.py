@@ -39,6 +39,7 @@ import time
 import urllib.parse
 import urllib.request
 import urllib.error
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -60,6 +61,44 @@ DEVICE_KEY = ROOT / "device_secret_key.bin"
 # AHCI SQL partition layout (LBA 1058..1065 = 8 sectors = 4096 bytes)
 SQL_PART_OFFSET = 1058 * 512
 SQL_PART_SIZE = 8 * 512
+
+
+@dataclass
+class TriadSpec:
+    """
+    One Triad's identity, kernel role and placement. The defaults reproduce the standalone
+    appliance started by `triad.bat` (role `full`, state in `target/cuttle_images/triad`,
+    node HTTP ports 18101-18103). `tools/cuttle_fleet.py` builds one spec per (client, job).
+    """
+
+    name: str = "triad"
+    job: str = "sql"  # what the Triad serves: web | sql | index | cron
+    # Kernel `NodeRole` profile (`service role <role>`), re-applied after every boot because
+    # the kernel starts each boot as `full`: wfe (svc-http only), sql (svc-sql only),
+    # shell (svc-sh only) or full (all three).
+    role: str = "full"
+    state_dir: Path = TRIAD_DIR
+    master_key_path: Path = DEVICE_KEY
+    key_context: str = "cuttle-triad-node-v1"  # domain label for per-node device-key derivation
+    http_base: int = 18100  # node N serves HTTP on http_base + N
+    https_base: int = 18500
+    smp: int = 4
+    memory: str = "128M"
+    node_names: tuple = ("OS-1 (SQL-Data-A)", "OS-2 (SQL-Data-B)", "OS-3 (SQL-Parity)")
+    node_roles: tuple = ("ACTIVE DATA STRIPE A", "ACTIVE DATA STRIPE B", "RAID PARITY & WITNESS")
+    base_seeds: tuple = (100101, 200202, 300303)
+    vote_tables: tuple = ("kv",)  # SQL tables compared by the 2-of-3 vote (SQL-capable roles)
+    provision_sql: tuple = ()  # statements committed once through the WAL after first boot
+    cron_jobs: tuple = ()  # (interval_ticks, command) re-applied after every boot
+    log_prefix: str = ""
+
+    @property
+    def has_sql(self) -> bool:
+        return self.role in ("sql", "full")
+
+    @property
+    def has_shell(self) -> bool:
+        return self.role in ("shell", "full")
 
 
 def is_printable_ascii_command(s: str) -> bool:
@@ -150,7 +189,18 @@ def extract_text_sha256(elf_bytes: bytes) -> str:
 
 
 class TriadNode:
-    def __init__(self, node_id: int, name: str, role: str, http_port: int, https_port: int, base_seed: int, show_gui: bool):
+    def __init__(
+        self,
+        node_id: int,
+        name: str,
+        role: str,
+        http_port: int,
+        https_port: int,
+        base_seed: int,
+        show_gui: bool,
+        state_dir: Path = TRIAD_DIR,
+        key_context: str = "cuttle-triad-node-v1",
+    ):
         self.node_id = node_id
         self.name = name
         self.role = role
@@ -158,8 +208,9 @@ class TriadNode:
         self.https_port = https_port
         self.current_seed = base_seed
         self.show_gui = show_gui
+        self.key_context = key_context
 
-        self.node_dir = TRIAD_DIR / f"node{node_id}"
+        self.node_dir = state_dir / f"node{node_id}"
         self.node_dir.mkdir(parents=True, exist_ok=True)
         self.bios_img = self.node_dir / f"bios_node{node_id}.img"
         self.morphed_elf = self.node_dir / f"kernel_node{node_id}.elf"
@@ -195,7 +246,7 @@ class TriadNode:
         # boots with its own seal_key, attest_key, net_auth_key, and initial service ELF variants.
         node_key = hmac.new(
             master_key_bytes,
-            f"cuttle-triad-node-v1:{self.node_id}".encode("ascii"),
+            f"{self.key_context}:{self.node_id}".encode("ascii"),
             hashlib.sha256,
         ).digest()
         self.device_key_path.write_bytes(node_key)
@@ -215,20 +266,24 @@ class TriadNode:
 
 
 class TriadController:
-    def __init__(self, show_gui: bool = False):
+    def __init__(self, show_gui: bool = False, spec: TriadSpec | None = None):
+        self.spec = spec or TriadSpec()
         self.qemu_bin = find_qemu()
         self.show_gui = show_gui
-        TRIAD_DIR.mkdir(parents=True, exist_ok=True)
+        state_dir = self.spec.state_dir
+        state_dir.mkdir(parents=True, exist_ok=True)
 
-        if DEVICE_KEY.exists() and len(DEVICE_KEY.read_bytes()) >= 32:
-            self.master_key_bytes = DEVICE_KEY.read_bytes()[:32]
+        key_path = self.spec.master_key_path
+        if key_path.exists() and len(key_path.read_bytes()) >= 32:
+            self.master_key_bytes = key_path.read_bytes()[:32]
         else:
             self.master_key_bytes = os.urandom(32)
-            DEVICE_KEY.write_bytes(self.master_key_bytes)
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            key_path.write_bytes(self.master_key_bytes)
 
         # Generate a fresh ephemeral 128-bit session token on every controller startup.
         self.coordinator_token = secrets.token_hex(16)
-        (TRIAD_DIR / "operator_token.txt").write_text(self.coordinator_token + "\n", encoding="utf-8")
+        (state_dir / "operator_token.txt").write_text(self.coordinator_token + "\n", encoding="utf-8")
 
         self.base_elf_bytes = BASE_ELF.read_bytes()
         self.base_bios_bytes = BASE_BIOS.read_bytes()
@@ -238,15 +293,35 @@ class TriadController:
                 "Base kernel ELF not found contiguously in run_bios.img; rebuild run_bios.img first."
             )
 
+        s = self.spec
         self.nodes = [
-            TriadNode(1, "OS-1 (SQL-Data-A)", "ACTIVE DATA STRIPE A", 18101, 18501, 100101, show_gui),
-            TriadNode(2, "OS-2 (SQL-Data-B)", "ACTIVE DATA STRIPE B", 18102, 18502, 200202, show_gui),
-            TriadNode(3, "OS-3 (SQL-Parity)", "RAID PARITY & WITNESS", 18103, 18503, 300303, show_gui),
+            TriadNode(
+                i,
+                s.node_names[i - 1],
+                s.node_roles[i - 1],
+                s.http_base + i,
+                s.https_base + i,
+                s.base_seeds[i - 1],
+                show_gui,
+                state_dir=state_dir,
+                key_context=s.key_context,
+            )
+            for i in (1, 2, 3)
         ]
+
+        # Cron jobs live in each node's RAM and are cleared on every boot, so the controller
+        # owns the desired list (spec defaults + jobs added through the API) and re-applies it.
+        self.cron_file = state_dir / "cron_jobs.json"
+        self.desired_cron: list[tuple[int, str]] = list(s.cron_jobs)
+        if self.cron_file.exists():
+            try:
+                self.desired_cron = [(int(t), str(c)) for t, c in json.loads(self.cron_file.read_text(encoding="utf-8"))]
+            except Exception:
+                pass
 
         # Monotonic Triad WAL for automatic catch-up after an OS morph bounce (persisted to disk)
         self.wal_lock = threading.Lock()
-        self.wal_file = TRIAD_DIR / "triad_wal.json"
+        self.wal_file = state_dir / "triad_wal.json"
         self.triad_tx_seq = 0
         self.wal_entries: list[tuple[int, str]] = []  # (tx_seq, sql_stmt)
         # Nodes whose applied tx_seq was restored from the WAL file (see `_load_wal_from_disk`).
@@ -254,9 +329,9 @@ class TriadController:
         self._load_wal_from_disk()
         self.events: list[dict] = []
         self.parity_Buffer = b"\x00" * SQL_PART_SIZE
-        self.parity_sha256 = hashlib.sha256(self.parity_Buffer).hexdigest()[:16]
+        self.parity_sha256 = hashlib.sha256(self.parity_Buffer).hexdigest()[:16] if s.has_sql else "n/a"
         self.parity_syndrome_ok = True
-        self.quorum_status = "3/3 TMR MAJORITY VERIFIED (D1 ^ D2 = P)"
+        self.quorum_status = "3/3 TMR MAJORITY VERIFIED (D1 ^ D2 = P)" if s.has_sql else "3/3 TMR MAJORITY VERIFIED"
         self.auto_morph_enabled = False
         self.auto_morph_interval = 45  # seconds
         self.next_rotate_idx = 0
@@ -376,7 +451,7 @@ class TriadController:
         if len(self.events) > 60:
             self.events.pop()
         safe_msg = msg.encode("ascii", errors="replace").decode("ascii")
-        print(f"[{ts}] [{level}] {safe_msg}", flush=True)
+        print(f"[{ts}] {self.spec.log_prefix}[{level}] {safe_msg}", flush=True)
 
     def morph_node_image(self, node: TriadNode, new_seed: int):
         """Run binmorph.exe (~250ms) and splice the morphed ELF directly into node's bios.img."""
@@ -421,9 +496,9 @@ class TriadController:
             "-accel",
             "tcg",
             "-smp",
-            "4",
+            str(self.spec.smp),
             "-m",
-            "128M",
+            self.spec.memory,
             "-fw_cfg",
             f"name=opt/cuttle_device_key,file={node.device_key_path}",
             "-drive",
@@ -524,6 +599,21 @@ class TriadController:
             return False
         time.sleep(0.08)
         return True
+
+    def apply_node_profile(self, node: TriadNode):
+        """
+        Re-apply what every boot resets: the kernel role profile (each boot starts as `full`)
+        and the desired cron jobs (held in node RAM). Called once the shell is ready, before
+        the node rejoins the pool.
+        """
+        role = self.spec.role
+        if role != "full":
+            out = self.send_shell_cmd(node, f"service role {role}")
+            if f"role={role}" not in out:
+                self.log_event("WARN", f"{node.name}: could not apply role '{role}': {out[:120]}")
+        if self.spec.has_shell:
+            for ticks, cmd in self.desired_cron:
+                self.send_shell_cmd(node, f"cron add {ticks} {cmd}")
 
     def send_shell_cmd(self, node: TriadNode, cmd_str: str, timeout: float = 5.0) -> str:
         """
@@ -651,9 +741,30 @@ class TriadController:
         if smp_out and "cpus=" in smp_out:
             first_line = smp_out.splitlines()[0]
             node.last_smp = first_line
+        if not self.spec.has_sql:
+            return
         sql_out = self.send_shell_cmd(node, "sql /*triad*/ SELECT * FROM kv", timeout=3.0)
         if sql_out and "k|v|rev" in sql_out:
             node.last_sql_table = sql_out
+
+    def _state_probe(self, node: TriadNode) -> str | None:
+        """
+        The node's replicated state as compared by the 2-of-3 vote, or None if unreadable.
+        SQL-capable roles compare the spec's vote tables; a web front end (`wfe`, no svc-sql)
+        compares the content it serves.
+        """
+        if not self.spec.has_sql:
+            out = self.send_shell_cmd(node, "ls", timeout=4.0)
+            return out if out and not out.lower().startswith("error") else None
+        parts = []
+        for table in self.spec.vote_tables:
+            out = self.send_shell_cmd(node, f"sql /*triad*/ SELECT * FROM {table}", timeout=4.0)
+            if not out or out.lower().startswith("error") or "|" not in out.splitlines()[0]:
+                return None
+            if table == "kv":
+                node.last_sql_table = out
+            parts.append(self._normalize_kv_for_tmr(out))
+        return "\n--\n".join(parts)
 
     def compute_and_verify_raid_parity(self):
         """
@@ -664,22 +775,18 @@ class TriadController:
         online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
 
         if len(online_nodes) >= 2:
-            # Query live kv table from all online nodes to verify 2-of-3 majority consistency
-            outputs = {}
-            for n in online_nodes:
-                out = self.send_shell_cmd(n, "sql /*triad*/ SELECT * FROM kv", timeout=4.0)
-                if out:
-                    n.last_sql_table = out
-                outputs[n.node_id] = out
+            # Read each online node's replicated state to verify 2-of-3 majority consistency
+            outputs = {n.node_id: self._state_probe(n) for n in online_nodes}
 
             # Check if any node diverges from the 2-of-3 majority!
-            if len(online_nodes) == 3 and all("k|v|rev" in outputs.get(i, "") for i in (1, 2, 3)):
-                o1 = self._normalize_kv_for_tmr(outputs[1])
-                o2 = self._normalize_kv_for_tmr(outputs[2])
-                o3 = self._normalize_kv_for_tmr(outputs[3])
+            if len(online_nodes) == 3 and all(outputs.get(i) is not None for i in (1, 2, 3)):
+                o1, o2, o3 = outputs[1], outputs[2], outputs[3]
                 if o1 == o2 == o3:
                     self.parity_syndrome_ok = True
-                    self.quorum_status = f"3/3 TMR MAJORITY LOCKED | RAID PARITY D1⊕D2=P VERIFIED (tx_seq={self.triad_tx_seq})"
+                    if self.spec.has_sql:
+                        self.quorum_status = f"3/3 TMR MAJORITY LOCKED | RAID PARITY D1⊕D2=P VERIFIED (tx_seq={self.triad_tx_seq})"
+                    else:
+                        self.quorum_status = "3/3 TMR MAJORITY LOCKED | SERVED CONTENT VERIFIED"
                 else:
                     # 2-of-3 Majority Vote identifies the exact tampered/corrupted node!
                     corrupted = None
@@ -704,6 +811,9 @@ class TriadController:
             else:
                 names = " + ".join(n.name.split()[0] for n in online_nodes)
                 self.quorum_status = f"2/3 DEGRADED TMR MAJORITY ACTIVE ({names}) — 0ms Downtime During Morph"
+
+        if not self.spec.has_sql:
+            return  # no SQL partition to protect with parity on this role
 
         # Update 4 KiB bitwise XOR parity across D1 and D2 AHCI SQL partitions
         d1 = n1.read_sql_partition_bytes()
@@ -916,6 +1026,8 @@ class TriadController:
 
         if app == "vault" and sub in ("put", "del"):
             self.compute_and_verify_raid_parity()
+        if app == "cron" and sub in ("add", "del"):
+            self._record_desired_cron(parts)
 
         redacted_cmd = self._redact_app_cmd(c)
         self.log_event(
@@ -930,6 +1042,34 @@ class TriadController:
             "output": chosen,
             "per_node": per_node,
         }
+
+    def _record_desired_cron(self, parts: list[str]):
+        """
+        Keep the desired cron list in step with an accepted `cron add <ticks> <cmd>` or
+        `cron del <id>`. Kernel job ids are slot numbers (first free slot), so every node holds
+        the list in order (ids 1..n, identical across the Triad): boots re-apply it, and a delete
+        rebuilds each online node's table so no node is left with a gap.
+        """
+        if parts[1].lower() == "add" and len(parts) >= 4 and parts[2].isdigit():
+            self.desired_cron.append((int(parts[2]), " ".join(parts[3:])))
+        elif parts[1].lower() == "del" and len(parts) >= 3 and parts[2].isdigit():
+            idx = int(parts[2]) - 1
+            if 0 <= idx < len(self.desired_cron):
+                self.desired_cron.pop(idx)
+            for n in self.nodes:
+                if n.state == "ONLINE":
+                    self._rebuild_cron_table(n)
+        else:
+            return
+        self.cron_file.write_text(json.dumps(self.desired_cron), encoding="utf-8")
+
+    def _rebuild_cron_table(self, node: TriadNode):
+        """Delete every job on `node` and re-add the desired list in order (ids become 1..n)."""
+        listing = self.send_shell_cmd(node, "cron list")
+        for job_id in re.findall(r"^\s*id=(\d+)", listing, re.M):
+            self.send_shell_cmd(node, f"cron del {job_id}")
+        for ticks, cmd in self.desired_cron:
+            self.send_shell_cmd(node, f"cron add {ticks} {cmd}")
 
     def _replay_wal_entry(self, node: TriadNode, stmt: str):
         s = stmt.strip()
@@ -991,6 +1131,7 @@ class TriadController:
                 self.log_event("ERROR", f"{node.name}: Timed out waiting for shell ready after morph (tail: {tail_str}).")
                 node.state = "OFFLINE"
                 return False
+            self.apply_node_profile(node)
 
             # 4. CATCHING_UP: Replay any SQL transactions committed while this node was morphing,
             #    holding `self.wal_lock` across the replay AND the `node.state = "ONLINE"` transition
@@ -1040,6 +1181,15 @@ class TriadController:
         Reconstruct a corrupted/tampered node from the 2-of-3 healthy majority (D1 = D2 ^ P),
         replay the full canonical WAL, and emergency-morph its binary.
         """
+        if not self.spec.has_sql:
+            # No SQL partition to rebuild: the emergency morph boots a clean, freshly morphed
+            # image and `apply_node_profile` restores the role and desired cron jobs.
+            node.state = "HEALING"
+            self.log_event("HEAL", f"{node.name}: Isolating diverged node; rebuilding from a clean morphed image...")
+            with self.morph_op_lock:
+                pass  # let any in-flight morph finish; bounce_and_morph_node takes the lock non-blocking
+            self.bounce_and_morph_node(node.node_id)
+            return
         with self.morph_op_lock:
             node.state = "HEALING"
             # Verify 4 KiB XOR block parity recovery (D_corrupted = D_peer ^ P)
@@ -1082,6 +1232,9 @@ class TriadController:
         node = self.nodes[node_id - 1]
         if node.state != "ONLINE":
             return
+        if not self.spec.has_sql:
+            self.log_event("WARN", f"Tamper drill needs a SQL-capable role; this Triad runs '{self.spec.role}'.")
+            return
         node.tampered = True
         self.log_event(
             "TAMPER",
@@ -1105,7 +1258,7 @@ class TriadController:
             n for n in self.nodes
             if n.node_id not in self.restored_tx_seq_nodes and n.state == "ONLINE"
         ]
-        if not pending or self.triad_tx_seq == 0:
+        if not pending or self.triad_tx_seq == 0 or not self.spec.has_sql:
             return
         tables = {}
         for n in self.nodes:
@@ -1139,13 +1292,17 @@ class TriadController:
         for n in self.nodes:
             self.morph_node_image(n, n.current_seed)
 
-        self.log_event("INIT", "Launching 3 parallel 4-core Cuttle VMs (12 vCPUs total, HLT idle)...")
+        self.log_event(
+            "INIT",
+            f"Launching 3 parallel {self.spec.smp}-core Cuttle VMs ({3 * self.spec.smp} vCPUs total, HLT idle, role={self.spec.role})...",
+        )
         for n in self.nodes:
             self.start_node_vm(n)
 
         for n in self.nodes:
             ok = self.wait_for_shell_ready(n, timeout=30.0)
             if ok:
+                self.apply_node_profile(n)
                 n.state = "ONLINE"
                 self.refresh_node_telemetry(n)
                 self.log_event(
@@ -1158,7 +1315,22 @@ class TriadController:
 
         self._adopt_tx_seq_from_majority()
         self.compute_and_verify_raid_parity()
+        self._provision_sql()
         threading.Thread(target=self._background_scheduler, daemon=True).start()
+
+    def _provision_sql(self):
+        """
+        Commit the spec's one-time schema statements (e.g. an index Triad's `idx` table) through
+        the WAL, so a node that morphs or heals later replays them like any other write.
+        """
+        if not self.spec.has_sql:
+            return
+        for stmt in self.spec.provision_sql:
+            if any(s == stmt for _, s in self.wal_entries):
+                continue
+            res = self.execute_triad_sql(stmt)
+            if not res.get("ok"):
+                self.log_event("WARN", f"Provisioning statement failed: {stmt} -> {res.get('error') or res.get('output')}")
 
     def _background_scheduler(self):
         last_rot = time.time()
@@ -1544,6 +1716,12 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                 "parity_sha256": c.parity_sha256,
                 "parity_syndrome_ok": c.parity_syndrome_ok,
                 "auto_morph": c.auto_morph_enabled,
+                "name": c.spec.name,
+                "job": c.spec.job,
+                "role": c.spec.role,
+                "has_sql": c.spec.has_sql,
+                "has_shell": c.spec.has_shell,
+                "desired_cron": [{"every": t, "cmd": cmd} for t, cmd in c.desired_cron],
                 "nodes": [
                     {
                         "node_id": n.node_id,
