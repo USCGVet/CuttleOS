@@ -4,7 +4,7 @@
 //!    1 and 3, and the RFC 8448 §3 early secret → `derived` → handshake
 //!    secret chain, byte-for-byte.
 //! 2. **Provider** (`target_enterprise::tls_provider`): AES-128-GCM (GCM spec
-//!    test cases 1–2), ChaCha20-Poly1305 (RFC 8439 §2.8.2), X25519 (RFC 7748
+//!    test cases 1, 2, and 4), ChaCha20-Poly1305 (RFC 8439 §2.8.2), X25519 (RFC 7748
 //!    §6.1), ECDSA P-256 / SHA-256 (RFC 6979 §A.2.5) and a record-layer
 //!    round trip — the same self-test the kernel runs at every boot.
 //!

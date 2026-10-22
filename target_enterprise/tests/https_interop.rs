@@ -368,6 +368,38 @@ fn https_tx_cap_backpressure_and_idle_rto_reclaim_slots() {
         0,
         "Idle Established HTTPS slot must be reclaimed once HTTPS_IDLE_TIMEOUT_TICKS elapses"
     );
+
+    // 3. Exercise the 16 KiB HTTPS_TX_HIGH_WATER pause inside `handle_https_slot` over
+    // `LoopbackClient`: send 24 pipelined `GET /app` requests (~30 KiB of responses)
+    // across a single connection and verify that `handle_https_slot` pauses at the
+    // 8-response / 16 KiB high-water mark per segment, resumes as segments are ACKed,
+    // and delivers all 24 responses intact without overflowing `MAX_PLAINTEXT_BYTES`.
+    let sh3 = Box::new(target_enterprise::OsShell::with_seal_key([0x33; 32]));
+    let (mut lb3, id3) = live_server(Some(sh3), 50021);
+    let mut c3 = ring_client(id3.cert_der(), "localhost");
+    let mut w3 = Wire::new();
+    w3.pump(&mut c3, &mut lb3).unwrap();
+    let mut burst = Vec::new();
+    for _ in 0..24 {
+        burst.extend_from_slice(b"GET /app HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    }
+    c3.writer().write_all(&burst).unwrap();
+    let mut flight = Vec::new();
+    while c3.wants_write() {
+        c3.write_tls(&mut flight).unwrap();
+    }
+    let back = lb3.send(&flight).unwrap();
+    let mut burst_plain = Vec::new();
+    for part in back.chunks(2048) {
+        deliver(&mut c3, part).unwrap();
+        burst_plain.extend_from_slice(&read_plaintext(&mut c3));
+    }
+    let burst_resp = String::from_utf8(burst_plain).unwrap();
+    let ok_200 = burst_resp.matches("HTTP/1.1 200 OK\r\n").count();
+    assert_eq!(
+        ok_200, 24,
+        "all 24 pipelined HTTPS /app responses (~30 KiB) must drain across HTTPS_TX_HIGH_WATER pauses; got {ok_200}"
+    );
 }
 
 #[test]
@@ -481,37 +513,65 @@ fn http_and_https_reject_oversized_and_unframed_requests_and_match_across_routes
     let mut wire = Wire::new();
     wire.pump(&mut client, &mut lb).unwrap();
 
-    // 1. POST/PUT without Content-Length is rejected with 400 on both :443 and :80.
-    let unframed_post = b"POST /sql HTTP/1.1\r\nHost: localhost\r\n\r\nSELECT * FROM kv";
+    // 1. POST/PUT without Content-Length is rejected with 400 on both :443 and :80,
+    // and closes the connection / discards any trailing pipelined request.
+    let unframed_post = b"POST /sql HTTP/1.1\r\nHost: localhost\r\n\r\nSELECT * FROM kv\r\nGET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n";
     let tls_unframed = get(&mut client, &mut lb, &mut wire, unframed_post);
     assert!(
         tls_unframed.starts_with("HTTP/1.1 400 Bad Request\r\n")
-            && tls_unframed.contains("Content-Length required for POST/PUT"),
-        "HTTPS unframed POST: {tls_unframed}"
+            && tls_unframed.contains("Content-Length required for POST/PUT")
+            && !tls_unframed.contains("CUTTLE-STATUS"),
+        "HTTPS unframed POST must return 400 and never execute trailing request: {tls_unframed}"
     );
 
     let (net, shell) = lb.into_parts();
     let mut plain = LoopbackClient::connect_to(net, shell, 50140, 80, 5).unwrap();
     let http_unframed = String::from_utf8(plain.send(unframed_post).unwrap()).unwrap();
     assert_eq!(tls_unframed, http_unframed, ":80 and :443 must reject unframed POST identically");
+    assert!(
+        plain.server_closed(),
+        "port 80 must emit FIN and close after a 400 framing error"
+    );
 
-    // 2. Oversized requests (> MAX_HTTP_REQUEST_BYTES) return 413 on both :80 and :443.
+    // 2. Oversized requests (> MAX_HTTP_REQUEST_BYTES) return 413 on both :80 and :443
+    // and close the connection without processing any trailing request.
+    let (net, shell) = plain.into_parts();
+    let mut plain_413 = LoopbackClient::connect_to(net, shell, 50141, 80, 5).unwrap();
     let mut oversized = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nX-Big: ".to_vec();
     oversized.extend(std::iter::repeat_n(
         b'B',
         target_enterprise::lived_net::MAX_HTTP_REQUEST_BYTES + 128,
     ));
-    oversized.extend_from_slice(b"\r\n\r\n");
-    let http_413 = String::from_utf8(plain.send(&oversized).unwrap()).unwrap();
-    assert!(http_413.starts_with("HTTP/1.1 413 "), "HTTP oversized: {http_413}");
+    oversized.extend_from_slice(b"\r\n\r\nGET /status HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let http_413 = String::from_utf8(plain_413.send(&oversized).unwrap()).unwrap();
+    assert!(
+        http_413.starts_with("HTTP/1.1 413 ") && !http_413.contains("CUTTLE-STATUS"),
+        "HTTP oversized: {http_413}"
+    );
+    assert!(
+        plain_413.server_closed(),
+        "port 80 must emit FIN and close after a 413 error"
+    );
 
-    let (net, shell) = plain.into_parts();
+    let (net, shell) = plain_413.into_parts();
     let mut lb_413 = LoopbackClient::connect(net, shell, 50041, 5).unwrap();
     let mut c_413 = ring_client(identity.cert_der(), "localhost");
     let mut w_413 = Wire::new();
     w_413.pump(&mut c_413, &mut lb_413).unwrap();
     let tls_413 = get(&mut c_413, &mut lb_413, &mut w_413, &oversized);
     assert_eq!(tls_413, http_413, ":80 and :443 must return identical 413 responses");
+
+    // 2b. Transfer-Encoding: chunked is rejected with 501 Not Implemented and closes the connection.
+    let (net, shell) = lb_413.into_parts();
+    let mut plain_501 = LoopbackClient::connect_to(net, shell, 50144, 80, 5).unwrap();
+    let chunked_req = b"POST /sql HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nGET /status HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let http_501 = String::from_utf8(plain_501.send(chunked_req).unwrap()).unwrap();
+    assert!(
+        http_501.starts_with("HTTP/1.1 501 Not Implemented\r\n")
+            && !http_501.contains("CUTTLE-STATUS"),
+        "HTTP chunked must return 501 and discard trailing bytes: {http_501}"
+    );
+    assert!(plain_501.server_closed());
 
     // 3. Public routes return identical responses over :443 and :80 when run
     // against identically-initialized (LivedNet, OsShell) pairs.

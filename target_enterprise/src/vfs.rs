@@ -510,7 +510,29 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
             }
             i += 1;
         }
+        let removed_off = self.inodes[idx].data_off;
+        let removed_cap = self.inodes[idx].capacity;
         self.inodes[idx] = EMPTY_INODE;
+        if removed_cap > 0
+            && (removed_off as usize).saturating_add(removed_cap as usize) <= self.pool_used as usize
+        {
+            let src_start = (removed_off + removed_cap) as usize;
+            let dst_start = removed_off as usize;
+            let move_len = (self.pool_used as usize).saturating_sub(src_start);
+            let mut m = 0usize;
+            while m < move_len {
+                self.pool[dst_start + m] = self.pool[src_start + m];
+                m += 1;
+            }
+            let mut k = 0usize;
+            while k < I {
+                if self.inodes[k].used && self.inodes[k].data_off > removed_off {
+                    self.inodes[k].data_off -= removed_cap;
+                }
+                k += 1;
+            }
+            self.pool_used -= removed_cap;
+        }
         Ok(())
     }
 
@@ -684,11 +706,40 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
             return Err(FsError::BadHandle);
         }
         let inode_idx = entry.inode_idx as usize;
-        let cap = self.inodes[inode_idx].capacity as u64;
+        let end = offset.saturating_add(buf.len() as u64);
+        let mut cap = self.inodes[inode_idx].capacity as u64;
+        if end > cap && end <= u32::MAX as u64 {
+            let needed = end - cap;
+            if (self.pool_used as u64).saturating_add(needed) <= P as u64 {
+                let needed_u32 = needed as u32;
+                let old_tail = self.inodes[inode_idx]
+                    .data_off
+                    .saturating_add(self.inodes[inode_idx].capacity);
+                let move_len = (self.pool_used as usize).saturating_sub(old_tail as usize);
+                let mut m = move_len;
+                while m > 0 {
+                    m -= 1;
+                    self.pool[old_tail as usize + needed as usize + m] =
+                        self.pool[old_tail as usize + m];
+                }
+                let mut k = 0usize;
+                while k < I {
+                    if self.inodes[k].used
+                        && k != inode_idx
+                        && self.inodes[k].data_off >= old_tail
+                    {
+                        self.inodes[k].data_off += needed_u32;
+                    }
+                    k += 1;
+                }
+                self.inodes[inode_idx].capacity += needed_u32;
+                self.pool_used += needed_u32;
+                cap = end;
+            }
+        }
         if offset > cap {
             return Err(FsError::NoSpace);
         }
-        let end = offset.saturating_add(buf.len() as u64);
         if end > cap {
             return Err(FsError::NoSpace);
         }

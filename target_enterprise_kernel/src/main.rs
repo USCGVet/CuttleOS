@@ -833,6 +833,7 @@ pub(crate) fn live_os_console_loop() -> ! {
     let mut net_rx: u64 = 0;
     let mut net_tx: u64 = 0;
     let mut last_sql_tx: u64 = sh.db.tx_seq;
+    let mut last_rto_irq: u64 = read_hw_irq_wakeups();
 
     smp_hw_tick_and_sync(sh);
     smp_hw_enable_bsp_timer();
@@ -850,7 +851,21 @@ pub(crate) fn live_os_console_loop() -> ! {
 
         // 0. Drain live VirtIO-Net interface for HTTP (:80), TLS 1.3 (:443), UDP (:8080/:8081), ICMP, and ARP.
         if let Some(vn) = vnet_opt.as_mut() {
-            let _ = svc.tick_tcp_rto();
+            let now_irq = read_hw_irq_wakeups();
+            if now_irq != last_rto_irq {
+                last_rto_irq = now_irq;
+                let mut rto_rep = CONSOLE_NET_REPLIES.lock();
+                *rto_rep = target_enterprise::ReplySet::new();
+                let _ = svc.tick_tcp_rto_with_replies(&mut *rto_rep);
+                let mut ri = 0usize;
+                while ri < rto_rep.len() {
+                    if let Some(r) = rto_rep.get(ri) {
+                        vnet_tx(vn, r);
+                        net_tx = net_tx.wrapping_add(1);
+                    }
+                    ri += 1;
+                }
+            }
             let mut f_guard = CONSOLE_NET_FRAME.lock();
             while let Some((flen, head_id)) = vnet_rx(vn, &mut *f_guard) {
                 did_io = true;

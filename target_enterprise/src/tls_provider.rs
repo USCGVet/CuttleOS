@@ -164,6 +164,35 @@ pub fn seed_system_rng(mut seed: [u8; 32]) {
     mixed.zeroize();
 }
 
+/// Classification of the QEMU `fw_cfg` `opt/cuttle_device_key` entry so the
+/// kernel can distinguish a deliberate unprovisioned boot (`Absent`) from a
+/// misconfigured / truncated / all-zero host key file (`Invalid`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FwCfgKeyStatus {
+    /// No `opt/cuttle_device_key` entry was supplied in `fw_cfg`.
+    Absent,
+    /// Valid 32-byte non-zero device master key.
+    Valid([u8; 32]),
+    /// `opt/cuttle_device_key` was present in `fw_cfg`, but its size was not
+    /// 32 bytes or its contents were all zero.
+    Invalid {
+        /// Directory-advertised byte length of the `fw_cfg` entry.
+        size: u32,
+    },
+}
+
+/// Classify an optional `(directory_size, raw_bytes)` read from QEMU `fw_cfg`
+/// `opt/cuttle_device_key`.
+pub fn classify_fw_cfg_device_key(entry: Option<(u32, &[u8])>) -> FwCfgKeyStatus {
+    let Some((size, raw)) = entry else {
+        return FwCfgKeyStatus::Absent;
+    };
+    match validate_fw_cfg_device_key(size, raw) {
+        Some(key) => FwCfgKeyStatus::Valid(key),
+        None => FwCfgKeyStatus::Invalid { size },
+    }
+}
+
 /// Validate a QEMU `fw_cfg` device-key blob (`opt/cuttle_device_key`).
 /// Requires the directory-advertised `size` to be exactly 32 bytes, `raw` to
 /// be 32 bytes long, and at least one byte to be non-zero.
@@ -642,14 +671,18 @@ impl EcdsaP256SigningKey {
         out
     }
 
-    /// DER-encoded ECDSA-SHA256 signature over `message`.
-    pub fn sign_der(&self, message: &[u8]) -> Vec<u8> {
-        let sig: p256::ecdsa::Signature = self.0.sign(message);
+    /// DER-encoded ECDSA-SHA256 signature over `message`, verified against the
+    /// public key before returning so a faulted signature is never emitted.
+    pub fn sign_der(&self, message: &[u8]) -> Result<Vec<u8>, &'static str> {
+        let sig: p256::ecdsa::Signature = self
+            .0
+            .try_sign(message)
+            .map_err(|_| "ECDSA P-256 signing failed")?;
         self.0
             .verifying_key()
             .verify(message, &sig)
-            .expect("ECDSA P-256 self-verification failed");
-        sig.to_der().as_bytes().to_vec()
+            .map_err(|_| "ECDSA P-256 self-verification failed")?;
+        Ok(sig.to_der().as_bytes().to_vec())
     }
 }
 
@@ -1158,6 +1191,24 @@ mod tests {
         assert_eq!(validate_fw_cfg_device_key(32, &[1u8; 31]), None);
         assert_eq!(validate_fw_cfg_device_key(32, &[0u8; 32]), None);
         assert_eq!(validate_fw_cfg_device_key(32, &[7u8; 32]), Some([7u8; 32]));
+
+        assert_eq!(classify_fw_cfg_device_key(None), FwCfgKeyStatus::Absent);
+        assert_eq!(
+            classify_fw_cfg_device_key(Some((16, &[1u8; 16]))),
+            FwCfgKeyStatus::Invalid { size: 16 }
+        );
+        assert_eq!(
+            classify_fw_cfg_device_key(Some((64, &[1u8; 32]))),
+            FwCfgKeyStatus::Invalid { size: 64 }
+        );
+        assert_eq!(
+            classify_fw_cfg_device_key(Some((32, &[0u8; 32]))),
+            FwCfgKeyStatus::Invalid { size: 32 }
+        );
+        assert_eq!(
+            classify_fw_cfg_device_key(Some((32, &[7u8; 32]))),
+            FwCfgKeyStatus::Valid([7u8; 32])
+        );
     }
 
     #[test]

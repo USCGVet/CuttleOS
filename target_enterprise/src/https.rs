@@ -46,14 +46,21 @@ pub struct ServerIdentity {
 
 impl ServerIdentity {
     /// Derive the identity from a 32-byte secret (the device key on a
+    /// provisioned node), returning `Err` if ECDSA P-256 self-signing or
+    /// self-verification fails.
+    pub fn try_derive(secret: &[u8; 32], mac: [u8; 6]) -> Result<Self, &'static str> {
+        let key = derive_p256_key(secret);
+        let cert_der = build_self_signed_cert(&key, mac)?;
+        let mut fingerprint = [0u8; 32];
+        fingerprint.copy_from_slice(&Sha256::digest(&cert_der));
+        Ok(Self { key, cert_der, fingerprint })
+    }
+
+    /// Derive the identity from a 32-byte secret (the device key on a
     /// provisioned node). The same secret always yields the same key and
     /// certificate, so a pinned certificate survives reboots and morph cycles.
     pub fn derive(secret: &[u8; 32], mac: [u8; 6]) -> Self {
-        let key = derive_p256_key(secret);
-        let cert_der = build_self_signed_cert(&key, mac);
-        let mut fingerprint = [0u8; 32];
-        fingerprint.copy_from_slice(&Sha256::digest(&cert_der));
-        Self { key, cert_der, fingerprint }
+        Self::try_derive(secret, mac).expect("ECDSA P-256 certificate self-signing failed")
     }
 
     /// DER certificate.
@@ -169,7 +176,10 @@ fn extension(oid: &[u8], value: &[u8]) -> Vec<u8> {
 /// valid 2025-01-01 through 2099-12-31, SAN `localhost` / `127.0.0.1` /
 /// `10.0.2.15`, EKU serverAuth, SKID = AKID. No basicConstraints and no
 /// keyUsage: it is an end-entity certificate that clients pin directly.
-fn build_self_signed_cert(key: &p256::ecdsa::SigningKey, mac: [u8; 6]) -> Vec<u8> {
+fn build_self_signed_cert(
+    key: &p256::ecdsa::SigningKey,
+    mac: [u8; 6],
+) -> Result<Vec<u8>, &'static str> {
     let signer = EcdsaP256SigningKey::new(key.clone());
     let public = signer.public_key_sec1();
     let spki = public_key_to_spki(&alg_id::ECDSA_P256, public);
@@ -219,12 +229,12 @@ fn build_self_signed_cert(key: &p256::ecdsa::SigningKey, mac: [u8; 6]) -> Vec<u8
     let tbs = der_vec(0x30, &tbs_body);
 
     let mut sig_bits = alloc::vec![0u8]; // BIT STRING: no unused bits
-    sig_bits.extend_from_slice(&signer.sign_der(&tbs));
+    sig_bits.extend_from_slice(&signer.sign_der(&tbs)?);
 
     let mut cert_body = tbs;
     cert_body.extend_from_slice(&sig_alg);
     der(0x03, &sig_bits, &mut cert_body);
-    der_vec(0x30, &cert_body)
+    Ok(der_vec(0x30, &cert_body))
 }
 
 // ------------------------------------------------------------------
@@ -259,7 +269,7 @@ pub fn server_config(
 /// plus slack. A peer that sends more without completing a record is cut off.
 pub const MAX_RX_BYTES: usize = 18 * 1024;
 /// Largest buffered decrypted request data (HTTP request head + body).
-pub const MAX_PLAINTEXT_BYTES: usize = 16 * 1024;
+pub const MAX_PLAINTEXT_BYTES: usize = 32 * 1024;
 /// Largest buffered outbound ciphertext queued in [`TlsSession::pending_tx`]
 /// before a stalled peer triggers [`SessionError::Overflow`].
 pub const MAX_TX_BYTES: usize = 64 * 1024;
@@ -635,12 +645,20 @@ impl LoopbackClient {
     pub fn send(&mut self, data: &[u8]) -> Result<Vec<u8>, &'static str> {
         let mut received = Vec::new();
         for chunk in data.chunks(LOOPBACK_SEGMENT) {
+            if self.server_fin {
+                break;
+            }
             let (seq, ack) = (self.seq, self.server_next);
             self.transmit(seq, ack, tcp_flags::ACK | tcp_flags::PSH, chunk)?;
             self.seq = self.seq.wrapping_add(chunk.len() as u32);
             self.collect(&mut received)?;
         }
         Ok(received)
+    }
+
+    /// True if the server has already sent a TCP `FIN` segment on this connection.
+    pub fn server_closed(&self) -> bool {
+        self.server_fin
     }
 
     /// Send FIN; return the server's remaining bytes (e.g. its `close_notify`)

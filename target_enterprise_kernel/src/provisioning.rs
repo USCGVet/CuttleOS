@@ -24,12 +24,15 @@ pub(crate) const FW_CFG_DEVICE_KEY_PATH: &str = "opt/cuttle_device_key";
 static PROVISIONED_MASTER_KEY: spin::Mutex<Option<([u8; 32], bool)>> = spin::Mutex::new(None);
 
 /// Attempt to read a 32-byte out-of-band device secret key from QEMU `fw_cfg`
-/// (`opt/cuttle_device_key`). Returns `None` if the entry is absent, its
-/// directory size is not 32 bytes, or all bytes are zero.
-fn read_fw_cfg_device_key() -> Option<[u8; 32]> {
-    let (sel, size) = fw_cfg_select(FW_CFG_DEVICE_KEY_PATH)?;
+/// (`opt/cuttle_device_key`), distinguishing an absent entry from a malformed
+/// (wrong length or all-zero) entry.
+fn read_fw_cfg_device_key_status() -> target_enterprise::tls_provider::FwCfgKeyStatus {
+    use target_enterprise::tls_provider::{classify_fw_cfg_device_key, FwCfgKeyStatus};
+    let Some((sel, size)) = fw_cfg_select(FW_CFG_DEVICE_KEY_PATH) else {
+        return FwCfgKeyStatus::Absent;
+    };
     if size != 32 {
-        return None;
+        return FwCfgKeyStatus::Invalid { size };
     }
     // SAFETY: Running at CPL=0 (ring 0); `FW_CFG_CTL` (0x510) is the standard
     // QEMU `fw_cfg` selector register and writing `sel` only latches the
@@ -45,9 +48,9 @@ fn read_fw_cfg_device_key() -> Option<[u8; 32]> {
         raw[i] = unsafe { inb(FW_CFG_DATA) };
         i += 1;
     }
-    let validated = target_enterprise::tls_provider::validate_fw_cfg_device_key(size, &raw);
+    let status = classify_fw_cfg_device_key(Some((size, &raw)));
     target_enterprise::durable_seal::zeroize_secret_bytes(&mut raw);
-    validated
+    status
 }
 
 /// Read CMOS RTC registers (seconds, minutes, hours, day, month, year) via
@@ -234,13 +237,26 @@ fn generate_hw_entropy_master_key() -> [u8; 32] {
 
 /// Resolve and return `(master_key, is_fw_cfg_provisioned)`.
 fn device_master_key_state() -> ([u8; 32], bool) {
+    use target_enterprise::tls_provider::FwCfgKeyStatus;
     let mut guard = PROVISIONED_MASTER_KEY.lock();
     if let Some(state) = *guard {
         return state;
     }
-    let state = match read_fw_cfg_device_key() {
-        Some(provisioned) => (provisioned, true),
-        None => (generate_hw_entropy_master_key(), false),
+    let state = match read_fw_cfg_device_key_status() {
+        FwCfgKeyStatus::Valid(provisioned) => (provisioned, true),
+        FwCfgKeyStatus::Absent => (generate_hw_entropy_master_key(), false),
+        FwCfgKeyStatus::Invalid { size } => {
+            let mut line = [0u8; 112];
+            let prefix = b"PROVISIONING ERROR: fw_cfg opt/cuttle_device_key invalid (size=";
+            line[..prefix.len()].copy_from_slice(prefix);
+            let mut pos = prefix.len();
+            pos += dec_u64(size as u64, &mut line[pos..]);
+            let suffix = b"); refusing provisioned services\n";
+            line[pos..pos + suffix.len()].copy_from_slice(suffix);
+            pos += suffix.len();
+            serial_write_bytes(&line[..pos]);
+            (generate_hw_entropy_master_key(), false)
+        }
     };
     *guard = Some(state);
     state
@@ -311,9 +327,12 @@ pub(crate) fn tls_rng_seed(mac: [u8; 6], boot_count: u64) -> Option<([u8; 32], &
     target_enterprise::durable_seal::zeroize_secret_bytes(&mut master);
     let mut i = 0usize;
     while i < hw_words.len() {
-        hw_words[i] = 0;
+        // SAFETY: `hw_words[i]` is a valid stack slot; `write_volatile`
+        // prevents dead-store elimination from eliding the zeroization.
+        unsafe { core::ptr::write_volatile(&mut hw_words[i], 0) };
         i += 1;
     }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     res
 }
 

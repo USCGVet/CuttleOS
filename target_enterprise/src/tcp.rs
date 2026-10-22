@@ -409,8 +409,10 @@ pub fn process_segment(
         TcpState::Established => established_data_or_fin(tcb, seg),
 
         TcpState::CloseWait => {
-            // Local app should call `close()` to send our FIN. Stray
-            // segments here are usually ACKs of our in-flight data.
+            // Peer has already sent FIN; reject any further data or FIN segments.
+            if !seg.payload.is_empty() || (seg.flags & tcp_flags::FIN) != 0 {
+                return Err(TcpProcessError::OutOfWindow);
+            }
             if seg.flags & tcp_flags::ACK != 0
                 && wrapping_lt(tcb.snd_una, seg.ack)
                 && wrapping_le(seg.ack, tcb.snd_nxt)
@@ -421,16 +423,34 @@ pub fn process_segment(
         }
 
         TcpState::LastAck => {
-            // Expect ACK of our FIN.
+            // Expect ACK of our FIN (or in-flight data / peer FIN after server-initiated close).
             if seg.flags & tcp_flags::ACK == 0 {
                 return Err(TcpProcessError::MalformedFlags);
             }
-            if seg.ack != tcb.snd_nxt {
+            if wrapping_lt(tcb.snd_una, seg.ack) && wrapping_le(seg.ack, tcb.snd_nxt) {
+                tcb.snd_una = seg.ack;
+            } else if seg.ack != tcb.snd_nxt && seg.ack != tcb.snd_una {
                 return Err(TcpProcessError::OutOfWindow);
             }
-            tcb.snd_una = seg.ack;
-            tcb.state = TcpState::Closed;
-            Ok((tcb, Reply::NONE))
+            let has_fin = (seg.flags & tcp_flags::FIN) != 0;
+            if has_fin && seg.seq == tcb.rcv_nxt {
+                tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(1);
+            }
+            if seg.ack == tcb.snd_nxt {
+                tcb.state = TcpState::Closed;
+            }
+            let reply = if has_fin {
+                Reply {
+                    present: true,
+                    seq: tcb.snd_nxt,
+                    ack: tcb.rcv_nxt,
+                    flags: tcp_flags::ACK,
+                    window: tcb.rcv_wnd,
+                }
+            } else {
+                Reply::NONE
+            };
+            Ok((tcb, reply))
         }
     }
 }
@@ -521,7 +541,7 @@ fn wrapping_le(a: u32, b: u32) -> bool {
 /// peer's FIN). Returns the FIN segment to emit.
 pub fn close(mut tcb: Tcb) -> Result<(Tcb, Reply), TcpProcessError> {
     match tcb.state {
-        TcpState::CloseWait => {
+        TcpState::Established | TcpState::CloseWait => {
             let seq = tcb.snd_nxt;
             tcb.snd_nxt = tcb.snd_nxt.wrapping_add(1); // FIN consumes a seq.
             tcb.state = TcpState::LastAck;

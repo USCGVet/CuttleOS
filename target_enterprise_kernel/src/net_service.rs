@@ -536,7 +536,16 @@ pub(crate) fn enable_https(svc: &mut target_enterprise::LivedNet, mac: [u8; 6]) 
             return;
         }
     };
-    let identity = ServerIdentity::derive(&secret, mac);
+    let identity = match ServerIdentity::try_derive(&secret, mac) {
+        Ok(id) => id,
+        Err(why) => {
+            target_enterprise::durable_seal::zeroize_secret_bytes(&mut secret);
+            serial_write_str("HTTPS DISABLED: TLS certificate generation failed: ");
+            serial_write_str(why);
+            serial_write_str("\n");
+            return;
+        }
+    };
     target_enterprise::durable_seal::zeroize_secret_bytes(&mut secret);
     match server_config(&identity, system_provider()) {
         Ok(config) => {
