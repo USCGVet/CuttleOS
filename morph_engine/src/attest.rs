@@ -1365,6 +1365,7 @@ fn resolve_primary_verifying_key(
         // key file so single-signer hosts still authenticate.
     }
     for candidate in [
+        crate::signing::resolve_signing_key_path(),
         attest_dir().join(crate::signing::SIGNING_KEY_FILE),
         PathBuf::from(crate::signing::SIGNING_KEY_FILE),
     ] {

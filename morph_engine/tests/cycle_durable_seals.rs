@@ -13,8 +13,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cuttle_morph_engine::{
     run_cycle, verify_chain_with_options, CycleArgs, DurableSeal, SynthesizerKind, VerifyOptions,
-    ATTEST_DIR_ENV, DURABLE_SEALS_DIR_ENV,
+    ATTEST_DIR_ENV, DURABLE_SEALS_DIR_ENV, FEDERATION_CONFIG_ENV, SIGNING_KEY_ENV,
 };
+use ed25519_dalek::SigningKey;
 
 static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -50,12 +51,6 @@ fn cycle_attaches_durable_seals_from_dir() {
     let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let root = workspace_root();
 
-    let key = root.join("factory_signing_key.bin");
-    assert!(
-        key.exists(),
-        "factory_signing_key.bin missing; run morph init-key"
-    );
-
     // Ensure verify binary exists (cycle stage 3 shells out).
     let st = Command::new("cargo")
         .args(["build", "-p", "cuttle-verifier", "--bin", "verify"])
@@ -72,6 +67,28 @@ fn cycle_attaches_durable_seals_from_dir() {
     let seals_dir = run_dir.join("seals");
     fs::create_dir_all(&attest_dir).unwrap();
     fs::create_dir_all(&seals_dir).unwrap();
+
+    // Provision a temporary signing key + matching federation config in run_dir
+    // so this test passes on a fresh checkout without workspace-root factory_signing_key.bin.
+    let sk_bytes = [0x37u8; 32];
+    let sk = SigningKey::from_bytes(&sk_bytes);
+    let pk_hex: String = sk
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    let key_path = run_dir.join("factory_signing_key.bin");
+    fs::write(&key_path, &sk_bytes).unwrap();
+    let fed_path = run_dir.join("factory_keys.toml");
+    fs::write(
+        &fed_path,
+        format!(
+            "threshold = 1\n[[signers]]\nid = \"primary\"\npubkey_hex = \"{}\"\n",
+            pk_hex
+        ),
+    )
+    .unwrap();
 
     // Fixture seals (labels must appear on the attest entry).
     DurableSeal::seal("fixture_audit", b"audit-blob-v1")
@@ -95,18 +112,23 @@ fn cycle_attaches_durable_seals_from_dir() {
 
     let prev_attest = std::env::var_os(ATTEST_DIR_ENV);
     let prev_seals = std::env::var_os(DURABLE_SEALS_DIR_ENV);
+    let prev_key = std::env::var_os(SIGNING_KEY_ENV);
+    let prev_fed = std::env::var_os(FEDERATION_CONFIG_ENV);
     let prev_cwd = std::env::current_dir().expect("cwd");
 
-    // Safety: restore env/cwd/lib even on panic.
+    // Safety: restore env/cwd/lib and remove temp run_dir even on panic.
     struct Guard {
         prev_cwd: PathBuf,
         prev_attest: Option<std::ffi::OsString>,
         prev_seals: Option<std::ffi::OsString>,
+        prev_key: Option<std::ffi::OsString>,
+        prev_fed: Option<std::ffi::OsString>,
         lib_path: PathBuf,
         lib_before: String,
         had_perf: bool,
         perf_path: PathBuf,
         perf_bak: PathBuf,
+        run_dir: PathBuf,
     }
     impl Drop for Guard {
         fn drop(&mut self) {
@@ -120,10 +142,22 @@ fn cycle_attaches_durable_seals_from_dir() {
                     Some(v) => std::env::set_var(DURABLE_SEALS_DIR_ENV, v),
                     None => std::env::remove_var(DURABLE_SEALS_DIR_ENV),
                 }
+                match &self.prev_key {
+                    Some(v) => std::env::set_var(SIGNING_KEY_ENV, v),
+                    None => std::env::remove_var(SIGNING_KEY_ENV),
+                }
+                match &self.prev_fed {
+                    Some(v) => std::env::set_var(FEDERATION_CONFIG_ENV, v),
+                    None => std::env::remove_var(FEDERATION_CONFIG_ENV),
+                }
             }
             let _ = fs::write(&self.lib_path, &self.lib_before);
             if self.had_perf {
                 let _ = fs::copy(&self.perf_bak, &self.perf_path);
+            }
+            let _ = fs::remove_dir_all(&self.run_dir);
+            if let Some(parent) = self.run_dir.parent() {
+                let _ = fs::remove_dir(parent);
             }
         }
     }
@@ -131,17 +165,22 @@ fn cycle_attaches_durable_seals_from_dir() {
         prev_cwd: prev_cwd.clone(),
         prev_attest: prev_attest.clone(),
         prev_seals: prev_seals.clone(),
+        prev_key: prev_key.clone(),
+        prev_fed: prev_fed.clone(),
         lib_path: lib_path.clone(),
         lib_before: lib_before.clone(),
         had_perf,
         perf_path: perf_path.clone(),
         perf_bak: perf_bak.clone(),
+        run_dir: run_dir.clone(),
     };
 
     unsafe {
         std::env::set_var(ATTEST_DIR_ENV, &attest_dir);
         // Prefer CLI path on CycleArgs; also set env so resolve is dual-covered.
         std::env::set_var(DURABLE_SEALS_DIR_ENV, &seals_dir);
+        std::env::set_var(SIGNING_KEY_ENV, &key_path);
+        std::env::set_var(FEDERATION_CONFIG_ENV, &fed_path);
     }
     std::env::set_current_dir(&root).expect("cd workspace");
 
@@ -171,7 +210,7 @@ fn cycle_attaches_durable_seals_from_dir() {
         require_threshold: false,
         require_merkle_root: false,
         require_strict_factory: false,
-        federation_config: None,
+        federation_config: Some(fed_path.clone()),
         factory_expected_path: None,
         require_ext_tlv: true,
         require_diversity: false, // single-module may still fill diversity

@@ -24,6 +24,7 @@ device_secret_key.bin
 /seals/
 /prompts_out/
 /experiments/cycle_durable_seals/
+/experiments/diversity_demo/results/
 /experiments/scorecard_logs/
 /experiments/redteam/work/
 /experiments/soak_short/results/

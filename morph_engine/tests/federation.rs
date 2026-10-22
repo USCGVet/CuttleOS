@@ -59,13 +59,12 @@ fn sig_hex(sk: &SigningKey, msg: &[u8; 32]) -> String {
         .collect()
 }
 
-/// Write a `factory_keys.toml` with three signers seeded as [0;32],
-/// [1;32], [2;32] (matching the bootstrap seeds shipped in
-/// tests/fixtures/federation/).
+/// Write a `factory_keys.toml` with three non-fixture test signers seeded as
+/// [0x10; 32], [0x11; 32], [0x12; 32].
 fn write_test_federation(dir: &PathBuf, threshold: u32) -> PathBuf {
-    let sk_primary = SigningKey::from_bytes(&[0u8; 32]);
-    let sk_a = SigningKey::from_bytes(&[1u8; 32]);
-    let sk_b = SigningKey::from_bytes(&[2u8; 32]);
+    let sk_primary = SigningKey::from_bytes(&[0x10u8; 32]);
+    let sk_a = SigningKey::from_bytes(&[0x11u8; 32]);
+    let sk_b = SigningKey::from_bytes(&[0x12u8; 32]);
     let toml = format!(
         "threshold = {}\n\
          [[signers]]\nid = \"primary\"\npubkey_hex = \"{}\"\n\
@@ -84,7 +83,7 @@ fn write_test_federation(dir: &PathBuf, threshold: u32) -> PathBuf {
 fn fields_with_primary_cosig(cycle: u64, threshold: u32) -> AttestEntryFields {
     let cand_hex = "39b94ac83ca00c15a2f4c292e41717f9e390b3c3157bb6428a519c9b42b0a7d8";
     let cand = parse_hex32(cand_hex).unwrap();
-    let sk_primary = SigningKey::from_bytes(&[0u8; 32]);
+    let sk_primary = SigningKey::from_bytes(&[0x10u8; 32]);
     let sig_hex_str = sig_hex(&sk_primary, &cand);
     AttestEntryFields {
         cycle,
@@ -130,7 +129,7 @@ fn accepts_when_threshold_met() {
     // In-process equivalent of `morph cosign --signer placeholder-a --all`.
     let mut entries = load_entries().unwrap();
     let mut anchors = load_anchors().unwrap();
-    let sk_a = SigningKey::from_bytes(&[1u8; 32]);
+    let sk_a = SigningKey::from_bytes(&[0x11u8; 32]);
     let cand = parse_hex32(&entries[0].candidate_sha256).unwrap();
     entries[0].cosignatures.push(Cosignature {
         signer_id: "placeholder-a".into(),
@@ -269,7 +268,7 @@ fn dedupes_repeat_signer() {
     // Append a second, identical primary cosig.
     let mut entries = load_entries().unwrap();
     let mut anchors = load_anchors().unwrap();
-    let sk_primary = SigningKey::from_bytes(&[0u8; 32]);
+    let sk_primary = SigningKey::from_bytes(&[0x10u8; 32]);
     let cand = parse_hex32(&entries[0].candidate_sha256).unwrap();
     entries[0].cosignatures.push(Cosignature {
         signer_id: "primary".into(),
@@ -305,9 +304,9 @@ fn dedupes_repeat_signer() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// In-process API exercise: load the bootstrap seeds from
-/// `tests/fixtures/federation/`, sign a message, call
-/// `verify_cosignatures` directly.
+/// Verify that the workspace `factory_keys.toml` contains NO committed
+/// test fixture seeds (`tests/fixtures/federation/`), and that verification
+/// rejects any roster containing a known fixture seed.
 #[test]
 fn fixture_seeds_match_factory_keys_toml() {
     // Find the fixtures dir relative to this test file's crate.
@@ -332,46 +331,52 @@ fn fixture_seeds_match_factory_keys_toml() {
     let sk_a = SigningKey::from_bytes(&a);
     let sk_b = SigningKey::from_bytes(&b);
 
-    // The placeholder pubkeys must match the workspace-root
-    // factory_keys.toml. The `primary` slot was rotated (2026-07-27, v11
-    // entry-signature fix) to the REAL factory_signing_key.bin pubkey:
-    // verify-attest authenticates v11+ entries against it, so a test
-    // fixture there would make every legitimately-minted entry fail
-    // verification — and would mean the checked-in fixture seed could
-    // forge production signatures. Assert primary is NOT a fixture seed.
+    // None of the committed fixture seeds may appear in the workspace
+    // factory_keys.toml, and `load_federation` on the workspace config must succeed.
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .to_path_buf();
     let cfg = load_federation(&workspace_root.join("factory_keys.toml")).unwrap();
-    let want_primary = &cfg.signers.iter().find(|s| s.id == "primary").unwrap().pubkey_hex;
-    let want_a = &cfg.signers.iter().find(|s| s.id == "placeholder-a").unwrap().pubkey_hex;
-    let want_b = &cfg.signers.iter().find(|s| s.id == "placeholder-b").unwrap().pubkey_hex;
-    assert_ne!(
-        &pk_hex(&sk_p),
-        want_primary,
-        "workspace factory_keys.toml primary must be the real factory key, not the test fixture"
-    );
-    assert_eq!(&pk_hex(&sk_a), want_a);
-    assert_eq!(&pk_hex(&sk_b), want_b);
+    let fixture_pks = [pk_hex(&sk_p), pk_hex(&sk_a), pk_hex(&sk_b)];
+    for s in &cfg.signers {
+        assert!(
+            !fixture_pks.contains(&s.pubkey_hex),
+            "workspace factory_keys.toml signer '{}' must not use a committed test fixture key",
+            s.id
+        );
+    }
 
-    // Sign a synthetic candidate with the fixture seeds under their own
-    // test-only roster and verify 2-of-3 threshold passes there. (The
-    // workspace roster is no longer signable by fixtures — by design.)
-    let test_cfg = FederationConfig {
-        threshold: 2,
-        signers: vec![
-            FedSigner { id: "primary".into(), pubkey_hex: pk_hex(&sk_p) },
-            FedSigner { id: "placeholder-a".into(), pubkey_hex: pk_hex(&sk_a) },
-            FedSigner { id: "placeholder-b".into(), pubkey_hex: pk_hex(&sk_b) },
-        ],
-    };
-    let msg = [0x42u8; 32];
-    let cosigs = vec![
-        Cosignature { signer_id: "primary".into(), sig_ed25519: sig_hex(&sk_p, &msg) },
-        Cosignature { signer_id: "placeholder-b".into(), sig_ed25519: sig_hex(&sk_b, &msg) },
-    ];
-    verify_cosignatures(&msg, &cosigs, &test_cfg).unwrap();
+    // Verification must reject any roster that includes a known fixture key.
+    for (label, sk_fix) in [("primary", &sk_p), ("placeholder-a", &sk_a), ("placeholder-b", &sk_b)]
+    {
+        let bad_cfg = FederationConfig {
+            threshold: 2,
+            signers: vec![
+                FedSigner { id: label.into(), pubkey_hex: pk_hex(sk_fix) },
+                FedSigner {
+                    id: "real".into(),
+                    pubkey_hex: pk_hex(&SigningKey::from_bytes(&[0x55u8; 32])),
+                },
+            ],
+        };
+        let msg = [0x42u8; 32];
+        let cosigs = vec![
+            Cosignature { signer_id: label.into(), sig_ed25519: sig_hex(sk_fix, &msg) },
+            Cosignature {
+                signer_id: "real".into(),
+                sig_ed25519: sig_hex(&SigningKey::from_bytes(&[0x55u8; 32]), &msg),
+            },
+        ];
+        let err = verify_cosignatures(&msg, &cosigs, &bad_cfg)
+            .expect_err("roster with committed fixture key must be rejected");
+        assert!(
+            format!("{:#}", err).contains("known test fixture key"),
+            "unexpected error for {}: {:#}",
+            label,
+            err
+        );
+    }
 }
 
 /// After `cosign` modifies entries we must rewrite the chain so plain
@@ -399,7 +404,7 @@ fn rebuild_chain_preserves_plain_verify() {
     // Cosign every entry with placeholder-a.
     let mut entries = load_entries().unwrap();
     let mut anchors = load_anchors().unwrap();
-    let sk_a = SigningKey::from_bytes(&[1u8; 32]);
+    let sk_a = SigningKey::from_bytes(&[0x11u8; 32]);
     for i in 0..entries.len() {
         let cand = parse_hex32(&entries[i].candidate_sha256).unwrap();
         entries[i].cosignatures.push(Cosignature {
@@ -516,8 +521,8 @@ fn v2_log_is_migrated_aside_to_v2_bak() {
 /// CLI path.
 #[test]
 fn in_process_verify_cosignatures_smoke() {
-    let sk_a = SigningKey::from_bytes(&[1u8; 32]);
-    let sk_b = SigningKey::from_bytes(&[2u8; 32]);
+    let sk_a = SigningKey::from_bytes(&[0x11u8; 32]);
+    let sk_b = SigningKey::from_bytes(&[0x12u8; 32]);
     let cfg = FederationConfig {
         threshold: 2,
         signers: vec![

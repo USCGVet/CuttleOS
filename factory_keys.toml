@@ -1,8 +1,10 @@
 # Cuttle M-of-N federation public keyset (2-of-3 threshold).
 #
 # `primary` corresponds to `factory_signing_key.bin` at the workspace root.
-# `placeholder-a` and `placeholder-b` are deterministic test signers used by
-# `morph_engine/tests/fixtures/federation/`.
+# `cosigner-a` and `cosigner-b` are independent out-of-band federation signers
+# whose private keys are never stored in this repository. Test-only fixture
+# seeds in `morph_engine/tests/fixtures/federation/` are rejected by
+# verification.
 
 threshold = 2
 
@@ -11,9 +13,9 @@ id = "primary"
 pubkey_hex = "90d8794cb0bf462c7fc422c8936cc6f133becddef71883794fb4931865da30df"
 
 [[signers]]
-id = "placeholder-a"
-pubkey_hex = "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+id = "cosigner-a"
+pubkey_hex = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
 
 [[signers]]
-id = "placeholder-b"
-pubkey_hex = "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+id = "cosigner-b"
+pubkey_hex = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"

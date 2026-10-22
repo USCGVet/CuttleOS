@@ -2,10 +2,12 @@
 //!
 //! Attestation entries are valid for deployment only when they carry at
 //! least `threshold` signatures from distinct factory public keys listed
-//! in `factory_keys.toml`. Bootstrap configuration ships with M=2, N=3:
-//! one "real" `primary` slot (currently filled by a deterministic
-//! test-only seed, see `tests/fixtures/federation/`) plus two placeholder
-//! slots used to exercise the threshold logic in tests.
+//! in `factory_keys.toml`. The repository configuration ships with M=2, N=3:
+//! one `primary` slot corresponding to `factory_signing_key.bin` plus two
+//! independent out-of-band federation cosigner slots (`cosigner-a`,
+//! `cosigner-b`). Deterministic test-only seeds in
+//! `tests/fixtures/federation/` are strictly rejected by verification
+//! (`KNOWN_FIXTURE_PUBKEYS`).
 //!
 //! The TOML schema:
 //!
@@ -15,10 +17,10 @@
 //! id = "primary"
 //! pubkey_hex = "<64-hex>"
 //! [[signers]]
-//! id = "placeholder-a"
+//! id = "cosigner-a"
 //! pubkey_hex = "<64-hex>"
 //! [[signers]]
-//! id = "placeholder-b"
+//! id = "cosigner-b"
 //! pubkey_hex = "<64-hex>"
 //! ```
 //!
@@ -71,12 +73,51 @@ pub struct Cosignature {
     pub sig_ed25519: String,
 }
 
+/// Known public keys derived from the committed test fixture seeds in
+/// `tests/fixtures/federation/` (`[0u8; 32]`, `[1u8; 32]`, `[2u8; 32]`).
+/// Any federation roster containing one of these keys is rejected by
+/// [`load_federation`] and [`verify_cosignatures`] so committed test seeds
+/// can never satisfy verification.
+pub const KNOWN_FIXTURE_PUBKEYS: &[(&str, &str)] = &[
+    (
+        "primary.seed ([0u8; 32])",
+        "3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29",
+    ),
+    (
+        "placeholder_a.seed ([1u8; 32])",
+        "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    ),
+    (
+        "placeholder_b.seed ([2u8; 32])",
+        "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+    ),
+];
+
+/// Reject a federation roster if any signer uses a known test-fixture public key.
+pub fn reject_fixture_signers(fed: &FederationConfig) -> Result<()> {
+    for s in &fed.signers {
+        for (fixture_label, fixture_pk) in KNOWN_FIXTURE_PUBKEYS {
+            if s.pubkey_hex.eq_ignore_ascii_case(fixture_pk) {
+                bail!(
+                    "federation config: signer '{}' uses known test fixture key {} ({}); \
+                     committed fixture seeds are forbidden in verification rosters",
+                    s.id,
+                    fixture_pk,
+                    fixture_label
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Load the federation config from `path`. Validates the schema:
 ///
 /// - `threshold >= 1`
 /// - `threshold as usize <= signers.len()`
 /// - signer `id` is unique
 /// - each `pubkey_hex` is 64 lowercase hex chars (parseable as 32 bytes)
+/// - no signer `pubkey_hex` is in [`KNOWN_FIXTURE_PUBKEYS`]
 pub fn load_federation(path: &Path) -> Result<FederationConfig> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read federation config {}", path.display()))?;
@@ -112,6 +153,7 @@ pub fn load_federation(path: &Path) -> Result<FederationConfig> {
             );
         }
     }
+    reject_fixture_signers(&cfg)?;
     Ok(cfg)
 }
 
@@ -152,6 +194,7 @@ pub fn verify_cosignatures(
     cosigs: &[Cosignature],
     fed: &FederationConfig,
 ) -> Result<()> {
+    reject_fixture_signers(fed)?;
     let mut counted: HashSet<String> = HashSet::new();
     for c in cosigs {
         let signer = fed
@@ -228,8 +271,8 @@ mod tests {
     #[test]
     fn loads_good_toml() {
         let d = tmpdir("good");
-        let sk0 = SigningKey::from_bytes(&[0u8; 32]);
-        let sk1 = SigningKey::from_bytes(&[1u8; 32]);
+        let sk0 = SigningKey::from_bytes(&[0x10u8; 32]);
+        let sk1 = SigningKey::from_bytes(&[0x11u8; 32]);
         let p = write_toml(
             &d,
             &format!(
@@ -246,9 +289,44 @@ mod tests {
     }
 
     #[test]
+    fn rejects_known_fixture_pubkeys() {
+        let d = tmpdir("fixture_reject");
+        for (i, seed_byte) in [0u8, 1u8, 2u8].into_iter().enumerate() {
+            let sk = SigningKey::from_bytes(&[seed_byte; 32]);
+            let p = write_toml(
+                &d,
+                &format!(
+                    "threshold = 1\n[[signers]]\nid = \"f{}\"\npubkey_hex = \"{}\"\n",
+                    i,
+                    pk_hex(&sk)
+                ),
+            );
+            let err = load_federation(&p).unwrap_err();
+            let msg = format!("{:#}", err);
+            assert!(msg.contains("known test fixture key"), "got: {}", msg);
+
+            let cfg = FederationConfig {
+                threshold: 1,
+                signers: vec![Signer {
+                    id: format!("f{}", i),
+                    pubkey_hex: pk_hex(&sk),
+                }],
+            };
+            let msg_bytes = [9u8; 32];
+            let cosigs = vec![Cosignature {
+                signer_id: format!("f{}", i),
+                sig_ed25519: sig_hex(&sk, &msg_bytes),
+            }];
+            let verr = verify_cosignatures(&msg_bytes, &cosigs, &cfg).unwrap_err();
+            let vmsg = format!("{:#}", verr);
+            assert!(vmsg.contains("known test fixture key"), "got: {}", vmsg);
+        }
+    }
+
+    #[test]
     fn rejects_threshold_above_signer_count() {
         let d = tmpdir("hi_thr");
-        let sk0 = SigningKey::from_bytes(&[0u8; 32]);
+        let sk0 = SigningKey::from_bytes(&[0x10u8; 32]);
         let p = write_toml(
             &d,
             &format!(
@@ -264,8 +342,8 @@ mod tests {
     #[test]
     fn rejects_duplicate_signer_id() {
         let d = tmpdir("dup");
-        let sk0 = SigningKey::from_bytes(&[0u8; 32]);
-        let sk1 = SigningKey::from_bytes(&[1u8; 32]);
+        let sk0 = SigningKey::from_bytes(&[0x10u8; 32]);
+        let sk1 = SigningKey::from_bytes(&[0x11u8; 32]);
         let p = write_toml(
             &d,
             &format!(
@@ -295,8 +373,8 @@ mod tests {
 
     #[test]
     fn verify_happy_path_threshold_2() {
-        let sk_a = SigningKey::from_bytes(&[1u8; 32]);
-        let sk_b = SigningKey::from_bytes(&[2u8; 32]);
+        let sk_a = SigningKey::from_bytes(&[0x11u8; 32]);
+        let sk_b = SigningKey::from_bytes(&[0x12u8; 32]);
         let cfg = FederationConfig {
             threshold: 2,
             signers: vec![
@@ -314,7 +392,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_unknown_signer() {
-        let sk_a = SigningKey::from_bytes(&[1u8; 32]);
+        let sk_a = SigningKey::from_bytes(&[0x11u8; 32]);
         let cfg = FederationConfig {
             threshold: 1,
             signers: vec![Signer { id: "a".into(), pubkey_hex: pk_hex(&sk_a) }],
@@ -331,8 +409,8 @@ mod tests {
 
     #[test]
     fn verify_rejects_bad_signature() {
-        let sk_a = SigningKey::from_bytes(&[1u8; 32]);
-        let sk_b = SigningKey::from_bytes(&[2u8; 32]);
+        let sk_a = SigningKey::from_bytes(&[0x11u8; 32]);
+        let sk_b = SigningKey::from_bytes(&[0x12u8; 32]);
         let cfg = FederationConfig {
             threshold: 1,
             signers: vec![Signer { id: "a".into(), pubkey_hex: pk_hex(&sk_a) }],
@@ -350,8 +428,8 @@ mod tests {
 
     #[test]
     fn verify_dedupes_repeat_signer() {
-        let sk_a = SigningKey::from_bytes(&[1u8; 32]);
-        let sk_b = SigningKey::from_bytes(&[2u8; 32]);
+        let sk_a = SigningKey::from_bytes(&[0x11u8; 32]);
+        let sk_b = SigningKey::from_bytes(&[0x12u8; 32]);
         let cfg = FederationConfig {
             threshold: 2,
             signers: vec![
@@ -372,8 +450,8 @@ mod tests {
 
     #[test]
     fn verify_rejects_below_threshold() {
-        let sk_a = SigningKey::from_bytes(&[1u8; 32]);
-        let sk_b = SigningKey::from_bytes(&[2u8; 32]);
+        let sk_a = SigningKey::from_bytes(&[0x11u8; 32]);
+        let sk_b = SigningKey::from_bytes(&[0x12u8; 32]);
         let cfg = FederationConfig {
             threshold: 2,
             signers: vec![

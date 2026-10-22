@@ -59,9 +59,9 @@ const QEMU_BOOT_TIMEOUT_SECS: u64 = 180;
 const BOOT_REQUIRED_BANNERS: &[&str] = &[
     "CUTTLE-TE OK",
     "TLS hkdf OK prk_sha=",
-    "TLS server_hello OK len=",
+    "TLS kat OK aead=2 kx=2 sig=1",
     "WAL replay OK frames=",
-    "NET build OK len=38 ip_cksum=63c7 udp_cksum=fa94",
+    "NET build OK len=37 ip_cksum=63c8 udp_cksum=50c2",
     "CUTTLE-TE HALT",
 ];
 
@@ -174,6 +174,8 @@ fn boot_kernel(elf: &Path, results_dir: &Path, cycle: u64) -> Result<PathBuf, St
     let mut qproc = Command::new(&qemu)
         .arg("-accel")
         .arg("tcg")
+        .arg("-cpu")
+        .arg("max")
         .arg("-drive")
         .arg(format!("format=raw,file={},if=ide", bios.display()))
         .arg("-drive")
@@ -884,6 +886,10 @@ fn summarize_durable_seals_empty_and_present() {
 fn boot_required_banners_include_halt() {
     assert!(BOOT_REQUIRED_BANNERS.iter().any(|b| b.contains("HALT")));
     assert!(BOOT_REQUIRED_BANNERS.iter().any(|b| b.contains("CUTTLE-TE OK")));
+    assert!(BOOT_REQUIRED_BANNERS.contains(&"TLS kat OK aead=2 kx=2 sig=1"));
+    assert!(BOOT_REQUIRED_BANNERS.contains(&"NET build OK len=37 ip_cksum=63c8 udp_cksum=50c2"));
+    assert!(!BOOT_REQUIRED_BANNERS.iter().any(|b| b.contains("TLS server_hello")));
+    assert!(!BOOT_REQUIRED_BANNERS.iter().any(|b| b.contains("len=38")));
     assert!(BOOT_REQUIRED_BANNERS.len() >= 4);
 }
 
