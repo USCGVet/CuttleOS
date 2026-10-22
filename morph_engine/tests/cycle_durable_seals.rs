@@ -70,8 +70,8 @@ fn cycle_attaches_durable_seals_from_dir() {
 
     // Provision a temporary signing key + matching federation config in run_dir
     // so this test passes on a fresh checkout without workspace-root factory_signing_key.bin.
-    let sk_bytes = [0x37u8; 32];
-    let sk = SigningKey::from_bytes(&sk_bytes);
+    let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+    let sk_bytes = sk.to_bytes();
     let pk_hex: String = sk
         .verifying_key()
         .to_bytes()

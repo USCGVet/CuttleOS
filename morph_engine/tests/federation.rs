@@ -59,12 +59,15 @@ fn sig_hex(sk: &SigningKey, msg: &[u8; 32]) -> String {
         .collect()
 }
 
-/// Write a `factory_keys.toml` with three non-fixture test signers seeded as
-/// [0x10; 32], [0x11; 32], [0x12; 32].
-fn write_test_federation(dir: &PathBuf, threshold: u32) -> PathBuf {
-    let sk_primary = SigningKey::from_bytes(&[0x10u8; 32]);
-    let sk_a = SigningKey::from_bytes(&[0x11u8; 32]);
-    let sk_b = SigningKey::from_bytes(&[0x12u8; 32]);
+fn random_sk() -> SigningKey {
+    SigningKey::generate(&mut rand::rngs::OsRng)
+}
+
+/// Write a `factory_keys.toml` with three freshly generated CSPRNG test signers.
+fn write_test_federation(dir: &PathBuf, threshold: u32) -> (PathBuf, SigningKey, SigningKey, SigningKey) {
+    let sk_primary = random_sk();
+    let sk_a = random_sk();
+    let sk_b = random_sk();
     let toml = format!(
         "threshold = {}\n\
          [[signers]]\nid = \"primary\"\npubkey_hex = \"{}\"\n\
@@ -77,14 +80,13 @@ fn write_test_federation(dir: &PathBuf, threshold: u32) -> PathBuf {
     );
     let p = dir.join("factory_keys.toml");
     fs::write(&p, toml).unwrap();
-    p
+    (p, sk_primary, sk_a, sk_b)
 }
 
-fn fields_with_primary_cosig(cycle: u64, threshold: u32) -> AttestEntryFields {
+fn fields_with_primary_cosig(cycle: u64, threshold: u32, sk_primary: &SigningKey) -> AttestEntryFields {
     let cand_hex = "39b94ac83ca00c15a2f4c292e41717f9e390b3c3157bb6428a519c9b42b0a7d8";
     let cand = parse_hex32(cand_hex).unwrap();
-    let sk_primary = SigningKey::from_bytes(&[0x10u8; 32]);
-    let sig_hex_str = sig_hex(&sk_primary, &cand);
+    let sig_hex_str = sig_hex(sk_primary, &cand);
     AttestEntryFields {
         cycle,
         module: "lib".into(),
@@ -117,19 +119,18 @@ fn fields_with_primary_cosig(cycle: u64, threshold: u32) -> AttestEntryFields {
 fn accepts_when_threshold_met() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = fresh_tempdir("threshold_met");
-    let fed_path = write_test_federation(&dir, 2);
+    let (fed_path, sk_primary, sk_a, _sk_b) = write_test_federation(&dir, 2);
     unsafe {
         std::env::set_var(ATTEST_DIR_ENV, &dir);
         std::env::set_var(FEDERATION_CONFIG_ENV, &fed_path);
     }
 
     // Write 1 attestation entry; primary cosig only.
-    write_attestation(fields_with_primary_cosig(1, 2)).unwrap();
+    write_attestation(fields_with_primary_cosig(1, 2, &sk_primary)).unwrap();
 
     // In-process equivalent of `morph cosign --signer placeholder-a --all`.
     let mut entries = load_entries().unwrap();
     let mut anchors = load_anchors().unwrap();
-    let sk_a = SigningKey::from_bytes(&[0x11u8; 32]);
     let cand = parse_hex32(&entries[0].candidate_sha256).unwrap();
     entries[0].cosignatures.push(Cosignature {
         signer_id: "placeholder-a".into(),
@@ -168,13 +169,13 @@ fn accepts_when_threshold_met() {
 fn rejects_below_threshold() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = fresh_tempdir("below_thr");
-    let fed_path = write_test_federation(&dir, 2);
+    let (fed_path, sk_primary, _sk_a, _sk_b) = write_test_federation(&dir, 2);
     unsafe {
         std::env::set_var(ATTEST_DIR_ENV, &dir);
         std::env::set_var(FEDERATION_CONFIG_ENV, &fed_path);
     }
 
-    write_attestation(fields_with_primary_cosig(1, 2)).unwrap();
+    write_attestation(fields_with_primary_cosig(1, 2, &sk_primary)).unwrap();
 
     // Plain verify ok (no threshold check); --require-threshold fails.
     verify_chain().expect("plain verify still ok");
@@ -209,18 +210,18 @@ fn rejects_below_threshold() {
 fn rejects_unknown_signer() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = fresh_tempdir("unknown_signer");
-    let fed_path = write_test_federation(&dir, 2);
+    let (fed_path, sk_primary, _sk_a, _sk_b) = write_test_federation(&dir, 2);
     unsafe {
         std::env::set_var(ATTEST_DIR_ENV, &dir);
         std::env::set_var(FEDERATION_CONFIG_ENV, &fed_path);
     }
 
-    write_attestation(fields_with_primary_cosig(1, 2)).unwrap();
+    write_attestation(fields_with_primary_cosig(1, 2, &sk_primary)).unwrap();
 
     // Inject a rogue cosig (well-formed sig hex, but unknown id).
     let mut entries = load_entries().unwrap();
     let mut anchors = load_anchors().unwrap();
-    let sk_rogue = SigningKey::from_bytes(&[99u8; 32]);
+    let sk_rogue = random_sk();
     let cand = parse_hex32(&entries[0].candidate_sha256).unwrap();
     entries[0].cosignatures.push(Cosignature {
         signer_id: "rogue".into(),
@@ -257,18 +258,17 @@ fn rejects_unknown_signer() {
 fn dedupes_repeat_signer() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = fresh_tempdir("dedupe");
-    let fed_path = write_test_federation(&dir, 2);
+    let (fed_path, sk_primary, _sk_a, _sk_b) = write_test_federation(&dir, 2);
     unsafe {
         std::env::set_var(ATTEST_DIR_ENV, &dir);
         std::env::set_var(FEDERATION_CONFIG_ENV, &fed_path);
     }
 
-    write_attestation(fields_with_primary_cosig(1, 2)).unwrap();
+    write_attestation(fields_with_primary_cosig(1, 2, &sk_primary)).unwrap();
 
     // Append a second, identical primary cosig.
     let mut entries = load_entries().unwrap();
     let mut anchors = load_anchors().unwrap();
-    let sk_primary = SigningKey::from_bytes(&[0x10u8; 32]);
     let cand = parse_hex32(&entries[0].candidate_sha256).unwrap();
     entries[0].cosignatures.push(Cosignature {
         signer_id: "primary".into(),
@@ -305,10 +305,11 @@ fn dedupes_repeat_signer() {
 }
 
 /// Verify that the workspace `factory_keys.toml` contains NO committed
-/// test fixture seeds (`tests/fixtures/federation/`), and that verification
-/// rejects any roster containing a known fixture seed.
+/// test fixture seeds (`tests/fixtures/federation/`), that verification
+/// rejects any roster containing a known fixture seed, and that a
+/// single-signer (`threshold = 1`) config is rejected under `--require-threshold`.
 #[test]
-fn fixture_seeds_match_factory_keys_toml() {
+fn workspace_factory_keys_rejects_fixture_seeds_and_validates_threshold() {
     // Find the fixtures dir relative to this test file's crate.
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -332,15 +333,16 @@ fn fixture_seeds_match_factory_keys_toml() {
     let sk_b = SigningKey::from_bytes(&b);
 
     // None of the committed fixture seeds may appear in the workspace
-    // factory_keys.toml, and `load_federation` on the workspace config must succeed.
+    // factory_keys.toml, and `load_federation` on the workspace config must succeed
+    // whether the operator leaves threshold = 1 or enrolls M-of-N co-signers.
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .to_path_buf();
     let cfg = load_federation(&workspace_root.join("factory_keys.toml")).unwrap();
-    assert_eq!(cfg.threshold, 1);
-    assert_eq!(cfg.signers.len(), 1);
-    assert_eq!(cfg.signers[0].id, "primary");
+    assert!(cfg.threshold >= 1);
+    assert!(!cfg.signers.is_empty());
+    assert!(cfg.signers.iter().any(|s| s.id == "primary"));
     let fixture_pks = [pk_hex(&sk_p), pk_hex(&sk_a), pk_hex(&sk_b)];
     for s in &cfg.signers {
         assert!(
@@ -351,17 +353,26 @@ fn fixture_seeds_match_factory_keys_toml() {
     }
 
     // Running `verify_chain_with_options(require_threshold: true)` against a
-    // single-signer (threshold = 1) config must fail closed until independent
-    // co-signer keys are enrolled.
+    // single-signer (threshold = 1) config must fail closed.
     let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = fresh_tempdir("single_signer_thr_reject");
+    let single_sk = random_sk();
+    let single_fed_path = dir.join("single_factory_keys.toml");
+    fs::write(
+        &single_fed_path,
+        format!(
+            "threshold = 1\n[[signers]]\nid = \"primary\"\npubkey_hex = \"{}\"\n",
+            pk_hex(&single_sk)
+        ),
+    )
+    .unwrap();
     unsafe {
         std::env::set_var(ATTEST_DIR_ENV, &dir);
-        std::env::set_var(FEDERATION_CONFIG_ENV, workspace_root.join("factory_keys.toml"));
+        std::env::set_var(FEDERATION_CONFIG_ENV, &single_fed_path);
     }
     let single_err = verify_chain_with_options(&VerifyOptions {
         require_threshold: true,
-        federation_config: Some(workspace_root.join("factory_keys.toml")),
+        federation_config: Some(single_fed_path),
         require_merkle_root: false,
         require_strict_factory: false,
         factory_expected_path: None,
@@ -382,6 +393,7 @@ fn fixture_seeds_match_factory_keys_toml() {
     let _ = fs::remove_dir_all(&dir);
 
     // Verification must reject any roster that includes a known fixture key.
+    let sk_real = random_sk();
     for (label, sk_fix) in [("primary", &sk_p), ("placeholder-a", &sk_a), ("placeholder-b", &sk_b)]
     {
         let bad_cfg = FederationConfig {
@@ -390,7 +402,7 @@ fn fixture_seeds_match_factory_keys_toml() {
                 FedSigner { id: label.into(), pubkey_hex: pk_hex(sk_fix) },
                 FedSigner {
                     id: "real".into(),
-                    pubkey_hex: pk_hex(&SigningKey::from_bytes(&[0x55u8; 32])),
+                    pubkey_hex: pk_hex(&sk_real),
                 },
             ],
         };
@@ -399,7 +411,7 @@ fn fixture_seeds_match_factory_keys_toml() {
             Cosignature { signer_id: label.into(), sig_ed25519: sig_hex(sk_fix, &msg) },
             Cosignature {
                 signer_id: "real".into(),
-                sig_ed25519: sig_hex(&SigningKey::from_bytes(&[0x55u8; 32]), &msg),
+                sig_ed25519: sig_hex(&sk_real, &msg),
             },
         ];
         let err = verify_cosignatures(&msg, &cosigs, &bad_cfg)
@@ -421,7 +433,7 @@ fn fixture_seeds_match_factory_keys_toml() {
 fn rebuild_chain_preserves_plain_verify() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = fresh_tempdir("rebuild");
-    let fed_path = write_test_federation(&dir, 2);
+    let (fed_path, sk_primary, sk_a, _sk_b) = write_test_federation(&dir, 2);
     unsafe {
         std::env::set_var(ATTEST_DIR_ENV, &dir);
         std::env::set_var(FEDERATION_CONFIG_ENV, &fed_path);
@@ -429,7 +441,7 @@ fn rebuild_chain_preserves_plain_verify() {
 
     // Write 12 entries: triggers one anchor (entries 0..=9).
     for i in 1u64..=12 {
-        write_attestation(fields_with_primary_cosig(i, 2)).unwrap();
+        write_attestation(fields_with_primary_cosig(i, 2, &sk_primary)).unwrap();
     }
     let anchors_before = load_anchors().unwrap();
     assert_eq!(anchors_before.len(), 1);
@@ -438,7 +450,6 @@ fn rebuild_chain_preserves_plain_verify() {
     // Cosign every entry with placeholder-a.
     let mut entries = load_entries().unwrap();
     let mut anchors = load_anchors().unwrap();
-    let sk_a = SigningKey::from_bytes(&[0x11u8; 32]);
     for i in 0..entries.len() {
         let cand = parse_hex32(&entries[i].candidate_sha256).unwrap();
         entries[i].cosignatures.push(Cosignature {
@@ -490,12 +501,12 @@ fn rebuild_chain_preserves_plain_verify() {
 fn v3_entry_carries_federation_fields() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = fresh_tempdir("v3_fields");
-    let fed_path = write_test_federation(&dir, 2);
+    let (fed_path, sk_primary, _sk_a, _sk_b) = write_test_federation(&dir, 2);
     unsafe {
         std::env::set_var(ATTEST_DIR_ENV, &dir);
         std::env::set_var(FEDERATION_CONFIG_ENV, &fed_path);
     }
-    write_attestation(fields_with_primary_cosig(7, 2)).unwrap();
+    write_attestation(fields_with_primary_cosig(7, 2, &sk_primary)).unwrap();
     let entries = load_entries().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].schema_version, cuttle_morph_engine::attest::LEGACY_SCHEMA_VERSION);
@@ -522,7 +533,7 @@ fn v3_entry_carries_federation_fields() {
 fn v2_log_is_migrated_aside_to_v2_bak() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = fresh_tempdir("v2_migrate");
-    let fed_path = write_test_federation(&dir, 2);
+    let (fed_path, sk_primary, _sk_a, _sk_b) = write_test_federation(&dir, 2);
     unsafe {
         std::env::set_var(ATTEST_DIR_ENV, &dir);
         std::env::set_var(FEDERATION_CONFIG_ENV, &fed_path);
@@ -531,7 +542,7 @@ fn v2_log_is_migrated_aside_to_v2_bak() {
     let v2_line = r#"{"schema_version":2,"cycle":1,"ts_unix":1700000000,"module":"lib","candidate_sha256":"39b94ac83ca00c15a2f4c292e41717f9e390b3c3157bb6428a519c9b42b0a7d8","sig_ed25519":"00","accepted":true,"synthesizer":"passthrough","prev_entry_sha256":"0000000000000000000000000000000000000000000000000000000000000000","entry_sha256":"deadbeef"}"#;
     fs::write(attest::attest_log_path(), format!("{}\n", v2_line)).unwrap();
 
-    write_attestation(fields_with_primary_cosig(5, 2)).unwrap();
+    write_attestation(fields_with_primary_cosig(5, 2, &sk_primary)).unwrap();
 
     let bak = dir.join(attest::ATTEST_LOG_V2_BAK);
     assert!(bak.exists(), "expected v2 backup at {}", bak.display());
@@ -555,8 +566,8 @@ fn v2_log_is_migrated_aside_to_v2_bak() {
 /// CLI path.
 #[test]
 fn in_process_verify_cosignatures_smoke() {
-    let sk_a = SigningKey::from_bytes(&[0x11u8; 32]);
-    let sk_b = SigningKey::from_bytes(&[0x12u8; 32]);
+    let sk_a = random_sk();
+    let sk_b = random_sk();
     let cfg = FederationConfig {
         threshold: 2,
         signers: vec![

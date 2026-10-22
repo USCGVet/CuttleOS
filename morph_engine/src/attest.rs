@@ -1359,6 +1359,7 @@ fn resolve_primary_verifying_key(
             }
             let vk = ed25519_dalek::VerifyingKey::from_bytes(&bytes)
                 .context("primary signer pubkey is not a valid ed25519 key")?;
+            federation::reject_fixture_verifying_key(&vk, "primary")?;
             return Ok(Some(vk));
         }
         // Config exists but has no "primary" signer — fall through to the
@@ -1372,7 +1373,9 @@ fn resolve_primary_verifying_key(
         if candidate.exists() {
             let key = crate::signing::load_signing_key_from(&candidate)
                 .with_context(|| format!("load primary key from {}", candidate.display()))?;
-            return Ok(Some(key.verifying_key()));
+            let vk = key.verifying_key();
+            federation::reject_fixture_verifying_key(&vk, &candidate.display().to_string())?;
+            return Ok(Some(vk));
         }
     }
     Ok(None)
