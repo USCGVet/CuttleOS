@@ -338,6 +338,9 @@ fn fixture_seeds_match_factory_keys_toml() {
         .unwrap()
         .to_path_buf();
     let cfg = load_federation(&workspace_root.join("factory_keys.toml")).unwrap();
+    assert_eq!(cfg.threshold, 1);
+    assert_eq!(cfg.signers.len(), 1);
+    assert_eq!(cfg.signers[0].id, "primary");
     let fixture_pks = [pk_hex(&sk_p), pk_hex(&sk_a), pk_hex(&sk_b)];
     for s in &cfg.signers {
         assert!(
@@ -346,6 +349,37 @@ fn fixture_seeds_match_factory_keys_toml() {
             s.id
         );
     }
+
+    // Running `verify_chain_with_options(require_threshold: true)` against a
+    // single-signer (threshold = 1) config must fail closed until independent
+    // co-signer keys are enrolled.
+    let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = fresh_tempdir("single_signer_thr_reject");
+    unsafe {
+        std::env::set_var(ATTEST_DIR_ENV, &dir);
+        std::env::set_var(FEDERATION_CONFIG_ENV, workspace_root.join("factory_keys.toml"));
+    }
+    let single_err = verify_chain_with_options(&VerifyOptions {
+        require_threshold: true,
+        federation_config: Some(workspace_root.join("factory_keys.toml")),
+        require_merkle_root: false,
+        require_strict_factory: false,
+        factory_expected_path: None,
+        require_ext_tlv: false,
+        require_diversity: false,
+        require_durable_seals: false,
+    })
+    .expect_err("single-signer factory_keys.toml must be rejected under --require-threshold");
+    assert!(
+        format!("{:#}", single_err).contains("threshold >= 2"),
+        "unexpected error: {:#}",
+        single_err
+    );
+    unsafe {
+        std::env::remove_var(ATTEST_DIR_ENV);
+        std::env::remove_var(FEDERATION_CONFIG_ENV);
+    }
+    let _ = fs::remove_dir_all(&dir);
 
     // Verification must reject any roster that includes a known fixture key.
     for (label, sk_fix) in [("primary", &sk_p), ("placeholder-a", &sk_a), ("placeholder-b", &sk_b)]

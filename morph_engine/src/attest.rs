@@ -1413,7 +1413,18 @@ pub fn verify_chain_with_options(opts: &VerifyOptions) -> Result<VerifyReport> {
             .federation_config
             .clone()
             .unwrap_or_else(federation::resolve_federation_path);
-        Some(federation::load_federation(&p)?)
+        let cfg = federation::load_federation(&p)?;
+        if cfg.threshold < 2 {
+            bail!(
+                "verify-attest --require-threshold: federation config {} has threshold={} \
+                 (only {} signer(s) enrolled); M-of-N threshold verification requires \
+                 threshold >= 2 with independent operator co-signer keys",
+                p.display(),
+                cfg.threshold,
+                cfg.signers.len()
+            );
+        }
+        Some(cfg)
     } else {
         None
     };

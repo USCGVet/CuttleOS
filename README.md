@@ -27,7 +27,7 @@ Cuttle OS is a hardened multi-role network and state appliance OS built for high
 | [`mtd_metrics`](mtd_metrics) | Binary gadget analyzer and ROP/JOP chain exploit simulator (`cuttle-mtd-metrics`). |
 | [`verifier`](verifier) | Candidate acceptance gate (`verify`) enforcing public-symbol preservation, locked-module integrity, unit/property test suites, and per-function performance bounds (`perf.jsonl`). |
 | [`factory_builder`](factory_builder) | Host packager that builds `target_enterprise_kernel` with per-seed codegen flags, provisions the out-of-band device key, and wraps the kernel ELF into BIOS/UEFI disk images. |
-| [`morph_engine`](morph_engine) | Factory orchestrator (`morph`) managing scheduled morph cycles (`scheduler.toml`), Ed25519 M-of-N threshold attestation chains (`attest.log.jsonl`), and Merkle root anchors. |
+| [`morph_engine`](morph_engine) | Factory orchestrator (`morph`) managing scheduled morph cycles (`scheduler.toml`), Ed25519 attestation chains (`attest.log.jsonl`, single `primary` signer by default; M-of-N threshold verification once operator co-signers are enrolled in `factory_keys.toml`), and Merkle root anchors. |
 
 ---
 

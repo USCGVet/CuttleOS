@@ -1,21 +1,14 @@
-# Cuttle M-of-N federation public keyset (2-of-3 threshold).
+# Cuttle factory attestation public keyset.
 #
-# `primary` corresponds to `factory_signing_key.bin` at the workspace root.
-# `cosigner-a` and `cosigner-b` are independent out-of-band federation signers
-# whose private keys are never stored in this repository. Test-only fixture
-# seeds in `morph_engine/tests/fixtures/federation/` are rejected by
-# verification.
+# `primary` corresponds to the operator's `factory_signing_key.bin` at the
+# workspace root. The repository ships with only `primary` (`threshold = 1`);
+# M-of-N threshold attestation (`verify-attest --require-threshold`) requires
+# the operator to enroll independent co-signer public keys here and set
+# `threshold >= 2`. Test fixture seeds (`morph_engine/tests/fixtures/federation/`)
+# and published RFC 8032 example keys are rejected by verification.
 
-threshold = 2
+threshold = 1
 
 [[signers]]
 id = "primary"
 pubkey_hex = "90d8794cb0bf462c7fc422c8936cc6f133becddef71883794fb4931865da30df"
-
-[[signers]]
-id = "cosigner-a"
-pubkey_hex = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
-
-[[signers]]
-id = "cosigner-b"
-pubkey_hex = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"

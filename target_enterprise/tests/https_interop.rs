@@ -551,6 +551,59 @@ fn http_and_https_reject_oversized_and_unframed_requests_and_match_across_routes
             String::from_utf8_lossy(req)
         );
     }
+
+    // 4. Pipelined back-to-back requests on port 80 whose combined responses
+    // exceed a single TCP segment (1380 bytes), including authenticated writes,
+    // must deliver every response without dropping any response.
+    let mut sh_pipe = Box::new(target_enterprise::OsShell::with_seal_key([0x44; 32]));
+    sh_pipe.attest_key = [0x55; 32];
+    let tok_bytes = sh_pipe
+        .try_create_session(b"root", b"1")
+        .expect("mint root session");
+    let tok = core::str::from_utf8(&tok_bytes).unwrap().to_string();
+    // Populate audit log so `GET /audit` returns a ~1,300-byte response, making
+    // the second back-to-back request's response overflow a single 1380-byte packet.
+    for _ in 0..32 {
+        sh_pipe.record_net_audit(cuttle_contracts::AuditVerdict::Allowed, b"net:test:fill-audit-log");
+    }
+    let net_pipe = Box::new(LivedNet::with_auth_key(MAC, [0x22; 32]));
+    let mut plain_pipe =
+        LoopbackClient::connect_to(net_pipe, Some(sh_pipe), 50143, 80, 5).unwrap();
+
+    // Send back-to-back requests in one flight: 3 `GET /app` responses
+    // (~500 B each) followed by an authenticated SQL INSERT write whose response
+    // pushes the combined payload past TCP_SEGMENT_PAYLOAD (1380 B).
+    let sql_insert = "INSERT INTO kv VALUES ('pipelined', 'ok', 1)";
+    let sql_select = "SELECT v FROM kv WHERE k = 'pipelined'";
+    let mut pipelined = Vec::new();
+    for _ in 0..3 {
+        pipelined.extend_from_slice(
+            format!("GET /app HTTP/1.1\r\nHost: localhost\r\nX-Session-Token: {tok}\r\n\r\n")
+                .as_bytes(),
+        );
+    }
+    pipelined.extend_from_slice(
+        format!(
+            "POST /sql HTTP/1.1\r\nHost: localhost\r\nX-Session-Token: {tok}\r\nContent-Length: {}\r\n\r\n{sql_insert}",
+            sql_insert.len()
+        )
+        .as_bytes(),
+    );
+    let combined_resp = String::from_utf8(plain_pipe.send(&pipelined).unwrap()).unwrap();
+    let status_count = combined_resp.matches("HTTP/1.1 200 OK\r\n").count();
+    assert_eq!(
+        status_count, 4,
+        "all 4 back-to-back port-80 responses must be returned without dropping the write response; got {status_count} in:\n{combined_resp}"
+    );
+    let select_req = format!(
+        "POST /sql HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{sql_select}",
+        sql_select.len()
+    );
+    let select_resp = String::from_utf8(plain_pipe.send(select_req.as_bytes()).unwrap()).unwrap();
+    assert!(
+        select_resp.contains("ok"),
+        "subsequent read must see the committed row:\n{select_resp}"
+    );
 }
 
 /// Re-record the golden session (run with `--ignored --nocapture

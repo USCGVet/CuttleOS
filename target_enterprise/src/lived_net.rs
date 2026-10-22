@@ -140,6 +140,7 @@ pub struct LivedNet {
     ticks: u32,
     ip_ident: u16,
     http_bufs: [alloc::vec::Vec<u8>; TCP_MAX_SLOTS],
+    http_tx: [alloc::vec::Vec<u8>; TCP_MAX_SLOTS],
     tls_config: Option<Arc<ServerConfig>>,
     tls: [Option<Box<TlsSession>>; TCP_MAX_SLOTS],
 }
@@ -161,6 +162,7 @@ impl LivedNet {
             ticks: 1,
             ip_ident: 1,
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
+            http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -188,6 +190,7 @@ impl LivedNet {
             ticks: 1,
             ip_ident: 1,
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
+            http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -210,6 +213,7 @@ impl LivedNet {
             ticks: 1,
             ip_ident: 1,
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
+            http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -247,17 +251,22 @@ impl LivedNet {
                     if self.ticks.wrapping_sub(self.slot_last_tick[i]) >= 16 {
                         self.tcbs[i] = Tcb::EMPTY;
                         self.http_bufs[i].clear();
+                        self.http_tx[i].clear();
                         self.tls[i] = None;
                     } else {
                         self.slot_rto_ticks[i] = self.ticks;
                     }
                 }
             } else if (st == TcpState::Established || st == TcpState::CloseWait)
-                && (self.tcbs[i].local_port == HTTPS_PORT || self.tls[i].is_some())
+                && (self.tcbs[i].local_port == HTTPS_PORT
+                    || self.tls[i].is_some()
+                    || !self.http_bufs[i].is_empty()
+                    || !self.http_tx[i].is_empty())
                 && self.ticks.wrapping_sub(self.slot_last_tick[i]) >= HTTPS_IDLE_TIMEOUT_TICKS
             {
                 self.tcbs[i] = Tcb::EMPTY;
                 self.http_bufs[i].clear();
+                self.http_tx[i].clear();
                 self.tls[i] = None;
                 actions += 1;
             }
@@ -967,6 +976,7 @@ impl LivedNet {
         self.tcbs[idx] = Tcb::listen(self.ip, dst_port, 65535);
         self.slot_rto_ticks[idx] = self.ticks;
         self.http_bufs[idx].clear();
+        self.http_tx[idx].clear();
         self.tls[idx] = None;
         Some(idx)
     }
@@ -1013,62 +1023,53 @@ impl LivedNet {
             return;
         }
 
-        let mut app_out = [0u8; TCP_SEGMENT_PAYLOAD];
-        let mut app_n = 0usize;
+        let mut overflow_413 = false;
         if !inbound_payload.is_empty() && self.tcbs[idx].state != TcpState::Listen {
             if self.http_bufs[idx].len().saturating_add(inbound_payload.len()) > MAX_HTTP_REQUEST_BYTES {
                 self.http_bufs[idx].clear();
-                app_n = build_http_413_response(&mut app_out);
+                overflow_413 = true;
             } else {
                 self.http_bufs[idx].extend_from_slice(inbound_payload);
             }
         }
 
-        if app_n == 0 {
+        if overflow_413 {
+            let mut single = [0u8; TCP_SEGMENT_PAYLOAD];
+            let n = build_http_413_response(&mut single);
+            if n > 0 {
+                self.http_tx[idx].extend_from_slice(&single[..n]);
+            }
+        } else {
             let mut responses = 0usize;
-            while responses < 8 {
+            while responses < 8 && self.http_tx[idx].len() < HTTPS_TX_HIGH_WATER {
                 let mut single = [0u8; TCP_SEGMENT_PAYLOAD];
+                let mut close_after = false;
                 let n = match frame_next_http_request(&mut self.http_bufs[idx]) {
                     HttpFrameOutcome::Incomplete => break,
-                    HttpFrameOutcome::PayloadTooLarge => build_http_413_response(&mut single),
+                    HttpFrameOutcome::PayloadTooLarge => {
+                        close_after = true;
+                        build_http_413_response(&mut single)
+                    }
                     HttpFrameOutcome::LengthRequired => build_http_length_required_response(&mut single),
                     HttpFrameOutcome::Complete(req) => {
+                        close_after = http_wants_close(&req);
                         self.handle_http_request(&req, boots, shell.as_deref_mut(), &mut single)
                     }
                 };
-                if n == 0 || app_n.saturating_add(n) > TCP_SEGMENT_PAYLOAD {
+                if n > 0 {
+                    self.http_tx[idx].extend_from_slice(&single[..n]);
+                }
+                responses += 1;
+                if close_after {
                     break;
                 }
-                app_out[app_n..app_n + n].copy_from_slice(&single[..n]);
-                app_n += n;
-                responses += 1;
             }
         }
 
-        let local_port = self.tcbs[idx].local_port;
-        let remote_port = self.tcbs[idx].remote_port;
-        if app_n > 0
-            && (self.tcbs[idx].state == TcpState::Established
-                || self.tcbs[idx].state == TcpState::CloseWait)
-        {
-            if let Ok((next, data_hint)) = send_payload(self.tcbs[idx], app_n as u32) {
-                self.tcbs[idx] = next;
-                if data_hint.present {
-                    self.emit_tcp(
-                        local_port,
-                        remote_port,
-                        dst_mac,
-                        reply_ip,
-                        data_hint.seq,
-                        data_hint.ack,
-                        data_hint.flags,
-                        data_hint.window,
-                        &app_out[..app_n],
-                        out,
-                    );
-                }
-            }
-        } else if hint.present {
+        let sent = self.flush_http_tx(idx, dst_mac, reply_ip, out);
+        if !sent && hint.present {
+            let local_port = self.tcbs[idx].local_port;
+            let remote_port = self.tcbs[idx].remote_port;
             self.emit_tcp(
                 local_port,
                 remote_port,
@@ -1083,9 +1084,63 @@ impl LivedNet {
             );
         }
 
-        if self.tcbs[idx].state == TcpState::CloseWait {
+        let drained = self.http_tx[idx].is_empty();
+        if self.tcbs[idx].state == TcpState::CloseWait && drained && out.len() < MAX_REPLIES {
             self.emit_fin(idx, dst_mac, reply_ip, out);
         }
+    }
+
+    /// Move queued HTTP response bytes for slot `idx` into TCP segments while
+    /// the reply set has room, keeping one frame free for a FIN. Returns
+    /// whether any data segment was emitted.
+    fn flush_http_tx(
+        &mut self,
+        idx: usize,
+        dst_mac: [u8; 6],
+        reply_ip: [u8; 4],
+        out: &mut ReplySet,
+    ) -> bool {
+        let state = self.tcbs[idx].state;
+        if state != TcpState::Established && state != TcpState::CloseWait {
+            return false;
+        }
+        let mut sent = false;
+        let local_port = self.tcbs[idx].local_port;
+        let remote_port = self.tcbs[idx].remote_port;
+        let mut chunk = [0u8; TCP_SEGMENT_PAYLOAD];
+        while out.len() + 1 < MAX_REPLIES {
+            let n = self.http_tx[idx].len().min(TCP_SEGMENT_PAYLOAD);
+            if n == 0 {
+                break;
+            }
+            chunk[..n].copy_from_slice(&self.http_tx[idx][..n]);
+            let Ok((next, data_hint)) = send_payload(self.tcbs[idx], n as u32) else {
+                break;
+            };
+            if !data_hint.present {
+                break;
+            }
+            let before = out.len();
+            self.emit_tcp(
+                local_port,
+                remote_port,
+                dst_mac,
+                reply_ip,
+                data_hint.seq,
+                data_hint.ack,
+                data_hint.flags,
+                data_hint.window,
+                &chunk[..n],
+                out,
+            );
+            if out.len() == before {
+                break;
+            }
+            self.tcbs[idx] = next;
+            self.http_tx[idx].drain(..n);
+            sent = true;
+        }
+        sent
     }
 
     /// Send our FIN from `CloseWait` (the peer already closed its side).

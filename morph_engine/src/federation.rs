@@ -1,13 +1,14 @@
 //! Federated cross-factory signature requirement (M-of-N).
 //!
-//! Attestation entries are valid for deployment only when they carry at
-//! least `threshold` signatures from distinct factory public keys listed
-//! in `factory_keys.toml`. The repository configuration ships with M=2, N=3:
-//! one `primary` slot corresponding to `factory_signing_key.bin` plus two
-//! independent out-of-band federation cosigner slots (`cosigner-a`,
-//! `cosigner-b`). Deterministic test-only seeds in
-//! `tests/fixtures/federation/` are strictly rejected by verification
-//! (`KNOWN_FIXTURE_PUBKEYS`).
+//! Attestation entries are valid for federated deployment when they carry at
+//! least `threshold` signatures from distinct factory public keys listed in
+//! `factory_keys.toml`. The repository configuration ships with only the
+//! single `primary` signer (`threshold = 1`, corresponding to the operator's
+//! `factory_signing_key.bin`); multi-signer M-of-N verification
+//! (`verify-attest --require-threshold`) requires `threshold >= 2` once the
+//! operator enrolls independent co-signer public keys. Deterministic test-only
+//! seeds in `tests/fixtures/federation/` and published RFC 8032 example keys
+//! are strictly rejected by verification (`KNOWN_FIXTURE_PUBKEYS`).
 //!
 //! The TOML schema:
 //!
@@ -74,10 +75,10 @@ pub struct Cosignature {
 }
 
 /// Known public keys derived from the committed test fixture seeds in
-/// `tests/fixtures/federation/` (`[0u8; 32]`, `[1u8; 32]`, `[2u8; 32]`).
-/// Any federation roster containing one of these keys is rejected by
-/// [`load_federation`] and [`verify_cosignatures`] so committed test seeds
-/// can never satisfy verification.
+/// `tests/fixtures/federation/` (`[0u8; 32]`, `[1u8; 32]`, `[2u8; 32]`) as
+/// well as published RFC 8032 §7.1 Ed25519 example keys whose private keys
+/// are public. Any federation roster containing one of these keys is rejected
+/// by [`load_federation`] and [`verify_cosignatures`].
 pub const KNOWN_FIXTURE_PUBKEYS: &[(&str, &str)] = &[
     (
         "primary.seed ([0u8; 32])",
@@ -90,6 +91,14 @@ pub const KNOWN_FIXTURE_PUBKEYS: &[(&str, &str)] = &[
     (
         "placeholder_b.seed ([2u8; 32])",
         "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+    ),
+    (
+        "RFC 8032 §7.1 TEST 1",
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    ),
+    (
+        "RFC 8032 §7.1 TEST 2",
+        "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
     ),
 ];
 
@@ -291,35 +300,42 @@ mod tests {
     #[test]
     fn rejects_known_fixture_pubkeys() {
         let d = tmpdir("fixture_reject");
-        for (i, seed_byte) in [0u8, 1u8, 2u8].into_iter().enumerate() {
-            let sk = SigningKey::from_bytes(&[seed_byte; 32]);
+        for (i, (label, fixture_pk)) in KNOWN_FIXTURE_PUBKEYS.iter().enumerate() {
             let p = write_toml(
                 &d,
                 &format!(
                     "threshold = 1\n[[signers]]\nid = \"f{}\"\npubkey_hex = \"{}\"\n",
-                    i,
-                    pk_hex(&sk)
+                    i, fixture_pk
                 ),
             );
             let err = load_federation(&p).unwrap_err();
             let msg = format!("{:#}", err);
-            assert!(msg.contains("known test fixture key"), "got: {}", msg);
+            assert!(
+                msg.contains("known test fixture key") && msg.contains(label),
+                "got: {}",
+                msg
+            );
 
             let cfg = FederationConfig {
                 threshold: 1,
                 signers: vec![Signer {
                     id: format!("f{}", i),
-                    pubkey_hex: pk_hex(&sk),
+                    pubkey_hex: (*fixture_pk).to_string(),
                 }],
             };
             let msg_bytes = [9u8; 32];
+            let sk = SigningKey::from_bytes(&[0x33u8; 32]);
             let cosigs = vec![Cosignature {
                 signer_id: format!("f{}", i),
                 sig_ed25519: sig_hex(&sk, &msg_bytes),
             }];
             let verr = verify_cosignatures(&msg_bytes, &cosigs, &cfg).unwrap_err();
             let vmsg = format!("{:#}", verr);
-            assert!(vmsg.contains("known test fixture key"), "got: {}", vmsg);
+            assert!(
+                vmsg.contains("known test fixture key") && vmsg.contains(label),
+                "got: {}",
+                vmsg
+            );
         }
     }
 
