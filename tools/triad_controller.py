@@ -36,6 +36,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -96,6 +97,8 @@ class TriadSpec:
     provision_sql: tuple = ()  # statements committed once through the WAL after first boot
     cron_jobs: tuple = ()  # (interval_ticks, command) re-applied after every boot
     log_prefix: str = ""
+    write_operator_token: bool = True  # False in fleet farms (which authenticate via farm secret)
+    forward_node_ports: bool = True  # False in fleet farms so node ports are not exposed on loopback
 
     @property
     def has_sql(self) -> bool:
@@ -104,6 +107,107 @@ class TriadSpec:
     @property
     def has_shell(self) -> bool:
         return self.role in ("shell", "full")
+
+
+MAX_HTTP_BODY_BYTES = 64 * 1024
+MAX_WAL_ENTRIES = 64
+
+
+def safe_token_eq(provided: str, expected: str) -> bool:
+    """Constant-time ASCII token comparison; returns False (never raises) on non-ASCII input."""
+    if not provided or not expected:
+        return False
+    try:
+        b_prov = provided.encode("ascii")
+        b_exp = expected.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return hmac.compare_digest(b_prov, b_exp)
+
+
+def restrict_file_permissions(path: Path) -> None:
+    """Restrict `path` to mode 0600 on POSIX or an explicit current-user-only ACL on Windows."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    if os.name == "nt":
+        user = os.environ.get("USERNAME")
+        domain = os.environ.get("USERDOMAIN")
+        principal = f"{domain}\\{user}" if domain and user else user
+        if principal:
+            subprocess.run(
+                ["icacls", str(path), "/inheritance:r", "/grant:r", f"{principal}:(F)"],
+                capture_output=True,
+                check=False,
+            )
+
+
+def write_secret_file(path: Path, data: bytes) -> None:
+    """Create or replace `path` exclusively with owner-only permissions and fsync."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(str(tmp), flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        restrict_file_permissions(tmp)
+        tmp.replace(path)
+        restrict_file_permissions(path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def load_or_create_secret_file(path: Path, nbytes: int = 16, binary: bool = False):
+    """
+    Load an existing secret file or create a new one exclusively with owner-only permissions.
+    Refuses to start (raises ValueError) if an existing file is empty, short, overlong, all-zero,
+    or non-hex, rather than silently truncating or replacing a master key or token.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raw = path.read_bytes()
+        if binary:
+            if len(raw) != nbytes:
+                raise ValueError(
+                    f"malformed secret file {path}: expected exactly {nbytes} bytes, got {len(raw)} bytes"
+                )
+            if raw == b"\x00" * nbytes:
+                raise ValueError(f"malformed secret file {path}: all-zero key rejected")
+            restrict_file_permissions(path)
+            return raw
+        try:
+            txt = raw.decode("ascii").strip()
+        except UnicodeDecodeError as e:
+            raise ValueError(f"malformed token secret file {path}: non-ASCII bytes") from e
+        if len(txt) != nbytes * 2 or any(c not in "0123456789abcdefABCDEF" for c in txt):
+            raise ValueError(
+                f"malformed token secret file {path}: expected {nbytes * 2} hex chars, got {len(txt)}"
+            )
+        restrict_file_permissions(path)
+        return txt
+    value = os.urandom(nbytes) if binary else secrets.token_hex(nbytes)
+    write_secret_file(path, value if binary else (value + "\n").encode("ascii"))
+    return value
+
+
+def atomic_write_json(path: Path, obj) -> None:
+    """Serialize `obj` to JSON, flush + fsync a temporary sibling file, and atomically replace `path`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    payload = json.dumps(obj, indent=2).encode("utf-8")
+    with open(tmp, "wb") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
 
 
 def is_printable_ascii_command(s: str) -> bool:
@@ -193,6 +297,74 @@ ACCELERATORS = ("auto", "whpx", "tcg")
 WHPX_FIRST_OUTPUT_S = 8.0
 _whpx_cache: dict = {}
 
+GUEST_SERIAL_MARKERS = (
+    "INFO :",
+    "CUTTLE",
+    "BOOT:",
+    "GDT ",
+    "IDT ",
+    "PAGING ",
+    "HEAP ",
+    "SMP ",
+    "NET SVC UP",
+    "HTTPS UP",
+    "Web UI:",
+    "interactive shell ready",
+)
+
+
+def has_guest_serial_output(lines: list[str]) -> bool:
+    """
+    Return True iff `lines` contains a line with a known CuttleOS bootloader or kernel
+    serial marker, ignoring QEMU host warnings/banners.
+    """
+    for ln in lines:
+        if "qemu-system" in ln or ln.lower().startswith("whpx:"):
+            continue
+        if any(marker in ln for marker in GUEST_SERIAL_MARKERS):
+            return True
+    return False
+
+
+def compact_wal_entries(entries: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """
+    Compact a WAL entry list by dropping earlier key-level overwrites that are completely
+    superseded by a later write to the same key (`UPDATE kv SET ... WHERE k = '<k>'`,
+    `INSERT OR REPLACE INTO kv VALUES ('<k>', ...)`, or `UPDATE idx SET ... WHERE term = '<t>'`).
+    Preserves monotonic `(tid, stmt)` order for all retained entries.
+    """
+    if len(entries) <= 1:
+        return list(entries)
+    kv_update_re = re.compile(
+        r"^(?:UPDATE\s+kv\s+SET\s+.+\s+WHERE\s+k\s*=\s*'([^']+)'"
+        r"|INSERT\s+OR\s+REPLACE\s+INTO\s+kv\s+VALUES\s*\(\s*'([^']+)')",
+        re.IGNORECASE,
+    )
+    idx_update_re = re.compile(
+        r"^UPDATE\s+idx\s+SET\s+.+\s+WHERE\s+term\s*=\s*'([^']+)'",
+        re.IGNORECASE,
+    )
+    last_idx_for_key: dict[str, int] = {}
+    key_at_pos: dict[int, str] = {}
+    for pos, (_, stmt) in enumerate(entries):
+        s = stmt.strip()
+        m_kv = kv_update_re.match(s)
+        if m_kv:
+            k = "kv:" + (m_kv.group(1) or m_kv.group(2))
+            last_idx_for_key[k] = pos
+            key_at_pos[pos] = k
+            continue
+        m_idx = idx_update_re.match(s)
+        if m_idx:
+            k = "idx:" + m_idx.group(1)
+            last_idx_for_key[k] = pos
+            key_at_pos[pos] = k
+    return [
+        entry
+        for pos, entry in enumerate(entries)
+        if pos not in key_at_pos or last_idx_for_key[key_at_pos[pos]] == pos
+    ]
+
 
 def whpx_available(qemu_bin: str) -> bool:
     """
@@ -208,7 +380,7 @@ def whpx_available(qemu_bin: str) -> bool:
         if sys.platform == "win32":
             try:
                 p = subprocess.Popen(
-                    [qemu_bin, "-accel", "whpx", "-M", "pc", "-display", "none", "-nodefaults",
+                    [qemu_bin, "-accel", "whpx", "-cpu", "max", "-M", "pc", "-display", "none", "-nodefaults",
                      "-S", "-no-reboot", "-monitor", "none", "-serial", "none"],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
@@ -229,8 +401,9 @@ def resolve_accelerator(qemu_bin: str, requested: str) -> tuple:
     Map a requested accelerator to (effective name, QEMU arguments).
       tcg  : software emulation, always available.
       whpx : Windows Hypervisor Platform (hardware virtualization); QEMU fails if unavailable.
-      auto : WHPX when this host can start it, else TCG. WHPX launches also list TCG second,
-             so QEMU itself falls back if a single VM's WHPX partition fails to initialize.
+      auto : WHPX when this host can start it, else TCG. Does not chain `-accel tcg` onto a
+             WHPX launch so `node.accel` always reflects the accelerator QEMU actually runs;
+             `await_boot` relaunches on TCG and updates `node.accel` if WHPX fails to run.
     """
     if requested not in ACCELERATORS:
         raise ValueError(f"accelerator must be one of {ACCELERATORS}, got {requested!r}")
@@ -239,7 +412,7 @@ def resolve_accelerator(qemu_bin: str, requested: str) -> tuple:
     if requested == "whpx":
         return "whpx", ["-accel", "whpx"]
     if whpx_available(qemu_bin):
-        return "whpx", ["-accel", "whpx", "-accel", "tcg"]
+        return "whpx", ["-accel", "whpx"]
     return "tcg", ["-accel", "tcg"]
 
 
@@ -293,12 +466,15 @@ class TriadNode:
         self.morph_count = 0
         self.boot_gen = 0
         self.tx_seq = 0
+        self.state_digest = ""
         self.last_smp = "cpus=4 online=4 idle=hlt-ipi"
         self.last_sql_table = ""
         self.last_morph_ms = 0
         self.tampered = False
         # SHA-256 of the node's HTTPS certificate, from its `HTTPS UP ... cert_sha256=` serial line.
         self.tls_cert_sha256 = ""
+        self.tls_entropy = ""
+        self.tls_provisioned = False
 
     def ensure_disks(self, master_key_bytes: bytes):
         for img in (self.ahci_img, self.virtio_img, self.nvme_img):
@@ -312,7 +488,15 @@ class TriadNode:
             f"{self.key_context}:{self.node_id}".encode("ascii"),
             hashlib.sha256,
         ).digest()
-        self.device_key_path.write_bytes(node_key)
+        write_secret_file(self.device_key_path, node_key)
+
+    def wipe_disks(self):
+        """Reset all 3 persistent disk images for this node to clean blank 1 MiB images."""
+        for img in (self.ahci_img, self.virtio_img, self.nvme_img):
+            with open(img, "wb") as f:
+                f.write(b"\x00" * (1024 * 1024))
+                f.flush()
+                os.fsync(f.fileno())
 
     def read_sql_partition_bytes(self) -> bytes:
         if not self.ahci_img.exists():
@@ -336,20 +520,38 @@ class TriadController:
         self.show_gui = show_gui
         state_dir = self.spec.state_dir
         state_dir.mkdir(parents=True, exist_ok=True)
+        self.events: list[dict] = []
 
         key_path = self.spec.master_key_path
-        if key_path.exists() and len(key_path.read_bytes()) >= 32:
-            self.master_key_bytes = key_path.read_bytes()[:32]
-        else:
-            self.master_key_bytes = os.urandom(32)
-            key_path.parent.mkdir(parents=True, exist_ok=True)
-            key_path.write_bytes(self.master_key_bytes)
+        self.master_key_bytes = load_or_create_secret_file(key_path, 32, binary=True)
 
         # Generate a fresh ephemeral 128-bit session token on every controller startup.
         self.coordinator_token = secrets.token_hex(16)
-        (state_dir / "operator_token.txt").write_text(self.coordinator_token + "\n", encoding="utf-8")
+        if self.spec.write_operator_token:
+            write_secret_file(
+                state_dir / "operator_token.txt",
+                (self.coordinator_token + "\n").encode("ascii"),
+            )
 
         self.base_elf_bytes = BASE_ELF.read_bytes()
+        if not BASE_BIOS.exists() or BASE_BIOS.read_bytes().find(self.base_elf_bytes) < 0:
+            subprocess.run(
+                [
+                    "cargo",
+                    "run",
+                    "-p",
+                    "factory_builder",
+                    "--release",
+                    "--quiet",
+                    "--",
+                    "--candidate",
+                    str(BASE_ELF),
+                    "--out",
+                    str(BASE_BIOS),
+                ],
+                cwd=str(ROOT),
+                check=True,
+            )
         self.base_bios_bytes = BASE_BIOS.read_bytes()
         self.elf_offset_in_bios = self.base_bios_bytes.find(self.base_elf_bytes)
         if self.elf_offset_in_bios < 0:
@@ -376,22 +578,31 @@ class TriadController:
         # Cron jobs live in each node's RAM and are cleared on every boot, so the controller
         # owns the desired list (spec defaults + jobs added through the API) and re-applies it.
         self.cron_file = state_dir / "cron_jobs.json"
-        self.desired_cron: list[tuple[int, str]] = list(s.cron_jobs)
+        self.desired_cron: list[tuple[int, str]] = [
+            (int(t), str(c)) for t, c in s.cron_jobs if is_readonly_shell_command(str(c))
+        ]
         if self.cron_file.exists():
             try:
-                self.desired_cron = [(int(t), str(c)) for t, c in json.loads(self.cron_file.read_text(encoding="utf-8"))]
-            except Exception:
-                pass
+                loaded_cron = json.loads(self.cron_file.read_text(encoding="utf-8"))
+                self.desired_cron = [
+                    (int(t), str(c))
+                    for t, c in loaded_cron
+                    if int(t) > 0 and is_printable_ascii_command(str(c)) and is_readonly_shell_command(str(c))
+                ]
+            except Exception as e:
+                self.log_event("WARN", f"Ignoring unreadable cron_jobs.json: {e}")
 
         # Monotonic Triad WAL for automatic catch-up after an OS morph bounce (persisted to disk)
         self.wal_lock = threading.Lock()
         self.wal_file = state_dir / "triad_wal.json"
         self.triad_tx_seq = 0
+        self.triad_state_digest = ""
         self.wal_entries: list[tuple[int, str]] = []  # (tx_seq, sql_stmt)
         # Nodes whose applied tx_seq was restored from the WAL file (see `_load_wal_from_disk`).
         self.restored_tx_seq_nodes: set[int] = set()
+        self.restored_node_digests: dict[int, str] = {}
+        self._after_wal_write_ahead_hook = None
         self._load_wal_from_disk()
-        self.events: list[dict] = []
         self.parity_Buffer = b"\x00" * SQL_PART_SIZE
         self.parity_sha256 = hashlib.sha256(self.parity_Buffer).hexdigest()[:16] if s.has_sql else "n/a"
         self.parity_syndrome_ok = True
@@ -406,41 +617,68 @@ class TriadController:
         if not self.wal_file.exists():
             return
         try:
-            data = json.loads(self.wal_file.read_text(encoding="utf-8"))
-            self.triad_tx_seq = int(data.get("triad_tx_seq", 0))
-            self.wal_entries = [
-                (int(tid), str(stmt))
-                for tid, stmt in data.get("wal_entries", [])
-                if is_printable_ascii_command(str(stmt))
-            ]
-            # Each node's AHCI SQL partition survives a controller restart, so restore the
-            # tx_seq each node had applied. Assuming 0 would make its next morph replay the
-            # whole WAL onto data it already holds and trip a false 2-of-3 TMR mismatch.
-            # WAL files written before per-node tracking have no `node_tx_seq`; those nodes
-            # are reconciled at boot by `_adopt_tx_seq_from_majority`.
+            raw_text = self.wal_file.read_text(encoding="utf-8")
+            data = json.loads(raw_text)
+            if not isinstance(data, dict):
+                raise ValueError("WAL root must be a JSON object")
+            tx_seq = data.get("triad_tx_seq", 0)
+            if not isinstance(tx_seq, int) or isinstance(tx_seq, bool) or tx_seq < 0:
+                raise ValueError(f"invalid triad_tx_seq: {tx_seq!r}")
+            raw_entries = data.get("wal_entries", [])
+            if not isinstance(raw_entries, list):
+                raise ValueError("wal_entries must be a list")
+            parsed_entries: list[tuple[int, str]] = []
+            for item in raw_entries:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    raise ValueError(f"malformed WAL entry: {item!r}")
+                tid, stmt = item
+                if not isinstance(tid, int) or isinstance(tid, bool) or tid <= 0:
+                    raise ValueError(f"invalid WAL entry tx_id: {tid!r}")
+                if not isinstance(stmt, str) or not is_printable_ascii_command(stmt):
+                    raise ValueError(f"WAL entry #{tid} contains non-printable or empty command")
+                parsed_entries.append((tid, stmt))
+            self.triad_tx_seq = tx_seq
+            self.wal_entries = parsed_entries
+            self.triad_state_digest = str(data.get("triad_state_digest") or "")
+
+            node_digests = data.get("node_state_digest", {})
+            if isinstance(node_digests, dict):
+                for n in self.nodes:
+                    d = node_digests.get(str(n.node_id))
+                    if isinstance(d, str) and d:
+                        self.restored_node_digests[n.node_id] = d
+                        n.state_digest = d
+
             node_seqs = data.get("node_tx_seq", {})
             if isinstance(node_seqs, dict):
                 for n in self.nodes:
                     v = node_seqs.get(str(n.node_id))
-                    if isinstance(v, int) and 0 <= v <= self.triad_tx_seq:
+                    if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= self.triad_tx_seq:
                         n.tx_seq = v
                         self.restored_tx_seq_nodes.add(n.node_id)
-        except Exception:
-            self.triad_tx_seq = 0
-            self.wal_entries = []
-            self.restored_tx_seq_nodes.clear()
-            for n in self.nodes:
-                n.tx_seq = 0
+        except Exception as e:
+            bad_copy = self.wal_file.with_suffix(".json.bad")
+            try:
+                shutil.copyfile(self.wal_file, bad_copy)
+            except OSError:
+                pass
+            self.log_event("ALERT", f"Corrupt Triad WAL {self.wal_file} (saved to {bad_copy}): {e}")
+            raise ValueError(f"corrupt Triad WAL {self.wal_file}: {e}") from e
 
     def _save_wal_to_disk(self):
+        if len(self.wal_entries) > MAX_WAL_ENTRIES:
+            min_applied = min((n.tx_seq for n in self.nodes if n.tx_seq > 0), default=0)
+            head = [e for e in self.wal_entries if e[0] <= min_applied]
+            tail = [e for e in self.wal_entries if e[0] > min_applied]
+            self.wal_entries = compact_wal_entries(head) + tail
         payload = {
             "triad_tx_seq": self.triad_tx_seq,
+            "triad_state_digest": self.triad_state_digest,
             "wal_entries": self.wal_entries,
             "node_tx_seq": {str(n.node_id): n.tx_seq for n in self.nodes},
+            "node_state_digest": {str(n.node_id): n.state_digest for n in self.nodes if n.state_digest},
         }
-        tmp = self.wal_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        tmp.replace(self.wal_file)
+        atomic_write_json(self.wal_file, payload)
 
     def _encrypt_wal_vault_cmd(self, cmd_str: str) -> str:
         """
@@ -556,9 +794,19 @@ class TriadController:
         node.ensure_disks(self.master_key_bytes)
         node.accel = self.accel
         mac_last = f"{0x50 + node.node_id:02x}"
+        if self.spec.forward_node_ports:
+            usernet_arg = (
+                f"user,id=usernet0,"
+                f"hostfwd=tcp:127.0.0.1:{node.http_port}-10.0.2.15:80,"
+                f"hostfwd=tcp:127.0.0.1:{node.https_port}-10.0.2.15:443"
+            )
+        else:
+            usernet_arg = "user,id=usernet0"
         cmd = [
             self.qemu_bin,
             *self.accel_args,
+            "-cpu",
+            "max",
             "-smp",
             str(self.spec.smp),
             "-m",
@@ -580,7 +828,7 @@ class TriadController:
             "-device",
             "virtio-net-pci,netdev=n1,disable-legacy=off,disable-modern=on",
             "-netdev",
-            f"user,id=usernet0,hostfwd=tcp:127.0.0.1:{node.http_port}-10.0.2.15:80,hostfwd=tcp:127.0.0.1:{node.https_port}-10.0.2.15:443",
+            usernet_arg,
             "-device",
             f"virtio-net-pci,netdev=usernet0,mac=52:54:00:12:34:{mac_last},disable-legacy=on,disable-modern=off",
             "-drive",
@@ -639,9 +887,18 @@ class TriadController:
                     node.serial_tail.pop(0)
 
                 if line.startswith("HTTPS UP "):
-                    m = re.search(r"cert_sha256=([0-9a-f]{64})", line)
+                    m = re.search(
+                        r"entropy=(\S+)\s+provisioned=([01])\s+cert_sha256=([0-9a-f]{64})",
+                        line,
+                    )
                     if m:
-                        node.tls_cert_sha256 = m.group(1)
+                        node.tls_entropy = m.group(1)
+                        node.tls_provisioned = m.group(2) == "1"
+                        node.tls_cert_sha256 = m.group(3)
+                    else:
+                        m2 = re.search(r"cert_sha256=([0-9a-f]{64})", line)
+                        if m2:
+                            node.tls_cert_sha256 = m2.group(1)
                 if "CONTINUITY genesis" in line:
                     node.boot_gen = 1
                 elif "CONTINUITY resume OK" in line:
@@ -653,12 +910,11 @@ class TriadController:
                 node.line_cond.notify_all()
 
     def _guest_started(self, node: TriadNode, timeout: float) -> bool:
-        """True once the guest prints anything of its own (the bootloader's `INFO :` lines come
-        first). QEMU's own warnings carry the binary name and do not count."""
+        """True once the guest prints a recognized bootloader/kernel serial marker."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             with node.line_cond:
-                if any("qemu-system" not in ln for ln in node.serial_tail):
+                if has_guest_serial_output(node.serial_tail):
                     return True
                 if not node.proc or node.proc.poll() is not None:
                     return False
@@ -671,7 +927,8 @@ class TriadController:
         runs (seen on some Windows hosts: the BIOS never leaves reset and serial stays empty)
         is relaunched on TCG, and this Triad stays on TCG from then on.
         """
-        if node.accel == "whpx" and self.spec.accel == "auto" and not self._guest_started(node, WHPX_FIRST_OUTPUT_S):
+        wait_s = 0.2 if self.accel == "tcg" else WHPX_FIRST_OUTPUT_S
+        if node.accel == "whpx" and self.spec.accel == "auto" and not self._guest_started(node, wait_s):
             self.log_event(
                 "WARN",
                 f"{node.name}: no guest output under WHPX after {WHPX_FIRST_OUTPUT_S:.0f}s; relaunching on TCG "
@@ -683,6 +940,8 @@ class TriadController:
             except Exception:
                 pass
             self.accel, self.accel_args = "tcg", ["-accel", "tcg"]
+            _whpx_cache[self.qemu_bin] = False
+            os.environ["CUTTLE_WHPX_AVAILABLE"] = "0"
             self.start_node_vm(node)
         return self.wait_for_shell_ready(node, timeout=timeout)
 
@@ -702,20 +961,42 @@ class TriadController:
         time.sleep(0.08)
         return True
 
-    def apply_node_profile(self, node: TriadNode):
+    def apply_node_profile(self, node: TriadNode) -> bool:
         """
         Re-apply what every boot resets: the kernel role profile (each boot starts as `full`)
         and the desired cron jobs (held in node RAM). Called once the shell is ready, before
-        the node rejoins the pool.
+        the node rejoins the pool. If applying the role fails after 3 attempts, terminates the
+        VM, marks the node OFFLINE, logs an ALERT, and returns False so the node never joins
+        the pool with an un-scoped `full` role.
         """
         role = self.spec.role
         if role != "full":
-            out = self.send_shell_cmd(node, f"service role {role}")
-            if f"role={role}" not in out:
-                self.log_event("WARN", f"{node.name}: could not apply role '{role}': {out[:120]}")
+            last_out = ""
+            applied = False
+            for _ in range(3):
+                last_out = self.send_shell_cmd(node, f"service role {role}")
+                if f"role={role}" in last_out:
+                    applied = True
+                    break
+                time.sleep(0.1)
+            if not applied:
+                self.log_event(
+                    "ALERT",
+                    f"{node.name}: failed to apply role '{role}' after 3 attempts ({last_out[:120]}); keeping node OFFLINE.",
+                )
+                node.state = "OFFLINE"
+                if node.proc and node.proc.poll() is None:
+                    try:
+                        node.proc.kill()
+                        node.proc.wait(timeout=3.0)
+                    except Exception:
+                        pass
+                return False
         if self.spec.has_shell:
             for ticks, cmd in self.desired_cron:
-                self.send_shell_cmd(node, f"cron add {ticks} {cmd}")
+                if is_readonly_shell_command(cmd):
+                    self.send_shell_cmd(node, f"cron add {ticks} {cmd}")
+        return True
 
     def send_shell_cmd(self, node: TriadNode, cmd_str: str, timeout: float = 5.0) -> str:
         """
@@ -853,11 +1134,22 @@ class TriadController:
         """
         The node's replicated state as compared by the 2-of-3 vote, or None if unreadable.
         SQL-capable roles compare the spec's vote tables; a web front end (`wfe`, no svc-sql)
-        compares the content it serves.
+        compares every served file's path, size, and SHA-256 content digest.
         """
         if not self.spec.has_sql:
-            out = self.send_shell_cmd(node, "ls", timeout=4.0)
-            return out if out and not out.lower().startswith("error") else None
+            ls_out = self.send_shell_cmd(node, "ls", timeout=4.0)
+            if not ls_out or ls_out.lower().startswith("error"):
+                return None
+            file_entries = []
+            for ln in ls_out.splitlines():
+                m = re.match(r"^(\S+)\s+\((\d+)\s+B\)$", ln.strip())
+                if not m:
+                    continue
+                fpath, flen = m.group(1), m.group(2)
+                content = self.send_shell_cmd(node, f"cat {fpath}", timeout=3.0)
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+                file_entries.append(f"{fpath} ({flen} B) sha256={digest}")
+            return "\n".join(file_entries) if file_entries else ls_out
         parts = []
         for table in self.spec.vote_tables:
             out = self.send_shell_cmd(node, f"sql /*triad*/ SELECT * FROM {table}", timeout=4.0)
@@ -867,6 +1159,29 @@ class TriadController:
                 node.last_sql_table = out
             parts.append(self._normalize_kv_for_tmr(out))
         return "\n--\n".join(parts)
+
+    def _state_fingerprint(self, node: TriadNode) -> str | None:
+        """SHA-256 hex digest of `node`'s replicated state probe, or None if unreadable."""
+        probe = self._state_probe(node)
+        if probe is None:
+            return None
+        return hashlib.sha256(probe.encode("utf-8")).hexdigest()
+
+    def _sync_files_from_peer(self, target: TriadNode, peer: TriadNode):
+        """Copy every file in `peer`'s shell filesystem onto `target` during a non-SQL heal."""
+        ls_out = self.send_shell_cmd(peer, "ls", timeout=4.0)
+        if not ls_out or ls_out.lower().startswith("error"):
+            return
+        for ln in ls_out.splitlines():
+            m = re.match(r"^(\S+)\s+\(\d+\s+B\)$", ln.strip())
+            if not m:
+                continue
+            fpath = m.group(1)
+            peer_content = self.send_shell_cmd(peer, f"cat {fpath}", timeout=3.0)
+            target_content = self.send_shell_cmd(target, f"cat {fpath}", timeout=3.0)
+            if peer_content != target_content and is_printable_ascii_command(peer_content):
+                self.send_shell_cmd(target, f"write {fpath} {peer_content}", timeout=3.0)
+        self.send_shell_cmd(target, "sync", timeout=3.0)
 
     def compute_and_verify_raid_parity(self):
         """
@@ -885,6 +1200,16 @@ class TriadController:
                 o1, o2, o3 = outputs[1], outputs[2], outputs[3]
                 if o1 == o2 == o3:
                     self.parity_syndrome_ok = True
+                    digest = hashlib.sha256(o1.encode("utf-8")).hexdigest()
+                    with self.wal_lock:
+                        changed = (self.triad_state_digest != digest) or any(
+                            n.state_digest != digest for n in online_nodes
+                        )
+                        self.triad_state_digest = digest
+                        for n in online_nodes:
+                            n.state_digest = digest
+                        if changed and self.wal_file.exists():
+                            self._save_wal_to_disk()
                     if self.spec.has_sql:
                         self.quorum_status = f"3/3 TMR MAJORITY LOCKED | RAID PARITY D1⊕D2=P VERIFIED (tx_seq={self.triad_tx_seq})"
                     else:
@@ -899,6 +1224,9 @@ class TriadController:
                     elif o1 == o2 and o3 != o1:
                         corrupted = n3
                     if corrupted:
+                        if corrupted.state == "HEALING":
+                            return
+                        corrupted.state = "HEALING"
                         self.parity_syndrome_ok = False
                         self.quorum_status = f"TMR PARITY FAULT ON {corrupted.name} — 2/3 MAJORITY HEALING!"
                         self.log_event(
@@ -930,8 +1258,9 @@ class TriadController:
         - Strictly rejects any query containing non-printable or control characters (0x08 BS, 0x7F DEL, etc.).
         - Read-only queries (`SELECT`, `.tables`, `.schema`) execute with 2-of-3 majority verification.
         - Mutating queries (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`) increment `triad_tx_seq`,
-          append to the Triad WAL, execute in parallel across all ONLINE nodes, and flush AHCI.
-          Any node currently `MORPHING` automatically replays the missed WAL entries during `CATCHING_UP`.
+          write-ahead and fsync to the Triad WAL BEFORE executing on the nodes, execute across all
+          ONLINE nodes, and flush AHCI. If 0 nodes accept the syntax/statement, the unapplied WAL
+          entry is rolled back.
         """
         if not is_printable_ascii_command(sql_query):
             raise ValueError("query contains non-printable or control characters")
@@ -969,20 +1298,32 @@ class TriadController:
                 "per_node": results,
             }
 
-        # Mutating SQL write: hold `self.wal_lock` across snapshotting `ONLINE` nodes,
-        # executing the mutation, appending to the Triad WAL, and advancing `tx_seq` so
-        # no concurrent write can slip in between a node's `CATCHING_UP` replay and its
-        # transition to `ONLINE`.
+        # Mutating SQL write: write-ahead to the Triad WAL and fsync BEFORE executing on
+        # any node, holding `self.wal_lock` across the write-ahead, replica execution, and
+        # `n.tx_seq` + `state_digest` update.
         with self.wal_lock:
             online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
             if not online_nodes:
                 return {"ok": False, "output": "error: no online nodes in triad", "quorum": "0/3"}
+
+            prev_tx_seq = self.triad_tx_seq
+            tx_id = prev_tx_seq + 1
+            self.triad_tx_seq = tx_id
+            self.wal_entries.append((tx_id, q))
+            self._save_wal_to_disk()
+            if self._after_wal_write_ahead_hook is not None:
+                self._after_wal_write_ahead_hook(tx_id, q)
+
             per_node = {}
             accepted_nodes = []
             for n in online_nodes:
                 try:
                     out = self.send_shell_cmd(n, f"sql /*triad*/ {q}")
                 except ValueError as e:
+                    if self.wal_entries and self.wal_entries[-1][0] == tx_id:
+                        self.wal_entries.pop()
+                    self.triad_tx_seq = prev_tx_seq
+                    self._save_wal_to_disk()
                     return {
                         "ok": False,
                         "error": f"rejected: {e}",
@@ -1001,6 +1342,10 @@ class TriadController:
 
             primary_out = next(iter(per_node.values()), "")
             if not accepted_nodes:
+                if self.wal_entries and self.wal_entries[-1][0] == tx_id:
+                    self.wal_entries.pop()
+                self.triad_tx_seq = prev_tx_seq
+                self._save_wal_to_disk()
                 return {
                     "ok": False,
                     "error": primary_out or "error: SQL statement rejected by online nodes",
@@ -1009,15 +1354,15 @@ class TriadController:
                     "per_node": per_node,
                 }
 
-            self.triad_tx_seq += 1
-            tx_id = self.triad_tx_seq
-            self.wal_entries.append((tx_id, q))
-            self._save_wal_to_disk()
-
             for n in accepted_nodes:
                 self.send_shell_cmd(n, "sync")
                 n.tx_seq = tx_id
-            self._save_wal_to_disk()  # persist each node's applied tx_seq
+            fp = self._state_fingerprint(accepted_nodes[0])
+            if fp:
+                self.triad_state_digest = fp
+                for n in accepted_nodes:
+                    n.state_digest = fp
+            self._save_wal_to_disk()  # persist each node's applied tx_seq and state digest
 
             for n in self.nodes:
                 if n.state != "ONLINE":
@@ -1041,12 +1386,13 @@ class TriadController:
         """
         Execute a Cuttle OS built-in application command (`vault`, `guard`, or `cron`) across the 3-as-1 Triad:
         - `vault put <key> <val>` / `vault del <key>`: encrypts `<val>` under each node's independent 256-bit
-          hardware `seal_key`, persists an encrypted `ENC_WAL_V1:...` record to the Triad WAL, and flushes AHCI (`sync`).
+          hardware `seal_key`, persists an encrypted `ENC_WAL_V1:...` record to the Triad WAL ahead of
+          execution, and flushes AHCI (`sync`).
         - `vault get <key>`: unseals and verifies `<key>` on all online nodes and returns a 2-of-3 Majority Vote!
         - `guard status` / `guard alerts` / `guard lockdown` / `guard unlock`: queries or enforces Blue-Team
           security posture across all 3 Triad nodes simultaneously.
         - `cron add <ticks> <cmd>` / `cron list` / `cron del <id>` / `cron run`: manages deterministic periodic
-          jobs across all 3 Triad nodes.
+          read-only jobs across all 3 Triad nodes. State-changing cron commands are refused with 403.
         """
         if not is_printable_ascii_command(app_cmd):
             raise ValueError("command contains non-printable or control characters")
@@ -1057,6 +1403,22 @@ class TriadController:
 
         app = parts[0].lower()
         sub = parts[1].lower() if len(parts) > 1 else "status"
+
+        if app == "cron" and sub == "add":
+            if len(parts) < 4 or not parts[2].isdigit() or int(parts[2]) <= 0:
+                return {
+                    "ok": False,
+                    "error": "usage: cron add <ticks> <readonly_command>",
+                    "quorum": "0/3",
+                }
+            cron_target_cmd = " ".join(parts[3:])
+            if not is_readonly_shell_command(cron_target_cmd):
+                return {
+                    "ok": False,
+                    "status_code": 403,
+                    "error": "rejected: /api/cron allows only read-only inspection commands; state-changing operations must go through the Triad WAL",
+                    "quorum": "0/3",
+                }
 
         is_read = (
             (app == "vault" and sub in ("get", "list", "status"))
@@ -1088,12 +1450,23 @@ class TriadController:
                 "per_node": per_node,
             }
 
-        # Mutating app write: hold `self.wal_lock` across snapshotting `ONLINE` nodes,
-        # executing the command, appending the encrypted WAL record, and updating `tx_seq`.
+        # Mutating app write: hold `self.wal_lock` across write-ahead, replica execution,
+        # and updating `tx_seq` / `desired_cron`.
         with self.wal_lock:
             online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
             if not online_nodes:
                 return {"ok": False, "error": "no online nodes in triad", "quorum": "0/3"}
+
+            is_vault_mut = app == "vault" and sub in ("put", "del")
+            prev_tx_seq = self.triad_tx_seq
+            tx_id = prev_tx_seq
+            if is_vault_mut:
+                tx_id = prev_tx_seq + 1
+                self.triad_tx_seq = tx_id
+                wal_record = self._encrypt_wal_vault_cmd(c) if sub == "put" else c
+                self.wal_entries.append((tx_id, wal_record))
+                self._save_wal_to_disk()
+
             per_node = {}
             accepted_nodes = []
             for n in online_nodes:
@@ -1106,6 +1479,11 @@ class TriadController:
             vals = list(per_node.values())
             chosen = max(set(vals), key=vals.count) if vals else ""
             if not accepted_nodes:
+                if is_vault_mut:
+                    if self.wal_entries and self.wal_entries[-1][0] == tx_id:
+                        self.wal_entries.pop()
+                    self.triad_tx_seq = prev_tx_seq
+                    self._save_wal_to_disk()
                 return {
                     "ok": False,
                     "error": chosen or f"error: {app} command rejected by online nodes",
@@ -1114,22 +1492,21 @@ class TriadController:
                     "per_node": per_node,
                 }
 
-            tx_id = self.triad_tx_seq
-            if app == "vault" and sub in ("put", "del"):
-                self.triad_tx_seq += 1
-                tx_id = self.triad_tx_seq
-                wal_record = self._encrypt_wal_vault_cmd(c) if sub == "put" else c
-                self.wal_entries.append((tx_id, wal_record))
-                self._save_wal_to_disk()
+            if is_vault_mut:
                 for n in accepted_nodes:
                     self.send_shell_cmd(n, "sync")
                     n.tx_seq = tx_id
-                self._save_wal_to_disk()  # persist each node's applied tx_seq
+                fp = self._state_fingerprint(accepted_nodes[0])
+                if fp:
+                    self.triad_state_digest = fp
+                    for n in accepted_nodes:
+                        n.state_digest = fp
+                self._save_wal_to_disk()  # persist each node's applied tx_seq and state digest
+            if app == "cron" and sub in ("add", "del"):
+                self._record_desired_cron(parts)
 
         if app == "vault" and sub in ("put", "del"):
             self.compute_and_verify_raid_parity()
-        if app == "cron" and sub in ("add", "del"):
-            self._record_desired_cron(parts)
 
         redacted_cmd = self._redact_app_cmd(c)
         self.log_event(
@@ -1148,12 +1525,13 @@ class TriadController:
     def _record_desired_cron(self, parts: list[str]):
         """
         Keep the desired cron list in step with an accepted `cron add <ticks> <cmd>` or
-        `cron del <id>`. Kernel job ids are slot numbers (first free slot), so every node holds
-        the list in order (ids 1..n, identical across the Triad): boots re-apply it, and a delete
-        rebuilds each online node's table so no node is left with a gap.
+        `cron del <id>` under `self.wal_lock`, writing `cron_jobs.json` atomically.
         """
         if parts[1].lower() == "add" and len(parts) >= 4 and parts[2].isdigit():
-            self.desired_cron.append((int(parts[2]), " ".join(parts[3:])))
+            cmd = " ".join(parts[3:])
+            if not is_readonly_shell_command(cmd):
+                return
+            self.desired_cron.append((int(parts[2]), cmd))
         elif parts[1].lower() == "del" and len(parts) >= 3 and parts[2].isdigit():
             idx = int(parts[2]) - 1
             if 0 <= idx < len(self.desired_cron):
@@ -1163,7 +1541,7 @@ class TriadController:
                     self._rebuild_cron_table(n)
         else:
             return
-        self.cron_file.write_text(json.dumps(self.desired_cron), encoding="utf-8")
+        atomic_write_json(self.cron_file, self.desired_cron)
 
     def _rebuild_cron_table(self, node: TriadNode):
         """Delete every job on `node` and re-add the desired list in order (ids become 1..n)."""
@@ -1171,7 +1549,8 @@ class TriadController:
         for job_id in re.findall(r"^\s*id=(\d+)", listing, re.M):
             self.send_shell_cmd(node, f"cron del {job_id}")
         for ticks, cmd in self.desired_cron:
-            self.send_shell_cmd(node, f"cron add {ticks} {cmd}")
+            if is_readonly_shell_command(cmd):
+                self.send_shell_cmd(node, f"cron add {ticks} {cmd}")
 
     def _replay_wal_entry(self, node: TriadNode, stmt: str):
         s = stmt.strip()
@@ -1183,12 +1562,14 @@ class TriadController:
         else:
             self.send_shell_cmd(node, f"sql /*triad*/ {s}")
 
-    def bounce_and_morph_node(self, node_id: int) -> bool:
+    def bounce_and_morph_node(
+        self, node_id: int, _lock_held: bool = False, _wipe_disks: bool = False
+    ) -> bool:
         """
         Perform a live zero-downtime MTD Morph on a single node while the other 2 nodes
         keep the logical SQL Appliance 100% online, followed by automatic WAL Delta Catch-Up.
         """
-        if not self.morph_op_lock.acquire(blocking=False):
+        if not _lock_held and not self.morph_op_lock.acquire(blocking=False):
             self.log_event("WARN", "Another node is currently morphing; keeping 2/3 majority intact.")
             return False
 
@@ -1205,7 +1586,8 @@ class TriadController:
                 "MTD",
                 f"{node.name}: Draining & sealing AHCI disk (peers {peers[0].name.split()[0]} + {peers[1].name.split()[0]} holding 2/3 majority)...",
             )
-            self.send_shell_cmd(node, "sync", timeout=3.0)
+            if not _wipe_disks:
+                self.send_shell_cmd(node, "sync", timeout=3.0)
             if node.proc and node.proc.poll() is None:
                 try:
                     node.proc.stdin.write("\nhalt\n")
@@ -1218,6 +1600,8 @@ class TriadController:
                     except Exception:
                         pass
             time.sleep(0.3)
+            if _wipe_disks:
+                node.wipe_disks()
 
             # 2. MORPHING: Rewrite kernel ELF with fresh seed via binmorph (~250ms)
             node.state = "MORPHING"
@@ -1233,7 +1617,10 @@ class TriadController:
                 self.log_event("ERROR", f"{node.name}: Timed out waiting for shell ready after morph (tail: {tail_str}).")
                 node.state = "OFFLINE"
                 return False
-            self.apply_node_profile(node)
+            if _wipe_disks and not self.spec.has_sql and peers:
+                self._sync_files_from_peer(node, peers[0])
+            if not self.apply_node_profile(node):
+                return False
 
             # 4. CATCHING_UP: Replay any SQL transactions committed while this node was morphing,
             #    holding `self.wal_lock` across the replay AND the `node.state = "ONLINE"` transition
@@ -1258,12 +1645,16 @@ class TriadController:
                             self.log_event("WARN", f"{node.name}: Error replaying WAL entry #{tid}: {e}")
                         node.tx_seq = tid
                     self.send_shell_cmd(node, "sync")
-                    self._save_wal_to_disk()  # persist the node's caught-up tx_seq
                 else:
                     self.log_event(
                         "RESYNC",
                         f"{node.name}: Woke up in sync at tx_seq={node.tx_seq} (CONTINUITY resume OK + SHELL resume OK).",
                     )
+                fp = self._state_fingerprint(node)
+                if fp:
+                    node.state_digest = fp
+                    self.triad_state_digest = fp
+                self._save_wal_to_disk()
                 node.tampered = False
                 node.state = "ONLINE"
 
@@ -1273,27 +1664,41 @@ class TriadController:
                 f"{node.name}: Rejoined 3/3 Triad Pool on new binary {node.elf_sha256[:12]}.. (boot #{node.boot_gen}, tx_seq={node.tx_seq}).",
             )
         finally:
-            self.morph_op_lock.release()
+            if not _lock_held:
+                self.morph_op_lock.release()
 
         self.compute_and_verify_raid_parity()
         return True
 
+    def _reset_sql_vote_tables(self, node: TriadNode):
+        """Drop and recreate all `self.spec.vote_tables` on `node` to clean genesis state."""
+        for table in self.spec.vote_tables:
+            self.send_shell_cmd(node, f"sql /*triad*/ DROP TABLE {table}")
+            if table == "kv":
+                self.send_shell_cmd(node, "sql /*triad*/ CREATE TABLE kv (k TEXT, v TEXT, rev INT)")
+                self.send_shell_cmd(node, "sql /*triad*/ INSERT INTO kv VALUES ('cluster.role', 'primary', 1)")
+                self.send_shell_cmd(node, "sql /*triad*/ INSERT INTO kv VALUES ('mtd.policy', 'binmorph-7pass', 1)")
+                self.send_shell_cmd(node, "sql /*triad*/ INSERT INTO kv VALUES ('boot.state', 'ready', 1)")
+
     def heal_and_remorph_node(self, node: TriadNode):
         """
         Reconstruct a corrupted/tampered node from the 2-of-3 healthy majority (D1 = D2 ^ P),
-        replay the full canonical WAL, and emergency-morph its binary.
+        replay the canonical WAL across all `vote_tables`, and emergency-morph its binary
+        under the same `morph_op_lock` critical section so no concurrent wave can leave the
+        node stuck in HEALING.
         """
-        if not self.spec.has_sql:
-            # No SQL partition to rebuild: the emergency morph boots a clean, freshly morphed
-            # image and `apply_node_profile` restores the role and desired cron jobs.
-            node.state = "HEALING"
-            self.log_event("HEAL", f"{node.name}: Isolating diverged node; rebuilding from a clean morphed image...")
-            with self.morph_op_lock:
-                pass  # let any in-flight morph finish; bounce_and_morph_node takes the lock non-blocking
-            self.bounce_and_morph_node(node.node_id)
-            return
         with self.morph_op_lock:
             node.state = "HEALING"
+            if not self.spec.has_sql:
+                # Non-SQL role (e.g. `wfe`): wipe the diverged persistent disk images, boot a
+                # freshly morphed kernel, sync served files from a healthy peer, and re-apply role.
+                self.log_event(
+                    "HEAL",
+                    f"{node.name}: Isolating diverged node; wiping filesystem image and rebuilding from peer + morphed ELF...",
+                )
+                self.bounce_and_morph_node(node.node_id, _lock_held=True, _wipe_disks=True)
+                return
+
             # Verify 4 KiB XOR block parity recovery (D_corrupted = D_peer ^ P)
             n1, n2 = self.nodes[0], self.nodes[1]
             if node.node_id == 1:
@@ -1304,33 +1709,49 @@ class TriadController:
             xor_tag = hashlib.sha256(xor_recovered).hexdigest()[:12]
             self.log_event(
                 "HEAL",
-                f"{node.name}: Isolating tampered node, verifying 4 KiB XOR parity block (D_peer ⊕ P = {xor_tag}..), and reconstructing from 2/3 RAID Majority + WAL...",
+                f"{node.name}: Isolating tampered node, verifying 4 KiB XOR parity block (D_peer ⊕ P = {xor_tag}..), and reconstructing {list(self.spec.vote_tables)} from 2/3 RAID Majority + WAL...",
             )
-            # Reconstruct canonical kv table from clean state + WAL replay under `self.wal_lock`
+
+            # Reset all vote tables (`kv`, `idx`, etc.) and replay a WAL snapshot without
+            # holding `wal_lock` across the bulk serial I/O; then briefly take `wal_lock` to
+            # apply any tail entries committed during the heal.
+            self._reset_sql_vote_tables(node)
             with self.wal_lock:
-                self.send_shell_cmd(node, "sql /*triad*/ DROP TABLE kv")
-                self.send_shell_cmd(node, "sql /*triad*/ CREATE TABLE kv (k TEXT, v TEXT, rev INT)")
-                self.send_shell_cmd(node, "sql /*triad*/ INSERT INTO kv VALUES ('cluster.role', 'primary', 1)")
-                self.send_shell_cmd(node, "sql /*triad*/ INSERT INTO kv VALUES ('mtd.policy', 'binmorph-7pass', 1)")
-                self.send_shell_cmd(node, "sql /*triad*/ INSERT INTO kv VALUES ('boot.state', 'ready', 1)")
+                snapshot = list(self.wal_entries)
+            last_tid = 0
+            for tid, stmt in snapshot:
+                if not is_printable_ascii_command(stmt):
+                    last_tid = tid
+                    continue
+                try:
+                    self._replay_wal_entry(node, stmt)
+                except Exception as e:
+                    self.log_event("WARN", f"{node.name}: Error replaying WAL entry #{tid} during heal: {e}")
+                last_tid = tid
+
+            with self.wal_lock:
                 for tid, stmt in self.wal_entries:
-                    if not is_printable_ascii_command(stmt):
-                        node.tx_seq = tid
+                    if tid <= last_tid:
                         continue
-                    try:
-                        self._replay_wal_entry(node, stmt)
-                    except Exception as e:
-                        self.log_event("WARN", f"{node.name}: Error replaying WAL entry #{tid} during heal: {e}")
-                    node.tx_seq = tid
+                    if is_printable_ascii_command(stmt):
+                        try:
+                            self._replay_wal_entry(node, stmt)
+                        except Exception as e:
+                            self.log_event("WARN", f"{node.name}: Error replaying WAL tail #{tid} during heal: {e}")
+                    last_tid = tid
+                node.tx_seq = last_tid
                 self.send_shell_cmd(node, "sync")
-                self._save_wal_to_disk()  # persist the rebuilt node's tx_seq
+                fp = self._state_fingerprint(node)
+                if fp:
+                    node.state_digest = fp
+                self._save_wal_to_disk()
                 node.tampered = False
 
-        # Now force an immediate binary re-morph so the exploit can never work again
-        self.bounce_and_morph_node(node.node_id)
+            # Force an immediate binary re-morph under the same `morph_op_lock` hold
+            self.bounce_and_morph_node(node.node_id, _lock_held=True)
 
     def simulate_byzantine_tamper(self, node_id: int):
-        """Inject an unauthorized rogue SQL modification onto a single node to test 2-of-3 RAID self-healing."""
+        """Inject an unauthorized rogue modification onto a single node to test 2-of-3 RAID self-healing."""
         node = self.nodes[node_id - 1]
         if node.state != "ONLINE":
             return
@@ -1343,18 +1764,50 @@ class TriadController:
             f"Injected unauthorized rogue row onto {node.name} ONLY: INSERT INTO kv VALUES ('hacked.backdoor', 'pwned', 999)",
         )
         self.send_shell_cmd(
-            node, "sql INSERT INTO kv VALUES ('hacked.backdoor', 'pwned', 999)"
+            node, "sql /*triad*/ INSERT INTO kv VALUES ('hacked.backdoor', 'pwned', 999)"
         )
+        if "idx" in self.spec.vote_tables:
+            self.send_shell_cmd(
+                node, "sql /*triad*/ INSERT INTO idx VALUES ('hacked', 'doc-pwned', 999)"
+            )
         # Immediately run the RAID parity & 2-of-3 majority check so the controller catches and heals it
         self.compute_and_verify_raid_parity()
+
+    def _verify_restored_tx_seq_at_boot(self):
+        """
+        Verify each restored node's on-disk state fingerprint against the digest saved in the
+        WAL file. A node whose disk was rolled back or tampered while offline does not match
+        the persisted digest, so its `tx_seq` is reset to 0 before majority adoption / parity check.
+        """
+        if not self.restored_tx_seq_nodes:
+            return
+        for n in list(self.restored_tx_seq_nodes):
+            node = self.nodes[n - 1]
+            if node.state != "ONLINE":
+                continue
+            actual_fp = self._state_fingerprint(node)
+            expected_fp = self.restored_node_digests.get(node.node_id) or self.triad_state_digest
+            if expected_fp and actual_fp != expected_fp:
+                self.log_event(
+                    "WARN",
+                    f"{node.name}: on-disk state digest ({(actual_fp or 'none')[:12]}) != WAL digest ({expected_fp[:12]}) "
+                    f"at tx_seq={node.tx_seq}; resetting tx_seq=0.",
+                )
+                node.tx_seq = 0
+                node.state_digest = ""
+                self.restored_tx_seq_nodes.discard(node.node_id)
+            elif actual_fp:
+                node.state_digest = actual_fp
 
     def _adopt_tx_seq_from_majority(self):
         """
         Reconcile nodes whose applied tx_seq could not be restored from the WAL file (files
-        written before per-node tracking). A node whose kv table matches the 2-of-3 majority
-        already holds every committed write on its persistent AHCI partition, so it adopts the
-        Triad's tx_seq instead of replaying the whole WAL on its next morph. A node that
-        disagrees with the majority keeps tx_seq=0 and is healed by the parity check that follows.
+        written before per-node tracking, or nodes whose digest was missing). Compares all
+        `self.spec.vote_tables` across online nodes; nodes that match the 2-of-3 majority
+        (and match `triad_state_digest` if recorded) adopt `self.triad_tx_seq`. If all nodes
+        were rolled back to a state that disagrees with the WAL, replays the WAL onto all
+        online nodes. Any single node that disagrees with the 2-of-3 majority keeps `tx_seq=0`
+        and is healed by `compute_and_verify_raid_parity()`.
         """
         pending = [
             n for n in self.nodes
@@ -1362,25 +1815,61 @@ class TriadController:
         ]
         if not pending or self.triad_tx_seq == 0 or not self.spec.has_sql:
             return
-        tables = {}
+        probes = {}
         for n in self.nodes:
             if n.state != "ONLINE":
                 continue
-            out = self.send_shell_cmd(n, "sql /*triad*/ SELECT * FROM kv", timeout=4.0)
-            if out and "k|v|rev" in out:
-                tables[n.node_id] = self._normalize_kv_for_tmr(out)
-        vals = list(tables.values())
+            p = self._state_probe(n)
+            if p is not None:
+                probes[n.node_id] = p
+        vals = list(probes.values())
         if len(vals) < 2:
             return
         majority = max(set(vals), key=vals.count)
+        maj_fp = hashlib.sha256(majority.encode("utf-8")).hexdigest()
+
+        # Check if all disks were rolled back so even the majority disagrees with the WAL's
+        # recorded state digest (or holds only the 3 genesis rows while `wal_entries` has writes).
+        genesis_only = (
+            "cluster.role|primary|1" in majority
+            and len(majority.splitlines()) <= 4
+            and len(self.wal_entries) > 0
+        )
+        if (self.triad_state_digest and maj_fp != self.triad_state_digest) or genesis_only:
+            if vals.count(majority) >= 2 and all(n.node_id not in self.restored_tx_seq_nodes for n in self.nodes if n.state == "ONLINE"):
+                self.log_event(
+                    "WARN",
+                    f"On-disk majority does not match WAL at tx_seq={self.triad_tx_seq}; replaying WAL on all online nodes.",
+                )
+                with self.wal_lock:
+                    for n in self.nodes:
+                        if n.state != "ONLINE":
+                            continue
+                        self._reset_sql_vote_tables(n)
+                        for tid, stmt in self.wal_entries:
+                            if is_printable_ascii_command(stmt):
+                                self._replay_wal_entry(n, stmt)
+                            n.tx_seq = tid
+                        self.send_shell_cmd(n, "sync")
+                        fp = self._state_fingerprint(n)
+                        if fp:
+                            n.state_digest = fp
+                            self.triad_state_digest = fp
+                        self.restored_tx_seq_nodes.add(n.node_id)
+                    self._save_wal_to_disk()
+                return
+
         if vals.count(majority) < 2:
             return
         with self.wal_lock:
-            adopted = [n for n in pending if tables.get(n.node_id) == majority]
+            adopted = [n for n in pending if probes.get(n.node_id) == majority]
             for n in adopted:
                 n.tx_seq = self.triad_tx_seq
+                n.state_digest = maj_fp
                 self.restored_tx_seq_nodes.add(n.node_id)
             if adopted:
+                if not self.triad_state_digest:
+                    self.triad_state_digest = maj_fp
                 self._save_wal_to_disk()
         if adopted:
             names = " + ".join(n.name.split()[0] for n in adopted)
@@ -1405,7 +1894,8 @@ class TriadController:
         for n in self.nodes:
             ok = self.await_boot(n, timeout=30.0)
             if ok:
-                self.apply_node_profile(n)
+                if not self.apply_node_profile(n):
+                    continue
                 n.state = "ONLINE"
                 self.refresh_node_telemetry(n)
                 self.log_event(
@@ -1416,6 +1906,7 @@ class TriadController:
                 n.state = "OFFLINE"
                 self.log_event("ERROR", f"{n.name} failed to reach interactive shell ready.")
 
+        self._verify_restored_tx_seq_at_boot()
         self._adopt_tx_seq_from_majority()
         self.compute_and_verify_raid_parity()
         self._provision_sql()
@@ -1615,13 +2106,26 @@ DASHBOARD_HTML = r"""<!doctype html>
 </div>
 
 <script>
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 (function initToken() {
-  const saved = localStorage.getItem('cuttle_triad_token') || '';
-  document.getElementById('tokInput').value = saved;
+  try {
+    const saved = sessionStorage.getItem('cuttle_app_session_token') || '';
+    document.getElementById('tokInput').value = saved;
+  } catch (e) {}
 })();
 
 function saveToken() {
-  localStorage.setItem('cuttle_triad_token', document.getElementById('tokInput').value.trim());
+  try {
+    sessionStorage.setItem('cuttle_app_session_token', document.getElementById('tokInput').value.trim());
+  } catch (e) {}
 }
 
 function authHeaders() {
@@ -1639,30 +2143,33 @@ async function refresh() {
     document.getElementById('autoBtn').textContent = 'Auto-Morph: ' + (d.auto_morph ? 'ON (45s)' : 'OFF');
 
     const grid = document.getElementById('nodesGrid');
-    grid.innerHTML = d.nodes.map(n => `
-      <div class="node-card ${n.state}">
+    grid.innerHTML = d.nodes.map(n => {
+      const nid = Number(n.node_id) || 0;
+      const port = Number(n.http_port) || 0;
+      return `
+      <div class="node-card ${esc(n.state)}">
         <div class="node-top">
-          <div class="node-title">${n.name}</div>
-          <span class="badge ${n.state}">${n.state}</span>
+          <div class="node-title">${esc(n.name)}</div>
+          <span class="badge ${esc(n.state)}">${esc(n.state)}</span>
         </div>
-        <div class="node-role">${n.role} (HTTP :${n.http_port} | 4x SMP vCPUs)</div>
-        <div class="kv-row"><span>Kernel Seed / Morphs:</span><span>#${n.seed} (${n.morph_count}x | ${n.last_morph_ms}ms)</span></div>
-        <div class="kv-row"><span>Binary SHA-256:</span><span class="hash">${n.elf_sha256.slice(0, 20)}…</span></div>
-        <div class="kv-row"><span>Binmorph Rewrite:</span><span>${n.morph_stats.slice(0, 38)}</span></div>
-        <div class="kv-row"><span>AHCI Boot Gen / SQL tx:</span><span>boot #${n.boot_gen} | tx_seq=${n.tx_seq}</span></div>
-        <div class="kv-row"><span>4-Core HLT / IPI:</span><span>${n.last_smp}</span></div>
-        <div class="kv-row"><span>RAID Parity Tag:</span><span class="hash">${d.parity_sha256} (D1⊕D2=P)</span></div>
+        <div class="node-role">${esc(n.role)} (HTTP :${port} | 4x SMP vCPUs)</div>
+        <div class="kv-row"><span>Kernel Seed / Morphs:</span><span>#${Number(n.seed) || 0} (${Number(n.morph_count) || 0}x | ${Number(n.last_morph_ms) || 0}ms)</span></div>
+        <div class="kv-row"><span>Binary SHA-256:</span><span class="hash">${esc(String(n.elf_sha256 || '').slice(0, 20))}…</span></div>
+        <div class="kv-row"><span>Binmorph Rewrite:</span><span>${esc(String(n.morph_stats || '').slice(0, 38))}</span></div>
+        <div class="kv-row"><span>AHCI Boot Gen / SQL tx:</span><span>boot #${Number(n.boot_gen) || 0} | tx_seq=${Number(n.tx_seq) || 0}</span></div>
+        <div class="kv-row"><span>4-Core HLT / IPI:</span><span>${esc(n.last_smp)}</span></div>
+        <div class="kv-row"><span>RAID Parity Tag:</span><span class="hash">${esc(d.parity_sha256)} (D1⊕D2=P)</span></div>
         <div class="btn-row">
-          <button class="morph-btn" onclick="morphNode(${n.node_id})">⚡ Morph & Bounce OS-${n.node_id}</button>
-          <button class="tamper-btn" onclick="tamperNode(${n.node_id})">☣ Simulate Hack on OS-${n.node_id}</button>
-          <button onclick="window.open('http://127.0.0.1:${n.http_port}/app','_blank')">Direct UI</button>
+          <button class="morph-btn" onclick="morphNode(${nid})">⚡ Morph & Bounce OS-${nid}</button>
+          <button class="tamper-btn" onclick="tamperNode(${nid})">☣ Simulate Hack on OS-${nid}</button>
+          <button onclick="window.open('http://127.0.0.1:${port}/app','_blank')">Direct UI</button>
         </div>
       </div>
-    `).join('');
+    `;}).join('');
 
     const evEl = document.getElementById('eventList');
     evEl.innerHTML = d.events.map(e => `
-      <div class="ev ${e.level}"><span class="ts">[${e.ts}]</span><strong>[${e.level}]</strong> ${e.msg}</div>
+      <div class="ev ${esc(e.level)}"><span class="ts">[${esc(e.ts)}]</span><strong>[${esc(e.level)}]</strong> ${esc(e.msg)}</div>
     `).join('');
   } catch (e) {}
 }
@@ -1774,26 +2281,34 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         expected = self.ctrl.coordinator_token
         for hdr in ("X-Cuttle-Session", "X-Session-Token"):
             val = (self.headers.get(hdr) or "").strip()
-            if val and hmac.compare_digest(val, expected):
+            if val and safe_token_eq(val, expected):
                 return True
         auth = (self.headers.get("Authorization") or "").strip()
         if auth.lower().startswith("bearer "):
             tok = auth[7:].strip()
-            if tok and hmac.compare_digest(tok, expected):
+            if tok and safe_token_eq(tok, expected):
                 return True
         cookie = self.headers.get("Cookie") or ""
         for part in cookie.split(";"):
             kv = part.strip()
             if kv.startswith("triad_sid="):
                 tok = kv[len("triad_sid="):].strip()
-                if tok and hmac.compare_digest(tok, expected):
+                if tok and safe_token_eq(tok, expected):
                     return True
         return False
+
+    def _send_security_headers(self):
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
+        )
+        self.send_header("X-Frame-Options", "DENY")
 
     def _send_json(self, code: int, obj: dict):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self._send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1802,9 +2317,28 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         body = text.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        self._send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_bounded_body(self) -> str | None:
+        raw_len = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_len)
+        except ValueError:
+            self._send_json(400, {"ok": False, "error": "invalid Content-Length"})
+            return None
+        if length < 0:
+            self._send_json(400, {"ok": False, "error": "negative Content-Length"})
+            return None
+        if length > MAX_HTTP_BODY_BYTES:
+            self._send_json(
+                413,
+                {"ok": False, "error": f"payload exceeds {MAX_HTTP_BODY_BYTES} bytes"},
+            )
+            return None
+        return self.rfile.read(length).decode("utf-8", errors="replace").strip() if length else ""
 
     def do_GET(self):
         base_path = self.path.split("?", 1)[0]
@@ -1899,14 +2433,15 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         return self._send_text(404, "text/plain", "not found\n")
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length).decode("utf-8", errors="replace").strip()
-
         if not self._is_authenticated():
             return self._send_json(
                 401,
                 {"ok": False, "error": "unauthorized: provide valid X-Cuttle-Session or Authorization: Bearer token"},
             )
+
+        body = self._read_bounded_body()
+        if body is None:
+            return
 
         if self.path == "/api/whoami":
             # Side-effect-free token check for the /console page's Connect dialog.
@@ -1974,17 +2509,24 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                 res = self.ctrl.execute_triad_app(cmd_str)
             except ValueError as e:
                 return self._send_json(400, {"ok": False, "error": f"rejected: {e}"})
-            return self._send_json(200 if res.get("ok") else 400, res)
+            code = res.get("status_code", 200 if res.get("ok") else 400)
+            return self._send_json(code, res)
 
         if self.path.startswith("/api/morph/"):
-            nid = int(self.path.rsplit("/", 1)[-1])
+            raw_nid = self.path.rsplit("/", 1)[-1]
+            if not raw_nid.isdigit() or int(raw_nid) not in (1, 2, 3):
+                return self._send_json(400, {"ok": False, "error": "node_id must be 1, 2, or 3"})
+            nid = int(raw_nid)
             threading.Thread(
                 target=self.ctrl.bounce_and_morph_node, args=(nid,), daemon=True
             ).start()
             return self._send_json(200, {"ok": True})
 
         if self.path.startswith("/api/tamper/"):
-            nid = int(self.path.rsplit("/", 1)[-1])
+            raw_nid = self.path.rsplit("/", 1)[-1]
+            if not raw_nid.isdigit() or int(raw_nid) not in (1, 2, 3):
+                return self._send_json(400, {"ok": False, "error": "node_id must be 1, 2, or 3"})
+            nid = int(raw_nid)
             threading.Thread(
                 target=self.ctrl.simulate_byzantine_tamper, args=(nid,), daemon=True
             ).start()
@@ -2012,6 +2554,12 @@ def https_probe(node: TriadNode, path: str = "/healthz") -> tuple[str, str, str]
     trusting only the certificate whose SHA-256 the node printed on its serial console.
     Returns (certificate sha256, TLS version, cipher)."""
     assert node.tls_cert_sha256, f"{node.name}: no HTTPS UP line on its serial console"
+    assert node.tls_entropy in ("rdrand", "tpm", "rdrand+tpm"), (
+        f"{node.name}: expected hardware entropy in HTTPS UP line, got {node.tls_entropy!r}"
+    )
+    assert node.tls_provisioned is True, (
+        f"{node.name}: expected provisioned=true in HTTPS UP line, got {node.tls_provisioned!r}"
+    )
     pem = ssl.get_server_certificate(("127.0.0.1", node.https_port), timeout=10)
     sha = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
     assert sha == node.tls_cert_sha256, f"{node.name}: served certificate {sha} != serial {node.tls_cert_sha256}"
@@ -2027,6 +2575,187 @@ def https_probe(node: TriadNode, path: str = "/healthz") -> tuple[str, str, str]
             version, cipher = tls.version(), tls.cipher()[0]
     assert resp.startswith(b"HTTP/1.1 200") and b"CUTTLE-STATUS" in resp, f"{node.name}: {resp[:120]!r}"
     return sha, version, cipher
+
+
+def run_unit_self_tests():
+    """Fast deterministic unit tests for controller hardening before booting QEMU VMs."""
+    with tempfile.TemporaryDirectory(prefix="cuttle_triad_unit_") as tmp:
+        tmp_dir = Path(tmp)
+
+        # #30: Guest serial output detector distinguishes QEMU stderr warnings from guest markers
+        assert not has_guest_serial_output([]), "Empty buffer must not count as guest output"
+        assert not has_guest_serial_output(
+            ["qemu-system-x86_64: warning: host doesn't support requested feature: CPUID.01H:ECX.vmx"]
+        ), "QEMU stderr warning must not count as guest output"
+        assert has_guest_serial_output(["INFO : stage1 bootloader starting"]), "Stage1 INFO marker must count as guest output"
+        assert has_guest_serial_output(["CUTTLE_OS_READY"]), "Kernel marker must count as guest output"
+
+        # #8 & #23: Secret loader creates owner-only files and refuses malformed existing secrets
+        sec_bin = tmp_dir / "device_key.bin"
+        created_key = load_or_create_secret_file(sec_bin, 32, binary=True)
+        assert len(created_key) == 32 and sec_bin.read_bytes() == created_key
+        for bad_bytes in (b"short", b"x" * 33, b"\x00" * 32):
+            bad_path = tmp_dir / "bad_key.bin"
+            bad_path.write_bytes(bad_bytes)
+            try:
+                load_or_create_secret_file(bad_path, 32, binary=True)
+                raise AssertionError(f"load_or_create_secret_file must reject {len(bad_bytes)}-byte malformed key")
+            except ValueError:
+                assert bad_path.read_bytes() == bad_bytes, "Malformed secret file must not be overwritten"
+
+        bad_tok_path = tmp_dir / "bad_token.txt"
+        bad_tok_path.write_text("é" * 48, encoding="utf-8")
+        try:
+            load_or_create_secret_file(bad_tok_path, 24, binary=False)
+            raise AssertionError("load_or_create_secret_file must reject non-ASCII text tokens")
+        except ValueError:
+            pass
+
+        # #22: safe_token_eq handles non-ASCII inputs without raising TypeError
+        assert safe_token_eq("abc123", "abc123")
+        assert not safe_token_eq("abc123", "abc124")
+        assert not safe_token_eq("é" * 20, "a" * 20)
+        assert not safe_token_eq("", "abc123")
+
+        # #8: write_operator_token=False suppresses operator_token.txt creation on disk
+        no_tok_dir = tmp_dir / "no_op_token"
+        no_tok_ctrl = TriadController(
+            show_gui=False,
+            spec=TriadSpec(name="no-tok", state_dir=no_tok_dir, write_operator_token=False),
+        )
+        no_tok_ctrl.shutdown()
+        assert not (no_tok_dir / "operator_token.txt").exists(), (
+            "write_operator_token=False must not write operator_token.txt"
+        )
+
+        # #9: Corrupt WAL file is refused and backed up to .json.bad
+        corrupt_dir = tmp_dir / "corrupt_wal"
+        corrupt_dir.mkdir(parents=True, exist_ok=True)
+        (corrupt_dir / "triad_wal.json").write_text("{corrupt json", encoding="utf-8")
+        try:
+            TriadController(show_gui=False, spec=TriadSpec(name="corrupt", state_dir=corrupt_dir))
+            raise AssertionError("Corrupt triad_wal.json must raise ValueError at startup")
+        except ValueError:
+            assert (corrupt_dir / "triad_wal.json.bad").exists(), "Corrupt WAL must be saved to triad_wal.json.bad"
+
+        # #32.6: WAL compaction bounds superseded key updates while preserving final values
+        raw_wal = [(i, f"INSERT OR REPLACE INTO kv VALUES ('hot.key', 'v{i}', {i})") for i in range(1, 20)]
+        raw_wal.append((20, "INSERT OR REPLACE INTO kv VALUES ('other.key', 'keep', 20)"))
+        compacted = compact_wal_entries(raw_wal)
+        assert len(compacted) == 2 and compacted[0] == (19, "INSERT OR REPLACE INTO kv VALUES ('hot.key', 'v19', 19)")
+        assert compacted[1] == (20, "INSERT OR REPLACE INTO kv VALUES ('other.key', 'keep', 20)")
+
+        # #12: apply_node_profile keeps node OFFLINE and logs ALERT when role application fails
+        role_dir = tmp_dir / "role_fail"
+        role_ctrl = TriadController(
+            show_gui=False,
+            spec=TriadSpec(name="role-fail", state_dir=role_dir, role="sql", write_operator_token=False),
+        )
+        role_ctrl.shutdown()
+        rn = role_ctrl.nodes[0]
+        rn.state = "BOOTING"
+        role_ctrl.send_shell_cmd = lambda node, cmd, timeout=4.0: "role=other" if cmd.startswith("service role") else "ok"
+        assert not role_ctrl.apply_node_profile(rn), "apply_node_profile must return False when service role fails"
+        assert rn.state == "OFFLINE", f"Node must remain OFFLINE when role application fails, got {rn.state}"
+        assert any(e["level"] == "ALERT" and "failed to apply role" in e["msg"] for e in role_ctrl.events)
+
+        # #11: wfe _state_probe hashes file contents and non-SQL heal re-syncs files from healthy peer
+        wfe_dir = tmp_dir / "wfe_probe"
+        wfe_ctrl = TriadController(
+            show_gui=False,
+            spec=TriadSpec(name="wfe-test", state_dir=wfe_dir, job="web", role="wfe", write_operator_token=False),
+        )
+        wfe_ctrl.shutdown()
+        fake_fs = {
+            1: {"/index.html": "hello"},
+            2: {"/index.html": "world"},  # same length (5 bytes), different content!
+            3: {"/index.html": "hello"},
+        }
+        for n in wfe_ctrl.nodes:
+            n.state = "ONLINE"
+
+        def fake_wfe_cmd(node, cmd, timeout=4.0):
+            fs = fake_fs[node.node_id]
+            if cmd == "ls":
+                return "\n".join(f"{p} ({len(c)} B)" for p, c in sorted(fs.items()))
+            if cmd.startswith("cat "):
+                p = cmd[4:].strip()
+                return fs.get(p, "")
+            if cmd.startswith("rm "):
+                p = cmd[3:].strip()
+                fs.pop(p, None)
+                return "ok"
+            if cmd.startswith("write "):
+                parts = cmd.split(" ", 2)
+                fs[parts[1]] = parts[2] if len(parts) > 2 else ""
+                return "ok"
+            return "ok"
+
+        wfe_ctrl.send_shell_cmd = fake_wfe_cmd
+        p1 = wfe_ctrl._state_probe(wfe_ctrl.nodes[0])
+        p2 = wfe_ctrl._state_probe(wfe_ctrl.nodes[1])
+        p3 = wfe_ctrl._state_probe(wfe_ctrl.nodes[2])
+        assert p1 == p3 and p1 != p2, "wfe _state_probe must detect same-length content changes"
+        wfe_ctrl._sync_files_from_peer(wfe_ctrl.nodes[1], wfe_ctrl.nodes[0])
+        assert fake_fs[2]["/index.html"] == "hello" and wfe_ctrl._state_probe(wfe_ctrl.nodes[1]) == p1
+
+        # #3: Multi-table heal (vote_tables=("kv", "idx")) resets all tables in spec.vote_tables
+        idx_dir = tmp_dir / "idx_heal"
+        idx_ctrl = TriadController(
+            show_gui=False,
+            spec=TriadSpec(
+                name="idx-test",
+                state_dir=idx_dir,
+                job="index",
+                role="sql",
+                vote_tables=("kv", "idx"),
+                write_operator_token=False,
+            ),
+        )
+        idx_ctrl.shutdown()
+        idx_tables = {
+            1: {"kv": ["doc.1|alpha|1"], "idx": ["alpha|doc.1|1"]},
+            2: {"kv": ["doc.1|TAMPER|9"], "idx": ["alpha|doc.1|1", "bogus|doc.9|9"]},
+            3: {"kv": ["doc.1|alpha|1"], "idx": ["alpha|doc.1|1"]},
+        }
+        for n in idx_ctrl.nodes:
+            n.state = "ONLINE"
+        idx_ctrl.wal_entries = [
+            (1, "CREATE TABLE IF NOT EXISTS idx (term TEXT, doc TEXT, weight INT)"),
+            (2, "INSERT OR REPLACE INTO kv VALUES ('doc.1', 'alpha', 1)"),
+            (3, "INSERT INTO idx VALUES ('alpha', 'doc.1', 1)"),
+        ]
+        idx_ctrl.triad_tx_seq = 3
+
+        def fake_idx_cmd(node, cmd, timeout=4.0):
+            t = idx_tables[node.node_id]
+            if "DROP TABLE" in cmd and "kv" in cmd:
+                t["kv"] = []
+                return "ok"
+            if "DROP TABLE" in cmd and "idx" in cmd:
+                t["idx"] = []
+                return "ok"
+            if "SELECT * FROM kv" in cmd:
+                return "\n".join(["k|v|rev"] + t["kv"])
+            if "SELECT * FROM idx" in cmd:
+                return "\n".join(["term|doc|weight"] + t["idx"])
+            if "INSERT OR REPLACE INTO kv VALUES ('doc.1', 'alpha', 1)" in cmd:
+                t["kv"] = ["doc.1|alpha|1"]
+                return "1 row inserted"
+            if "INSERT INTO idx VALUES ('alpha', 'doc.1', 1)" in cmd:
+                t["idx"].append("alpha|doc.1|1")
+                return "1 row inserted"
+            return "ok"
+
+        idx_ctrl.send_shell_cmd = fake_idx_cmd
+        idx_ctrl.bounce_and_morph_node = lambda nid, _lock_held=False, _wipe_disks=False: (
+            setattr(idx_ctrl.nodes[nid - 1], "state", "ONLINE") or True
+        )
+        idx_ctrl.heal_and_remorph_node(idx_ctrl.nodes[1])
+        assert idx_tables[2] == idx_tables[1] == idx_tables[3], (
+            f"Multi-table heal left duplicate or stale rows in idx: {idx_tables[2]}"
+        )
+        assert idx_ctrl._state_probe(idx_ctrl.nodes[1]) == idx_ctrl._state_probe(idx_ctrl.nodes[0])
 
 
 def main():
@@ -2046,19 +2775,16 @@ def main():
     )
     args = parser.parse_args()
 
+    selftest_dir: Path | None = None
     if args.self_test:
-        # Start from a clean Triad: the WAL and the desired cron jobs (restored onto every
-        # node at boot) would otherwise accumulate across self-test runs.
-        for stale in (TRIAD_DIR / "triad_wal.json", TRIAD_DIR / "cron_jobs.json"):
-            if stale.exists():
-                stale.unlink()
+        run_unit_self_tests()
+        IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        selftest_dir = Path(tempfile.mkdtemp(prefix="cuttle_triad_selftest_", dir=str(IMAGES_DIR)))
+        spec = TriadSpec(state_dir=selftest_dir, accel=args.accel)
+    else:
+        spec = TriadSpec(accel=args.accel)
 
-    ctrl = TriadController(show_gui=args.gui, spec=TriadSpec(accel=args.accel))
-    if args.self_test:
-        for n in ctrl.nodes:
-            for img in (n.ahci_img, n.virtio_img, n.nvme_img):
-                if img.exists():
-                    img.unlink()
+    ctrl = TriadController(show_gui=args.gui, spec=spec)
     TriadHttpHandler.ctrl = ctrl
     ctrl.boot_all_parallel()
 
@@ -2084,7 +2810,7 @@ def main():
             if ctrl.accel == "whpx":
                 probe = TriadController(
                     show_gui=False,
-                    spec=TriadSpec(name="accel-fallback-probe", state_dir=TRIAD_DIR / "accel_fallback_probe",
+                    spec=TriadSpec(name="accel-fallback-probe", state_dir=selftest_dir / "accel_fallback_probe",
                                    http_base=18190, https_base=18590, smp=2, accel="auto"),
                 )
                 probe._guest_started = lambda node, timeout: False  # "no guest output under WHPX"
@@ -2121,27 +2847,65 @@ def main():
             test_port = test_srv.server_address[1]
             threading.Thread(target=test_srv.serve_forever, daemon=True).start()
             try:
-                unauth_read_req = urllib.request.Request(
-                    f"http://127.0.0.1:{test_port}/api/sql",
-                    data=b"SELECT * FROM kv",
-                    method="POST",
-                )
-                try:
-                    urllib.request.urlopen(unauth_read_req, timeout=5.0)
-                    raise AssertionError("Unauthenticated POST /api/sql SELECT must be refused with 401")
-                except urllib.error.HTTPError as e:
-                    assert e.code == 401, f"Expected 401 on unauthenticated POST /api/sql SELECT, got {e.code}"
+                # #17 & #22: Every authenticated endpoint refuses {no token, wrong token, non-ASCII token} with 401
+                auth_endpoints = [
+                    ("GET", "/sql?SELECT+*+FROM+kv", None),
+                    ("POST", "/sql", b"SELECT * FROM kv"),
+                    ("POST", "/api/sql", b"SELECT * FROM kv"),
+                    ("POST", "/api/sh", b"status"),
+                    ("POST", "/api/app", b"guard status"),
+                    ("POST", "/api/vault", b"get cluster.secret"),
+                    ("POST", "/api/guard", b"status"),
+                    ("POST", "/api/cron", b"list"),
+                    ("POST", "/api/whoami", b""),
+                    ("POST", "/api/morph/1", b""),
+                    ("POST", "/api/tamper/1", b""),
+                    ("POST", "/api/rolling_wave", b""),
+                    ("POST", "/api/toggle_auto", b""),
+                ]
+                for method, ep_path, ep_body in auth_endpoints:
+                    for bad_hdr in ({}, {"X-Cuttle-Session": "wrong-token"}, {"X-Cuttle-Session": "é" * 32}):
+                        req = urllib.request.Request(
+                            f"http://127.0.0.1:{test_port}{ep_path}",
+                            data=ep_body,
+                            headers=bad_hdr,
+                            method=method,
+                        )
+                        try:
+                            urllib.request.urlopen(req, timeout=5.0)
+                            raise AssertionError(f"Unauthenticated {method} {ep_path} ({bad_hdr}) must return 401")
+                        except urllib.error.HTTPError as e:
+                            assert e.code == 401, f"Expected 401 on {method} {ep_path} ({bad_hdr}), got {e.code}"
 
-                unauth_req = urllib.request.Request(
-                    f"http://127.0.0.1:{test_port}/api/sql",
-                    data=b"INSERT INTO kv VALUES ('unauth', 'nope', 1)",
-                    method="POST",
-                )
-                try:
-                    urllib.request.urlopen(unauth_req, timeout=5.0)
-                    raise AssertionError("Unauthenticated POST /api/sql must be refused with 401")
-                except urllib.error.HTTPError as e:
-                    assert e.code == 401, f"Expected 401 on unauthenticated POST /api/sql, got {e.code}"
+                # #22: Content-Length validation (negative -> 400, non-numeric -> 400, oversized -> 413)
+                for bad_cl, expected_code in (("-5", 400), ("notanumber", 400), (str(MAX_HTTP_BODY_BYTES + 1024), 413)):
+                    with socket.create_connection(("127.0.0.1", test_port), timeout=5.0) as raw_sock:
+                        raw_req = (
+                            f"POST /api/sql HTTP/1.1\r\n"
+                            f"Host: 127.0.0.1:{test_port}\r\n"
+                            f"X-Cuttle-Session: {ctrl.coordinator_token}\r\n"
+                            f"Content-Length: {bad_cl}\r\n"
+                            f"Connection: close\r\n\r\n"
+                        ).encode("ascii")
+                        raw_sock.sendall(raw_req)
+                        raw_resp = raw_sock.recv(4096).decode("utf-8", errors="replace")
+                    assert f"HTTP/1.0 {expected_code}" in raw_resp or f"HTTP/1.1 {expected_code}" in raw_resp, (
+                        f"Expected {expected_code} for Content-Length {bad_cl}, got: {raw_resp[:120]!r}"
+                    )
+
+                # #32.4: Invalid node IDs on /api/morph/<nid> and /api/tamper/<nid> return 400
+                for bad_nid_path in ("/api/morph/0", "/api/morph/4", "/api/morph/abc", "/api/tamper/0", "/api/tamper/4"):
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{test_port}{bad_nid_path}",
+                        data=b"",
+                        headers={"X-Cuttle-Session": ctrl.coordinator_token},
+                        method="POST",
+                    )
+                    try:
+                        urllib.request.urlopen(req, timeout=5.0)
+                        raise AssertionError(f"POST {bad_nid_path} must be refused with 400")
+                    except urllib.error.HTTPError as e:
+                        assert e.code == 400, f"Expected 400 on POST {bad_nid_path}, got {e.code}"
 
                 bs_req = urllib.request.Request(
                     f"http://127.0.0.1:{test_port}/api/sql",
@@ -2155,22 +2919,18 @@ def main():
                 except urllib.error.HTTPError as e:
                     assert e.code == 400, f"Expected 400 on backspace-injected POST /api/sql, got {e.code}"
 
-                # 3-console. The /console page is served without credentials but must never embed
-                # the operator token, and its actions stay behind auth (unauthenticated POSTs above are 401).
+                # 3-console & #18: /console and /app include CSP + frame-ancestors 'none' and X-Frame-Options: DENY
                 with urllib.request.urlopen(f"http://127.0.0.1:{test_port}/console", timeout=5.0) as resp:
                     assert resp.status == 200, f"Expected 200 on GET /console, got {resp.status}"
+                    csp = resp.headers.get("Content-Security-Policy", "")
+                    assert "frame-ancestors 'none'" in csp, f"Missing frame-ancestors in CSP: {csp}"
+                    assert resp.headers.get("X-Frame-Options") == "DENY"
                     console_page = resp.read().decode("utf-8")
                 assert "Cuttle Triad Console" in console_page, "GET /console did not serve the console page"
                 assert ctrl.coordinator_token not in console_page, "GET /console must not embed the operator token"
-                for unauth_path in ("/api/whoami", "/api/morph/1", "/api/tamper/1", "/api/toggle_auto", "/api/rolling_wave"):
-                    try:
-                        urllib.request.urlopen(
-                            urllib.request.Request(f"http://127.0.0.1:{test_port}{unauth_path}", data=b"", method="POST"),
-                            timeout=5.0,
-                        )
-                        raise AssertionError(f"Unauthenticated POST {unauth_path} must be refused with 401")
-                    except urllib.error.HTTPError as e:
-                        assert e.code == 401, f"Expected 401 on unauthenticated POST {unauth_path}, got {e.code}"
+                with urllib.request.urlopen(f"http://127.0.0.1:{test_port}/app", timeout=5.0) as resp:
+                    app_page = resp.read().decode("utf-8")
+                assert "function esc(s)" in app_page and "sessionStorage" in app_page
                 whoami_req = urllib.request.Request(
                     f"http://127.0.0.1:{test_port}/api/whoami",
                     data=b"",
@@ -2181,16 +2941,29 @@ def main():
                     assert resp.status == 200, f"Expected 200 on authenticated POST /api/whoami, got {resp.status}"
                     assert json.loads(resp.read().decode("utf-8")).get("ok") is True
 
-                auth_req = urllib.request.Request(
-                    f"http://127.0.0.1:{test_port}/api/sql",
-                    data=b"INSERT OR REPLACE INTO kv VALUES ('triad.init', 'active', 1)",
-                    headers={"X-Cuttle-Session": ctrl.coordinator_token},
-                    method="POST",
-                )
-                with urllib.request.urlopen(auth_req, timeout=10.0) as resp:
-                    assert resp.status == 200
-                    r1 = json.loads(resp.read().decode("utf-8"))
-                    assert r1["ok"] and "3/3" in r1["quorum"], f"Expected 3/3 majority write: {r1}"
+                # #9: Verify write-ahead logging: WAL entry is on disk BEFORE node execution runs
+                wal_seen_before_exec = []
+
+                def _check_wal_on_disk(tid: int, stmt: str):
+                    disk_data = json.loads(ctrl.wal_file.read_text(encoding="utf-8"))
+                    disk_tids = [entry[0] for entry in disk_data.get("wal_entries", [])]
+                    wal_seen_before_exec.append(tid in disk_tids)
+
+                ctrl._after_wal_write_ahead_hook = _check_wal_on_disk
+                try:
+                    auth_req = urllib.request.Request(
+                        f"http://127.0.0.1:{test_port}/api/sql",
+                        data=b"INSERT OR REPLACE INTO kv VALUES ('triad.init', 'active', 1)",
+                        headers={"X-Cuttle-Session": ctrl.coordinator_token},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(auth_req, timeout=10.0) as resp:
+                        assert resp.status == 200
+                        r1 = json.loads(resp.read().decode("utf-8"))
+                        assert r1["ok"] and "3/3" in r1["quorum"], f"Expected 3/3 majority write: {r1}"
+                    assert wal_seen_before_exec == [True], "WAL entry must be persisted to disk before node execution"
+                finally:
+                    ctrl._after_wal_write_ahead_hook = None
 
                 # 3a. Verify /api/sh allows read-only inspection commands (`status`) and refuses state-changing commands with 403:
                 sh_ro_req = urllib.request.Request(
@@ -2270,6 +3043,21 @@ def main():
                 with urllib.request.urlopen(cron_req, timeout=10.0) as resp:
                     rc = json.loads(resp.read().decode("utf-8"))
                     assert rc["ok"] and "3/3" in rc["quorum"], f"Expected 3/3 cron schedule: {rc}"
+
+                # #7: Mutating cron commands via /api/cron or /api/app must be refused with 403
+                for bad_cron in (b"add 5 sql DELETE FROM kv", b"add 5 write /var/pwn 1", b"add 5 vault put k v"):
+                    bad_cron_req = urllib.request.Request(
+                        f"http://127.0.0.1:{test_port}/api/cron",
+                        data=bad_cron,
+                        headers={"X-Cuttle-Session": ctrl.coordinator_token},
+                        method="POST",
+                    )
+                    try:
+                        urllib.request.urlopen(bad_cron_req, timeout=5.0)
+                        raise AssertionError(f"Mutating /api/cron ({bad_cron!r}) must be refused with 403")
+                    except urllib.error.HTTPError as e:
+                        assert e.code == 403, f"Expected 403 on mutating /api/cron ({bad_cron!r}), got {e.code}"
+                assert all("DELETE" not in cmd and "write" not in cmd for _, cmd in ctrl.desired_cron)
             finally:
                 test_srv.shutdown()
 
@@ -2362,14 +3150,18 @@ def main():
             assert sha == tls_before[1], "OS-1 certificate changed across a morph cycle"
             print(f"HTTPS after OS-1 morph: {version} {cipher}, same pinned certificate", flush=True)
 
-            # 5. Simulate single-node tamper on OS-2 and verify automatic 2-of-3 self-healing + 4 KiB XOR parity check
+            # 5. Simulate single-node tamper on OS-2 while another thread contends for morph_op_lock (#20),
+            #    and verify automatic 2-of-3 self-healing + 4 KiB XOR parity check completes cleanly.
             old_morphs = ctrl.nodes[1].morph_count
+            ctrl.morph_op_lock.acquire()
+            threading.Timer(0.4, ctrl.morph_op_lock.release).start()
             ctrl.simulate_byzantine_tamper(2)
             deadline = time.time() + 45.0
             while time.time() < deadline:
                 if ctrl.nodes[1].state == "ONLINE" and ctrl.nodes[1].morph_count > old_morphs:
                     break
                 time.sleep(0.5)
+            assert ctrl.nodes[1].state == "ONLINE", f"OS-2 stuck in {ctrl.nodes[1].state} after lock contention"
             q2_out = ctrl.send_shell_cmd(ctrl.nodes[1], "sql SELECT * FROM kv")
             assert "pwned" not in q2_out and "zero_downtime" in q2_out, f"OS-2 heal failed:\n{q2_out}"
             # Also verify OS-2 reconstructed and re-sealed `cluster.secret` from the WAL during heal!
@@ -2391,7 +3183,7 @@ def main():
                 time.sleep(1.0)
                 if before_boot:
                     before_boot()
-                new = TriadController(show_gui=args.gui, spec=TriadSpec(accel=args.accel))
+                new = TriadController(show_gui=args.gui, spec=TriadSpec(state_dir=selftest_dir, accel=args.accel))
                 TriadHttpHandler.ctrl = new
                 new.boot_all_parallel()
                 return new
@@ -2416,10 +3208,13 @@ def main():
 
             # 6b. WAL file from before per-node tracking: nodes that match the 2/3 majority adopt
             #     the Triad's tx_seq at boot instead of replaying the whole WAL.
-            wal_path = TRIAD_DIR / "triad_wal.json"
+            wal_path = selftest_dir / "triad_wal.json"
 
             def strip_node_tx_seq():
                 data = json.loads(wal_path.read_text(encoding="utf-8"))
+                assert data.get("triad_state_digest") and data.get("node_state_digest"), (
+                    "triad_wal.json must record triad_state_digest and node_state_digest (#10)"
+                )
                 data.pop("node_tx_seq", None)
                 wal_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -2433,7 +3228,7 @@ def main():
             # 6c. A restored tx_seq must not hide real divergence: wipe OS-3's disk while the Triad
             #     is down. The WAL still says OS-3 is current, but the boot parity check must outvote
             #     it, rebuild it from the majority + WAL, and emergency-morph it.
-            ctrl = restart_controller(ctrl, before_boot=lambda: (TRIAD_DIR / "node3" / "ahci_node3.img").unlink())
+            ctrl = restart_controller(ctrl, before_boot=lambda: (selftest_dir / "node3" / "ahci_node3.img").unlink())
             os3 = ctrl.nodes[2]
             deadline = time.time() + 60.0
             while time.time() < deadline:
@@ -2448,6 +3243,8 @@ def main():
             print("=== TRIAD 3-AS-1 SELF-TEST PASSED ===", flush=True)
         finally:
             ctrl.shutdown()
+            if selftest_dir and selftest_dir.exists():
+                shutil.rmtree(selftest_dir, ignore_errors=True)
         return
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), TriadHttpHandler)

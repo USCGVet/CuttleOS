@@ -682,6 +682,11 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch { /* storage unavailable */ } },
   del(k) { try { localStorage.removeItem(k); } catch { /* storage unavailable */ } },
 };
+const tokStore = {
+  get(k, d) { try { const v = sessionStorage.getItem(k); return v == null ? d : v; } catch { return d; } },
+  set(k, v) { try { sessionStorage.setItem(k, v); } catch { /* storage unavailable */ } },
+  del(k) { try { sessionStorage.removeItem(k); } catch { /* storage unavailable */ } },
+};
 const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 // Standalone (/console on a Triad controller) or fleet (/fleet on tools/cuttle_fleet.py).
@@ -693,7 +698,7 @@ const CLIENT = FLEET && SAFE_ID.test(QS.get('c') || '') ? QS.get('c') : null;
 const JOB = CLIENT && SAFE_ID.test(QS.get('t') || '') ? QS.get('t') : null;
 const VIEW = !FLEET || JOB ? 'triad' : CLIENT ? 'farm' : 'clients';
 const API_BASE = FLEET && JOB ? '/api/c/' + CLIENT + '/t/' + JOB : '';
-const TOKEN_KEY = FLEET ? 'cuttle_fleet_token' : 'cuttle_triad_token'; // the latter is shared with /app
+const TOKEN_KEY = FLEET ? 'cuttle_fleet_session_token' : 'cuttle_console_session_token';
 const fleetUrl = (c, t) => '/fleet' + (c ? '?c=' + encodeURIComponent(c) + (t ? '&t=' + encodeURIComponent(t) : '') : '');
 const AUTO_INTERVAL = 45;               // TriadController.auto_morph_interval
 const WINDOW_MS = 5 * 60 * 1000;
@@ -816,6 +821,8 @@ function openConnect() {
   setTimeout(() => $('#tokIn').focus(), 50);
 }
 async function tryToken(inputSel = '#tokIn', msgSel = '#tokMsg') {
+  if (typeof inputSel !== 'string') inputSel = '#tokIn';
+  if (typeof msgSel !== 'string') msgSel = '#tokMsg';
   const tok = $(inputSel).value.trim();
   const msg = $(msgSel);
   if (!/^[0-9a-fA-F]{16,128}$/.test(tok)) { msg.textContent = 'That doesn’t look like a token: expected hex characters.'; msg.style.color = 'var(--bad)'; return; }
@@ -823,7 +830,7 @@ async function tryToken(inputSel = '#tokIn', msgSel = '#tokMsg') {
   const ok = await probeToken(tok);
   if (ok === null) { msg.textContent = 'Controller not reachable.'; msg.style.color = 'var(--bad)'; return; }
   if (!ok) { msg.textContent = 'Rejected. The controller may have restarted with a new token.'; msg.style.color = 'var(--bad)'; return; }
-  S.token = tok; store.set(TOKEN_KEY, tok);
+  S.token = tok; tokStore.set(TOKEN_KEY, tok);
   $(inputSel).value = '';
   setUnlocked(true);
   if ($('#dlgConnect').open) $('#dlgConnect').close();
@@ -831,7 +838,7 @@ async function tryToken(inputSel = '#tokIn', msgSel = '#tokMsg') {
   else toast('Connected as operator. Operations are unlocked.', 'ok');
 }
 async function restoreToken() {
-  const tok = store.get(TOKEN_KEY, '');
+  const tok = tokStore.get(TOKEN_KEY, '');
   const ok = tok ? await probeToken(tok) : false;
   if (ok) { S.token = tok; setUnlocked(true); }
   if (FLEET) enterFleet();
@@ -2125,11 +2132,11 @@ function wire() {
 
   $('#lockBtn').addEventListener('click', openConnect);
   $('#introConnect').addEventListener('click', openConnect);
-  $('#tokGo').addEventListener('click', tryToken);
+  $('#tokGo').addEventListener('click', () => tryToken());
   $('#tokIn').addEventListener('keydown', e => { if (e.key === 'Enter') tryToken(); });
   $('#tokClose').addEventListener('click', () => $('#dlgConnect').close());
   $('#tokForget').addEventListener('click', () => {
-    store.del(TOKEN_KEY); S.token = ''; setUnlocked(false); $('#dlgConnect').close();
+    tokStore.del(TOKEN_KEY); S.token = ''; setUnlocked(false); $('#dlgConnect').close();
     toast(FLEET ? 'Signed out on this browser.' : 'Token forgotten on this browser.');
     if (FLEET) enterFleet();
   });

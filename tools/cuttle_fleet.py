@@ -19,6 +19,8 @@ Trust boundaries:
   * The provider token sees and manages every client. A client token sees only that client.
   * Farms bind 127.0.0.1 and accept only the per-run secret the provider passes them in the
     environment; browsers never talk to a farm directly.
+  * Fleet VMs run with host loopback port forwarding disabled (`forward_node_ports=False`), so
+    one client process on the host cannot connect directly to another client's VM `:80`/`:443`.
   * Each client farm derives its node device keys from its own random master key, so no key
     material is shared between clients.
 """
@@ -68,8 +70,10 @@ def load_fleet_config(path: Path = FLEET_CONFIG) -> dict:
         for job_id in plan.get("jobs", []):
             if job_id not in jobs:
                 raise ValueError(f"plan '{plan_id}' uses unknown job '{job_id}'")
-        if not 1 <= len(plan.get("jobs", [])) <= 9:
-            raise ValueError(f"plan '{plan_id}' must have 1-9 jobs (port block is 100 per client)")
+        if not 1 <= len(plan.get("jobs", [])) <= 5:
+            raise ValueError(
+                f"plan '{plan_id}' must have 1-5 jobs (port block is 100 per client with +50 HTTPS offset)"
+            )
     for where, value in [("provider", cfg.get("provider", {}).get("accelerator"))] + [
         (f"plan '{p}'", v.get("accelerator")) for p, v in plans.items()
     ]:
@@ -84,6 +88,30 @@ def load_fleet_config(path: Path = FLEET_CONFIG) -> dict:
         if c.get("plan") not in plans:
             raise ValueError(f"client '{c['id']}' uses unknown plan '{c.get('plan')}'")
         seen.add(c["id"])
+
+    prov = cfg.get("provider", {})
+    port_owners: dict[int, str] = {}
+
+    def claim_port(p: int, label: str):
+        if not isinstance(p, int) or isinstance(p, bool) or not (1024 <= p <= 65535):
+            raise ValueError(f"{label}: port {p!r} must be an integer in 1024..65535")
+        if p in port_owners:
+            raise ValueError(f"port collision on {p}: {label} collides with {port_owners[p]}")
+        port_owners[p] = label
+
+    if "port" in prov:
+        claim_port(prov["port"], "provider.port")
+    farm_base = prov.get("farm_port_base", 18900)
+    vm_base = prov.get("vm_port_base", 20000)
+    for slot, c in enumerate(clients):
+        cid = c["id"]
+        claim_port(farm_base + slot, f"client '{cid}' farm port")
+        plan_jobs = plans[c["plan"]].get("jobs", [])
+        for t, job_id in enumerate(plan_jobs):
+            base = vm_base + slot * 100 + t * 10
+            for nid in (1, 2, 3):
+                claim_port(base + nid, f"client '{cid}' job '{job_id}' node {nid} http_port")
+                claim_port(base + 50 + nid, f"client '{cid}' job '{job_id}' node {nid} https_port")
     return cfg
 
 
@@ -136,22 +164,15 @@ def triad_specs(cfg: dict, client: dict) -> list:
                 provision_sql=tuple(job.get("provision_sql", [])),
                 cron_jobs=tuple((int(a), str(b)) for a, b in job.get("cron", [])),
                 log_prefix=f"[{client['id']}/{job_id}] ",
+                write_operator_token=False,
+                forward_node_ports=False,
             )
         )
     return specs
 
 
 def load_or_create_secret(path: Path, nbytes: int = 16, binary: bool = False):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        data = path.read_bytes()
-        if binary and len(data) >= nbytes:
-            return data[:nbytes]
-        if not binary and len(data.strip()) >= nbytes * 2:
-            return data.decode("ascii").strip()
-    value = os.urandom(nbytes) if binary else secrets.token_hex(nbytes)
-    path.write_bytes(value if binary else (value + "\n").encode("ascii"))
-    return value
+    return tc.load_or_create_secret_file(path, nbytes=nbytes, binary=binary)
 
 
 # --------------------------------------------------------------------------------------------
@@ -295,7 +316,10 @@ class Farm:
         if ctrl.spec.role == "wfe":
             for n in online:
                 try:
-                    urllib.request.urlopen(f"http://127.0.0.1:{n.http_port}/status", timeout=2.0).read()
+                    if ctrl.spec.forward_node_ports:
+                        urllib.request.urlopen(f"http://127.0.0.1:{n.http_port}/status", timeout=2.0).read()
+                    else:
+                        ctrl.send_shell_cmd(n, "status", timeout=2.0)
                 except Exception:
                     pass
         elif job == "index":
@@ -372,7 +396,7 @@ class FarmHandler(tc.TriadHttpHandler):
 
     def _is_authenticated(self) -> bool:
         val = (self.headers.get("X-Cuttle-Farm-Secret") or "").strip()
-        return bool(val) and hmac.compare_digest(val, self.secret)
+        return tc.safe_token_eq(val, self.secret)
 
     def _route_triad(self) -> bool:
         m = re.match(r"^/api/t/([a-z0-9-]+)(/.*)$", self.path)
@@ -395,10 +419,13 @@ class FarmHandler(tc.TriadHttpHandler):
     def do_POST(self):
         if not self._is_authenticated():
             return self._send_json(401, {"ok": False, "error": "unauthorized"})
-        if self.path == "/api/load":
-            self.farm.load_enabled = not self.farm.load_enabled
-            return self._send_json(200, {"ok": True, "load": self.farm.load_enabled})
-        if self.path == "/api/shutdown":
+        if self.path in ("/api/load", "/api/shutdown"):
+            body = self._read_bounded_body()
+            if body is None:
+                return None
+            if self.path == "/api/load":
+                self.farm.load_enabled = not self.farm.load_enabled
+                return self._send_json(200, {"ok": True, "load": self.farm.load_enabled})
             self._send_json(200, {"ok": True})
             threading.Thread(target=_farm_exit, args=(self.farm,), daemon=True).start()
             return None
@@ -414,7 +441,7 @@ def _farm_exit(farm: Farm):
 
 
 def run_farm(client_id: str):
-    secret = os.environ.get(FARM_SECRET_ENV, "")
+    secret = os.environ.pop(FARM_SECRET_ENV, "")
     if len(secret) < 32:
         sys.exit(f"farm: {FARM_SECRET_ENV} must be set by the provider")
     cfg = load_fleet_config(Path(os.environ.get("CUTTLE_FLEET_CONFIG", FLEET_CONFIG)))
@@ -459,7 +486,7 @@ class Provider:
         fd.mkdir(parents=True, exist_ok=True)
         # Fresh provider token every start; client tokens persist so clients keep their credentials.
         self.provider_token = secrets.token_hex(16)
-        (fd / "provider_token.txt").write_text(self.provider_token + "\n", encoding="utf-8")
+        tc.write_secret_file(fd / "provider_token.txt", (self.provider_token + "\n").encode("ascii"))
         self.client_tokens = {cid: load_or_create_secret(fd / cid / "client_token.txt") for cid in self.clients}
         self.farm_secrets = {cid: secrets.token_hex(24) for cid in self.clients}
         self.procs: dict = {}
@@ -473,10 +500,10 @@ class Provider:
         """('provider', None) | ('client', client_id) | (None, None)."""
         if not token:
             return None, None
-        if hmac.compare_digest(token, self.provider_token):
+        if tc.safe_token_eq(token, self.provider_token):
             return "provider", None
         for cid, tok in self.client_tokens.items():
-            if hmac.compare_digest(token, tok):
+            if tc.safe_token_eq(token, tok):
                 return "client", cid
         return None, None
 
@@ -618,6 +645,7 @@ class ProviderHandler(tc.TriadHttpHandler):
     def _send_raw(self, code: int, ctype: str, body: bytes):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        self._send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -633,12 +661,29 @@ class ProviderHandler(tc.TriadHttpHandler):
         return self._dispatch("GET", b"")
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", "0") or 0)
-        body = self.rfile.read(length) if length else b""
-        return self._dispatch("POST", body)
-
-    def _dispatch(self, method: str, body: bytes):
         scope, own = self._scope()
+        if scope is None:
+            return self._send_json(
+                401,
+                {"ok": False, "error": "unauthorized: provide a provider or client token"},
+            )
+        raw_len = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_len)
+        except ValueError:
+            return self._send_json(400, {"ok": False, "error": "invalid Content-Length"})
+        if length < 0:
+            return self._send_json(400, {"ok": False, "error": "negative Content-Length"})
+        if length > tc.MAX_HTTP_BODY_BYTES:
+            return self._send_json(
+                413,
+                {"ok": False, "error": f"payload exceeds {tc.MAX_HTTP_BODY_BYTES} bytes"},
+            )
+        body = self.rfile.read(length) if length else b""
+        return self._dispatch("POST", body, pre_auth=(scope, own))
+
+    def _dispatch(self, method: str, body: bytes, pre_auth=None):
+        scope, own = pre_auth if pre_auth is not None else self._scope()
         if scope is None:
             return self._send_json(401, {"ok": False, "error": "unauthorized: provide a provider or client token"})
         base = self.path.split("?", 1)[0]
@@ -648,11 +693,13 @@ class ProviderHandler(tc.TriadHttpHandler):
         if method == "GET" and base == "/api/fleet":
             return self._send_json(200, self.provider.fleet_view(scope, own))
         m = re.match(r"^/api/c/([a-z0-9-]+)(/.*)$", self.path)
-        if not m or m.group(1) not in self.provider.clients:
+        if not m:
             return self._send_json(404, {"error": "unknown endpoint"})
         cid, rest = m.group(1), m.group(2)
         if scope == "client" and cid != own:
             return self._send_json(403, {"ok": False, "error": "forbidden: this token is scoped to another client"})
+        if cid not in self.provider.clients:
+            return self._send_json(404, {"error": "unknown endpoint"})
         if method == "POST" and rest in ("/start", "/stop", "/load"):
             if scope != "provider":
                 return self._send_json(403, {"ok": False, "error": "forbidden: provider token required"})
@@ -773,11 +820,51 @@ plan = "basic"
 """
 
 
+def run_fleet_unit_tests(work: Path):
+    """Fast deterministic unit tests for fleet config and secret validation (#15, #23)."""
+    # #15a: 6-job plan rejected (would collide HTTP on job 5 with HTTPS on job 0)
+    six_jobs_cfg = work / "six_jobs.toml"
+    six_jobs_cfg.write_text(
+        SELFTEST_CONFIG
+        + '\n[jobs.j5]\nrole = "wfe"\n[jobs.j6]\nrole = "wfe"\n[plans.too_many]\njobs = ["web", "sql", "index", "cron", "j5", "j6"]\n',
+        encoding="utf-8",
+    )
+    try:
+        load_fleet_config(six_jobs_cfg)
+        raise AssertionError("load_fleet_config must reject a 6-job plan")
+    except ValueError as e:
+        assert "1-5 jobs" in str(e), e
+
+    # #15b: Overlapping provider.port and farm_port_base rejected
+    overlap_cfg = work / "overlap.toml"
+    overlap_cfg.write_text(
+        SELFTEST_CONFIG.replace("farm_port_base = 18950", "farm_port_base = 18899"),
+        encoding="utf-8",
+    )
+    try:
+        load_fleet_config(overlap_cfg)
+        raise AssertionError("load_fleet_config must reject overlapping provider/farm ports")
+    except ValueError as e:
+        assert "port collision" in str(e), e
+
+    # #23: Malformed secret file rejected
+    bad_sec = work / "bad_master.bin"
+    bad_sec.write_bytes(b"short")
+    try:
+        load_or_create_secret(bad_sec, 32, binary=True)
+        raise AssertionError("load_or_create_secret must reject truncated master_key.bin")
+    except ValueError:
+        pass
+
+
 def run_self_test() -> int:
     import shutil
+    import socket
     import tempfile
 
+    tc.IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="cuttle_fleet_selftest_", dir=str(tc.IMAGES_DIR)))
+    run_fleet_unit_tests(work)
     cfg_path = work / "fleet.toml"
     cfg_path.write_text(SELFTEST_CONFIG, encoding="utf-8")
     os.environ[FLEET_DIR_ENV] = str(work / "state")
@@ -821,23 +908,81 @@ def run_self_test() -> int:
         assert all(provider.status[c] == "running" for c in provider.clients), f"farms not running: {provider.status}"
         print("farms running", flush=True)
 
-        # 1. Authentication: nothing is readable without a token, farms refuse anything but their secret.
-        for method, path in (("GET", "/api/fleet"), ("POST", "/api/whoami"), ("GET", "/api/c/alpha/farm"),
-                             ("GET", "/api/c/alpha/t/sql/api/triad"), ("POST", "/api/c/alpha/t/sql/api/sql"),
-                             ("POST", "/api/c/alpha/start"), ("POST", "/api/c/alpha/t/sql/api/morph/1")):
-            code, _ = call(method, path)
-            assert code == 401, f"unauthenticated {method} {path} must be 401, got {code}"
-            code, _ = call(method, path, token="0" * 32)
-            assert code == 401, f"bad-token {method} {path} must be 401, got {code}"
-        for path in ("/api/farm", "/api/t/sql/api/triad"):
-            for hdrs in ({}, {"X-Cuttle-Farm-Secret": "0" * 48}, {"X-Cuttle-Session": P}):
-                req = urllib.request.Request(f"http://127.0.0.1:{provider.farm_port('alpha')}{path}", headers=hdrs)
+        # 1. Authentication (#17, #22): every provider and farm endpoint across every role refuses
+        #    {no token, wrong token, non-ASCII token} with 401.
+        provider_endpoints = [
+            ("GET", "/api/fleet"),
+            ("POST", "/api/whoami"),
+            ("GET", "/api/c/alpha/farm"),
+            ("POST", "/api/c/alpha/start"),
+            ("POST", "/api/c/alpha/stop"),
+            ("POST", "/api/c/alpha/load"),
+        ]
+        triad_subpaths = [
+            ("GET", "/api/triad"),
+            ("GET", "/sql?SELECT+*+FROM+kv"),
+            ("POST", "/sql"),
+            ("POST", "/api/sql"),
+            ("POST", "/api/sh"),
+            ("POST", "/api/app"),
+            ("POST", "/api/vault"),
+            ("POST", "/api/guard"),
+            ("POST", "/api/cron"),
+            ("POST", "/api/whoami"),
+            ("POST", "/api/morph/1"),
+            ("POST", "/api/tamper/1"),
+            ("POST", "/api/rolling_wave"),
+            ("POST", "/api/toggle_auto"),
+        ]
+        for job in ("web", "sql", "index", "cron"):
+            for m_verb, sub in triad_subpaths:
+                provider_endpoints.append((m_verb, f"/api/c/alpha/t/{job}{sub}"))
+
+        for method, path in provider_endpoints:
+            for bad_tok in (None, "0" * 32, "é" * 32):
+                code, _ = call(method, path, token=bad_tok)
+                assert code == 401, f"provider {method} {path} (token={bad_tok!r}) must be 401, got {code}"
+
+        farm_endpoints = [
+            ("GET", "/api/farm"),
+            ("POST", "/api/load"),
+            ("POST", "/api/shutdown"),
+        ]
+        for job in ("web", "sql", "index", "cron"):
+            for m_verb, sub in triad_subpaths:
+                farm_endpoints.append((m_verb, f"/api/t/{job}{sub}"))
+
+        alpha_farm_port = provider.farm_port("alpha")
+        for method, path in farm_endpoints:
+            for hdrs in ({}, {"X-Cuttle-Farm-Secret": "0" * 48}, {"X-Cuttle-Farm-Secret": "é" * 48}, {"X-Cuttle-Session": P}):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{alpha_farm_port}{path}",
+                    data=b"" if method == "POST" else None,
+                    headers=hdrs,
+                    method=method,
+                )
                 try:
                     urllib.request.urlopen(req, timeout=5.0)
-                    raise AssertionError(f"farm {path} must refuse headers {list(hdrs)}")
+                    raise AssertionError(f"farm {method} {path} must refuse headers {list(hdrs)}")
                 except urllib.error.HTTPError as e:
-                    assert e.code == 401, f"farm {path} expected 401, got {e.code}"
-        print("auth: unauthenticated and wrong-secret requests refused at provider and farm", flush=True)
+                    assert e.code == 401, f"farm {method} {path} expected 401, got {e.code}"
+
+        # #22: Content-Length validation on ProviderHandler
+        for bad_cl, expected_code in (("-5", 400), ("notanumber", 400), (str(tc.MAX_HTTP_BODY_BYTES + 1024), 413)):
+            with socket.create_connection(("127.0.0.1", port), timeout=5.0) as raw_sock:
+                raw_req = (
+                    f"POST /api/whoami HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{port}\r\n"
+                    f"X-Cuttle-Session: {P}\r\n"
+                    f"Content-Length: {bad_cl}\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("ascii")
+                raw_sock.sendall(raw_req)
+                raw_resp = raw_sock.recv(4096).decode("utf-8", errors="replace")
+            assert f"HTTP/1.0 {expected_code}" in raw_resp or f"HTTP/1.1 {expected_code}" in raw_resp, (
+                f"Expected {expected_code} for Content-Length {bad_cl}, got: {raw_resp[:120]!r}"
+            )
+        print("auth: all provider & farm endpoints across all 4 roles refused unauthenticated/bad/non-ASCII tokens", flush=True)
 
         # 2. Scopes: the provider sees both clients; a client sees only itself and nothing provider-only.
         code, me = call("POST", "/api/whoami", P)
@@ -852,10 +997,25 @@ def run_self_test() -> int:
                              ("POST", "/api/c/bravo/t/sql/api/sql"), ("POST", "/api/c/bravo/t/sql/api/morph/1")):
             code, _ = call(method, path, A, b"SELECT * FROM kv")
             assert code == 403, f"client alpha -> {path} must be 403, got {code}"
+        # #32.5: Client token querying a non-existent client ID gets 403 (cannot enumerate client IDs),
+        # while provider token gets 404.
+        code, _ = call("GET", "/api/c/nonexistent/farm", A)
+        assert code == 403, f"client token querying nonexistent client must get 403, got {code}"
+        code, _ = call("GET", "/api/c/nonexistent/farm", P)
+        assert code == 404, f"provider token querying nonexistent client must get 404, got {code}"
         for path in ("/api/c/alpha/stop", "/api/c/alpha/start", "/api/c/alpha/load"):
             code, _ = call("POST", path, A)
             assert code == 403, f"client token on provider-only {path} must be 403, got {code}"
-        print("scopes: provider sees all; client alpha is confined to its own farm", flush=True)
+        print("scopes: provider sees all; client alpha is confined to its own farm (403 on other/unknown clients)", flush=True)
+
+        # 2b. Network isolation (#16): farm VMs do not forward node HTTP/HTTPS ports on host loopback.
+        for vm_port in (21101, 21151, 21001, 21051):
+            try:
+                with socket.create_connection(("127.0.0.1", vm_port), timeout=1.0):
+                    raise AssertionError(f"Fleet VM port {vm_port} must not be forwarded on host loopback")
+            except OSError:
+                pass
+        print("isolation: fleet VM node ports are not forwarded on host loopback", flush=True)
 
         # 3. Kernel roles are applied per job.
         expect = {("alpha", "web"): "wfe", ("alpha", "sql"): "sql", ("alpha", "index"): "sql",
@@ -887,17 +1047,34 @@ def run_self_test() -> int:
         assert "alpha-only" not in rb["output"] and all("alpha-only" not in v for v in rb["per_node"].values()), rb
         print("isolation: alpha's write is invisible to bravo", flush=True)
 
-        # 5. Key isolation: separate master keys and no device key shared across clients or jobs.
+        # 5. Key isolation (#8): separate master keys, no device key shared across clients or jobs,
+        #    and no unused operator_token.txt written in farm Triad directories.
         sd = work / "state"
         assert (sd / "alpha" / "master_key.bin").read_bytes() != (sd / "bravo" / "master_key.bin").read_bytes()
         dev_keys = [p.read_bytes() for p in sd.glob("*/*/node*/device_key_node*.bin")]
         assert len(dev_keys) == 18 and len(set(dev_keys)) == 18, f"expected 18 distinct device keys, got {len(set(dev_keys))}/{len(dev_keys)}"
-        print("keys: distinct master keys per client, 18 distinct node device keys", flush=True)
+        assert list(sd.glob("*/*/operator_token.txt")) == [], "farm Triads must not write unused operator_token.txt"
+        print("keys: distinct master keys per client, 18 distinct node device keys, no unused operator_token.txt", flush=True)
 
-        # 6. Index Triad provisioned through the WAL on every node.
+        # 6. Index Triad provisioned through the WAL on every node, and multi-table heal (#3)
+        #    drops and rebuilds both `kv` and `idx` without duplicate rows or a second ALERT.
         code, r = call("POST", "/api/c/alpha/t/index/api/sql", P, b"SELECT * FROM idx")
         assert code == 200 and all("cuttle|doc-1" in v for v in r["per_node"].values()), r
-        print("index: idx table provisioned on all three nodes", flush=True)
+        idx_before_morphs = call("GET", "/api/c/alpha/t/index/api/triad", P)[1]["nodes"][1]["morph_count"]
+        code, _ = call("POST", "/api/c/alpha/t/index/api/tamper/2", P)
+        assert code == 200
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            t_idx = call("GET", "/api/c/alpha/t/index/api/triad", P)[1]
+            if t_idx["nodes"][1]["state"] == "ONLINE" and t_idx["nodes"][1]["morph_count"] > idx_before_morphs:
+                break
+            time.sleep(1.0)
+        code, r_idx = call("POST", "/api/c/alpha/t/index/api/sql", P, b"SELECT * FROM idx")
+        assert code == 200 and r_idx["ok"] and "3/3" in r_idx["quorum"], f"index Triad did not converge after heal: {r_idx}"
+        idx_outputs = list(r_idx["per_node"].values())
+        assert idx_outputs[0] == idx_outputs[1] == idx_outputs[2], f"idx table diverged across nodes after heal: {idx_outputs}"
+        assert idx_outputs[1].count("cuttle|doc-1") == 1, f"duplicate row in healed idx table:\n{idx_outputs[1]}"
+        print("index: idx table provisioned and healed cleanly across both kv and idx without duplicate rows", flush=True)
 
         # 7. Cron desired state survives a morph (cron jobs live in node RAM).
         code, r = call("POST", "/api/c/alpha/t/cron/api/cron", P, b"cron add 7 uptime")
@@ -917,11 +1094,16 @@ def run_self_test() -> int:
         assert 'cmd="uptime"' in n1 and 'cmd="status"' in n1, f"cron jobs not restored after morph:\n{n1}"
         print("cron: desired jobs re-applied after OS-1 morphed", flush=True)
 
-        # 8. The console page is served without credentials and embeds no token.
-        code, page = call("GET", "/fleet")
-        assert code == 200 and "Cuttle Triad Console" in page
+        # 8. The console page is served without credentials, embeds no token, and sets CSP (#18).
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/fleet", timeout=10.0) as resp:
+            assert resp.status == 200
+            csp = resp.headers.get("Content-Security-Policy", "")
+            assert "frame-ancestors 'none'" in csp, f"Missing frame-ancestors in /fleet CSP: {csp}"
+            assert resp.headers.get("X-Frame-Options") == "DENY"
+            page = resp.read().decode("utf-8")
+        assert "Cuttle Triad Console" in page
         assert all(t not in page for t in (P, A, B)), "console page must not embed tokens"
-        print("console: /fleet served, no tokens embedded", flush=True)
+        print("console: /fleet served with CSP headers, no tokens embedded", flush=True)
 
         print("=== FLEET SELF-TEST PASSED ===", flush=True)
         ok = True

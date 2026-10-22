@@ -12,7 +12,7 @@ port = 18888            # provider console + API: http://127.0.0.1:18888/fleet
 farm_port_base = 18900  # client farm in slot i listens on 127.0.0.1:(farm_port_base + i)
 vm_port_base = 20000    # slot i, Triad t, node n -> HTTP vm_port_base + i*100 + t*10 + n (HTTPS +50)
 boot_stagger_s = 8      # seconds between client farm launches
-synthetic_load = true   # farms start with labelled synthetic traffic so the stats move
+synthetic_load = false  # opt-in synthetic traffic (toggleable in the console or via /api/load)
 # QEMU accelerator for every VM (a plan may override it):
 #   auto = WHPX (Hyper-V hardware virtualization) when this host can start it, else TCG
 #   whpx = WHPX only;  tcg = software emulation only
