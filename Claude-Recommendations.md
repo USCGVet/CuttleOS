@@ -148,7 +148,7 @@ Review of the 11 commits after `a623b5a`, up to `1c59464`: `79b8161` and `ca26a6
 - **Problem:** I confirmed that both committed seeds derive the roster's placeholder public keys. Together they meet the 2-of-3 threshold without `primary`. The module doc (`federation.rs:6-8`) also says `primary` is a test seed, which the roster contradicts.
 - **Effect:** `verify-attest --require-threshold` with the shipped roster adds no protection beyond the primary key. That flag is documented as the defense against a stolen primary key, and README:30 advertises M-of-N threshold attestation.
 - **Fix:** Keep the fixture signers only in test rosters. Have verification reject a roster that contains a known fixture key. Fix the module doc.
-- Status: Fixed — test: `federation::tests::rejects_known_fixture_pubkeys`, `threshold_check_rejects_roster_containing_known_fixture_pubkey` — commit: `ef2c0ad`, `37f9d23`
+- Status: Partly fixed — committed fixture seeds and RFC 8032 §7.1 example keys are removed from `factory_keys.toml` and rejected by `KNOWN_FIXTURE_PUBKEYS`, `factory_keys.toml` ships with only `primary` (`threshold = 1`), and `verify-attest --require-threshold` rejects `threshold < 2` (test: `federation::tests::rejects_known_fixture_pubkeys`, `threshold_check_rejects_roster_containing_known_fixture_pubkey`, `fixture_seeds_match_factory_keys_toml` — commit: `ef2c0ad`, `37f9d23`, `a38eb08`); enrolling real independent human co-signer keys in `factory_keys.toml` and raising `threshold` to `2` requires an operator key ceremony.
 
 ### 15. Fleet port blocks collide for plans with 6 to 9 jobs, which validation allows
 - **Where:** `tools/cuttle_fleet.py:71-72` (allows 1 to 9 jobs) and `:117-128` (`base = vm_port_base + slot*100 + t*10`, with `https_base = base + 50`).
@@ -263,7 +263,7 @@ Review of the 11 commits after `a623b5a`, up to `1c59464`: `79b8161` and `ca26a6
   - An oversize request ends the TLS session without an HTTP 413.
   - "Every HTTP route answers identically on :80 and :443" (`README.md:105`) is tested on `/healthz` only (`https_interop.rs:143-154`).
 - **Fix:** Reject oversize requests on both ports with 413. Require `Content-Length` on bodies. Run the identity test across the public routes, or soften the wording.
-- Status: Fixed — test: `http_and_https_reject_oversized_and_unframed_requests_and_match_across_routes` — commit: `17f3d14`, `37f9d23`
+- Status: Fixed — test: `http_and_https_reject_oversized_and_unframed_requests_and_match_across_routes` — commit: `17f3d14`, `37f9d23`, `a38eb08`
 
 ### 29. The binmorphed boot in `qemu_smoke` asserts only 6 banners
 - **Where:** `factory_builder/tests/qemu_smoke.rs:994-1010`, which discards the `done` result and doesn't assert HALT.
