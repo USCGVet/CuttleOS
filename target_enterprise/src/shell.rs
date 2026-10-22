@@ -6082,7 +6082,7 @@ mod tests {
         assert_eq!(&sql_secs[0][0..8], &[0u8; 8]);
 
         // 2. Verification operations must refuse even if the disk image was forged with `[0u8; 32]`.
-        let mut forged_wal: WalImpl<512> = WalImpl::new();
+        let forged_wal: WalImpl<512> = WalImpl::new();
         let mut forged_seal = [0u8; DURABLE_DIGEST_LEN];
         compute_wal_seal(&[0u8; DURABLE_DIGEST_LEN], &forged_wal, &mut forged_seal);
         assert!(unprov.restore_sealed(&forged_wal, &forged_seal).is_err());

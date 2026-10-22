@@ -24,34 +24,30 @@ pub(crate) const FW_CFG_DEVICE_KEY_PATH: &str = "opt/cuttle_device_key";
 static PROVISIONED_MASTER_KEY: spin::Mutex<Option<([u8; 32], bool)>> = spin::Mutex::new(None);
 
 /// Attempt to read a 32-byte out-of-band device secret key from QEMU `fw_cfg`
-/// (`opt/cuttle_device_key`). Returns `None` if the entry is absent, shorter
-/// than 32 bytes, or all zeros.
+/// (`opt/cuttle_device_key`). Returns `None` if the entry is absent, its
+/// directory size is not 32 bytes, or all bytes are zero.
 fn read_fw_cfg_device_key() -> Option<[u8; 32]> {
-    let sel = fw_cfg_select(FW_CFG_DEVICE_KEY_PATH)?;
+    let (sel, size) = fw_cfg_select(FW_CFG_DEVICE_KEY_PATH)?;
+    if size != 32 {
+        return None;
+    }
     // SAFETY: Running at CPL=0 (ring 0); `FW_CFG_CTL` (0x510) is the standard
     // QEMU `fw_cfg` selector register and writing `sel` only latches the
     // active directory stream offset without touching memory or CPU flags.
     unsafe { outw(FW_CFG_CTL, sel) };
 
-    let mut key = [0u8; 32];
-    let mut non_zero = false;
+    let mut raw = [0u8; 32];
     let mut i = 0usize;
     while i < 32 {
         // SAFETY: Running at CPL=0 after latching `sel` on port 0x510; reading
         // `FW_CFG_DATA` (0x511) sequentially streams the next byte of the
         // selected `fw_cfg` blob without aliasing any Rust memory.
-        let b = unsafe { inb(FW_CFG_DATA) };
-        if b != 0 {
-            non_zero = true;
-        }
-        key[i] = b;
+        raw[i] = unsafe { inb(FW_CFG_DATA) };
         i += 1;
     }
-    if non_zero {
-        Some(key)
-    } else {
-        None
-    }
+    let validated = target_enterprise::tls_provider::validate_fw_cfg_device_key(size, &raw);
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut raw);
+    validated
 }
 
 /// Read CMOS RTC registers (seconds, minutes, hours, day, month, year) via
@@ -86,9 +82,8 @@ fn read_cmos_and_pit_word(round: u64) -> u64 {
 }
 
 /// Read a 64-bit hardware random word via `rdrand` if CPUID.01H:ECX[30]
-/// advertises `RDRAND` support, falling back to `rdtsc` mixed with CMOS RTC
-/// registers and the 8254 PIT counter if the CPU/emulator does not implement `rdrand`.
-fn read_hw_entropy_u64(round: u64) -> u64 {
+/// advertises `RDRAND` support and the instruction succeeds within 16 retries.
+fn read_rdrand_u64() -> Option<u64> {
     let has_rdrand: bool = {
         let ecx: u32;
         // SAFETY: `cpuid` with leaf EAX=1 is unconditionally supported on all
@@ -127,10 +122,20 @@ fn read_hw_entropy_u64(round: u64) -> u64 {
                 );
             }
             if ok != 0 && val != 0 && val != u64::MAX {
-                return val;
+                return Some(val);
             }
             tries += 1;
         }
+    }
+    None
+}
+
+/// Read a 64-bit hardware random word via `rdrand` if CPUID.01H:ECX[30]
+/// advertises `RDRAND` support, falling back to `rdtsc` mixed with CMOS RTC
+/// registers and the 8254 PIT counter if the CPU/emulator does not implement `rdrand`.
+fn read_hw_entropy_u64(round: u64) -> u64 {
+    if let Some(val) = read_rdrand_u64() {
+        return val;
     }
 
     let cmos_pit = read_cmos_and_pit_word(round);
@@ -210,7 +215,7 @@ fn generate_hw_entropy_master_key() -> [u8; 32] {
     }
     let mut salt = [0u8; 32];
     salt.copy_from_slice(&raw[0..32]);
-    if let Some((did_vid, tpm_rnd)) = probe_hw_tpm_random_16() {
+    if let Some((did_vid, mut tpm_rnd)) = probe_hw_tpm_random_16() {
         let dv = did_vid.to_le_bytes();
         let mut i = 0usize;
         while i < 16 {
@@ -218,9 +223,12 @@ fn generate_hw_entropy_master_key() -> [u8; 32] {
             salt[16 + i] ^= tpm_rnd[i] ^ dv[i & 3];
             i += 1;
         }
+        target_enterprise::durable_seal::zeroize_secret_bytes(&mut tpm_rnd);
     }
     let mut out = [0u8; 32];
     target_enterprise::tls::hmac_sha256(&salt, &raw[32..64], &mut out);
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut raw);
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut salt);
     out
 }
 
@@ -243,70 +251,100 @@ fn device_master_key_state() -> ([u8; 32], bool) {
 /// no key was provisioned via `fw_cfg` so the network service refuses
 /// authenticated commands entirely on unprovisioned boots.
 pub(crate) fn derive_runtime_net_auth_key(mac: [u8; 6]) -> Option<[u8; 32]> {
-    let (master, provisioned) = device_master_key_state();
-    if provisioned {
+    let (mut master, provisioned) = device_master_key_state();
+    let out = if provisioned {
         Some(target_enterprise::lived_net::LivedNet::derive_node_key(&master, mac))
     } else {
         None
-    }
+    };
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut master);
+    out
 }
 
 /// Derive the 32-byte secret behind this node's TLS identity (P-256 key and
 /// self-signed certificate, see `target_enterprise::https::ServerIdentity`)
-/// from the device master key and `mac`. On a provisioned device the result is
-/// stable across reboots and morph cycles, so clients can pin the
-/// certificate; on an unprovisioned boot the master key is boot-ephemeral and
-/// so is the certificate.
-pub(crate) fn derive_runtime_tls_identity_secret(mac: [u8; 6]) -> [u8; 32] {
-    let (master, _) = device_master_key_state();
-    let mut msg = [0u8; 29];
-    msg[..23].copy_from_slice(b"cuttle-tls-identity-v1:");
-    msg[23..].copy_from_slice(&mac);
-    let mut out = [0u8; 32];
-    target_enterprise::tls::hmac_sha256(&master, &msg, &mut out);
-    out
+/// and whether the identity is backed by a provisioned `fw_cfg` device key.
+/// On an unprovisioned boot, draws directly from `SYSTEM_RNG` rather than the
+/// unprovisioned master-key fallback.
+pub(crate) fn derive_runtime_tls_identity_secret(
+    mac: [u8; 6],
+) -> Result<([u8; 32], bool), &'static str> {
+    let (mut master, provisioned) = device_master_key_state();
+    let res = target_enterprise::https::derive_tls_identity_secret(
+        if provisioned { Some(&master) } else { None },
+        mac,
+        &target_enterprise::tls_provider::SYSTEM_RNG,
+    )
+    .map_err(|_| "SYSTEM_RNG not seeded");
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut master);
+    res
 }
 
-/// 32 bytes of seed material for the TLS CSPRNG
-/// (`target_enterprise::tls_provider::SYSTEM_RNG`): sixteen hardware-entropy
-/// words (RDRAND, or the TSC/CMOS/PIT jitter fallback) plus TPM randomness
-/// when a TPM is present, condensed with HMAC-SHA256.
-pub(crate) fn tls_rng_seed() -> [u8; 32] {
-    let mut raw = [0u8; 144];
+/// Harvest hardware entropy (`RDRAND` and/or TPM 2.0 `GetRandom`) plus
+/// per-node context (`master_key`, `mac`, `boot_count`) to seed `SYSTEM_RNG`.
+/// Returns `None` when neither `RDRAND` nor a TPM is present so HTTPS can be
+/// refused rather than running with predictable timer/RTC fallback entropy.
+pub(crate) fn tls_rng_seed(mac: [u8; 6], boot_count: u64) -> Option<([u8; 32], &'static str)> {
+    let mut hw_words = [0u64; 16];
+    let mut has_rdrand = true;
     let mut r = 0usize;
     while r < 16 {
-        let w = read_hw_entropy_u64(0x544c_5300 + r as u64);
-        raw[r * 8..r * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        match read_rdrand_u64() {
+            Some(w) => hw_words[r] = w,
+            None => {
+                has_rdrand = false;
+                hw_words[r] = read_hw_entropy_u64(0x544c_5300 + r as u64);
+            }
+        }
         r += 1;
     }
-    if let Some((_, tpm_rnd)) = probe_hw_tpm_random_16() {
-        raw[128..144].copy_from_slice(&tpm_rnd);
+    let tpm_random = probe_hw_tpm_random_16().map(|(_, rnd)| rnd);
+    let (mut master, _) = device_master_key_state();
+    let res = target_enterprise::tls_provider::derive_tls_rng_seed(
+        &hw_words,
+        has_rdrand,
+        tpm_random,
+        &master,
+        mac,
+        boot_count,
+    );
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut master);
+    let mut i = 0usize;
+    while i < hw_words.len() {
+        hw_words[i] = 0;
+        i += 1;
     }
-    let mut out = [0u8; 32];
-    target_enterprise::tls::hmac_sha256(b"cuttle-tls-rng-seed-v1", &raw, &mut out);
-    target_enterprise::durable_seal::zeroize_secret_bytes(&mut raw);
-    out
+    res
 }
 
 /// Derive the 256-bit `HMAC-SHA256` durable-state seal key from the
 /// out-of-band provisioned device master key (or the boot-ephemeral hardware
 /// key on unprovisioned boots).
 pub(crate) fn derive_runtime_seal_key() -> [u8; 32] {
-    let (master, _) = device_master_key_state();
-    target_enterprise::durable_seal::derive_seal_key(&master, b"cuttle-ahci-wal-seal-v1")
+    let (mut master, _) = device_master_key_state();
+    let out = target_enterprise::durable_seal::derive_seal_key(&master, b"cuttle-ahci-wal-seal-v1");
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut master);
+    out
 }
 
 /// Derive the legacy pre-rebrand (`Proteus`) 256-bit `HMAC-SHA256` durable-state
 /// seal key (`proteus-durable-seal-v1:proteus-ahci-wal-seal-v1`) from the device
 /// master key so pre-rebrand `PRTS*` disks can be verified and migrated to `CTTL*`.
 pub(crate) fn derive_runtime_legacy_seal_key() -> [u8; 32] {
-    let (master, _) = device_master_key_state();
-    target_enterprise::durable_seal::derive_legacy_seal_key(&master, b"proteus-ahci-wal-seal-v1")
+    let (mut master, _) = device_master_key_state();
+    let out = target_enterprise::durable_seal::derive_legacy_seal_key(
+        &master,
+        b"proteus-ahci-wal-seal-v1",
+    );
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut master);
+    out
 }
 
 /// Derive the 256-bit `HMAC-SHA256` remote attestation quote key from the
 /// out-of-band provisioned device master key (or boot-ephemeral hardware key).
 pub(crate) fn derive_runtime_attest_key() -> [u8; 32] {
-    let (master, _) = device_master_key_state();
-    target_enterprise::durable_seal::derive_attest_key(&master, b"cuttle-quote-v1")
+    let (mut master, _) = device_master_key_state();
+    let out = target_enterprise::durable_seal::derive_attest_key(&master, b"cuttle-quote-v1");
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut master);
+    out
 }

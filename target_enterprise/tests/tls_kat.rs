@@ -89,3 +89,52 @@ fn provider_offers_tls13_aes_gcm_and_chacha_with_x25519_first() {
     let groups: Vec<_> = p.kx_groups.iter().map(|g| g.name()).collect();
     assert_eq!(groups, [rustls::NamedGroup::X25519, rustls::NamedGroup::secp256r1]);
 }
+
+#[test]
+fn soft_float_crypto_backends_pass_kats_and_golden_replay() {
+    let report = tls_provider::self_test().expect("provider KATs");
+    assert_eq!((report.aead, report.kx, report.sig), (2, 2, 1));
+    let golden = target_enterprise::https::replay_golden_session().expect("golden replay");
+    assert!(golden.server_bytes > 500);
+
+    // When invoked by normal `cargo test`, re-run this exact test with the
+    // kernel's 5 soft-float crypto RUSTFLAGS cfgs so the non-SIMD backends
+    // (`aes_force_soft`, `polyval_force_soft`, `chacha20_force_soft`,
+    // `poly1305_force_soft`, `curve25519_dalek_backend="serial"`) are
+    // verified on host tests as well as in QEMU.
+    if std::env::var_os("CUTTLE_SOFT_FLOAT_SUBTEST").is_none() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let target_dir = root.join("target").join("soft_float_kat_check");
+        let rustflags = [
+            std::env::var("RUSTFLAGS").unwrap_or_default(),
+            "--cfg aes_force_soft --cfg polyval_force_soft --cfg chacha20_force_soft --cfg poly1305_force_soft --cfg curve25519_dalek_backend=\"serial\"".to_string(),
+        ]
+        .join(" ");
+        let out = std::process::Command::new("cargo")
+            .current_dir(&root)
+            .env("CUTTLE_SOFT_FLOAT_SUBTEST", "1")
+            .env("RUSTFLAGS", rustflags.trim())
+            .arg("test")
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .args([
+                "-p",
+                "target_enterprise",
+                "--test",
+                "tls_kat",
+                "--test",
+                "https_interop",
+            ])
+            .output()
+            .expect("spawn cargo test with soft-float crypto cfgs");
+        assert!(
+            out.status.success(),
+            "soft-float crypto KAT subtest failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

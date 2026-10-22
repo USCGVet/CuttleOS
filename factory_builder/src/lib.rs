@@ -265,6 +265,40 @@ pub fn parse_pkg_output_line(line: &str) -> Result<(ImageKind, PathBuf)> {
     Ok((kind, PathBuf::from(rest.trim())))
 }
 
+/// Base `RUSTFLAGS` required for bare-metal `x86_64-unknown-none` soft-float builds
+/// of `target_enterprise_kernel` (mirrors `target_enterprise_kernel/.cargo/config.toml`).
+/// Cargo ignores `build.rustflags` in `.cargo/config.toml` whenever `RUSTFLAGS` is set
+/// in the environment, so `factory_builder` always includes these flags when setting
+/// `RUSTFLAGS` for `--layout-seed` or `--prod`.
+pub const KERNEL_BASE_RUSTFLAGS: &str = "--cfg aes_force_soft --cfg polyval_force_soft \
+--cfg chacha20_force_soft --cfg poly1305_force_soft --cfg curve25519_dalek_backend=\"serial\"";
+
+/// Compose the full `RUSTFLAGS` string for a kernel build, always preserving
+/// [`KERNEL_BASE_RUSTFLAGS`] alongside any `inherited` flags, optional `layout_seed`
+/// diversity flags, and optional `--cfg cuttle_prod`.
+pub fn compose_kernel_rustflags(
+    inherited: &str,
+    layout_seed: Option<u64>,
+    prod: bool,
+) -> String {
+    let mut rustflags = if inherited.trim().is_empty() {
+        KERNEL_BASE_RUSTFLAGS.to_string()
+    } else if inherited.contains("aes_force_soft") {
+        inherited.trim().to_string()
+    } else {
+        format!("{KERNEL_BASE_RUSTFLAGS} {}", inherited.trim())
+    };
+    if let Some(seed) = layout_seed {
+        rustflags = kernel_diversity_rustflags(&rustflags, seed);
+        let llvm_flags = kernel_llvm_codegen_rustflags(seed);
+        rustflags = format!("{rustflags} {llvm_flags}").trim().to_string();
+    }
+    if prod {
+        rustflags = format!("{rustflags} --cfg cuttle_prod").trim().to_string();
+    }
+    rustflags
+}
+
 /// Invoke `cargo build --release --manifest-path <kernel-crate>/Cargo.toml`
 /// against an out-of-workspace kernel crate and return the absolute path
 /// to the produced ELF.
@@ -397,18 +431,14 @@ pub fn build_kernel_with_layout_seed_and_prod(
         .arg("--release")
         .arg("--manifest-path")
         .arg(&manifest);
-    // Compose RUSTFLAGS once from the inherited base: diversity levers
-    // for a layout seed, then the prod cfg. Building the string in one
-    // place avoids each lever clobbering the other's flags.
-    let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+    // Compose RUSTFLAGS once from the inherited base + KERNEL_BASE_RUSTFLAGS:
+    // diversity levers for a layout seed, then the prod cfg. Building the
+    // string in one place avoids clobbering the soft-float crypto cfgs in
+    // `target_enterprise_kernel/.cargo/config.toml`.
+    let inherited_rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+    let rustflags = compose_kernel_rustflags(&inherited_rustflags, layout_seed, prod);
     if let Some(seed) = layout_seed {
-        // Append to any inherited RUSTFLAGS rather than clobber. The seed
-        // must be explicit: `-Zrandomize-layout` without a fixed seed picks
-        // a non-reproducible per-build value, which would make attestation
-        // un-replayable.
-        rustflags = kernel_diversity_rustflags(&rustflags, seed);
         let llvm_flags = kernel_llvm_codegen_rustflags(seed);
-        rustflags = format!("{rustflags} {llvm_flags}").trim().to_string();
         // Public variant label only (the kernel's `ATTEST: OK seed=` banner);
         // no key material is derived from it.
         cmd.env("CUTTLE_VARIANT_SEED", seed.to_string());
@@ -420,10 +450,9 @@ pub fn build_kernel_with_layout_seed_and_prod(
         cmd.env_remove("CUTTLE_VARIANT_SEED");
     }
     if prod {
-        rustflags = format!("{rustflags} --cfg cuttle_prod").trim().to_string();
         eprintln!("factory_builder: production kernel build (banner suite + attack harness stripped)");
     }
-    if layout_seed.is_some() || prod {
+    if layout_seed.is_some() || prod || !inherited_rustflags.trim().is_empty() {
         // Because `-Zlayout-seed=<seed>` changes `RUSTFLAGS` on every cycle,
         // Cargo computes a fresh crate metadata hash each cycle and would
         // otherwise accumulate hundreds of old `.rlib`/`.rmeta` copies in
@@ -507,6 +536,37 @@ mod tests {
     use std::io::Write;
 
     // ---- kernel_diversity_rustflags ----
+
+    #[test]
+    fn compose_kernel_rustflags_always_includes_soft_float_crypto_cfgs() {
+        for (inherited, seed, prod) in [
+            ("", Some(42u64), false),
+            ("", None, true),
+            ("", Some(99u64), true),
+            ("-Cforce-frame-pointers=yes", Some(7u64), true),
+        ] {
+            let flags = compose_kernel_rustflags(inherited, seed, prod);
+            for required in [
+                "--cfg aes_force_soft",
+                "--cfg polyval_force_soft",
+                "--cfg chacha20_force_soft",
+                "--cfg poly1305_force_soft",
+                "--cfg curve25519_dalek_backend=\"serial\"",
+            ] {
+                assert!(
+                    flags.contains(required),
+                    "missing required soft-float cfg {required:?} in {flags:?}"
+                );
+            }
+            if let Some(s) = seed {
+                assert!(flags.contains(&format!("-Zlayout-seed={s}")));
+                assert!(flags.contains("-Cllvm-args=--inline-threshold="));
+            }
+            if prod {
+                assert!(flags.contains("--cfg cuttle_prod"));
+            }
+        }
+    }
 
     #[test]
     fn diversity_rustflags_small_seed_full_width_everywhere() {

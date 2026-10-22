@@ -308,6 +308,251 @@ fn golden_session_replays_byte_for_byte() {
     assert!(report.server_bytes > 500);
 }
 
+#[test]
+fn https_tx_cap_backpressure_and_idle_rto_reclaim_slots() {
+    // 1. TlsSession enforces MAX_TX_BYTES on outbound ciphertext when a peer never drains pending_tx.
+    tls_provider::seed_system_rng(*b"https_tx_cap test entropy seed!!");
+    let identity = ServerIdentity::derive(&NODE_SECRET, MAC);
+    let config = https::server_config(&identity, tls_provider::system_provider()).unwrap();
+    let mut session = https::TlsSession::new(config.clone()).unwrap();
+    let mut client = ring_client(identity.cert_der(), "localhost");
+    // Complete handshake directly against `session`.
+    let mut c_hello = Vec::new();
+    while client.wants_write() {
+        client.write_tls(&mut c_hello).unwrap();
+    }
+    session.receive(&c_hello).unwrap();
+    deliver(&mut client, session.pending_tx()).unwrap();
+    session.consume_tx(session.pending_tx().len());
+    let mut c_fin = Vec::new();
+    while client.wants_write() {
+        client.write_tls(&mut c_fin).unwrap();
+    }
+    session.receive(&c_fin).unwrap();
+    assert!(session.is_established());
+
+    let chunk = vec![b'A'; 8192];
+    let mut hit_overflow = false;
+    for _ in 0..16 {
+        match session.send(&chunk) {
+            Ok(()) => assert!(session.pending_tx().len() <= https::MAX_TX_BYTES),
+            Err(https::SessionError::Overflow) => {
+                hit_overflow = true;
+                break;
+            }
+            Err(other) => panic!("unexpected send error: {other:?}"),
+        }
+    }
+    assert!(hit_overflow, "pending_tx must be bounded by MAX_TX_BYTES");
+    assert!(session.pending_tx().len() <= https::MAX_TX_BYTES);
+
+    // 2. Idle Established HTTPS connections are reclaimed by tick_tcp_rto after HTTPS_IDLE_TIMEOUT_TICKS.
+    let (mut lb, id2) = live_server(None, 50020);
+    let mut c2 = ring_client(id2.cert_der(), "localhost");
+    let mut wire = Wire::new();
+    wire.pump(&mut c2, &mut lb).unwrap();
+    assert_eq!(lb.net().active_tcp_slots(), 1);
+    for _ in 0..(target_enterprise::lived_net::HTTPS_IDLE_TIMEOUT_TICKS - 10) {
+        lb.net().tick_tcp_rto();
+    }
+    assert_eq!(
+        lb.net().active_tcp_slots(),
+        1,
+        "HTTPS slot must stay alive before HTTPS_IDLE_TIMEOUT_TICKS"
+    );
+    for _ in 0..20 {
+        lb.net().tick_tcp_rto();
+    }
+    assert_eq!(
+        lb.net().active_tcp_slots(),
+        0,
+        "Idle Established HTTPS slot must be reclaimed once HTTPS_IDLE_TIMEOUT_TICKS elapses"
+    );
+}
+
+#[test]
+fn every_mutating_endpoint_and_node_role_enforces_auth_over_https() {
+    use target_enterprise::svc_runtime::NodeRole;
+
+    let requests: &[(&str, &[u8])] = &[
+        (
+            "GET /session/whoami (no token)",
+            b"GET /session/whoami HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        (
+            "GET /session/whoami (wrong token)",
+            b"GET /session/whoami HTTP/1.1\r\nHost: localhost\r\nCookie: sid=deadbeefdeadbeefdeadbeefdeadbeef\r\n\r\n",
+        ),
+        (
+            "POST /session/logout (no token)",
+            b"POST /session/logout HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        ),
+        (
+            "POST /session/logout (wrong token)",
+            b"POST /session/logout HTTP/1.1\r\nHost: localhost\r\nX-Session-Token: deadbeefdeadbeefdeadbeefdeadbeef\r\nContent-Length: 0\r\n\r\n",
+        ),
+        (
+            "POST /sql INSERT (no token)",
+            b"POST /sql HTTP/1.1\r\nHost: localhost\r\nContent-Length: 35\r\n\r\nINSERT INTO kv VALUES ('x', 'y', 1)",
+        ),
+        (
+            "POST /sql INSERT (wrong token)",
+            b"POST /sql HTTP/1.1\r\nHost: localhost\r\nX-Session-Token: deadbeefdeadbeefdeadbeefdeadbeef\r\nContent-Length: 35\r\n\r\nINSERT INTO kv VALUES ('x', 'y', 1)",
+        ),
+        (
+            "POST /db DELETE (no token)",
+            b"POST /db HTTP/1.1\r\nHost: localhost\r\nContent-Length: 14\r\n\r\nDELETE FROM kv",
+        ),
+        (
+            "GET /sql?DELETE (no token)",
+            b"GET /sql?DELETE+FROM+kv HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        (
+            "POST /sh (no token)",
+            b"POST /sh HTTP/1.1\r\nHost: localhost\r\nContent-Length: 14\r\n\r\nwrite /var/x 1",
+        ),
+        (
+            "POST /sh (wrong token)",
+            b"POST /sh HTTP/1.1\r\nHost: localhost\r\nX-Session-Token: deadbeefdeadbeefdeadbeefdeadbeef\r\nContent-Length: 14\r\n\r\nwrite /var/x 1",
+        ),
+        (
+            "POST /exec (no token)",
+            b"POST /exec HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\n/bin/fib 12",
+        ),
+        (
+            "POST /exec (wrong token)",
+            b"POST /exec HTTP/1.1\r\nHost: localhost\r\nX-Session-Token: deadbeefdeadbeefdeadbeefdeadbeef\r\nContent-Length: 11\r\n\r\n/bin/fib 12",
+        ),
+        (
+            "PUT /fs/var/pwn.txt (no token)",
+            b"PUT /fs/var/pwn.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\npwned",
+        ),
+        (
+            "PUT /fs/var/pwn.txt (wrong token)",
+            b"PUT /fs/var/pwn.txt HTTP/1.1\r\nHost: localhost\r\nX-Session-Token: deadbeefdeadbeefdeadbeefdeadbeef\r\nContent-Length: 5\r\n\r\npwned",
+        ),
+        (
+            "DELETE /fs/etc/hostname (no token)",
+            b"DELETE /fs/etc/hostname HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        (
+            "DELETE /fs/etc/hostname (wrong token)",
+            b"DELETE /fs/etc/hostname HTTP/1.1\r\nHost: localhost\r\nX-Session-Token: deadbeefdeadbeefdeadbeefdeadbeef\r\n\r\n",
+        ),
+    ];
+
+    for (role_idx, role) in [NodeRole::Full, NodeRole::Wfe, NodeRole::Sql, NodeRole::Shell]
+        .into_iter()
+        .enumerate()
+    {
+        let mut sh = Box::new(target_enterprise::OsShell::with_seal_key([0x33; 32]));
+        sh.svc.set_role(role, &mut sh.audit);
+        let (mut lb, identity) = live_server(Some(sh), 50030 + role_idx as u16);
+        let mut client = ring_client(identity.cert_der(), "localhost");
+        let mut wire = Wire::new();
+        wire.pump(&mut client, &mut lb).unwrap();
+
+        for (label, req) in requests {
+            let resp = get(&mut client, &mut lb, &mut wire, req);
+            let expected_status = match role {
+                NodeRole::Full => "HTTP/1.1 401 Unauthorized\r\n",
+                NodeRole::Wfe => {
+                    if label.contains("/session/") {
+                        "HTTP/1.1 401 Unauthorized\r\n"
+                    } else {
+                        "HTTP/1.1 503 "
+                    }
+                }
+                NodeRole::Sql | NodeRole::Shell => "HTTP/1.1 503 ",
+            };
+            assert!(
+                resp.starts_with(expected_status),
+                "role={role:?} {label}: expected {expected_status:?}, got {resp:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn http_and_https_reject_oversized_and_unframed_requests_and_match_across_routes() {
+    let sh = Box::new(target_enterprise::OsShell::with_seal_key([0x44; 32]));
+    let (mut lb, identity) = live_server(Some(sh), 50040);
+    let mut client = ring_client(identity.cert_der(), "localhost");
+    let mut wire = Wire::new();
+    wire.pump(&mut client, &mut lb).unwrap();
+
+    // 1. POST/PUT without Content-Length is rejected with 400 on both :443 and :80.
+    let unframed_post = b"POST /sql HTTP/1.1\r\nHost: localhost\r\n\r\nSELECT * FROM kv";
+    let tls_unframed = get(&mut client, &mut lb, &mut wire, unframed_post);
+    assert!(
+        tls_unframed.starts_with("HTTP/1.1 400 Bad Request\r\n")
+            && tls_unframed.contains("Content-Length required for POST/PUT"),
+        "HTTPS unframed POST: {tls_unframed}"
+    );
+
+    let (net, shell) = lb.into_parts();
+    let mut plain = LoopbackClient::connect_to(net, shell, 50140, 80, 5).unwrap();
+    let http_unframed = String::from_utf8(plain.send(unframed_post).unwrap()).unwrap();
+    assert_eq!(tls_unframed, http_unframed, ":80 and :443 must reject unframed POST identically");
+
+    // 2. Oversized requests (> MAX_HTTP_REQUEST_BYTES) return 413 on both :80 and :443.
+    let mut oversized = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nX-Big: ".to_vec();
+    oversized.extend(std::iter::repeat_n(
+        b'B',
+        target_enterprise::lived_net::MAX_HTTP_REQUEST_BYTES + 128,
+    ));
+    oversized.extend_from_slice(b"\r\n\r\n");
+    let http_413 = String::from_utf8(plain.send(&oversized).unwrap()).unwrap();
+    assert!(http_413.starts_with("HTTP/1.1 413 "), "HTTP oversized: {http_413}");
+
+    let (net, shell) = plain.into_parts();
+    let mut lb_413 = LoopbackClient::connect(net, shell, 50041, 5).unwrap();
+    let mut c_413 = ring_client(identity.cert_der(), "localhost");
+    let mut w_413 = Wire::new();
+    w_413.pump(&mut c_413, &mut lb_413).unwrap();
+    let tls_413 = get(&mut c_413, &mut lb_413, &mut w_413, &oversized);
+    assert_eq!(tls_413, http_413, ":80 and :443 must return identical 413 responses");
+
+    // 3. Public routes return identical responses over :443 and :80 when run
+    // against identically-initialized (LivedNet, OsShell) pairs.
+    let (mut lb_routes, id_routes) = live_server(
+        Some(Box::new(target_enterprise::OsShell::with_seal_key([0x44; 32]))),
+        50042,
+    );
+    let mut c_routes = ring_client(id_routes.cert_der(), "localhost");
+    let mut w_routes = Wire::new();
+    w_routes.pump(&mut c_routes, &mut lb_routes).unwrap();
+
+    let public_routes: &[&[u8]] = &[
+        b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        b"GET /uname HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        b"GET /ps HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        b"GET /ls HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        b"GET /fw HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        b"GET /ima HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        b"GET /fs/etc/hostname HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        b"POST /sql HTTP/1.1\r\nHost: localhost\r\nContent-Length: 39\r\n\r\nSELECT name FROM services WHERE id = 2",
+    ];
+    let mut tls_resps = Vec::new();
+    for req in public_routes {
+        tls_resps.push(get(&mut c_routes, &mut lb_routes, &mut w_routes, req));
+    }
+    let net_http = Box::new(LivedNet::with_auth_key(MAC, [0x22; 32]));
+    let sh_http = Some(Box::new(target_enterprise::OsShell::with_seal_key([0x44; 32])));
+    let mut plain_routes =
+        LoopbackClient::connect_to(net_http, sh_http, 50142, 80, 5).unwrap();
+    for (req, tls_resp) in public_routes.iter().zip(tls_resps.iter()) {
+        let http_resp = String::from_utf8(plain_routes.send(req).unwrap()).unwrap();
+        assert_eq!(
+            tls_resp,
+            &http_resp,
+            "mismatch between :443 and :80 on {:?}",
+            String::from_utf8_lossy(req)
+        );
+    }
+}
+
 /// Re-record the golden session (run with `--ignored --nocapture
 /// record_golden`) after a deliberate change to rustls, the provider, the
 /// certificate or the HTTP response. Rewrites `src/https_golden_fixture.rs`.

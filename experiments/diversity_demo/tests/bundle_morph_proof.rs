@@ -43,9 +43,9 @@ const REQUIRED_BANNERS: &[&str] = &[
     "CUTTLE-TE OK",
     // crypto / transport
     "TLS hkdf OK prk_sha=",
-    "TLS server_hello OK len=",
+    "TLS kat OK aead=2 kx=2 sig=1",
     "KAT all OK vectors=9",
-    "NET build OK len=38 ip_cksum=63c7 udp_cksum=fa94",
+    "NET build OK len=37 ip_cksum=63c8 udp_cksum=50c2",
     "TCP handshake OK state=ESTABLISHED seq=",
     "HTTP parse OK method=GET path=/healthz",
     "DNS query OK id=c0de qname=cuttle.local",
@@ -76,7 +76,7 @@ const REQUIRED_BANNERS: &[&str] = &[
     "GOP mode OK 1280x720",
     // live composition (must survive multi-module diversify)
     "TIMEBASE compose OK pit_div=1193 pet_rem=5 fire=timeout",
-    "VFS+QUOTA compose OK allow=1000 reject=1001 bytes=8",
+    "VFS+QUOTA compose OK allow=1000 reject=1001 bytes=7",
     "AHCI storage compose OK fis=ec prdtl=1 bytes=512",
     "NET path compose OK method=GET status=200",
     "BLOCK path compose OK sector=512 nvme=a5 virtio=a5",
@@ -150,6 +150,15 @@ impl Drop for SourceBackup {
             let _ = std::fs::remove_file(bak);
         }
     }
+}
+
+#[test]
+fn required_banners_match_current_kernel_banners() {
+    assert!(REQUIRED_BANNERS.contains(&"TLS kat OK aead=2 kx=2 sig=1"));
+    assert!(REQUIRED_BANNERS.contains(&"NET build OK len=37 ip_cksum=63c8 udp_cksum=50c2"));
+    assert!(REQUIRED_BANNERS.contains(&"VFS+QUOTA compose OK allow=1000 reject=1001 bytes=7"));
+    assert!(!REQUIRED_BANNERS.iter().any(|x| x.contains("TLS server_hello")));
+    assert!(!REQUIRED_BANNERS.iter().any(|x| x.contains("len=38")));
 }
 
 #[test]
@@ -266,14 +275,8 @@ fn full_bundle_kernel_modules_boot_under_qemu() {
         "bundle_morph_proof: building kernel layout_seed={:#x}...",
         layout_seed
     );
-    let elf = match factory_builder::build_kernel_with_layout_seed(&kernel_crate, Some(layout_seed))
-    {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("SKIP: kernel build failed: {:#}", e);
-            return;
-        }
-    };
+    let elf = factory_builder::build_kernel_with_layout_seed(&kernel_crate, Some(layout_seed))
+        .unwrap_or_else(|e| panic!("kernel build failed: {:#}", e));
 
     let results_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("results")

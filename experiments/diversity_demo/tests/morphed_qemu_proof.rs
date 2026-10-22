@@ -99,9 +99,9 @@ const REQUIRED_BANNERS: &[&str] = &[
     "CUTTLE-TE OK",
     // crypto / transport
     "TLS hkdf OK prk_sha=",
-    "TLS server_hello OK len=",
+    "TLS kat OK aead=2 kx=2 sig=1",
     "KAT all OK vectors=9",
-    "NET build OK len=38 ip_cksum=63c7 udp_cksum=fa94",
+    "NET build OK len=37 ip_cksum=63c8 udp_cksum=50c2",
     "TCP handshake OK state=ESTABLISHED seq=",
     "HTTP parse OK method=GET path=/healthz",
     // durability + block
@@ -124,7 +124,7 @@ const REQUIRED_BANNERS: &[&str] = &[
     "B64 roundtrip OK",
     // live composition (must survive multi-module diversify)
     "TIMEBASE compose OK pit_div=1193 pet_rem=5 fire=timeout",
-    "VFS+QUOTA compose OK allow=1000 reject=1001 bytes=8",
+    "VFS+QUOTA compose OK allow=1000 reject=1001 bytes=7",
     "AHCI storage compose OK fis=ec prdtl=1 bytes=512",
     "NET path compose OK method=GET status=200",
     "BLOCK path compose OK sector=512 nvme=a5 virtio=a5",
@@ -152,6 +152,9 @@ const REQUIRED_BANNERS: &[&str] = &[
 #[test]
 fn required_banners_include_ahci_e1000_nvme_hw() {
     let need = [
+        "TLS kat OK aead=2 kx=2 sig=1",
+        "NET build OK len=37 ip_cksum=63c8 udp_cksum=50c2",
+        "VFS+QUOTA compose OK allow=1000 reject=1001 bytes=7",
         "AHCI_HW probe OK slot=",
         "AHCI_HW identify OK sectors=2048",
         "AHCI_HW sector OK first_byte=5a",
@@ -165,9 +168,11 @@ fn required_banners_include_ahci_e1000_nvme_hw() {
     for b in need {
         assert!(
             REQUIRED_BANNERS.iter().any(|x| *x == b),
-            "morphed proof missing enrolled HW banner: {b}"
+            "morphed proof missing enrolled banner: {b}"
         );
     }
+    assert!(!REQUIRED_BANNERS.iter().any(|x| x.contains("TLS server_hello")));
+    assert!(!REQUIRED_BANNERS.iter().any(|x| x.contains("len=38")));
 }
 
 /// Deterministic proof cycle number. Seed is derived via the same
@@ -260,19 +265,11 @@ fn morphed_modules_boot_under_qemu_with_banners() {
         "morphed_qemu_proof: building BASE kernel (pristine) layout_seed={:#x}...",
         base_layout_seed
     );
-    let base_elf_built = match factory_builder::build_kernel_with_layout_seed(
+    let base_elf_built = factory_builder::build_kernel_with_layout_seed(
         &kernel_crate,
         Some(base_layout_seed),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "SKIP: base kernel build failed (nightly/build-std?): {:#}",
-                e
-            );
-            return;
-        }
-    };
+    )
+    .unwrap_or_else(|e| panic!("base kernel build failed: {:#}", e));
     let base_elf = results_dir.join("base_kernel.elf");
     std::fs::copy(&base_elf_built, &base_elf).unwrap_or_else(|e| {
         panic!(
@@ -329,19 +326,11 @@ fn morphed_modules_boot_under_qemu_with_banners() {
         "morphed_qemu_proof: building VARIANT kernel (morphed) layout_seed={:#x}...",
         layout_seed
     );
-    let elf_built = match factory_builder::build_kernel_with_layout_seed(
+    let elf_built = factory_builder::build_kernel_with_layout_seed(
         &kernel_crate,
         Some(layout_seed),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "SKIP: variant kernel build failed (nightly/build-std?): {:#}",
-                e
-            );
-            return;
-        }
-    };
+    )
+    .unwrap_or_else(|e| panic!("variant kernel build failed: {:#}", e));
     let elf = results_dir.join("variant_kernel.elf");
     std::fs::copy(&elf_built, &elf).unwrap_or_else(|e| {
         panic!(

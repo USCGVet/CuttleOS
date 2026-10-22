@@ -45,7 +45,7 @@ use rustls::crypto::cipher::{
     MessageEncrypter, Nonce, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload,
     Tls13AeadAlgorithm, UnsupportedOperationError,
 };
-use rustls::crypto::tls13::HkdfUsingHmac;
+use rustls::crypto::tls13::{Hkdf, HkdfUsingHmac};
 use rustls::crypto::{
     hash, hmac, ActiveKeyExchange, CryptoProvider, GetRandomFailed, KeyProvider, SecureRandom,
     SharedSecret, SupportedKxGroup, WebPkiSupportedAlgorithms,
@@ -72,17 +72,34 @@ use zeroize::Zeroize;
 /// output, so a kernel that forgot to seed it cannot run a TLS handshake.
 pub struct KernelRng {
     inner: spin::Mutex<Option<ChaCha20Rng>>,
+    rekey_on_fill: bool,
 }
 
 impl KernelRng {
-    /// An unseeded generator (fills fail until seeded).
+    /// An unseeded generator (fills fail until seeded). Rekeys after each
+    /// [`SecureRandom::fill`] so a later memory read cannot roll back past
+    /// handshakes.
     pub const fn unseeded() -> Self {
-        Self { inner: spin::Mutex::new(None) }
+        Self {
+            inner: spin::Mutex::new(None),
+            rekey_on_fill: true,
+        }
+    }
+
+    /// Deterministic generator used only by [`GOLDEN_RNG`] so multi-draw
+    /// golden-transcript replays remain byte-reproducible.
+    #[cfg(any(test, not(cuttle_prod)))]
+    const fn unseeded_deterministic() -> Self {
+        Self {
+            inner: spin::Mutex::new(None),
+            rekey_on_fill: false,
+        }
     }
 
     /// Replace the generator state with one keyed by `seed`.
-    pub fn reseed(&self, seed: [u8; 32]) {
+    pub(crate) fn reseed(&self, mut seed: [u8; 32]) {
         *self.inner.lock() = Some(ChaCha20Rng::from_seed(seed));
+        seed.zeroize();
     }
 
     /// True once seeded.
@@ -99,9 +116,16 @@ impl fmt::Debug for KernelRng {
 
 impl SecureRandom for KernelRng {
     fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed> {
-        match self.inner.lock().as_mut() {
+        let mut guard = self.inner.lock();
+        match guard.as_mut() {
             Some(rng) => {
                 rng.fill_bytes(buf);
+                if self.rekey_on_fill {
+                    let mut next_seed = [0u8; 32];
+                    rng.fill_bytes(&mut next_seed);
+                    *guard = Some(ChaCha20Rng::from_seed(next_seed));
+                    next_seed.zeroize();
+                }
                 Ok(())
             }
             None => Err(GetRandomFailed),
@@ -113,17 +137,19 @@ impl SecureRandom for KernelRng {
 pub static SYSTEM_RNG: KernelRng = KernelRng::unseeded();
 
 /// Deterministic RNG for the boot golden-transcript self-test only.
-static GOLDEN_RNG: KernelRng = KernelRng::unseeded();
+#[cfg(any(test, not(cuttle_prod)))]
+static GOLDEN_RNG: KernelRng = KernelRng::unseeded_deterministic();
 
 /// Serializes users of [`GOLDEN_RNG`] so two replays cannot interleave draws.
+#[cfg(any(test, not(cuttle_prod)))]
 pub static GOLDEN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 /// Seed (or re-seed) the live-traffic RNG. When it is already seeded, the new
 /// seed is mixed with 32 bytes of current output, so a weak later seed never
 /// replaces a strong earlier one.
-pub fn seed_system_rng(seed: [u8; 32]) {
+pub fn seed_system_rng(mut seed: [u8; 32]) {
     let mut current = [0u8; 32];
-    let mixed = if SYSTEM_RNG.fill(&mut current).is_ok() {
+    let mut mixed: [u8; 32] = if SYSTEM_RNG.fill(&mut current).is_ok() {
         let mut h = Sha256::new();
         h.update(b"cuttle-rng-reseed-v1");
         h.update(current);
@@ -133,11 +159,61 @@ pub fn seed_system_rng(seed: [u8; 32]) {
         seed
     };
     current.zeroize();
+    seed.zeroize();
     SYSTEM_RNG.reseed(mixed);
+    mixed.zeroize();
+}
+
+/// Validate a QEMU `fw_cfg` device-key blob (`opt/cuttle_device_key`).
+/// Requires the directory-advertised `size` to be exactly 32 bytes, `raw` to
+/// be 32 bytes long, and at least one byte to be non-zero.
+pub fn validate_fw_cfg_device_key(size: u32, raw: &[u8]) -> Option<[u8; 32]> {
+    if size != 32 || raw.len() != 32 || !raw.iter().any(|&b| b != 0) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(raw);
+    Some(out)
+}
+
+/// Derive a 32-byte seed for [`SYSTEM_RNG`] from hardware entropy sources and
+/// per-node context. Fails closed (`None`) when neither CPU `RDRAND` nor a
+/// hardware/virtual TPM 2.0 RNG was available, so the caller can refuse to
+/// enable HTTPS rather than seeding TLS from predictable timer/RTC fallback
+/// words.
+pub fn derive_tls_rng_seed(
+    hw_words: &[u64; 16],
+    has_rdrand: bool,
+    tpm_random: Option<[u8; 16]>,
+    master_key: &[u8; 32],
+    mac: [u8; 6],
+    boot_count: u64,
+) -> Option<([u8; 32], &'static str)> {
+    let source = match (has_rdrand, tpm_random.is_some()) {
+        (true, true) => "rdrand+tpm",
+        (true, false) => "rdrand",
+        (false, true) => "tpm",
+        (false, false) => return None,
+    };
+    let mut raw = [0u8; 190];
+    for (i, w) in hw_words.iter().enumerate() {
+        raw[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    if let Some(tpm) = tpm_random {
+        raw[128..144].copy_from_slice(&tpm);
+    }
+    raw[144..176].copy_from_slice(master_key);
+    raw[176..182].copy_from_slice(&mac);
+    raw[182..190].copy_from_slice(&boot_count.to_le_bytes());
+    let mut out = [0u8; 32];
+    crate::tls::hmac_sha256(b"cuttle-tls-rng-seed-v2", &raw, &mut out);
+    raw.zeroize();
+    Some((out, source))
 }
 
 /// Reset the deterministic golden-test RNG to `seed`. Callers must hold
 /// [`GOLDEN_LOCK`].
+#[cfg(any(test, not(cuttle_prod)))]
 pub fn reset_golden_rng(seed: [u8; 32]) {
     GOLDEN_RNG.reseed(seed);
 }
@@ -539,7 +615,9 @@ impl ActiveKeyExchange for Secp256r1Exchange {
 
 static SYSTEM_X25519: X25519 = X25519 { rng: &SYSTEM_RNG };
 static SYSTEM_SECP256R1: Secp256r1 = Secp256r1 { rng: &SYSTEM_RNG };
+#[cfg(any(test, not(cuttle_prod)))]
 static GOLDEN_X25519: X25519 = X25519 { rng: &GOLDEN_RNG };
+#[cfg(any(test, not(cuttle_prod)))]
 static GOLDEN_SECP256R1: Secp256r1 = Secp256r1 { rng: &GOLDEN_RNG };
 
 // ------------------------------------------------------------------
@@ -567,6 +645,10 @@ impl EcdsaP256SigningKey {
     /// DER-encoded ECDSA-SHA256 signature over `message`.
     pub fn sign_der(&self, message: &[u8]) -> Vec<u8> {
         let sig: p256::ecdsa::Signature = self.0.sign(message);
+        self.0
+            .verifying_key()
+            .verify(message, &sig)
+            .expect("ECDSA P-256 self-verification failed");
         sig.to_der().as_bytes().to_vec()
     }
 }
@@ -609,6 +691,10 @@ impl Signer for EcdsaP256Signer {
             .0
             .try_sign(message)
             .map_err(|_| Error::General("ECDSA signing failed".into()))?;
+        self.0
+            .verifying_key()
+            .verify(message, &sig)
+            .map_err(|_| Error::General("ECDSA signature self-verification failed".into()))?;
         Ok(sig.to_der().as_bytes().to_vec())
     }
 
@@ -699,6 +785,7 @@ pub fn system_provider() -> CryptoProvider {
 /// Provider for the boot golden-transcript self-test ONLY: its randomness is
 /// the deterministic [`reset_golden_rng`] stream, so every handshake it runs
 /// is predictable. Never use it for a listening service.
+#[cfg(any(test, not(cuttle_prod)))]
 pub fn golden_provider() -> CryptoProvider {
     provider_with(&GOLDEN_RNG, &GOLDEN_X25519, &GOLDEN_SECP256R1)
 }
@@ -712,7 +799,7 @@ pub fn golden_provider() -> CryptoProvider {
 pub struct SelfTestReport {
     /// AEAD vectors checked (AES-128-GCM, ChaCha20-Poly1305).
     pub aead: u8,
-    /// Key-exchange vectors checked (X25519, P-256 ECDH agreement).
+    /// Key-exchange vectors checked (X25519, P-256 ECDH RFC 5903).
     pub kx: u8,
     /// Signature vectors checked (ECDSA P-256 RFC 6979).
     pub sig: u8,
@@ -740,16 +827,19 @@ fn hex_into(s: &str, out: &mut [u8]) {
 /// Run published known-answer vectors through the exact primitives this
 /// provider uses, plus a TLS record round trip with tamper rejection:
 ///
-/// - AES-128-GCM: McGrew & Viega GCM spec test cases 1 and 2.
+/// - AES-128-GCM: McGrew & Viega GCM spec test cases 1, 2, and 4 (multi-block
+///   with non-zero key/IV, 20-byte AAD, and partial final block).
 /// - ChaCha20-Poly1305: RFC 8439 §2.8.2.
+/// - HMAC-SHA256: RFC 4231 test case 2 via `HMAC_SHA256`.
+/// - HKDF-SHA256: RFC 5869 test case 1 via `HKDF_SHA256`.
 /// - X25519: RFC 7748 §6.1 (both public keys and the shared secret).
 /// - ECDSA P-256 / SHA-256: RFC 6979 §A.2.5 deterministic signature of
 ///   "sample", then verification, then rejection of a flipped bit.
-/// - P-256 ECDH: two keys agree.
+/// - P-256 ECDH: RFC 5903 §8.1 published key pair and shared secret `Z`.
 /// - Record layer: each suite's encrypter/decrypter round-trips a record
 ///   and rejects a modified one.
 pub fn self_test() -> Result<SelfTestReport, &'static str> {
-    // AES-128-GCM, test case 1 (empty) and 2 (one zero block).
+    // AES-128-GCM, test case 1 (empty), 2 (one zero block), and 4 (multi-block + AAD + partial block).
     let gcm = AeadKind::Aes128Gcm.cipher(&[0u8; 16]);
     let mut empty = [0u8; 0];
     let tag1 = gcm.seal(&[0u8; 12], &[], &mut empty).map_err(|_| "AES-GCM seal")?;
@@ -761,6 +851,58 @@ pub fn self_test() -> Result<SelfTestReport, &'static str> {
     let expect2 = hex32("0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf");
     if block[..] != expect2[..16] || tag2[..] != expect2[16..] {
         return Err("AES-128-GCM test case 2");
+    }
+    let mut key4 = [0u8; 16];
+    hex_into("feffe9928665731c6d6a8f9467308308", &mut key4);
+    let mut iv4 = [0u8; 12];
+    hex_into("cafebabefacedbaddecaf888", &mut iv4);
+    let mut aad4 = [0u8; 20];
+    hex_into("feedfacedeadbeeffeedfacedeadbeefabaddad2", &mut aad4);
+    let mut pt4_orig = [0u8; 60];
+    hex_into(
+        "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39",
+        &mut pt4_orig,
+    );
+    let mut pt4 = pt4_orig;
+    let mut expect_ct4 = [0u8; 60];
+    hex_into(
+        "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091",
+        &mut expect_ct4,
+    );
+    let mut expect_tag4 = [0u8; 16];
+    hex_into("5bc94fbc3221a5db94fae95ae7121a47", &mut expect_tag4);
+    let gcm4 = AeadKind::Aes128Gcm.cipher(&key4);
+    let tag4 = gcm4.seal(&iv4, &aad4, &mut pt4).map_err(|_| "AES-GCM case 4 seal")?;
+    if pt4 != expect_ct4 || tag4 != expect_tag4 {
+        return Err("AES-128-GCM test case 4");
+    }
+    gcm4.open(&iv4, &aad4, &mut pt4, &tag4).map_err(|_| "AES-GCM case 4 open")?;
+    if pt4 != pt4_orig {
+        return Err("AES-128-GCM test case 4 decrypt");
+    }
+
+    // HMAC-SHA256 RFC 4231 test case 2 via `HMAC_SHA256` (`hmac::Hmac`).
+    let hmac_key = hmac::Hmac::with_key(&HMAC_SHA256, b"Jefe");
+    let hmac_tag = hmac_key.sign_concat(b"what do ", &[b"ya want "], b"for nothing?");
+    if hmac_tag.as_ref() != hex32("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843") {
+        return Err("HMAC-SHA256 RFC 4231 test case 2");
+    }
+
+    // HKDF-SHA256 RFC 5869 test case 1 via `HKDF_SHA256` (`rustls::crypto::tls13::Hkdf`).
+    let hkdf_salt: [u8; 13] = core::array::from_fn(|i| i as u8);
+    let hkdf_info: [u8; 10] = core::array::from_fn(|i| 0xf0 + i as u8);
+    let hkdf_expander = HKDF_SHA256.extract_from_secret(Some(&hkdf_salt), &[0x0b; 22]);
+    let mut hkdf_okm = [0u8; 42];
+    hkdf_expander
+        .expand_slice(&[&hkdf_info[..5], &hkdf_info[5..]], &mut hkdf_okm)
+        .map_err(|_| "HKDF-SHA256 expand")?;
+    let mut expect_okm = [0u8; 42];
+    hex_into(
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+        &mut expect_okm,
+    );
+    if hkdf_okm != expect_okm {
+        return Err("HKDF-SHA256 RFC 5869 test case 1");
     }
 
     // ChaCha20-Poly1305, RFC 8439 §2.8.2.
@@ -849,25 +991,33 @@ pub fn self_test() -> Result<SelfTestReport, &'static str> {
         return Err("ECDSA verify accepted a bad signature");
     }
 
-    // P-256 ECDH: two fixed keys must agree.
+    // P-256 ECDH: published RFC 5903 §8.1 test vector (initiator i, responder r, shared secret Z).
     let a = p256::SecretKey::from_slice(&hex32(
-        "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721",
+        "c88f01f510d9ac3f70a292daa2316de544e9aab8afe84049c62a9c57862d1433",
     ))
-    .map_err(|_| "P-256 key a")?;
+    .map_err(|_| "P-256 RFC 5903 key i")?;
     let b = p256::SecretKey::from_slice(&hex32(
-        "0000000000000000000000000000000000000000000000000000000000000007",
+        "c6ef9c5d78ae012a011164acb397ce2088685d8f06bf9be0b283ab46476bee53",
     ))
-    .map_err(|_| "P-256 key b")?;
+    .map_err(|_| "P-256 RFC 5903 key r")?;
     let a_pub = a.public_key().to_encoded_point(false).as_bytes().to_vec();
     let b_pub = b.public_key().to_encoded_point(false).as_bytes().to_vec();
+    if a_pub[1..33] != hex32("dad0b65394221cf9b051e1feca5787d098dfe637fc90b9ef945d0c3772581180")
+        || a_pub[33..65] != hex32("5271a0461cdb8252d61f1c456fa3e59ab1f45b33accf5f58389e0577b8990bb3")
+        || b_pub[1..33] != hex32("d12dfb5289c8d4f81208b70270398c342296970a0bccb74c736fc7554494bf63")
+        || b_pub[33..65] != hex32("56fbf3ca366cc23e8157854c13c58d6aac23f046ada30f8353e74f33039872ab")
+    {
+        return Err("P-256 ECDH RFC 5903 public keys");
+    }
+    let expect_p256_shared = hex32("d6840f6b42f6edafd13116e0e12565202fef8e9ece7dce03812464d04b9442de");
     let ab = Box::new(Secp256r1Exchange { secret: a, public: a_pub.clone() })
         .complete(&b_pub)
         .map_err(|_| "P-256 ECDH a")?;
     let ba = Box::new(Secp256r1Exchange { secret: b, public: b_pub })
         .complete(&a_pub)
         .map_err(|_| "P-256 ECDH b")?;
-    if ab.secret_bytes() != ba.secret_bytes() {
-        return Err("P-256 ECDH disagreement");
+    if ab.secret_bytes() != expect_p256_shared || ba.secret_bytes() != expect_p256_shared {
+        return Err("P-256 ECDH RFC 5903 shared secret");
     }
 
     // Record layer: round trip and tamper rejection for both suites.
@@ -969,5 +1119,76 @@ mod tests {
         assert!(kx.complete(&off_curve).is_err());
         let kx = group.start().unwrap();
         assert!(kx.complete(&[0x02; 33]).is_err());
+    }
+
+    #[test]
+    fn kernel_rng_rekeys_after_every_fill() {
+        let rng = KernelRng::unseeded();
+        rng.reseed([0x42; 32]);
+        let mut raw = ChaCha20Rng::from_seed([0x42; 32]);
+
+        let mut d1 = [0u8; 32];
+        let mut r1 = [0u8; 32];
+        rng.fill(&mut d1).unwrap();
+        raw.fill_bytes(&mut r1);
+        assert_eq!(d1, r1, "first fill comes from initial seed");
+
+        // Advance `raw` past the 32-byte rekey draw and check that a naive
+        // continuation of the initial ChaCha20 stream does NOT match the
+        // rekeyed generator's next output.
+        let mut raw_next_seed = [0u8; 32];
+        raw.fill_bytes(&mut raw_next_seed);
+        let mut raw_continued = [0u8; 32];
+        raw.fill_bytes(&mut raw_continued);
+
+        let mut d2 = [0u8; 32];
+        rng.fill(&mut d2).unwrap();
+        assert_ne!(d2, raw_continued, "second fill must come from a fresh ChaCha20 key");
+
+        let mut expected_rekeyed = ChaCha20Rng::from_seed(raw_next_seed);
+        let mut r2 = [0u8; 32];
+        expected_rekeyed.fill_bytes(&mut r2);
+        assert_eq!(d2, r2, "second fill must match the rekeyed ChaCha20 instance");
+    }
+
+    #[test]
+    fn validate_fw_cfg_device_key_rejects_wrong_size_and_zero_keys() {
+        assert_eq!(validate_fw_cfg_device_key(31, &[1u8; 32]), None);
+        assert_eq!(validate_fw_cfg_device_key(33, &[1u8; 32]), None);
+        assert_eq!(validate_fw_cfg_device_key(32, &[1u8; 31]), None);
+        assert_eq!(validate_fw_cfg_device_key(32, &[0u8; 32]), None);
+        assert_eq!(validate_fw_cfg_device_key(32, &[7u8; 32]), Some([7u8; 32]));
+    }
+
+    #[test]
+    fn derive_tls_rng_seed_requires_rdrand_or_tpm_and_mixes_node_context() {
+        let words = [0x1122_3344_5566_7788u64; 16];
+        let master = [0xAAu8; 32];
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        assert_eq!(
+            derive_tls_rng_seed(&words, false, None, &master, mac, 1),
+            None,
+            "must fail closed when neither RDRAND nor TPM is available"
+        );
+        let (s_rdrand, src1) =
+            derive_tls_rng_seed(&words, true, None, &master, mac, 1).expect("rdrand seed");
+        assert_eq!(src1, "rdrand");
+        let (s_tpm, src2) =
+            derive_tls_rng_seed(&words, false, Some([0x55; 16]), &master, mac, 1).expect("tpm seed");
+        assert_eq!(src2, "tpm");
+        let (s_both, src3) =
+            derive_tls_rng_seed(&words, true, Some([0x55; 16]), &master, mac, 1).expect("both seed");
+        assert_eq!(src3, "rdrand+tpm");
+        assert_ne!(s_rdrand, s_tpm);
+        assert_ne!(s_rdrand, s_both);
+
+        // Changing master key, MAC, or boot count must produce distinct seeds.
+        let (s_mac2, _) =
+            derive_tls_rng_seed(&words, true, None, &master, [0x52, 0x54, 0, 0, 0, 1], 1).unwrap();
+        let (s_boot2, _) = derive_tls_rng_seed(&words, true, None, &master, mac, 2).unwrap();
+        let (s_key2, _) = derive_tls_rng_seed(&words, true, None, &[0xBB; 32], mac, 1).unwrap();
+        assert_ne!(s_rdrand, s_mac2);
+        assert_ne!(s_rdrand, s_boot2);
+        assert_ne!(s_rdrand, s_key2);
     }
 }

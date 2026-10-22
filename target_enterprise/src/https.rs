@@ -73,6 +73,42 @@ impl ServerIdentity {
     }
 }
 
+/// Derive the 32-byte secret behind a node's [`ServerIdentity`]:
+/// - When `provisioned_master` is `Some(master)`, computes
+///   `HMAC-SHA256(master, "cuttle-tls-identity-v1:" || mac)` and returns
+///   `(secret, true)` so the certificate is stable across reboots and morphs.
+/// - When `provisioned_master` is `None` (unprovisioned boot), draws 32 bytes
+///   directly from the seeded `rng` ([`crate::tls_provider::SYSTEM_RNG`]),
+///   mixes `mac`, and returns `(secret, false)` so the certificate key is
+///   never derived from the unprovisioned master-key fallback.
+pub fn derive_tls_identity_secret(
+    provisioned_master: Option<&[u8; 32]>,
+    mac: [u8; 6],
+    rng: &crate::tls_provider::KernelRng,
+) -> Result<([u8; 32], bool), rustls::crypto::GetRandomFailed> {
+    use rustls::crypto::SecureRandom as _;
+    use zeroize::Zeroize as _;
+    let mut out = [0u8; 32];
+    if let Some(master) = provisioned_master {
+        let mut msg = [0u8; 29];
+        msg[..23].copy_from_slice(b"cuttle-tls-identity-v1:");
+        msg[23..].copy_from_slice(&mac);
+        hmac_sha256(master, &msg, &mut out);
+        msg.zeroize();
+        Ok((out, true))
+    } else {
+        let mut random = [0u8; 32];
+        rng.fill(&mut random)?;
+        let mut msg = [0u8; 39];
+        msg[..33].copy_from_slice(b"cuttle-tls-ephemeral-identity-v1:");
+        msg[33..].copy_from_slice(&mac);
+        hmac_sha256(&random, &msg, &mut out);
+        random.zeroize();
+        msg.zeroize();
+        Ok((out, false))
+    }
+}
+
 /// Domain-separated HMAC expansion of `secret` into a valid P-256 scalar
 /// (rejection sampling; a 32-byte HMAC output is out of range with
 /// probability ~2^-32, so the loop almost never runs twice).
@@ -101,8 +137,10 @@ const OID_AUTHORITY_KEY_ID: &[u8] = &[0x55, 0x1d, 0x23];
 const OID_EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
 const OID_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
 
-/// Append one DER TLV.
+/// Append one DER TLV. Panics if `content.len() > 0xffff` so a 2-byte length
+/// field can never silently truncate oversized content.
 fn der(tag: u8, content: &[u8], out: &mut Vec<u8>) {
+    assert!(content.len() <= 0xffff, "DER TLV content exceeds 65535 bytes");
     out.push(tag);
     let len = content.len();
     if len < 0x80 {
@@ -222,6 +260,9 @@ pub fn server_config(
 pub const MAX_RX_BYTES: usize = 18 * 1024;
 /// Largest buffered decrypted request data (HTTP request head + body).
 pub const MAX_PLAINTEXT_BYTES: usize = 16 * 1024;
+/// Largest buffered outbound ciphertext queued in [`TlsSession::pending_tx`]
+/// before a stalled peer triggers [`SessionError::Overflow`].
+pub const MAX_TX_BYTES: usize = 64 * 1024;
 /// Upper bound on state-machine steps per call (each step makes progress).
 const MAX_STEPS: usize = 64;
 
@@ -231,7 +272,8 @@ pub enum SessionError {
     /// rustls rejected the peer (bad record, bad handshake, failed MAC…);
     /// any alert it generated has been queued for transmission.
     Tls(rustls::Error),
-    /// The peer sent more than [`MAX_RX_BYTES`] / [`MAX_PLAINTEXT_BYTES`].
+    /// The peer sent more than [`MAX_RX_BYTES`] / [`MAX_PLAINTEXT_BYTES`], or
+    /// outbound ciphertext exceeded [`MAX_TX_BYTES`].
     Overflow,
     /// Application data was offered before the handshake completed.
     NotReady,
@@ -357,15 +399,17 @@ impl TlsSession {
             };
             let mut stop = false;
             let mut overflow = false;
+            let mut plaintext_overflow = false;
             let mut tls_error = None;
             match state {
                 ConnectionState::ReadTraffic(mut traffic) => {
+                    self.handshake_done = true;
                     while let Some(record) = traffic.next_record() {
                         match record {
                             Ok(record) => {
                                 discard += record.discard;
                                 if self.plaintext.len() + record.payload.len() > MAX_PLAINTEXT_BYTES {
-                                    overflow = true;
+                                    plaintext_overflow = true;
                                     break;
                                 }
                                 self.plaintext.extend_from_slice(record.payload);
@@ -381,6 +425,11 @@ impl TlsSession {
                     let start = self.tx.len();
                     let mut room = 4096usize;
                     loop {
+                        if start.saturating_add(room) > MAX_TX_BYTES {
+                            self.tx.truncate(start);
+                            overflow = true;
+                            break;
+                        }
                         self.tx.resize(start + room, 0);
                         match encoder.encode(&mut self.tx[start..]) {
                             Ok(n) => {
@@ -406,8 +455,14 @@ impl TlsSession {
                     self.handshake_done = true;
                     match outbound.take() {
                         Some(Outbound::Data(data)) => {
-                            if let Err(err) = encrypt_into(&mut self.tx, |buf| writer.encrypt(data, buf)) {
-                                tls_error = Some(err);
+                            if self.tx.len().saturating_add(data.len()).saturating_add(32) > MAX_TX_BYTES {
+                                overflow = true;
+                            } else if let Err(err) = encrypt_into(&mut self.tx, |buf| writer.encrypt(data, buf)) {
+                                if matches!(err, rustls::Error::General(_)) {
+                                    overflow = true;
+                                } else {
+                                    tls_error = Some(err);
+                                }
                             }
                         }
                         Some(Outbound::CloseNotify) => {
@@ -426,6 +481,10 @@ impl TlsSession {
                 _ => stop = true,
             }
             self.rx.drain(..discard.min(self.rx.len()));
+            if plaintext_overflow {
+                self.plaintext.clear();
+                return Err(SessionError::Overflow);
+            }
             if overflow {
                 self.failed = true;
                 return Err(SessionError::Overflow);
@@ -474,6 +533,10 @@ fn encrypt_into(
     let start = tx.len();
     let mut room = 2048usize;
     loop {
+        if start.saturating_add(room) > MAX_TX_BYTES {
+            tx.truncate(start);
+            return Err(rustls::Error::General("outbound TLS buffer exceeds MAX_TX_BYTES".into()));
+        }
         tx.resize(start + room, 0);
         match encrypt(&mut tx[start..]) {
             Ok(n) => {
@@ -680,6 +743,7 @@ impl LoopbackClient {
 
 /// Fixed inputs of the golden session: everything the server's output
 /// depends on besides the recorded client bytes.
+#[cfg(any(test, not(cuttle_prod)))]
 pub mod golden {
     /// Seed for the deterministic RNG (server random, key share).
     pub const RNG_SEED: [u8; 32] = *b"cuttle-https-golden-rng-seed-v1!";
@@ -697,6 +761,7 @@ pub mod golden {
 
 /// Build the golden LivedNet: deterministic provider, fixture identity.
 /// Callers must hold [`crate::tls_provider::GOLDEN_LOCK`].
+#[cfg(any(test, not(cuttle_prod)))]
 pub fn golden_server() -> Result<Box<LivedNet>, &'static str> {
     crate::tls_provider::reset_golden_rng(golden::RNG_SEED);
     let identity = ServerIdentity::derive(&golden::IDENTITY_SECRET, golden::MAC);
@@ -708,6 +773,7 @@ pub fn golden_server() -> Result<Box<LivedNet>, &'static str> {
 }
 
 /// Result of [`replay_golden_session`].
+#[cfg(any(test, not(cuttle_prod)))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GoldenReport {
     /// Server TLS bytes produced over the whole session.
@@ -724,6 +790,7 @@ pub struct GoldenReport {
 /// response and its `close_notify` — to hash to
 /// [`kf::HTTPS_GOLDEN_SERVER_SHA256`]. Any change to rustls, the provider,
 /// the certificate, LivedNet or TCP that alters one server byte fails it.
+#[cfg(any(test, not(cuttle_prod)))]
 pub fn replay_golden_session() -> Result<GoldenReport, &'static str> {
     let _guard = crate::tls_provider::GOLDEN_LOCK.lock();
     let net = golden_server()?;
@@ -735,6 +802,7 @@ pub fn replay_golden_session() -> Result<GoldenReport, &'static str> {
 /// golden server itself (holding [`crate::tls_provider::GOLDEN_LOCK`]) and
 /// connected `client` to it — e.g. the kernel's boot check, which first
 /// fills the other fifteen TCP slots.
+#[cfg(any(test, not(cuttle_prod)))]
 pub fn replay_golden_flights(client: &mut LoopbackClient) -> Result<GoldenReport, &'static str> {
     let mut server = Vec::new();
     for flight in kf::HTTPS_GOLDEN_CLIENT_FLIGHTS {
@@ -808,5 +876,34 @@ mod tests {
         let mut session = TlsSession::new(config).unwrap();
         assert_eq!(session.send(b"hello"), Err(SessionError::NotReady));
         assert!(session.pending_tx().is_empty());
+    }
+
+    #[test]
+    fn derive_tls_identity_secret_uses_rng_when_unprovisioned_and_master_when_provisioned() {
+        let rng = crate::tls_provider::KernelRng::unseeded();
+        let mac = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+        // Unseeded RNG fails closed on unprovisioned boots.
+        assert!(derive_tls_identity_secret(None, mac, &rng).is_err());
+
+        rng.reseed([0x77; 32]);
+        let (ephem1, prov1) = derive_tls_identity_secret(None, mac, &rng).unwrap();
+        let (ephem2, prov2) = derive_tls_identity_secret(None, mac, &rng).unwrap();
+        assert!(!prov1 && !prov2);
+        assert_ne!(ephem1, ephem2, "unprovisioned identity draws fresh entropy per call");
+
+        let master = [0x99; 32];
+        let (p1, is_prov1) = derive_tls_identity_secret(Some(&master), mac, &rng).unwrap();
+        let (p2, is_prov2) = derive_tls_identity_secret(Some(&master), mac, &rng).unwrap();
+        assert!(is_prov1 && is_prov2);
+        assert_eq!(p1, p2, "provisioned identity is deterministic for certificate pinning");
+        assert_ne!(p1, ephem1);
+    }
+
+    #[test]
+    #[should_panic(expected = "DER TLV content exceeds 65535 bytes")]
+    fn der_panics_on_content_over_65535_bytes() {
+        let oversized = alloc::vec![0u8; 0x1_0000];
+        let mut out = Vec::new();
+        der(0x04, &oversized, &mut out);
     }
 }

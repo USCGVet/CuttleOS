@@ -1061,10 +1061,10 @@ pub(crate) fn attack_iface_pilot() {
 pub(crate) const FW_CFG_CTL: u16 = 0x510;
 pub(crate) const FW_CFG_DATA: u16 = 0x511;
 
-/// Locate the fw_cfg file named `want` and return its selector. The
-/// fw_cfg file directory (key 0x0019) is a BE u32 count followed by
+/// Locate the fw_cfg file named `want` and return its `(selector, size)`.
+/// The fw_cfg file directory (key 0x0019) is a BE u32 count followed by
 /// entries {u32 size, u16 select, u16 reserved, char name[56]}.
-pub(crate) fn fw_cfg_select(want: &str) -> Option<u16> {
+pub(crate) fn fw_cfg_select(want: &str) -> Option<(u16, u32)> {
     // SAFETY: Running at CPL=0; port 0x510 is the QEMU `fw_cfg` selector register and writing 0x0019 selects the read-only directory stream.
     unsafe { outw(FW_CFG_CTL, 0x0019) };
     // SAFETY: Running at CPL=0 after selecting key 0x0019 on port 0x510; reading port 0x511 streams the 4-byte big-endian directory entry count.
@@ -1076,7 +1076,7 @@ pub(crate) fn fw_cfg_select(want: &str) -> Option<u16> {
             inb(FW_CFG_DATA),
         ])
     };
-    let mut found: Option<u16> = None;
+    let mut found: Option<(u16, u32)> = None;
     for _ in 0..count.min(256) {
         // Entry: u32 size (BE), u16 select (BE), u16 reserved, name[56].
         let mut hdr = [0u8; 8];
@@ -1084,6 +1084,7 @@ pub(crate) fn fw_cfg_select(want: &str) -> Option<u16> {
             // SAFETY: Running at CPL=0 with key 0x0019 active; reading port 0x511 streams the 8-byte `(size, select, reserved)` header of the current entry.
             *b = unsafe { inb(FW_CFG_DATA) };
         }
+        let size = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
         let select = u16::from_be_bytes([hdr[4], hdr[5]]);
         let mut name = [0u8; 56];
         for b in name.iter_mut() {
@@ -1093,7 +1094,7 @@ pub(crate) fn fw_cfg_select(want: &str) -> Option<u16> {
         let end = name.iter().position(|&c| c == 0).unwrap_or(56);
         if let Ok(n) = core::str::from_utf8(&name[..end]) {
             if n == want {
-                found = Some(select);
+                found = Some((select, size));
             }
         }
     }
@@ -1111,7 +1112,7 @@ pub(crate) fn fw_cfg_select(want: &str) -> Option<u16> {
 #[inline(never)]
 #[cfg(not(cuttle_prod))]
 pub(crate) fn attack_vulnerable_service() {
-    let Some(sel) = fw_cfg_select("opt/attack.bin") else {
+    let Some((sel, _)) = fw_cfg_select("opt/attack.bin") else {
         serial_write_str("ATK NO PAYLOAD FILE\n");
         return;
     };

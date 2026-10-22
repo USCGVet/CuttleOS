@@ -41,9 +41,9 @@ const MODULES: &[&str] = &["tls", "wal", "net"];
 const REQUIRED_BANNERS: &[&str] = &[
     "CUTTLE-TE OK",
     "TLS hkdf OK prk_sha=",
-    "TLS server_hello OK len=",
+    "TLS kat OK aead=2 kx=2 sig=1",
     "WAL replay OK frames=",
-    "NET build OK len=38 ip_cksum=63c7 udp_cksum=fa94",
+    "NET build OK len=37 ip_cksum=63c8 udp_cksum=50c2",
     "CUTTLE-TE HALT",
 ];
 
@@ -142,6 +142,10 @@ fn boot_kernel(elf: &Path, results_dir: &Path, cycle: u64) -> Result<PathBuf, St
         .map_err(|e| format!("{:#}", e))?;
 
     let mut qproc = Command::new(&qemu)
+        .arg("-accel")
+        .arg("tcg")
+        .arg("-cpu")
+        .arg("max")
         .arg("-drive")
         .arg(format!("format=raw,file={}", bios.display()))
         .arg("-fw_cfg")
@@ -190,6 +194,14 @@ fn boot_kernel(elf: &Path, results_dir: &Path, cycle: u64) -> Result<PathBuf, St
         ));
     }
     Ok(serial)
+}
+
+#[test]
+fn required_banners_match_current_kernel_banners() {
+    assert!(REQUIRED_BANNERS.contains(&"TLS kat OK aead=2 kx=2 sig=1"));
+    assert!(REQUIRED_BANNERS.contains(&"NET build OK len=37 ip_cksum=63c8 udp_cksum=50c2"));
+    assert!(!REQUIRED_BANNERS.iter().any(|b| b.contains("TLS server_hello")));
+    assert!(!REQUIRED_BANNERS.iter().any(|b| b.contains("len=38")));
 }
 
 #[test]

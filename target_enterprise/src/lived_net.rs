@@ -48,9 +48,15 @@ pub const IPV4_HEADER_LEN: usize = 20;
 pub const MAX_FRAME: usize = 1514;
 /// Max replies produced from one inbound frame.
 pub const MAX_REPLIES: usize = 3;
-/// Per-slot scratch buffer for an in-progress plain-HTTP request (HTTPS slots
-/// buffer inside their [`TlsSession`]).
-const SLOT_BUF: usize = 1024;
+/// Maximum HTTP request size (headers + body) accepted on port 80 or 443
+/// before returning `413 Content Too Large`.
+pub const MAX_HTTP_REQUEST_BYTES: usize = 8 * 1024;
+/// High-water mark on a [`TlsSession`]'s outbound ciphertext queue (`pending_tx`)
+/// above which `handle_https_slot` pauses draining new decrypted HTTP requests.
+pub const HTTPS_TX_HIGH_WATER: usize = 16 * 1024;
+/// Idle tick threshold after which `tick_tcp_rto` reclaims an idle
+/// `Established` or `CloseWait` HTTPS slot and drops its `TlsSession`.
+pub const HTTPS_IDLE_TIMEOUT_TICKS: u32 = 4096;
 /// Largest TCP payload emitted per segment.
 const TCP_SEGMENT_PAYLOAD: usize = 1380;
 /// Deterministic 256-bit HMAC-SHA256 fixture key used only by in-memory unit
@@ -133,8 +139,7 @@ pub struct LivedNet {
     slot_rto_ticks: [u32; TCP_MAX_SLOTS],
     ticks: u32,
     ip_ident: u16,
-    http_bufs: [[u8; SLOT_BUF]; TCP_MAX_SLOTS],
-    http_lens: [usize; TCP_MAX_SLOTS],
+    http_bufs: [alloc::vec::Vec<u8>; TCP_MAX_SLOTS],
     tls_config: Option<Arc<ServerConfig>>,
     tls: [Option<Box<TlsSession>>; TCP_MAX_SLOTS],
 }
@@ -155,8 +160,7 @@ impl LivedNet {
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
             ticks: 1,
             ip_ident: 1,
-            http_bufs: [[0u8; SLOT_BUF]; TCP_MAX_SLOTS],
-            http_lens: [0usize; TCP_MAX_SLOTS],
+            http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -183,8 +187,7 @@ impl LivedNet {
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
             ticks: 1,
             ip_ident: 1,
-            http_bufs: [[0u8; SLOT_BUF]; TCP_MAX_SLOTS],
-            http_lens: [0usize; TCP_MAX_SLOTS],
+            http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -206,8 +209,7 @@ impl LivedNet {
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
             ticks: 1,
             ip_ident: 1,
-            http_bufs: [[0u8; SLOT_BUF]; TCP_MAX_SLOTS],
-            http_lens: [0usize; TCP_MAX_SLOTS],
+            http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -229,7 +231,8 @@ impl LivedNet {
 
     /// Advance per-slot TCP Retransmission Timeout (RTO) timers, reclaiming stale
     /// half-open (`SynReceived`) or closing (`LastAck`) slots so embryonic SYN floods
-    /// cannot pin connection slots indefinitely.
+    /// cannot pin connection slots indefinitely, as well as idle `Established` /
+    /// `CloseWait` HTTPS slots after [`HTTPS_IDLE_TIMEOUT_TICKS`].
     pub fn tick_tcp_rto(&mut self) -> usize {
         self.ticks = self.ticks.wrapping_add(1);
         let mut actions = 0usize;
@@ -243,12 +246,20 @@ impl LivedNet {
                     actions += 1;
                     if self.ticks.wrapping_sub(self.slot_last_tick[i]) >= 16 {
                         self.tcbs[i] = Tcb::EMPTY;
-                        self.http_lens[i] = 0;
+                        self.http_bufs[i].clear();
                         self.tls[i] = None;
                     } else {
                         self.slot_rto_ticks[i] = self.ticks;
                     }
                 }
+            } else if (st == TcpState::Established || st == TcpState::CloseWait)
+                && (self.tcbs[i].local_port == HTTPS_PORT || self.tls[i].is_some())
+                && self.ticks.wrapping_sub(self.slot_last_tick[i]) >= HTTPS_IDLE_TIMEOUT_TICKS
+            {
+                self.tcbs[i] = Tcb::EMPTY;
+                self.http_bufs[i].clear();
+                self.tls[i] = None;
+                actions += 1;
             }
             i += 1;
         }
@@ -955,7 +966,7 @@ impl LivedNet {
         let idx = free_slot.or(half_open_slot).unwrap_or(lru_slot);
         self.tcbs[idx] = Tcb::listen(self.ip, dst_port, 65535);
         self.slot_rto_ticks[idx] = self.ticks;
-        self.http_lens[idx] = 0;
+        self.http_bufs[idx].clear();
         self.tls[idx] = None;
         Some(idx)
     }
@@ -968,7 +979,7 @@ impl LivedNet {
         src_ip: [u8; 4],
         reply_ip: [u8; 4],
         boots: u64,
-        shell: Option<&mut crate::shell::OsShell>,
+        mut shell: Option<&mut crate::shell::OsShell>,
         out: &mut ReplySet,
     ) {
         let seg = match TcpImpl::parse_segment(tcp, src_ip, self.ip) {
@@ -1002,22 +1013,36 @@ impl LivedNet {
             return;
         }
 
-        if !inbound_payload.is_empty() && self.tcbs[idx].state != TcpState::Listen {
-            let cur = self.http_lens[idx];
-            let room = SLOT_BUF.saturating_sub(cur);
-            let n = inbound_payload.len().min(room);
-            self.http_bufs[idx][cur..cur + n].copy_from_slice(&inbound_payload[..n]);
-            self.http_lens[idx] = cur + n;
-        }
-
         let mut app_out = [0u8; TCP_SEGMENT_PAYLOAD];
         let mut app_n = 0usize;
-        let cur = self.http_lens[idx];
-        if cur >= 18 && http_request_complete(&self.http_bufs[idx][..cur]) {
-            let mut req_copy = [0u8; SLOT_BUF];
-            req_copy[..cur].copy_from_slice(&self.http_bufs[idx][..cur]);
-            self.http_lens[idx] = 0;
-            app_n = self.handle_http_request(&req_copy[..cur], boots, shell, &mut app_out);
+        if !inbound_payload.is_empty() && self.tcbs[idx].state != TcpState::Listen {
+            if self.http_bufs[idx].len().saturating_add(inbound_payload.len()) > MAX_HTTP_REQUEST_BYTES {
+                self.http_bufs[idx].clear();
+                app_n = build_http_413_response(&mut app_out);
+            } else {
+                self.http_bufs[idx].extend_from_slice(inbound_payload);
+            }
+        }
+
+        if app_n == 0 {
+            let mut responses = 0usize;
+            while responses < 8 {
+                let mut single = [0u8; TCP_SEGMENT_PAYLOAD];
+                let n = match frame_next_http_request(&mut self.http_bufs[idx]) {
+                    HttpFrameOutcome::Incomplete => break,
+                    HttpFrameOutcome::PayloadTooLarge => build_http_413_response(&mut single),
+                    HttpFrameOutcome::LengthRequired => build_http_length_required_response(&mut single),
+                    HttpFrameOutcome::Complete(req) => {
+                        self.handle_http_request(&req, boots, shell.as_deref_mut(), &mut single)
+                    }
+                };
+                if n == 0 || app_n.saturating_add(n) > TCP_SEGMENT_PAYLOAD {
+                    break;
+                }
+                app_out[app_n..app_n + n].copy_from_slice(&single[..n]);
+                app_n += n;
+                responses += 1;
+            }
         }
 
         let local_port = self.tcbs[idx].local_port;
@@ -1115,26 +1140,53 @@ impl LivedNet {
         }
 
         if let Some(mut session) = self.tls[idx].take() {
-            if !inbound.is_empty() && session.receive(inbound).is_err() {
-                if let Some(sh) = shell.as_deref_mut() {
-                    sh.record_net_audit(AuditVerdict::Denied, b"net:tls:rejected");
+            let mut overflow_413 = false;
+            if !inbound.is_empty() {
+                if let Err(err) = session.receive(inbound) {
+                    if let Some(sh) = shell.as_deref_mut() {
+                        sh.record_net_audit(AuditVerdict::Denied, b"net:tls:rejected");
+                    }
+                    if err == crate::https::SessionError::Overflow && session.is_established() && !session.is_failed() {
+                        overflow_413 = true;
+                    }
                 }
             }
-            let mut responses = 0usize;
-            while !session.is_failed() && responses < 8 {
-                let Some(len) = http_request_len(session.plaintext()) else {
-                    break;
-                };
-                let request: alloc::vec::Vec<u8> = session.plaintext().drain(..len).collect();
+            if overflow_413 {
                 let mut response = [0u8; TCP_SEGMENT_PAYLOAD];
-                let n = self.handle_http_request(&request, boots, shell.as_deref_mut(), &mut response);
+                let n = build_http_413_response(&mut response);
+                if n > 0 {
+                    let _ = session.send(&response[..n]);
+                }
+                session.close();
+            }
+            let mut responses = 0usize;
+            while !session.is_failed()
+                && responses < 8
+                && session.pending_tx().len() < HTTPS_TX_HIGH_WATER
+            {
+                let mut response = [0u8; TCP_SEGMENT_PAYLOAD];
+                let mut close_after = false;
+                let n = match frame_next_http_request(session.plaintext()) {
+                    HttpFrameOutcome::Incomplete => break,
+                    HttpFrameOutcome::PayloadTooLarge => {
+                        close_after = true;
+                        build_http_413_response(&mut response)
+                    }
+                    HttpFrameOutcome::LengthRequired => {
+                        build_http_length_required_response(&mut response)
+                    }
+                    HttpFrameOutcome::Complete(request) => {
+                        close_after = http_wants_close(&request);
+                        self.handle_http_request(&request, boots, shell.as_deref_mut(), &mut response)
+                    }
+                };
                 if n > 0 && session.send(&response[..n]).is_err() {
                     break;
                 }
                 responses += 1;
-                // `Connection: close`: end the TLS session after this
-                // response; the client then closes TCP and we FIN back.
-                if http_wants_close(&request) {
+                // `Connection: close` or oversized request: end the TLS session
+                // after this response; the client then closes TCP and we FIN back.
+                if close_after {
                     session.close();
                     break;
                 }
@@ -2107,43 +2159,83 @@ fn build_service_error_response(err: crate::svc_runtime::ServiceError, out: &mut
     }
 }
 
-fn http_request_complete(buf: &[u8]) -> bool {
-    let Some(hdr_end) = find_double_crlf(buf) else {
-        return false;
-    };
-    let body_start = hdr_end + 4;
-    if let Ok(view) = HttpImpl::parse_request(buf) {
-        if let Some(cl_raw) = HttpImpl::find_header(view.headers_raw, b"Content-Length") {
-            if let Some(cl) = parse_u64_dec(trim_ws(cl_raw)) {
-                return buf.len() >= body_start.saturating_add(cl as usize);
-            }
-        }
-    }
-    true
+fn build_http_413_response(out: &mut [u8]) -> usize {
+    HttpImpl::build_response(
+        413,
+        b"text/plain",
+        b"error: EMSGSIZE (HTTP request exceeds buffer capacity)\n",
+        out,
+    )
+    .unwrap_or(0)
 }
 
-/// Length of the first complete HTTP request in `buf`, or `None` while it is
-/// still incomplete. Used on HTTPS connections, where several requests may
-/// arrive back to back. The body is `Content-Length` bytes; without that
-/// header, GET/HEAD have no body and any other method takes everything
-/// buffered (what port 80 passes to [`LivedNet::handle_http_request`]).
-fn http_request_len(buf: &[u8]) -> Option<usize> {
-    let hdr_end = find_double_crlf(buf)?;
+fn build_http_length_required_response(out: &mut [u8]) -> usize {
+    HttpImpl::build_response(
+        400,
+        b"text/plain",
+        b"error: Content-Length required for POST/PUT\n",
+        out,
+    )
+    .unwrap_or(0)
+}
+
+enum HttpFrameOutcome {
+    Incomplete,
+    Complete(alloc::vec::Vec<u8>),
+    PayloadTooLarge,
+    LengthRequired,
+}
+
+/// Unified HTTP/1.1 request framer shared by plain HTTP (`:80`) and HTTPS (`:443`).
+/// - Rejects any request whose header or total length exceeds [`MAX_HTTP_REQUEST_BYTES`]
+///   with [`HttpFrameOutcome::PayloadTooLarge`] (`413`).
+/// - Requires an explicit `Content-Length` header on `POST` and `PUT` requests so
+///   a split request body is never silently truncated.
+fn frame_next_http_request(buf: &mut alloc::vec::Vec<u8>) -> HttpFrameOutcome {
+    let Some(hdr_end) = find_double_crlf(buf) else {
+        if buf.len() > MAX_HTTP_REQUEST_BYTES {
+            buf.clear();
+            return HttpFrameOutcome::PayloadTooLarge;
+        }
+        return HttpFrameOutcome::Incomplete;
+    };
     let body_start = hdr_end + 4;
-    let mut total = buf.len();
-    if let Ok(view) = HttpImpl::parse_request(&buf[..body_start]) {
-        let content_length = HttpImpl::find_header(view.headers_raw, b"Content-Length")
-            .and_then(|raw| parse_u64_dec(trim_ws(raw)));
-        total = match (content_length, view.method) {
-            (Some(cl), _) => body_start.saturating_add(cl as usize),
-            (None, HttpMethod::Get | HttpMethod::Head) => body_start,
-            (None, _) => buf.len(),
-        };
+    if body_start > MAX_HTTP_REQUEST_BYTES {
+        buf.clear();
+        return HttpFrameOutcome::PayloadTooLarge;
     }
+    let total = match HttpImpl::parse_request(&buf[..body_start]) {
+        Ok(view) => {
+            let content_length = HttpImpl::find_header(view.headers_raw, b"Content-Length")
+                .and_then(|raw| parse_u64_dec(trim_ws(raw)));
+            match (content_length, view.method) {
+                (Some(cl), _) => {
+                    let Some(total) = body_start.checked_add(cl as usize) else {
+                        buf.clear();
+                        return HttpFrameOutcome::PayloadTooLarge;
+                    };
+                    if total > MAX_HTTP_REQUEST_BYTES {
+                        buf.clear();
+                        return HttpFrameOutcome::PayloadTooLarge;
+                    }
+                    total
+                }
+                (None, HttpMethod::Post | HttpMethod::Put) => {
+                    buf.clear();
+                    return HttpFrameOutcome::LengthRequired;
+                }
+                (None, _) => body_start,
+            }
+        }
+        Err(_) => body_start,
+    };
     if buf.len() >= total {
-        Some(total)
+        HttpFrameOutcome::Complete(buf.drain(..total).collect())
+    } else if buf.len() > MAX_HTTP_REQUEST_BYTES {
+        buf.clear();
+        HttpFrameOutcome::PayloadTooLarge
     } else {
-        None
+        HttpFrameOutcome::Incomplete
     }
 }
 
