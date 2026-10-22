@@ -111,14 +111,25 @@ def s_client(openssl: str, host: str, port: int, cafile: str, path: str, extra: 
 
 
 def is_tls_handshake_refusal(r: subprocess.CompletedProcess) -> bool:
-    """Return True only when `s_client` failed with an explicit TLS alert or
-    handshake refusal, never on a timeout (returncode 124)."""
+    """Return True only when `s_client` failed with an explicit server TLS alert,
+    never on a client-side error ('no protocols available') or timeout (returncode 124)."""
     out = (r.stdout + r.stderr).lower()
-    if r.returncode in (0, 124) or "timed out" in out or "cuttle-status" in out:
+    if (
+        r.returncode in (0, 124)
+        or "timed out" in out
+        or "cuttle-status" in out
+        or "no protocols available" in out
+    ):
         return False
     return any(
         marker in out
-        for marker in ("alert", "handshake failure", "protocol version", "no protocols available")
+        for marker in (
+            "ssl alert",
+            "tlsv1 alert",
+            "sslv3 alert",
+            "alert handshake failure",
+            "alert protocol version",
+        )
     )
 
 
@@ -131,6 +142,14 @@ def run_self_test() -> int:
     assert not is_tls_handshake_refusal(ok_res), "200 OK must not count as TLS refusal"
     conn_refused = subprocess.CompletedProcess(["openssl"], 1, "", "connect:errno=111")
     assert not is_tls_handshake_refusal(conn_refused), "TCP error without TLS alert must not count as handshake alert"
+    client_no_proto = subprocess.CompletedProcess(
+        ["openssl"], 1, "", "error:0A0000BF:SSL routines::no protocols available"
+    )
+    assert not is_tls_handshake_refusal(client_no_proto), "client-side 'no protocols available' must not count as server alert"
+    path_substr = subprocess.CompletedProcess(
+        ["openssl"], 1, "", "Can't open /tmp/alert.pem for reading"
+    )
+    assert not is_tls_handshake_refusal(path_substr), "arbitrary 'alert' substring must not count as server alert"
     alert_res = subprocess.CompletedProcess(
         ["openssl"], 1, "", "SSL alert number 70: tlsv1 alert protocol version"
     )

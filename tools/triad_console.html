@@ -687,6 +687,9 @@ const tokStore = {
   set(k, v) { try { sessionStorage.setItem(k, v); } catch { /* storage unavailable */ } },
   del(k) { try { sessionStorage.removeItem(k); } catch { /* storage unavailable */ } },
 };
+for (const legacyKey of ['cuttle_session_token', 'cuttle_operator_token', 'cuttle_console_session_token', 'cuttle_fleet_session_token']) {
+  store.del(legacyKey);
+}
 const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 // Standalone (/console on a Triad controller) or fleet (/fleet on tools/cuttle_fleet.py).
@@ -1153,7 +1156,7 @@ function renderOverview(d, fresh, first) {
     g('smp').textContent = n.last_smp;
     g('accel').textContent = accelLabel(n.accel || d.accel);
     g('stats').textContent = n.morph_stats;
-    c.querySelector('footer a').hidden = !!d.role && d.role !== 'wfe' && d.role !== 'full'; // no svc-http
+    c.querySelector('footer a').hidden = FLEET || d.forward_node_ports === false || (!!d.role && d.role !== 'wfe' && d.role !== 'full'); // no svc-http or host port forwarding disabled
   }
   if (S.tab === 'overview' || first) {
     const freshSet = new Set(fresh.map(e => e.key));
@@ -2136,7 +2139,11 @@ function wire() {
   $('#tokIn').addEventListener('keydown', e => { if (e.key === 'Enter') tryToken(); });
   $('#tokClose').addEventListener('click', () => $('#dlgConnect').close());
   $('#tokForget').addEventListener('click', () => {
-    tokStore.del(TOKEN_KEY); S.token = ''; setUnlocked(false); $('#dlgConnect').close();
+    tokStore.del(TOKEN_KEY);
+    for (const legacyKey of ['cuttle_session_token', 'cuttle_operator_token', 'cuttle_console_session_token', 'cuttle_fleet_session_token']) {
+      store.del(legacyKey);
+    }
+    S.token = ''; setUnlocked(false); $('#dlgConnect').close();
     toast(FLEET ? 'Signed out on this browser.' : 'Token forgotten on this browser.');
     if (FLEET) enterFleet();
   });

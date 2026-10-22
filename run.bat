@@ -96,8 +96,9 @@ if not exist "%VIRTIO_IMG%" fsutil file createnew "%VIRTIO_IMG%" 1048576 >nul
 if not exist "%AHCI_IMG%" fsutil file createnew "%AHCI_IMG%" 1048576 >nul
 if not exist "%NVME_IMG%" fsutil file createnew "%NVME_IMG%" 1048576 >nul
 if exist "%DEVICE_KEY%" goto :have_device_key
-echo     Generating 32-byte device_secret_key.bin for local boot...
-powershell -NoProfile -Command "$b = New-Object byte[] 32; [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); [System.IO.File]::WriteAllBytes('%DEVICE_KEY%', $b)"
+echo     Generating 32-byte owner-only device_secret_key.bin for local boot...
+powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $dst = '%DEVICE_KEY%'; $tmp = $dst + '.tmp'; [System.IO.File]::WriteAllBytes($tmp, [byte[]]@()); $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; & icacls.exe $tmp /inheritance:r /grant:r ('*' + $sid + ':(F)') | Out-Null; if ($LASTEXITCODE -ne 0) { Remove-Item -Force $tmp -ErrorAction SilentlyContinue; exit 1 }; $b = New-Object byte[] 32; [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); [System.IO.File]::WriteAllBytes($tmp, $b); Move-Item -Force $tmp $dst"
+if not "%ERRORLEVEL%"=="0" goto :no_device_key
 if not exist "%DEVICE_KEY%" goto :no_device_key
 :have_device_key
 

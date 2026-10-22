@@ -319,7 +319,8 @@ class Farm:
                     if ctrl.spec.forward_node_ports:
                         urllib.request.urlopen(f"http://127.0.0.1:{n.http_port}/status", timeout=2.0).read()
                     else:
-                        ctrl.send_shell_cmd(n, "status", timeout=2.0)
+                        # Exercise svc-http via IpcOp::GuardQuery when host port forwarding is disabled.
+                        ctrl.send_shell_cmd(n, "guard status", timeout=2.0)
                 except Exception:
                     pass
         elif job == "index":
@@ -345,6 +346,7 @@ class Farm:
                     "name": ctrl.spec.name,
                     "accel": ctrl.accel,
                     "has_sql": ctrl.spec.has_sql,
+                    "forward_node_ports": ctrl.spec.forward_node_ports,
                     "online": sum(1 for n in ctrl.nodes if n.state == "ONLINE"),
                     "nodes": [
                         {
@@ -487,10 +489,20 @@ class Provider:
         # Fresh provider token every start; client tokens persist so clients keep their credentials.
         self.provider_token = secrets.token_hex(16)
         tc.write_secret_file(fd / "provider_token.txt", (self.provider_token + "\n").encode("ascii"))
-        self.client_tokens = {cid: load_or_create_secret(fd / cid / "client_token.txt") for cid in self.clients}
+        self.client_tokens: dict[str, str | None] = {}
+        self.token_errors: dict[str, str] = {}
+        self.status = {}
+        for cid in self.clients:
+            try:
+                self.client_tokens[cid] = load_or_create_secret(fd / cid / "client_token.txt")
+                self.status[cid] = "stopped"
+            except (OSError, ValueError) as e:
+                self.client_tokens[cid] = None
+                self.token_errors[cid] = str(e)
+                self.status[cid] = "error"
+                print(f"[WARN] client '{cid}' disabled due to malformed client_token.txt: {e}", flush=True)
         self.farm_secrets = {cid: secrets.token_hex(24) for cid in self.clients}
         self.procs: dict = {}
-        self.status = {cid: "stopped" for cid in self.clients}
         self.cache: dict = {cid: None for cid in self.clients}
         self.lock = threading.Lock()
         self.running = True
@@ -503,7 +515,7 @@ class Provider:
         if tc.safe_token_eq(token, self.provider_token):
             return "provider", None
         for cid, tok in self.client_tokens.items():
-            if tc.safe_token_eq(token, tok):
+            if tok and tc.safe_token_eq(token, tok):
                 return "client", cid
         return None, None
 
@@ -513,6 +525,9 @@ class Provider:
 
     def start_farm(self, cid: str):
         with self.lock:
+            if cid in self.token_errors:
+                self.status[cid] = "error"
+                return
             p = self.procs.get(cid)
             if p and p.poll() is None:
                 return
@@ -602,6 +617,7 @@ class Provider:
                     "plan_label": plan.get("label", c["plan"]),
                     "jobs": plan["jobs"],
                     "status": self.status[cid],
+                    "token_error": self.token_errors.get(cid),
                     "farm": self.cache[cid],
                 }
             )
@@ -855,6 +871,36 @@ def run_fleet_unit_tests(work: Path):
         raise AssertionError("load_or_create_secret must reject truncated master_key.bin")
     except ValueError:
         pass
+
+    # Round-6 #15: A malformed client_token.txt on one client isolates only that client
+    # (`status='error'`), rather than crashing Provider.__init__ for the entire fleet.
+    iso_dir = work / "iso_state"
+    (iso_dir / "bravo").mkdir(parents=True, exist_ok=True)
+    (iso_dir / "bravo" / "client_token.txt").write_text("not-valid-hex\n", encoding="utf-8")
+    iso_cfg_path = work / "iso_fleet.toml"
+    iso_cfg_path.write_text(SELFTEST_CONFIG, encoding="utf-8")
+    old_fleet_env = os.environ.get(FLEET_DIR_ENV)
+    old_whpx_env = os.environ.get("CUTTLE_WHPX_AVAILABLE")
+    try:
+        os.environ[FLEET_DIR_ENV] = str(iso_dir)
+        os.environ["CUTTLE_WHPX_AVAILABLE"] = "0"
+        iso_cfg = load_fleet_config(iso_cfg_path)
+        iso_prov = Provider(iso_cfg, iso_cfg_path)
+        assert iso_prov.status["alpha"] == "stopped", iso_prov.status
+        assert iso_prov.status["bravo"] == "error", iso_prov.status
+        assert iso_prov.client_tokens["alpha"] is not None
+        assert iso_prov.client_tokens["bravo"] is None
+        assert "bravo" in iso_prov.token_errors
+        assert iso_prov.scope_for(iso_prov.client_tokens["alpha"]) == ("client", "alpha")
+    finally:
+        if old_fleet_env is None:
+            os.environ.pop(FLEET_DIR_ENV, None)
+        else:
+            os.environ[FLEET_DIR_ENV] = old_fleet_env
+        if old_whpx_env is None:
+            os.environ.pop("CUTTLE_WHPX_AVAILABLE", None)
+        else:
+            os.environ["CUTTLE_WHPX_AVAILABLE"] = old_whpx_env
 
 
 def run_self_test() -> int:
