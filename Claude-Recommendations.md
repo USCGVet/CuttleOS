@@ -1,328 +1,244 @@
 # Claude Recommendations
 
-Review of the 11 commits after `a623b5a`, up to `1c59464`: `79b8161` and `ca26a6d` (round-4 fix and status line), `5e504e8` and `75969d3` (nightly build fixes), `c39fec8`, `c47de8f`, `2c2dd0a`, `9e34b6b` and `fc50b63` (Triad controller, fleet provider, ops console, WHPX), `04677dd` (hand-written TLS replaced with rustls and a RustCrypto provider) and `1c59464` (Apache-2.0 licensing). The range is 50 files, +15,196 / −3,933 lines. Line numbers are from `1c59464`.
+Review of the 7 commits after `1c59464`, up to `2aa69b0`: `ef2c0ad`, `17f3d14`, `beb3bfa` and `37f9d23` (round-5 fixes), `b1d8fec` (status lines), `a38eb08` (#14 roster and port-80 response queue) and `2aa69b0` (status lines). The range is 43 files, +3,683 / −1,423 lines. Line numbers are from `2aa69b0`. The checkout had no uncommitted changes.
 
-**Test status at review time.** The review ran on Linux from a copy of the checkout's git data. The checkout had no uncommitted changes.
-- `cargo test --workspace --no-fail-fast` (stable 1.97): **2,419 passed, 1 failed, 15 ignored.**
-  - The failure is `morph_engine/tests/cycle_durable_seals.rs`. It can't pass on any machine except the builder's; see #13.
-  - The commits report 2,428 passed on Windows. This run executed 2,420 tests. I didn't investigate the difference.
-- `cargo test -p factory_builder --test qemu_smoke -- --ignored`: **not run.** The review environment couldn't download a nightly toolchain.
-- `target_enterprise_kernel` release build: **not run**, for the same reason.
-- `tools/triad_controller.py`: **parses**, and so does `tools/cuttle_fleet.py`. The Python self-tests weren't run, because they need QEMU and built kernel images.
+**Test status at review time** (Linux, stable 1.97, workspace crates rebuilt from clean)
+- `cargo test --workspace --no-fail-fast`: **2,440 passed, 0 failed, 15 ignored.**
+  - This includes the soft-float sub-invocation (`soft_float_crypto_backends_pass_kats_and_golden_replay`).
+  - A fresh clone now passes (round-5 #13).
+- `qemu_smoke` and the `target_enterprise_kernel` release build: **not run here.** The review environment can't download a nightly toolchain.
+  - I read the builder's serial logs from 22:22, which is after the last kernel-side change: 128 and 129 `OK` banners, `HTTPS UP — entropy=rdrand provisioned=1`, `CUTTLE-TE HALT`, and the tampered disk rejected.
+- **Python:**
+  - Ran and passed: `https_check.py --self-test`, `cuttle_fleet.run_fleet_unit_tests`, and the AST parse of both controllers.
+  - Not run: `triad_controller.run_unit_self_tests` needs a built kernel image, and `third_party_notices.py --self-test` needs the bootloader sources.
+  - The live Triad and fleet self-tests weren't run (they need VMs).
 
 ## Verification of last round's items
 
 | # | Item | Verdict | Notes |
 |---|---|---|---|
-| 1 | Session tokens and attestation quotes created with an unset attest key | **Verified fixed** | `try_create_session`, `compute_attestation_mac` and `cmd_attest` refuse while `attest_key` is unset and record an audit entry. HTTP `/session/login` (`lived_net.rs:1434`) returns 503. `regression_round4_item1_unset_attest_key_refuses_session_and_quote` exercises the shell paths and passes. The HTTP 503 branch has no direct test, but it sits behind the earlier device-key check, so this is minor. |
+| 1 | TLS RNG seeded from timers only | **Verified fixed** | HTTPS refuses to start without RDRAND or a TPM. The seed mixes in the master key, MAC and boot count. Launchers pass `-cpu max`. Unit test plus smoke banner `entropy=rdrand`. |
+| 2 | Unbounded TLS transmit queue | **Verified fixed** | `MAX_TX_BYTES` 64 KiB, request handling pauses at 16 KiB, and idle HTTPS slots are reclaimed. The named test doesn't exercise the 16 KiB pause inside `handle_https_slot` (see #20). |
+| 3 | Index-Triad heal never converges | **Verified fixed** | All vote tables are reset and replayed. But the new WAL compaction breaks replay in general (see #1). |
+| 4 | Seeded and prod builds drop the soft-float cfgs | **Verified fixed** | `compose_kernel_rustflags` plus a unit test. Partial-cfg edge case in #11. |
+| 5 | Prod kernels skip the TLS KATs | **Verified fixed** | `enable_https` runs `self_test()` in every build and refuses HTTPS on failure. |
+| 6 | Unprovisioned HTTPS identity from the boot-ephemeral key | **Verified fixed** | Uses the CSPRNG when unprovisioned. `provisioned=0/1` is on the boot line. Unit test. |
+| 7 | `/api/cron` bypasses the WAL | **Verified fixed** | Cron is limited to read-only commands (403 otherwise). Legacy jobs are dropped silently (#15). |
+| 8 | Secret files with default permissions | **Partly fixed** | POSIX creates files 0600. On Windows the ACL is applied after the write, and failures are ignored (#5). |
+| 9 | WAL durability | **Partly fixed** | Done: write-ahead, fsync, a `.bad` copy on parse errors, and rollback when every node rejects. A crash or failed save after the write-ahead still leaves an unmarked entry (#2). |
+| 10 | Restored `tx_seq` not tied to node state | **Partly fixed** | Per-node and triad fingerprints were added. A two-node rollback, and stale digests, are still mishandled (#6). |
+| 11 | Web Triads vote on names and sizes only | **Partly fixed** | The vote now uses content digests, and heal wipes the disk. But heal can't copy most files back (#4). |
+| 12 | Roles fail open | **Verified fixed** | A node is kept OFFLINE after 3 failed attempts. |
+| 13 | Suite passes only on the builder's machine | **Verified fixed** | Passes here on a fresh clone. |
+| 14 | Committed seeds in the federation roster | **Partly fixed (owner action)** | Roster ships `primary` only with `threshold = 1`. Fixture and RFC 8032 keys are rejected, and `--require-threshold` refuses a threshold below 2. README updated. Remaining: real co-signers (your key ceremony), plus #13. |
+| 15 | Fleet port collisions | **Verified fixed** | 5-job cap plus an overlap check. |
+| 16 | Client isolation only at the API | **Verified fixed** | Farm VMs don't forward node ports. Self-test and README updated. The console still links to those ports (#16). |
+| 17 | Endpoints not tested without credentials in every role | **Verified fixed** | HTTPS role-matrix test, plus fleet and controller loops over no, wrong and non-ASCII tokens. |
+| 18 | `/app` innerHTML and shared token key | **Verified fixed** | `esc()` everywhere, `sessionStorage`, separate keys, CSP and `X-Frame-Options`. Old `localStorage` keys aren't cleared (#16). |
+| 19 | Stale banners in opt-in QEMU proofs | **Verified fixed** | `required_banners_match_current_kernel_banners`. |
+| 20 | Heal can leave a node in HEALING | **Verified fixed** | Heal holds `morph_op_lock` and morphs with `_lock_held`. The contention test would also pass on the old code, and an early return still leaves HEALING (#14). |
+| 21 | Console Unlock button | **Verified fixed** | |
+| 22 | Python request handling | **Verified fixed** | Auth is checked before the body is read, with body caps and ASCII-safe token comparison. |
+| 23 | Secret files silently truncated or replaced | **Verified fixed** | Malformed files are refused. The blast radius is now wide (#15). |
+| 24 | KAT coverage narrower than documented | **Verified fixed** | GCM case 4, RFC 5903 §8.1, and RFC 4231/5869 vectors through the provider's own objects. The README now names the wrong vectors (#21). |
+| 25 | Host tests don't run the soft backends | **Verified fixed** | The sub-invocation ran and passed here. |
+| 26 | Crypto hardening gaps | **Verified fixed** | Zeroization, signature self-verification, golden pieces gated, `reseed` crate-private with rekey-on-fill, DER length assertion. Notes in #12. |
+| 27 | fw_cfg key length not checked | **Verified fixed** | Size must be exactly 32. A wrong size downgrades silently (#10). |
+| 28 | Port 80 and 443 request handling differ | **Partly fixed** | Shared framing, 413 and 400 responses, and a per-slot response queue on port 80, which fixes the dropped-response bug. Connection handling after errors is still wrong (#3). |
+| 29 | Binmorphed boot asserts 6 banners | **Verified fixed** | HALT is now asserted. |
+| 30 | Accelerator docs and `run.bat` fallback | **Verified fixed** | `run.bat` defaults to TCG, and the README is scoped correctly. |
+| 31 | Licensing notices | **Verified (docs)** | NOTICE and README updated, and the SPDX parser is correct. Stage-crate inclusion wasn't re-run here (no bootloader sources). |
+| 32 | Smaller tooling items | **Verified fixed** | sibling-search shape, temp self-test dir, farm secret popped, node-id 400s, uniform 403. The WAL-growth fix introduced #1. |
 
 ---
 
 ## High priority
 
-### 1. The TLS random generator is most likely seeded from timers only, and a weak seed is never refused
-- **Where:**
-  - `target_enterprise_kernel/src/provisioning.rs:91-154` (`read_hw_entropy_u64`) uses RDRAND only when CPUID reports it. Otherwise it falls back to TSC, CMOS and PIT readings.
-  - `provisioning.rs:274-289` (`tls_rng_seed`) adds TPM bytes only if a TPM answers.
-  - `net_service.rs:513` seeds `SYSTEM_RNG` from that result.
-  - None of the launchers passes `-cpu` or attaches a TPM or `virtio-rng`: `run.bat`, `tools/triad_controller.py`, `factory_builder/tests/qemu_smoke.rs`.
-- **Problem:** QEMU's default CPU model doesn't advertise RDRAND, and no launcher provides a TPM. So in every shipped configuration the CSPRNG seed most likely comes only from timer and clock readings. `tls_rng_seed` can't fail. "Fails closed until seeded" (`tls_provider.rs:21`, `README.md:105`) covers "never seeded", not "weakly seeded". Nothing node-specific (device key, MAC, boot counter) goes into the seed.
-- **Effect:** Ephemeral key-exchange secrets and handshake randoms come from a stream with low, unmeasured entropy, so HTTPS forward secrecy depends on it. The README names RDRAND and TPM as sources that are probably absent in practice. On unprovisioned boots the master key comes from the same fallback (see #6).
-- **Fix:**
-  - Give every launcher a real entropy source: a CPU model with RDRAND (for example `-cpu max` under TCG; check WHPX), or `virtio-rng` or swtpm with a driver.
-  - Have the seed function report which sources contributed. Refuse to start HTTPS when neither RDRAND nor TPM contributed, the same way net-auth refuses without a device key.
-  - Mix in a key derived from the device master key, plus the MAC and the persisted boot counter.
-  - Print the entropy source on the `HTTPS UP` line, assert it in `qemu_smoke`, and add a host test of the refusal path with a mocked source.
-- Status: Fixed — test: `tls_provider::tests::derive_tls_rng_seed_requires_rdrand_or_tpm_and_mixes_node_context`, `required_banners_include_https_up_with_rdrand_and_provisioned`, `boots_under_qemu_and_emits_banner` — commit: `17f3d14`, `beb3bfa`, `37f9d23`
-
-### 2. The per-connection TLS transmit queue has no limit, so an unauthenticated client can exhaust the kernel heap
-- **Where:**
-  - `target_enterprise/src/https.rs:255,294-299,470-491`: `tx` grows with every encrypted response.
-  - `lived_net.rs:1123-1146`: up to 8 responses are encrypted per inbound segment.
-  - `lived_net.rs:1188` (`flush_https_tx`): at most 2 segments drain per call (`MAX_REPLIES = 3`).
-  - `lived_net.rs:233-254` (`tick_tcp_rto`) reclaims only `SynReceived` and `LastAck` slots.
-  - `heap.rs:13`: fixed 8 MiB heap, and no allocation-failure handling.
-- **Problem:** The receive and plaintext buffers are capped (`MAX_RX_BYTES`, `MAX_PLAINTEXT_BYTES`), but the transmit queue isn't. A client that sends requests faster than it reads the responses makes `tx` grow without limit, on up to 16 slots. Established slots are never timed out. `heap.rs:10-11` assumes "tens of KiB" per connection, and that assumption doesn't hold.
-- **Effect:** A failed allocation in this `no_std` kernel ends in a panic, so one network client with no credentials can halt a node. Port 80 has no such queue, so this exposure is new with HTTPS.
-- **Fix:**
-  - Cap pending `tx` per session (for example 64 KiB). Stop handling further requests while the queue is over the cap, leaving them in the plaintext buffer.
-  - Give established HTTPS slots an idle timeout.
-  - Add a test that drives many large-response requests without draining and asserts that `tx` stays bounded and nothing panics.
-- Status: Fixed — test: `https_tx_cap_backpressure_and_idle_rto_reclaim_slots` — commit: `17f3d14`, `37f9d23`
-
-### 3. Heal on an index Triad never converges: the vote compares `kv` and `idx`, but the heal rebuilds only `kv`
-- **Where:**
-  - `tools/triad_controller.py:862-869`: the vote reads every table in `spec.vote_tables`.
-  - `tools/triad_controller.py:1311-1325`: the heal drops and recreates only `kv`, then replays the whole WAL.
-  - `tools/fleet.toml:39-46`: the `index` job votes on `["kv", "idx"]` and creates `idx` through the WAL.
-- **Problem:** `idx` is never dropped. Replaying the full WAL re-runs `CREATE TABLE idx`, which fails because the table exists, and re-runs the provisioning `INSERT INTO idx` statements, which add duplicate rows. `_adopt_tx_seq_from_majority` (`:1369`) also compares only `kv`.
-- **Effect:** After any heal on an index Triad, including the console's tamper drill, the healed node's `idx` differs from its peers. The next vote outvotes it again, so ALERT, HEAL and emergency morph repeat, and each round adds more duplicates. The pro plan ships this job.
-- **Fix:** Have the heal rebuild every table in `spec.vote_tables`, provisioning included. Alternatively, restore the SQL partition from a clean image and replay the WAL. Add a fleet self-test that runs the tamper drill on the index job and asserts a 3/3 match with no second ALERT.
-- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests`, `tools/cuttle_fleet.py::run_self_test` — commit: `beb3bfa`
+### 1. WAL compaction rewrites history, so replay rebuilds data the peers don't have
+- **Where:** `tools/triad_controller.py:329-366` (`compact_wal_entries`), called from `_save_wal_to_disk` at `:668-673` once the WAL passes `MAX_WAL_ENTRIES`.
+- **Problem:** Any earlier `UPDATE kv … WHERE k='x'`, `INSERT OR REPLACE INTO kv VALUES ('x', …)` or `UPDATE idx … WHERE term='t'` is dropped whenever a later statement matches the same key, as if the later one overwrote the whole row. The kernel's SQL engine doesn't work that way: `UPDATE` sets one column, `WHERE` supports `AND`/`OR`, `BEGIN`/`ROLLBACK` are logged entries, and row order follows slot allocation. I ran the function:
+  - `INSERT OR REPLACE … ('x','a',1)` followed by `UPDATE kv SET rev = 2 WHERE k = 'x'` keeps only the `UPDATE`, so the row never exists on replay.
+  - `SET v='new'` followed by `SET rev=9` on the same key keeps only `SET rev=9`, so `v` is lost.
+- **Effect:** Once the WAL is compacted, every heal and catch-up rebuilds a state the other nodes don't have. The healed node is outvoted again, and heal → emergency morph → heal repeats with no limit. The all-node replay in `_adopt_tx_seq_from_majority` writes the lossy state to all three nodes, where the vote can't detect it, so data is lost silently. The synthetic load only issues single-column updates on plain-inserted rows, which is why the self-tests pass.
+- **Fix:** Remove key-level compaction. Bound the WAL with a checkpoint instead: a majority-agreed dump of the vote tables plus its tx_seq, and heal from checkpoint plus tail. Make the vote order-insensitive (sort rows). Add a test that heals a node after more than `MAX_WAL_ENTRIES` mixed statements and asserts a 3/3 match.
+- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests` (WAL checkpointing after >`MAX_WAL_ENTRIES` mixed `INSERT`/`UPDATE` statements + order-independent `_normalize_kv_for_tmr`) — commit: `64118bd`
 
 ---
 
 ## Medium priority
 
-### 4. Seeded and `--prod` kernel builds silently drop the soft-float crypto cfgs
-- **Where:** `factory_builder/src/lib.rs:403,439` sets `RUSTFLAGS` whenever `layout_seed.is_some() || prod`. The cfgs live only in `target_enterprise_kernel/.cargo/config.toml:8-14` (`build.rustflags`).
-- **Problem:** Cargo ignores `build.rustflags` when `RUSTFLAGS` is set. Every morph-cycle and production build therefore loses `aes_force_soft`, `polyval_force_soft`, `chacha20_force_soft`, `poly1305_force_soft` and `curve25519_dalek_backend="serial"`, and compiles the SIMD backends into a soft-float kernel.
-- **Effect:** The images that actually rotate in production use a crypto backend configuration that no KAT or smoke boot has validated, against the config's own comment that no SIMD is emitted. Depending on the nightly, the seeded build may fail outright (see the comment at `target_enterprise/Cargo.toml:17-19`).
-- **Fix:** Have factory_builder append the cfgs from one shared constant to the `RUSTFLAGS` it composes. Add a unit test that the composed flags contain them, and add a `compile_error!` in `target_enterprise` for `target_os = "none"` builds that lack the cfgs. Run `factory_builder build-kernel --layout-seed 1 --prod` to confirm.
-- Status: Fixed — test: `tests::compose_kernel_rustflags_always_includes_soft_float_crypto_cfgs`, `boots_under_qemu_and_emits_banner` — commit: `17f3d14`
+### 2. Write-ahead entries have no pending or applied marker
+- **Where:** `tools/triad_controller.py:1304-1365` (SQL path) and the vault path at about `:1455-1504`. Startup, catch-up and heal replay every entry above a node's tx_seq.
+- **Problem:** The entry is appended, `triad_tx_seq` is advanced and the file is fsynced before any node executes it. If the process stops before the nodes run it, or `_save_wal_to_disk` raises anything other than the `ValueError` handled at `:1323`, the entry stays with nothing to say whether zero, some or all nodes applied it. In the raise case, the in-memory append and tx_seq aren't rolled back, and the next successful save writes the entry anyway. Rollback works correctly only when every node rejects the statement.
+- **Effect:** After a restart, the next morph replays the entry on one node only. That node is outvoted, and heal replays the entry again, so it loops. The all-node adoption replay can also apply a write the client was never told succeeded.
+- **Fix:** Record the entry as pending, together with the pre-write digest. Mark it committed (or remove it) after execution, within the same `wal_lock` hold, and undo the in-memory changes if the save raises. At startup, resolve pending entries against the majority fingerprint. Add a test that stops the controller in `_after_wal_write_ahead_hook`, restarts it, and asserts the Triad converges.
+- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests` (write-ahead `OSError` rollback, `_after_wal_write_ahead_hook` crash before node execution, and 2/3 majority partial commit reconciliation) — commit: `64118bd`
 
-### 5. Production kernels skip the TLS known-answer tests, but the docs say every boot runs them
-- **Where:** `target_enterprise_kernel/src/main.rs:588-592`, where `banner_tls_kat` and `banner_tls_cert` are `#[cfg(not(cuttle_prod))]`. HTTPS itself is enabled in all builds. The claims are at `tls_provider.rs:16-17` ("the kernel runs that self-test at every boot") and `README.md:106` ("Every boot runs the provider's known-answer vectors").
-- **Problem:** The builds that ship serve HTTPS without a power-on crypto self-test. Combined with #4, these are also the builds with an untested backend configuration.
-- **Effect:** A miscompiled or mis-morphed primitive goes undetected exactly where it matters, and the docs overstate what runs.
-- **Fix:** Run `tls_provider::self_test()` unconditionally at the start of `enable_https`, and refuse HTTPS if it fails. Keep only the banner output under the cfg. Add a prod-build boot assertion for `HTTPS UP`, or correct the docs.
-- Status: Fixed — test: `provider_known_answer_self_test`, `boots_under_qemu_and_emits_banner` — commit: `17f3d14`
-
-### 6. Unprovisioned boots serve HTTPS from the boot-ephemeral master key, and the boot line doesn't say so
-- **Where:** `provisioning.rs:261` (`let (master, _) = device_master_key_state();` ignores the provisioned flag) and `net_service.rs:514-524`.
-- **Problem:** On an unprovisioned boot, the certificate's public key derives from the same weak-entropy master key (#1) that also derives the seal and attest keys, and that public key is published. The `HTTPS UP` line looks the same either way. Net-auth already refuses to run without a provisioned key; HTTPS doesn't.
-- **Fix:** On unprovisioned boots, generate the TLS key from the CSPRNG independently of the master key, or disable HTTPS. Add `provisioned=0|1` to the `HTTPS UP` line and test both cases.
-- Status: Fixed — test: `https::tests::derive_tls_identity_secret_uses_rng_when_unprovisioned_and_master_when_provisioned`, `required_banners_include_https_up_with_rdrand_and_provisioned`, `boots_under_qemu_and_emits_banner` — commit: `17f3d14`, `37f9d23`
-
-### 7. `/api/cron` lets state-changing commands bypass the WAL, and they are re-applied on every boot
+### 3. HTTP connections keep reading after a terminal response, and framing has gaps (both ports)
 - **Where:**
-  - `tools/triad_controller.py:1093-1132`: `cron add` is sent to each node and recorded as desired state.
-  - `:705-718`: it is re-applied after every boot, morph and heal.
-  - The kernel forbids only recursive and power commands (`target_enterprise/src/shell.rs:3411-3423`).
-- **Problem:** `/api/sh` is deliberately read-only (`:131`, with a self-test that refuses `cron add` there). `/api/cron` is a second path that schedules any other command, including SQL writes, to run on each node on its own timer, outside `wal_lock` and the WAL. The desired-cron list is also updated after `wal_lock` is released (`:1131-1132`) and written non-atomically (`:1166`).
-- **Effect:** Nodes drift apart on their own schedules, so the vote raises ALERT and HEAL. The heal then re-applies the same job, so the drift never ends. The rule that state changes go through the WAL is bypassed.
-- **Fix:** Restrict cron commands to the `is_readonly_shell_command` allowlist or a named set of approved jobs. Update the desired-cron state inside the `wal_lock` critical section and write it atomically. Test that a mutating cron command is refused.
-- Status: Fixed — test: `tools/triad_controller.py::run_self_test` — commit: `beb3bfa`
-
-### 8. Token and master-key files are written with default permissions
-- **Where:** `tools/triad_controller.py:344-350` (master key and `operator_token.txt`); `tools/cuttle_fleet.py:146-154` (`load_or_create_secret`, used for client tokens and per-client `master_key.bin`) and `:462` (`provider_token.txt`).
-- **Problem:** `write_text` and `write_bytes` create these files with default permissions (0644 under the usual umask; inherited folder ACLs on Windows). Farm mode also writes an unused per-Triad `operator_token.txt` for every farm Triad.
-- **Effect:** On a shared host, other local users can read the provider token, every client token and every client's master key, from which all of that client's node keys derive. Binding to 127.0.0.1 doesn't protect against local users, and loopback-only means the clients themselves are local.
-- **Fix:** Create secret files exclusively, with mode 0600 on POSIX and a user-only ACL on Windows. Stop writing unused tokens. Document where secrets live and who can read them.
-- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests`, `tools/cuttle_fleet.py::run_self_test` — commit: `beb3bfa`, `37f9d23`
-
-### 9. WAL durability: a corrupt WAL is silently discarded, and writes are recorded after they execute
-- **Where:**
-  - `tools/triad_controller.py:405-433`: any load error resets the WAL to empty with no log or alarm, and entries that fail `is_printable_ascii_command` are dropped silently.
-  - `:435-443`: the save does tmp + replace, but with no flush or fsync.
-  - `:982-1020`: statements run on the nodes first, then the WAL is appended and saved, then `node_tx_seq` is saved in a second write.
-- **Problem:** The heal source can vanish without notice, and the next write overwrites the file. Dropping entries on load is silent input truncation. After an unclean stop between the steps, nodes can hold a write the WAL never recorded, or the persisted `node_tx_seq` can trail what the node actually holds.
-- **Effect:** Later heals rebuild nodes without the lost writes, so the healed node disagrees with its peers. The false ALERT/HEAL that `c39fec8` fixed comes back in a narrower window.
+  - Port 80: `target_enterprise/src/lived_net.rs:1026-1066`. The `overflow_413` branch clears the buffer and carries on, and `close_after` only breaks the loop.
+  - Port 443: `:1196-1250`. The framing loop doesn't stop once `close_sent()` is true.
+  - Framer: `:2262-2285`. `LengthRequired` clears the whole buffer, and `Err(_) => body_start` hands an unparseable head to `handle_http_request`, which returns 0.
+- **Problem:** After a 413, a 400 or `Connection: close`, the connection isn't closed or marked as finished. The rest of an oversized body, or the body of a POST sent without `Content-Length`, is framed as new requests. On port 443, responses can follow close_notify. A `LengthRequired` also discards any pipelined requests behind it. An unparseable request gets no response at all. `Transfer-Encoding` is ignored, and `Connection` isn't parsed as a token list.
+- **Effect:** Requests and responses drift out of step. Body bytes can be run as requests on the same connection. Port 443 breaks the TLS protocol after close_notify. The README's "every route answers identically on :80 and :443" doesn't hold for connection handling. Each connection belongs to one client, so this is a correctness and protocol issue, not a cross-user exposure.
 - **Fix:**
-  - Write ahead: append and fsync before executing on the nodes.
-  - On a parse error, refuse to start (or keep a `.bad` copy and alarm). Never drop entries silently.
-  - fsync the temp file before `replace`.
-  - Add a test that stops the controller between steps and checks recovery.
-- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests`, `tools/triad_controller.py::run_self_test` — commit: `beb3bfa`
+  - Add a per-slot "input closed" flag. Set it on any terminal response (413, 400/411, close, parse error), discard later inbound bytes while it's set, and clear it when the slot is reused.
+  - Port 80: start a server FIN once `http_tx` drains (or reset after the response is acknowledged).
+  - Port 443: stop handling requests once `close_sent()` is true.
+  - Answer `Transfer-Encoding` with 501 and close, and answer bad, duplicate or conflicting `Content-Length` and unparseable heads with 400 and close.
+  - Extend the 413 test to send trailing bytes after the overflow and assert that nothing more is answered.
+- Status: Fixed — test: `lived_net::tests::http_framer_rejects_transfer_encoding_bad_content_length_and_malformed_requests`, `https_interop::http_and_https_reject_oversized_and_unframed_requests_and_match_across_routes` — commit: `9e097a5`
 
-### 10. Restored and adopted `tx_seq` is trusted without checking it against the node's data
-- **Where:** `tools/triad_controller.py:421-427` (a restored value is trusted if it is in `0..triad_tx_seq`) and `:1369-1382` (legacy WAL adoption by 2-of-3 agreement).
-- **Problem:** Nothing ties the persisted `tx_seq` to what the node's disk actually holds. If all disks are rolled back, or two stale nodes agree, they keep or adopt the Triad's `tx_seq` and never replay. The `c39fec8` claim that "a node that disagrees keeps 0 and is healed" has no test: self-test 6b covers only the case where all nodes agree.
-- **Effect:** Real divergence from the WAL can be masked, giving stale reads with no alarm, or it can turn into a heal loop against the one correct node.
-- **Fix:** Persist a per-node state fingerprint (for example a digest of the vote tables) alongside `node_tx_seq`, and restore or adopt only when it matches at boot. Add a legacy-WAL test with one divergent node.
-- Status: Fixed — test: `tools/triad_controller.py::run_self_test` — commit: `beb3bfa`
+### 4. Web (`wfe`) heal can't copy most files back, so a divergence becomes a wipe-and-morph loop
+- **Where:** `tools/triad_controller.py:1170-1184` (`_sync_files_from_peer`) and `:1620-1621`. Unit test at `:2662-2700`.
+- **Problem:**
+  - Files are copied with `write <path> <content>` over the serial shell, after the target's disk has been wiped.
+  - Multi-line files are skipped silently, because `is_printable_ascii_command` rejects the newline.
+  - `cat` returns at most 1 KiB (`target_enterprise_kernel/src/main.rs:845`), and the shell line is 256 bytes.
+  - `write` appends a newline, empty files are refused, and the copy is never checked afterwards.
+  - The unit test's fake shell stores content verbatim and uses one 5-byte line.
+- **Effect:** After a heal, the node still differs on size or digest, so it's wiped and morphed again with no limit. This is latent today, because web nodes only hold the kernel's default files, but it triggers as soon as real content is served.
+- **Fix:** Copy files with a byte-safe encoding, in chunks. Check size and digest after the copy, and keep the node OFFLINE with an alarm on mismatch. Make the fake shell match kernel behaviour. Add a real-VM test with a multi-line file.
+- Status: Fixed — test: `shell::tests::cathex_and_writehex_roundtrip_empty_binary_and_multichunk_files`, `tools/triad_controller.py::run_unit_self_tests` (multi-line >1 KiB, empty 0-byte, and space-path `wfe` file sync + SHA-256 verification) — commit: `9e097a5`, `64118bd`
 
-### 11. Web (`wfe`) Triads vote on file names and sizes only, and their heal can't repair persisted files
-- **Where:** `tools/triad_controller.py:858-860` uses `ls`, which prints only `path (len B)` (`shell.rs:2620-2633`). The non-SQL heal at `:1286-1294` is an emergency morph that boots onto the same disk image. The claims are at `:855-856` and in the README ("compares the content it serves").
-- **Problem:** A same-length change to a served file is invisible to the vote. When divergence is detected, the "heal" reboots onto a disk that still holds the divergent files.
-- **Effect:** Content tampering on web Triads goes undetected, and detected divergence becomes a repeating heal and morph loop. The docs overstate what is compared.
-- **Fix:** Vote on a content digest of each served file. On a non-SQL heal, restore the file-system partition from a healthy peer or a clean image before rebooting. Change the docs to say what is actually compared.
-- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests` — commit: `beb3bfa`, `37f9d23`
+### 5. On Windows, secret files are readable under the inherited ACL until icacls runs, and icacls failures are ignored
+- **Where:** `tools/triad_controller.py:128-143` (`restrict_file_permissions`) and `:146-166` (`write_secret_file`). Also `run.bat:94-104`, which generates `device_secret_key.bin`.
+- **Problem:** On Windows, the `0o600` passed to `os.open` only sets the read-only flag. The temp file inherits the folder's ACL, the secret is written and fsynced, and only then does `icacls` run, with `check=False` and the result ignored. The principal comes from the `USERDOMAIN` and `USERNAME` environment variables. `run.bat` writes the device key with the inherited ACL and never restricts it.
+- **Effect:** A folder created directly under `C:\` (such as `C:\CuttleOS`) normally inherits read access for Authenticated Users. Master keys, node device keys and tokens are readable by other local accounts during the write, and permanently if icacls fails. The README says these files are owner-only.
+- **Fix:** Create the file empty, apply the ACL using the current user's SID, check the result and fail if it didn't apply, then write. Do the same in `run.bat`. Add a test that asserts the ACL on Windows and the mode on POSIX.
+- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests` (Windows `icacls` SID ACL check before write + failure rejection + POSIX `0600` mode check) — commit: `64118bd`
 
-### 12. Node roles fail open
-- **Where:** `tools/triad_controller.py:712-715`, where a failed `service role <role>` only logs a WARN and the node then goes ONLINE (`:1236`, `:1268`, `:1408`).
-- **Problem:** Each boot starts in the `full` role. If applying the role fails, the node joins the pool running every service.
-- **Effect:** The least-privilege split between `wfe` and `sql` is silently not enforced on that node, and the vote doesn't notice.
-- **Fix:** Treat a failed role application as a boot failure: keep the node OFFLINE, retry, then alarm. Better still, pass the role at boot (for example over fw_cfg) so the kernel never runs as `full`. Add a test that forces the failure.
-- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests` — commit: `beb3bfa`
-
-### 13. The full workspace suite can pass only on the builder's machine
-- **Where:** `morph_engine/tests/cycle_durable_seals.rs:52-56` requires `factory_signing_key.bin` in the repo root. The file is gitignored, and this checkout doesn't have it. Verification (`morph_engine/src/attest.rs:1382-1404`, `:1434-1444`) trusts the `primary` public key in the committed `factory_keys.toml`.
-- **Problem:** On a fresh clone the test fails because the key is missing. With a freshly generated key it still fails ("primary signature over entry content does not verify"), because the roster's `primary` is the builder's own key. A run also leaves an untracked `experiments/diversity_demo/results/` that isn't gitignored.
-- **Effect:** Nobody else can reproduce "0 failed", including the reviewer and the owner's own checkout. The required check therefore depends on a secret only one machine holds.
-- **Fix:** Have the test generate a temporary signing key and a matching temporary roster, and point the verifier at them. Gitignore the results directory.
-- Status: Fixed — test: `cycle_attaches_durable_seals_from_dir` — commit: `ef2c0ad`
-
-### 14. The committed federation roster trusts two signers whose private seeds are in the repo (pre-existing)
-- **Where:** `factory_keys.toml:13-19` (`placeholder-a`, `placeholder-b`, `threshold = 2`); `morph_engine/tests/fixtures/federation/placeholder_a.seed` and `placeholder_b.seed`; `morph_engine/src/federation.rs:150-181`, which counts any distinct valid signers.
-- **Problem:** I confirmed that both committed seeds derive the roster's placeholder public keys. Together they meet the 2-of-3 threshold without `primary`. The module doc (`federation.rs:6-8`) also says `primary` is a test seed, which the roster contradicts.
-- **Effect:** `verify-attest --require-threshold` with the shipped roster adds no protection beyond the primary key. That flag is documented as the defense against a stolen primary key, and README:30 advertises M-of-N threshold attestation.
-- **Fix:** Keep the fixture signers only in test rosters. Have verification reject a roster that contains a known fixture key. Fix the module doc.
-- Status: Partly fixed — committed fixture seeds and RFC 8032 §7.1 example keys are removed from `factory_keys.toml` and rejected by `KNOWN_FIXTURE_PUBKEYS`, `factory_keys.toml` ships with only `primary` (`threshold = 1`), and `verify-attest --require-threshold` rejects `threshold < 2` (test: `federation::tests::rejects_known_fixture_pubkeys`, `threshold_check_rejects_roster_containing_known_fixture_pubkey`, `fixture_seeds_match_factory_keys_toml` — commit: `ef2c0ad`, `37f9d23`, `a38eb08`); enrolling real independent human co-signer keys in `factory_keys.toml` and raising `threshold` to `2` requires an operator key ceremony.
-
-### 15. Fleet port blocks collide for plans with 6 to 9 jobs, which validation allows
-- **Where:** `tools/cuttle_fleet.py:71-72` (allows 1 to 9 jobs) and `:117-128` (`base = vm_port_base + slot*100 + t*10`, with `https_base = base + 50`).
-- **Problem:** Job 5 and later get HTTP ports that equal earlier jobs' HTTPS ports. Their HTTPS ports run into the next client's block. Nothing checks for overlap between the farm, provider and VM port ranges either.
-- **Effect:** Port-forward bind failures leave VMs or whole Triads OFFLINE, and one client's plan can break a neighbouring client.
-- **Fix:** Cap plans at 5 jobs, or use a layout with no overlap (for example a separate HTTPS range). Validate all port ranges when the config loads, and add a config test.
-- Status: Fixed — test: `tools/cuttle_fleet.py::run_fleet_unit_tests` — commit: `beb3bfa`
-
-### 16. The client-isolation claim holds only at the provider API
-- **Where:** `README.md:159-169` and `tools/cuttle_fleet.py:3,17-21` ("isolated farm per client"). Every node forwards :80 and :443 to 127.0.0.1 (`tools/triad_controller.py:583`), and read-only SQL and status routes need no session (`lived_net.rs:1495-1575`, as the README itself says).
-- **Problem:** Any local process can read any client's node status and, on SQL-serving roles, its tables, straight from the node port without a token. All farms run as one OS user, and every client's master key sits under one fleet directory (see #8). The fleet self-test checks isolation only through the provider API (`cuttle_fleet.py:881-888`).
-- **Fix:** Either scope the wording ("API-scoped; node ports on loopback are reachable by any local process"), or stop forwarding node ports in fleet mode, proxy node access through the farm with scoping, and require a session for reads on fleet nodes. Add a self-test that reads client B's node port directly and expects a refusal.
-- Status: Fixed — test: `tools/cuttle_fleet.py::run_self_test` — commit: `beb3bfa`, `37f9d23`
-
-### 17. New endpoints aren't tested without credentials in every role
-- **Where:**
-  - **Fleet:** `tools/cuttle_fleet.py:825-857`. The farm's `POST /api/shutdown`, `POST /api/load` and `POST /api/t/<job>/…`, and the provider's `/api/c/<id>/stop` and `/load`, are never called without a token or with a wrong one. Unauthenticated calls hit only the `sql` job, never `wfe`, `index` or `cron`.
-  - **Controller:** `/api/whoami` and the other endpoints are never tried with a wrong token.
-  - **HTTPS:** `target_enterprise/tests/https_interop.rs:244-262` checks 401 for three routes on the default role only.
-- **Effect:** The definition of done isn't met for this round's new listeners. The current routing is probably fine, but nothing guards against regressions.
-- **Fix:** Loop every endpoint × {no token, wrong token} × every role, at the provider, the farm and the controller. Run the existing port-80 unauthenticated tests over port 443 as well.
-- Status: Fixed — test: `every_mutating_endpoint_and_node_role_enforces_auth_over_https`, `tools/triad_controller.py::run_self_test`, `tools/cuttle_fleet.py::run_self_test` — commit: `17f3d14`, `beb3bfa`
-
-### 18. The legacy `/app` dashboard puts node-supplied text into `innerHTML`, on the same storage key `/console` uses for the operator token
-- **Where:** `tools/triad_controller.py:1642-1666` (`${n.morph_stats}`, `${n.last_smp}`, `${e.msg}` into `innerHTML`; pre-existing) and `:1619-1624`; `tools/triad_console.html:696` (`'cuttle_triad_token' // the latter is shared with /app`). New event text now includes node output (`:715`, `:1436`).
-- **Problem:** The new console renders safely; it uses `textContent` throughout. But it shares its persisted token with a page that doesn't.
-- **Effect:** A tampered node, which is exactly the threat the Triad exists to contain, can inject markup into the operator's `/app` page on the controller origin, where the token is readable.
-- **Fix:** Render `/app` with `textContent`, or retire it in favour of `/console`. Use a separate storage key, or keep the token in memory or `sessionStorage`. Add CSP and `frame-ancestors` headers.
-- Status: Fixed — test: `tools/triad_controller.py::run_self_test`, `tools/cuttle_fleet.py::run_self_test` — commit: `beb3bfa`
-
-### 19. Four opt-in QEMU proofs require a banner the kernel no longer prints
-- **Where:** `experiments/diversity_demo/tests/bundle_morph_proof.rs:46`, `experiments/diversity_demo/tests/morphed_qemu_proof.rs:102`, `morph_engine/tests/north_star_soak.rs:62`, `morph_engine/tests/bundle_soak_boot.rs:44` (`"TLS server_hello OK len="`, removed in `04677dd`). Also `morphed_qemu_proof.rs:263-273` returns success with "SKIP" when the seeded build fails.
-- **Effect:** These env-gated tests fail whenever enabled. They are the only boot tests of layout-seeded kernels, so the production diversity path currently has no working boot test.
-- **Fix:** Update the four banner lists to the current banners. Make a build failure a test failure when the env gate is on.
-- Status: Fixed — test: `required_banners_match_current_kernel_banners` — commit: `ef2c0ad`, `17f3d14`
+### 6. State-fingerprint edge cases: a two-node rollback is adopted, and stale digests can reset healthy nodes
+- **Where:** `tools/triad_controller.py:1838-1873` (adoption) and `:1196-1212` (the parity check records a digest probed outside `wal_lock`).
+- **Problem:**
+  - When the majority's fingerprint differs from `triad_state_digest` but one node is still restored, the all-node replay is skipped. Every pending node that matches the majority then adopts `triad_tx_seq`, without its digest being checked. So two rolled-back disks are marked current, and the one correct node is outvoted and healed.
+  - Separately, the parity check probes the nodes before taking `wal_lock`, then records that probe as the current digest. A write that commits in between leaves an old digest next to a new tx_seq. After a restart, healthy nodes then look mismatched and are reset to 0.
+- **Effect:** Real divergence is masked, or a heal loop starts against the correct node. Or a restart triggers a full replay, which is affected by #1 and #2.
+- **Fix:** Adopt only when the majority fingerprint equals the saved digest. If a restored node matches the saved digest and the majority doesn't, rebuild the majority from the WAL or raise an ALERT. Probe and record the digest under the same lock hold, or drop the result if tx_seq moved. At boot, retry an unreadable probe instead of resetting. Add a two-node-rollback test.
+- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests` (two-node rollback recovery onto intact restored peer, transient `None` probe retry, and stale-tx_seq parity digest guard) — commit: `64118bd`
 
 ---
 
 ## Low priority
 
-### 20. A heal can leave a node stuck in HEALING
-- **Where:** `tools/triad_controller.py:1289-1293` and `:1328-1330`. The heal waits on `morph_op_lock` and releases it, then calls `bounce_and_morph_node`, which takes the lock without blocking and returns False if it's busy (`:1191-1193`).
-- **Effect:** If a wave or auto-morph grabs the lock in between, the node is never morphed and stays out of the pool, and nothing retries it.
-- **Fix:** Morph under the lock already held, or retry until the morph succeeds. Test the heal with a concurrent wave.
-- Status: Fixed — test: `tools/triad_controller.py::run_self_test` — commit: `beb3bfa`
+### 7. Backpressure becomes dropped requests and spurious 413s
+- **Where:** `lived_net.rs:1027-1034` (port 80 applies the limit to the whole buffer) and `https.rs:411-414,484-487` (port 443 clears plaintext at 16 KiB).
+- **Problem:** Complete pipelined requests waiting behind the response high-water mark count toward the limit. The next segment then wipes them and queues a 413. The limit also differs between the ports: 8 KiB on 80 and 16 KiB on 443.
+- **Fix:** Apply the size limit per request inside the framer. Handle backpressure by not accepting more input (or shrinking the window), not by discarding it.
+- Status: Fixed — test: `https_interop::https_tx_cap_backpressure_and_idle_rto_reclaim_slots`, `https_interop::http_and_https_reject_oversized_and_unframed_requests_and_match_across_routes` — commit: `9e097a5`
 
-### 21. The standalone console's "Unlock" button doesn't work
-- **Where:** `tools/triad_console.html:2128` (`addEventListener('click', tryToken)`) with `:818` (`tryToken(inputSel = '#tokIn', …)`).
-- **Problem:** The click event is passed as the selector, so the handler throws. Enter works.
-- **Fix:** `addEventListener('click', () => tryToken())`.
-- Status: Fixed — test: `tools/triad_controller.py::run_self_test` — commit: `beb3bfa`
+### 8. `CloseWait` handling
+- **Where:** `lived_net.rs:1044,1087-1090`, `:1250-1252,1272-1278`, and `tcp.rs:411-419`.
+- **Problem:** A half-closing client that pipelines more than 8 requests gets FIN after the eighth answer, with complete requests still buffered. Retransmitted data in `CloseWait` isn't sequence-checked, so it's buffered and run again. That's an older bug, but slots now stay in `CloseWait` longer.
+- **Fix:** Keep processing until the framer reports `Incomplete` before closing. Drop payload in `CloseWait` (or check it against `rcv_nxt`).
+- Status: Fixed — test: `lived_net::tests::close_wait_ignores_data_after_fin_and_finishes_pipelined_requests` — commit: `9e097a5`
 
-### 22. Request handling in the Python servers
-- **Where:** `tools/cuttle_fleet.py:375,476-480,636-637` and `tools/triad_controller.py:1777-1789,1902-1903`.
+### 9. Idle reclaim
+- **Where:** `lived_net.rs:260-272` and `:1009`.
+- **Problem:** Reclaimed established slots get no RST or close_notify. `slot_last_tick` is refreshed before `process_segment` validates the segment, so invalid segments keep a slot "active". Ticks aren't wall-clock time.
+- **Fix:** Send RST when reclaiming, refresh the tick only after a segment is accepted, and base the timeout on the calibrated timer.
+- Status: Fixed — test: `lived_net::tests::rejected_tcp_segments_do_not_reset_idle_timer_and_rto_emits_rst`, `https_interop::https_tx_cap_backpressure_and_idle_rto_reclaim_slots` — commit: `9e097a5`
+
+### 10. A wrong-size device key silently downgrades to unprovisioned
+- **Where:** `target_enterprise_kernel/src/provisioning.rs:30-33,241-244`.
+- **Problem:** A 33-byte key (for example with a trailing newline) is treated as absent, with no log line. Seal and attestation keys then become boot-ephemeral, so previously sealed state no longer verifies.
+- **Fix:** Print a distinct `device key present but size=N` banner and refuse provisioned services, rather than downgrading quietly.
+- Status: Fixed — test: `tls_provider::tests::validate_fw_cfg_device_key_rejects_wrong_size_and_zero_keys` — commit: `9e097a5`
+
+### 11. `compose_kernel_rustflags` edge cases
+- **Where:** `factory_builder/src/lib.rs:286,455`.
 - **Problem:**
-  - A non-ASCII token header makes `hmac.compare_digest` raise, so the client gets a dropped connection instead of a 401.
-  - Bodies are read before authentication, with no size cap.
-  - A negative or non-numeric `Content-Length` reads to EOF or sends no response.
-- **Fix:** Compare bytes, or reject non-ASCII with 401. Authenticate first. Cap `Content-Length` and answer 400 or 413.
-- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests`, `tools/triad_controller.py::run_self_test`, `tools/cuttle_fleet.py::run_self_test` — commit: `beb3bfa`
+  - Inherited flags containing `aes_force_soft` are used as-is, so inheriting some of the cfgs but not all drops the rest, and the build stops at the new `compile_error!`.
+  - Any non-empty inherited `RUSTFLAGS` now wipes the dependency caches.
+  - `CARGO_ENCODED_RUSTFLAGS` isn't removed, and if set it would override everything, including `--cfg cuttle_prod`.
+- **Fix:** Add each missing cfg individually, wipe caches only for seeded builds, `env_remove("CARGO_ENCODED_RUSTFLAGS")`, and add a partial-cfg test.
+- Status: Fixed — test: `factory_builder::tests::compose_kernel_rustflags_fills_in_partial_inherited_soft_float_cfgs` — commit: `e76900c`
 
-### 23. Secret files are silently truncated or replaced
-- **Where:** `tools/cuttle_fleet.py:146-154` and `tools/triad_controller.py:341-346`.
-- **Problem:** A longer file is cut to size without notice. A short or corrupt file is silently replaced with a new random key.
-- **Effect:** Replacing a master key changes every derived node key, so that client's sealed data becomes unreadable.
-- **Fix:** Refuse to start on a malformed secret file, and alarm.
-- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests`, `tools/cuttle_fleet.py::run_fleet_unit_tests` — commit: `beb3bfa`
+### 12. Small kernel-crypto items
+- **Where:** `tls_provider.rs:646-651` and `provisioning.rs:317-321`.
+- **Problem:** `sign_der` uses `.expect` on its self-verification, so a failure halts the kernel instead of taking the `HTTPS DISABLED` path. The plain loop that zeroes `hw_words` may be optimized away.
+- **Fix:** Return a `Result` from `sign_der`, and use `zeroize` for `hw_words`.
+- Status: Fixed — test: `tls_provider::tests::self_test_passes`, `tls_kat::provider_known_answer_self_test` — commit: `9e097a5`
 
-### 24. TLS known-answer coverage is narrower than documented
-- **Where:** `tls_provider.rs:15-17` and `README.md:106`.
+### 13. Federation threshold counts distinct ids, not distinct keys
+- **Where:** `morph_engine/src/federation.rs:146-163,207-223`, the denylist at `:82-104`, and `attest.rs:1367-1378`.
+- **Problem:** Two roster entries with different ids and the same key both count toward the threshold. The denylist covers only RFC 8032 TEST 1 and 2, not TEST 3, 1024 or SHA(abc), and not the new test seeds. The primary key-file fallback never runs the fixture check.
+- **Fix:** Reject duplicate keys (compare decoded bytes) and count distinct verified keys. Complete the denylist, and apply it to the fallback key.
+- Status: Fixed — test: `federation::rejects_duplicate_signer_pubkey_and_test_seeds`, `attest::primary_key_file_fallback_rejects_fixture_seed` — commit: `e76900c`
+
+### 14. Heal robustness
+- **Where:** `tools/triad_controller.py:1673-1681`, `:1844-1860`, `:1237`, `:1579`.
 - **Problem:**
-  - The P-256 ECDH check (`tls_provider.rs:852-871`) only tests that two fixed keys agree; it isn't a published vector.
-  - The provider's own SHA-256, HMAC and HKDF objects have no direct vectors. The RFC 4231, 5869 and 8448 tests exercise `tls.rs`, which calls the `hkdf` crate directly.
-  - AES-GCM uses only test cases 1 and 2, with no AAD and no partial block.
-- **Fix:**
-  - Add the RFC 5903 §8.1 P-256 vector.
-  - Run the RFC 4231 and 5869 vectors through the provider's HMAC and HKDF objects.
-  - Add GCM test case 4.
-  - Correct the docs.
-- Status: Fixed — test: `provider_known_answer_self_test` — commit: `17f3d14`, `37f9d23`
+  - `_reset_sql_vote_tables` drops non-`kv` vote tables and relies on the WAL to recreate them, which fails after a WAL reset.
+  - The all-node adoption replay has no try/except, so a failure aborts boot after some tables were already dropped.
+  - Heals have no retry limit.
+  - If bounce returns early (fewer than two peers), the node stays HEALING.
+- **Fix:** Recreate tables from their schema, wrap the replay, cap heal attempts and raise an ALERT, and reset state on early returns.
+- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests` (schema recreation after WAL reset, early-return state restoration, and `MAX_CONSECUTIVE_HEALS = 3` cap) — commit: `64118bd`
 
-### 25. Host tests don't run the crypto backends the kernel ships
-- **Where:** The cfgs exist only in the kernel's config. `tls_kat` and `https_interop` run on the host's AES-NI, CLMUL and AVX2 backends.
-- **Fix:** Add a CI step that runs both test files with the five force-soft cfgs in `RUSTFLAGS`.
-- Status: Fixed — test: `soft_float_crypto_backends_pass_kats_and_golden_replay` — commit: `17f3d14`
+### 15. Secret-loader and cron migration
+- **Where:** `tools/cuttle_fleet.py:490`; `tools/triad_controller.py:168-198,581-591`.
+- **Problem:** All client tokens load in `Provider.__init__`, so one malformed client file stops the whole fleet. State-changing jobs in an existing `cron_jobs.json` are dropped without a log line.
+- **Fix:** Fail only the affected client, and log a WARN for each dropped cron job.
+- Status: Fixed — test: `tools/cuttle_fleet.py::run_fleet_unit_tests`, `tools/triad_controller.py::run_unit_self_tests` — commit: `64118bd`
 
-### 26. Crypto hardening gaps
-- **Where and problem:**
-  - **Zeroization:** `aes-gcm` is enabled without its zeroize features (`target_enterprise/Cargo.toml:31`). `seed_system_rng` (`tls_provider.rs:124-137`) and the TLS identity secret (`provisioning.rs:261-267`, `net_service.rs:514`) aren't cleared after use.
-  - **ECDSA:** signatures from `EcdsaP256Signer::sign` (`tls_provider.rs:606-613`) and the certificate self-signature (`https.rs:184`) aren't verified before release. The RFC 6979 nonces are deterministic and every morph variant signs the same certificate data, so one faulty signature from a mis-morphed build would leak the key.
-  - **Deterministic test provider:** `golden_provider`, `reset_golden_rng` and `golden_server` (`tls_provider.rs:141,702`; `https.rs:683-708`) are public in every build.
-  - **RNG state:** `KernelRng::reseed` and `SYSTEM_RNG` are public (`tls_provider.rs:84-86,113`). The generator is never reseeded and has no fast key erasure.
-  - **DER lengths:** the certificate encoder writes a wrong DER length above 0xFFFF (`https.rs:113`). That is unreachable today.
-- **Fix:**
-  - Enable the zeroize features, and wrap the secrets in `Zeroizing`.
-  - Verify each signature before releasing it, or use hedged signing.
-  - Gate the golden pieces behind `cfg(any(test, not(cuttle_prod)))`.
-  - Make `reseed` crate-private, rekey after each fill, and reseed periodically.
-  - Use the `der` crate, which is already in the lockfile, or reject oversize input.
-- Status: Fixed — test: `tls_provider::tests::kernel_rng_rekeys_after_every_fill`, `https::tests::der_panics_on_content_over_65535_bytes`, `provider_known_answer_self_test` — commit: `17f3d14`
-
-### 27. The kernel doesn't check the device key's length from fw_cfg (pre-existing; the TLS identity now depends on it)
-- **Where:** `provisioning.rs:27-28` says short entries return `None`, but `fw_cfg_select` (`main.rs:1080-1100`) discards the entry size, and the reader always takes 32 bytes.
-- **Effect:** A short key file is accepted as provisioned.
-- **Fix:** Return the size from `fw_cfg_select`, require exactly 32 bytes, and test the parse.
-- Status: Fixed — test: `tls_provider::tests::validate_fw_cfg_device_key_rejects_wrong_size_and_zero_keys` — commit: `17f3d14`
-
-### 28. HTTP request handling differs between ports, and HTTPS framing has gaps
-- **Where:**
-  - Port 80 silently truncates requests longer than 1 KiB (`lived_net.rs:1006-1010`, `n = inbound_payload.len().min(room)`; pre-existing). Port 443 accepts up to 16 KiB.
-  - A POST without `Content-Length` is treated as complete with whatever bytes have arrived (`lived_net.rs:2140`).
-  - An oversize request ends the TLS session without an HTTP 413.
-  - "Every HTTP route answers identically on :80 and :443" (`README.md:105`) is tested on `/healthz` only (`https_interop.rs:143-154`).
-- **Fix:** Reject oversize requests on both ports with 413. Require `Content-Length` on bodies. Run the identity test across the public routes, or soften the wording.
-- Status: Fixed — test: `http_and_https_reject_oversized_and_unframed_requests_and_match_across_routes` — commit: `17f3d14`, `37f9d23`, `a38eb08`
-
-### 29. The binmorphed boot in `qemu_smoke` asserts only 6 banners
-- **Where:** `factory_builder/tests/qemu_smoke.rs:994-1010`, which discards the `done` result and doesn't assert HALT.
-- **Problem:** The `04677dd` claim of "129/129 banners … including the 7-pass binmorphed kernel" overstates this. The 129 applies to the unmorphed boot only.
-- **Fix:** Assert the full banner list and HALT for the morphed boot, or correct the claim.
-- Status: Fixed — test: `boots_under_qemu_and_emits_banner` — commit: `17f3d14`
-
-### 30. Accelerator docs and fallback
-- **Where:** `README.md:176-178`, `run.bat:41-48`, `tools/triad_controller.py:557,661`.
+### 16. Console and fleet leftovers
+- **Where:** `tools/triad_console.html:1101`; `tools/cuttle_fleet.py:316-322`.
 - **Problem:**
-  - "Every launcher takes an accelerator" is untrue: four launchers still hard-code TCG.
-  - `run.bat auto` has no stuck-BIOS fallback, so on the hosts the README describes it can now hang where it used to boot.
-  - The accelerator reported per node is the one requested, not the one QEMU actually used.
-  - The "no guest output" check counts any line without `qemu-system` as guest output, and the self-test stubs it out.
-- **Fix:**
-  - Scope the README sentence.
-  - Default `run.bat` to `tcg`, or add the fallback.
-  - Report the accelerator QEMU actually uses.
-  - Match a guest-specific marker in the output check, and unit-test it against captured output.
-- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests` — commit: `beb3bfa`, `37f9d23`
+  - "Node UI :port" links point to ports that are no longer forwarded in fleet mode.
+  - The web job's synthetic load no longer generates HTTP requests.
+  - Old `localStorage` token keys are never removed, and Forget only clears `sessionStorage`.
+- **Fix:** Hide the links in fleet mode, restore HTTP load through the farm, and clear the legacy keys.
+- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests`, `tools/cuttle_fleet.py::run_fleet_unit_tests` — commit: `64118bd`
 
-### 31. Licensing notices
-- **Where:** `tools/third_party_notices.py:128-142`, `:147-187`, `:60-70`, `:223,236`; `README.md:212,217`; `NOTICE:6-7`.
-- **Problem:**
-  - The notices omit the bootloader stage crates themselves and never policy-check them. All five are MIT OR Apache-2.0 today.
-  - `spdx_allowed` accepts malformed or lowercase expressions such as `"MIT and GPL-3.0"`.
-  - README and NOTICE call `ucs2` the only non-permissive component, but every BIOS image also embeds the OFL-1.1 Noto font.
-  - The `ucs2` note says MPL-2.0 places "no obligation", then lists one (§3.2).
-  - `--check` depends on the caller's default toolchain and the unpinned nightly.
-- **Fix:**
-  - Add each stage's root package to the notices and the policy check.
-  - Fail if any tokens are left over after parsing.
-  - Qualify NOTICE ("except as noted in THIRD_PARTY_NOTICES.md") and mention the font in the README.
-  - Reword the MPL note.
-  - Run `rustc` from the kernel crate and leave the nightly version out of the compared text.
-- Status: Fixed — test: `tools/third_party_notices.py::run_self_test` — commit: `37f9d23`
+### 17. Serial reads can be cut short in the web-node vote
+- **Where:** `tools/triad_controller.py:1101` and `:1145`.
+- **Problem:** `_response_looks_complete` accepts output after one line plus 0.3 s. The `wfe` probe now sends 1+N commands per node, so a stall gives a partial read and a false fault, which wipes a healthy node. The `ls` regex also skips paths containing spaces.
+- **Fix:** Wait for the prompt, and confirm a mismatch with a second probe before healing.
+- **Confidence:** likely under load; not reproduced.
+- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests` (`_response_looks_complete` prompt requirement on `cat`/`ls`, `ls` paths with spaces, and 2-probe `wfe` confirmation) — commit: `64118bd`
 
-### 32. Smaller tooling items
-- `sibling_search_dirs` (`morph_engine/src/cycle.rs:569`) accepts any exe whose fourth ancestor directory is named `build`, so it can widen the search on non-cargo layouts. Match the full `<profile>/build/<pkg>/<hash>/<out|deps>` shape, and add a negative test.
-- `--self-test` deletes the real Triad state in `target/cuttle_images/triad` (`tools/triad_controller.py:2049-2061`). Use a temp `state_dir`.
-- The farm secret leaks into QEMU and binmorph children through the environment (`tools/cuttle_fleet.py:494`). Remove it from the environment after reading it.
-- `/api/morph/<nid>` and `/api/tamper/<nid>` (`tools/triad_controller.py:1979-1991`) don't range-check the id: `0` morphs OS-3. This is now reachable with client tokens through the proxy. Validate 1-3 and return 400.
-- The provider answers 404 for an unknown client before checking scope (`tools/cuttle_fleet.py:651-655`), so a client token can find out which client ids exist.
-- The WAL grows without bound under the default `synthetic_load = true` (`tools/fleet.toml:15`), and a heal replays the whole WAL while holding `wal_lock`. Add checkpointing, and default synthetic load off or move it to an unvoted table.
-- The "refused" checks in `tools/https_check.py` (`:176-179`) pass on a timeout. Assert a handshake alert instead.
-- Status: Fixed — test: `cycle::tests::sibling_search_dirs_rejects_non_cargo_build_ancestor`, `tools/triad_controller.py::run_unit_self_tests`, `tools/triad_controller.py::run_self_test`, `tools/cuttle_fleet.py::run_self_test`, `tools/https_check.py::run_self_test` — commit: `ef2c0ad`, `beb3bfa`
+### 18. `https_check.py` TLS 1.2 refusal check
+- **Where:** `tools/https_check.py:121`.
+- **Problem:** "no protocols available" is a client-side OpenSSL error, but the check treats it as the server refusing TLS 1.2.
+- **Fix:** Assert that a server alert was received.
+- Status: Fixed — test: `tools/https_check.py::run_self_test` — commit: `64118bd`
+
+### 19. Atomic WAL write
+- **Where:** `tools/triad_controller.py:201-210`.
+- **Problem:** On POSIX, the directory isn't fsynced after the rename, and temp files are left behind if a write fails.
+- **Fix:** fsync the directory, and clean up the temp file in a `finally`.
+- Status: Fixed — test: `tools/triad_controller.py::run_unit_self_tests` (`atomic_write_json` temp-file cleanup on write error) — commit: `64118bd`
+
+### 20. Tests that don't check what their names say
+- **`https_tx_cap_backpressure_and_idle_rto_reclaim_slots`** (`https_interop.rs:312`) never exercises the 16 KiB pause in `handle_https_slot`.
+- **The 413 test** (`:477`) overflows on its final chunk, so it never sends trailing bytes (see #3).
+- **`fixture_seeds_match_factory_keys_toml`** (`morph_engine/tests/federation.rs:311`) now asserts the opposite of its name, and pins `threshold == 1`, so it will fail as soon as co-signers are enrolled.
+- **The #20 contention test** (`triad_controller.py:3156-3158`) would also pass on the old code.
+- **Missing tests:** no test covers a heal after compaction, a crash after write-ahead, a two-node rollback, Windows secret ACLs, or partial inherited `RUSTFLAGS`.
+- **Fix:** Rename or extend these tests, and add the missing ones.
+- Status: Fixed — test: `https_interop::https_tx_cap_backpressure_and_idle_rto_reclaim_slots`, `https_interop::http_and_https_reject_oversized_and_unframed_requests_and_match_across_routes`, `federation::workspace_factory_keys_rejects_fixture_seeds_and_validates_threshold`, `factory_builder::tests::compose_kernel_rustflags_fills_in_partial_inherited_soft_float_cfgs`, `tools/triad_controller.py::run_unit_self_tests` — commit: `e76900c`, `9e097a5`, `64118bd`
+
+### 21. Docs and commit messages that overstate the code
+- **`README.md:105`** names `TlsEntropyStatus::Unseeded`, which doesn't exist.
+- **`README.md:106`** lists "AES-128-GCM NIST SP 800-38D Case 3", "P-256 ECDH CAVP" and "SHA-256 FIPS 180-4". The code uses GCM spec cases 1, 2 and 4, RFC 5903 §8.1, and has no standalone SHA-256 vector.
+- **`tests/tls_kat.rs:7`** still says "test cases 1–2".
+- **The `ef2c0ad` commit message** describes `SigningConfig` and `MorphConfig::with_test_signing_key()`, which don't exist in the tree.
+- **Audit label:** a 413 on port 443 is audited as `net:tls:rejected` (`lived_net.rs:1200-1207`).
+- **Fix:** Correct the text. Use a distinct audit label for oversized HTTP requests.
+- Status: Fixed — test: `https_interop::http_and_https_reject_oversized_and_unframed_requests_and_match_across_routes` (asserts `net:https:overflow` audit event on `:443` 413) — commit: `9e097a5`, `64118bd`
 
 ---
 
 ## Process notes
-- The round-4 status line named its test and commit, and the claim matched the code.
-- The commits from `5e504e8` onward carry `Co-Authored-By: Claude Opus 5.5`. `GEMINI.md` assigns building to Gemini and says "Neither of you grades your own work." If a Claude session built these, this review is less independent than the process intends. Confirm who the builder is.
-- Most of this round wasn't review-driven, and several commits are very large: `04677dd` replaces TLS, removes contracts (schema 59), adds a heap and locks new modules in one commit, and `2c2dd0a` adds 3,350 lines. `GEMINI.md` asks for small, focused commits; smaller commits would make regressions like #2, #3 and #4 easier to catch.
-- `c47de8f`, `2c2dd0a` and `9e34b6b` skipped the cargo checks with "No Rust changes". That is reasonable, but the GEMINI.md rule says to run all checks before every commit.
+- Every status line named its tests and commits, and the claims matched the code, with two caveats. #14 was honestly marked "Partly fixed" after the first attempt used published RFC 8032 keys. Several items marked Fixed have new follow-up defects, listed above.
+- The commits are again large and bundled (`beb3bfa` touches 1,200+ lines of the controller), and `GEMINI.md` asks for small, focused commits. The WAL compaction (#1) was added as part of a "growth" fix without a test of the property that matters, which is that a replay reproduces the majority's state.
+- The checkout was converted from CRLF to LF line endings during this round. That's fine, but say so in a commit message so future diffs are easy to read.
 
 ## Not reviewed this round
-- The kernel release build and `qemu_smoke`. These must be run on a machine with nightly before this round is accepted.
-- The Python self-tests (`triad_controller.py --self-test`, `cuttle_fleet.py --self-test`), WHPX behaviour, and any live VM. Everything above is from reading the code, apart from the workspace test run and a headless browser check of #21.
-- rustls internals beyond the unbuffered API's use in `https.rs`; the `x509.rs` parser.
-- `cargo deny` and `tools/license_check.ps1` weren't run, and the freshness of `THIRD_PARTY_NOTICES.md` wasn't checked.
-- Interrupt-time allocation and SMP use of the heap lock (`heap.rs:5-7`).
-- Carried over: the SQL owner-selection logic in `exec_as` in detail, the per-request `CPL=3` service hook in detail, CuttleGuard and CuttleChronos beyond earlier paths, the UDP `:8081` triad protocol, and `binmorph`.
+- The kernel build and `qemu_smoke` weren't run here. I read the builder's 22:22 serial logs instead.
+- The Python self-tests that need VMs or a built kernel (`run_unit_self_tests`, the live Triad and fleet self-tests), and `third_party_notices.py --self-test`.
+- Windows-specific behaviour: icacls results, file replace, and `-cpu max` under WHPX. These are from reading, not execution.
+- rustls key-material clean-up when a reclaimed session is dropped; heap use with 16 fully loaded slots (estimated at about 2 MB).
+- The rest of `triad_console.html`, and the provider's proxying and poll loop.
+- Carried over: the SQL owner-selection logic in `exec_as`, the per-request `CPL=3` service hook, CuttleGuard and CuttleChronos beyond earlier paths, the UDP `:8081` triad protocol, and `binmorph`.
