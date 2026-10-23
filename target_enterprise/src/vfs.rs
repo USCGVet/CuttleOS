@@ -1551,4 +1551,62 @@ mod tests {
             Err(FsError::NoSpace)
         );
     }
+
+    #[test]
+    fn growing_and_unlinking_middle_file_shifts_and_compacts_neighbors_intact() {
+        let mut fs = MemRamFs::<8, 512>::new();
+        fs.seed_file(b"/a", b"ALPHA-HEAD", 16, 10).unwrap();
+        fs.seed_file(b"/b", b"MID", 8, 20).unwrap();
+        fs.seed_file(b"/c", b"OMEGA-TAIL-99", 16, 30).unwrap();
+        assert_eq!(fs.pool_used, 40);
+
+        // 1. Grow the middle file `/b` past its 8-byte capacity twice (`8 -> 24 -> 64`)
+        // and verify `/a` before it and `/c` after it remain byte-for-byte intact.
+        let hb = fs.open(b"/b", FS_O_RDWR).unwrap();
+        let grown1 = b"MIDDLE-EXPANDED-24-BYTES";
+        assert_eq!(fs.write(hb, 0, grown1).unwrap(), 24);
+        assert_eq!(fs.pool_used, 40 + 16);
+        let grown2 = [b'M'; 64];
+        assert_eq!(fs.write(hb, 0, &grown2).unwrap(), 64);
+        fs.close(hb).unwrap();
+        assert_eq!(fs.pool_used, 40 + 56);
+
+        let mut buf = [0u8; 128];
+        let ha = fs.open(b"/a", FS_O_RDONLY).unwrap();
+        let na = fs.read(ha, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..na], b"ALPHA-HEAD");
+        fs.close(ha).unwrap();
+
+        let hb2 = fs.open(b"/b", FS_O_RDONLY).unwrap();
+        let nb = fs.read(hb2, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..nb], &grown2[..]);
+        fs.close(hb2).unwrap();
+
+        let hc = fs.open(b"/c", FS_O_RDONLY).unwrap();
+        let nc = fs.read(hc, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..nc], b"OMEGA-TAIL-99");
+        fs.close(hc).unwrap();
+
+        // 2. Unlink `/b` in the middle and verify `/c` shifts down to compact `pool_used`
+        // without corrupting `/a` or `/c`, and that a new file `/d` can claim the freed pool space.
+        fs.unlink(b"/b").unwrap();
+        assert_eq!(fs.pool_used, 32);
+        assert_eq!(fs.stat(b"/b"), Err(FsError::NotFound));
+
+        let ha = fs.open(b"/a", FS_O_RDONLY).unwrap();
+        let na = fs.read(ha, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..na], b"ALPHA-HEAD");
+        fs.close(ha).unwrap();
+
+        let hc = fs.open(b"/c", FS_O_RDONLY).unwrap();
+        let nc = fs.read(hc, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..nc], b"OMEGA-TAIL-99");
+        fs.close(hc).unwrap();
+
+        let hd = fs.open(b"/d", FS_O_CREATE | FS_O_RDWR).unwrap();
+        let payload_d = [b'D'; 460];
+        assert_eq!(fs.write(hd, 0, &payload_d).unwrap(), 460);
+        fs.close(hd).unwrap();
+        assert_eq!(fs.pool_used, 32 + 460);
+    }
 }

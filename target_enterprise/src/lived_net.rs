@@ -186,6 +186,7 @@ pub struct LivedNet {
     http_bufs: [alloc::vec::Vec<u8>; TCP_MAX_SLOTS],
     http_tx: [alloc::vec::Vec<u8>; TCP_MAX_SLOTS],
     slot_tls_buffered: [usize; TCP_MAX_SLOTS],
+    peak_tls_pending_tx: usize,
     tls_config: Option<Arc<ServerConfig>>,
     tls: [Option<Box<TlsSession>>; TCP_MAX_SLOTS],
 }
@@ -212,6 +213,7 @@ impl LivedNet {
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             slot_tls_buffered: [0usize; TCP_MAX_SLOTS],
+            peak_tls_pending_tx: 0,
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -244,6 +246,7 @@ impl LivedNet {
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             slot_tls_buffered: [0usize; TCP_MAX_SLOTS],
+            peak_tls_pending_tx: 0,
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -271,9 +274,16 @@ impl LivedNet {
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             slot_tls_buffered: [0usize; TCP_MAX_SLOTS],
+            peak_tls_pending_tx: 0,
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
+    }
+
+    /// Return the high-water mark of `TlsSession::pending_tx().len()` observed
+    /// across `handle_https_slot` runs.
+    pub fn peak_tls_pending_tx(&self) -> usize {
+        self.peak_tls_pending_tx
     }
 
     /// Configure the hardware-calibrated Local APIC timer interrupt frequency
@@ -1541,6 +1551,9 @@ impl LivedNet {
             }
             if session.plaintext().is_empty() && session.plaintext().capacity() > 4096 {
                 session.plaintext().shrink_to_fit();
+            }
+            if session.pending_tx().len() > self.peak_tls_pending_tx {
+                self.peak_tls_pending_tx = session.pending_tx().len();
             }
             self.slot_tls_buffered[idx] = session
                 .plaintext()
@@ -4269,8 +4282,12 @@ mod tests {
         let ack = build_tcp_frame(41000, 80, client_seq, server_seq, tcp_flags::ACK, b"");
         net.handle_frame(&ack, 1, &mut out);
 
-        // Send a segment carrying a valid GET plus a FIN.
-        let req1 = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        // Send a segment carrying 12 (> 8, the per-segment response cap) pipelined GET requests plus a FIN.
+        let single_req = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut req_burst = alloc::vec::Vec::new();
+        for _ in 0..12 {
+            req_burst.extend_from_slice(single_req);
+        }
         out = ReplySet::new();
         let fin_seg = build_tcp_frame(
             41000,
@@ -4278,23 +4295,74 @@ mod tests {
             client_seq,
             server_seq,
             tcp_flags::ACK | tcp_flags::PSH | tcp_flags::FIN,
-            req1,
+            &req_burst,
         );
         net.handle_frame(&fin_seg, 1, &mut out);
+        let client_after_fin = client_seq.wrapping_add(req_burst.len() as u32 + 1);
 
-        // Collect server response + FIN.
-        let mut saw_resp = false;
+        // First pass frames at most 8 requests in CloseWait and must NOT emit the server FIN yet.
+        let mut total_200 = 0usize;
+        let mut saw_server_fin = false;
         for i in 0..out.len() {
             let s = TcpImpl::parse_segment(&out.get(i).unwrap()[34..], GUEST_IP, peer_ip).unwrap();
             if !s.payload.is_empty() {
-                saw_resp = true;
+                total_200 += core::str::from_utf8(s.payload)
+                    .unwrap()
+                    .matches("HTTP/1.1 200 OK\r\n")
+                    .count();
                 server_seq = server_seq.wrapping_add(s.payload.len() as u32);
             }
             if s.flags & tcp_flags::FIN != 0 {
+                saw_server_fin = true;
                 server_seq = server_seq.wrapping_add(1);
             }
         }
-        assert!(saw_resp);
+        assert_eq!(
+            total_200, 8,
+            "first pass must pause at the 8-response per-segment cap"
+        );
+        assert!(
+            !saw_server_fin,
+            "server must not emit FIN while 4 pipelined requests remain queued in CloseWait"
+        );
+
+        // Send a bare ACK in CloseWait so the server drains the remaining 4 queued requests and then emits FIN.
+        out = ReplySet::new();
+        let drain_ack = build_tcp_frame(
+            41000,
+            80,
+            client_after_fin,
+            server_seq,
+            tcp_flags::ACK,
+            b"",
+        );
+        net.handle_frame(&drain_ack, 1, &mut out);
+        for i in 0..out.len() {
+            let s = TcpImpl::parse_segment(&out.get(i).unwrap()[34..], GUEST_IP, peer_ip).unwrap();
+            if !s.payload.is_empty() {
+                assert!(
+                    !saw_server_fin,
+                    "all pipelined HTTP responses must be emitted before the server's FIN"
+                );
+                total_200 += core::str::from_utf8(s.payload)
+                    .unwrap()
+                    .matches("HTTP/1.1 200 OK\r\n")
+                    .count();
+                server_seq = server_seq.wrapping_add(s.payload.len() as u32);
+            }
+            if s.flags & tcp_flags::FIN != 0 {
+                saw_server_fin = true;
+                server_seq = server_seq.wrapping_add(1);
+            }
+        }
+        assert_eq!(
+            total_200, 12,
+            "all 12 pipelined requests must be answered in CloseWait before server FIN"
+        );
+        assert!(
+            saw_server_fin,
+            "server must emit FIN once all 12 pipelined responses have drained"
+        );
 
         // Now test a second connection where client sends FIN first, then tries to smuggle payload in CloseWait:
         let syn2 = build_tcp_frame(41001, 80, 2000, 0, tcp_flags::SYN, b"");

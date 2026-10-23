@@ -370,17 +370,19 @@ fn https_tx_cap_backpressure_and_idle_rto_reclaim_slots() {
     );
 
     // 3. Exercise the 16 KiB HTTPS_TX_HIGH_WATER pause inside `handle_https_slot` over
-    // `LoopbackClient`: send 24 pipelined `GET /app` requests (~30 KiB of responses)
-    // across a single connection and verify that `handle_https_slot` pauses at the
-    // 8-response / 16 KiB high-water mark per segment, resumes as segments are ACKed,
-    // and delivers all 24 responses intact without overflowing `MAX_PLAINTEXT_BYTES`.
+    // `LoopbackClient`: send 60 pipelined `GET /app` requests (~75 KiB of responses,
+    // exceeding `https::MAX_TX_BYTES = 64 KiB`) across a single connection and verify
+    // that `handle_https_slot` pauses at `HTTPS_TX_HIGH_WATER` (never allowing
+    // `pending_tx` to exceed `HTTPS_TX_HIGH_WATER` plus one response), resumes as
+    // segments are ACKed, and delivers all 60 responses intact without overflowing
+    // `https::MAX_TX_BYTES`.
     let sh3 = Box::new(target_enterprise::OsShell::with_seal_key([0x33; 32]));
     let (mut lb3, id3) = live_server(Some(sh3), 50021);
     let mut c3 = ring_client(id3.cert_der(), "localhost");
     let mut w3 = Wire::new();
     w3.pump(&mut c3, &mut lb3).unwrap();
     let mut burst = Vec::new();
-    for _ in 0..24 {
+    for _ in 0..60 {
         burst.extend_from_slice(b"GET /app HTTP/1.1\r\nHost: localhost\r\n\r\n");
     }
     c3.writer().write_all(&burst).unwrap();
@@ -397,8 +399,19 @@ fn https_tx_cap_backpressure_and_idle_rto_reclaim_slots() {
     let burst_resp = String::from_utf8(burst_plain).unwrap();
     let ok_200 = burst_resp.matches("HTTP/1.1 200 OK\r\n").count();
     assert_eq!(
-        ok_200, 24,
-        "all 24 pipelined HTTPS /app responses (~30 KiB) must drain across HTTPS_TX_HIGH_WATER pauses; got {ok_200}"
+        ok_200, 60,
+        "all 60 pipelined HTTPS /app responses (> 64 KiB) must drain across HTTPS_TX_HIGH_WATER pauses; got {ok_200}"
+    );
+    assert!(
+        burst_resp.len() > https::MAX_TX_BYTES,
+        "total pipelined response payload ({}) must exceed MAX_TX_BYTES ({})",
+        burst_resp.len(),
+        https::MAX_TX_BYTES
+    );
+    let peak_tx = lb3.net().peak_tls_pending_tx();
+    assert!(
+        peak_tx <= target_enterprise::lived_net::HTTPS_TX_HIGH_WATER + 1500,
+        "peak TLS pending_tx ({peak_tx}) must never exceed HTTPS_TX_HIGH_WATER + one response"
     );
 }
 

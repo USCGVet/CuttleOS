@@ -127,20 +127,38 @@ def safe_token_eq(provided: str, expected: str) -> bool:
     return hmac.compare_digest(b_prov, b_exp)
 
 
+_WINDOWS_CURRENT_SID: str | None = None
+
+
+def _get_windows_current_sid() -> str:
+    """Resolve and cache the current Windows user's SID (`S-1-...`) via `whoami /user`."""
+    global _WINDOWS_CURRENT_SID
+    if _WINDOWS_CURRENT_SID:
+        return _WINDOWS_CURRENT_SID
+    res = subprocess.run(
+        ["whoami", "/user"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode == 0 and res.stdout:
+        m = re.search(r"(S-1-\d+(?:-\d+)+)", res.stdout)
+        if m:
+            _WINDOWS_CURRENT_SID = m.group(1)
+            return _WINDOWS_CURRENT_SID
+    raise OSError("cannot resolve current user SID via `whoami /user`")
+
+
 def restrict_file_permissions(path: Path) -> None:
-    """Restrict `path` to mode 0600 on POSIX or an explicit current-user-only ACL on Windows."""
+    """Restrict `path` to mode 0600 on POSIX or an explicit current-user-SID-only ACL on Windows."""
     try:
         os.chmod(path, 0o600)
     except OSError:
         pass
     if os.name == "nt":
-        user = os.environ.get("USERNAME")
-        domain = os.environ.get("USERDOMAIN")
-        principal = f"{domain}\\{user}" if domain and user else user
-        if not principal:
-            raise OSError(f"cannot restrict permissions on {path}: USERNAME is not set")
+        sid = _get_windows_current_sid()
         res = subprocess.run(
-            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{principal}:(F)"],
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"*{sid}:(F)"],
             capture_output=True,
             check=False,
         )
@@ -3685,6 +3703,22 @@ def run_unit_self_tests():
         assert acl_sizes_seen == [0], (
             f"restrict_file_permissions must run on empty tmp file (0 B) before writing secret bytes, saw {acl_sizes_seen}"
         )
+        if os.name == "nt":
+            expected_sid = _get_windows_current_sid()
+            acl_dump = acl_order_dir / "acl_sddl.txt"
+            save_res = subprocess.run(
+                ["icacls", str(acl_target), "/save", str(acl_dump)],
+                capture_output=True,
+                check=True,
+            )
+            assert save_res.returncode == 0
+            sddl_text = acl_dump.read_text(encoding="utf-16le", errors="replace")
+            assert f"D:PAI(A;;FA;;;{expected_sid})" in sddl_text, (
+                f"Expected exact current-user SID DACL D:PAI(A;;FA;;;{expected_sid}) in icacls /save output, got: {sddl_text!r}"
+            )
+        else:
+            mode = acl_target.stat().st_mode & 0o777
+            assert mode == 0o600, f"Expected POSIX mode 0600 on secret file, got {oct(mode)}"
 
         def fail_restrict(p: Path):
             raise OSError("icacls failed (simulated exit 1)")
@@ -4544,19 +4578,38 @@ def run_unit_self_tests():
         hm_ctrl.nodes[0].state = "ONLINE"
 
         # #20: Concurrent bounce_and_morph_node(1) during heal_and_remorph_node(2)'s SQL replay
-        #      cannot steal morph_op_lock or leave node 2 in HEALING
+        #      cannot steal morph_op_lock, while a concurrent execute_triad_sql write succeeds
+        #      without deadlocking (because wal_lock is not held during bulk snapshot replay)
+        #      and is applied to node 2 during the post-snapshot WAL tail catch-up.
         hm_rows[1].append(("k1", "v1", 1))
         hm_rows[3].append(("k1", "v1", 1))
         hm_ctrl.wal_entries = [(1, "INSERT OR REPLACE INTO kv VALUES ('k1', 'v1', 1)")]
         hm_ctrl.triad_tx_seq = 1
         contender_results = []
+        concurrent_sql_results = []
         orig_replay = hm_ctrl._replay_wal_entry
+        fired_contenders = False
 
         def replay_with_concurrent_morph(node, stmt):
+            nonlocal fired_contenders
             res = orig_replay(node, stmt)
-            t = threading.Thread(target=lambda: contender_results.append(hm_ctrl.bounce_and_morph_node(1)))
-            t.start()
-            t.join(timeout=2.0)
+            if not fired_contenders:
+                fired_contenders = True
+
+                def _contend():
+                    contender_results.append(hm_ctrl.bounce_and_morph_node(1))
+                    concurrent_sql_results.append(
+                        hm_ctrl.execute_triad_sql(
+                            "INSERT OR REPLACE INTO kv VALUES ('concurrent_heal_tx', 'ok', 2)"
+                        )
+                    )
+
+                t = threading.Thread(target=_contend)
+                t.start()
+                t.join(timeout=2.0)
+                assert not t.is_alive(), (
+                    "Concurrent execute_triad_sql deadlocked on wal_lock during heal_and_remorph_node snapshot replay"
+                )
             return res
 
         hm_ctrl._replay_wal_entry = replay_with_concurrent_morph
@@ -4569,9 +4622,19 @@ def run_unit_self_tests():
         assert contender_results == [False], (
             f"Concurrent bounce_and_morph_node(1) during heal must return False, got {contender_results}"
         )
+        assert len(concurrent_sql_results) == 1 and concurrent_sql_results[0].get("ok") is True, (
+            f"Concurrent execute_triad_sql during heal snapshot replay must succeed on 2/3 peers, got {concurrent_sql_results}"
+        )
         assert hm_ctrl.nodes[1].state == "ONLINE", (
             f"Node 2 stuck in {hm_ctrl.nodes[1].state} after concurrent morph contention"
         )
+        assert hm_ctrl.nodes[1].tx_seq == 2, (
+            f"Healed node 2 must catch up to tail tx_seq=2 committed during snapshot replay, got {hm_ctrl.nodes[1].tx_seq}"
+        )
+        for nid in (1, 2, 3):
+            assert ("concurrent_heal_tx", "ok", 2) in hm_rows[nid], (
+                f"Node {nid} missing concurrent tail write after heal_and_remorph_node: {hm_rows[nid]}"
+            )
 
         # #14.3: Consecutive heal cap isolates a persistently diverging node as OFFLINE after MAX_CONSECUTIVE_HEALS
         hm_ctrl.nodes[2].consecutive_heals = MAX_CONSECUTIVE_HEALS
