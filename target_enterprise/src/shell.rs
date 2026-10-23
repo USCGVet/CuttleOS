@@ -2644,7 +2644,7 @@ impl OsShell {
     }
 
     fn cmd_cat(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
-        let path = trim_ascii(arg);
+        let path = strip_shell_quotes(arg);
         if path.is_empty() {
             self.record_audit(8, AuditVerdict::Error, b"shell:cat:no-arg");
             return copy_into(b"usage: cat <path>\n", out);
@@ -2668,12 +2668,11 @@ impl OsShell {
     }
 
     fn cmd_cathex(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
-        let (path, rest) = split_first_word(trim_ascii(arg));
+        let (path, off_tok, len_tok) = split_cathex_args(arg);
         if path.is_empty() {
             self.record_audit(8, AuditVerdict::Error, b"shell:cathex:no-arg");
             return copy_into(b"usage: cathex <path> [offset] [len]\n", out);
         }
-        let (off_tok, len_tok) = split_first_word(trim_ascii(rest));
         let offset = if off_tok.is_empty() {
             0u64
         } else {
@@ -2737,9 +2736,7 @@ impl OsShell {
                 out,
             );
         }
-        let (path, rest) = split_first_word(trim_ascii(arg));
-        let (off_tok, hex_raw) = split_first_word(trim_ascii(rest));
-        let hex_tok = trim_ascii(hex_raw);
+        let (path, off_tok, hex_tok) = split_writehex_args(arg);
         if path.is_empty() || off_tok.is_empty() {
             self.record_audit(9, AuditVerdict::Error, b"shell:writehex:bad-args");
             return copy_into(b"usage: writehex <path> <offset> [hex]\n", out);
@@ -2818,7 +2815,7 @@ impl OsShell {
                 out,
             );
         }
-        let (path, content) = split_first_word(trim_ascii(arg));
+        let (path, content) = split_shell_path(arg);
         if path.is_empty() || content.is_empty() {
             self.record_audit(9, AuditVerdict::Error, b"shell:write:bad-args");
             return copy_into(b"usage: write <path> <text>\n", out);
@@ -2875,7 +2872,7 @@ impl OsShell {
                 out,
             );
         }
-        let path = trim_ascii(arg);
+        let path = strip_shell_quotes(arg);
         if path.is_empty() {
             self.record_audit(10, AuditVerdict::Error, b"shell:rm:no-arg");
             return copy_into(b"usage: rm <path>\n", out);
@@ -2901,7 +2898,7 @@ impl OsShell {
     }
 
     fn cmd_stat(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
-        let path = trim_ascii(arg);
+        let path = strip_shell_quotes(arg);
         if path.is_empty() {
             self.record_audit(11, AuditVerdict::Error, b"shell:stat:no-arg");
             return copy_into(b"usage: stat <path>\n", out);
@@ -4924,6 +4921,104 @@ fn split_first_word(s: &[u8]) -> (&[u8], &[u8]) {
     (first, rest)
 }
 
+fn split_last_word(s: &[u8]) -> (&[u8], &[u8]) {
+    let s = trim_ascii(s);
+    let mut i = s.len();
+    while i > 0 {
+        if s[i - 1] == b' ' || s[i - 1] == b'\t' {
+            return (trim_ascii(&s[..i - 1]), &s[i..]);
+        }
+        i -= 1;
+    }
+    (&[], s)
+}
+
+fn strip_shell_quotes(s: &[u8]) -> &[u8] {
+    let s = trim_ascii(s);
+    if s.len() >= 2
+        && ((s[0] == b'"' && s[s.len() - 1] == b'"')
+            || (s[0] == b'\'' && s[s.len() - 1] == b'\''))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+fn split_shell_path(s: &[u8]) -> (&[u8], &[u8]) {
+    let s = trim_ascii(s);
+    if s.len() >= 2 && (s[0] == b'"' || s[0] == b'\'') {
+        let q = s[0];
+        let mut i = 1usize;
+        while i < s.len() {
+            if s[i] == q {
+                return (&s[1..i], trim_ascii(&s[i + 1..]));
+            }
+            i += 1;
+        }
+        return (&[], s);
+    }
+    split_first_word(s)
+}
+
+fn split_cathex_args(arg: &[u8]) -> (&[u8], &[u8], &[u8]) {
+    let s = trim_ascii(arg);
+    if s.is_empty() {
+        return (&[], &[], &[]);
+    }
+    if s[0] == b'"' || s[0] == b'\'' {
+        let (path, rest) = split_shell_path(s);
+        let (off_tok, len_tok) = split_first_word(rest);
+        return (path, off_tok, len_tok);
+    }
+    let (p0, r0) = split_first_word(s);
+    if r0.is_empty() {
+        return (p0, &[], &[]);
+    }
+    let (o0, l0) = split_first_word(r0);
+    if parse_u64_ascii(o0).is_some()
+        && (l0.is_empty() || (parse_u64_ascii(l0).is_some() && split_first_word(l0).1.is_empty()))
+    {
+        return (p0, o0, l0);
+    }
+    let (before_last, last_tok) = split_last_word(s);
+    if !before_last.is_empty() && parse_u64_ascii(last_tok).is_some() {
+        let (before_prev, prev_tok) = split_last_word(before_last);
+        if !before_prev.is_empty() && parse_u64_ascii(prev_tok).is_some() {
+            return (before_prev, prev_tok, last_tok);
+        }
+        return (before_last, last_tok, &[]);
+    }
+    (p0, o0, l0)
+}
+
+fn split_writehex_args(arg: &[u8]) -> (&[u8], &[u8], &[u8]) {
+    let s = trim_ascii(arg);
+    if s.is_empty() {
+        return (&[], &[], &[]);
+    }
+    if s[0] == b'"' || s[0] == b'\'' {
+        let (path, rest) = split_shell_path(s);
+        let (off_tok, hex_raw) = split_first_word(rest);
+        return (path, off_tok, trim_ascii(hex_raw));
+    }
+    let (p0, r0) = split_first_word(s);
+    let (o0, h0) = split_first_word(r0);
+    let h0_trim = trim_ascii(h0);
+    if parse_u64_ascii(o0).is_some() && split_first_word(h0_trim).1.is_empty() {
+        return (p0, o0, h0_trim);
+    }
+    let (before_last, last_tok) = split_last_word(s);
+    let (before_prev, prev_tok) = split_last_word(before_last);
+    if !before_prev.is_empty() && parse_u64_ascii(prev_tok).is_some() {
+        return (before_prev, prev_tok, last_tok);
+    }
+    if !before_last.is_empty() && parse_u64_ascii(last_tok).is_some() {
+        return (before_last, last_tok, &[]);
+    }
+    (p0, o0, h0_trim)
+}
+
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -6331,7 +6426,30 @@ mod tests {
         let act = sh.exec_line(b"cathex /www/big.bin 256 64", 1, 0, 0, &mut out);
         assert!(out[..act.bytes_written()].starts_with(b"hex len=320 off=256 data="));
 
-        // 4. Role enforcement: `sql` role refuses `writehex`.
+        // 4. Quoted and unquoted paths with spaces round-trip.
+        let act = sh.exec_line(
+            b"writehex \"/www/my page.html\" 0 737061636520706174680a",
+            1,
+            0,
+            0,
+            &mut out,
+        );
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"wrote 11 bytes to /www/my page.html at offset 0\n"
+        );
+        let act = sh.exec_line(b"cathex \"/www/my page.html\" 0 64", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"hex len=11 off=0 data=737061636520706174680a\n"
+        );
+        let act = sh.exec_line(b"cathex /www/my page.html 0 64", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"hex len=11 off=0 data=737061636520706174680a\n"
+        );
+
+        // 5. Role enforcement: `sql` role refuses `writehex`.
         sh.svc.set_role(crate::svc_runtime::NodeRole::Sql, &mut sh.audit);
         let act = sh.exec_line(b"writehex /www/blocked 0 41", 1, 0, 0, &mut out);
         assert_eq!(

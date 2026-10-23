@@ -305,6 +305,81 @@ def is_readonly_shell_command(s: str) -> bool:
     return False
 
 
+# Shared definitions matching `target_enterprise/src/shell.rs` (`cmd_cathex` / `cmd_writehex`).
+CATHEX_REPLY_RE = re.compile(r"^hex len=(\d+) off=(\d+) data=([0-9a-fA-F]*)$")
+WRITEHEX_REPLY_RE = re.compile(r"^wrote (\d+) bytes to (.+) at offset (\d+)$")
+
+
+def quote_shell_path(fpath: str) -> str:
+    """Quote a VFS path containing whitespace for `cathex` / `writehex` commands."""
+    if " " in fpath or "\t" in fpath:
+        return f'"{fpath}"'
+    return fpath
+
+
+def format_kernel_cathex_reply(total_len: int, offset: int, chunk: bytes) -> str:
+    """Format a `cathex` reply line exactly as `OsShell::cmd_cathex` (`shell.rs:2714`) emits."""
+    return f"hex len={total_len} off={offset} data={chunk.hex()}"
+
+
+def format_kernel_writehex_reply(written: int, fpath: str, offset: int) -> str:
+    """Format a `writehex` reply line exactly as `OsShell::cmd_writehex` (`shell.rs:2795`) emits."""
+    return f"wrote {written} bytes to {fpath} at offset {offset}"
+
+
+class RealOsShellHarness:
+    """Drives 3 real `target_enterprise::OsShell` instances via `examples/shell_harness.rs`."""
+
+    def __init__(self):
+        exe_name = "shell_harness.exe" if os.name == "nt" else "shell_harness"
+        candidates = [
+            ROOT / "target" / "debug" / "examples" / exe_name,
+            ROOT / "target" / "release" / "examples" / exe_name,
+        ]
+        exe = next((p for p in candidates if p.exists()), None)
+        if exe is None:
+            subprocess.run(
+                ["cargo", "build", "-p", "target_enterprise", "--example", "shell_harness", "--quiet"],
+                cwd=str(ROOT),
+                check=True,
+            )
+            exe = next((p for p in candidates if p.exists()), None)
+            if exe is None:
+                raise RuntimeError("Failed to locate built shell_harness binary")
+        self.proc = subprocess.Popen(
+            [str(exe)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        self._lock = threading.Lock()
+
+    def exec(self, node, cmd: str, timeout: float = 4.0) -> str:
+        with self._lock:
+            assert self.proc.stdin is not None and self.proc.stdout is not None
+            self.proc.stdin.write(f"{node.node_id}\t{cmd}\n")
+            self.proc.stdin.flush()
+            line = self.proc.stdout.readline()
+            return bytes.fromhex(line.strip()).decode("utf-8", errors="replace").strip()
+
+    def reset_node(self, node_id: int) -> None:
+        with self._lock:
+            assert self.proc.stdin is not None and self.proc.stdout is not None
+            self.proc.stdin.write(f"{node_id}\t__reset__\n")
+            self.proc.stdin.flush()
+            self.proc.stdout.readline()
+
+    def close(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3.0)
+            except Exception:
+                self.proc.kill()
+
+
+
 def find_qemu() -> str:
     q = shutil.which("qemu-system-x86_64")
     if q:
@@ -1258,8 +1333,10 @@ class TriadController:
             return "role=" in joined or "error:" in joined
         if c == "status":
             return "net_tx=" in joined or "error:" in joined
+        if c.startswith("cathex "):
+            return "hex len=" in joined or "error:" in joined or "usage:" in joined
         if c.startswith("writehex "):
-            return "writehex:" in joined or "error:" in joined
+            return ("wrote " in joined and " at offset " in joined) or "error:" in joined or "usage:" in joined
         return False
 
     @staticmethod
@@ -1305,32 +1382,25 @@ class TriadController:
         """
         Read `fpath` from `node` in 128-byte chunks via `cathex <path> <offset> <len>` so
         empty, multi-line, UTF-8, and binary files are read losslessly without serial framing
-        ambiguity. Verifies the final byte length matches `total_size` (and `expected_len` if
-        given). Falls back to `cat` only if a unit-test stub does not implement `cathex`.
+        ambiguity. Parses the kernel's `hex len=<N> off=<O> data=<hex>` output (`CATHEX_REPLY_RE`)
+        and verifies the final byte length matches `total_size` (and `expected_len` if given).
         """
         chunk_size = 128
         offset = 0
         buf = bytearray()
         total_size: int | None = None
+        qpath = quote_shell_path(fpath)
         while True:
-            out = self.send_shell_cmd(node, f"cathex {fpath} {offset} {chunk_size}", timeout=3.0)
-            if out.lower().startswith("error"):
+            out = self.send_shell_cmd(node, f"cathex {qpath} {offset} {chunk_size}", timeout=3.0)
+            if out.lower().startswith("error") or out.lower().startswith("usage"):
                 return None
-            m = re.match(r"^(\d+)(?:\s+([0-9a-fA-F]*))?$", out.strip())
+            m = CATHEX_REPLY_RE.match(out.strip())
             if not m:
-                # Fallback for simple unit-test mocks that only handle `cat <path>`
-                if offset == 0:
-                    cat_out = self.send_shell_cmd(node, f"cat {fpath}", timeout=3.0)
-                    if cat_out.lower().startswith("error"):
-                        return None
-                    raw = cat_out.encode("utf-8") if isinstance(cat_out, str) else bytes(cat_out)
-                    if expected_len is not None and len(raw) != expected_len:
-                        return None
-                    return raw
                 return None
             reported_total = int(m.group(1))
-            hex_part = m.group(2) or ""
-            if len(hex_part) % 2 != 0:
+            reported_off = int(m.group(2))
+            hex_part = m.group(3) or ""
+            if reported_off != offset or len(hex_part) % 2 != 0:
                 return None
             chunk = bytes.fromhex(hex_part)
             if total_size is None:
@@ -1350,37 +1420,26 @@ class TriadController:
     def _write_node_file_bytes(self, node: TriadNode, fpath: str, data: bytes) -> bool:
         """
         Write arbitrary `data` (including empty, multi-line, UTF-8, or binary bytes) to `fpath`
-        on `node` in 96-byte chunks via `writehex <path> <offset> <hex>`, then verify the
-        written size and SHA-256 digest on `node`.
+        on `node` in 96-byte chunks via `writehex <path> <offset> <hex>`, verifying the kernel's
+        `wrote <N> bytes to <path> at offset <O>` reply (`WRITEHEX_REPLY_RE`) on each chunk as
+        well as the post-write size and SHA-256 digest on `node`.
         """
         chunk_size = 96
+        qpath = quote_shell_path(fpath)
         if len(data) == 0:
-            out = self.send_shell_cmd(node, f"writehex {fpath} 0", timeout=3.0)
-            if out.lower().startswith("error") or ("writehex:" not in out and out != "ok"):
+            out = self.send_shell_cmd(node, f"writehex {qpath} 0", timeout=3.0)
+            m = WRITEHEX_REPLY_RE.match(out.strip())
+            if not m or int(m.group(1)) != 0 or m.group(2) != fpath or int(m.group(3)) != 0:
                 return False
         else:
             offset = 0
-            used_fallback = False
             while offset < len(data):
                 chunk = data[offset : offset + chunk_size]
-                out = self.send_shell_cmd(node, f"writehex {fpath} {offset} {chunk.hex()}", timeout=3.0)
-                if out.lower().startswith("error"):
-                    return False
-                if "writehex:" not in out and offset == 0:
-                    # Fallback for simple unit-test mocks that only handle `write <path> <text>`
-                    try:
-                        txt = data.decode("utf-8")
-                    except UnicodeDecodeError:
-                        return False
-                    if is_printable_ascii_command(txt):
-                        self.send_shell_cmd(node, f"write {fpath} {txt}", timeout=3.0)
-                        used_fallback = True
-                        break
+                out = self.send_shell_cmd(node, f"writehex {qpath} {offset} {chunk.hex()}", timeout=3.0)
+                m = WRITEHEX_REPLY_RE.match(out.strip())
+                if not m or int(m.group(1)) != len(chunk) or m.group(2) != fpath or int(m.group(3)) != offset:
                     return False
                 offset += len(chunk)
-            if used_fallback:
-                actual = self._read_node_file_bytes(node, fpath, expected_len=len(data))
-                return actual == data
         actual = self._read_node_file_bytes(node, fpath, expected_len=len(data))
         return actual is not None and len(actual) == len(data) and (
             hashlib.sha256(actual).digest() == hashlib.sha256(data).digest()
@@ -3421,8 +3480,9 @@ def run_unit_self_tests():
         assert rn.state == "OFFLINE", f"Node must remain OFFLINE when role application fails, got {rn.state}"
         assert any(e["level"] == "ALERT" and "failed to apply role" in e["msg"] for e in role_ctrl.events)
 
-        # #11, #4, #17: wfe _state_probe & _sync_files_from_peer handle multi-line HTML, empty,
-        #               multi-chunk binary/UTF-8, and filenames with spaces via cathex/writehex
+        # #11, #4, #17: wfe _state_probe & _sync_files_from_peer handle default newline-terminated
+        #               files, multi-line HTML, empty, multi-chunk binary/UTF-8, and filenames with
+        #               spaces via cathex/writehex against the REAL Rust `OsShell` (`shell_harness`).
         wfe_dir = tmp_dir / "wfe_probe"
         wfe_ctrl = TriadController(
             show_gui=False,
@@ -3430,71 +3490,113 @@ def run_unit_self_tests():
         )
         wfe_ctrl.shutdown()
         multiline_html = b"<h1>hello</h1>\n<p>world</p>\n" + (b"<!-- pad -->\n" * 16)
-        fake_fs: dict[int, dict[str, bytes]] = {
-            1: {"/index.html": multiline_html, "/empty.txt": b"", "/my page.html": b"space path\n"},
-            2: {"/index.html": b"corrupted", "/empty.txt": b"nonempty", "/my page.html": b"tampered"},
-            3: {"/index.html": multiline_html, "/empty.txt": b"", "/my page.html": b"space path\n"},
-        }
         for n in wfe_ctrl.nodes:
             n.state = "ONLINE"
 
-        def fake_wfe_cmd(node, cmd, timeout=4.0):
-            fs = fake_fs[node.node_id]
-            if cmd == "ls":
-                return "\n".join(f"{p} ({len(c)} B)" for p, c in sorted(fs.items()))
-            if cmd.startswith("cathex "):
-                rest = cmd[len("cathex ") :].strip()
-                m_ch = re.match(r"^(.+?)\s+(\d+)\s+(\d+)$", rest)
-                if m_ch:
-                    p, off, ln = m_ch.group(1), int(m_ch.group(2)), int(m_ch.group(3))
-                    if p not in fs:
-                        return "error: file not found"
-                    b = fs[p]
-                    return f"{len(b)} {b[off : off + ln].hex()}"
-                if rest in fs:
-                    b = fs[rest]
-                    return f"{len(b)} {b.hex()}"
-                return "error: file not found"
-            if cmd.startswith("writehex "):
-                rest = cmd[len("writehex ") :].strip()
-                m_wh = re.match(r"^(.+?)\s+(\d+)(?:\s+([0-9a-fA-F]*))?$", rest)
-                if not m_wh:
-                    return "error: usage"
-                p = m_wh.group(1)
-                off = int(m_wh.group(2))
-                raw = bytes.fromhex(m_wh.group(3) or "")
-                if off == 0 or p not in fs:
-                    fs[p] = raw
-                else:
-                    cur = bytearray(fs[p])
-                    if off == len(cur):
-                        cur.extend(raw)
-                    else:
-                        cur[off : off + len(raw)] = raw
-                    fs[p] = bytes(cur)
-                return f"writehex: {len(raw)} bytes at +{off} -> {p} (total={len(fs[p])} B)"
-            if cmd.startswith("cat "):
-                p = cmd[4:].strip()
-                return fs.get(p, b"").decode("utf-8", errors="replace")
-            return "sync: ok"
+        wfe_harness = RealOsShellHarness()
+        try:
+            wfe_ctrl.send_shell_cmd = wfe_harness.exec
+            # Verify shared format helpers match the real Rust `OsShell` output byte-for-byte.
+            raw_wh = wfe_harness.exec(wfe_ctrl.nodes[0], "writehex /check.bin 0 414243")
+            assert raw_wh == format_kernel_writehex_reply(3, "/check.bin", 0), (
+                f"format_kernel_writehex_reply drifted from OsShell: {raw_wh!r}"
+            )
+            raw_ch = wfe_harness.exec(wfe_ctrl.nodes[0], "cathex /check.bin 0 64")
+            assert raw_ch == format_kernel_cathex_reply(3, 0, b"ABC"), (
+                f"format_kernel_cathex_reply drifted from OsShell: {raw_ch!r}"
+            )
+            for nid in (1, 2, 3):
+                wfe_harness.reset_node(nid)
 
-        wfe_ctrl.send_shell_cmd = fake_wfe_cmd
-        assert not wfe_ctrl._response_looks_complete("cat /index.html", ["<h1>hello</h1>"]), (
-            "cat must wait for prompt rather than completing on first line (#4.2)"
-        )
-        assert not wfe_ctrl._response_looks_complete("ls", ["/index.html (28 B)"]), (
-            "ls must wait for prompt rather than completing on first line (#4.2)"
-        )
-        p1 = wfe_ctrl._state_probe(wfe_ctrl.nodes[0])
-        p2 = wfe_ctrl._state_probe(wfe_ctrl.nodes[1])
-        p3 = wfe_ctrl._state_probe(wfe_ctrl.nodes[2])
-        assert p1 is not None and p1 == p3 and p1 != p2, "wfe _state_probe must detect content changes"
-        assert "/my page.html" in p1, f"wfe _state_probe skipped filename with space: {p1}"
-        assert wfe_ctrl._sync_files_from_peer(wfe_ctrl.nodes[1], wfe_ctrl.nodes[0])
-        assert fake_fs[2]["/index.html"] == multiline_html
-        assert fake_fs[2]["/empty.txt"] == b""
-        assert fake_fs[2]["/my page.html"] == b"space path\n"
-        assert wfe_ctrl._state_probe(wfe_ctrl.nodes[1]) == p1
+            for idx in (0, 2):
+                assert wfe_ctrl._write_node_file_bytes(wfe_ctrl.nodes[idx], "/index.html", multiline_html)
+                assert wfe_ctrl._write_node_file_bytes(wfe_ctrl.nodes[idx], "/empty.txt", b"")
+                assert wfe_ctrl._write_node_file_bytes(wfe_ctrl.nodes[idx], "/my page.html", b"space path\n")
+            assert wfe_ctrl._write_node_file_bytes(wfe_ctrl.nodes[1], "/index.html", b"corrupted")
+            assert wfe_ctrl._write_node_file_bytes(wfe_ctrl.nodes[1], "/empty.txt", b"nonempty")
+            assert wfe_ctrl._write_node_file_bytes(wfe_ctrl.nodes[1], "/my page.html", b"tampered")
+
+            assert not wfe_ctrl._response_looks_complete("cat /index.html", ["<h1>hello</h1>"]), (
+                "cat must wait for prompt rather than completing on first line (#4.2)"
+            )
+            assert not wfe_ctrl._response_looks_complete("ls", ["/index.html (28 B)"]), (
+                "ls must wait for prompt rather than completing on first line (#4.2)"
+            )
+            assert wfe_ctrl._response_looks_complete("cathex /index.html 0 128", [raw_ch])
+            assert wfe_ctrl._response_looks_complete("writehex /index.html 0 414243", [raw_wh])
+
+            p1 = wfe_ctrl._state_probe(wfe_ctrl.nodes[0])
+            p2 = wfe_ctrl._state_probe(wfe_ctrl.nodes[1])
+            p3 = wfe_ctrl._state_probe(wfe_ctrl.nodes[2])
+            assert p1 is not None and p1 == p3 and p1 != p2, "wfe _state_probe must detect content changes"
+            assert "/etc/hostname" in p1 and "/my page.html" in p1, (
+                f"wfe _state_probe missing default or space-named files: {p1}"
+            )
+            assert wfe_ctrl._sync_files_from_peer(wfe_ctrl.nodes[1], wfe_ctrl.nodes[0])
+            assert wfe_ctrl._read_node_file_bytes(wfe_ctrl.nodes[1], "/index.html") == multiline_html
+            assert wfe_ctrl._read_node_file_bytes(wfe_ctrl.nodes[1], "/empty.txt") == b""
+            assert wfe_ctrl._read_node_file_bytes(wfe_ctrl.nodes[1], "/my page.html") == b"space path\n"
+            assert wfe_ctrl._state_probe(wfe_ctrl.nodes[1]) == p1
+
+            # Verify /api/sh enforces auth (401 without token) and read-only policy (`writehex` -> 403,
+            # `cathex` -> 200) across every node role (`full`, `wfe`, `sql`, `gw`).
+            for role_name in ("full", "wfe", "sql", "gw"):
+                sh_role_dir = tmp_dir / f"sh_role_{role_name}"
+                sh_role_ctrl = TriadController(
+                    show_gui=False,
+                    spec=TriadSpec(
+                        name=f"sh-{role_name}",
+                        state_dir=sh_role_dir,
+                        role=role_name,
+                        write_operator_token=False,
+                    ),
+                )
+                sh_role_ctrl.shutdown()
+                for n in sh_role_ctrl.nodes:
+                    n.state = "ONLINE"
+                sh_role_ctrl.send_shell_cmd = wfe_harness.exec
+                handler_cls = type("RoleShHandler", (TriadHttpHandler,), {"ctrl": sh_role_ctrl})
+                srv = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+                srv_port = srv.server_address[1]
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                try:
+                    for cmd_bytes in (b"cathex /etc/hostname 0 64", b"writehex /var/x 0 4142"):
+                        req_unauth = urllib.request.Request(
+                            f"http://127.0.0.1:{srv_port}/api/sh",
+                            data=cmd_bytes,
+                            method="POST",
+                        )
+                        try:
+                            urllib.request.urlopen(req_unauth, timeout=3.0)
+                            raise AssertionError(f"role={role_name}: unauthenticated /api/sh {cmd_bytes!r} must return 401")
+                        except urllib.error.HTTPError as e:
+                            assert e.code == 401, f"role={role_name}: expected 401, got {e.code}"
+                    req_wh = urllib.request.Request(
+                        f"http://127.0.0.1:{srv_port}/api/sh",
+                        data=b"writehex /var/x 0 4142",
+                        headers={"X-Session-Token": sh_role_ctrl.coordinator_token},
+                        method="POST",
+                    )
+                    try:
+                        urllib.request.urlopen(req_wh, timeout=3.0)
+                        raise AssertionError(f"role={role_name}: /api/sh writehex must return 403")
+                    except urllib.error.HTTPError as e:
+                        assert e.code == 403, f"role={role_name}: expected 403 for writehex, got {e.code}"
+                    req_ch = urllib.request.Request(
+                        f"http://127.0.0.1:{srv_port}/api/sh",
+                        data=b"cathex /etc/hostname 0 64",
+                        headers={"X-Session-Token": sh_role_ctrl.coordinator_token},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req_ch, timeout=3.0) as resp:
+                        assert resp.status == 200
+                        ch_data = json.loads(resp.read().decode("utf-8"))
+                        assert ch_data["ok"] and all("hex len=10 off=0 data=" in v for v in ch_data["per_node"].values())
+                finally:
+                    srv.shutdown()
+                    srv.server_close()
+        finally:
+            wfe_harness.close()
 
         # #3: Multi-table heal (vote_tables=("kv", "idx")) resets all tables in spec.vote_tables
         idx_dir = tmp_dir / "idx_heal"

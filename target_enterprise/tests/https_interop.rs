@@ -448,6 +448,22 @@ fn every_mutating_endpoint_and_node_role_enforces_auth_over_https() {
             b"POST /sh HTTP/1.1\r\nHost: localhost\r\nX-Session-Token: deadbeefdeadbeefdeadbeefdeadbeef\r\nContent-Length: 14\r\n\r\nwrite /var/x 1",
         ),
         (
+            "POST /sh writehex (no token)",
+            b"POST /sh HTTP/1.1\r\nHost: localhost\r\nContent-Length: 22\r\n\r\nwritehex /var/x 0 4142",
+        ),
+        (
+            "POST /sh writehex (wrong token)",
+            b"POST /sh HTTP/1.1\r\nHost: localhost\r\nX-Session-Token: deadbeefdeadbeefdeadbeefdeadbeef\r\nContent-Length: 22\r\n\r\nwritehex /var/x 0 4142",
+        ),
+        (
+            "POST /sh cathex (no token)",
+            b"POST /sh HTTP/1.1\r\nHost: localhost\r\nContent-Length: 25\r\n\r\ncathex /etc/hostname 0 64",
+        ),
+        (
+            "POST /sh cathex (wrong token)",
+            b"POST /sh HTTP/1.1\r\nHost: localhost\r\nX-Session-Token: deadbeefdeadbeefdeadbeefdeadbeef\r\nContent-Length: 25\r\n\r\ncathex /etc/hostname 0 64",
+        ),
+        (
             "POST /exec (no token)",
             b"POST /exec HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\n/bin/fib 12",
         ),
