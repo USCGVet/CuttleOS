@@ -1999,66 +1999,89 @@ class TriadController:
 
             per_node = {}
             accepted_nodes = []
-            for n in online_nodes:
-                try:
-                    out = self.send_shell_cmd(n, f"sql /*triad*/ {q}")
-                except ValueError as e:
+            required_quorum = (len(online_nodes) // 2) + 1
+            try:
+                for n in online_nodes:
+                    try:
+                        out = self.send_shell_cmd(n, f"sql /*triad*/ {q}")
+                    except ValueError as e:
+                        if self.wal_entries and self.wal_entries[-1][0] == tx_id:
+                            self.wal_entries.pop()
+                        self.triad_tx_seq = prev_tx_seq
+                        self.wal_pending_tx = None
+                        self.wal_pending_pre_digest = ""
+                        for acc in accepted_nodes:
+                            self._rebuild_node_sql_from_committed_wal_locked(acc)
+                        self._save_wal_to_disk()
+                        return {
+                            "ok": False,
+                            "error": f"rejected: {e}",
+                            "output": f"error: {e}",
+                            "quorum": "0/3",
+                        }
+                    per_node[n.name] = out
+                    low_out = out.strip().lower()
+                    if (
+                        low_out
+                        and "error:" not in low_out
+                        and "unknown command" not in low_out
+                        and "usage:" not in low_out
+                    ):
+                        accepted_nodes.append(n)
+
+                primary_out = next(iter(per_node.values()), "")
+                if len(accepted_nodes) < required_quorum:
                     if self.wal_entries and self.wal_entries[-1][0] == tx_id:
                         self.wal_entries.pop()
                     self.triad_tx_seq = prev_tx_seq
                     self.wal_pending_tx = None
                     self.wal_pending_pre_digest = ""
+                    for n in accepted_nodes:
+                        self._rebuild_node_sql_from_committed_wal_locked(n)
                     self._save_wal_to_disk()
+                    err_out = next(
+                        (v for k, v in per_node.items() if "error:" in v.lower()),
+                        primary_out or "error: SQL statement rejected by online majority",
+                    )
                     return {
                         "ok": False,
-                        "error": f"rejected: {e}",
-                        "output": f"error: {e}",
-                        "quorum": "0/3",
+                        "error": err_out,
+                        "output": err_out,
+                        "quorum": f"{len(accepted_nodes)}/{len(online_nodes)} online nodes accepted",
+                        "per_node": per_node,
                     }
-                per_node[n.name] = out
-                low_out = out.strip().lower()
-                if (
-                    low_out
-                    and "error:" not in low_out
-                    and "unknown command" not in low_out
-                    and "usage:" not in low_out
-                ):
-                    accepted_nodes.append(n)
 
-            required_quorum = (len(online_nodes) // 2) + 1
-            primary_out = next(iter(per_node.values()), "")
-            if len(accepted_nodes) < required_quorum:
-                if self.wal_entries and self.wal_entries[-1][0] == tx_id:
-                    self.wal_entries.pop()
-                self.triad_tx_seq = prev_tx_seq
                 self.wal_pending_tx = None
                 self.wal_pending_pre_digest = ""
                 for n in accepted_nodes:
-                    self._rebuild_node_sql_from_committed_wal_locked(n)
-                self._save_wal_to_disk()
-                err_out = next(
-                    (v for k, v in per_node.items() if "error:" in v.lower()),
-                    primary_out or "error: SQL statement rejected by online majority",
-                )
-                return {
-                    "ok": False,
-                    "error": err_out,
-                    "output": err_out,
-                    "quorum": f"{len(accepted_nodes)}/{len(online_nodes)} online nodes accepted",
-                    "per_node": per_node,
-                }
-
-            self.wal_pending_tx = None
-            self.wal_pending_pre_digest = ""
-            for n in accepted_nodes:
-                self.send_shell_cmd(n, "sync")
-                n.tx_seq = tx_id
-            fp = self._state_fingerprint(accepted_nodes[0])
-            if fp:
-                self.triad_state_digest = fp
-                for n in accepted_nodes:
-                    n.state_digest = fp
-            self._save_wal_to_disk()  # persist committed status, each node's applied tx_seq, and state digest
+                    self.send_shell_cmd(n, "sync")
+                    n.tx_seq = tx_id
+                fp = self._state_fingerprint(accepted_nodes[0])
+                if fp:
+                    self.triad_state_digest = fp
+                    for n in accepted_nodes:
+                        n.state_digest = fp
+                self._save_wal_to_disk()  # persist committed status, each node's applied tx_seq, and state digest
+            finally:
+                if self.wal_pending_tx == tx_id:
+                    self.wal_pending_tx = None
+                    self.wal_pending_pre_digest = ""
+                    if len(accepted_nodes) >= required_quorum:
+                        for n in accepted_nodes:
+                            n.tx_seq = tx_id
+                    else:
+                        if self.wal_entries and self.wal_entries[-1][0] == tx_id:
+                            self.wal_entries.pop()
+                        self.triad_tx_seq = prev_tx_seq
+                        for n in accepted_nodes:
+                            try:
+                                self._rebuild_node_sql_from_committed_wal_locked(n)
+                            except Exception:
+                                pass
+                    try:
+                        self._save_wal_to_disk()
+                    except Exception:
+                        pass
 
             for n in self.nodes:
                 if n.state != "ONLINE":
@@ -2182,48 +2205,69 @@ class TriadController:
 
             per_node = {}
             accepted_nodes = []
-            for n in online_nodes:
-                out = self.send_shell_cmd(n, c)
-                per_node[n.name] = out
-                low_out = out.strip().lower()
-                if low_out and not low_out.startswith("error:") and not low_out.startswith("usage:"):
-                    accepted_nodes.append(n)
-
             required_quorum = (len(online_nodes) // 2) + 1
-            vals = list(per_node.values())
-            chosen = max(set(vals), key=vals.count) if vals else ""
-            if len(accepted_nodes) < required_quorum:
+            try:
+                for n in online_nodes:
+                    out = self.send_shell_cmd(n, c)
+                    per_node[n.name] = out
+                    low_out = out.strip().lower()
+                    if low_out and not low_out.startswith("error:") and not low_out.startswith("usage:"):
+                        accepted_nodes.append(n)
+
+                vals = list(per_node.values())
+                chosen = max(set(vals), key=vals.count) if vals else ""
+                if len(accepted_nodes) < required_quorum:
+                    if is_vault_mut:
+                        if self.wal_entries and self.wal_entries[-1][0] == tx_id:
+                            self.wal_entries.pop()
+                        self.triad_tx_seq = prev_tx_seq
+                        self.wal_pending_tx = None
+                        self.wal_pending_pre_digest = ""
+                        for n in accepted_nodes:
+                            self._rebuild_node_sql_from_committed_wal_locked(n)
+                        self._save_wal_to_disk()
+                    return {
+                        "ok": False,
+                        "error": chosen or f"error: {app} command rejected by online majority",
+                        "output": chosen,
+                        "quorum": f"{len(accepted_nodes)}/{len(online_nodes)} online nodes accepted",
+                        "per_node": per_node,
+                    }
+
                 if is_vault_mut:
-                    if self.wal_entries and self.wal_entries[-1][0] == tx_id:
-                        self.wal_entries.pop()
-                    self.triad_tx_seq = prev_tx_seq
                     self.wal_pending_tx = None
                     self.wal_pending_pre_digest = ""
                     for n in accepted_nodes:
-                        self._rebuild_node_sql_from_committed_wal_locked(n)
-                    self._save_wal_to_disk()
-                return {
-                    "ok": False,
-                    "error": chosen or f"error: {app} command rejected by online majority",
-                    "output": chosen,
-                    "quorum": f"{len(accepted_nodes)}/{len(online_nodes)} online nodes accepted",
-                    "per_node": per_node,
-                }
-
-            if is_vault_mut:
-                self.wal_pending_tx = None
-                self.wal_pending_pre_digest = ""
-                for n in accepted_nodes:
-                    self.send_shell_cmd(n, "sync")
-                    n.tx_seq = tx_id
-                fp = self._state_fingerprint(accepted_nodes[0])
-                if fp:
-                    self.triad_state_digest = fp
-                    for n in accepted_nodes:
-                        n.state_digest = fp
-                self._save_wal_to_disk()  # persist committed status, each node's applied tx_seq, and state digest
-            if app == "cron" and sub in ("add", "del"):
-                self._record_desired_cron(parts)
+                        self.send_shell_cmd(n, "sync")
+                        n.tx_seq = tx_id
+                    fp = self._state_fingerprint(accepted_nodes[0])
+                    if fp:
+                        self.triad_state_digest = fp
+                        for n in accepted_nodes:
+                            n.state_digest = fp
+                    self._save_wal_to_disk()  # persist committed status, each node's applied tx_seq, and state digest
+                if app == "cron" and sub in ("add", "del"):
+                    self._record_desired_cron(parts)
+            finally:
+                if is_vault_mut and self.wal_pending_tx == tx_id:
+                    self.wal_pending_tx = None
+                    self.wal_pending_pre_digest = ""
+                    if len(accepted_nodes) >= required_quorum:
+                        for n in accepted_nodes:
+                            n.tx_seq = tx_id
+                    else:
+                        if self.wal_entries and self.wal_entries[-1][0] == tx_id:
+                            self.wal_entries.pop()
+                        self.triad_tx_seq = prev_tx_seq
+                        for n in accepted_nodes:
+                            try:
+                                self._rebuild_node_sql_from_committed_wal_locked(n)
+                            except Exception:
+                                pass
+                    try:
+                        self._save_wal_to_disk()
+                    except Exception:
+                        pass
 
         if app == "vault" and sub in ("put", "del"):
             if len(self.wal_entries) > MAX_WAL_ENTRIES:
@@ -2582,11 +2626,12 @@ class TriadController:
         """
         Resolve any trailing `"pending"` WAL entry left behind if the controller crashed between
         the write-ahead fsync and the post-quorum commit save:
-        - If a majority of online nodes already have the post-entry state (digest differs from
-          their pre-entry digest), replay the pending entry onto any online node that still has
-          the pre-entry state and mark the entry `"committed"`.
-        - Otherwise, roll the uncommitted `"pending"` entry back from `self.wal_entries` and
-          `self.triad_tx_seq`, and reset any minority node that executed it.
+        - A node counts as having applied the pending entry ONLY if a majority of online nodes
+          agree on the exact same post-entry fingerprint AND that fingerprint matches the state
+          produced by replaying the pending entry onto the committed pre-entry state.
+        - Never overwrites `restored_node_digests` or `triad_state_digest` with unverified
+          per-node fingerprints, preserving `_verify_restored_tx_seq_at_boot` and
+          `_adopt_tx_seq_from_majority` rollback detection for any rolled-back or diverged nodes.
         """
         if self.wal_pending_tx is None:
             return
@@ -2599,74 +2644,141 @@ class TriadController:
         online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
         if not online_nodes:
             return
+
+        expected_pre = self.wal_pending_pre_digest or self.triad_state_digest
+        node_fps: dict[int, str | None] = {}
         pre_nodes: list[TriadNode] = []
-        post_nodes: list[TriadNode] = []
+        cand_nodes: list[TriadNode] = []
         for n in online_nodes:
-            fp = self._state_fingerprint(n)
-            expected_pre = (
-                self.restored_node_digests.get(n.node_id)
-                or self.wal_pending_pre_digest
-                or self.triad_state_digest
-            )
-            if expected_pre:
-                if fp is not None and fp != expected_pre:
-                    post_nodes.append(n)
-                else:
+            probe = self._state_probe(n)
+            fp = hashlib.sha256(probe.encode("utf-8")).hexdigest() if probe is not None else None
+            node_fps[n.node_id] = fp
+            node_expected_pre = self.restored_node_digests.get(n.node_id) or expected_pre
+            if node_expected_pre:
+                if fp is not None and fp == node_expected_pre:
                     pre_nodes.append(n)
+                elif fp is not None:
+                    cand_nodes.append(n)
             else:
-                probe = self._state_probe(n) or ""
-                is_genesis = "cluster.role|primary|1" in probe and len(probe.splitlines()) <= 4
-                if not is_genesis and probe:
-                    post_nodes.append(n)
-                else:
+                p_str = probe or ""
+                is_genesis = "cluster.role|primary|1" in p_str and len(p_str.splitlines()) <= 4
+                if is_genesis:
                     pre_nodes.append(n)
+                elif fp is not None:
+                    cand_nodes.append(n)
 
         required_quorum = (len(online_nodes) // 2) + 1
         with self.wal_lock:
-            if len(post_nodes) >= required_quorum and pending_stmt:
+            post_nodes: list[TriadNode] = []
+            expected_post_fp: str | None = None
+            rebuilt_pre_fp: str | None = expected_pre or None
+            pre_node_already_advanced: TriadNode | None = None
+
+            # Check if at least `required_quorum` candidate nodes agree on the same fingerprint `cand_fp`.
+            cand_fps = [node_fps[n.node_id] for n in cand_nodes if node_fps.get(n.node_id)]
+            maj_cand_fp: str | None = None
+            if len(cand_fps) >= required_quorum:
+                top_fp = max(set(cand_fps), key=cand_fps.count)
+                if cand_fps.count(top_fp) >= required_quorum:
+                    maj_cand_fp = top_fp
+
+            if maj_cand_fp is not None and pending_stmt and is_printable_ascii_command(pending_stmt):
+                matching_cands = [n for n in cand_nodes if node_fps.get(n.node_id) == maj_cand_fp]
+                # Verify `maj_cand_fp` equals the state produced by replaying `pending_stmt`
+                # onto the committed pre-pending state (without touching rolled-back `cand_nodes`
+                # when `pre_nodes` is available).
+                if pre_nodes:
+                    vnode = pre_nodes[0]
+                    try:
+                        self._replay_wal_entry(vnode, pending_stmt)
+                    except Exception as e:
+                        self.log_event("WARN", f"{vnode.name}: Error verifying pending WAL #{pending_tid}: {e}")
+                    self.send_shell_cmd(vnode, "sync")
+                    expected_post_fp = self._state_fingerprint(vnode)
+                    if expected_post_fp and expected_post_fp == maj_cand_fp:
+                        post_nodes = matching_cands
+                        pre_node_already_advanced = vnode
+                    else:
+                        # `maj_cand_fp` is not the post-pending state (e.g. rolled-back disks);
+                        # restore `vnode` to the committed pre-pending state.
+                        self._rebuild_node_sql_from_committed_wal_locked(vnode)
+                        rebuilt_pre_fp = self._state_fingerprint(vnode) or expected_pre
+                else:
+                    vnode = matching_cands[0]
+                    self._rebuild_node_sql_from_committed_wal_locked(vnode)
+                    rebuilt_pre_fp = self._state_fingerprint(vnode) or expected_pre
+                    try:
+                        self._replay_wal_entry(vnode, pending_stmt)
+                    except Exception as e:
+                        self.log_event("WARN", f"{vnode.name}: Error verifying pending WAL #{pending_tid}: {e}")
+                    self.send_shell_cmd(vnode, "sync")
+                    expected_post_fp = self._state_fingerprint(vnode)
+                    if expected_post_fp and expected_post_fp == maj_cand_fp:
+                        post_nodes = matching_cands
+                    else:
+                        self._rebuild_node_sql_from_committed_wal_locked(vnode)
+                        rebuilt_pre_fp = self._state_fingerprint(vnode) or rebuilt_pre_fp
+
+            if len(post_nodes) >= required_quorum and pending_stmt and expected_post_fp:
                 self.log_event(
                     "RESYNC",
-                    f"Pending WAL tx #{pending_tid} already present on {len(post_nodes)}/{len(online_nodes)} nodes; "
+                    f"Pending WAL tx #{pending_tid} verified on {len(post_nodes)}/{len(online_nodes)} nodes; "
                     f"completing commit on remaining nodes.",
                 )
                 for n in pre_nodes:
+                    if n is pre_node_already_advanced:
+                        continue
                     if is_printable_ascii_command(pending_stmt):
                         try:
                             self._replay_wal_entry(n, pending_stmt)
                         except Exception as e:
                             self.log_event("WARN", f"{n.name}: Error replaying pending WAL #{pending_tid}: {e}")
                     self.send_shell_cmd(n, "sync")
+
+                self.triad_state_digest = expected_post_fp
                 for n in online_nodes:
-                    n.tx_seq = pending_tid
-                    fp = self._state_fingerprint(n)
-                    if fp:
-                        n.state_digest = fp
-                        self.triad_state_digest = fp
-                        self.restored_node_digests[n.node_id] = fp
-                    self.restored_tx_seq_nodes.add(n.node_id)
+                    self.restored_node_digests[n.node_id] = expected_post_fp
+                    cur_fp = self._state_fingerprint(n)
+                    if cur_fp == expected_post_fp:
+                        n.tx_seq = pending_tid
+                        n.state_digest = expected_post_fp
+                        self.restored_tx_seq_nodes.add(n.node_id)
                 self.wal_pending_tx = None
                 self.wal_pending_pre_digest = ""
                 self._save_wal_to_disk()
             else:
                 self.log_event(
                     "WARN",
-                    f"Rolling back uncommitted pending WAL tx #{pending_tid} (applied on {len(post_nodes)}/{len(online_nodes)} nodes).",
+                    f"Rolling back uncommitted pending WAL tx #{pending_tid} (verified on {len(post_nodes)}/{len(online_nodes)} nodes).",
                 )
                 self.wal_entries = [(tid, s) for tid, s in self.wal_entries if tid != pending_tid]
                 cp_seq = int(self.wal_checkpoint.get("tx_seq", 0))
                 self.triad_tx_seq = self.wal_entries[-1][0] if self.wal_entries else cp_seq
                 self.wal_pending_tx = None
                 self.wal_pending_pre_digest = ""
-                for n in post_nodes:
-                    self._rebuild_node_sql_from_committed_wal_locked(n)
-                for n in online_nodes:
-                    n.tx_seq = self.triad_tx_seq
-                    fp = self._state_fingerprint(n)
-                    if fp:
-                        n.state_digest = fp
-                        self.triad_state_digest = fp
-                        self.restored_node_digests[n.node_id] = fp
-                    self.restored_tx_seq_nodes.add(n.node_id)
+
+                # If only a minority (1 node) differed from `expected_pre`, rebuild that minority node
+                # from the committed WAL. If >= 2 nodes differed (e.g. a 2-node disk rollback), leave
+                # them untouched so `_verify_restored_tx_seq_at_boot` and `_adopt_tx_seq_from_majority`
+                # detect the rollback and replay the committed WAL onto them.
+                if len(cand_nodes) < required_quorum:
+                    for n in cand_nodes:
+                        self._rebuild_node_sql_from_committed_wal_locked(n)
+                        if not rebuilt_pre_fp:
+                            rebuilt_pre_fp = self._state_fingerprint(n)
+
+                if not rebuilt_pre_fp and pre_nodes:
+                    rebuilt_pre_fp = node_fps.get(pre_nodes[0].node_id)
+
+                if rebuilt_pre_fp:
+                    self.triad_state_digest = rebuilt_pre_fp
+                    for n in online_nodes:
+                        self.restored_node_digests[n.node_id] = rebuilt_pre_fp
+                        cur_fp = self._state_fingerprint(n)
+                        if cur_fp == rebuilt_pre_fp:
+                            n.tx_seq = self.triad_tx_seq
+                            n.state_digest = rebuilt_pre_fp
+                            self.restored_tx_seq_nodes.add(n.node_id)
                 self._save_wal_to_disk()
 
     def _verify_restored_tx_seq_at_boot(self):
@@ -4138,6 +4250,116 @@ def run_unit_self_tests():
         assert restarted_pend.triad_tx_seq == 1 and len(restarted_pend.wal_entries) == 1
         assert [n.tx_seq for n in restarted_pend.nodes] == [1, 1, 1], (
             f"All nodes must converge on tx_seq=1 after pending rollback: {[n.tx_seq for n in restarted_pend.nodes]}"
+        )
+
+        # Medium #3a: Commit-at-boot when 2/3 nodes applied the pending entry before controller crash
+        def crash_after_two_nodes_applied(tid, stmt):
+            # Simulate nodes 1 and 2 applying `stmt` before the controller crashes (node 3 still at pre-state)
+            for nid in (1, 2):
+                pend_rows[nid].append(("partial.commit", "applied2of3", 2))
+            raise RuntimeError("simulated crash after 2/3 nodes applied pending entry")
+
+        restarted_pend._after_wal_write_ahead_hook = crash_after_two_nodes_applied
+        try:
+            try:
+                restarted_pend.execute_triad_sql(
+                    "INSERT OR REPLACE INTO kv VALUES ('partial.commit', 'applied2of3', 2)"
+                )
+                raise AssertionError("Expected crash_after_two_nodes_applied to raise RuntimeError")
+            except RuntimeError:
+                pass
+        finally:
+            restarted_pend._after_wal_write_ahead_hook = None
+
+        commit_boot = TriadController(
+            show_gui=False,
+            spec=TriadSpec(name="pend-commit-boot", state_dir=pend_dir, role="sql", write_operator_token=False),
+        )
+        commit_boot.shutdown()
+        for n in commit_boot.nodes:
+            n.state = "ONLINE"
+        commit_boot.send_shell_cmd = make_kv_handler(pend_rows)
+        assert commit_boot.wal_pending_tx == 2
+        commit_boot._resolve_pending_wal_at_boot()
+        commit_boot._verify_restored_tx_seq_at_boot()
+        commit_boot._adopt_tx_seq_from_majority()
+        assert commit_boot.wal_pending_tx is None, "Pending entry applied on 2/3 nodes must be committed at boot"
+        assert commit_boot.triad_tx_seq == 2 and len(commit_boot.wal_entries) == 2
+        assert [n.tx_seq for n in commit_boot.nodes] == [2, 2, 2]
+        assert all(("partial.commit", "applied2of3", 2) in pend_rows[nid] for nid in (1, 2, 3)), (
+            f"Commit-at-boot did not replay pending entry onto lagging node 3: {pend_rows}"
+        )
+
+        # Medium #3b: Pending WAL entry combined with a 2-node rollback to genesis while offline
+        #             must NOT treat the 2 rolled-back nodes as a post-pending majority and must
+        #             NOT bypass rollback detection (`_verify_restored_tx_seq_at_boot` + `_adopt_tx_seq_from_majority`).
+        commit_boot._after_wal_write_ahead_hook = crash_after_write_ahead
+        try:
+            try:
+                commit_boot.execute_triad_sql(
+                    "INSERT OR REPLACE INTO kv VALUES ('uncommitted.tx3', 'never_ran', 3)"
+                )
+                raise AssertionError("Expected crash_after_write_ahead to raise RuntimeError")
+            except RuntimeError:
+                pass
+        finally:
+            commit_boot._after_wal_write_ahead_hook = None
+
+        # Roll back nodes 1 and 2 to genesis while node 3 retains the committed tx #2 state
+        pend_rows[1] = [("cluster.role", "primary", 1), ("mtd.policy", "binmorph-7pass", 1), ("boot.state", "ready", 1)]
+        pend_rows[2] = [("cluster.role", "primary", 1), ("mtd.policy", "binmorph-7pass", 1), ("boot.state", "ready", 1)]
+        combined_boot = TriadController(
+            show_gui=False,
+            spec=TriadSpec(name="pend-rb-combined", state_dir=pend_dir, role="sql", write_operator_token=False),
+        )
+        combined_boot.shutdown()
+        for n in combined_boot.nodes:
+            n.state = "ONLINE"
+        combined_boot.send_shell_cmd = make_kv_handler(pend_rows)
+        assert combined_boot.wal_pending_tx == 3
+        combined_boot._resolve_pending_wal_at_boot()
+        assert combined_boot.wal_pending_tx is None
+        assert combined_boot.triad_tx_seq == 2 and len(combined_boot.wal_entries) == 2, (
+            f"Unapplied pending tx #3 must be rolled back even when 2 disks were rolled back: {combined_boot.wal_entries}"
+        )
+        combined_boot._verify_restored_tx_seq_at_boot()
+        assert combined_boot.restored_tx_seq_nodes == {3}, (
+            f"Rolled-back nodes 1 and 2 must be detected by _verify_restored_tx_seq_at_boot, got {combined_boot.restored_tx_seq_nodes}"
+        )
+        combined_boot._adopt_tx_seq_from_majority()
+        combined_boot.compute_and_verify_raid_parity()
+        assert [n.tx_seq for n in combined_boot.nodes] == [2, 2, 2]
+        assert pend_rows[1] == pend_rows[2] == pend_rows[3], (
+            f"Pending + 2-node rollback failed to recover committed tx #1..#2 on nodes 1 and 2: {pend_rows}"
+        )
+        assert ("partial.commit", "applied2of3", 2) in pend_rows[1]
+        assert all(all(k != "uncommitted.tx3" for k, _, _ in pend_rows[nid]) for nid in (1, 2, 3))
+
+        # Low #9.4: Unexpected exception during node execution (after write-ahead) cleans up
+        #           `wal_pending_tx` in `finally` so the failed entry is not left pending or
+        #           marked committed by a subsequent write.
+        base_handler = make_kv_handler(pend_rows)
+
+        def raising_node_handler(node, cmd, timeout=4.0):
+            if "boom.tx" in cmd and node.node_id == 2:
+                raise RuntimeError("simulated unexpected serial exception during node execution")
+            return base_handler(node, cmd, timeout)
+
+        combined_boot.send_shell_cmd = raising_node_handler
+        try:
+            try:
+                combined_boot.execute_triad_sql("INSERT OR REPLACE INTO kv VALUES ('boom.tx', 'err', 9)")
+                raise AssertionError("Expected raising_node_handler to raise RuntimeError")
+            except RuntimeError:
+                pass
+        finally:
+            combined_boot.send_shell_cmd = base_handler
+        assert combined_boot.wal_pending_tx is None, (
+            f"wal_pending_tx was not cleared in finally after node execution exception: {combined_boot.wal_pending_tx}"
+        )
+        assert combined_boot.triad_tx_seq == 2 and len(combined_boot.wal_entries) == 2
+        assert all(all(k != "boom.tx" for k, _, _ in pend_rows[nid]) for nid in (1, 2, 3)), (
+            f"Node 1 was not rolled back after node 2 raised during execution: {pend_rows[1]}"
         )
 
         # #6: Two-node rollback with one intact node replays WAL onto the two rolled-back nodes;
