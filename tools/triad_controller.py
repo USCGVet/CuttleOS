@@ -238,7 +238,7 @@ def is_printable_ascii_command(s: str) -> bool:
 
 
 def is_readonly_sql_query(q: str) -> bool:
-    """Return True iff `q` is a read-only SQL query (`SELECT`, `.tables`, `SHOW`, `.schema`, `DESCRIBE`)."""
+    """Return True iff `q` is a read-only SQL query (`SELECT`, `.tables`, `SHOW`, `.schema`, `.dump`, `DESCRIBE`)."""
     trimmed = q.strip()
     if trimmed.startswith("/*triad*/"):
         trimmed = trimmed[len("/*triad*/") :].strip()
@@ -250,6 +250,7 @@ def is_readonly_sql_query(q: str) -> bool:
         or up.startswith(".TABLES")
         or up.startswith("SHOW")
         or up.startswith(".SCHEMA")
+        or up.startswith(".DUMP")
         or up.startswith("DESCRIBE")
     )
 
@@ -305,9 +306,13 @@ def is_readonly_shell_command(s: str) -> bool:
     return False
 
 
-# Shared definitions matching `target_enterprise/src/shell.rs` (`cmd_cathex` / `cmd_writehex`).
+# Shared definitions matching `target_enterprise/src/shell.rs` (`cmd_cathex` / `cmd_writehex`)
+# and `target_enterprise/src/sql.rs` (`exec_dump`).
 CATHEX_REPLY_RE = re.compile(r"^hex len=(\d+) off=(\d+) data=([0-9a-fA-F]*)$")
 WRITEHEX_REPLY_RE = re.compile(r"^wrote (\d+) bytes to (.+) at offset (\d+)$")
+SQLDUMP_HEADER_RE = re.compile(
+    r"^sqldump table=(\S+) rows=(\d+) off=(\d+) count=(\d+) digest=([0-9a-f]{16})(?: ddl=([0-9a-f]+))?(?: idx_ddl=([0-9a-f]+))?$"
+)
 
 
 def quote_shell_path(fpath: str) -> str:
@@ -325,6 +330,101 @@ def format_kernel_cathex_reply(total_len: int, offset: int, chunk: bytes) -> str
 def format_kernel_writehex_reply(written: int, fpath: str, offset: int) -> str:
     """Format a `writehex` reply line exactly as `OsShell::cmd_writehex` (`shell.rs:2795`) emits."""
     return f"wrote {written} bytes to {fpath} at offset {offset}"
+
+
+def format_kernel_sqldump_reply(
+    table: str,
+    cols: list[tuple[str, str]],
+    rows: list[tuple],
+    offset: int = 0,
+    limit: int = 3,
+    indexed_col: int = 0xFF,
+    index_name: str = "",
+) -> str:
+    """
+    Format a `.dump <table> [offset] [limit]` reply chunk using the exact 64-bit FNV-1a
+    table digest and hex cell framing emitted by `SqlDb::exec_dump` (`sql.rs:815`).
+    """
+    limit = max(1, min(3, int(limit)))
+    offset = max(0, int(offset))
+    is_kv = table.lower() == "kv"
+
+    def _row_sort_key(r: tuple) -> tuple:
+        if is_kv and len(r) > 0 and isinstance(r[0], str) and r[0].startswith("v:"):
+            return (0, r[0].encode("utf-8"))
+        key_parts = []
+        for idx, val in enumerate(r):
+            ctype = cols[idx][1].upper() if idx < len(cols) else ("INT" if isinstance(val, int) else "TEXT")
+            if ctype.startswith("INT"):
+                key_parts.append((1, int(val)))
+            else:
+                key_parts.append((2, str(val).encode("utf-8")))
+        return tuple(key_parts)
+
+    sorted_rows = sorted(rows, key=_row_sort_key)
+    mcount = len(sorted_rows)
+
+    def _mix(acc: int, b: int) -> int:
+        return ((acc ^ (b & 0xFF)) * 0x0100000001B3) & 0xFFFFFFFFFFFFFFFF
+
+    h = 0xCBF29CE484222325
+    for b in table.encode("ascii"):
+        h = _mix(h, b)
+    h = _mix(h, len(cols))
+    for cname, ctype in cols:
+        for b in cname.encode("ascii"):
+            h = _mix(h, b)
+        h = _mix(h, 1 if ctype.upper().startswith("INT") else 2)
+    h = _mix(h, indexed_col & 0xFF)
+    for b in index_name.encode("ascii"):
+        h = _mix(h, b)
+    for b in mcount.to_bytes(8, "little", signed=False):
+        h = _mix(h, b)
+
+    for r in sorted_rows:
+        if is_kv and len(r) > 0 and isinstance(r[0], str) and r[0].startswith("v:"):
+            h = _mix(h, 0x5B)
+            kb = r[0].encode("utf-8")
+            h = _mix(h, len(kb))
+            for b in kb:
+                h = _mix(h, b)
+            for b in b"<HW_SEALED>":
+                h = _mix(h, b)
+        else:
+            h = _mix(h, 0x5A)
+            for idx, val in enumerate(r):
+                ctype = cols[idx][1].upper() if idx < len(cols) else ("INT" if isinstance(val, int) else "TEXT")
+                if ctype.startswith("INT"):
+                    h = _mix(h, 1)
+                    for b in int(val).to_bytes(8, "little", signed=True):
+                        h = _mix(h, b)
+                else:
+                    tb = str(val).encode("utf-8")
+                    h = _mix(h, 2)
+                    h = _mix(h, len(tb))
+                    for b in tb:
+                        h = _mix(h, b)
+
+    chunk = sorted_rows[offset : offset + limit] if offset < mcount else []
+    hdr = f"sqldump table={table} rows={mcount} off={offset} count={len(chunk)} digest={h:016x}"
+    if offset == 0:
+        col_defs = ", ".join(f"{cname} {'INT' if ctype.upper().startswith('INT') else 'TEXT'}" for cname, ctype in cols)
+        ddl_str = f"CREATE TABLE {table} ({col_defs})"
+        hdr += f" ddl={ddl_str.encode('ascii').hex()}"
+        if index_name and 0 <= indexed_col < len(cols):
+            idx_ddl_str = f"CREATE INDEX {index_name} ON {table} ({cols[indexed_col][0]})"
+            hdr += f" idx_ddl={idx_ddl_str.encode('ascii').hex()}"
+    out_lines = [hdr]
+    for r in chunk:
+        cell_parts = []
+        for idx, val in enumerate(r):
+            ctype = cols[idx][1].upper() if idx < len(cols) else ("INT" if isinstance(val, int) else "TEXT")
+            if ctype.startswith("INT"):
+                cell_parts.append(f"I:{int(val)}")
+            else:
+                cell_parts.append(f"T:{str(val).encode('utf-8').hex()}")
+        out_lines.append("row " + "|".join(cell_parts))
+    return "\n".join(out_lines)
 
 
 class RealOsShellHarness:
@@ -816,24 +916,56 @@ class TriadController:
 
     def checkpoint_wal(self) -> bool:
         """
-        Take a consistent full-state checkpoint when all 3 nodes are ONLINE, at the same
-        `triad_tx_seq`, and agree on `_state_probe`. Dumps current table rows from an online
-        node (and encrypted `vault` records for active `v:*` keys) into `self.wal_checkpoint`
-        at `checkpoint_tx_seq`, clearing superseded `self.wal_entries` so subsequent heals
-        and catch-ups replay the exact converged state rather than statement-filtered history.
+        Take a consistent full-state checkpoint when all 3 nodes (or a 2-of-3 online majority
+        when 1 node is offline/catching up) are at `triad_tx_seq` and agree on every vote
+        table's lossless chunked `.dump` (row count, kernel table digest, and normalized rows).
+        Records each non-`kv` table's DDL (`CREATE TABLE` / `CREATE INDEX`), `DELETE FROM <table>`,
+        and lossless `INSERT` statements (plus encrypted `vault` records for active `v:*` keys)
+        into `self.wal_checkpoint` at `checkpoint_tx_seq`, clearing superseded `self.wal_entries`.
         """
         if not self.spec.has_sql:
             return False
         with self.wal_lock:
             if self.wal_pending_tx is not None or self.triad_tx_seq <= self.wal_checkpoint.get("tx_seq", 0):
                 return False
-            if any(n.state != "ONLINE" or n.tx_seq != self.triad_tx_seq for n in self.nodes):
+            ready_nodes = [
+                n for n in self.nodes if n.state == "ONLINE" and n.tx_seq == self.triad_tx_seq
+            ]
+            if len(ready_nodes) < 2:
                 return False
-            probes = [self._state_probe(n) for n in self.nodes]
-            if any(p is None for p in probes) or not (probes[0] == probes[1] == probes[2]):
+            if len(ready_nodes) < len(self.nodes):
+                down_names = [n.name.split()[0] for n in self.nodes if n not in ready_nodes]
+                self.log_event(
+                    "WARN",
+                    f"Taking {len(ready_nodes)}/3 majority WAL checkpoint at tx_seq={self.triad_tx_seq} "
+                    f"while {down_names} is offline/catching up; lagging node will rebuild from checkpoint.",
+                )
+
+            table_dumps: dict[str, dict] = {}
+            probe_parts_per_node: list[list[str]] = [[] for _ in ready_nodes]
+            for table in self.spec.vote_tables:
+                dumps = [self._dump_node_sql_table(n, table) for n in ready_nodes]
+                if any(d is None for d in dumps):
+                    return False
+                first = dumps[0]
+                assert first is not None
+                for d in dumps[1:]:
+                    assert d is not None
+                    if (
+                        d["rows_count"] != first["rows_count"]
+                        or d["kernel_digest"] != first["kernel_digest"]
+                        or d["probe_text"] != first["probe_text"]
+                    ):
+                        return False
+                table_dumps[table] = first
+                for idx, d in enumerate(dumps):
+                    assert d is not None
+                    probe_parts_per_node[idx].append(d["probe_text"])
+
+            probes = ["\n--\n".join(parts) for parts in probe_parts_per_node]
+            if not all(p == probes[0] for p in probes):
                 return False
 
-            donor = self.nodes[0]
             # Collect active encrypted/plain vault put commands in order up to triad_tx_seq.
             vault_records: dict[str, str] = {}
             for raw_stmt in list(self.wal_checkpoint.get("stmts", [])) + [s for _, s in self.wal_entries]:
@@ -856,33 +988,47 @@ class TriadController:
             cp_stmts: list[str] = []
             seen_vault_keys: set[str] = set()
             for table in self.spec.vote_tables:
-                col_types = self._extract_table_col_types(table, donor)
-                sel_out = self.send_shell_cmd(donor, f"sql /*triad*/ SELECT * FROM {table}", timeout=4.0)
-                if not sel_out or sel_out.lower().startswith("error"):
-                    return False
-                lines = sel_out.splitlines()
-                if not lines or "|" not in lines[0]:
-                    return False
+                tdump = table_dumps[table]
+                if table != "kv":
+                    ddl_str = tdump.get("ddl") or ""
+                    if not ddl_str:
+                        col_types = self._extract_table_col_types(table, ready_nodes[0])
+                        if col_types:
+                            ddl_str = f"CREATE TABLE {table} (" + ", ".join(
+                                f"c{i} {ct}" for i, ct in enumerate(col_types)
+                            ) + ")"
+                    if ddl_str:
+                        if re.match(r"^CREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS\b)", ddl_str, re.I):
+                            ddl_str = re.sub(
+                                r"^CREATE\s+TABLE\s+",
+                                "CREATE TABLE IF NOT EXISTS ",
+                                ddl_str,
+                                count=1,
+                                flags=re.I,
+                            )
+                        cp_stmts.append(ddl_str)
+                    if tdump.get("idx_ddl"):
+                        cp_stmts.append(tdump["idx_ddl"])
                 cp_stmts.append(f"DELETE FROM {table}")
-                for ln in lines[1:]:
-                    if not ln.strip() or "|" not in ln:
-                        continue
-                    if table == "kv" and ln.startswith("v:"):
-                        vkey = ln.split("|", 1)[0][2:]
+                for cells in tdump["rows"]:
+                    if (
+                        table == "kv"
+                        and cells
+                        and cells[0][0] == "TEXT"
+                        and str(cells[0][1]).startswith("v:")
+                    ):
+                        vkey = str(cells[0][1])[2:]
                         if vkey in vault_records:
                             cp_stmts.append(vault_records[vkey])
                             seen_vault_keys.add(vkey)
                         continue
-                    cells = ln.split("|")
                     formatted: list[str] = []
-                    for idx, val in enumerate(cells):
-                        ctype = col_types[idx] if idx < len(col_types) else (
-                            "INT" if re.match(r"^-?\d+$", val) and idx == len(cells) - 1 else "TEXT"
-                        )
-                        if ctype == "INT" and re.match(r"^-?\d+$", val):
-                            formatted.append(val)
+                    for ctype, val in cells:
+                        if ctype == "INT":
+                            formatted.append(str(int(val)))
                         else:
-                            escaped = val.replace("'", "''")
+                            sval = str(val)
+                            escaped = sval.replace("'", "''")
                             formatted.append(f"'{escaped}'")
                     verb = "INSERT OR REPLACE INTO" if table == "kv" else "INSERT INTO"
                     cp_stmts.append(f"{verb} {table} VALUES ({', '.join(formatted)})")
@@ -896,7 +1042,7 @@ class TriadController:
             self.wal_entries = [(tid, s) for tid, s in self.wal_entries if tid > cp_seq]
             digest = hashlib.sha256(probes[0].encode("utf-8")).hexdigest()
             self.triad_state_digest = digest
-            for n in self.nodes:
+            for n in ready_nodes:
                 n.state_digest = digest
             self._save_wal_to_disk()
             return True
@@ -1302,6 +1448,17 @@ class TriadController:
         joined = "\n".join(lines)
         c = cmd_str.strip()
         if c.startswith("sql "):
+            if ".dump " in c.lower():
+                if "error:" in joined or "usage:" in joined:
+                    return True
+                non_empty = [ln.strip() for ln in lines if ln.strip()]
+                if non_empty:
+                    m = SQLDUMP_HEADER_RE.match(non_empty[0])
+                    if m:
+                        expected_count = int(m.group(4))
+                        row_lines = sum(1 for ln in non_empty[1:] if ln.startswith("row "))
+                        return row_lines >= expected_count
+                return False
             return (
                 "INSERT " in joined
                 or "REPLACE " in joined
@@ -1445,11 +1602,133 @@ class TriadController:
             hashlib.sha256(actual).digest() == hashlib.sha256(data).digest()
         )
 
+    def _dump_node_sql_table(self, node: TriadNode, table: str) -> dict | None:
+        """
+        Read `table` from `node` in 3-row chunks via `sql /*triad*/ .dump <table> <offset> 3`
+        so each reply stays strictly under the 1,024-byte kernel serial console buffer and
+        cells containing `|`, quotes, or arbitrary UTF-8 bytes are decoded losslessly from hex.
+        Verifies row count and the kernel's 64-bit FNV-1a table digest across all chunks.
+        """
+        chunk_limit = 3
+        offset = 0
+        total_rows: int | None = None
+        kernel_digest: str | None = None
+        ddl = ""
+        idx_ddl = ""
+        col_names: list[str] = []
+        all_rows: list[list[tuple[str, str | int]]] = []
+
+        while True:
+            out = self.send_shell_cmd(
+                node, f"sql /*triad*/ .dump {table} {offset} {chunk_limit}", timeout=4.0
+            )
+            if not out or out.lower().startswith("error") or out.lower().startswith("usage"):
+                return None
+            lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+            if not lines:
+                return None
+            m = SQLDUMP_HEADER_RE.match(lines[0])
+            if not m:
+                return None
+            rep_table, rep_rows_s, rep_off_s, rep_count_s, rep_digest, ddl_hex, idx_ddl_hex = m.groups()
+            rep_rows, rep_off, rep_count = int(rep_rows_s), int(rep_off_s), int(rep_count_s)
+            if rep_table.lower() != table.lower() or rep_off != offset:
+                return None
+            if total_rows is None:
+                total_rows = rep_rows
+                kernel_digest = rep_digest
+                if ddl_hex:
+                    try:
+                        ddl = bytes.fromhex(ddl_hex).decode("ascii")
+                    except Exception:
+                        return None
+                    m_ddl = re.search(r"\(([^)]+)\)", ddl)
+                    if m_ddl:
+                        for cdef in m_ddl.group(1).split(","):
+                            parts = cdef.strip().split()
+                            if parts:
+                                col_names.append(parts[0])
+                if idx_ddl_hex:
+                    try:
+                        idx_ddl = bytes.fromhex(idx_ddl_hex).decode("ascii")
+                    except Exception:
+                        return None
+            else:
+                if rep_rows != total_rows or rep_digest != kernel_digest:
+                    return None
+            row_lines = lines[1:]
+            if len(row_lines) != rep_count:
+                return None
+            for rln in row_lines:
+                if not rln.startswith("row "):
+                    return None
+                raw_cells = rln[4:].split("|") if rln[4:] else []
+                parsed_cells: list[tuple[str, str | int]] = []
+                for rc in raw_cells:
+                    if rc.startswith("I:"):
+                        try:
+                            parsed_cells.append(("INT", int(rc[2:])))
+                        except ValueError:
+                            return None
+                    elif rc.startswith("T:"):
+                        hex_part = rc[2:]
+                        if len(hex_part) % 2 != 0:
+                            return None
+                        try:
+                            parsed_cells.append(("TEXT", bytes.fromhex(hex_part).decode("utf-8")))
+                        except Exception:
+                            return None
+                    else:
+                        return None
+                all_rows.append(parsed_cells)
+            offset += rep_count
+            if offset >= total_rows or rep_count == 0:
+                break
+
+        if total_rows is None or kernel_digest is None or len(all_rows) != total_rows:
+            return None
+
+        col_hdr = "|".join(col_names) if col_names else ("k|v|rev" if table.lower() == "kv" else table.lower())
+        select_lines = [col_hdr]
+        probe_rows: list[str] = []
+        for cells in all_rows:
+            select_lines.append("|".join(str(v) for _, v in cells))
+            if (
+                table.lower() == "kv"
+                and cells
+                and cells[0][0] == "TEXT"
+                and str(cells[0][1]).startswith("v:")
+            ):
+                k_esc = str(cells[0][1]).replace("\\", "\\\\").replace("|", "\\|")
+                probe_rows.append(f"{k_esc}|<HW_SEALED>")
+            else:
+                escaped = [
+                    str(v) if ct == "INT" else str(v).replace("\\", "\\\\").replace("|", "\\|")
+                    for ct, v in cells
+                ]
+                probe_rows.append("|".join(escaped))
+        probe_rows.sort()
+        probe_hdr = f"{col_hdr} #rows={total_rows} digest={kernel_digest}"
+        if idx_ddl:
+            probe_hdr += f" idx={idx_ddl}"
+        probe_text = "\n".join([probe_hdr] + probe_rows)
+        return {
+            "table": table,
+            "rows_count": total_rows,
+            "kernel_digest": kernel_digest,
+            "ddl": ddl,
+            "idx_ddl": idx_ddl,
+            "rows": all_rows,
+            "probe_text": probe_text,
+            "select_text": "\n".join(select_lines),
+        }
+
     def _state_probe(self, node: TriadNode) -> str | None:
         """
         The node's replicated state as compared by the 2-of-3 vote, or None if unreadable.
-        SQL-capable roles compare the spec's vote tables; a web front end (`wfe`, no svc-sql)
-        compares every served file's path, size, and SHA-256 content digest.
+        SQL-capable roles compare the spec's vote tables via lossless chunked `.dump`; a web
+        front end (`wfe`, no svc-sql) compares every served file's path, size, and SHA-256
+        content digest.
         """
         if not self.spec.has_sql:
             ls_out = self.send_shell_cmd(node, "ls", timeout=4.0)
@@ -1484,12 +1763,12 @@ class TriadController:
             return "\n".join(file_entries)
         parts = []
         for table in self.spec.vote_tables:
-            out = self.send_shell_cmd(node, f"sql /*triad*/ SELECT * FROM {table}", timeout=4.0)
-            if not out or out.lower().startswith("error") or "|" not in out.splitlines()[0]:
+            tdump = self._dump_node_sql_table(node, table)
+            if tdump is None:
                 return None
             if table == "kv":
-                node.last_sql_table = out
-            parts.append(self._normalize_kv_for_tmr(out))
+                node.last_sql_table = tdump["select_text"]
+            parts.append(tdump["probe_text"])
         return "\n--\n".join(parts)
 
     def _state_fingerprint(self, node: TriadNode) -> str | None:
@@ -3363,108 +3642,145 @@ def run_unit_self_tests():
         leftover_tmps = list(atomic_fail_dir.glob("*.tmp"))
         assert not leftover_tmps, f"atomic_write_json leaked temporary file(s) on failure: {leftover_tmps}"
 
-        # #1: WAL checkpointing preserves partial UPDATEs (`SET rev=2`, `SET v='new'` + `SET rev=9`)
-        #     and order-insensitive `_normalize_kv_for_tmr` converges across healed nodes
+        # #1 & High #2 & Low #9.3: WAL checkpointing via lossless chunked `.dump` against the
+        #     REAL Rust `OsShell` (`shell_harness`, 1,024-byte console cap) across >MAX_WAL_ENTRIES
+        #     mixed INSERT/UPDATE statements (>1 KiB of rows, including `|` and `'` values),
+        #     automatic trigger past MAX_WAL_ENTRIES, healing a tampered node to 3/3 convergence,
+        #     and 2/3 majority checkpoint when 1 node is offline.
         cp_dir = tmp_dir / "wal_checkpoint"
         cp_ctrl = TriadController(
             show_gui=False,
             spec=TriadSpec(name="cp-test", state_dir=cp_dir, role="sql", write_operator_token=False),
         )
         cp_ctrl.shutdown()
-        cp_rows = {
-            1: [("cluster.role", "primary", 1), ("mtd.policy", "binmorph-7pass", 1), ("boot.state", "ready", 1)],
-            2: [("cluster.role", "primary", 1), ("mtd.policy", "binmorph-7pass", 1), ("boot.state", "ready", 1)],
-            3: [("cluster.role", "primary", 1), ("mtd.policy", "binmorph-7pass", 1), ("boot.state", "ready", 1)],
-        }
         for n in cp_ctrl.nodes:
             n.state = "ONLINE"
 
-        def fake_cp_sql_cmd(node, cmd, timeout=4.0):
-            rows = cp_rows[node.node_id]
-            s = cmd.strip()
-            if s.startswith("sql /*triad*/"):
-                s = s[len("sql /*triad*/") :].strip()
-            elif s.startswith("sql "):
-                s = s[4:].strip()
-            if s == ".schema kv":
-                return "CREATE TABLE kv (k TEXT, v TEXT, rev INT);"
-            if s == "DROP TABLE kv":
-                rows.clear()
-                return "DROP TABLE kv OK"
-            if s.startswith("CREATE TABLE kv"):
-                return "CREATE TABLE kv OK"
-            if s == "DELETE FROM kv":
-                rows.clear()
-                return "DELETE OK"
-            if s == "SELECT * FROM kv":
-                return "\n".join(["k|v|rev"] + [f"{k}|{v}|{r}" for k, v, r in rows])
-            m_ins = re.match(
-                r"^INSERT\s+(?:OR\s+REPLACE\s+)?INTO\s+kv\s+VALUES\s*\(\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*(-?\d+)\s*\)$",
-                s,
-                re.I,
+        cp_harness = RealOsShellHarness()
+        try:
+            cp_ctrl.send_shell_cmd = cp_harness.exec
+            cp_ctrl.bounce_and_morph_node = lambda nid, _lock_held=False, _wipe_disks=False: (
+                setattr(cp_ctrl.nodes[nid - 1], "state", "ONLINE") or True
             )
-            if m_ins:
-                k, v, r = m_ins.group(1), m_ins.group(2), int(m_ins.group(3))
-                for i, (ek, ev, er) in enumerate(rows):
-                    if ek == k:
-                        rows[i] = (k, v, r)
-                        return "1 row replaced"
-                rows.append((k, v, r))
-                return "1 row inserted"
-            m_upd_rev = re.match(
-                r"^UPDATE\s+kv\s+SET\s+rev\s*=\s*(-?\d+)\s+WHERE\s+k\s*=\s*'([^']*)'$",
-                s,
-                re.I,
+            # Verify shared `format_kernel_sqldump_reply` matches real `OsShell` `.dump` byte-for-byte.
+            for n in cp_ctrl.nodes:
+                cp_ctrl._reset_sql_vote_tables(n)
+            raw_dump0 = cp_harness.exec(cp_ctrl.nodes[0], "sql /*triad*/ .dump kv 0 3")
+            expected_dump0 = format_kernel_sqldump_reply(
+                "kv",
+                [("k", "TEXT"), ("v", "TEXT"), ("rev", "INT")],
+                [("cluster.role", "primary", 1), ("mtd.policy", "binmorph-7pass", 1), ("boot.state", "ready", 1)],
+                0,
+                3,
             )
-            if m_upd_rev:
-                new_r, target_k = int(m_upd_rev.group(1)), m_upd_rev.group(2)
-                for i, (ek, ev, er) in enumerate(rows):
-                    if ek == target_k:
-                        rows[i] = (ek, ev, new_r)
-                return "1 row updated"
-            m_upd_v = re.match(
-                r"^UPDATE\s+kv\s+SET\s+v\s*=\s*'([^']*)'\s+WHERE\s+k\s*=\s*'([^']*)'$",
-                s,
-                re.I,
+            assert raw_dump0 == expected_dump0, (
+                f"format_kernel_sqldump_reply drifted from OsShell:\nactual:   {raw_dump0!r}\nexpected: {expected_dump0!r}"
             )
-            if m_upd_v:
-                new_v, target_k = m_upd_v.group(1), m_upd_v.group(2)
-                for i, (ek, ev, er) in enumerate(rows):
-                    if ek == target_k:
-                        rows[i] = (ek, new_v, er)
-                return "1 row updated"
-            return "ok"
 
-        cp_ctrl.send_shell_cmd = fake_cp_sql_cmd
-        cp_ctrl.bounce_and_morph_node = lambda nid, _lock_held=False, _wipe_disks=False: (
-            setattr(cp_ctrl.nodes[nid - 1], "state", "ONLINE") or True
-        )
-        assert cp_ctrl.execute_triad_sql("INSERT OR REPLACE INTO kv VALUES ('x', 'a', 1)")["ok"]
-        assert cp_ctrl.execute_triad_sql("UPDATE kv SET rev = 2 WHERE k = 'x'")["ok"]
-        assert cp_ctrl.checkpoint_wal(), "checkpoint_wal must succeed when all 3 nodes are ONLINE and agree"
-        assert cp_ctrl.wal_entries == [], "checkpoint_wal must clear superseded wal_entries"
-        # Tamper node 2 and reverse row order on node 3 to verify order-insensitive digest + heal
-        cp_rows[2] = [("x", "CORRUPTED", 999)]
-        cp_rows[3] = list(reversed(cp_rows[1]))
-        assert cp_ctrl._state_probe(cp_ctrl.nodes[0]) == cp_ctrl._state_probe(cp_ctrl.nodes[2]), (
-            "_state_probe must be order-insensitive across row slot allocations"
-        )
-        cp_ctrl.heal_and_remorph_node(cp_ctrl.nodes[1])
-        assert ("x", "a", 2) in cp_rows[2], f"Healed node lost row 'x' or column 'v' after checkpoint: {cp_rows[2]}"
-        assert cp_ctrl._state_probe(cp_ctrl.nodes[1]) == cp_ctrl._state_probe(cp_ctrl.nodes[0])
+            # Execute > MAX_WAL_ENTRIES (66 statements across 44 rows -> 47 total rows > 1 KiB)
+            # including values with `|`, doubled single quotes `''`, and multi-column partial UPDATEs.
+            assert cp_ctrl.execute_triad_sql(
+                "INSERT OR REPLACE INTO kv VALUES ('pipe.key', 'left|mid|right', 1)"
+            )["ok"]
+            assert cp_ctrl.execute_triad_sql(
+                "INSERT OR REPLACE INTO kv VALUES ('quote.key', 'it''s|quoted', 1)"
+            )["ok"]
+            assert cp_ctrl.execute_triad_sql(
+                "INSERT OR REPLACE INTO kv VALUES ('partial.key', 'orig_v', 1)"
+            )["ok"]
+            assert cp_ctrl.execute_triad_sql(
+                "UPDATE kv SET v = 'updated|v' WHERE k = 'partial.key'"
+            )["ok"]
+            assert cp_ctrl.execute_triad_sql(
+                "UPDATE kv SET rev = 9 WHERE k = 'partial.key'"
+            )["ok"]
+            for i in range(1, 42):
+                assert cp_ctrl.execute_triad_sql(
+                    f"INSERT OR REPLACE INTO kv VALUES ('row.{i:02d}', 'val_{i:02d}_padding_text', {i})"
+                )["ok"]
+            for i in range(1, 22):
+                assert cp_ctrl.execute_triad_sql(
+                    f"UPDATE kv SET rev = {100 + i} WHERE k = 'row.{i:02d}'"
+                )["ok"]
 
-        # Also test multi-column partial updates (`SET v='new'` followed by `SET rev=9`) across checkpoint + heal
-        assert cp_ctrl.execute_triad_sql("UPDATE kv SET v = 'new' WHERE k = 'x'")["ok"]
-        assert cp_ctrl.execute_triad_sql("UPDATE kv SET rev = 9 WHERE k = 'x'")["ok"]
-        assert cp_ctrl.checkpoint_wal()
-        cp_rows[2] = [("x", "TAMPER", 0)]
-        cp_ctrl.heal_and_remorph_node(cp_ctrl.nodes[1])
-        assert ("x", "new", 9) in cp_rows[2], f"Healed node lost column 'v' after multi-column UPDATE: {cp_rows[2]}"
-        assert (
-            cp_ctrl._state_probe(cp_ctrl.nodes[0])
-            == cp_ctrl._state_probe(cp_ctrl.nodes[1])
-            == cp_ctrl._state_probe(cp_ctrl.nodes[2])
-        )
+            assert cp_ctrl.triad_tx_seq == 67, f"Expected tx_seq=67 (> MAX_WAL_ENTRIES), got {cp_ctrl.triad_tx_seq}"
+            assert cp_ctrl.wal_checkpoint["tx_seq"] >= 65, (
+                f"Automatic WAL checkpoint did not trigger after crossing MAX_WAL_ENTRIES ({MAX_WAL_ENTRIES}): {cp_ctrl.wal_checkpoint}"
+            )
+            assert len(cp_ctrl.wal_entries) <= 2, (
+                f"Superseded WAL entries were not cleared by automatic checkpoint: len={len(cp_ctrl.wal_entries)}"
+            )
+            # Confirm raw `SELECT * FROM kv` is truncated at the 1,024-byte kernel console buffer,
+            # while `_dump_node_sql_table` reads all 47 rows losslessly.
+            raw_sel = cp_harness.exec(cp_ctrl.nodes[0], "sql /*triad*/ SELECT * FROM kv")
+            assert len(raw_sel) >= 1000, f"Expected SELECT output to hit ~1 KiB console cap, got {len(raw_sel)} B"
+            tdump0 = cp_ctrl._dump_node_sql_table(cp_ctrl.nodes[0], "kv")
+            assert tdump0 is not None and tdump0["rows_count"] == 47, (
+                f"Expected 47 lossless rows in chunked .dump, got {tdump0}"
+            )
+
+            # Tamper a row past the 1 KiB SELECT truncation boundary on node 2 (`z.tail` sorts last)
+            # and verify `_state_probe` detects the divergence and `heal_and_remorph_node` restores 3/3.
+            cp_harness.exec(
+                cp_ctrl.nodes[1],
+                "sql /*triad*/ UPDATE kv SET v = 'TAMPERED_PAST_1K' WHERE k = 'row.41'",
+            )
+            assert cp_ctrl._state_probe(cp_ctrl.nodes[0]) != cp_ctrl._state_probe(cp_ctrl.nodes[1]), (
+                "_state_probe must detect divergence beyond the first 1 KiB of rows"
+            )
+            cp_ctrl.heal_and_remorph_node(cp_ctrl.nodes[1])
+            healed_dump = cp_ctrl._dump_node_sql_table(cp_ctrl.nodes[1], "kv")
+            assert healed_dump is not None and healed_dump["rows_count"] == 47, (
+                f"Healed node lost rows after checkpoint replay: {healed_dump}"
+            )
+            row_map = {r[0][1]: (r[1][1], r[2][1]) for r in healed_dump["rows"]}
+            assert row_map.get("pipe.key") == ("left|mid|right", 1), f"Pipe row corrupted: {row_map.get('pipe.key')}"
+            assert row_map.get("quote.key") == ("it's|quoted", 1), f"Quote row corrupted: {row_map.get('quote.key')}"
+            assert row_map.get("partial.key") == ("updated|v", 9), f"Partial update row corrupted: {row_map.get('partial.key')}"
+            assert row_map.get("row.41") == ("val_41_padding_text", 41), f"Tail row.41 not healed: {row_map.get('row.41')}"
+            assert (
+                cp_ctrl._state_probe(cp_ctrl.nodes[0])
+                == cp_ctrl._state_probe(cp_ctrl.nodes[1])
+                == cp_ctrl._state_probe(cp_ctrl.nodes[2])
+            ), "All 3 nodes must converge 3/3 after healing from chunked checkpoint + tail"
+
+            # Low #9.3: When 1 node is OFFLINE, checkpoint_wal logs WARN and succeeds with 2/3 agreeing nodes.
+            cp_ctrl.nodes[2].state = "OFFLINE"
+            assert cp_ctrl.execute_triad_sql("UPDATE kv SET rev = 777 WHERE k = 'pipe.key'")["ok"]
+            assert cp_ctrl.checkpoint_wal(), "checkpoint_wal must succeed with 2/3 agreeing online nodes when 1 node is down"
+            assert any(
+                e["level"] == "WARN" and "majority WAL checkpoint" in e["msg"] for e in cp_ctrl.events
+            ), "2/3 degraded checkpoint must log a WARN event"
+            cp_ctrl.nodes[2].state = "ONLINE"
+            cp_ctrl.heal_and_remorph_node(cp_ctrl.nodes[2])
+            assert (
+                cp_ctrl._state_probe(cp_ctrl.nodes[0])
+                == cp_ctrl._state_probe(cp_ctrl.nodes[1])
+                == cp_ctrl._state_probe(cp_ctrl.nodes[2])
+            )
+
+            # High #2: Non-`kv` table DDL (`CREATE TABLE` + `CREATE INDEX`) is recorded in `wal_checkpoint["stmts"]`.
+            cp_ctrl.spec.vote_tables = ("kv", "idx")
+            cp_ctrl.spec.provision_sql = ()
+            assert cp_ctrl.execute_triad_sql("CREATE TABLE idx (term TEXT, doc TEXT, weight INT)")["ok"]
+            assert cp_ctrl.execute_triad_sql("CREATE INDEX idx_term ON idx (term)")["ok"]
+            assert cp_ctrl.execute_triad_sql("INSERT INTO idx VALUES ('cuttle|term', 'doc''1', 42)")["ok"]
+            assert cp_ctrl.checkpoint_wal()
+            assert any("CREATE TABLE IF NOT EXISTS idx" in s for s in cp_ctrl.wal_checkpoint["stmts"]), (
+                f"checkpoint_wal did not record CREATE TABLE idx DDL: {cp_ctrl.wal_checkpoint['stmts']}"
+            )
+            assert any("CREATE INDEX idx_term ON idx" in s for s in cp_ctrl.wal_checkpoint["stmts"]), (
+                f"checkpoint_wal did not record CREATE INDEX DDL: {cp_ctrl.wal_checkpoint['stmts']}"
+            )
+            cp_harness.exec(cp_ctrl.nodes[1], "sql /*triad*/ DROP TABLE idx")
+            cp_ctrl.heal_and_remorph_node(cp_ctrl.nodes[1])
+            assert (
+                cp_ctrl._state_probe(cp_ctrl.nodes[0])
+                == cp_ctrl._state_probe(cp_ctrl.nodes[1])
+                == cp_ctrl._state_probe(cp_ctrl.nodes[2])
+            )
+        finally:
+            cp_harness.close()
 
         # #12: apply_node_profile keeps node OFFLINE and logs ALERT when role application fails
         role_dir = tmp_dir / "role_fail"
@@ -3628,6 +3944,27 @@ def run_unit_self_tests():
 
         def fake_idx_cmd(node, cmd, timeout=4.0):
             t = idx_tables[node.node_id]
+            m_dump = re.search(r"\.dump\s+(\S+)\s+(\d+)\s+(\d+)", cmd)
+            if m_dump:
+                tname, off, lim = m_dump.group(1), int(m_dump.group(2)), int(m_dump.group(3))
+                if tname == "kv":
+                    parsed = [
+                        (parts[0], parts[1], int(parts[2]))
+                        for ln in t["kv"]
+                        for parts in [ln.split("|")]
+                    ]
+                    return format_kernel_sqldump_reply(
+                        "kv", [("k", "TEXT"), ("v", "TEXT"), ("rev", "INT")], parsed, off, lim
+                    )
+                if tname == "idx":
+                    parsed = [
+                        (parts[0], parts[1], int(parts[2]))
+                        for ln in t["idx"]
+                        for parts in [ln.split("|")]
+                    ]
+                    return format_kernel_sqldump_reply(
+                        "idx", [("term", "TEXT"), ("doc", "TEXT"), ("weight", "INT")], parsed, off, lim
+                    )
             if "DROP TABLE" in cmd and "kv" in cmd:
                 t["kv"] = []
                 return "ok"
@@ -3701,6 +4038,13 @@ def run_unit_self_tests():
                     s = s[len("sql /*triad*/") :].strip()
                 elif s.startswith("sql "):
                     s = s[4:].strip()
+                m_dump = re.match(r"^\.dump\s+kv(?:\s+(\d+)(?:\s+(\d+))?)?$", s, re.I)
+                if m_dump:
+                    off = int(m_dump.group(1)) if m_dump.group(1) else 0
+                    lim = int(m_dump.group(2)) if m_dump.group(2) else 3
+                    return format_kernel_sqldump_reply(
+                        "kv", [("k", "TEXT"), ("v", "TEXT"), ("rev", "INT")], rows, off, lim
+                    )
                 if s == "DROP TABLE kv" or s == "DELETE FROM kv":
                     rows.clear()
                     return "OK"
