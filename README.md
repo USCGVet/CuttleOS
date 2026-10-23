@@ -146,6 +146,11 @@ Evaluated via `cuttle-binmorph` and `cuttle-mtd-metrics` (`churn` and `chainsim`
 
 ## Build, Test & Run
 
+> **Nightly Toolchain Requirement:** Building [`target_enterprise_kernel`](target_enterprise_kernel/rust-toolchain.toml) (`-Zbuild-std`) and packaging BIOS/UEFI boot images via [`factory_builder_pkg`](factory_builder_pkg/rust-toolchain.toml) (`bootloader 0.11.17`) pin **`nightly-2026-10-22`** (`rustc 1.101.0-nightly (1a2c4797e 2026-10-21)`) with `rust-src` and `llvm-tools-preview`:
+> ```powershell
+> rustup toolchain install nightly-2026-10-22 --component rust-src --component llvm-tools-preview
+> ```
+
 ### 1. Launch the Cuttle Triad Appliance (*"Three Hearts. One Appliance."* — 3 VMs + TMR 2-of-3 Majority + RAID-SQL + Rolling MTD)
 ```powershell
 .\triad.bat

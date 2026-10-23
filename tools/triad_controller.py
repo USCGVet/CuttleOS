@@ -99,6 +99,7 @@ class TriadSpec:
     log_prefix: str = ""
     write_operator_token: bool = True  # False in fleet farms (which authenticate via farm secret)
     forward_node_ports: bool = True  # False in fleet farms so node ports are not exposed on loopback
+    unit_test: bool = False  # True only in run_unit_self_tests() to skip QEMU/BASE_ELF packaging
 
     @property
     def has_sql(self) -> bool:
@@ -672,14 +673,20 @@ class TriadNode:
 
 
 class TriadController:
-    def __init__(self, show_gui: bool = False, spec: TriadSpec | None = None):
+    def __init__(
+        self,
+        show_gui: bool = False,
+        spec: TriadSpec | None = None,
+        unit_test: bool = False,
+    ):
         self.spec = spec or TriadSpec()
-        try:
-            self.qemu_bin = find_qemu()
-            self.accel, self.accel_args = resolve_accelerator(self.qemu_bin, self.spec.accel)
-        except RuntimeError:
+        self.unit_test = bool(unit_test or self.spec.unit_test)
+        if self.unit_test:
             self.qemu_bin = "qemu-system-x86_64"
             self.accel, self.accel_args = "tcg", ["-accel", "tcg"]
+        else:
+            self.qemu_bin = find_qemu()
+            self.accel, self.accel_args = resolve_accelerator(self.qemu_bin, self.spec.accel)
         self.show_gui = show_gui
         state_dir = self.spec.state_dir
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -696,7 +703,15 @@ class TriadController:
                 (self.coordinator_token + "\n").encode("ascii"),
             )
 
-        if BASE_ELF.exists():
+        if self.unit_test:
+            self.base_elf_bytes = b"\x7fELF" + b"\x00" * 60
+            self.base_bios_bytes = b"\x00" * 64 + self.base_elf_bytes + b"\x00" * 64
+            self.elf_offset_in_bios = 64
+        else:
+            if not BASE_ELF.exists():
+                raise RuntimeError(
+                    f"Base kernel ELF not found at {BASE_ELF}; build target_enterprise_kernel first."
+                )
             self.base_elf_bytes = BASE_ELF.read_bytes()
             if not BASE_BIOS.exists() or BASE_BIOS.read_bytes().find(self.base_elf_bytes) < 0:
                 subprocess.run(
@@ -722,10 +737,6 @@ class TriadController:
                 raise RuntimeError(
                     "Base kernel ELF not found contiguously in run_bios.img; rebuild run_bios.img first."
                 )
-        else:
-            self.base_elf_bytes = b"\x7fELF" + b"\x00" * 60
-            self.base_bios_bytes = b"\x00" * 64 + self.base_elf_bytes + b"\x00" * 64
-            self.elf_offset_in_bios = 64
 
         s = self.spec
         self.nodes = [
@@ -3690,6 +3701,51 @@ def run_unit_self_tests():
         assert not list(acl_order_dir.glob("*.tmp")), "Failed write_secret_file must unlink tmp file"
         assert not (acl_order_dir / "fail_secret.bin").exists()
 
+        # Medium #4 & Low #5: Production controller (unit_test=False) refuses to start when
+        #                     QEMU or BASE_ELF is missing, while unit_test=True constructs
+        #                     controllers without touching BASE_ELF/BASE_BIOS or invoking cargo.
+        orig_base_elf = globals()["BASE_ELF"]
+        orig_base_bios = globals()["BASE_BIOS"]
+        orig_find_qemu = globals()["find_qemu"]
+        try:
+            globals()["BASE_ELF"] = tmp_dir / "definitely_missing_kernel_elf"
+            globals()["BASE_BIOS"] = tmp_dir / "definitely_missing_bios.img"
+            try:
+                TriadController(
+                    show_gui=False,
+                    spec=TriadSpec(name="prod-missing-elf", state_dir=tmp_dir / "prod_missing_elf", write_operator_token=False),
+                    unit_test=False,
+                )
+                raise AssertionError("Production TriadController (unit_test=False) must raise RuntimeError when BASE_ELF is missing")
+            except RuntimeError as e:
+                assert "Base kernel ELF not found" in str(e), f"Unexpected error: {e}"
+
+            def missing_qemu():
+                raise RuntimeError("qemu-system-x86_64 not found on PATH")
+
+            globals()["find_qemu"] = missing_qemu
+            try:
+                TriadController(
+                    show_gui=False,
+                    spec=TriadSpec(name="prod-missing-qemu", state_dir=tmp_dir / "prod_missing_qemu", write_operator_token=False),
+                    unit_test=False,
+                )
+                raise AssertionError("Production TriadController (unit_test=False) must raise RuntimeError when QEMU is missing")
+            except RuntimeError as e:
+                assert "qemu-system-x86_64 not found" in str(e), f"Unexpected error: {e}"
+
+            ut_ctrl = TriadController(
+                show_gui=False,
+                spec=TriadSpec(name="ut-no-elf", state_dir=tmp_dir / "ut_no_elf", write_operator_token=False),
+                unit_test=True,
+            )
+            ut_ctrl.shutdown()
+            assert ut_ctrl.base_elf_bytes.startswith(b"\x7fELF") and ut_ctrl.elf_offset_in_bios == 64
+        finally:
+            globals()["BASE_ELF"] = orig_base_elf
+            globals()["BASE_BIOS"] = orig_base_bios
+            globals()["find_qemu"] = orig_find_qemu
+
         # #15.2: Dropped legacy/non-read-only cron jobs log a WARN event on startup
         cron_warn_dir = tmp_dir / "cron_warn"
         cron_warn_dir.mkdir(parents=True, exist_ok=True)
@@ -3700,6 +3756,7 @@ def run_unit_self_tests():
         cron_warn_ctrl = TriadController(
             show_gui=False,
             spec=TriadSpec(name="cron-warn", state_dir=cron_warn_dir, write_operator_token=False),
+            unit_test=True,
         )
         cron_warn_ctrl.shutdown()
         assert cron_warn_ctrl.desired_cron == [(5, "status")]
@@ -3717,6 +3774,7 @@ def run_unit_self_tests():
         no_tok_ctrl = TriadController(
             show_gui=False,
             spec=TriadSpec(name="no-tok", state_dir=no_tok_dir, write_operator_token=False),
+            unit_test=True,
         )
         no_tok_ctrl.shutdown()
         assert not (no_tok_dir / "operator_token.txt").exists(), (
@@ -3728,7 +3786,7 @@ def run_unit_self_tests():
         corrupt_dir.mkdir(parents=True, exist_ok=True)
         (corrupt_dir / "triad_wal.json").write_text("{corrupt json", encoding="utf-8")
         try:
-            TriadController(show_gui=False, spec=TriadSpec(name="corrupt", state_dir=corrupt_dir))
+            TriadController(show_gui=False, spec=TriadSpec(name="corrupt", state_dir=corrupt_dir), unit_test=True)
             raise AssertionError("Corrupt triad_wal.json must raise ValueError at startup")
         except ValueError:
             assert (corrupt_dir / "triad_wal.json.bad").exists(), "Corrupt WAL must be saved to triad_wal.json.bad"
@@ -3763,6 +3821,7 @@ def run_unit_self_tests():
         cp_ctrl = TriadController(
             show_gui=False,
             spec=TriadSpec(name="cp-test", state_dir=cp_dir, role="sql", write_operator_token=False),
+            unit_test=True,
         )
         cp_ctrl.shutdown()
         for n in cp_ctrl.nodes:
@@ -3899,6 +3958,7 @@ def run_unit_self_tests():
         role_ctrl = TriadController(
             show_gui=False,
             spec=TriadSpec(name="role-fail", state_dir=role_dir, role="sql", write_operator_token=False),
+            unit_test=True,
         )
         role_ctrl.shutdown()
         rn = role_ctrl.nodes[0]
@@ -3915,6 +3975,7 @@ def run_unit_self_tests():
         wfe_ctrl = TriadController(
             show_gui=False,
             spec=TriadSpec(name="wfe-test", state_dir=wfe_dir, job="web", role="wfe", write_operator_token=False),
+            unit_test=True,
         )
         wfe_ctrl.shutdown()
         multiline_html = b"<h1>hello</h1>\n<p>world</p>\n" + (b"<!-- pad -->\n" * 16)
@@ -3978,6 +4039,7 @@ def run_unit_self_tests():
                         role=role_name,
                         write_operator_token=False,
                     ),
+                    unit_test=True,
                 )
                 sh_role_ctrl.shutdown()
                 for n in sh_role_ctrl.nodes:
@@ -4038,6 +4100,7 @@ def run_unit_self_tests():
                 vote_tables=("kv", "idx"),
                 write_operator_token=False,
             ),
+            unit_test=True,
         )
         idx_ctrl.shutdown()
         idx_tables = {
@@ -4132,6 +4195,7 @@ def run_unit_self_tests():
         pend_ctrl = TriadController(
             show_gui=False,
             spec=TriadSpec(name="pend-test", state_dir=pend_dir, role="sql", write_operator_token=False),
+            unit_test=True,
         )
         pend_ctrl.shutdown()
         pend_rows = {
@@ -4237,6 +4301,7 @@ def run_unit_self_tests():
         restarted_pend = TriadController(
             show_gui=False,
             spec=TriadSpec(name="pend-restart", state_dir=pend_dir, role="sql", write_operator_token=False),
+            unit_test=True,
         )
         restarted_pend.shutdown()
         for n in restarted_pend.nodes:
@@ -4274,6 +4339,7 @@ def run_unit_self_tests():
         commit_boot = TriadController(
             show_gui=False,
             spec=TriadSpec(name="pend-commit-boot", state_dir=pend_dir, role="sql", write_operator_token=False),
+            unit_test=True,
         )
         commit_boot.shutdown()
         for n in commit_boot.nodes:
@@ -4311,6 +4377,7 @@ def run_unit_self_tests():
         combined_boot = TriadController(
             show_gui=False,
             spec=TriadSpec(name="pend-rb-combined", state_dir=pend_dir, role="sql", write_operator_token=False),
+            unit_test=True,
         )
         combined_boot.shutdown()
         for n in combined_boot.nodes:
@@ -4369,6 +4436,7 @@ def run_unit_self_tests():
         rb_ctrl = TriadController(
             show_gui=False,
             spec=TriadSpec(name="rb-test", state_dir=rb_dir, role="sql", write_operator_token=False),
+            unit_test=True,
         )
         rb_ctrl.shutdown()
         rb_rows = {
@@ -4390,6 +4458,7 @@ def run_unit_self_tests():
         rb_boot = TriadController(
             show_gui=False,
             spec=TriadSpec(name="rb-boot", state_dir=rb_dir, role="sql", write_operator_token=False),
+            unit_test=True,
         )
         rb_boot.shutdown()
         for n in rb_boot.nodes:
@@ -4451,6 +4520,7 @@ def run_unit_self_tests():
         hm_ctrl = TriadController(
             show_gui=False,
             spec=TriadSpec(name="hm-test", state_dir=hm_dir, role="sql", write_operator_token=False),
+            unit_test=True,
         )
         hm_ctrl.shutdown()
         hm_rows = {
