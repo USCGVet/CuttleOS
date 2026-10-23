@@ -55,6 +55,10 @@ pub const MAX_HTTP_REQUEST_BYTES: usize = 8 * 1024;
 /// requests that are individually `<= MAX_HTTP_REQUEST_BYTES` can queue without
 /// being wiped while outbound segments drain.
 pub const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
+/// Maximum aggregate buffered HTTP/TLS bytes across all 16 [`TCP_MAX_SLOTS`]
+/// connection slots (`512 KiB`), bounding total network buffer memory well
+/// inside the 8 MiB kernel heap even when all 16 slots are active concurrently.
+pub const MAX_TOTAL_BUFFERED_BYTES: usize = 512 * 1024;
 /// High-water mark on a [`TlsSession`]'s outbound ciphertext queue (`pending_tx`)
 /// above which `handle_https_slot` pauses draining new decrypted HTTP requests.
 pub const HTTPS_TX_HIGH_WATER: usize = 16 * 1024;
@@ -181,6 +185,7 @@ pub struct LivedNet {
     ip_ident: u16,
     http_bufs: [alloc::vec::Vec<u8>; TCP_MAX_SLOTS],
     http_tx: [alloc::vec::Vec<u8>; TCP_MAX_SLOTS],
+    slot_tls_buffered: [usize; TCP_MAX_SLOTS],
     tls_config: Option<Arc<ServerConfig>>,
     tls: [Option<Box<TlsSession>>; TCP_MAX_SLOTS],
 }
@@ -206,6 +211,7 @@ impl LivedNet {
             ip_ident: 1,
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
+            slot_tls_buffered: [0usize; TCP_MAX_SLOTS],
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -237,6 +243,7 @@ impl LivedNet {
             ip_ident: 1,
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
+            slot_tls_buffered: [0usize; TCP_MAX_SLOTS],
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -263,6 +270,7 @@ impl LivedNet {
             ip_ident: 1,
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
+            slot_tls_buffered: [0usize; TCP_MAX_SLOTS],
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -312,11 +320,51 @@ impl LivedNet {
         count
     }
 
+    /// Return total unread input and queued output bytes buffered across all
+    /// [`TCP_MAX_SLOTS`] HTTP and HTTPS connection slots.
+    pub fn total_buffered_bytes(&self) -> usize {
+        let mut total = 0usize;
+        let mut i = 0usize;
+        while i < TCP_MAX_SLOTS {
+            total = total
+                .saturating_add(self.http_bufs[i].len())
+                .saturating_add(self.http_tx[i].len())
+                .saturating_add(self.slot_tls_buffered[i]);
+            i += 1;
+        }
+        total
+    }
+
+    /// Return total heap capacity (`Vec::capacity`) held by HTTP/HTTPS buffers
+    /// across all [`TCP_MAX_SLOTS`] connection slots.
+    pub fn total_buffered_capacity(&self) -> usize {
+        let mut total = 0usize;
+        let mut i = 0usize;
+        while i < TCP_MAX_SLOTS {
+            total = total
+                .saturating_add(self.http_bufs[i].capacity())
+                .saturating_add(self.http_tx[i].capacity())
+                .saturating_add(self.slot_tls_buffered[i]);
+            i += 1;
+        }
+        total
+    }
+
+    fn release_slot_buffers(&mut self, idx: usize) {
+        self.http_input_closed[idx] = false;
+        self.http_bufs[idx].clear();
+        self.http_bufs[idx].shrink_to_fit();
+        self.http_tx[idx].clear();
+        self.http_tx[idx].shrink_to_fit();
+        self.slot_tls_buffered[idx] = 0;
+        self.tls[idx] = None;
+    }
+
     /// Advance per-slot TCP Retransmission Timeout (RTO) timers by one calibrated
     /// Local APIC timer interrupt (`vector 0x40`), reclaiming stale half-open
-    /// (`SynReceived`) or closing (`LastAck`) slots after [`TCP_HALF_OPEN_RECLAIM_MS`]
-    /// (`2,000 ms`) and idle `Established` / `CloseWait` slots after
-    /// [`HTTPS_IDLE_TIMEOUT_MS`] (`16,384 ms`).
+    /// (`SynReceived`) or closing (`FinWait1`, `FinWait2`, `LastAck`) slots after
+    /// [`TCP_HALF_OPEN_RECLAIM_MS`] (`2,000 ms`) and idle `Established` / `CloseWait`
+    /// slots after [`HTTPS_IDLE_TIMEOUT_MS`] (`16,384 ms`).
     pub fn tick_tcp_rto(&mut self) -> usize {
         let mut discard = ReplySet::new();
         self.tick_tcp_rto_with_replies(&mut discard)
@@ -334,7 +382,11 @@ impl LivedNet {
         let mut i = 0usize;
         while i < TCP_MAX_SLOTS {
             let st = self.tcbs[i].state;
-            if st == TcpState::SynReceived || st == TcpState::LastAck {
+            if st == TcpState::SynReceived
+                || st == TcpState::FinWait1
+                || st == TcpState::FinWait2
+                || st == TcpState::LastAck
+            {
                 let elapsed = self.ticks.wrapping_sub(self.slot_rto_ticks[i]);
                 if elapsed >= rto_ticks {
                     self.rto_retransmits = self.rto_retransmits.wrapping_add(1);
@@ -342,10 +394,7 @@ impl LivedNet {
                     if self.ticks.wrapping_sub(self.slot_last_tick[i]) >= reclaim_ticks {
                         self.tcbs[i] = Tcb::EMPTY;
                         self.slot_remote_mac[i] = [0u8; 6];
-                        self.http_input_closed[i] = false;
-                        self.http_bufs[i].clear();
-                        self.http_tx[i].clear();
-                        self.tls[i] = None;
+                        self.release_slot_buffers(i);
                     } else {
                         self.slot_rto_ticks[i] = self.ticks;
                     }
@@ -376,10 +425,7 @@ impl LivedNet {
                 }
                 self.tcbs[i] = Tcb::EMPTY;
                 self.slot_remote_mac[i] = [0u8; 6];
-                self.http_input_closed[i] = false;
-                self.http_bufs[i].clear();
-                self.http_tx[i].clear();
-                self.tls[i] = None;
+                self.release_slot_buffers(i);
                 actions += 1;
             }
             i += 1;
@@ -1088,10 +1134,7 @@ impl LivedNet {
         self.tcbs[idx] = Tcb::listen(self.ip, dst_port, 65535);
         self.slot_rto_ticks[idx] = self.ticks;
         self.slot_remote_mac[idx] = [0u8; 6];
-        self.http_input_closed[idx] = false;
-        self.http_bufs[idx].clear();
-        self.http_tx[idx].clear();
-        self.tls[idx] = None;
+        self.release_slot_buffers(idx);
         Some(idx)
     }
 
@@ -1120,7 +1163,10 @@ impl LivedNet {
             Some(i) => i,
             None => return,
         };
-        let was_close_wait = self.tcbs[idx].state == TcpState::CloseWait;
+        let was_close_wait = matches!(
+            self.tcbs[idx].state,
+            TcpState::CloseWait | TcpState::FinWait1 | TcpState::FinWait2 | TcpState::LastAck
+        );
         let inbound_payload = seg.payload;
         let (next, hint) = match process_segment(self.tcbs[idx], &seg, self.ticks) {
             Ok(t) => t,
@@ -1155,12 +1201,15 @@ impl LivedNet {
 
         let mut overflow_413 = false;
         if !effective_payload.is_empty() && self.tcbs[idx].state != TcpState::Listen {
-            if self.http_bufs[idx]
+            let next_slot_len = self.http_bufs[idx]
                 .len()
-                .saturating_add(effective_payload.len())
-                > MAX_HTTP_BUFFER_BYTES
-            {
+                .saturating_add(effective_payload.len());
+            let next_total_len = self
+                .total_buffered_bytes()
+                .saturating_add(effective_payload.len());
+            if next_slot_len > MAX_HTTP_BUFFER_BYTES || next_total_len > MAX_TOTAL_BUFFERED_BYTES {
                 self.http_bufs[idx].clear();
+                self.http_bufs[idx].shrink_to_fit();
                 self.http_input_closed[idx] = true;
                 overflow_413 = true;
             } else {
@@ -1172,6 +1221,7 @@ impl LivedNet {
         if overflow_413 {
             self.http_input_closed[idx] = true;
             self.http_bufs[idx].clear();
+            self.http_bufs[idx].shrink_to_fit();
             let mut single = [0u8; TCP_SEGMENT_PAYLOAD];
             let n = build_http_413_response(&mut single);
             if n > 0 {
@@ -1216,6 +1266,7 @@ impl LivedNet {
                 if close_after {
                     self.http_input_closed[idx] = true;
                     self.http_bufs[idx].clear();
+                    self.http_bufs[idx].shrink_to_fit();
                     framing_exhausted = true;
                     break;
                 }
@@ -1243,11 +1294,20 @@ impl LivedNet {
         }
 
         let drained = self.http_tx[idx].is_empty();
+        if drained && self.http_tx[idx].capacity() > 4096 {
+            self.http_tx[idx].shrink_to_fit();
+        }
+        if self.http_bufs[idx].is_empty() && self.http_bufs[idx].capacity() > 4096 {
+            self.http_bufs[idx].shrink_to_fit();
+        }
         let ready_to_close = (self.tcbs[idx].state == TcpState::CloseWait
             && (framing_exhausted || self.http_input_closed[idx]))
             || (self.http_input_closed[idx] && self.tcbs[idx].state == TcpState::Established);
         if ready_to_close && drained && out.len() < MAX_REPLIES {
             self.emit_fin(idx, dst_mac, reply_ip, out);
+        }
+        if self.tcbs[idx].state == TcpState::Closed {
+            self.release_slot_buffers(idx);
         }
     }
 
@@ -1304,7 +1364,7 @@ impl LivedNet {
         sent
     }
 
-    /// Send our FIN from `CloseWait` (the peer already closed its side).
+    /// Send our FIN from `CloseWait` or `Established`.
     fn emit_fin(&mut self, idx: usize, dst_mac: [u8; 6], reply_ip: [u8; 4], out: &mut ReplySet) {
         let local_port = self.tcbs[idx].local_port;
         let remote_port = self.tcbs[idx].remote_port;
@@ -1358,7 +1418,31 @@ impl LivedNet {
         if let Some(mut session) = self.tls[idx].take() {
             let mut overflow_413 = false;
             if !inbound.is_empty() && !self.http_input_closed[idx] {
-                if let Err(err) = session.receive(inbound) {
+                let other_slots_buffered =
+                    self.total_buffered_bytes().saturating_sub(self.slot_tls_buffered[idx]);
+                let projected_slot = session
+                    .plaintext()
+                    .len()
+                    .saturating_add(session.pending_tx().len())
+                    .saturating_add(inbound.len());
+                if other_slots_buffered.saturating_add(projected_slot) > MAX_TOTAL_BUFFERED_BYTES {
+                    let is_http_overflow = session.is_established() && !session.is_failed();
+                    if let Some(sh) = shell.as_deref_mut() {
+                        sh.record_net_audit(
+                            AuditVerdict::Denied,
+                            if is_http_overflow {
+                                b"net:https:overflow"
+                            } else {
+                                b"net:tls:rejected"
+                            },
+                        );
+                    }
+                    if is_http_overflow {
+                        overflow_413 = true;
+                    } else {
+                        self.http_input_closed[idx] = true;
+                    }
+                } else if let Err(err) = session.receive(inbound) {
                     let is_http_overflow = err == crate::https::SessionError::Overflow
                         && session.is_established()
                         && !session.is_failed();
@@ -1381,6 +1465,7 @@ impl LivedNet {
             if overflow_413 {
                 self.http_input_closed[idx] = true;
                 session.plaintext().clear();
+                session.plaintext().shrink_to_fit();
                 let mut response = [0u8; TCP_SEGMENT_PAYLOAD];
                 let n = build_http_413_response(&mut response);
                 if n > 0 {
@@ -1438,6 +1523,7 @@ impl LivedNet {
                 if close_after {
                     self.http_input_closed[idx] = true;
                     session.plaintext().clear();
+                    session.plaintext().shrink_to_fit();
                     session.close();
                     framing_exhausted = true;
                     break;
@@ -1453,6 +1539,13 @@ impl LivedNet {
             {
                 session.close();
             }
+            if session.plaintext().is_empty() && session.plaintext().capacity() > 4096 {
+                session.plaintext().shrink_to_fit();
+            }
+            self.slot_tls_buffered[idx] = session
+                .plaintext()
+                .len()
+                .saturating_add(session.pending_tx().len());
             self.tls[idx] = Some(session);
         }
 
@@ -1485,6 +1578,9 @@ impl LivedNet {
             && out.len() < MAX_REPLIES
         {
             self.emit_fin(idx, dst_mac, reply_ip, out);
+        }
+        if self.tcbs[idx].state == TcpState::Closed {
+            self.release_slot_buffers(idx);
         }
     }
 
@@ -1537,6 +1633,10 @@ impl LivedNet {
             self.tcbs[idx] = next;
             if let Some(session) = self.tls[idx].as_mut() {
                 session.consume_tx(n);
+                self.slot_tls_buffered[idx] = session
+                    .plaintext()
+                    .len()
+                    .saturating_add(session.pending_tx().len());
             }
             sent = true;
         }
@@ -4317,5 +4417,258 @@ mod tests {
         let rst_seg =
             TcpImpl::parse_segment(&rst_replies.get(0).unwrap()[34..], GUEST_IP, peer_ip).unwrap();
         assert_ne!(rst_seg.flags & tcp_flags::RST, 0, "expected RST flag on reclaimed slot");
+    }
+
+    #[test]
+    fn connection_close_header_enters_fin_wait_and_acks_late_client_fin() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x9E];
+        let peer_mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+        let peer_ip = [10, 0, 2, 2];
+        let mut net = LivedNet::new(mac);
+        let mut out = ReplySet::new();
+
+        let build_tcp_frame =
+            |sport: u16, dport: u16, seq: u32, ack: u32, flags: u8, payload: &[u8]| -> alloc::vec::Vec<u8> {
+                let mut frame = alloc::vec![0u8; 54 + payload.len()];
+                let tcp_len = TcpImpl::build_segment(
+                    sport,
+                    dport,
+                    seq,
+                    ack,
+                    flags,
+                    65535,
+                    payload,
+                    peer_ip,
+                    GUEST_IP,
+                    &mut frame[34..],
+                )
+                .unwrap();
+                let ip_len = 20 + tcp_len;
+                frame.truncate(14 + ip_len);
+                frame[..6].copy_from_slice(&mac);
+                frame[6..12].copy_from_slice(&peer_mac);
+                frame[12..14].copy_from_slice(&[0x08, 0x00]);
+                frame[14] = 0x45;
+                frame[16..18].copy_from_slice(&(ip_len as u16).to_be_bytes());
+                frame[20] = 0x40;
+                frame[22] = 64;
+                frame[23] = IP_PROTO_TCP;
+                frame[26..30].copy_from_slice(&peer_ip);
+                frame[30..34].copy_from_slice(&GUEST_IP);
+                let ck = ipv4_header_checksum(&frame[14..34]);
+                frame[24..26].copy_from_slice(&ck.to_be_bytes());
+                frame
+            };
+
+        // 1. Handshake to port 80.
+        let syn = build_tcp_frame(43000, 80, 10_000, 0, tcp_flags::SYN, b"");
+        net.handle_frame(&syn, 1, &mut out);
+        let synack = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, peer_ip).unwrap();
+        let mut cseq = 10_001u32;
+        let mut sseq = synack.seq.wrapping_add(1);
+        out = ReplySet::new();
+        let ack = build_tcp_frame(43000, 80, cseq, sseq, tcp_flags::ACK, b"");
+        net.handle_frame(&ack, 1, &mut out);
+
+        // 2. Client sends `Connection: close` request WITHOUT a TCP FIN.
+        let req = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        out = ReplySet::new();
+        let req_seg = build_tcp_frame(43000, 80, cseq, sseq, tcp_flags::ACK | tcp_flags::PSH, req);
+        net.handle_frame(&req_seg, 1, &mut out);
+        cseq = cseq.wrapping_add(req.len() as u32);
+
+        let mut saw_server_fin = false;
+        for i in 0..out.len() {
+            let s = TcpImpl::parse_segment(&out.get(i).unwrap()[34..], GUEST_IP, peer_ip).unwrap();
+            if !s.payload.is_empty() {
+                sseq = sseq.wrapping_add(s.payload.len() as u32);
+            }
+            if (s.flags & tcp_flags::FIN) != 0 {
+                saw_server_fin = true;
+                sseq = sseq.wrapping_add(1);
+            }
+        }
+        assert!(saw_server_fin, "server must emit FIN after Connection: close response");
+        assert_eq!(net.tcbs[0].state, TcpState::FinWait1);
+
+        // 3. Client first ACKs the server's FIN without sending its own FIN yet -> FinWait2.
+        out = ReplySet::new();
+        let bare_ack = build_tcp_frame(43000, 80, cseq, sseq, tcp_flags::ACK, b"");
+        net.handle_frame(&bare_ack, 1, &mut out);
+        assert_eq!(
+            net.tcbs[0].state,
+            TcpState::FinWait2,
+            "slot must stay in FinWait2 after bare ACK of server FIN so a late client FIN is answered"
+        );
+        assert!(out.is_empty());
+
+        // 4. Client now sends its late FIN|ACK -> server answers with ACK and closes the slot.
+        out = ReplySet::new();
+        let client_fin = build_tcp_frame(
+            43000,
+            80,
+            cseq,
+            sseq,
+            tcp_flags::FIN | tcp_flags::ACK,
+            b"",
+        );
+        net.handle_frame(&client_fin, 1, &mut out);
+        assert_eq!(out.len(), 1, "server must emit an ACK for the late client FIN");
+        let fin_ack =
+            TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, peer_ip).unwrap();
+        assert_eq!(fin_ack.flags, tcp_flags::ACK);
+        assert_eq!(fin_ack.ack, cseq.wrapping_add(1));
+        assert_eq!(net.tcbs[0].state, TcpState::Closed);
+        assert_eq!(net.active_tcp_slots(), 0);
+    }
+
+    #[test]
+    fn cross_slot_buffer_cap_and_capacity_shrink_bound_heap_footprint() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x9F];
+        let peer_mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+        let peer_ip = [10, 0, 2, 2];
+        let mut net = LivedNet::new(mac);
+
+        let build_tcp_frame =
+            |sport: u16, dport: u16, seq: u32, ack: u32, flags: u8, payload: &[u8]| -> alloc::vec::Vec<u8> {
+                let mut frame = alloc::vec![0u8; 54 + payload.len()];
+                let tcp_len = TcpImpl::build_segment(
+                    sport,
+                    dport,
+                    seq,
+                    ack,
+                    flags,
+                    65535,
+                    payload,
+                    peer_ip,
+                    GUEST_IP,
+                    &mut frame[34..],
+                )
+                .unwrap();
+                let ip_len = 20 + tcp_len;
+                frame.truncate(14 + ip_len);
+                frame[..6].copy_from_slice(&mac);
+                frame[6..12].copy_from_slice(&peer_mac);
+                frame[12..14].copy_from_slice(&[0x08, 0x00]);
+                frame[14] = 0x45;
+                frame[16..18].copy_from_slice(&(ip_len as u16).to_be_bytes());
+                frame[20] = 0x40;
+                frame[22] = 64;
+                frame[23] = IP_PROTO_TCP;
+                frame[26..30].copy_from_slice(&peer_ip);
+                frame[30..34].copy_from_slice(&GUEST_IP);
+                let ck = ipv4_header_checksum(&frame[14..34]);
+                frame[24..26].copy_from_slice(&ck.to_be_bytes());
+                frame
+            };
+
+        // Open 10 concurrent TCP connections on port 80 and buffer ~56 KiB of incomplete pipelined
+        // HTTP headers on the first 9 slots (`9 * 56 KiB = 504 KiB <= MAX_TOTAL_BUFFERED_BYTES`).
+        let mut cseqs = [0u32; 10];
+        let mut sseqs = [0u32; 10];
+        for slot in 0..10usize {
+            let sport = 44000 + slot as u16;
+            let mut out = ReplySet::new();
+            let syn = build_tcp_frame(sport, 80, 20_000 + (slot as u32) * 100_000, 0, tcp_flags::SYN, b"");
+            net.handle_frame(&syn, 1, &mut out);
+            let synack =
+                TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, peer_ip).unwrap();
+            cseqs[slot] = 20_001 + (slot as u32) * 100_000;
+            sseqs[slot] = synack.seq.wrapping_add(1);
+            out = ReplySet::new();
+            let ack = build_tcp_frame(sport, 80, cseqs[slot], sseqs[slot], tcp_flags::ACK, b"");
+            net.handle_frame(&ack, 1, &mut out);
+        }
+
+        // Each 1,024-byte chunk is a valid complete `GET /healthz` request EXCEPT we keep a
+        // trailing incomplete request at the head so `frame_next_http_request` stops at Incomplete.
+        // Wait: if the first request is incomplete (>8 KiB would 413), how can a slot hold 56 KiB?
+        // In `handle_tcp`, `while responses < 8` drains at most 8 requests per inbound segment!
+        // So if we send 40 tiny 40-byte `GET /healthz` requests per segment across multiple segments,
+        // `http_bufs[slot]` accumulates the remaining unread requests up to 56 KiB!
+        let single_req = b"GET /healthz HTTP/1.1\r\nHost: a\r\n\r\n"; // 34 bytes
+        let mut batch = alloc::vec::Vec::new();
+        while batch.len() + single_req.len() <= 1360 {
+            batch.extend_from_slice(single_req);
+        }
+        // Each `batch` has 40 requests (1,360 bytes), and each segment drains 8 requests (272 bytes),
+        // leaving +1,088 bytes in `http_bufs[slot]` per segment!
+        // 50 segments on each of slots 0..9 accumulates ~54,400 bytes per slot (~489,600 bytes total).
+        for slot in 0..9usize {
+            let sport = 44000 + slot as u16;
+            for _ in 0..50 {
+                let mut out = ReplySet::new();
+                let seg = build_tcp_frame(
+                    sport,
+                    80,
+                    cseqs[slot],
+                    sseqs[slot],
+                    tcp_flags::ACK | tcp_flags::PSH,
+                    &batch,
+                );
+                net.handle_frame(&seg, 1, &mut out);
+                cseqs[slot] = cseqs[slot].wrapping_add(batch.len() as u32);
+                for i in 0..out.len() {
+                    let s = TcpImpl::parse_segment(&out.get(i).unwrap()[34..], GUEST_IP, peer_ip)
+                        .unwrap();
+                    sseqs[slot] = sseqs[slot].wrapping_add(s.payload.len() as u32);
+                }
+            }
+        }
+        assert!(
+            net.total_buffered_bytes() <= MAX_TOTAL_BUFFERED_BYTES,
+            "buffered bytes ({}) must stay within MAX_TOTAL_BUFFERED_BYTES ({})",
+            net.total_buffered_bytes(),
+            MAX_TOTAL_BUFFERED_BYTES
+        );
+        assert!(net.total_buffered_bytes() > 450 * 1024);
+
+        // Now push slot 9 over the global `MAX_TOTAL_BUFFERED_BYTES` (512 KiB) cap even though
+        // slot 9's per-slot buffer is well below `MAX_HTTP_BUFFER_BYTES` (64 KiB):
+        let sport9 = 44009u16;
+        let mut hit_global_413 = false;
+        for _ in 0..40 {
+            let mut out = ReplySet::new();
+            let seg = build_tcp_frame(
+                sport9,
+                80,
+                cseqs[9],
+                sseqs[9],
+                tcp_flags::ACK | tcp_flags::PSH,
+                &batch,
+            );
+            net.handle_frame(&seg, 1, &mut out);
+            cseqs[9] = cseqs[9].wrapping_add(batch.len() as u32);
+            for i in 0..out.len() {
+                let s =
+                    TcpImpl::parse_segment(&out.get(i).unwrap()[34..], GUEST_IP, peer_ip).unwrap();
+                sseqs[9] = sseqs[9].wrapping_add(s.payload.len() as u32);
+                if core::str::from_utf8(s.payload)
+                    .unwrap_or("")
+                    .contains("HTTP/1.1 413 ")
+                {
+                    hit_global_413 = true;
+                }
+            }
+            if hit_global_413 {
+                break;
+            }
+        }
+        assert!(
+            hit_global_413,
+            "exceeding MAX_TOTAL_BUFFERED_BYTES across slots must trigger 413 Content Too Large"
+        );
+        assert!(net.total_buffered_bytes() <= MAX_TOTAL_BUFFERED_BYTES);
+
+        // Reclaim all slots via idle timeout and verify heap capacity shrinks back to 0.
+        for _ in 0..(net.idle_timeout_ticks() + 4) {
+            net.tick_tcp_rto();
+        }
+        assert_eq!(net.total_buffered_bytes(), 0);
+        assert_eq!(
+            net.total_buffered_capacity(),
+            0,
+            "reclaimed slots must release inflated Vec capacities via shrink_to_fit"
+        );
     }
 }
