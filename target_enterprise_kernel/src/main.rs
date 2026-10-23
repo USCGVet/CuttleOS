@@ -837,6 +837,7 @@ pub(crate) fn live_os_console_loop() -> ! {
 
     smp_hw_tick_and_sync(sh);
     smp_hw_enable_bsp_timer();
+    svc.set_timer_hz(read_calibrated_irqs_per_sec());
     fb_console_start();
     serial_write_str("Cuttle Enterprise OS interactive shell ready.\n");
     serial_write_str("Web UI: http://127.0.0.1:18080/app | SQL: http://127.0.0.1:18080/sql\n");
@@ -852,18 +853,23 @@ pub(crate) fn live_os_console_loop() -> ! {
         // 0. Drain live VirtIO-Net interface for HTTP (:80), TLS 1.3 (:443), UDP (:8080/:8081), ICMP, and ARP.
         if let Some(vn) = vnet_opt.as_mut() {
             let now_irq = read_hw_irq_wakeups();
-            if now_irq != last_rto_irq {
+            if now_irq > last_rto_irq {
+                let elapsed_irqs = (now_irq - last_rto_irq).min(64);
                 last_rto_irq = now_irq;
-                let mut rto_rep = CONSOLE_NET_REPLIES.lock();
-                *rto_rep = target_enterprise::ReplySet::new();
-                let _ = svc.tick_tcp_rto_with_replies(&mut *rto_rep);
-                let mut ri = 0usize;
-                while ri < rto_rep.len() {
-                    if let Some(r) = rto_rep.get(ri) {
-                        vnet_tx(vn, r);
-                        net_tx = net_tx.wrapping_add(1);
+                let mut step = 0u64;
+                while step < elapsed_irqs {
+                    let mut rto_rep = CONSOLE_NET_REPLIES.lock();
+                    *rto_rep = target_enterprise::ReplySet::new();
+                    let _ = svc.tick_tcp_rto_with_replies(&mut *rto_rep);
+                    let mut ri = 0usize;
+                    while ri < rto_rep.len() {
+                        if let Some(r) = rto_rep.get(ri) {
+                            vnet_tx(vn, r);
+                            net_tx = net_tx.wrapping_add(1);
+                        }
+                        ri += 1;
                     }
-                    ri += 1;
+                    step += 1;
                 }
             }
             let mut f_guard = CONSOLE_NET_FRAME.lock();

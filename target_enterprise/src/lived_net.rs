@@ -58,9 +58,42 @@ pub const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
 /// High-water mark on a [`TlsSession`]'s outbound ciphertext queue (`pending_tx`)
 /// above which `handle_https_slot` pauses draining new decrypted HTTP requests.
 pub const HTTPS_TX_HIGH_WATER: usize = 16 * 1024;
-/// Idle tick threshold after which `tick_tcp_rto` reclaims an idle
-/// `Established` or `CloseWait` HTTPS slot and drops its `TlsSession`.
-pub const HTTPS_IDLE_TIMEOUT_TICKS: u32 = 4096;
+/// Default calibrated Local APIC timer interrupt rate (`250 Hz`, matching
+/// [`crate::timer::calibrate_apic_irqs_per_sec`] default).
+pub const DEFAULT_TIMER_HZ: u32 = 250;
+/// Retransmission Timeout (RTO) interval in milliseconds (`1,000 ms` = 1 s)
+/// for half-open (`SynReceived`) and closing (`LastAck`) TCP slots.
+pub const TCP_RTO_RETRANSMIT_MS: u32 = 1_000;
+/// Half-open (`SynReceived`) and closing (`LastAck`) slot reclamation timeout
+/// in milliseconds (`2,000 ms` = 2 s).
+pub const TCP_HALF_OPEN_RECLAIM_MS: u32 = 2_000;
+/// Idle connection reclamation timeout in milliseconds (`16,384 ms` = ~16.4 s).
+pub const HTTPS_IDLE_TIMEOUT_MS: u32 = 16_384;
+/// Idle tick threshold at [`DEFAULT_TIMER_HZ`] (`250 Hz` -> `4,096` ticks).
+pub const HTTPS_IDLE_TIMEOUT_TICKS: u32 =
+    ms_to_timer_ticks(HTTPS_IDLE_TIMEOUT_MS, DEFAULT_TIMER_HZ as u64);
+
+/// Convert a timeout in milliseconds (`ms`) to Local APIC timer interrupt ticks
+/// using the hardware-calibrated interrupt rate (`irqs_per_sec` from
+/// [`crate::timer::calibrate_apic_irqs_per_sec`]).
+#[inline]
+pub const fn ms_to_timer_ticks(ms: u32, irqs_per_sec: u64) -> u32 {
+    let hz = if irqs_per_sec < 16 {
+        16
+    } else if irqs_per_sec > 4096 {
+        4096
+    } else {
+        irqs_per_sec
+    };
+    let ticks = ((ms as u64) * hz + 999) / 1000;
+    if ticks < 1 {
+        1
+    } else if ticks > (u32::MAX as u64) {
+        u32::MAX
+    } else {
+        ticks as u32
+    }
+}
 /// Largest TCP payload emitted per segment.
 const TCP_SEGMENT_PAYLOAD: usize = 1380;
 /// Deterministic 256-bit HMAC-SHA256 fixture key used only by in-memory unit
@@ -144,6 +177,7 @@ pub struct LivedNet {
     slot_remote_mac: [[u8; 6]; TCP_MAX_SLOTS],
     http_input_closed: [bool; TCP_MAX_SLOTS],
     ticks: u32,
+    timer_hz: u32,
     ip_ident: u16,
     http_bufs: [alloc::vec::Vec<u8>; TCP_MAX_SLOTS],
     http_tx: [alloc::vec::Vec<u8>; TCP_MAX_SLOTS],
@@ -168,6 +202,7 @@ impl LivedNet {
             slot_remote_mac: [[0u8; 6]; TCP_MAX_SLOTS],
             http_input_closed: [false; TCP_MAX_SLOTS],
             ticks: 1,
+            timer_hz: DEFAULT_TIMER_HZ,
             ip_ident: 1,
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
@@ -198,6 +233,7 @@ impl LivedNet {
             slot_remote_mac: [[0u8; 6]; TCP_MAX_SLOTS],
             http_input_closed: [false; TCP_MAX_SLOTS],
             ticks: 1,
+            timer_hz: DEFAULT_TIMER_HZ,
             ip_ident: 1,
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
@@ -223,12 +259,43 @@ impl LivedNet {
             slot_remote_mac: [[0u8; 6]; TCP_MAX_SLOTS],
             http_input_closed: [false; TCP_MAX_SLOTS],
             ticks: 1,
+            timer_hz: DEFAULT_TIMER_HZ,
             ip_ident: 1,
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
+    }
+
+    /// Configure the hardware-calibrated Local APIC timer interrupt frequency
+    /// (`irqs_per_sec` from [`crate::timer::calibrate_apic_irqs_per_sec`]) used
+    /// to convert [`TCP_RTO_RETRANSMIT_MS`], [`TCP_HALF_OPEN_RECLAIM_MS`], and
+    /// [`HTTPS_IDLE_TIMEOUT_MS`] into timer ticks.
+    pub fn set_timer_hz(&mut self, irqs_per_sec: u64) {
+        self.timer_hz = irqs_per_sec.clamp(16, 4096) as u32;
+    }
+
+    /// Return the configured Local APIC timer interrupt frequency in Hz.
+    pub fn timer_hz(&self) -> u32 {
+        self.timer_hz
+    }
+
+    /// Return the calibrated RTO retransmit interval (`1,000 ms`) in timer ticks.
+    pub fn rto_retransmit_ticks(&self) -> u32 {
+        ms_to_timer_ticks(TCP_RTO_RETRANSMIT_MS, self.timer_hz as u64)
+    }
+
+    /// Return the calibrated half-open (`SynReceived`) / `LastAck` slot
+    /// reclamation timeout (`2,000 ms`) in timer ticks.
+    pub fn half_open_reclaim_ticks(&self) -> u32 {
+        ms_to_timer_ticks(TCP_HALF_OPEN_RECLAIM_MS, self.timer_hz as u64)
+    }
+
+    /// Return the calibrated idle connection reclamation timeout (`16,384 ms`)
+    /// in timer ticks.
+    pub fn idle_timeout_ticks(&self) -> u32 {
+        ms_to_timer_ticks(HTTPS_IDLE_TIMEOUT_MS, self.timer_hz as u64)
     }
 
     /// Return the number of currently active (non-`Closed`, non-`Listen`) TCP connection slots.
@@ -245,29 +312,34 @@ impl LivedNet {
         count
     }
 
-    /// Advance per-slot TCP Retransmission Timeout (RTO) timers, reclaiming stale
-    /// half-open (`SynReceived`) or closing (`LastAck`) slots so embryonic SYN floods
-    /// cannot pin connection slots indefinitely, as well as idle `Established` /
-    /// `CloseWait` HTTPS slots after [`HTTPS_IDLE_TIMEOUT_TICKS`].
+    /// Advance per-slot TCP Retransmission Timeout (RTO) timers by one calibrated
+    /// Local APIC timer interrupt (`vector 0x40`), reclaiming stale half-open
+    /// (`SynReceived`) or closing (`LastAck`) slots after [`TCP_HALF_OPEN_RECLAIM_MS`]
+    /// (`2,000 ms`) and idle `Established` / `CloseWait` slots after
+    /// [`HTTPS_IDLE_TIMEOUT_MS`] (`16,384 ms`).
     pub fn tick_tcp_rto(&mut self) -> usize {
         let mut discard = ReplySet::new();
         self.tick_tcp_rto_with_replies(&mut discard)
     }
 
-    /// Advance per-slot TCP RTO timers and emit a `RST | ACK` segment into `out`
-    /// whenever an idle `Established` or `CloseWait` connection slot is reclaimed.
+    /// Advance per-slot TCP RTO timers by one calibrated Local APIC timer interrupt
+    /// and emit a `RST | ACK` segment into `out` whenever an idle `Established` or
+    /// `CloseWait` connection slot is reclaimed.
     pub fn tick_tcp_rto_with_replies(&mut self, out: &mut ReplySet) -> usize {
         self.ticks = self.ticks.wrapping_add(1);
+        let rto_ticks = self.rto_retransmit_ticks();
+        let reclaim_ticks = self.half_open_reclaim_ticks();
+        let idle_ticks = self.idle_timeout_ticks();
         let mut actions = 0usize;
         let mut i = 0usize;
         while i < TCP_MAX_SLOTS {
             let st = self.tcbs[i].state;
             if st == TcpState::SynReceived || st == TcpState::LastAck {
                 let elapsed = self.ticks.wrapping_sub(self.slot_rto_ticks[i]);
-                if elapsed >= 8 {
+                if elapsed >= rto_ticks {
                     self.rto_retransmits = self.rto_retransmits.wrapping_add(1);
                     actions += 1;
-                    if self.ticks.wrapping_sub(self.slot_last_tick[i]) >= 16 {
+                    if self.ticks.wrapping_sub(self.slot_last_tick[i]) >= reclaim_ticks {
                         self.tcbs[i] = Tcb::EMPTY;
                         self.slot_remote_mac[i] = [0u8; 6];
                         self.http_input_closed[i] = false;
@@ -283,7 +355,7 @@ impl LivedNet {
                     || self.tls[i].is_some()
                     || !self.http_bufs[i].is_empty()
                     || !self.http_tx[i].is_empty())
-                && self.ticks.wrapping_sub(self.slot_last_tick[i]) >= HTTPS_IDLE_TIMEOUT_TICKS
+                && self.ticks.wrapping_sub(self.slot_last_tick[i]) >= idle_ticks
             {
                 let tcb = self.tcbs[i];
                 if tcb.remote_ip != [0, 0, 0, 0] && out.len() < MAX_REPLIES {
@@ -3198,16 +3270,94 @@ mod tests {
         );
         assert_eq!(net.tcbs[0].remote_port, 50000);
 
-        // 4. Advance RTO timer (`tick_tcp_rto`) and verify all 15 half-open `SynReceived` slots
-        //    are automatically reclaimed while `Established` slot 0 remains active:
+        // 4. Advance RTO timer (`tick_tcp_rto`): after 20 ticks (~80 ms at 250 Hz), half-open
+        //    `SynReceived` slots MUST still be alive (since `TCP_HALF_OPEN_RECLAIM_MS = 2,000 ms`),
+        //    and after reaching `net.half_open_reclaim_ticks()` (`500` ticks = 2.0 s), all 15
+        //    half-open `SynReceived` slots are reclaimed while `Established` slot 0 remains active:
         for _ in 0..20 {
             let _ = net.tick_tcp_rto();
         }
-        assert!(net.rto_retransmits >= 15);
+        assert_eq!(
+            net.active_tcp_slots(),
+            16,
+            "Half-open SynReceived slots must not be reclaimed after only 20 ticks (~80 ms at 250 Hz)"
+        );
+        for _ in 20..net.half_open_reclaim_ticks() {
+            let _ = net.tick_tcp_rto();
+        }
+        assert!(net.rto_retransmits >= 30);
         assert_eq!(
             net.active_tcp_slots(),
             1,
-            "RTO reclamation must clean up all stale half-open SynReceived slots while preserving Established slot 0"
+            "RTO reclamation must clean up all stale half-open SynReceived slots after 2 s while preserving Established slot 0"
+        );
+    }
+
+    #[test]
+    fn tcp_timers_scale_with_calibrated_apic_hz_and_keep_half_open_for_2s() {
+        use crate::timer::{
+            calibrate_apic_irqs_per_sec, LAPIC_TIMER_PERIOD_COUNT, PIT_CALIBRATION_TICKS_10MS,
+        };
+
+        // 1. Default 250 Hz calibration (~625,000 LAPIC ticks in 10 ms at 250,000 period):
+        let hz_250 = calibrate_apic_irqs_per_sec(
+            625_000,
+            PIT_CALIBRATION_TICKS_10MS as u32,
+            LAPIC_TIMER_PERIOD_COUNT,
+        );
+        assert_eq!(hz_250, 250);
+        let mut net250 = LivedNet::new(MAC);
+        net250.set_timer_hz(hz_250);
+        assert_eq!(net250.rto_retransmit_ticks(), 250); // 1,000 ms @ 250 Hz
+        assert_eq!(net250.half_open_reclaim_ticks(), 500); // 2,000 ms @ 250 Hz
+        assert_eq!(net250.idle_timeout_ticks(), 4096); // 16,384 ms @ 250 Hz
+
+        // 2. Slower 62 Hz APIC bus (~155,000 LAPIC ticks in 10 ms at 250,000 period):
+        let hz_62 = calibrate_apic_irqs_per_sec(
+            155_000,
+            PIT_CALIBRATION_TICKS_10MS as u32,
+            LAPIC_TIMER_PERIOD_COUNT,
+        );
+        assert_eq!(hz_62, 62);
+        let mut net62 = LivedNet::new(MAC);
+        net62.set_timer_hz(hz_62);
+        assert_eq!(net62.rto_retransmit_ticks(), 62); // 1,000 ms @ 62 Hz
+        assert_eq!(net62.half_open_reclaim_ticks(), 124); // 2,000 ms @ 62 Hz
+        assert_eq!(net62.idle_timeout_ticks(), 1016); // ~16.39 s @ 62 Hz (not 66 s!)
+
+        // Open a half-open SynReceived slot on `net62` and verify it survives 123 ticks (1.98 s)
+        // and is reclaimed on tick 124 (2.00 s):
+        let mut syn = [0u8; 40];
+        let n = TcpImpl::build_segment(
+            51234,
+            HTTP_PORT,
+            0x2222_0000,
+            0,
+            tcp_flags::SYN,
+            65535,
+            b"",
+            PEER_IP,
+            GUEST_IP,
+            &mut syn,
+        )
+        .unwrap();
+        let (frame, flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn[..n]);
+        let mut out = ReplySet::new();
+        net62.handle_frame(&frame[..flen], 1, &mut out);
+        assert_eq!(net62.active_tcp_slots(), 1);
+        for _ in 0..123 {
+            let _ = net62.tick_tcp_rto();
+        }
+        assert_eq!(
+            net62.active_tcp_slots(),
+            1,
+            "Half-open slot at 62 Hz must survive 123 ticks (1.98 s)"
+        );
+        let _ = net62.tick_tcp_rto();
+        assert_eq!(
+            net62.active_tcp_slots(),
+            0,
+            "Half-open slot at 62 Hz must be reclaimed at tick 124 (2.00 s)"
         );
     }
 
