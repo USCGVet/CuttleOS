@@ -1,13 +1,26 @@
 # Cuttle OS
 
-> **Three hearts. One appliance. A new skin every boot.**
+> **Three hearts. One appliance. Rearranging its own guts every boot.**
 
-**Cuttle OS** is a Moving Target Defense (MTD) x86-64 unikernel, isolated service appliance, and automated binary diversification factory written in Rust. Like its namesake cuttlefish — which repatterns its skin in milliseconds to evade predators, stabilizes its body around a rigid internal **cuttlebone**, and pumps blood through **three hearts** — Cuttle OS combines:
+## Cuttle OS in Plain English (The 60-Second Version)
 
-- **The Cuttlebone (`cuttle-contracts` & `locked_modules.toml`)**: The minimal, formally specified contract surface, hardware Ring-0/Ring-3 isolation boundary, and constant-time cryptographic seal core that holds still while everything around it changes.
-- **Skins (`cuttle-diversifier` + `factory_builder` + `cuttle-binmorph`)**: Every build cycle, VM boot (~140ms fast binary morph), and live in-place service rotation (`service rotate`) sheds the previous binary layout and adopts a structurally distinct x86-64 machine-code **skin** while preserving cryptographically sealed state across reboots.
-- **Cuttle Triad — *"Three hearts. One appliance. Lose a heart, keep beating."* (`triad.bat` / `tools/triad_controller.py`)**: Packages **3 independent 4-core Cuttle OS VMs** (each with its own binary skin and domain-separated cryptographic keys) into a single Triple Modular Redundancy (TMR) 2-of-3 majority-vote + 4 KiB RAID XOR parity ($D_1 \oplus D_2 = P$) appliance.
-- **Ink (Active Tamper Detection & Self-Healing)**: Native UDP `:8081` quorum state-hash verification (`TRIAD_ALERT status=DIVERGENCE`), 2-of-3 majority syndrome checks, and eBPF/canary traps immediately detect single-node tampering, isolate the compromised node, reconstruct its state from the surviving two hearts, and force an emergency skin re-morph.
+Most computers run the exact same compiled binary as every other machine running that software. If an attacker finds one memory bug and builds an exploit on their laptop, that same exploit works on every copy of the system everywhere, forever.
+
+**Cuttle OS fixes that by constantly rearranging its own internal guts.**
+
+Saying it "changes its skin" actually undersells what happens inside. Skin is surface-level; Cuttle OS rewires its **internal organs** on every build, every reboot (~140 ms), and even live while running:
+
+1. **It scrambles its own machine code ("Rearranging the Guts" — `cuttle-diversifier` + `factory_builder` + `cuttle-binmorph`):**
+   Every instance of Cuttle OS does the exact same job, but the raw x86-64 instructions inside the kernel and services are completely different from build to build and boot to boot. It shuffles function and statement order in the Rust source code, randomizes compiler memory layouts, swaps which CPU registers (`R8`–`R15`) and stack slots functions use, reorders instructions, and replaces instruction opcodes with equivalent machine code. An exploit written against one copy crashes uselessly on the next copy — or even on the same machine a minute later.
+2. **A rigid spine holds the rules and data steady ("The Cuttlebone" — `cuttle-contracts` & `locked_modules.toml`):**
+   While the machine-code guts get scrambled, a tiny locked core ([`cuttle-contracts`](contracts) and [`locked_modules.toml`](locked_modules.toml)) never changes. That keeps wire formats, hardware Ring-0/Ring-3 isolation rules, and encrypted disk data compatible across morphs — so the OS can reboot into a freshly scrambled binary in ~140 ms and pick up right where it left off without losing a single SQL row or file.
+3. **Three brains vote on every answer ("The Triad" — `triad.bat` / `tools/triad_controller.py`):**
+   Because Cuttle OS is tiny (3.5 MB disk, 128 MB RAM), a single appliance actually runs **three separate 4-core Cuttle OS virtual machines at once** — each with *different* internal machine-code guts and its own cryptographic keys:
+   - Every read and write is checked by a **2-of-3 majority vote** plus **4 KiB RAID-style XOR parity** ($D_1 \oplus D_2 = P$) across the three nodes.
+   - One node at a time can drain, scramble its guts into a brand-new binary, reboot, and catch up from the transaction log with **zero downtime** while the other two keep running.
+   - **Ink (Active Tamper Detection & Self-Healing):** If an attacker or disk fault corrupts one node, native UDP `:8081` quorum state-hash checks (`TRIAD_ALERT status=DIVERGENCE`), 2-of-3 majority voting, and eBPF/canary traps immediately detect the divergence, isolate the bad node, rebuild its database from the healthy majority, and force it to re-morph into a clean binary automatically.
+
+**In short:** Cuttle OS is a tiny bare-metal Rust operating system (with a built-in web server, SQL database, shell, and TLS stack) that runs as three differently-wired clones voting together, constantly scrambling their internal machine code so attackers never have a stationary target.
 
 ## Expected Use Case
 
