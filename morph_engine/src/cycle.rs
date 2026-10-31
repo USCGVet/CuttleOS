@@ -554,9 +554,10 @@ fn locate_sibling_bin(name: &str) -> Result<PathBuf> {
 /// - `<profile>/morph(.exe)`: production — the exe's own directory.
 /// - `<profile>/deps/` or `<profile>/examples/` (classic cargo layout for
 ///   test harnesses and examples): one level up.
-/// - `<profile>/build/<pkg>/<hash>/<kind>/` (cargo's newer build-dir
-///   layout, where test harnesses no longer live in `deps/`): the
-///   `<profile>` directory four levels up, only when that shape matches.
+/// - `<profile>/build/<pkg>/<16-hex-hash>/<out|deps>/` (cargo's newer
+///   build-dir layout, where test harnesses no longer live in `deps/`):
+///   the `<profile>` directory four levels up, only when the full
+///   `<profile>/build/<pkg>/<16-hex-hash>/<out|deps>` shape matches.
 fn sibling_search_dirs(self_exe: &Path) -> Vec<PathBuf> {
     let Some(dir) = self_exe.parent() else {
         return Vec::new();
@@ -565,9 +566,26 @@ fn sibling_search_dirs(self_exe: &Path) -> Vec<PathBuf> {
     if let Some(up) = dir.parent() {
         dirs.push(up.to_path_buf());
     }
-    let mut ancestors = dir.ancestors();
-    if ancestors.nth(3).and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new("build")) {
-        if let Some(profile) = ancestors.next() {
+    let kind_ok = matches!(
+        dir.file_name().and_then(|s| s.to_str()),
+        Some("out" | "deps")
+    );
+    let hash_dir = dir.parent();
+    let hash_ok = hash_dir
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .is_some_and(|h| {
+            h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        });
+    let pkg_dir = hash_dir.and_then(|p| p.parent());
+    let pkg_ok = pkg_dir
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| !s.is_empty());
+    let build_dir = pkg_dir.and_then(|p| p.parent());
+    let build_ok = build_dir.and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new("build"));
+    if kind_ok && hash_ok && pkg_ok && build_ok {
+        if let Some(profile) = build_dir.and_then(|p| p.parent()) {
             dirs.push(profile.to_path_buf());
         }
     }
@@ -1881,6 +1899,28 @@ mod tests {
         // Without the build-dir shape, only the exe dir and its parent.
         let dirs = sibling_search_dirs(Path::new("/a/b/c/d/e/f.exe"));
         assert_eq!(dirs, vec![PathBuf::from("/a/b/c/d/e"), PathBuf::from("/a/b/c/d")]);
+    }
+
+    #[test]
+    fn sibling_search_dirs_rejects_non_cargo_build_ancestor() {
+        // An arbitrary `build` ancestor without `<16-hex-hash>/<out|deps>` must NOT add its parent.
+        let dirs = sibling_search_dirs(Path::new("/opt/build/foo/bar/baz/morph.exe"));
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/opt/build/foo/bar/baz"),
+                PathBuf::from("/opt/build/foo/bar"),
+            ]
+        );
+        // Even with `/out/`, a non-16-hex parent must be rejected.
+        let dirs2 = sibling_search_dirs(Path::new("/opt/build/foo/not_hex_hash/out/morph.exe"));
+        assert_eq!(
+            dirs2,
+            vec![
+                PathBuf::from("/opt/build/foo/not_hex_hash/out"),
+                PathBuf::from("/opt/build/foo/not_hex_hash"),
+            ]
+        );
     }
 
     #[test]

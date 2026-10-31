@@ -3,5 +3,6 @@
 # `unstable.build-std`. The .cargo/config.toml in this crate sets
 # build.target = "x86_64-unknown-none" so all cargo invocations here
 # build for the kernel target without needing --target on the CLI.
-channel = "nightly"
+# Pinned to the verified dated nightly (`rustc 1.101.0-nightly (1a2c4797e 2026-10-21)`).
+channel = "nightly-2026-10-22"
 components = ["rust-src", "llvm-tools-preview"]

@@ -654,6 +654,10 @@ impl SqlDb {
             let (_, rest) = next_token(q);
             return self.exec_schema(trim_sql(rest), out);
         }
+        if q.starts_with(b".dump") {
+            let (_, rest) = next_token(q);
+            return self.exec_dump(owner, trim_sql(rest), out);
+        }
         let (kw, rest) = next_token(q);
         if eq_ignore_ascii_case(kw, b"SELECT") {
             return self.exec_select(owner, rest, out);
@@ -808,6 +812,226 @@ impl SqlDb {
         pos
     }
 
+    fn exec_dump(&self, owner: u64, rest: &[u8], out: &mut [u8]) -> usize {
+        let (tname, after_tname) = next_token(rest);
+        if tname.is_empty() {
+            return copy_str(b"usage: .dump <table> [offset] [limit]\n", out);
+        }
+        let Some(t_idx) = self.find_table(tname) else {
+            return copy_str(b"error: table not found\n", out);
+        };
+        let (off_tok, after_off) = next_token(after_tname);
+        let offset = if off_tok.is_empty() {
+            0usize
+        } else {
+            let Some(v) = parse_i64(off_tok) else {
+                return copy_str(b"usage: .dump <table> [offset] [limit]\n", out);
+            };
+            if v < 0 {
+                return copy_str(b"usage: .dump <table> [offset] [limit]\n", out);
+            }
+            v as usize
+        };
+        let (lim_tok, _) = next_token(after_off);
+        let limit = if lim_tok.is_empty() {
+            3usize
+        } else {
+            let Some(v) = parse_i64(lim_tok) else {
+                return copy_str(b"usage: .dump <table> [offset] [limit]\n", out);
+            };
+            if v <= 0 {
+                return copy_str(b"usage: .dump <table> [offset] [limit]\n", out);
+            }
+            (v as usize).clamp(1, 3)
+        };
+
+        let use_committed = self.tx_active && self.tx_owner != owner;
+        let t = &self.tables[t_idx];
+        let col_count = t.col_count as usize;
+        let is_kv = eq_ignore_ascii_case(t.name_bytes(), b"kv");
+        let mut matched = [0usize; SQL_MAX_ROWS];
+        let mut mcount = 0usize;
+        let mut r = 0usize;
+        while r < SQL_MAX_ROWS {
+            if self.visible_row(t_idx, r, use_committed).used {
+                matched[mcount] = r;
+                mcount += 1;
+            }
+            r += 1;
+        }
+
+        // Canonically sort rows by cell values so the table digest and dump order
+        // are invariant to physical row-slot allocation order across nodes.
+        let mut i = 0usize;
+        while i < mcount {
+            let mut j = i + 1;
+            while j < mcount {
+                let ra = self.visible_row(t_idx, matched[i], use_committed);
+                let rb = self.visible_row(t_idx, matched[j], use_committed);
+                if cmp_rows_canonical(ra, rb, col_count, is_kv) > 0 {
+                    matched.swap(i, j);
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+
+        // Compute 64-bit FNV-1a table digest over schema + canonically sorted rows
+        // (normalizing `kv` rows where col 0 starts with `v:` as `<HW_SEALED>`).
+        let mix_byte = |acc: u64, b: u8| -> u64 { (acc ^ (b as u64)).wrapping_mul(0x0100_0000_01b3) };
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in t.name_bytes() {
+            h = mix_byte(h, b);
+        }
+        h = mix_byte(h, t.col_count);
+        let mut c = 0usize;
+        while c < col_count {
+            for &b in t.cols[c].name_bytes() {
+                h = mix_byte(h, b);
+            }
+            h = mix_byte(
+                h,
+                match t.cols[c].col_type {
+                    SqlType::Int => 1,
+                    SqlType::Text => 2,
+                },
+            );
+            c += 1;
+        }
+        h = mix_byte(h, t.indexed_col);
+        for &b in t.index_name_bytes() {
+            h = mix_byte(h, b);
+        }
+        for &b in &(mcount as u64).to_le_bytes() {
+            h = mix_byte(h, b);
+        }
+        let mut k = 0usize;
+        while k < mcount {
+            let row = self.visible_row(t_idx, matched[k], use_committed);
+            let is_vault_row = is_kv
+                && col_count > 0
+                && matches!(
+                    &row.cells[0],
+                    SqlVal::Text(tb, tl) if *tl >= 2 && tb[0] == b'v' && tb[1] == b':'
+                );
+            if is_vault_row {
+                h = mix_byte(h, 0x5B);
+                if let SqlVal::Text(tb, tl) = &row.cells[0] {
+                    h = mix_byte(h, *tl);
+                    for &b in &tb[..*tl as usize] {
+                        h = mix_byte(h, b);
+                    }
+                }
+                for &b in b"<HW_SEALED>" {
+                    h = mix_byte(h, b);
+                }
+            } else {
+                h = mix_byte(h, 0x5A);
+                let mut col = 0usize;
+                while col < col_count {
+                    match &row.cells[col] {
+                        SqlVal::Int(iv) => {
+                            h = mix_byte(h, 1);
+                            for &b in &iv.to_le_bytes() {
+                                h = mix_byte(h, b);
+                            }
+                        }
+                        SqlVal::Text(tb, tl) => {
+                            h = mix_byte(h, 2);
+                            h = mix_byte(h, *tl);
+                            for &b in &tb[..*tl as usize] {
+                                h = mix_byte(h, b);
+                            }
+                        }
+                    }
+                    col += 1;
+                }
+            }
+            k += 1;
+        }
+
+        let chunk_count = if offset >= mcount {
+            0usize
+        } else {
+            (mcount - offset).min(limit)
+        };
+
+        let mut pos = 0usize;
+        pos += append_bytes(out, pos, b"sqldump table=");
+        pos += append_bytes(out, pos, t.name_bytes());
+        pos += append_bytes(out, pos, b" rows=");
+        pos += append_u64(out, pos, mcount as u64);
+        pos += append_bytes(out, pos, b" off=");
+        pos += append_u64(out, pos, offset as u64);
+        pos += append_bytes(out, pos, b" count=");
+        pos += append_u64(out, pos, chunk_count as u64);
+        pos += append_bytes(out, pos, b" digest=");
+        pos += append_hex_u64(out, pos, h);
+        if offset == 0 {
+            let mut ddl_buf = [0u8; 192];
+            let mut dpos = 0usize;
+            dpos += append_bytes(&mut ddl_buf, dpos, b"CREATE TABLE ");
+            dpos += append_bytes(&mut ddl_buf, dpos, t.name_bytes());
+            dpos += append_bytes(&mut ddl_buf, dpos, b" (");
+            let mut col = 0usize;
+            while col < col_count {
+                if col > 0 {
+                    dpos += append_bytes(&mut ddl_buf, dpos, b", ");
+                }
+                dpos += append_bytes(&mut ddl_buf, dpos, t.cols[col].name_bytes());
+                match t.cols[col].col_type {
+                    SqlType::Int => dpos += append_bytes(&mut ddl_buf, dpos, b" INT"),
+                    SqlType::Text => dpos += append_bytes(&mut ddl_buf, dpos, b" TEXT"),
+                }
+                col += 1;
+            }
+            dpos += append_bytes(&mut ddl_buf, dpos, b")");
+            pos += append_bytes(out, pos, b" ddl=");
+            pos += append_hex_bytes(out, pos, &ddl_buf[..dpos]);
+
+            if t.index_name_len > 0 && (t.indexed_col as usize) < col_count {
+                let mut idx_buf = [0u8; 128];
+                let mut ipos = 0usize;
+                ipos += append_bytes(&mut idx_buf, ipos, b"CREATE INDEX ");
+                ipos += append_bytes(&mut idx_buf, ipos, t.index_name_bytes());
+                ipos += append_bytes(&mut idx_buf, ipos, b" ON ");
+                ipos += append_bytes(&mut idx_buf, ipos, t.name_bytes());
+                ipos += append_bytes(&mut idx_buf, ipos, b" (");
+                ipos += append_bytes(&mut idx_buf, ipos, t.cols[t.indexed_col as usize].name_bytes());
+                ipos += append_bytes(&mut idx_buf, ipos, b")");
+                pos += append_bytes(out, pos, b" idx_ddl=");
+                pos += append_hex_bytes(out, pos, &idx_buf[..ipos]);
+            }
+        }
+        pos += append_bytes(out, pos, b"\n");
+
+        let mut ri = 0usize;
+        while ri < chunk_count {
+            let row = self.visible_row(t_idx, matched[offset + ri], use_committed);
+            pos += append_bytes(out, pos, b"row ");
+            let mut col = 0usize;
+            while col < col_count {
+                if col > 0 {
+                    pos += append_bytes(out, pos, b"|");
+                }
+                match &row.cells[col] {
+                    SqlVal::Int(iv) => {
+                        pos += append_bytes(out, pos, b"I:");
+                        pos += append_i64(out, pos, *iv);
+                    }
+                    SqlVal::Text(tb, tl) => {
+                        pos += append_bytes(out, pos, b"T:");
+                        pos += append_hex_bytes(out, pos, &tb[..*tl as usize]);
+                    }
+                }
+                col += 1;
+            }
+            pos += append_bytes(out, pos, b"\n");
+            ri += 1;
+        }
+        pos
+    }
+
     fn exec_create(&mut self, rest: &[u8], out: &mut [u8]) -> usize {
         let (kw_kind, after_kind) = next_token(rest);
         if eq_ignore_ascii_case(kw_kind, b"INDEX") {
@@ -826,11 +1050,28 @@ impl SqlDb {
         if rparen <= lparen {
             return copy_str(b"error: malformed column list in CREATE TABLE\n", out);
         }
-        let tname = trim_sql(&after_table[..lparen]);
+        let mut tname = trim_sql(&after_table[..lparen]);
+        let mut if_not_exists = false;
+        let (w1, r1) = next_token(tname);
+        if eq_ignore_ascii_case(w1, b"IF") {
+            let (w2, r2) = next_token(r1);
+            let (w3, r3) = next_token(r2);
+            if eq_ignore_ascii_case(w2, b"NOT") && eq_ignore_ascii_case(w3, b"EXISTS") {
+                if_not_exists = true;
+                tname = trim_sql(r3);
+            }
+        }
         if !is_valid_ident(tname) {
             return copy_str(b"error: invalid table name\n", out);
         }
         if self.find_table(tname).is_some() {
+            if if_not_exists {
+                let mut pos = 0usize;
+                pos += append_bytes(out, pos, b"CREATE TABLE ");
+                pos += append_bytes(out, pos, tname);
+                pos += append_bytes(out, pos, b" OK\n");
+                return pos;
+            }
             return copy_str(b"error: table already exists\n", out);
         }
         let mut free_slot = None;
@@ -965,8 +1206,24 @@ impl SqlDb {
         if !eq_ignore_ascii_case(kw_kind, b"TABLE") {
             return copy_str(b"error: expected DROP TABLE <name>\n", out);
         }
-        let (tname, _) = next_token(after_kind);
+        let (mut tname, after_t1) = next_token(after_kind);
+        let mut if_exists = false;
+        if eq_ignore_ascii_case(tname, b"IF") {
+            let (w2, r2) = next_token(after_t1);
+            if eq_ignore_ascii_case(w2, b"EXISTS") {
+                if_exists = true;
+                let (real_tname, _) = next_token(r2);
+                tname = real_tname;
+            }
+        }
         let Some(t_idx) = self.find_table(tname) else {
+            if if_exists {
+                let mut pos = 0usize;
+                pos += append_bytes(out, pos, b"DROP TABLE ");
+                pos += append_bytes(out, pos, tname);
+                pos += append_bytes(out, pos, b" OK\n");
+                return pos;
+            }
             return copy_str(b"error: table not found\n", out);
         };
         self.tables[t_idx] = SqlTable::empty();
@@ -1953,13 +2210,21 @@ fn split_comma(s: &[u8]) -> (&[u8], &[u8]) {
 }
 
 fn split_comma_respecting_quotes(s: &[u8]) -> (&[u8], &[u8]) {
-    let mut in_quote = false;
+    let mut quote_char = 0u8;
     let mut i = 0usize;
     while i < s.len() {
-        if s[i] == b'\'' {
-            in_quote = !in_quote;
-        } else if s[i] == b',' && !in_quote {
-            return (&s[..i], &s[i + 1..]);
+        if quote_char == 0 {
+            if s[i] == b'\'' || s[i] == b'"' {
+                quote_char = s[i];
+            } else if s[i] == b',' {
+                return (&s[..i], &s[i + 1..]);
+            }
+        } else if s[i] == quote_char {
+            if i + 1 < s.len() && s[i + 1] == quote_char {
+                i += 2;
+                continue;
+            }
+            quote_char = 0;
         }
         i += 1;
     }
@@ -1967,19 +2232,27 @@ fn split_comma_respecting_quotes(s: &[u8]) -> (&[u8], &[u8]) {
 }
 
 fn split_keyword_ignore_case<'a>(s: &'a [u8], kw: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
-    let mut in_quote = false;
+    let mut quote_char = 0u8;
     let mut i = 0usize;
     while i + kw.len() <= s.len() {
-        if s[i] == b'\'' {
-            in_quote = !in_quote;
-        }
-        if !in_quote {
+        if quote_char == 0 {
+            if s[i] == b'\'' || s[i] == b'"' {
+                quote_char = s[i];
+                i += 1;
+                continue;
+            }
             let left_ok = i == 0 || s[i - 1] == b' ' || s[i - 1] == b'\t';
             let right_ok =
                 i + kw.len() == s.len() || s[i + kw.len()] == b' ' || s[i + kw.len()] == b'\t';
             if left_ok && right_ok && eq_ignore_ascii_case(&s[i..i + kw.len()], kw) {
                 return Some((&s[..i], &s[i + kw.len()..]));
             }
+        } else if s[i] == quote_char {
+            if i + 1 < s.len() && s[i + 1] == quote_char {
+                i += 2;
+                continue;
+            }
+            quote_char = 0;
         }
         i += 1;
     }
@@ -2055,12 +2328,15 @@ fn parse_where_clause(table: &SqlTable, raw: &[u8]) -> Option<(usize, CmpOp, Sql
         (b"<", CmpOp::Lt),
         (b">", CmpOp::Gt),
     ];
-    let mut in_quote = false;
+    let mut quote_char = 0u8;
     let mut i = 0usize;
     while i < raw.len() {
-        if raw[i] == b'\'' {
-            in_quote = !in_quote;
-        } else if !in_quote {
+        if quote_char == 0 {
+            if raw[i] == b'\'' || raw[i] == b'"' {
+                quote_char = raw[i];
+                i += 1;
+                continue;
+            }
             let mut k = 0usize;
             while k < ops.len() {
                 let (pat, op) = ops[k];
@@ -2073,10 +2349,25 @@ fn parse_where_clause(table: &SqlTable, raw: &[u8]) -> Option<(usize, CmpOp, Sql
                 }
                 k += 1;
             }
+        } else if raw[i] == quote_char {
+            if i + 1 < raw.len() && raw[i + 1] == quote_char {
+                i += 2;
+                continue;
+            }
+            quote_char = 0;
         }
         i += 1;
     }
     None
+}
+
+fn parse_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn parse_literal(raw: &[u8], expected: SqlType) -> Option<SqlVal> {
@@ -2084,18 +2375,56 @@ fn parse_literal(raw: &[u8], expected: SqlType) -> Option<SqlVal> {
     match expected {
         SqlType::Int => parse_i64(raw).map(SqlVal::Int),
         SqlType::Text => {
-            if raw.len() >= 2 && raw[0] == b'\'' && raw[raw.len() - 1] == b'\'' {
-                let inner = &raw[1..raw.len() - 1];
-                if find_byte(inner, b'\'').is_some() {
+            if raw.len() >= 3
+                && (raw[0] == b'X' || raw[0] == b'x')
+                && raw[1] == b'\''
+                && raw[raw.len() - 1] == b'\''
+            {
+                let hex = &raw[2..raw.len() - 1];
+                if hex.len() % 2 != 0 {
                     return None;
                 }
-                Some(SqlVal::from_text(inner))
-            } else if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' {
-                let inner = &raw[1..raw.len() - 1];
-                if find_byte(inner, b'"').is_some() {
-                    return None;
+                let mut decoded = [0u8; SQL_TEXT_LEN];
+                let mut out_len = 0usize;
+                let mut i = 0usize;
+                while i < hex.len() {
+                    let hi = parse_hex_nibble(hex[i])?;
+                    let lo = parse_hex_nibble(hex[i + 1])?;
+                    if out_len < SQL_TEXT_LEN {
+                        decoded[out_len] = (hi << 4) | lo;
+                        out_len += 1;
+                    }
+                    i += 2;
                 }
-                Some(SqlVal::from_text(inner))
+                Some(SqlVal::from_text(&decoded[..out_len]))
+            } else if raw.len() >= 2
+                && ((raw[0] == b'\'' && raw[raw.len() - 1] == b'\'')
+                    || (raw[0] == b'"' && raw[raw.len() - 1] == b'"'))
+            {
+                let q = raw[0];
+                let inner = &raw[1..raw.len() - 1];
+                let mut decoded = [0u8; SQL_TEXT_LEN];
+                let mut out_len = 0usize;
+                let mut i = 0usize;
+                while i < inner.len() {
+                    if inner[i] == q {
+                        if i + 1 < inner.len() && inner[i + 1] == q {
+                            if out_len < SQL_TEXT_LEN {
+                                decoded[out_len] = q;
+                                out_len += 1;
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        return None;
+                    }
+                    if out_len < SQL_TEXT_LEN {
+                        decoded[out_len] = inner[i];
+                        out_len += 1;
+                    }
+                    i += 1;
+                }
+                Some(SqlVal::from_text(&decoded[..out_len]))
             } else {
                 None
             }
@@ -2251,6 +2580,61 @@ fn append_i64(out: &mut [u8], pos: usize, val: i64) -> usize {
     } else {
         append_u64(out, pos, val as u64)
     }
+}
+
+fn cmp_rows_canonical(a: &SqlRow, b: &SqlRow, col_count: usize, is_kv: bool) -> i32 {
+    if is_kv
+        && col_count > 0
+        && matches!(&a.cells[0], SqlVal::Text(tb, tl) if *tl >= 2 && tb[0] == b'v' && tb[1] == b':')
+        && matches!(&b.cells[0], SqlVal::Text(tb, tl) if *tl >= 2 && tb[0] == b'v' && tb[1] == b':')
+    {
+        if a.cells[0].compare(CmpOp::Lt, &b.cells[0]) {
+            return -1;
+        }
+        if a.cells[0].compare(CmpOp::Gt, &b.cells[0]) {
+            return 1;
+        }
+        return 0;
+    }
+    let mut c = 0usize;
+    while c < col_count {
+        if a.cells[c].compare(CmpOp::Lt, &b.cells[c]) {
+            return -1;
+        }
+        if a.cells[c].compare(CmpOp::Gt, &b.cells[c]) {
+            return 1;
+        }
+        c += 1;
+    }
+    0
+}
+
+fn append_hex_u64(out: &mut [u8], pos: usize, val: u64) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 16];
+    let mut i = 0usize;
+    while i < 16 {
+        let shift = (15 - i) * 4;
+        buf[i] = HEX[((val >> shift) & 0xF) as usize];
+        i += 1;
+    }
+    append_bytes(out, pos, &buf)
+}
+
+fn append_hex_bytes(out: &mut [u8], pos: usize, src: &[u8]) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut written = 0usize;
+    let mut i = 0usize;
+    while i < src.len() {
+        if pos + written + 2 > out.len() {
+            break;
+        }
+        out[pos + written] = HEX[(src[i] >> 4) as usize];
+        out[pos + written + 1] = HEX[(src[i] & 0xF) as usize];
+        written += 2;
+        i += 1;
+    }
+    written
 }
 
 #[cfg(test)]
@@ -2648,5 +3032,58 @@ mod tests {
             b"error: transaction undo log full (max 8 rows); COMMIT or ROLLBACK first\n"
         );
         let _ = db.exec(b"ROLLBACK", &mut out);
+    }
+
+    #[test]
+    fn sqldump_chunked_lossless_and_doubled_quotes_hex_literals() {
+        let mut db = SqlDb::new();
+        let mut out = [0u8; 1024];
+
+        // 1. Doubled single quotes ('it''s') and hex literals (X'...') round-trip losslessly,
+        //    including values containing '|' and ','.
+        let n1 = db.exec(
+            b"INSERT OR REPLACE INTO kv VALUES ('quote.k', 'it''s|a,test', 7)",
+            &mut out,
+        );
+        assert_eq!(&out[..n1], b"REPLACE 1\n");
+        let n2 = db.exec(
+            b"INSERT OR REPLACE INTO kv VALUES ('hex.k', X'617c622763', 8)",
+            &mut out,
+        );
+        assert_eq!(&out[..n2], b"REPLACE 1\n");
+
+        // Unescaped interior quote (SQL injection attempt) must still be rejected.
+        let n_inj = db.exec(
+            b"SELECT * FROM kv WHERE k = 'a' OR '1'='1'",
+            &mut out,
+        );
+        assert!(out[..n_inj].starts_with(b"error:"));
+
+        // 2. `.dump kv 0 3` and `.dump kv 3 3` emit chunked hex-encoded rows and DDL under 1024 bytes.
+        let nd0 = db.exec(b".dump kv 0 3", &mut out);
+        assert!(nd0 < 1024);
+        let s0 = core::str::from_utf8(&out[..nd0]).unwrap();
+        assert!(s0.starts_with("sqldump table=kv rows=4 off=0 count=3 digest="));
+        assert!(s0.contains(" ddl="));
+
+        let nd1 = db.exec(b".dump kv 3 3", &mut out);
+        assert!(nd1 < 1024);
+        let s1 = core::str::from_utf8(&out[..nd1]).unwrap();
+        assert!(s1.starts_with("sqldump table=kv rows=4 off=3 count=1 digest="));
+
+        // 3. Two databases with identical rows inserted in opposite order produce identical `.dump` output and digest.
+        let mut db_a = SqlDb::empty();
+        let mut db_b = SqlDb::empty();
+        let _ = db_a.exec(b"CREATE TABLE t (k TEXT, v INT)", &mut out);
+        let _ = db_b.exec(b"CREATE TABLE t (k TEXT, v INT)", &mut out);
+        let _ = db_a.exec(b"INSERT INTO t VALUES ('alpha', 1)", &mut out);
+        let _ = db_a.exec(b"INSERT INTO t VALUES ('bravo', 2)", &mut out);
+        let _ = db_b.exec(b"INSERT INTO t VALUES ('bravo', 2)", &mut out);
+        let _ = db_b.exec(b"INSERT INTO t VALUES ('alpha', 1)", &mut out);
+        let mut out_a = [0u8; 1024];
+        let mut out_b = [0u8; 1024];
+        let na = db_a.exec(b".dump t 0 3", &mut out_a);
+        let nb = db_b.exec(b".dump t 0 3", &mut out_b);
+        assert_eq!(&out_a[..na], &out_b[..nb]);
     }
 }

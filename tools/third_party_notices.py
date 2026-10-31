@@ -60,10 +60,11 @@ EXCEPTIONS = {
     "ucs2": (
         "MPL-2.0",
         "Used only by the optional UEFI loader. MPL-2.0 is file-level copyleft: it "
-        "covers ucs2's own source files only and places no obligation on CuttleOS "
-        "or on software built on it. A distributed UEFI image must say where the "
-        "unmodified ucs2 source can be obtained (MPL-2.0 section 3.2): "
-        "https://crates.io/crates/ucs2 and https://github.com/rust-osdev/ucs2-rs.",
+        "covers ucs2's own source files only and does not require relicensing "
+        "CuttleOS or software built on it, provided a distributed UEFI image informs "
+        "recipients where the unmodified ucs2 source can be obtained (MPL-2.0 "
+        "section 3.2): https://crates.io/crates/ucs2 and "
+        "https://github.com/rust-osdev/ucs2-rs.",
     ),
 }
 
@@ -96,7 +97,7 @@ def metadata(manifest: pathlib.Path, platform: str) -> dict:
     )
 
 
-def runtime_closure(manifest: pathlib.Path, platform: str) -> list[dict]:
+def runtime_closure(manifest: pathlib.Path, platform: str, include_root: bool = False) -> list[dict]:
     """Third-party packages linked into `manifest`'s binary for `platform`:
     `cargo tree` over normal edges (it applies the real feature resolution,
     which `cargo metadata` does not), skipping proc-macro crates and
@@ -125,48 +126,75 @@ def runtime_closure(manifest: pathlib.Path, platform: str) -> list[dict]:
         if any("proc-macro" in t["kind"] for t in pkg["targets"]):
             skip_below = depth
             continue
-        if pkg["source"] is not None:
+        if pkg["source"] is not None or (include_root and depth == 0):
             found[(name, version)] = pkg
     return list(found.values())
 
 
 def stage_closure(registry_src: pathlib.Path, stage: str, version: str, platform: str) -> list[dict]:
-    """Resolve a bootloader stage crate from its shipped Cargo.lock. Works on a
-    temporary copy so nothing is written into the cargo registry."""
+    """Resolve a bootloader stage crate (including the stage root package
+    itself) from its shipped Cargo.lock. Works on a temporary copy so nothing
+    is written into the cargo registry."""
     src = registry_src / f"bootloader-x86_64-{stage}-{version}"
     if not src.is_dir():
         sys.exit(f"{src} not found: build an image once (run.bat or factory_builder) first")
+    stage_name = f"bootloader-x86_64-{stage}"
     with tempfile.TemporaryDirectory() as tmp:
         dst = pathlib.Path(tmp) / src.name
         shutil.copytree(src, dst)
-        return runtime_closure(dst / "Cargo.toml", platform)
+        pkgs = runtime_closure(dst / "Cargo.toml", platform, include_root=True)
+        for pkg in pkgs:
+            if pkg["name"] == stage_name and pkg["source"] is None:
+                pkg["manifest_path"] = str(src / "Cargo.toml")
+        return pkgs
 
 
 # --- SPDX expressions -------------------------------------------------------
 
+class _SpdxSyntaxError(Exception):
+    pass
+
+
 def spdx_allowed(expr: str, allowed: set[str]) -> bool:
     """Evaluate a Cargo license expression ("A OR B", "A AND (B OR C)",
-    "A WITH E", legacy "A/B") against the allow list."""
+    "A WITH E", legacy "A/B") against the allow list. Rejects malformed or
+    lowercase operators ("and", "or", "with"), unbalanced parentheses, and
+    any trailing tokens."""
     tokens = re.findall(r"\(|\)|[^\s()]+", expr.replace("/", " OR "))
+    if not tokens:
+        return False
     pos = 0
+    reserved = {"(", ")", "AND", "OR", "WITH", "and", "or", "with"}
 
     def peek() -> str | None:
         return tokens[pos] if pos < len(tokens) else None
 
     def take() -> str:
         nonlocal pos
+        if pos >= len(tokens):
+            raise _SpdxSyntaxError("unexpected end of SPDX expression")
         pos += 1
         return tokens[pos - 1]
 
     def factor() -> bool:
-        if peek() == "(":
+        tok = peek()
+        if tok is None:
+            raise _SpdxSyntaxError("missing factor")
+        if tok == "(":
             take()
             value = disjunction()
-            take()  # ")"
+            if peek() != ")":
+                raise _SpdxSyntaxError("unclosed '('")
+            take()
             return value
+        if tok in reserved:
+            raise _SpdxSyntaxError(f"unexpected operator {tok!r}")
         lic = take()
         if peek() == "WITH":
             take()
+            exc = peek()
+            if exc is None or exc in reserved:
+                raise _SpdxSyntaxError("missing exception after WITH")
             lic = f"{lic} WITH {take()}"
         return lic in allowed
 
@@ -174,17 +202,25 @@ def spdx_allowed(expr: str, allowed: set[str]) -> bool:
         value = factor()
         while peek() == "AND":
             take()
-            value = factor() and value
+            rhs = factor()
+            value = value and rhs
         return value
 
     def disjunction() -> bool:
         value = conjunction()
         while peek() == "OR":
             take()
-            value = conjunction() or value
+            rhs = conjunction()
+            value = value or rhs
         return value
 
-    return disjunction()
+    try:
+        result = disjunction()
+    except _SpdxSyntaxError:
+        return False
+    if pos != len(tokens):
+        return False
+    return result
 
 
 # --- License texts ----------------------------------------------------------
@@ -220,8 +256,11 @@ def fallback_text(pkg: dict) -> list[tuple[str, str]]:
 
 
 def rust_std_entry() -> dict:
-    sysroot = pathlib.Path(run(["rustc", "--print", "sysroot"]).strip())
-    docs = sysroot / "share" / "doc" / "rust" / "licenses"
+    kernel_dir = KERNEL_MANIFEST.parent
+    sysroot = pathlib.Path(run(["rustc", "--print", "sysroot"], cwd=kernel_dir).strip())
+    docs_apache = sysroot / "share" / "doc" / "rust" / "licenses" / "Apache-2.0.txt"
+    src_apache = sysroot / "lib" / "rustlib" / "src" / "rust" / "LICENSE-APACHE"
+    apache_path = docs_apache if docs_apache.is_file() else (src_apache if src_apache.is_file() else (ROOT / "LICENSE"))
     builtins = sysroot / "lib" / "rustlib" / "src" / "rust" / "library" / "compiler-builtins" / "LICENSE.txt"
     files = [
         (
@@ -230,13 +269,12 @@ def rust_std_entry() -> dict:
                 "<COPYRIGHT HOLDERS>", "The Rust Project Contributors"
             ),
         ),
-        ("LICENSE-APACHE", normalize((docs / "Apache-2.0.txt").read_text(encoding="utf-8"))),
+        ("LICENSE-APACHE", normalize(apache_path.read_text(encoding="utf-8"))),
         ("compiler-builtins/LICENSE.txt", normalize(builtins.read_text(encoding="utf-8"))),
     ]
-    version = run(["rustc", "--version"]).split()[1]
     return {
         "name": "Rust standard library (core, alloc, compiler_builtins)",
-        "version": version,
+        "version": "nightly (build-std)",
         "license": "MIT OR Apache-2.0; compiler_builtins: MIT AND Apache-2.0 WITH LLVM-exception AND (MIT OR Apache-2.0)",
         "repository": "https://github.com/rust-lang/rust",
         "files": files,
@@ -347,10 +385,38 @@ def render(entries: list[dict]) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+def run_self_test() -> int:
+    allowed = {"MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause"}
+    assert spdx_allowed("MIT OR Apache-2.0", allowed)
+    assert spdx_allowed("MIT/Apache-2.0", allowed)
+    assert spdx_allowed("MIT AND (Apache-2.0 WITH LLVM-exception OR GPL-3.0)", allowed)
+    assert not spdx_allowed("MIT and GPL-3.0", allowed), "lowercase 'and' must fail"
+    assert not spdx_allowed("MIT or GPL-3.0", allowed), "lowercase 'or' must fail"
+    assert not spdx_allowed("MIT GPL-3.0", allowed), "trailing token must fail"
+    assert not spdx_allowed("(MIT OR Apache-2.0", allowed), "unclosed '(' must fail"
+    assert not spdx_allowed("MIT OR Apache-2.0)", allowed), "trailing ')' must fail"
+    assert not spdx_allowed("MIT WITH", allowed), "missing exception must fail"
+    assert not spdx_allowed("", allowed), "empty expression must fail"
+
+    text, problems = collect()
+    assert not problems, f"unexpected license policy problems: {problems}"
+    for stage, _, _ in STAGES:
+        stage_pkg = f"[bootloader-x86_64-{stage}]"
+        assert stage_pkg in text, f"missing bootloader stage root package {stage_pkg} in notices"
+    assert "| [Rust standard library (core, alloc, compiler_builtins)](https://github.com/rust-lang/rust) | nightly (build-std) |" in text
+    assert "does not require relicensing CuttleOS" in text
+    print("third_party_notices self-test OK")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--check", action="store_true", help="fail if THIRD_PARTY_NOTICES.md is stale")
+    parser.add_argument("--self-test", action="store_true", help="run unit and policy self-tests")
     args = parser.parse_args()
+
+    if args.self_test:
+        return run_self_test()
 
     text, problems = collect()
     if problems:

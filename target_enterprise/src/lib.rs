@@ -13,6 +13,22 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
+#[cfg(all(
+    target_os = "none",
+    not(all(
+        aes_force_soft,
+        polyval_force_soft,
+        chacha20_force_soft,
+        poly1305_force_soft,
+        curve25519_dalek_backend = "serial",
+    ))
+))]
+compile_error!(
+    "target_enterprise on target_os=\"none\" requires soft-float RustCrypto cfgs: \
+     --cfg aes_force_soft --cfg polyval_force_soft --cfg chacha20_force_soft \
+     --cfg poly1305_force_soft --cfg curve25519_dalek_backend=\"serial\""
+);
+
 // rustls (HTTPS on port 443) needs a heap; the kernel supplies the global
 // allocator (`target_enterprise_kernel/src/heap.rs`), host tests use std's.
 extern crate alloc;

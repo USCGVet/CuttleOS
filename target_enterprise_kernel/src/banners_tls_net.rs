@@ -35,7 +35,7 @@ pub(crate) fn banner_tls_hkdf() {
 }
 
 /// TLS: run the RustCrypto provider's known-answer self-test — AES-128-GCM
-/// (GCM spec cases 1–2), ChaCha20-Poly1305 (RFC 8439 §2.8.2), X25519
+/// (GCM spec cases 1, 2, and 4), ChaCha20-Poly1305 (RFC 8439 §2.8.2), X25519
 /// (RFC 7748 §6.1), ECDSA P-256 / SHA-256 (RFC 6979 §A.2.5), P-256 ECDH and a
 /// record-layer round trip with tamper rejection — then emit
 /// `TLS kat OK aead=2 kx=2 sig=1\n`. These are the exact primitives rustls

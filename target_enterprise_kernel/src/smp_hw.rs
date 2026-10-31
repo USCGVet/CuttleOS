@@ -63,7 +63,7 @@ const RUNTIME_GDT_PHYS: u64 = 0x8240;
 const RUNTIME_GDTR_PHYS: u64 = 0x8280;
 /// Physical address of the 10-byte Runtime `IDTR` descriptor.
 const RUNTIME_IDTR_PHYS: u64 = 0x8290;
-/// Physical address of `ISR_LAPIC_EOI` (25 bytes, handles vectors `0x30..0xFE`).
+/// Physical address of `ISR_LAPIC_EOI` (25 bytes, handles Local APIC Timer vector `0x40`).
 const ISR_LAPIC_EOI_PHYS: u64 = 0x8300;
 /// Physical address of `ISR_PIC_EOI` (11 bytes, handles legacy vectors `0x20..0x2F`).
 const ISR_PIC_EOI_PHYS: u64 = 0x8320;
@@ -73,10 +73,12 @@ const ISR_SPURIOUS_PHYS: u64 = 0x8340;
 const LOAD_GDT_IDT_PHYS: u64 = 0x8350;
 /// Physical address of `SLEEP_HLT_CODE` (4 bytes: `sti; hlt; cli; ret`).
 const SLEEP_HLT_PHYS: u64 = 0x8370;
-/// Physical address of the 64-bit atomic hardware IRQ/IPI wakeup counter.
+/// Physical address of the 64-bit atomic Local APIC Timer (`vector 0x40`) wakeup counter.
 const IRQ_WAKEUPS_PHYS: u64 = 0x8380;
 /// Physical address storing `pa_to_va(LAPIC_PHYS_BASE + LAPIC_EOI) as u64`.
 const LAPIC_EOI_PTR_PHYS: u64 = 0x8388;
+/// Physical address of `ISR_LAPIC_DOORBELL` (17 bytes, handles Doorbell IPI `0x41` and non-timer LAPIC vectors without touching `0x8380`).
+const ISR_LAPIC_DOORBELL_PHYS: u64 = 0x8390;
 /// Physical page holding the 256-entry Runtime 64-bit IDT (`4096` bytes).
 const RUNTIME_IDT_PHYS: u64 = 0x9000;
 
@@ -604,13 +606,36 @@ unsafe fn init_runtime_idt_and_isrs() {
     ];
     // 7. Install `SLEEP_HLT_CODE` at `0x8370` (`sti; hlt; cli; ret`):
     const SLEEP_HLT_CODE: [u8; 4] = [0xFB, 0xF4, 0xFA, 0xC3];
+    // 7b. Install `ISR_LAPIC_DOORBELL` at `0x8390` (handles Doorbell IPI `0x41` and non-timer
+    //     LAPIC vectors `0x30..0xFE` except `0x40`, writing 0 to `LAPIC_EOI` without incrementing
+    //     the timer-only counter at `0x8380`):
+    //      push rax
+    //      mov  rax, [rip - 16]         -> 0x8388 (LAPIC_EOI_PTR_PHYS)
+    //      mov  dword ptr [rax], 0      -> write 0 to LAPIC_EOI
+    //      pop  rax
+    //      iretq
+    const ISR_LAPIC_DOORBELL: [u8; 17] = [
+        0x50,
+        0x48, 0x8B, 0x05, 0xF0, 0xFF, 0xFF, 0xFF,
+        0xC7, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x58,
+        0x48, 0xCF,
+    ];
 
-    // SAFETY: All destination offsets (`0x8300..0x8374`) lie within the mapped `0x8000` page.
+    // SAFETY: All destination offsets (`0x8300..0x83A1`) lie within the mapped `0x8000` page.
     unsafe {
         let mut i = 0usize;
         while i < ISR_LAPIC_EOI.len() {
             core::ptr::write_volatile(pa_to_va(ISR_LAPIC_EOI_PHYS).add(i), ISR_LAPIC_EOI[i]);
             i += 1;
+        }
+        let mut d = 0usize;
+        while d < ISR_LAPIC_DOORBELL.len() {
+            core::ptr::write_volatile(
+                pa_to_va(ISR_LAPIC_DOORBELL_PHYS).add(d),
+                ISR_LAPIC_DOORBELL[d],
+            );
+            d += 1;
         }
         let mut j = 0usize;
         while j < ISR_PIC_EOI.len() {
@@ -642,6 +667,7 @@ unsafe fn init_runtime_idt_and_isrs() {
     let gdt_va = pa_to_va(RUNTIME_GDT_PHYS) as u64;
     let idt_va = pa_to_va(RUNTIME_IDT_PHYS) as u64;
     let isr_lapic_va = pa_to_va(ISR_LAPIC_EOI_PHYS) as u64;
+    let isr_doorbell_va = pa_to_va(ISR_LAPIC_DOORBELL_PHYS) as u64;
     let isr_pic_va = pa_to_va(ISR_PIC_EOI_PHYS) as u64;
     let isr_spurious_va = pa_to_va(ISR_SPURIOUS_PHYS) as u64;
 
@@ -661,8 +687,10 @@ unsafe fn init_runtime_idt_and_isrs() {
                 isr_spurious_va
             } else if v < 0x30 {
                 isr_pic_va
-            } else {
+            } else if v == (LAPIC_TIMER_VECTOR as usize) {
                 isr_lapic_va
+            } else {
+                isr_doorbell_va
             };
             write_idt_gate(idt_ptr, v, handler);
             v += 1;
@@ -778,6 +806,12 @@ pub(crate) fn kthread_switch_next() -> usize {
 /// Calibrated number of Local APIC timer interrupts (`vector 0x40`) corresponding to 1 second (`1 Hz` cooldown tick),
 /// measured against the 8254 PIT (`1,193,182 Hz`) during `smp_hw_enable_bsp_timer`.
 static CALIBRATED_IRQS_PER_COOLDOWN_TICK: AtomicU64 = AtomicU64::new(250);
+
+/// Return the hardware-calibrated Local APIC timer interrupt frequency (`vector 0x40` IRQs per second).
+#[inline]
+pub(crate) fn read_calibrated_irqs_per_sec() -> u64 {
+    CALIBRATED_IRQS_PER_COOLDOWN_TICK.load(Ordering::Relaxed).max(16)
+}
 
 /// Calibrate the BSP (`CPU 0`) Local APIC Timer against the 8254 PIT (`1,193,182 Hz`, Channel 2)
 /// over a `10 ms` window (`11,932` PIT ticks) and arm the Periodic Timer on vector `0x40` so
@@ -1152,6 +1186,11 @@ pub(crate) fn banner_smp_hw() {
     {
         let mut sh = KERNEL_SHELL.lock();
         smp_hw_tick_and_sync(&mut sh);
+    }
+    // Verify Doorbell IPIs (`vector 0x41`) fired during AP wakeup and kthread scheduling
+    // did NOT increment the Local APIC Timer (`vector 0x40`) counter at `0x8380`.
+    if read_hw_irq_wakeups() != 0 {
+        panic!("SMP_HW: Doorbell IPI 0x41 incremented timer IRQ counter");
     }
 
     let mut line = [0u8; 80];

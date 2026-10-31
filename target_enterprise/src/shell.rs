@@ -1024,6 +1024,7 @@ impl OsShell {
             || bytes_eq(cmd, b"caps")
             || bytes_eq(cmd, b"ls")
             || bytes_eq(cmd, b"cat")
+            || bytes_eq(cmd, b"cathex")
             || bytes_eq(cmd, b"stat")
             || bytes_eq(cmd, b"df")
             || bytes_eq(cmd, b"net")
@@ -1974,8 +1975,18 @@ impl OsShell {
             return ShellAction::Continue(n);
         }
 
+        if bytes_eq(cmd, b"cathex") {
+            let n = self.cmd_cathex(rest, out);
+            return ShellAction::Continue(n);
+        }
+
         if bytes_eq(cmd, b"write") {
             let n = self.cmd_write(rest, out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"writehex") {
+            let n = self.cmd_writehex(rest, out);
             return ShellAction::Continue(n);
         }
 
@@ -2633,7 +2644,7 @@ impl OsShell {
     }
 
     fn cmd_cat(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
-        let path = trim_ascii(arg);
+        let path = strip_shell_quotes(arg);
         if path.is_empty() {
             self.record_audit(8, AuditVerdict::Error, b"shell:cat:no-arg");
             return copy_into(b"usage: cat <path>\n", out);
@@ -2656,6 +2667,138 @@ impl OsShell {
         pos
     }
 
+    fn cmd_cathex(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        let (path, off_tok, len_tok) = split_cathex_args(arg);
+        if path.is_empty() {
+            self.record_audit(8, AuditVerdict::Error, b"shell:cathex:no-arg");
+            return copy_into(b"usage: cathex <path> [offset] [len]\n", out);
+        }
+        let offset = if off_tok.is_empty() {
+            0u64
+        } else {
+            let Some(v) = parse_u64_ascii(off_tok) else {
+                self.record_audit(8, AuditVerdict::Error, b"shell:cathex:bad-off");
+                return copy_into(b"usage: cathex <path> [offset] [len]\n", out);
+            };
+            v
+        };
+        let req_len = if len_tok.is_empty() {
+            128usize
+        } else {
+            let Some(v) = parse_u64_ascii(trim_ascii(len_tok)) else {
+                self.record_audit(8, AuditVerdict::Error, b"shell:cathex:bad-len");
+                return copy_into(b"usage: cathex <path> [offset] [len]\n", out);
+            };
+            (v as usize).clamp(1, 192)
+        };
+        let st = match self.fs.stat(path) {
+            Ok(s) => s,
+            Err(_) => {
+                self.record_audit(8, AuditVerdict::Error, b"shell:cathex:not-found");
+                return copy_into(b"error: file not found\n", out);
+            }
+        };
+        let h = match self.fs.open(path, FS_O_RDONLY) {
+            Ok(h) => h,
+            Err(_) => {
+                self.record_audit(8, AuditVerdict::Error, b"shell:cathex:not-found");
+                return copy_into(b"error: file not found\n", out);
+            }
+        };
+        let mut raw = [0u8; 192];
+        let n = self.fs.read(h, offset, &mut raw[..req_len]).unwrap_or(0);
+        let _ = self.fs.close(h);
+        self.record_audit(8, AuditVerdict::Allowed, b"shell:cathex");
+        let mut pos = 0usize;
+        pos += copy_into(b"hex len=", &mut out[pos..]);
+        pos += dec_u64(st.size, &mut out[pos..]);
+        pos += copy_into(b" off=", &mut out[pos..]);
+        pos += dec_u64(offset, &mut out[pos..]);
+        pos += copy_into(b" data=", &mut out[pos..]);
+        pos += hex_bytes(&raw[..n], &mut out[pos..]);
+        pos += copy_into(b"\n", &mut out[pos..]);
+        pos
+    }
+
+    fn cmd_writehex(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        if self
+            .svc
+            .mediate_endpoint(
+                crate::svc_runtime::IpcOp::VfsWrite,
+                false,
+                true,
+                &mut self.audit,
+            )
+            .is_err()
+        {
+            return copy_into(
+                b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                out,
+            );
+        }
+        let (path, off_tok, hex_tok) = split_writehex_args(arg);
+        if path.is_empty() || off_tok.is_empty() {
+            self.record_audit(9, AuditVerdict::Error, b"shell:writehex:bad-args");
+            return copy_into(b"usage: writehex <path> <offset> [hex]\n", out);
+        }
+        let Some(offset) = parse_u64_ascii(off_tok) else {
+            self.record_audit(9, AuditVerdict::Error, b"shell:writehex:bad-off");
+            return copy_into(b"usage: writehex <path> <offset> [hex]\n", out);
+        };
+        if bytes_eq(path, b"/etc/os-release") {
+            self.record_audit(9, AuditVerdict::Denied, b"shell:writehex:protected");
+            return copy_into(b"error: permission denied (immutable system file)\n", out);
+        }
+        let mut payload = [0u8; 128];
+        let plen = if hex_tok.is_empty() {
+            0usize
+        } else {
+            let Some(decoded_len) = decode_hex_slice(hex_tok, &mut payload) else {
+                self.record_audit(9, AuditVerdict::Error, b"shell:writehex:bad-hex");
+                return copy_into(b"error: invalid hex payload\n", out);
+            };
+            decoded_len
+        };
+        if offset == 0 {
+            let _ = self.fs.unlink(path);
+        }
+        let flags = if offset == 0 {
+            FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC
+        } else {
+            FS_O_RDWR | FS_O_CREATE
+        };
+        let h = match self.fs.open(path, flags) {
+            Ok(h) => h,
+            Err(_) => {
+                self.record_audit(9, AuditVerdict::Error, b"shell:writehex:open-failed");
+                return copy_into(b"error: cannot open path for write\n", out);
+            }
+        };
+        let written = if plen == 0 && offset == 0 {
+            0usize
+        } else {
+            match self.fs.write(h, offset, &payload[..plen]) {
+                Ok(w) => w,
+                Err(_) => {
+                    let _ = self.fs.close(h);
+                    self.record_audit(9, AuditVerdict::Error, b"shell:writehex:io-err");
+                    return copy_into(b"error: write failed\n", out);
+                }
+            }
+        };
+        let _ = self.fs.close(h);
+        self.record_audit(9, AuditVerdict::Allowed, b"shell:writehex");
+        let mut pos = 0usize;
+        pos += copy_into(b"wrote ", &mut out[pos..]);
+        pos += dec_u64(written as u64, &mut out[pos..]);
+        pos += copy_into(b" bytes to ", &mut out[pos..]);
+        pos += copy_into(path, &mut out[pos..]);
+        pos += copy_into(b" at offset ", &mut out[pos..]);
+        pos += dec_u64(offset, &mut out[pos..]);
+        pos += copy_into(b"\n", &mut out[pos..]);
+        pos
+    }
+
     fn cmd_write(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
         if self
             .svc
@@ -2672,7 +2815,7 @@ impl OsShell {
                 out,
             );
         }
-        let (path, content) = split_first_word(trim_ascii(arg));
+        let (path, content) = split_shell_path(arg);
         if path.is_empty() || content.is_empty() {
             self.record_audit(9, AuditVerdict::Error, b"shell:write:bad-args");
             return copy_into(b"usage: write <path> <text>\n", out);
@@ -2729,7 +2872,7 @@ impl OsShell {
                 out,
             );
         }
-        let path = trim_ascii(arg);
+        let path = strip_shell_quotes(arg);
         if path.is_empty() {
             self.record_audit(10, AuditVerdict::Error, b"shell:rm:no-arg");
             return copy_into(b"usage: rm <path>\n", out);
@@ -2755,7 +2898,7 @@ impl OsShell {
     }
 
     fn cmd_stat(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
-        let path = trim_ascii(arg);
+        let path = strip_shell_quotes(arg);
         if path.is_empty() {
             self.record_audit(11, AuditVerdict::Error, b"shell:stat:no-arg");
             return copy_into(b"usage: stat <path>\n", out);
@@ -4778,6 +4921,104 @@ fn split_first_word(s: &[u8]) -> (&[u8], &[u8]) {
     (first, rest)
 }
 
+fn split_last_word(s: &[u8]) -> (&[u8], &[u8]) {
+    let s = trim_ascii(s);
+    let mut i = s.len();
+    while i > 0 {
+        if s[i - 1] == b' ' || s[i - 1] == b'\t' {
+            return (trim_ascii(&s[..i - 1]), &s[i..]);
+        }
+        i -= 1;
+    }
+    (&[], s)
+}
+
+fn strip_shell_quotes(s: &[u8]) -> &[u8] {
+    let s = trim_ascii(s);
+    if s.len() >= 2
+        && ((s[0] == b'"' && s[s.len() - 1] == b'"')
+            || (s[0] == b'\'' && s[s.len() - 1] == b'\''))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+fn split_shell_path(s: &[u8]) -> (&[u8], &[u8]) {
+    let s = trim_ascii(s);
+    if s.len() >= 2 && (s[0] == b'"' || s[0] == b'\'') {
+        let q = s[0];
+        let mut i = 1usize;
+        while i < s.len() {
+            if s[i] == q {
+                return (&s[1..i], trim_ascii(&s[i + 1..]));
+            }
+            i += 1;
+        }
+        return (&[], s);
+    }
+    split_first_word(s)
+}
+
+fn split_cathex_args(arg: &[u8]) -> (&[u8], &[u8], &[u8]) {
+    let s = trim_ascii(arg);
+    if s.is_empty() {
+        return (&[], &[], &[]);
+    }
+    if s[0] == b'"' || s[0] == b'\'' {
+        let (path, rest) = split_shell_path(s);
+        let (off_tok, len_tok) = split_first_word(rest);
+        return (path, off_tok, len_tok);
+    }
+    let (p0, r0) = split_first_word(s);
+    if r0.is_empty() {
+        return (p0, &[], &[]);
+    }
+    let (o0, l0) = split_first_word(r0);
+    if parse_u64_ascii(o0).is_some()
+        && (l0.is_empty() || (parse_u64_ascii(l0).is_some() && split_first_word(l0).1.is_empty()))
+    {
+        return (p0, o0, l0);
+    }
+    let (before_last, last_tok) = split_last_word(s);
+    if !before_last.is_empty() && parse_u64_ascii(last_tok).is_some() {
+        let (before_prev, prev_tok) = split_last_word(before_last);
+        if !before_prev.is_empty() && parse_u64_ascii(prev_tok).is_some() {
+            return (before_prev, prev_tok, last_tok);
+        }
+        return (before_last, last_tok, &[]);
+    }
+    (p0, o0, l0)
+}
+
+fn split_writehex_args(arg: &[u8]) -> (&[u8], &[u8], &[u8]) {
+    let s = trim_ascii(arg);
+    if s.is_empty() {
+        return (&[], &[], &[]);
+    }
+    if s[0] == b'"' || s[0] == b'\'' {
+        let (path, rest) = split_shell_path(s);
+        let (off_tok, hex_raw) = split_first_word(rest);
+        return (path, off_tok, trim_ascii(hex_raw));
+    }
+    let (p0, r0) = split_first_word(s);
+    let (o0, h0) = split_first_word(r0);
+    let h0_trim = trim_ascii(h0);
+    if parse_u64_ascii(o0).is_some() && split_first_word(h0_trim).1.is_empty() {
+        return (p0, o0, h0_trim);
+    }
+    let (before_last, last_tok) = split_last_word(s);
+    let (before_prev, prev_tok) = split_last_word(before_last);
+    if !before_prev.is_empty() && parse_u64_ascii(prev_tok).is_some() {
+        return (before_prev, prev_tok, last_tok);
+    }
+    if !before_last.is_empty() && parse_u64_ascii(last_tok).is_some() {
+        return (before_last, last_tok, &[]);
+    }
+    (p0, o0, h0_trim)
+}
+
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -6128,6 +6369,92 @@ mod tests {
         assert_eq!(
             &out[..act_att.bytes_written()],
             b"error: EPERM (attestation key not provisioned)\n"
+        );
+    }
+
+    #[test]
+    fn cathex_and_writehex_roundtrip_empty_binary_and_multichunk_files() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 512];
+
+        assert!(OsShell::is_readonly_command(b"cathex /etc/hostname 0 64"));
+        assert!(!OsShell::is_readonly_command(b"writehex /www/x 0 4142"));
+
+        // 1. Empty 0-byte file round-trip.
+        let act = sh.exec_line(b"writehex /www/empty.bin 0", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"wrote 0 bytes to /www/empty.bin at offset 0\n"
+        );
+        let act = sh.exec_line(b"cathex /www/empty.bin 0 64", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"hex len=0 off=0 data=\n"
+        );
+
+        // 2. Multi-line / binary payload with NULs and non-newline termination.
+        let act = sh.exec_line(
+            b"writehex /www/page.html 0 3c68313e48693c2f68313e0a00ff3c703e546573743c2f703e",
+            1,
+            0,
+            0,
+            &mut out,
+        );
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"wrote 25 bytes to /www/page.html at offset 0\n"
+        );
+        let act = sh.exec_line(b"cathex /www/page.html 0 64", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"hex len=25 off=0 data=3c68313e48693c2f68313e0a00ff3c703e546573743c2f703e\n"
+        );
+
+        // 3. Multi-chunk file > 256 bytes (320 bytes across 5 chunks of 64 bytes).
+        let chunk_hex = [b'a'; 128];
+        for chunk_idx in 0..5usize {
+            let off = chunk_idx * 64;
+            let mut cmd = [0u8; 200];
+            let mut p = 0usize;
+            p += copy_into(b"writehex /www/big.bin ", &mut cmd[p..]);
+            p += dec_u64(off as u64, &mut cmd[p..]);
+            p += copy_into(b" ", &mut cmd[p..]);
+            p += copy_into(&chunk_hex, &mut cmd[p..]);
+            let a = sh.exec_line(&cmd[..p], 1, 0, 0, &mut out);
+            assert!(out[..a.bytes_written()].starts_with(b"wrote 64 bytes to /www/big.bin"));
+        }
+        let act = sh.exec_line(b"cathex /www/big.bin 256 64", 1, 0, 0, &mut out);
+        assert!(out[..act.bytes_written()].starts_with(b"hex len=320 off=256 data="));
+
+        // 4. Quoted and unquoted paths with spaces round-trip.
+        let act = sh.exec_line(
+            b"writehex \"/www/my page.html\" 0 737061636520706174680a",
+            1,
+            0,
+            0,
+            &mut out,
+        );
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"wrote 11 bytes to /www/my page.html at offset 0\n"
+        );
+        let act = sh.exec_line(b"cathex \"/www/my page.html\" 0 64", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"hex len=11 off=0 data=737061636520706174680a\n"
+        );
+        let act = sh.exec_line(b"cathex /www/my page.html 0 64", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"hex len=11 off=0 data=737061636520706174680a\n"
+        );
+
+        // 5. Role enforcement: `sql` role refuses `writehex`.
+        sh.svc.set_role(crate::svc_runtime::NodeRole::Sql, &mut sh.audit);
+        let act = sh.exec_line(b"writehex /www/blocked 0 41", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"error: EACCES (svc-sh disabled by node role or policy)\n"
         );
     }
 }

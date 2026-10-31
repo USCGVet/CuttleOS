@@ -1359,19 +1359,23 @@ fn resolve_primary_verifying_key(
             }
             let vk = ed25519_dalek::VerifyingKey::from_bytes(&bytes)
                 .context("primary signer pubkey is not a valid ed25519 key")?;
+            federation::reject_fixture_verifying_key(&vk, "primary")?;
             return Ok(Some(vk));
         }
         // Config exists but has no "primary" signer — fall through to the
         // key file so single-signer hosts still authenticate.
     }
     for candidate in [
+        crate::signing::resolve_signing_key_path(),
         attest_dir().join(crate::signing::SIGNING_KEY_FILE),
         PathBuf::from(crate::signing::SIGNING_KEY_FILE),
     ] {
         if candidate.exists() {
             let key = crate::signing::load_signing_key_from(&candidate)
                 .with_context(|| format!("load primary key from {}", candidate.display()))?;
-            return Ok(Some(key.verifying_key()));
+            let vk = key.verifying_key();
+            federation::reject_fixture_verifying_key(&vk, &candidate.display().to_string())?;
+            return Ok(Some(vk));
         }
     }
     Ok(None)
@@ -1412,7 +1416,18 @@ pub fn verify_chain_with_options(opts: &VerifyOptions) -> Result<VerifyReport> {
             .federation_config
             .clone()
             .unwrap_or_else(federation::resolve_federation_path);
-        Some(federation::load_federation(&p)?)
+        let cfg = federation::load_federation(&p)?;
+        if cfg.threshold < 2 {
+            bail!(
+                "verify-attest --require-threshold: federation config {} has threshold={} \
+                 (only {} signer(s) enrolled); M-of-N threshold verification requires \
+                 threshold >= 2 with independent operator co-signer keys",
+                p.display(),
+                cfg.threshold,
+                cfg.signers.len()
+            );
+        }
+        Some(cfg)
     } else {
         None
     };

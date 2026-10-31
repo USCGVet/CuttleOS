@@ -143,6 +143,8 @@ pub fn boot_and_capture(
     let mut qproc = Command::new(&qemu)
         .arg("-accel")
         .arg("tcg")
+        .arg("-cpu")
+        .arg("max")
         .arg("-drive")
         .arg(format!("format=raw,file={},if=ide", bios.display()))
         .arg("-drive")

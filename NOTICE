@@ -4,7 +4,10 @@ Copyright 2026 Cuttle Research
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 Bootable CuttleOS images also contain third-party open-source components
-under permissive licenses (MIT, Apache-2.0, ISC, BSD-3-Clause and similar).
+under permissive licenses (MIT, Apache-2.0, ISC, BSD-3-Clause and similar),
+except as noted in THIRD_PARTY_NOTICES.md (the SIL Open Font License 1.1 for
+the embedded Noto Sans Mono bitmap font in BIOS/UEFI images, and MPL-2.0 for
+the ucs2 crate in optional UEFI images).
 Their copyright notices and license texts are listed in THIRD_PARTY_NOTICES.md,
 which must accompany any distributed image.
 

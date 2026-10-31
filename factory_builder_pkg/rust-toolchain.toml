@@ -1,7 +1,7 @@
 [toolchain]
 # The `bootloader = "0.11"` build script invokes nested cargo builds for
 # its BIOS / UEFI stages that require nightly (build-std, -Z flags).
-# Pin nightly here so this packager works regardless of the parent
-# shell's default toolchain — mirrors the sibling `rustos-builder` crate.
-channel = "nightly"
+# Pin the verified dated nightly (`rustc 1.101.0-nightly (1a2c4797e 2026-10-21)`)
+# so `bootloader 0.11.17` builds reproducibly across hosts.
+channel = "nightly-2026-10-22"
 components = ["rust-src", "llvm-tools-preview"]

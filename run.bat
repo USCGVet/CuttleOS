@@ -10,9 +10,10 @@ REM
 REM For the full bundle-morph + verifier flow, use the QEMU smoke test:
 REM     cargo test -p factory_builder --test qemu_smoke -- --ignored
 REM
-REM Accelerator: run.bat [auto^|whpx^|tcg]  (or set CUTTLE_ACCEL). Default auto:
-REM   WHPX (Hyper-V hardware virtualization) when it can start, else QEMU falls
-REM   back to TCG software emulation by itself.
+REM Accelerator: run.bat [tcg^|whpx^|auto]  (or set CUTTLE_ACCEL). Default tcg:
+REM   TCG software emulation is the default for standalone single-VM runs so a
+REM   host where WHPX hangs in BIOS reset still boots reliably. Pass whpx or
+REM   auto to use Hyper-V hardware virtualization.
 REM
 REM Requirements:
 REM   - QEMU on PATH, or at C:\Program Files\qemu\qemu-system-x86_64.exe
@@ -40,7 +41,7 @@ set "KERNEL_PATH_FILE=%TEMP%\cuttle_kernel_elf_path.txt"
 REM ----- accelerator ---------------------------------------------------------
 set "ACCEL=%CUTTLE_ACCEL%"
 if not "%~1"=="" set "ACCEL=%~1"
-if "%ACCEL%"=="" set "ACCEL=auto"
+if "%ACCEL%"=="" set "ACCEL=tcg"
 set "ACCEL_ARGS="
 if /i "%ACCEL%"=="auto" set "ACCEL_ARGS=-accel whpx -accel tcg"
 if /i "%ACCEL%"=="whpx" set "ACCEL_ARGS=-accel whpx"
@@ -90,9 +91,16 @@ set "SERIAL_LOG=%IMAGES_DIR%\run_serial.log"
 set "VIRTIO_IMG=%IMAGES_DIR%\virtio_hw.img"
 set "AHCI_IMG=%IMAGES_DIR%\ahci_hw.img"
 set "NVME_IMG=%IMAGES_DIR%\nvme_hw.img"
+set "DEVICE_KEY=%ROOT%\device_secret_key.bin"
 if not exist "%VIRTIO_IMG%" fsutil file createnew "%VIRTIO_IMG%" 1048576 >nul
 if not exist "%AHCI_IMG%" fsutil file createnew "%AHCI_IMG%" 1048576 >nul
 if not exist "%NVME_IMG%" fsutil file createnew "%NVME_IMG%" 1048576 >nul
+if exist "%DEVICE_KEY%" goto :have_device_key
+echo     Generating 32-byte owner-only device_secret_key.bin for local boot...
+powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $dst = '%DEVICE_KEY%'; $tmp = $dst + '.tmp'; [System.IO.File]::WriteAllBytes($tmp, [byte[]]@()); $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; & icacls.exe $tmp /inheritance:r /grant:r ('*' + $sid + ':(F)') | Out-Null; if ($LASTEXITCODE -ne 0) { Remove-Item -Force $tmp -ErrorAction SilentlyContinue; exit 1 }; $b = New-Object byte[] 32; [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); [System.IO.File]::WriteAllBytes($tmp, $b); Move-Item -Force $tmp $dst"
+if not "%ERRORLEVEL%"=="0" goto :no_device_key
+if not exist "%DEVICE_KEY%" goto :no_device_key
+:have_device_key
 
 echo.
 echo [3/3] Launching QEMU (4x SMP vCPUs + 1280x720 console + HTTP :18080 / HTTPS :18443 + SQL).
@@ -104,8 +112,9 @@ echo        Exit:        type 'halt' at cuttle^> prompt or close QEMU window
 echo ============================================================================
 "%QEMU%" ^
     %ACCEL_ARGS% ^
+    -cpu max ^
     -smp 4 ^
-    -fw_cfg name=opt/cuttle_device_key,file="%ROOT%\device_secret_key.bin" ^
+    -fw_cfg name=opt/cuttle_device_key,file="%DEVICE_KEY%" ^
     -drive format=raw,file="%BIOS_IMG%",if=ide ^
     -drive if=none,id=vd0,format=raw,file="%VIRTIO_IMG%" ^
     -device virtio-blk-pci,drive=vd0,disable-legacy=off,disable-modern=on ^
@@ -168,4 +177,9 @@ exit /b 1
 echo.
 echo ERROR: BIOS packaging failed -- exit code %PKG_RC%.
 echo factory_builder couldn't wrap the kernel ELF into a bootable image.
+exit /b 1
+
+:no_device_key
+echo.
+echo ERROR: failed to generate "%DEVICE_KEY%".
 exit /b 1

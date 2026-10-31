@@ -501,24 +501,69 @@ pub(crate) fn service_udp_status() {
     service_udp_status_legacy();
 }
 
-/// Serve HTTPS on port 443 from `svc`: seed the TLS CSPRNG from hardware
-/// entropy, derive this node's TLS identity, build the rustls server
-/// configuration and hand it to the service. Emits
-/// `HTTPS UP port=443 tls13=rustls cert_sha256=<hex64>`; clients pin that
-/// certificate (fetch it once, compare this fingerprint out of band).
+/// Serve HTTPS on port 443 from `svc`: run the RustCrypto provider's
+/// known-answer self-test (even in `cuttle_prod`), require genuine hardware
+/// entropy (`RDRAND` or TPM 2.0 `GetRandom`) to seed the TLS CSPRNG, derive
+/// this node's TLS identity, build the rustls server configuration and hand it
+/// to the service. Emits
+/// `HTTPS UP port=443 tls13=rustls entropy=<src> provisioned=<0|1> cert_sha256=<hex64>`;
+/// clients pin that certificate (fetch it once, compare this fingerprint out
+/// of band).
 pub(crate) fn enable_https(svc: &mut target_enterprise::LivedNet, mac: [u8; 6]) {
     use target_enterprise::https::{server_config, ServerIdentity};
-    use target_enterprise::tls_provider::{seed_system_rng, system_provider};
+    use target_enterprise::tls_provider::{seed_system_rng, self_test, system_provider};
 
-    seed_system_rng(tls_rng_seed());
-    let identity = ServerIdentity::derive(&derive_runtime_tls_identity_secret(mac), mac);
+    if let Err(why) = self_test() {
+        serial_write_str("HTTPS DISABLED: TLS provider self-test failed: ");
+        serial_write_str(why);
+        serial_write_str("\n");
+        return;
+    }
+    let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let Some((mut seed, entropy_src)) = tls_rng_seed(mac, boots) else {
+        serial_write_str("HTTPS DISABLED: no hardware entropy (RDRAND and TPM absent)\n");
+        return;
+    };
+    seed_system_rng(seed);
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut seed);
+
+    let (mut secret, provisioned) = match derive_runtime_tls_identity_secret(mac) {
+        Ok(v) => v,
+        Err(why) => {
+            serial_write_str("HTTPS DISABLED: TLS identity derivation failed: ");
+            serial_write_str(why);
+            serial_write_str("\n");
+            return;
+        }
+    };
+    let identity = match ServerIdentity::try_derive(&secret, mac) {
+        Ok(id) => id,
+        Err(why) => {
+            target_enterprise::durable_seal::zeroize_secret_bytes(&mut secret);
+            serial_write_str("HTTPS DISABLED: TLS certificate generation failed: ");
+            serial_write_str(why);
+            serial_write_str("\n");
+            return;
+        }
+    };
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut secret);
     match server_config(&identity, system_provider()) {
         Ok(config) => {
             svc.enable_tls(config);
-            let mut line = [0u8; 128];
-            let prefix = b"HTTPS UP port=443 tls13=rustls cert_sha256=";
+            let mut line = [0u8; 160];
+            let prefix = b"HTTPS UP port=443 tls13=rustls entropy=";
             line[..prefix.len()].copy_from_slice(prefix);
             let mut pos = prefix.len();
+            let src_bytes = entropy_src.as_bytes();
+            line[pos..pos + src_bytes.len()].copy_from_slice(src_bytes);
+            pos += src_bytes.len();
+            let prov_tag = if provisioned {
+                &b" provisioned=1 cert_sha256="[..]
+            } else {
+                &b" provisioned=0 cert_sha256="[..]
+            };
+            line[pos..pos + prov_tag.len()].copy_from_slice(prov_tag);
+            pos += prov_tag.len();
             pos += hex_encode(&identity.fingerprint(), 32, &mut line[pos..]);
             line[pos] = b'\n';
             pos += 1;
@@ -536,9 +581,9 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
         Some(k) => target_enterprise::LivedNet::with_auth_key(mac, k),
         None => target_enterprise::LivedNet::new_unprovisioned(mac),
     };
-    enable_https(&mut svc, mac);
     serial_write_str("UDP SVC UP modern ip=10.0.2.15 port=8080\n");
     serial_write_str("NET SVC UP ip=10.0.2.15 udp=8080 tcp=80 icmp=echo\n");
+    enable_https(&mut svc, mac);
     {
         // Debug: DMA window base + queue sanity.
         let mut line = [0u8; 64];

@@ -27,7 +27,7 @@ Cuttle OS is a hardened multi-role network and state appliance OS built for high
 | [`mtd_metrics`](mtd_metrics) | Binary gadget analyzer and ROP/JOP chain exploit simulator (`cuttle-mtd-metrics`). |
 | [`verifier`](verifier) | Candidate acceptance gate (`verify`) enforcing public-symbol preservation, locked-module integrity, unit/property test suites, and per-function performance bounds (`perf.jsonl`). |
 | [`factory_builder`](factory_builder) | Host packager that builds `target_enterprise_kernel` with per-seed codegen flags, provisions the out-of-band device key, and wraps the kernel ELF into BIOS/UEFI disk images. |
-| [`morph_engine`](morph_engine) | Factory orchestrator (`morph`) managing scheduled morph cycles (`scheduler.toml`), Ed25519 M-of-N threshold attestation chains (`attest.log.jsonl`), and Merkle root anchors. |
+| [`morph_engine`](morph_engine) | Factory orchestrator (`morph`) managing scheduled morph cycles (`scheduler.toml`), Ed25519 attestation chains (`attest.log.jsonl`, single `primary` signer by default; M-of-N threshold verification once operator co-signers are enrolled in `factory_keys.toml`), and Merkle root anchors. |
 
 ---
 
@@ -102,8 +102,8 @@ Because each 4-core Cuttle OS VM requires only **3.5 MB of disk**, **128 MB of R
 
 ### Dynamic Web Application Server, HTTPS (rustls TLS 1.3) & 16-Slot TCP Stack (`LivedNet`)
 [`LivedNet`](target_enterprise/src/lived_net.rs) serves both HTTP/TCP (`:80`) and HTTPS (`:443`) across a 16-slot concurrent TCP connection table (`[Tcb; 16]`) with SYN-flood priority eviction (evicting half-open `SynReceived` slots before any `Established` connection) and per-slot RTO tick tracking (`tick_tcp_rto`):
-- **HTTPS on `:443` ([`https.rs`](target_enterprise/src/https.rs), [`tls_provider.rs`](target_enterprise/src/tls_provider.rs))**: The TLS 1.3 protocol is [rustls](https://github.com/rustls/rustls) (`no_std` + `alloc`, driven through its unbuffered API, one session per TCP slot); the cryptography is a RustCrypto provider written for the bare-metal soft-float target: `TLS_AES_128_GCM_SHA256` and `TLS_CHACHA20_POLY1305_SHA256`, X25519 and secp256r1 key exchange, ECDSA P-256 / SHA-256 signatures with RFC 6979 nonces, and a ChaCha20 CSPRNG seeded from `RDRAND` / TSC jitter / TPM entropy (it fails closed until seeded). TLS 1.3 only; no session tickets, resumption or 0-RTT. Each node presents a self-signed X.509 v3 certificate for its own P-256 key (SAN `localhost`, `127.0.0.1`, `10.0.2.15`) and prints the certificate's SHA-256 fingerprint at boot (`HTTPS UP port=443 tls13=rustls cert_sha256=…`). Every HTTP route answers identically on `:80` and `:443`.
-- **HTTPS boot proofs**: Every boot runs the provider's known-answer vectors (AES-128-GCM, ChaCha20-Poly1305 RFC 8439, X25519 RFC 7748, ECDSA RFC 6979, P-256 ECDH, record tamper rejection), parses and verifies a generated certificate, and replays a recorded TLS 1.3 session through the real `LivedNet` frame path with all 16 TCP slots in use, requiring every server byte to match (`HTTPS compose OK … sha=…`). [`tests/https_interop.rs`](target_enterprise/tests/https_interop.rs) checks the server against an independent rustls client using *ring* crypto (both cipher suites, both key-exchange groups, certificate pinning, tampered-Finished rejection, `401` on unauthenticated calls); `tools/https_check.py` checks a booted node with OpenSSL, Python `ssl` and curl, and the Triad self-test checks every node over TLS 1.3 against its pinned certificate, before and after a live morph.
+- **HTTPS on `:443` ([`https.rs`](target_enterprise/src/https.rs), [`tls_provider.rs`](target_enterprise/src/tls_provider.rs))**: The TLS 1.3 protocol is [rustls](https://github.com/rustls/rustls) (`no_std` + `alloc`, driven through its unbuffered API, one session per TCP slot); the cryptography is a RustCrypto provider written for the bare-metal soft-float target: `TLS_AES_128_GCM_SHA256` and `TLS_CHACHA20_POLY1305_SHA256`, X25519 and secp256r1 key exchange, ECDSA P-256 / SHA-256 signatures with RFC 6979 nonces, and a ChaCha20 CSPRNG that requires hardware entropy (`RDRAND` or TPM 2.0 `GetRandom`, enabled by `-cpu max` under QEMU) and fails closed (`HTTPS DISABLED: no hardware entropy (RDRAND and TPM absent)`) when neither hardware entropy source is available. TLS 1.3 only; no session tickets, resumption or 0-RTT. Each node presents a self-signed X.509 v3 certificate for its own P-256 key (SAN `localhost`, `127.0.0.1`, `10.0.2.15`) and prints the entropy source, provisioning state, and certificate SHA-256 fingerprint at boot (`HTTPS UP port=443 tls13=rustls entropy=<rdrand|tpm|rdrand+tpm> provisioned=<0|1> cert_sha256=…`). Every HTTP route answers identically on `:80` and `:443`.
+- **HTTPS boot proofs**: Every boot runs the provider's known-answer vectors (`tls_provider::self_test()`: AES-128-GCM McGrew & Viega GCM spec Appendix B test cases 1, 2, and 4, ChaCha20-Poly1305 RFC 8439 §2.8.2, X25519 RFC 7748 §6.1, ECDSA P-256 RFC 6979 §A.2.5, P-256 ECDH RFC 5903 §8.1, HMAC-SHA256 RFC 4231 §4.3, HKDF-SHA256 RFC 5869 Appendix A.1, and record tamper rejection), parses and verifies a generated certificate, and replays a recorded TLS 1.3 session through the real `LivedNet` frame path with all 16 TCP slots in use, requiring every server byte to match (`HTTPS compose OK … sha=…`). [`kat.rs`](target_enterprise/src/kat.rs) checks HMAC-SHA256 RFC 4231 §4.2–4.5 and HKDF-SHA256 RFC 5869 Appendix A.1–A.2, while [`tests/tls_kat.rs`](target_enterprise/tests/tls_kat.rs) and [`tests/https_interop.rs`](target_enterprise/tests/https_interop.rs) check `tls_provider::self_test()`, HKDF-SHA256 RFC 5869 test cases 1 and 3 (`tls::`), RFC 8448 §3 key schedule through handshake secret, and test the server against an independent rustls client using *ring* crypto (both cipher suites, both key-exchange groups, certificate pinning, tampered-Finished rejection, `401` on unauthenticated calls), including a dedicated sub-invocation compiled with the kernel's five soft-float `RUSTFLAGS` cfgs; `tools/https_check.py` checks a booted node with OpenSSL, Python `ssl` and curl, and the Triad self-test checks every node over TLS 1.3 against its pinned certificate, before and after a live morph.
 - **Dynamic HTML5 Dashboard (`GET /app`, `GET /dashboard`, `GET /index.html`)**: Renders live kernel boot generation, VFS file count, SQL table/row telemetry, active web session count, and authenticated operator identity.
 - **Cryptographic Web Sessions (`POST /session/login`, `GET /session/whoami`, `POST /session/logout`)**: Authenticates `<user>:<seq>:<hmac_sha256_hex>` against the device's UDP/web auth key (with a decaying 8-tick cooldown after 5 failed attempts) and issues a 128-bit `HMAC-SHA256` session token (`Set-Cookie: sid=<32hex>; HttpOnly; Path=/`), accepted on subsequent requests via `Cookie: sid=<32hex>` or `X-Session-Token: <32hex>`.
 - **Networked SQL Database Server (`GET /sql?<query>`, `POST /sql`, `GET /db`, `POST /db`)**: Executes read-only `SELECT`, `.tables`, and `.schema` queries openly and requires a valid session token (`401 Unauthorized` otherwise) for mutating `CREATE`, `DROP`, `INSERT`, `UPDATE`, and `DELETE` statements.
@@ -121,12 +121,12 @@ Because each 4-core Cuttle OS VM requires only **3.5 MB of disk**, **128 MB of R
 - **Measured User Execution, TPM 2.0 TIS Driver & Remote Attestation**: `exec <path> [arg]`, `ima [status | enroll <path>]`, `attest [nonce]`, and `audit`.
 
 ### Out-of-Band Key Provisioning & State Continuity
-- **Master Key Provisioning ([`provisioning.rs`](target_enterprise_kernel/src/provisioning.rs))**: `factory_builder` generates a 32-byte OS-CSPRNG key in `device_secret_key.bin` (gitignored, never stored in source, the kernel ELF, or the guest disk) and passes it to QEMU via `-fw_cfg name=opt/cuttle_device_key,file=device_secret_key.bin`. On unprovisioned boots, the kernel harvests hardware entropy from `RDRAND`, `RDTSC`, CMOS RTC, 8254 PIT, and physical TPM 2.0 TIS `GetRandom` (`0xFED4_0000`).
+- **Master Key Provisioning ([`provisioning.rs`](target_enterprise_kernel/src/provisioning.rs))**: `factory_builder`, `run.bat`, `triad_controller.py`, and `cuttle_fleet.py` generate 32-byte OS-CSPRNG keys and session/client tokens (`device_secret_key.bin`, `target/cuttle_images/triad/operator_token.txt`, `target/cuttle_images/triad/node*/device_key_node*.bin`, `target/cuttle_images/fleet/provider_token.txt`, and `target/cuttle_images/fleet/<client>/{master_key.bin,client_token.txt}`) exclusively with owner-only permissions (`0600` on POSIX / current-user ACL via `icacls` on Windows; all gitignored and never stored in source, the kernel ELF, or the guest disk) and pass each VM's device key to QEMU via `-fw_cfg name=opt/cuttle_device_key,file=...`. Malformed or truncated existing secret files are rejected at startup rather than silently truncated or overwritten. On unprovisioned boots, the kernel harvests hardware entropy from `RDRAND` and physical TPM 2.0 TIS `GetRandom` (`0xFED4_0000`), mixed with `RDTSC`, CMOS RTC, and 8254 PIT jitter.
 - **Domain-Separated Runtime Keys**:
-  - **UDP & Web Session Auth Key**: `HMAC-SHA256(master_key, "cuttle-net-auth-v1:" || mac_address)`. On unprovisioned boots (no `fw_cfg` key), `LivedNet` starts in unprovisioned mode and rejects all state-mutating `AUTH` and `/session/login` requests.
+  - **UDP & Web Session Auth Key**: `HMAC-SHA256(master_key, "cuttle-net-auth-v1:" || mac_address)`. On unprovisioned boots (no `fw_cfg` key), `LivedNet` starts in unprovisioned mode and rejects all state-mutating `AUTH`, `/session/login`, `/sql`, `/sh`, `/exec`, and `/fs` requests even if a caller computes an HMAC under a zero key.
   - **Durable Disk Seal Key**: `HMAC-SHA256(master_key, "cuttle-durable-seal-v1:" || "ahci0-lba1040")`. Seals and verifies the 2-sector (`LBA 1040..=1041`) AHCI WAL header (`CTTLSHL1`), the 16-sector (`LBA 1042..=1057`) `CTTLFS01` filesystem partition, and the 8-sector (`LBA 1058..=1065`) `CTTLSQL1` SQL database partition in constant time across reboots.
   - **Remote Attestation Key**: `HMAC-SHA256(master_key, "cuttle-remote-attest-v1:" || seed)`.
-  - **TLS Identity**: `HMAC-SHA256(master_key, "cuttle-tls-identity-v1:" || mac_address)` seeds the node's P-256 key, so a provisioned node keeps the same HTTPS certificate across reboots and morph cycles (clients can pin it). Unprovisioned boots get a fresh certificate each boot.
+  - **TLS Identity**: `HMAC-SHA256(master_key, "cuttle-tls-identity-v1:" || mac_address)` seeds the node's P-256 key via rejection sampling in $[1, n-1]$ (`provisioned=1`), so a provisioned node keeps the same HTTPS certificate across reboots and morph cycles (clients can pin it). Unprovisioned boots (`provisioned=0`) derive an ephemeral certificate from hardware entropy each boot.
 
 ---
 
@@ -146,6 +146,11 @@ Evaluated via `cuttle-binmorph` and `cuttle-mtd-metrics` (`churn` and `chainsim`
 
 ## Build, Test & Run
 
+> **Nightly Toolchain Requirement:** Building [`target_enterprise_kernel`](target_enterprise_kernel/rust-toolchain.toml) (`-Zbuild-std`) and packaging BIOS/UEFI boot images via [`factory_builder_pkg`](factory_builder_pkg/rust-toolchain.toml) (`bootloader 0.11.17`) pin **`nightly-2026-10-22`** (`rustc 1.101.0-nightly (1a2c4797e 2026-10-21)`) with `rust-src` and `llvm-tools-preview`:
+> ```powershell
+> rustup toolchain install nightly-2026-10-22 --component rust-src --component llvm-tools-preview
+> ```
+
 ### 1. Launch the Cuttle Triad Appliance (*"Three Hearts. One Appliance."* — 3 VMs + TMR 2-of-3 Majority + RAID-SQL + Rolling MTD)
 ```powershell
 .\triad.bat
@@ -161,22 +166,22 @@ Then open **`http://127.0.0.1:18080/app`** in your browser, or **`http://127.0.0
 
 | Job | Kernel role | 2-of-3 vote compares |
 | :--- | :--- | :--- |
-| Web front end | `wfe` (svc-http only) | served content |
+| Web front end | `wfe` (svc-http only) | per-file path, size, and SHA-256 content digests (wiping and resyncing from a healthy peer on divergence) |
 | SQL database | `sql` (svc-sql only) | `kv` table + XOR parity |
 | Search index | `sql` | `kv` + `idx` tables (schema provisioned through the WAL) |
-| Business jobs (cron) | `full` (jobs need svc-sh, listing needs svc-http) | `kv` table; the desired cron jobs are re-applied after every boot |
+| Business jobs (cron) | `full` (jobs need svc-sh, listing needs svc-http) | `kv` table; read-only desired cron jobs are re-applied after every boot |
 
-Plans `basic` (web + SQL) and `pro` (web + SQL + index + cron) ship with seven sample clients (60 VMs). Every farm runs in its own process with its own random master key (all node device keys derive from it), state directory, WALs and port block. The provider token sees every client; a client token sees only its own farm. Farms bind `127.0.0.1` and accept only a per-run secret held by the provider.
+Plans `basic` (web + SQL) and `pro` (web + SQL + index + cron) ship with seven sample clients (60 VMs, up to 5 jobs per plan). Every farm runs in its own process with its own random master key (all node device keys derive from it), state directory, and WALs. The provider token sees every client; a client token sees only its own farm (`403` on any other or unknown client ID). Farms bind `127.0.0.1`, accept only a per-run secret held by the provider (scrubbed from the farm environment before child processes spawn), and launch VMs with `forward_node_ports=False` so guest `:80`/`:443` ports are not forwarded on host loopback (whereas standalone `triad.bat` forwards `:18101–18103` and `:18501–18503` on loopback for direct node inspection).
 ```powershell
 .\fleet.bat                                   # console: http://127.0.0.1:18888/fleet
-python tools/cuttle_fleet.py --self-test      # 2-client fleet: auth, scoping, roles, data/key isolation
+python tools/cuttle_fleet.py --self-test      # 2-client fleet: auth, scoping, roles, data/key/port isolation
 ```
 
 ### QEMU accelerator: WHPX (Hyper-V) or TCG
-Every launcher takes an accelerator: `auto` (default), `whpx` or `tcg`. `auto` uses **WHPX**, the Windows Hypervisor Platform's hardware virtualization, when this host can run it, and **TCG** software emulation otherwise. With WHPX, guest code runs natively, so boots and morphs are faster and an idle VM barely costs host CPU. Under TCG, every timer tick is emulated.
+`triad.bat` and `fleet.bat` take `--accel auto|whpx|tcg` (default `auto`), while single-VM `run.bat` and `qemu_smoke` default to `tcg` (`run.bat whpx` or `CUTTLE_QEMU_ACCEL=whpx` opts into WHPX). `auto` uses **WHPX**, the Windows Hypervisor Platform's hardware virtualization, when this host can run it, and **TCG** software emulation otherwise. With WHPX, guest code runs natively, so boots and morphs are faster and an idle VM barely costs host CPU. Under TCG, every timer tick is emulated.
 - `triad.bat --accel tcg`, `fleet.bat --accel tcg` or `run.bat tcg`; or set `CUTTLE_ACCEL`. The fleet also reads `accelerator` in `tools/fleet.toml`, globally or per plan.
-- `auto` probes WHPX once at startup. Because some Windows hosts accept a WHPX guest but never let its BIOS leave reset, a VM that prints nothing within 8 s under WHPX is relaunched on TCG, and that Triad stays on TCG.
-- The QEMU smoke test stays on TCG by default (deterministic reference). `CUTTLE_QEMU_ACCEL=whpx` runs the same assertions under WHPX.
+- `auto` probes WHPX once at startup. Because some Windows hosts accept a WHPX guest (and emit QEMU stderr feature warnings) without ever letting its BIOS leave reset, a VM that prints no recognized guest serial marker within 8 s under WHPX is relaunched on TCG, and that Triad stays on TCG.
+- The QEMU smoke test and `run.bat` stay on TCG by default (deterministic reference). `CUTTLE_QEMU_ACCEL=whpx` or `run.bat whpx` runs under WHPX.
 
 ### 2. Boot a Single 4-Core VM Under QEMU
 Run `run.bat` to build the kernel ELF, package a BIOS disk image, and boot a single 4-core VM in QEMU (`http://127.0.0.1:18080/app`), or run the automated multi-boot + tamper-rejection QEMU smoke suite:
@@ -186,7 +191,7 @@ cargo test -p factory_builder --test qemu_smoke -- --ignored --nocapture --test-
 ```
 
 ### 2b. Talk to a Node over HTTPS
-Each node serves HTTPS on guest port 443 (`run.bat` forwards it to `127.0.0.1:18443`; Triad and fleet nodes use their `https_port`). The certificate is self-signed per node, so pin it: fetch it once, compare its SHA-256 with the `HTTPS UP … cert_sha256=` line on the node's serial console, then trust exactly that certificate.
+Each node serves HTTPS on guest port 443 (`run.bat` forwards it to `127.0.0.1:18443`; standalone Triad nodes use `:18501–18503`). The certificate is self-signed per node, so pin it: fetch it once, compare its SHA-256 with the `HTTPS UP … cert_sha256=` line on the node's serial console, then trust exactly that certificate.
 ```powershell
 python tools/https_check.py --port 18443 --save-cert node.pem   # fetch, then OpenSSL + Python ssl + curl checks
 curl --ssl-no-revoke --cacert node.pem https://localhost:18443/healthz   # --ssl-no-revoke: Windows curl (Schannel); no CRL for a self-signed cert
@@ -209,9 +214,9 @@ cargo run --release -p cuttle-mtd-metrics -- chainsim <base.elf> <variant.elf>
 
 CuttleOS is licensed under the [Apache License 2.0](LICENSE) (see also [NOTICE](NOTICE)). You may use, modify and redistribute it, including inside commercial and closed-source products; keep the license and notices, and state your changes. The CuttleOS name and logo are not licensed for use as another product's name.
 
-Every dependency must be permissively licensed, so CuttleOS stays open source while software built on top of it can stay proprietary. [`deny.toml`](deny.toml) holds the policy; the license check fails on any copyleft dependency. [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) lists every third-party component inside a boot image with its license text, and must ship with any distributed image. Check both with:
+Every dependency is permissively licensed (with the two documented exceptions below), so CuttleOS stays open source while software built on top of it can stay proprietary. [`deny.toml`](deny.toml) holds the policy; the license check fails on any unapproved copyleft dependency. [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) lists every third-party component inside a boot image with its license text, and must ship with any distributed image. Check both with:
 ```powershell
 powershell -File tools\license_check.ps1     # cargo deny on all 3 Cargo workspaces + notices up to date
 python tools/third_party_notices.py         # regenerate THIRD_PARTY_NOTICES.md after a dependency change
 ```
-The one non-permissive component is `ucs2` (MPL-2.0, file-level copyleft), and only in the optional UEFI loader (`factory_builder --uefi`); see the notes in THIRD_PARTY_NOTICES.md.
+Two components use non-Apache-2.0/MIT/BSD licenses and are documented in [`NOTICE`](NOTICE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md): the embedded Noto Sans Mono bitmap font inside `noto-sans-mono-bitmap` (SIL Open Font License 1.1) and `ucs2` (MPL-2.0, file-level copyleft, used only in the optional UEFI loader `factory_builder --uefi`; under MPL-2.0 §3.2, distributing unmodified `ucs2` inside a larger work does not require relicensing CuttleOS provided recipients are informed where unmodified `ucs2` source can be obtained).

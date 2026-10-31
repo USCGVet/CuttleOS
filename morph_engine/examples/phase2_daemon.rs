@@ -67,6 +67,7 @@ fn spawn_qemu(img: &Path, work: &Path, serial_log: &Path) -> Result<std::process
     let qemu = if Path::new(qemu).exists() { qemu.to_string() } else { "qemu-system-x86_64".to_string() };
     let child = Command::new(&qemu)
         .arg("-accel").arg("tcg")
+        .arg("-cpu").arg("max")
         .arg("-drive").arg(format!("format=raw,file={},if=ide", img.display()))
         .arg("-drive").arg(format!("if=none,id=vd0,format=raw,file={}", work.join("vd0.img").display()))
         .arg("-device").arg("virtio-blk-pci,drive=vd0,disable-legacy=off,disable-modern=on")

@@ -28,13 +28,23 @@ sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 rustls = { version = "0.23", default-features = false }
 hmac = { version = "0.12", default-features = false }
 hkdf = { version = "0.12", default-features = false }
-aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "zeroize"] }
 chacha20poly1305 = { version = "0.10", default-features = false }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh"] }
 rand_chacha = { version = "0.3", default-features = false }
 rand_core = { version = "0.6", default-features = false }
 zeroize = { version = "1", default-features = false }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(cuttle_prod)",
+    "cfg(aes_force_soft)",
+    "cfg(polyval_force_soft)",
+    "cfg(chacha20_force_soft)",
+    "cfg(poly1305_force_soft)",
+    'cfg(curve25519_dalek_backend, values("serial"))',
+] }
 
 # Integration tests run as std targets and exercise both the contract
 # property-test harness and the no_std skeleton modules (memory bitmap,

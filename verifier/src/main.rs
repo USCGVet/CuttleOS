@@ -383,6 +383,9 @@ fn compile_and_test(
         if is_target_minimal {
             build.arg("--tests");
         }
+        if scratch.join("Cargo.lock").exists() {
+            build.arg("--offline");
+        }
         build
             .arg("--release")
             .arg("--target-dir")
@@ -412,8 +415,11 @@ fn compile_and_test(
                 .arg("-p")
                 .arg(&package_name)
                 .arg("--target-dir")
-                .arg(&target_dir)
-                .current_dir(&scratch);
+                .arg(&target_dir);
+            if scratch.join("Cargo.lock").exists() {
+                test.arg("--offline");
+            }
+            test.current_dir(&scratch);
             let test_status = test.status().with_context(|| {
                 format!("invoke cargo test in {}", scratch.display())
             })?;
@@ -756,6 +762,10 @@ fn write_scratch_workspace(scratch: &Path, target_crate: &str, workspace_root: &
     );
     let path = scratch.join("Cargo.toml");
     fs::write(&path, &toml).with_context(|| format!("write {}", path.display()))?;
+    let root_lock = workspace_root.join("Cargo.lock");
+    if root_lock.exists() {
+        let _ = fs::copy(&root_lock, scratch.join("Cargo.lock"));
+    }
     Ok(())
 }
 
@@ -879,8 +889,11 @@ fn run_perf(
         .arg("-p")
         .arg("cuttle-target-minimal")
         .arg("--target-dir")
-        .arg(target_dir)
-        .arg("--")
+        .arg(target_dir);
+    if scratch.join("Cargo.lock").exists() {
+        perf.arg("--offline");
+    }
+    perf.arg("--")
         .arg("--nocapture")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

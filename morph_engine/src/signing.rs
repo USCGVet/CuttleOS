@@ -5,28 +5,38 @@ use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const SIGNING_KEY_FILE: &str = "factory_signing_key.bin";
+pub const SIGNING_KEY_ENV: &str = "CUTTLE_SIGNING_KEY_PATH";
+
+pub fn resolve_signing_key_path() -> PathBuf {
+    match std::env::var(SIGNING_KEY_ENV) {
+        Ok(s) if !s.is_empty() => PathBuf::from(s),
+        _ => PathBuf::from(SIGNING_KEY_FILE),
+    }
+}
 
 pub fn init_signing_key() -> Result<()> {
-    if Path::new(SIGNING_KEY_FILE).exists() {
-        bail!("signing key already exists at {}", SIGNING_KEY_FILE);
+    let path = resolve_signing_key_path();
+    if path.exists() {
+        bail!("signing key already exists at {}", path.display());
     }
     let key = SigningKey::generate(&mut OsRng);
-    fs::write(SIGNING_KEY_FILE, key.to_bytes())
-        .with_context(|| format!("write {}", SIGNING_KEY_FILE))?;
+    fs::write(&path, key.to_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
     eprintln!(
         "morph: generated factory signing key at {} (verifying key: {})",
-        SIGNING_KEY_FILE,
+        path.display(),
         hex(&key.verifying_key().to_bytes())
     );
     Ok(())
 }
 
 pub fn load_signing_key() -> Result<SigningKey> {
-    load_signing_key_from(Path::new(SIGNING_KEY_FILE))
-        .with_context(|| format!("run `morph init-key` first"))
+    let path = resolve_signing_key_path();
+    load_signing_key_from(&path)
+        .with_context(|| "run `morph init-key` first".to_string())
 }
 
 /// Load a 32-byte Ed25519 signing key from an explicit path. Used by

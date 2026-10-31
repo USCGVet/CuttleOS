@@ -36,7 +36,7 @@ fn fresh_tempdir(label: &str) -> PathBuf {
 }
 
 fn test_key() -> SigningKey {
-    SigningKey::from_bytes(&[0x42u8; 32])
+    SigningKey::generate(&mut rand::rngs::OsRng)
 }
 
 fn pk_hex(sk: &SigningKey) -> String {
@@ -304,7 +304,7 @@ fn cosign_appended_post_mint_does_not_invalidate_primary_sig() {
     // the chain. The primary sig excludes `cosignatures` from its
     // preimage, so it must still verify.
     let mut entries = load_entries().unwrap();
-    let other = SigningKey::from_bytes(&[0x99u8; 32]);
+    let other = test_key();
     let cand = attest::parse_hex32(&entries[0].candidate_sha256).unwrap();
     entries[0]
         .cosignatures
@@ -323,4 +323,27 @@ fn cosign_appended_post_mint_does_not_invalidate_primary_sig() {
 
     let report = verify_chain().expect("cosigned chain must still verify");
     assert_eq!(report.entries_ok, 1);
+}
+
+#[test]
+fn primary_key_file_fallback_rejects_fixture_seed() {
+    let (_g, guard) = Guard::new("fallback_fixture_reject");
+    let fixture_sk = SigningKey::from_bytes(&[0x42u8; 32]);
+    let key_file = guard.dir.join(cuttle_morph_engine::SIGNING_KEY_FILE);
+    fs::write(&key_file, fixture_sk.to_bytes()).unwrap();
+    let nonexistent_fed = guard.dir.join("no_such_factory_keys.toml");
+    unsafe {
+        std::env::set_var(FEDERATION_CONFIG_ENV, &nonexistent_fed);
+        std::env::set_var(cuttle_morph_engine::SIGNING_KEY_ENV, &key_file);
+    }
+    write_attestation(fields(1, "http", fixture_sk)).unwrap();
+    let err = verify_chain().expect_err("fallback key file using fixture seed must be rejected");
+    unsafe {
+        std::env::remove_var(cuttle_morph_engine::SIGNING_KEY_ENV);
+    }
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains("known test fixture key"),
+        "expected fixture rejection from fallback key file, got: {msg}"
+    );
 }

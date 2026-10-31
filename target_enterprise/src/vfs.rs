@@ -510,7 +510,29 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
             }
             i += 1;
         }
+        let removed_off = self.inodes[idx].data_off;
+        let removed_cap = self.inodes[idx].capacity;
         self.inodes[idx] = EMPTY_INODE;
+        if removed_cap > 0
+            && (removed_off as usize).saturating_add(removed_cap as usize) <= self.pool_used as usize
+        {
+            let src_start = (removed_off + removed_cap) as usize;
+            let dst_start = removed_off as usize;
+            let move_len = (self.pool_used as usize).saturating_sub(src_start);
+            let mut m = 0usize;
+            while m < move_len {
+                self.pool[dst_start + m] = self.pool[src_start + m];
+                m += 1;
+            }
+            let mut k = 0usize;
+            while k < I {
+                if self.inodes[k].used && self.inodes[k].data_off > removed_off {
+                    self.inodes[k].data_off -= removed_cap;
+                }
+                k += 1;
+            }
+            self.pool_used -= removed_cap;
+        }
         Ok(())
     }
 
@@ -684,11 +706,40 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
             return Err(FsError::BadHandle);
         }
         let inode_idx = entry.inode_idx as usize;
-        let cap = self.inodes[inode_idx].capacity as u64;
+        let end = offset.saturating_add(buf.len() as u64);
+        let mut cap = self.inodes[inode_idx].capacity as u64;
+        if end > cap && end <= u32::MAX as u64 {
+            let needed = end - cap;
+            if (self.pool_used as u64).saturating_add(needed) <= P as u64 {
+                let needed_u32 = needed as u32;
+                let old_tail = self.inodes[inode_idx]
+                    .data_off
+                    .saturating_add(self.inodes[inode_idx].capacity);
+                let move_len = (self.pool_used as usize).saturating_sub(old_tail as usize);
+                let mut m = move_len;
+                while m > 0 {
+                    m -= 1;
+                    self.pool[old_tail as usize + needed as usize + m] =
+                        self.pool[old_tail as usize + m];
+                }
+                let mut k = 0usize;
+                while k < I {
+                    if self.inodes[k].used
+                        && k != inode_idx
+                        && self.inodes[k].data_off >= old_tail
+                    {
+                        self.inodes[k].data_off += needed_u32;
+                    }
+                    k += 1;
+                }
+                self.inodes[inode_idx].capacity += needed_u32;
+                self.pool_used += needed_u32;
+                cap = end;
+            }
+        }
         if offset > cap {
             return Err(FsError::NoSpace);
         }
-        let end = offset.saturating_add(buf.len() as u64);
         if end > cap {
             return Err(FsError::NoSpace);
         }
@@ -1499,5 +1550,63 @@ mod tests {
             vfs.mount(b"/data", fs_b as &mut dyn Filesystem),
             Err(FsError::NoSpace)
         );
+    }
+
+    #[test]
+    fn growing_and_unlinking_middle_file_shifts_and_compacts_neighbors_intact() {
+        let mut fs = MemRamFs::<8, 512>::new();
+        fs.seed_file(b"/a", b"ALPHA-HEAD", 16, 10).unwrap();
+        fs.seed_file(b"/b", b"MID", 8, 20).unwrap();
+        fs.seed_file(b"/c", b"OMEGA-TAIL-99", 16, 30).unwrap();
+        assert_eq!(fs.pool_used, 40);
+
+        // 1. Grow the middle file `/b` past its 8-byte capacity twice (`8 -> 24 -> 64`)
+        // and verify `/a` before it and `/c` after it remain byte-for-byte intact.
+        let hb = fs.open(b"/b", FS_O_RDWR).unwrap();
+        let grown1 = b"MIDDLE-EXPANDED-24-BYTES";
+        assert_eq!(fs.write(hb, 0, grown1).unwrap(), 24);
+        assert_eq!(fs.pool_used, 40 + 16);
+        let grown2 = [b'M'; 64];
+        assert_eq!(fs.write(hb, 0, &grown2).unwrap(), 64);
+        fs.close(hb).unwrap();
+        assert_eq!(fs.pool_used, 40 + 56);
+
+        let mut buf = [0u8; 128];
+        let ha = fs.open(b"/a", FS_O_RDONLY).unwrap();
+        let na = fs.read(ha, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..na], b"ALPHA-HEAD");
+        fs.close(ha).unwrap();
+
+        let hb2 = fs.open(b"/b", FS_O_RDONLY).unwrap();
+        let nb = fs.read(hb2, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..nb], &grown2[..]);
+        fs.close(hb2).unwrap();
+
+        let hc = fs.open(b"/c", FS_O_RDONLY).unwrap();
+        let nc = fs.read(hc, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..nc], b"OMEGA-TAIL-99");
+        fs.close(hc).unwrap();
+
+        // 2. Unlink `/b` in the middle and verify `/c` shifts down to compact `pool_used`
+        // without corrupting `/a` or `/c`, and that a new file `/d` can claim the freed pool space.
+        fs.unlink(b"/b").unwrap();
+        assert_eq!(fs.pool_used, 32);
+        assert_eq!(fs.stat(b"/b"), Err(FsError::NotFound));
+
+        let ha = fs.open(b"/a", FS_O_RDONLY).unwrap();
+        let na = fs.read(ha, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..na], b"ALPHA-HEAD");
+        fs.close(ha).unwrap();
+
+        let hc = fs.open(b"/c", FS_O_RDONLY).unwrap();
+        let nc = fs.read(hc, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..nc], b"OMEGA-TAIL-99");
+        fs.close(hc).unwrap();
+
+        let hd = fs.open(b"/d", FS_O_CREATE | FS_O_RDWR).unwrap();
+        let payload_d = [b'D'; 460];
+        assert_eq!(fs.write(hd, 0, &payload_d).unwrap(), 460);
+        fs.close(hd).unwrap();
+        assert_eq!(fs.pool_used, 32 + 460);
     }
 }

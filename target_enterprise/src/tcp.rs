@@ -219,6 +219,11 @@ pub enum TcpState {
     SynReceived,
     /// Connection open; data flows both ways.
     Established,
+    /// Local side initiated close from `Established` and sent `FIN`.
+    /// Waiting for the peer's ACK of our `FIN` (or simultaneous `FIN`).
+    FinWait1,
+    /// Peer ACKed our `FIN`; waiting for the peer's `FIN`.
+    FinWait2,
     /// Peer sent FIN. We ACKed it. We can still send data; the
     /// application should call `close()` to send our own FIN.
     CloseWait,
@@ -408,9 +413,86 @@ pub fn process_segment(
 
         TcpState::Established => established_data_or_fin(tcb, seg),
 
+        TcpState::FinWait1 => {
+            if seg.flags & tcp_flags::ACK == 0 {
+                return Err(TcpProcessError::MalformedFlags);
+            }
+            if wrapping_lt(tcb.snd_una, seg.ack) && wrapping_le(seg.ack, tcb.snd_nxt) {
+                tcb.snd_una = seg.ack;
+            } else if seg.ack != tcb.snd_nxt && seg.ack != tcb.snd_una {
+                return Err(TcpProcessError::OutOfWindow);
+            }
+            let has_data = !seg.payload.is_empty();
+            let has_fin = (seg.flags & tcp_flags::FIN) != 0;
+            if (has_data || has_fin) && seg.seq != tcb.rcv_nxt {
+                return Err(TcpProcessError::OutOfWindow);
+            }
+            if has_data {
+                tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(seg.payload.len() as u32);
+            }
+            if has_fin {
+                tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(1);
+            }
+            let fin_acked = seg.ack == tcb.snd_nxt;
+            tcb.state = match (fin_acked, has_fin) {
+                (true, true) => TcpState::Closed,
+                (true, false) => TcpState::FinWait2,
+                (false, true) => TcpState::LastAck,
+                (false, false) => TcpState::FinWait1,
+            };
+            let reply = if has_data || has_fin {
+                Reply {
+                    present: true,
+                    seq: tcb.snd_nxt,
+                    ack: tcb.rcv_nxt,
+                    flags: tcp_flags::ACK,
+                    window: tcb.rcv_wnd,
+                }
+            } else {
+                Reply::NONE
+            };
+            Ok((tcb, reply))
+        }
+
+        TcpState::FinWait2 => {
+            if seg.flags & tcp_flags::ACK == 0 {
+                return Err(TcpProcessError::MalformedFlags);
+            }
+            if seg.ack != tcb.snd_nxt {
+                return Err(TcpProcessError::OutOfWindow);
+            }
+            let has_data = !seg.payload.is_empty();
+            let has_fin = (seg.flags & tcp_flags::FIN) != 0;
+            if !has_data && !has_fin {
+                return Ok((tcb, Reply::NONE));
+            }
+            if seg.seq != tcb.rcv_nxt {
+                return Err(TcpProcessError::OutOfWindow);
+            }
+            if has_data {
+                tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(seg.payload.len() as u32);
+            }
+            if has_fin {
+                tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(1);
+                tcb.state = TcpState::Closed;
+            }
+            Ok((
+                tcb,
+                Reply {
+                    present: true,
+                    seq: tcb.snd_nxt,
+                    ack: tcb.rcv_nxt,
+                    flags: tcp_flags::ACK,
+                    window: tcb.rcv_wnd,
+                },
+            ))
+        }
+
         TcpState::CloseWait => {
-            // Local app should call `close()` to send our FIN. Stray
-            // segments here are usually ACKs of our in-flight data.
+            // Peer has already sent FIN; reject any further data or FIN segments.
+            if !seg.payload.is_empty() || (seg.flags & tcp_flags::FIN) != 0 {
+                return Err(TcpProcessError::OutOfWindow);
+            }
             if seg.flags & tcp_flags::ACK != 0
                 && wrapping_lt(tcb.snd_una, seg.ack)
                 && wrapping_le(seg.ack, tcb.snd_nxt)
@@ -421,16 +503,34 @@ pub fn process_segment(
         }
 
         TcpState::LastAck => {
-            // Expect ACK of our FIN.
+            // Expect ACK of our FIN (or in-flight data / peer FIN after server-initiated close).
             if seg.flags & tcp_flags::ACK == 0 {
                 return Err(TcpProcessError::MalformedFlags);
             }
-            if seg.ack != tcb.snd_nxt {
+            if wrapping_lt(tcb.snd_una, seg.ack) && wrapping_le(seg.ack, tcb.snd_nxt) {
+                tcb.snd_una = seg.ack;
+            } else if seg.ack != tcb.snd_nxt && seg.ack != tcb.snd_una {
                 return Err(TcpProcessError::OutOfWindow);
             }
-            tcb.snd_una = seg.ack;
-            tcb.state = TcpState::Closed;
-            Ok((tcb, Reply::NONE))
+            let has_fin = (seg.flags & tcp_flags::FIN) != 0;
+            if has_fin && seg.seq == tcb.rcv_nxt {
+                tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(1);
+            }
+            if seg.ack == tcb.snd_nxt {
+                tcb.state = TcpState::Closed;
+            }
+            let reply = if has_fin {
+                Reply {
+                    present: true,
+                    seq: tcb.snd_nxt,
+                    ack: tcb.rcv_nxt,
+                    flags: tcp_flags::ACK,
+                    window: tcb.rcv_wnd,
+                }
+            } else {
+                Reply::NONE
+            };
+            Ok((tcb, reply))
         }
     }
 }
@@ -516,15 +616,18 @@ fn wrapping_le(a: u32, b: u32) -> bool {
 }
 
 /// Local close — only valid from `Established` or `CloseWait`. Transitions
-/// to `LastAck` (from `CloseWait`) or `FinWait1` (from `Established`, but
-/// `FinWait1` isn't in this seed; we go straight to `LastAck` after the
-/// peer's FIN). Returns the FIN segment to emit.
+/// to `FinWait1` (from `Established`) or `LastAck` (from `CloseWait`).
+/// Returns the FIN segment to emit.
 pub fn close(mut tcb: Tcb) -> Result<(Tcb, Reply), TcpProcessError> {
     match tcb.state {
-        TcpState::CloseWait => {
+        TcpState::Established | TcpState::CloseWait => {
             let seq = tcb.snd_nxt;
             tcb.snd_nxt = tcb.snd_nxt.wrapping_add(1); // FIN consumes a seq.
-            tcb.state = TcpState::LastAck;
+            tcb.state = if tcb.state == TcpState::Established {
+                TcpState::FinWait1
+            } else {
+                TcpState::LastAck
+            };
             Ok((
                 tcb,
                 Reply {
@@ -989,5 +1092,76 @@ mod tests {
         assert_eq!(next.snd_una, 121);
         assert!(!reply.present);
         assert_eq!(next.state, TcpState::Established);
+    }
+
+    #[test]
+    fn server_close_from_established_enters_fin_wait_and_acks_late_client_fin() {
+        let server_ip = ip(10, 0, 2, 15);
+        let client_ip = ip(10, 0, 2, 2);
+        let tcb = Tcb {
+            state: TcpState::Established,
+            local_port: 80,
+            remote_port: 40000,
+            local_ip: server_ip,
+            remote_ip: client_ip,
+            snd_iss: 100,
+            snd_una: 121,
+            snd_nxt: 121,
+            snd_wnd: 65535,
+            rcv_irs: 50,
+            rcv_nxt: 51,
+            rcv_wnd: 65535,
+        };
+        // 1. Server initiates close from Established -> FinWait1 (emitting FIN|ACK at seq=121).
+        let (tcb, fin_reply) = close(tcb).unwrap();
+        assert_eq!(tcb.state, TcpState::FinWait1);
+        assert!(fin_reply.present);
+        assert_eq!(fin_reply.seq, 121);
+        assert_eq!(fin_reply.flags, tcp_flags::FIN | tcp_flags::ACK);
+        assert_eq!(tcb.snd_nxt, 122);
+
+        // 2. Client first sends a bare ACK of our FIN (ack=122) without FIN -> FinWait2.
+        let mut buf = [0u8; 32];
+        let n = TcpImpl::build_segment(
+            40000,
+            80,
+            51,
+            122,
+            tcp_flags::ACK,
+            65535,
+            b"",
+            client_ip,
+            server_ip,
+            &mut buf,
+        )
+        .unwrap();
+        let ack_seg = TcpImpl::parse_segment(&buf[..n], client_ip, server_ip).unwrap();
+        let (tcb, ack_reply) = process_segment(tcb, &ack_seg, 0).unwrap();
+        assert_eq!(tcb.state, TcpState::FinWait2);
+        assert_eq!(tcb.snd_una, 122);
+        assert!(!ack_reply.present);
+
+        // 3. Client then sends its late FIN|ACK (seq=51, ack=122) -> Closed, and server emits ACK (ack=52).
+        let n = TcpImpl::build_segment(
+            40000,
+            80,
+            51,
+            122,
+            tcp_flags::FIN | tcp_flags::ACK,
+            65535,
+            b"",
+            client_ip,
+            server_ip,
+            &mut buf,
+        )
+        .unwrap();
+        let fin_seg = TcpImpl::parse_segment(&buf[..n], client_ip, server_ip).unwrap();
+        let (tcb, final_ack) = process_segment(tcb, &fin_seg, 0).unwrap();
+        assert_eq!(tcb.state, TcpState::Closed);
+        assert_eq!(tcb.rcv_nxt, 52);
+        assert!(final_ack.present);
+        assert_eq!(final_ack.flags, tcp_flags::ACK);
+        assert_eq!(final_ack.seq, 122);
+        assert_eq!(final_ack.ack, 52);
     }
 }

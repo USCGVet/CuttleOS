@@ -956,6 +956,7 @@ pub(crate) fn banner_shell_compose() {
         panic!("SHELL compose: sync output drift");
     }
     serial_write_str("FS partition OK lba=1042..1057 sectors=16 files=1 magic=CTTLFS01\n");
+    #[cfg(not(cuttle_prod))]
     verify_https_and_concurrent_tcp_compose();
     verify_service_runtime_compose(vsh);
     let mut s_idx = 0usize;
@@ -1108,6 +1109,7 @@ fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
 /// `/healthz` response and the closing `close_notify` — must hash to the
 /// locked fixture. Emits
 /// `HTTPS compose OK slots=16 port=443 tls13=rustls bytes=<n> sha=<hex8>`.
+#[cfg(not(cuttle_prod))]
 #[inline(never)]
 fn verify_https_and_concurrent_tcp_compose() {
     use cuttle_contracts::{tcp_flags, Tcp, IP_PROTO_TCP};

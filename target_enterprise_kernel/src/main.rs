@@ -833,9 +833,11 @@ pub(crate) fn live_os_console_loop() -> ! {
     let mut net_rx: u64 = 0;
     let mut net_tx: u64 = 0;
     let mut last_sql_tx: u64 = sh.db.tx_seq;
+    let mut last_rto_irq: u64 = read_hw_irq_wakeups();
 
     smp_hw_tick_and_sync(sh);
     smp_hw_enable_bsp_timer();
+    svc.set_timer_hz(read_calibrated_irqs_per_sec());
     fb_console_start();
     serial_write_str("Cuttle Enterprise OS interactive shell ready.\n");
     serial_write_str("Web UI: http://127.0.0.1:18080/app | SQL: http://127.0.0.1:18080/sql\n");
@@ -850,7 +852,26 @@ pub(crate) fn live_os_console_loop() -> ! {
 
         // 0. Drain live VirtIO-Net interface for HTTP (:80), TLS 1.3 (:443), UDP (:8080/:8081), ICMP, and ARP.
         if let Some(vn) = vnet_opt.as_mut() {
-            let _ = svc.tick_tcp_rto();
+            let now_irq = read_hw_irq_wakeups();
+            if now_irq > last_rto_irq {
+                let elapsed_irqs = (now_irq - last_rto_irq).min(64);
+                last_rto_irq = now_irq;
+                let mut step = 0u64;
+                while step < elapsed_irqs {
+                    let mut rto_rep = CONSOLE_NET_REPLIES.lock();
+                    *rto_rep = target_enterprise::ReplySet::new();
+                    let _ = svc.tick_tcp_rto_with_replies(&mut *rto_rep);
+                    let mut ri = 0usize;
+                    while ri < rto_rep.len() {
+                        if let Some(r) = rto_rep.get(ri) {
+                            vnet_tx(vn, r);
+                            net_tx = net_tx.wrapping_add(1);
+                        }
+                        ri += 1;
+                    }
+                    step += 1;
+                }
+            }
             let mut f_guard = CONSOLE_NET_FRAME.lock();
             while let Some((flen, head_id)) = vnet_rx(vn, &mut *f_guard) {
                 did_io = true;
@@ -1061,10 +1082,10 @@ pub(crate) fn attack_iface_pilot() {
 pub(crate) const FW_CFG_CTL: u16 = 0x510;
 pub(crate) const FW_CFG_DATA: u16 = 0x511;
 
-/// Locate the fw_cfg file named `want` and return its selector. The
-/// fw_cfg file directory (key 0x0019) is a BE u32 count followed by
+/// Locate the fw_cfg file named `want` and return its `(selector, size)`.
+/// The fw_cfg file directory (key 0x0019) is a BE u32 count followed by
 /// entries {u32 size, u16 select, u16 reserved, char name[56]}.
-pub(crate) fn fw_cfg_select(want: &str) -> Option<u16> {
+pub(crate) fn fw_cfg_select(want: &str) -> Option<(u16, u32)> {
     // SAFETY: Running at CPL=0; port 0x510 is the QEMU `fw_cfg` selector register and writing 0x0019 selects the read-only directory stream.
     unsafe { outw(FW_CFG_CTL, 0x0019) };
     // SAFETY: Running at CPL=0 after selecting key 0x0019 on port 0x510; reading port 0x511 streams the 4-byte big-endian directory entry count.
@@ -1076,7 +1097,7 @@ pub(crate) fn fw_cfg_select(want: &str) -> Option<u16> {
             inb(FW_CFG_DATA),
         ])
     };
-    let mut found: Option<u16> = None;
+    let mut found: Option<(u16, u32)> = None;
     for _ in 0..count.min(256) {
         // Entry: u32 size (BE), u16 select (BE), u16 reserved, name[56].
         let mut hdr = [0u8; 8];
@@ -1084,6 +1105,7 @@ pub(crate) fn fw_cfg_select(want: &str) -> Option<u16> {
             // SAFETY: Running at CPL=0 with key 0x0019 active; reading port 0x511 streams the 8-byte `(size, select, reserved)` header of the current entry.
             *b = unsafe { inb(FW_CFG_DATA) };
         }
+        let size = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
         let select = u16::from_be_bytes([hdr[4], hdr[5]]);
         let mut name = [0u8; 56];
         for b in name.iter_mut() {
@@ -1093,7 +1115,7 @@ pub(crate) fn fw_cfg_select(want: &str) -> Option<u16> {
         let end = name.iter().position(|&c| c == 0).unwrap_or(56);
         if let Ok(n) = core::str::from_utf8(&name[..end]) {
             if n == want {
-                found = Some(select);
+                found = Some((select, size));
             }
         }
     }
@@ -1111,7 +1133,7 @@ pub(crate) fn fw_cfg_select(want: &str) -> Option<u16> {
 #[inline(never)]
 #[cfg(not(cuttle_prod))]
 pub(crate) fn attack_vulnerable_service() {
-    let Some(sel) = fw_cfg_select("opt/attack.bin") else {
+    let Some((sel, _)) = fw_cfg_select("opt/attack.bin") else {
         serial_write_str("ATK NO PAYLOAD FILE\n");
         return;
     };

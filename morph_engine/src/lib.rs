@@ -65,7 +65,10 @@ pub use scheduler::{
     NextBundleChoice, NextChoice, NextWork, SchedulerConfig, SchedulerState, EX_NOINPUT,
     SCHEDULER_CONFIG, SCHEDULER_STATE,
 };
-pub use signing::{init_signing_key, load_signing_key, SIGNING_KEY_FILE};
+pub use signing::{
+    init_signing_key, load_signing_key, resolve_signing_key_path, SIGNING_KEY_ENV,
+    SIGNING_KEY_FILE,
+};
 pub use synth::{
     parse_anthropic_response_text, AnthropicSynth, MutationBudget, PassThrough, PromptBuilder,
     PromptOnly, SynthRequest, SynthResponse, Synthesizer, ANTHROPIC_API_KEY_ENV,
