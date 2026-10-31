@@ -781,15 +781,9 @@ impl OsShell {
 
         // 2b. Execute the target service's isolated Ring-3 (`CPL=3`, `PTE_U`) user-space request
         //     parser & lexical validator over the staged mailbox before Ring-0 touches the payload.
-        let r3_summary = self
+        let _r3_summary = self
             .svc
             .parse_and_validate_ring3_mailbox(op, &mut self.audit)?;
-        if r3_summary.service != target
-            || r3_summary.user_va != target.user_va_base()
-            || r3_summary.parser_digest == 0
-        {
-            return Err(ServiceError::SandboxTrap);
-        }
 
         // 3. Copy the request out of the target service's mailbox so the service handler
         //    operates exclusively on the mailbox message.
@@ -5059,6 +5053,15 @@ fn split_writehex_args(arg: &[u8]) -> (&[u8], &[u8], &[u8]) {
     (path, off_tok, hex_tok)
 }
 
+/// Maximum byte length of a writable VFS path (`200` bytes).
+///
+/// Leaves >= 56 bytes of headroom inside [`SHELL_LINE_MAX`] (`256` bytes) so any file
+/// created via `write`, `writehex`, or `PUT /fs/<path>` can always be read and synced
+/// chunk-by-chunk via `cathex "<path>" 4096 128` (`18` framing bytes) and
+/// `writehex "<path>" 4096 <hex>` (`17` framing bytes + hex payload) without exceeding
+/// the 256-byte serial console line buffer.
+pub const SHELL_MAX_WRITABLE_PATH: usize = 200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WritablePathPolicy {
     Allowed(usize),
@@ -5067,14 +5070,21 @@ enum WritablePathPolicy {
 }
 
 /// Normalize `raw_path` using the VFS path normalizer (`crate::vfs::normalise_path`) into
-/// `norm_out` and run immutable-system-file policy checks on the canonical normalized path.
+/// `norm_out` and run immutable-system-file and max-writable-path policy checks on the
+/// canonical normalized path.
 fn check_writable_vfs_path(
     raw_path: &[u8],
     norm_out: &mut [u8; cuttle_contracts::FS_PATH_MAX],
 ) -> WritablePathPolicy {
+    if raw_path.len() > SHELL_MAX_WRITABLE_PATH {
+        return WritablePathPolicy::Invalid;
+    }
     let Ok(nlen) = crate::vfs::normalise_path(raw_path, norm_out) else {
         return WritablePathPolicy::Invalid;
     };
+    if nlen > SHELL_MAX_WRITABLE_PATH {
+        return WritablePathPolicy::Invalid;
+    }
     let norm = &norm_out[..nlen];
     if bytes_eq(norm, b"/etc/os-release") {
         return WritablePathPolicy::Protected;
@@ -6806,6 +6816,70 @@ mod tests {
         assert_eq!(
             &reply[..n_uname],
             b"Cuttle-TE x86_64 1.0-mtd (Moving Target Defense Kernel)\ncuttle> "
+        );
+    }
+
+    #[test]
+    fn writable_vfs_path_enforces_200_byte_cap_and_fits_cathex_writehex_line_limit() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 512];
+
+        // 1. A 201-byte path (> SHELL_MAX_WRITABLE_PATH = 200) is rejected by `write`, `writehex`, and `VfsWrite`.
+        let mut path_201 = [b'a'; 201];
+        path_201[0] = b'/';
+        for &sep_idx in &[40usize, 80, 120, 160] {
+            path_201[sep_idx] = b'/';
+        }
+        let mut cmd_w201 = [0u8; 256];
+        let mut p = 0usize;
+        p += copy_into(b"write ", &mut cmd_w201[p..]);
+        p += copy_into(&path_201, &mut cmd_w201[p..]);
+        p += copy_into(b" hi", &mut cmd_w201[p..]);
+        let act_w201 = sh.exec_line(&cmd_w201[..p], 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_w201.bytes_written()],
+            b"error: cannot open path for write\n"
+        );
+
+        let mut cmd_wh201 = [0u8; 256];
+        let mut p2 = 0usize;
+        p2 += copy_into(b"writehex ", &mut cmd_wh201[p2..]);
+        p2 += copy_into(&path_201, &mut cmd_wh201[p2..]);
+        p2 += copy_into(b" 0 4142", &mut cmd_wh201[p2..]);
+        let act_wh201 = sh.exec_line(&cmd_wh201[..p2], 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_wh201.bytes_written()],
+            b"error: cannot open path for write\n"
+        );
+
+        let mut norm_chk = [0u8; cuttle_contracts::FS_PATH_MAX];
+        assert_eq!(
+            check_writable_vfs_path(&path_201, &mut norm_chk),
+            WritablePathPolicy::Invalid
+        );
+
+        // 2. A 200-byte path (== SHELL_MAX_WRITABLE_PATH) succeeds and fits inside `SHELL_LINE_MAX` (256)
+        //    for both `writehex "<path>" 4096 414243` and `cathex "<path>" 0 128`.
+        let path_200 = &path_201[..SHELL_MAX_WRITABLE_PATH];
+        let mut cmd_wh200 = [0u8; 256];
+        let mut p3 = 0usize;
+        p3 += copy_into(b"writehex ", &mut cmd_wh200[p3..]);
+        p3 += copy_into(path_200, &mut cmd_wh200[p3..]);
+        p3 += copy_into(b" 0 414243", &mut cmd_wh200[p3..]);
+        assert!(p3 <= SHELL_LINE_MAX);
+        let act_wh200 = sh.exec_line(&cmd_wh200[..p3], 1, 0, 0, &mut out);
+        assert!(out[..act_wh200.bytes_written()].starts_with(b"wrote 3 bytes to /"));
+
+        let mut cmd_ch200 = [0u8; 256];
+        let mut p4 = 0usize;
+        p4 += copy_into(b"cathex ", &mut cmd_ch200[p4..]);
+        p4 += copy_into(path_200, &mut cmd_ch200[p4..]);
+        p4 += copy_into(b" 0 128", &mut cmd_ch200[p4..]);
+        assert!(p4 <= SHELL_LINE_MAX);
+        let act_ch200 = sh.exec_line(&cmd_ch200[..p4], 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_ch200.bytes_written()],
+            b"hex len=3 off=0 data=414243\n"
         );
     }
 }

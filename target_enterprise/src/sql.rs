@@ -907,35 +907,24 @@ impl SqlDb {
             i += 1;
         }
 
-        // Compute 64-bit FNV-1a table digest over schema + canonically sorted rows
+        // Compute 256-bit SHA-256 table digest over schema + canonically sorted rows
         // (normalizing `kv` rows where col 0 starts with `v:` as `<HW_SEALED>`).
-        let mix_byte = |acc: u64, b: u8| -> u64 { (acc ^ (b as u64)).wrapping_mul(0x0100_0000_01b3) };
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for &b in t.name_bytes() {
-            h = mix_byte(h, b);
-        }
-        h = mix_byte(h, t.col_count);
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(t.name_bytes());
+        hasher.update([t.col_count]);
         let mut c = 0usize;
         while c < col_count {
-            for &b in t.cols[c].name_bytes() {
-                h = mix_byte(h, b);
-            }
-            h = mix_byte(
-                h,
-                match t.cols[c].col_type {
-                    SqlType::Int => 1,
-                    SqlType::Text => 2,
-                },
-            );
+            hasher.update(t.cols[c].name_bytes());
+            hasher.update([match t.cols[c].col_type {
+                SqlType::Int => 1,
+                SqlType::Text => 2,
+            }]);
             c += 1;
         }
-        h = mix_byte(h, t.indexed_col);
-        for &b in t.index_name_bytes() {
-            h = mix_byte(h, b);
-        }
-        for &b in &(mcount as u64).to_le_bytes() {
-            h = mix_byte(h, b);
-        }
+        hasher.update([t.indexed_col]);
+        hasher.update(t.index_name_bytes());
+        hasher.update((mcount as u64).to_le_bytes());
         let mut k = 0usize;
         while k < mcount {
             let row = self.visible_row(t_idx, matched[k], use_committed);
@@ -946,33 +935,24 @@ impl SqlDb {
                     SqlVal::Text(tb, tl) if *tl >= 2 && tb[0] == b'v' && tb[1] == b':'
                 );
             if is_vault_row {
-                h = mix_byte(h, 0x5B);
+                hasher.update([0x5B]);
                 if let SqlVal::Text(tb, tl) = &row.cells[0] {
-                    h = mix_byte(h, *tl);
-                    for &b in &tb[..*tl as usize] {
-                        h = mix_byte(h, b);
-                    }
+                    hasher.update([*tl]);
+                    hasher.update(&tb[..*tl as usize]);
                 }
-                for &b in b"<HW_SEALED>" {
-                    h = mix_byte(h, b);
-                }
+                hasher.update(b"<HW_SEALED>");
             } else {
-                h = mix_byte(h, 0x5A);
+                hasher.update([0x5A]);
                 let mut col = 0usize;
                 while col < col_count {
                     match &row.cells[col] {
                         SqlVal::Int(iv) => {
-                            h = mix_byte(h, 1);
-                            for &b in &iv.to_le_bytes() {
-                                h = mix_byte(h, b);
-                            }
+                            hasher.update([1]);
+                            hasher.update(iv.to_le_bytes());
                         }
                         SqlVal::Text(tb, tl) => {
-                            h = mix_byte(h, 2);
-                            h = mix_byte(h, *tl);
-                            for &b in &tb[..*tl as usize] {
-                                h = mix_byte(h, b);
-                            }
+                            hasher.update([2, *tl]);
+                            hasher.update(&tb[..*tl as usize]);
                         }
                     }
                     col += 1;
@@ -980,6 +960,7 @@ impl SqlDb {
             }
             k += 1;
         }
+        let digest_bytes: [u8; 32] = hasher.finalize().into();
 
         let max_rows = if offset >= mcount {
             0usize
@@ -1001,7 +982,7 @@ impl SqlDb {
         let count_digit_pos = pos;
         pos += append_u64(out, pos, 0);
         pos += append_bytes(out, pos, b" digest=");
-        pos += append_hex_u64(out, pos, h);
+        pos += append_hex_bytes(out, pos, &digest_bytes);
         if offset == 0 {
             let mut ddl_buf = [0u8; 192];
             let mut dpos = 0usize;
@@ -2667,18 +2648,6 @@ fn cmp_rows_canonical(a: &SqlRow, b: &SqlRow, col_count: usize, is_kv: bool) -> 
     0
 }
 
-fn append_hex_u64(out: &mut [u8], pos: usize, val: u64) -> usize {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut buf = [0u8; 16];
-    let mut i = 0usize;
-    while i < 16 {
-        let shift = (15 - i) * 4;
-        buf[i] = HEX[((val >> shift) & 0xF) as usize];
-        i += 1;
-    }
-    append_bytes(out, pos, &buf)
-}
-
 fn append_hex_bytes(out: &mut [u8], pos: usize, src: &[u8]) -> usize {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut written = 0usize;
@@ -3150,6 +3119,15 @@ mod tests {
         let mut db = SqlDb::new();
         let mut out_full = [0u8; 1024];
         let mut out_dig = [0u8; 1024];
+        // Verify 256-bit SHA-256 table digest on fresh genesis `kv` matches golden SHA-256 vector:
+        let mut out_gen = [0u8; 1024];
+        let n_gen = db.exec(b".dump kv digest", &mut out_gen);
+        let s_gen = core::str::from_utf8(&out_gen[..n_gen]).unwrap().trim_end_matches('\n');
+        assert_eq!(
+            s_gen,
+            "sqldump table=kv rows=2 off=0 count=0 digest=9909bdf6933be5adf4c8f9dc94e9b4bc072d9e85d068d1b7ec603240be4bbc21 ddl=435245415445205441424c45206b7620286b20544558542c207620544558542c2072657620494e5429"
+        );
+
         let _ = db.exec(
             b"INSERT OR REPLACE INTO kv VALUES ('v:secret', 'cipher-a', 100)",
             &mut out_full,
@@ -3172,6 +3150,12 @@ mod tests {
             "unexpected digest header: {}",
             dig_lines[0]
         );
+        let dig_tok = dig_lines[0]
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("digest="))
+            .unwrap();
+        assert_eq!(dig_tok.len(), 64, "expected 64-hex-char SHA-256 digest, got: {dig_tok}");
+        assert!(dig_tok.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
         // Header matches full dump header except count=0 instead of count=3
         let expected_dig_hdr = full_hdr.replace(" count=3 ", " count=0 ");
         assert_eq!(dig_lines[0], expected_dig_hdr);
