@@ -2096,6 +2096,9 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
     // Discover all `.text` functions (`STT_FUNC`, size 12..=2048) that execute cleanly to `ret`
     // with balanced `RSP` across all `NUM_INPUTS` inputs under one of the realistic ABI profiles.
     let mut verified_kernel_fns: Vec<(String, u64, usize, AbiProfile)> = Vec::new();
+    let mut input_sensitive_fns = 0usize;
+    let mut mem_mutating_fns = 0usize;
+
     for sym in obj.symbols() {
         if sym.kind() != SymbolKind::Text {
             continue;
@@ -2112,8 +2115,14 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
 
         for profile in AbiProfile::ALL {
             let mut profile_ok = true;
+            let mut first_ret_pair: Option<(u64, u64)> = None;
+            let mut first_data_hash: Option<[u8; 32]> = None;
+            let mut varies_across_inputs = false;
+            let mut mutates_data_arena = false;
+
             for input_idx in 0..NUM_INPUTS {
                 let init = profile.make_input(input_idx);
+                let init_data_slice = init.mem[..0x4000].to_vec();
                 match execute_function_with_ro(
                     orig_text,
                     text_vaddr,
@@ -2122,7 +2131,31 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
                     init,
                     MAX_STEPS,
                 ) {
-                    Ok(out) if out.regs[4] == expected_ret_rsp => {}
+                    Ok(out) if out.regs[4] == expected_ret_rsp => {
+                        let ret_pair = (out.regs[0], out.regs[2]);
+                        // Compute the XOR-delta between `out.mem[..0x4000]` and `init_data_slice`
+                        // so we measure only the bytes actually written by the function, not the
+                        // varying initial random contents of `init.mem`.
+                        let mut delta_hasher = Sha256::new();
+                        for (&after, &before) in
+                            out.mem[..0x4000].iter().zip(init_data_slice.iter())
+                        {
+                            delta_hasher.update([after ^ before]);
+                        }
+                        let write_delta_hash: [u8; 32] = delta_hasher.finalize().into();
+                        if out.mem[..0x4000] != init_data_slice[..] {
+                            mutates_data_arena = true;
+                        }
+                        if let (Some(prev_ret), Some(prev_hash)) = (first_ret_pair, first_data_hash)
+                        {
+                            if ret_pair != prev_ret || write_delta_hash != prev_hash {
+                                varies_across_inputs = true;
+                            }
+                        } else {
+                            first_ret_pair = Some(ret_pair);
+                            first_data_hash = Some(write_delta_hash);
+                        }
+                    }
                     _ => {
                         profile_ok = false;
                         break;
@@ -2130,6 +2163,12 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
                 }
             }
             if profile_ok {
+                if varies_across_inputs {
+                    input_sensitive_fns += 1;
+                }
+                if mutates_data_arena {
+                    mem_mutating_fns += 1;
+                }
                 verified_kernel_fns.push((name, addr, size, profile));
                 break;
             }
@@ -2140,6 +2179,16 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
         verified_kernel_fns.len() >= 500,
         "expected at least 500 real compiled kernel functions in target_enterprise_kernel .text, got {}",
         verified_kernel_fns.len()
+    );
+    assert!(
+        input_sensitive_fns >= 450,
+        "expected at least 450 real kernel functions with input-dependent dynamic return/memory outputs, got {}",
+        input_sensitive_fns
+    );
+    assert!(
+        mem_mutating_fns >= 250,
+        "expected at least 250 real kernel functions that concretely mutate the 16 KiB data/struct arena, got {}",
+        mem_mutating_fns
     );
 
     // Rewrite the entire real kernel ELF across 32 seeds (`1..=32`) and verify that every discovered
@@ -2232,13 +2281,107 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
         }
     }
 
+    // Negative mutation-testing proof on REAL compiled kernel functions:
+    // For each verified real kernel function, take a morphed `.text` buffer, inject a single
+    // interior instruction semantic corruption (flipping `add` <-> `sub`, `xor` <-> `or`,
+    // `mov` source/dest register bits, or immediate/displacement byte), and verify that the
+    // concrete execution comparator catches the divergence!
+    let mut base_morphed_elf = base_elf.clone();
+    rewrite_elf_bytes(&mut base_morphed_elf, 1).expect("rewrite kernel ELF for negative check");
+    let base_morph_text =
+        &base_morphed_elf[text_file_off as usize..(text_file_off + text_len) as usize];
+    let mut real_kernel_semantic_faults_caught = 0usize;
+
+    for (_fn_name, fn_vaddr, fn_size, profile) in &verified_kernel_fns {
+        let fn_off = (*fn_vaddr - text_vaddr) as usize;
+        let fn_bytes = &base_morph_text[fn_off..fn_off + *fn_size];
+
+        // Decode instructions in this real kernel function and find an interior instruction to corrupt.
+        let mut dec = Decoder::with_ip(64, fn_bytes, *fn_vaddr, DecoderOptions::NONE);
+        let mut cursor = 0usize;
+        let mut corrupt_pos: Option<(usize, u8)> = None;
+        while dec.can_decode() {
+            let insn = dec.decode();
+            let len = insn.len();
+            if insn.is_invalid() || len == 0 {
+                break;
+            }
+            let raw = &fn_bytes[cursor..cursor + len];
+            // Corrupt an interior arithmetic, logic, move, or immediate/displacement byte:
+            if len >= 2 && insn.mnemonic() != iced_x86::Mnemonic::Ret {
+                // Flip the last byte of the instruction (either ModR/M register field or immediate/disp8)
+                // by XORing with 0x01, avoiding creating 0xC3/0xCF.
+                let last_idx = cursor + len - 1;
+                let flipped = raw[len - 1] ^ 0x01;
+                if flipped != 0xC3 && flipped != 0xCF {
+                    corrupt_pos = Some((fn_off + last_idx, flipped));
+                    break;
+                }
+            }
+            cursor += len;
+        }
+
+        if let Some((byte_idx, bad_byte)) = corrupt_pos {
+            let mut corrupted_text = base_morph_text.to_vec();
+            corrupted_text[byte_idx] = bad_byte;
+
+            let mut caught_divergence = false;
+            for input_idx in 0..NUM_INPUTS {
+                let init = profile.make_input(input_idx);
+                let Ok(out_orig) = execute_function_with_ro(
+                    orig_text,
+                    text_vaddr,
+                    &ro_segments,
+                    *fn_vaddr,
+                    init.clone(),
+                    MAX_STEPS,
+                ) else {
+                    continue;
+                };
+                let Ok(out_bad) = execute_function_with_ro(
+                    &corrupted_text,
+                    text_vaddr,
+                    &ro_segments,
+                    *fn_vaddr,
+                    init,
+                    MAX_STEPS,
+                ) else {
+                    // Faulting in the micro-VM on the corrupted instruction also catches the bug!
+                    caught_divergence = true;
+                    break;
+                };
+                if out_orig.regs[0] != out_bad.regs[0]
+                    || out_orig.regs[2] != out_bad.regs[2]
+                    || out_orig.regs[4] != out_bad.regs[4]
+                    || out_orig.regs[3] != out_bad.regs[3]
+                    || out_orig.regs[5] != out_bad.regs[5]
+                    || out_orig.regs[12] != out_bad.regs[12]
+                    || out_orig.regs[13] != out_bad.regs[13]
+                    || out_orig.regs[14] != out_bad.regs[14]
+                    || out_orig.regs[15] != out_bad.regs[15]
+                    || out_orig.mem[..0x4000] != out_bad.mem[..0x4000]
+                    || out_orig.mem[INITIAL_RSP_OFFSET..] != out_bad.mem[INITIAL_RSP_OFFSET..]
+                {
+                    caught_divergence = true;
+                    break;
+                }
+            }
+            if caught_divergence {
+                real_kernel_semantic_faults_caught += 1;
+            }
+        }
+    }
+
     eprintln!(
-        "real kernel ELF differential check: verified {} real kernel functions ({} distinct mutated functions, {} mutated fn×seed instances, {} total concrete executions across {} seeds)",
+        "real kernel ELF differential check: verified {} real kernel functions ({} input-sensitive, {} memory-mutating, {} distinct mutated functions, {} mutated fn×seed instances, {} total concrete executions across {} seeds, {} real-kernel injected faults caught)",
         verified_kernel_fns.len(),
+        input_sensitive_fns,
+        mem_mutating_fns,
         distinct_mutated_fns.len(),
         mutated_fn_seed_instances,
         verified_kernel_fns.len() * (NUM_SEEDS as usize) * NUM_INPUTS,
-        NUM_SEEDS
+        NUM_SEEDS,
+        real_kernel_semantic_faults_caught
     );
     assert!(
         distinct_mutated_fns.len() >= 480,
@@ -2249,5 +2392,10 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
         mutated_fn_seed_instances >= 14_000,
         "expected at least 14000 mutated (function, seed) instances verified on real kernel ELF, got {}",
         mutated_fn_seed_instances
+    );
+    assert!(
+        real_kernel_semantic_faults_caught >= 400,
+        "expected concrete execution comparator to catch injected 1-byte instruction corruptions on at least 400 real kernel functions, got {}",
+        real_kernel_semantic_faults_caught
     );
 }
