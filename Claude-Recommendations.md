@@ -113,6 +113,7 @@ Review of the 8 commits after `db46a14`, up to `e9c10f5`: `924d655` (#1), `4b315
 - **Unquoted paths with spaces (`shell.rs:4964-5025`):** `cathex` and `writehex` guess where a path with spaces ends by looking for numeric tokens. That's ambiguous when a path's own words are numeric. The controller always quotes, so require quotes for paths with spaces and drop the guessing.
 - **Silent text truncation (`sql.rs:75-84`, `:2390-2400`):** TEXT values and the new `X'..'` literals longer than 24 bytes are cut silently. That predates `X'..'`, but it breaks the "never silently truncate" standard. Return an error.
 - **Global buffer cap (`lived_net.rs:1220`, `:1438`):** when the 512 KiB budget across slots is used up, the next client gets `413 Content Too Large` and its connection is closed, even if its request was small. Use 503, and consider a per-peer share so one client can't use up the whole budget.
+- `Status: Fixed — test: lived_net::tests::cross_slot_buffer_cap_and_capacity_shrink_bound_heap_footprint, sql::tests::parse_literal_rejects_text_and_hex_literals_exceeding_24_bytes_without_truncating, shell::tests::cathex_and_writehex_roundtrip_empty_binary_and_multichunk_files, tools/triad_controller.py --unit-test — commit: 3788fbb`
 
 ---
 
