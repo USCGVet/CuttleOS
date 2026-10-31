@@ -94,6 +94,7 @@ Review of the 8 commits after `db46a14`, up to `e9c10f5`: `924d655` (#1), `4b315
   - Compute the chunk size from the line limit, the quoted path length and the offset width.
   - Make the kernel reject an over-long line with an error instead of dropping characters (the "never silently truncate" standard).
   - Drive the harness byte by byte through `feed_byte`.
+- `Status: Fixed — test: shell::tests::feed_byte_rejects_overlong_command_line_without_truncating, tools/triad_controller.py --unit-test (RealOsShellHarness overlong rejection & >60-char path writehex sync) — commit: 7d88d4b`
 
 ### 5. The new probe format invalidates digests saved by the previous version
 - **Where:** `tools/triad_controller.py:1740` (the probe text now includes `#rows=` and the kernel digest), `:900-914` (the WAL file has no format version), and the boot-time verify and adopt steps.
