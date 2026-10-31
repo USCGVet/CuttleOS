@@ -116,7 +116,8 @@ pub use crate::iommu::{
 };
 pub use crate::memory::{BitmapAllocator, FRAME_SIZE};
 pub use crate::btree_pager::{
-    BTreeError, BTreePageKind, BTreePager, BTreeRecord, BTREE_MAX_PAGES, BTREE_PAGE_SIZE,
+    BTreeError, BTreeManifest, BTreePageKind, BTreePager, BTreeRecord, BTREE_MAX_PAGES,
+    BTREE_PAGE_SIZE,
 };
 pub use crate::lived_net::{
     LivedNet, ReplySet, TriadIngressVoter, TriadNodeHealth, TriadNodeVoteInput, TriadVoteOutcome,

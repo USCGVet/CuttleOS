@@ -2610,12 +2610,12 @@ pub struct TriadNodeVoteInput<'a> {
     pub body: &'a [u8],
 }
 
-/// Self-contained `#![no_std]` Pure-Rust Triad Ingress Quorum Voter & Rolling Morph Coordinator.
+/// Standalone `#![no_std]` Pure-Rust Triad Ingress Quorum Voter & Rolling Morph Library Component.
 ///
-/// Enables a `Wfe`- or `Full`-role Cuttle OS gateway VM (or standalone Rust appliance proxy)
-/// to perform 2-of-3 TMR response voting, automatic Byzantine node isolation, zero-downtime
-/// rolling binary morph coordination, and 4 KiB (`CTTLSQL1`) RAID-5 XOR parity reconstruction
-/// natively in Rust without depending on the host Python coordinator in the critical path.
+/// Provides a self-contained pure-Rust model for 2-of-3 TMR response voting, automatic Byzantine
+/// node isolation, rolling binary morph state tracking, and 4 KiB (`CTTLSQL1`) RAID-5 XOR parity
+/// reconstruction. Note: this struct is a standalone library component exercised by unit tests;
+/// the live 3-VM Triad uses `tools/triad_controller.py` and UDP `:8080` `TRIAD_PREPARE` / `TRIAD_ACK`.
 #[derive(Copy, Clone, Debug)]
 pub struct TriadIngressVoter {
     /// Active appliance role profile (`Wfe` or `Full` required to serve ingress traffic).
@@ -2628,10 +2628,12 @@ pub struct TriadIngressVoter {
     pub health: [TriadNodeHealth; 3],
     /// Active binary diversification seed on each Triad node (`0..3`).
     pub variant_seeds: [u64; 3],
-    /// Latest committed transaction sequence number per node (`0..3`).
+    /// Latest committed SQL `tx_seq` per node (`0..3`), initialized to [`crate::sql::SQL_GENESIS_TX_SEQ`].
     pub node_seq: [u64; 3],
     /// Latest verified 64-bit state hash per node (`0..3`).
     pub node_hash: [u64; 3],
+    /// Previous committed quorum state hash (used to detect and reject 2-node state rollbacks).
+    pub prev_quorum_hash: u64,
     /// Total 3-of-3 unanimous TMR votes completed.
     pub unanimous_votes: u64,
     /// Total 2-of-3 majority TMR votes completed (degraded or Byzantine outlier masked).
@@ -2655,8 +2657,9 @@ impl TriadIngressVoter {
             key_provisioned: false,
             health: [TriadNodeHealth::Online; 3],
             variant_seeds: [0u64; 3],
-            node_seq: [0u64; 3],
+            node_seq: [crate::sql::SQL_GENESIS_TX_SEQ; 3],
             node_hash: [0u64; 3],
+            prev_quorum_hash: 0,
             unanimous_votes: 0,
             majority_2of3_votes: 0,
             split_brain_refusals: 0,
@@ -2679,8 +2682,9 @@ impl TriadIngressVoter {
             key_provisioned: key_ok,
             health: [TriadNodeHealth::Online; 3],
             variant_seeds,
-            node_seq: [0u64; 3],
+            node_seq: [crate::sql::SQL_GENESIS_TX_SEQ; 3],
             node_hash: [0u64; 3],
+            prev_quorum_hash: 0,
             unanimous_votes: 0,
             majority_2of3_votes: 0,
             split_brain_refusals: 0,
@@ -2744,7 +2748,13 @@ impl TriadIngressVoter {
                 && self.health[i] == TriadNodeHealth::Online
                 && r.body.len() <= winning_body_out.len()
             {
-                active[i] = true;
+                // Anti-rollback on read-only votes: an Online node that already has a committed
+                // `node_hash[i] != 0` must report that exact `state_hash` on a non-mutating read.
+                if !is_mutating && self.node_hash[i] != 0 && r.state_hash != self.node_hash[i] {
+                    self.health[i] = TriadNodeHealth::Isolated;
+                } else {
+                    active[i] = true;
+                }
             }
             i += 1;
         }
@@ -2757,12 +2767,26 @@ impl TriadIngressVoter {
             && Self::responses_match(&responses[1], &responses[2])
         {
             let win = &responses[0];
+            let commit_ok = is_mutating
+                && win.status_code >= 200
+                && win.status_code < 300
+                && !win.body.starts_with(b"error:")
+                && !win.body.starts_with(b"usage:");
+            if commit_ok && self.prev_quorum_hash != 0 && win.state_hash == self.prev_quorum_hash {
+                self.split_brain_refusals = self.split_brain_refusals.wrapping_add(1);
+                return (TriadVoteOutcome::SplitBrainOrQuorumLost, 0);
+            }
             winning_body_out[..win.body.len()].copy_from_slice(win.body);
-            self.node_hash = [win.state_hash; 3];
-            if is_mutating {
+            if commit_ok {
+                if self.node_hash[0] != 0 && self.node_hash[0] != win.state_hash {
+                    self.prev_quorum_hash = self.node_hash[0];
+                }
+                self.node_hash = [win.state_hash; 3];
                 self.node_seq[0] = self.node_seq[0].wrapping_add(1);
                 self.node_seq[1] = self.node_seq[1].wrapping_add(1);
                 self.node_seq[2] = self.node_seq[2].wrapping_add(1);
+            } else if !is_mutating {
+                self.node_hash = [win.state_hash; 3];
             }
             self.unanimous_votes = self.unanimous_votes.wrapping_add(1);
             return (
@@ -2790,22 +2814,37 @@ impl TriadIngressVoter {
 
         if let Some((a, b, outlier)) = pair_match {
             let win = &responses[a];
+            let commit_ok = is_mutating
+                && win.status_code >= 200
+                && win.status_code < 300
+                && !win.body.starts_with(b"error:")
+                && !win.body.starts_with(b"usage:");
+            if commit_ok && self.prev_quorum_hash != 0 && win.state_hash == self.prev_quorum_hash {
+                self.split_brain_refusals = self.split_brain_refusals.wrapping_add(1);
+                return (TriadVoteOutcome::SplitBrainOrQuorumLost, 0);
+            }
             winning_body_out[..win.body.len()].copy_from_slice(win.body);
-            self.node_hash[a] = win.state_hash;
-            self.node_hash[b] = win.state_hash;
-            if is_mutating {
+            if commit_ok {
+                if self.node_hash[a] != 0 && self.node_hash[a] != win.state_hash {
+                    self.prev_quorum_hash = self.node_hash[a];
+                }
+                self.node_hash[a] = win.state_hash;
+                self.node_hash[b] = win.state_hash;
                 self.node_seq[a] = self.node_seq[a].wrapping_add(1);
                 self.node_seq[b] = self.node_seq[b].wrapping_add(1);
+            } else if !is_mutating {
+                self.node_hash[a] = win.state_hash;
+                self.node_hash[b] = win.state_hash;
             }
             // Isolate the 3rd node if it was Online and:
             // - returned an incompatible or oversized response (`responses[outlier].available`), OR
-            // - dropped mid-commit during a mutating write (`is_mutating && !responses[outlier].available`),
+            // - dropped mid-commit during a mutating write (`commit_ok && !responses[outlier].available`),
             //   leaving its committed state behind the 2-of-3 quorum (`node_seq[a]` / `node_seq[b]`).
             // Note: A node in `TriadNodeHealth::Morphing` remains `Morphing` so it can replay WAL
             // deltas via `complete_rolling_morph_catchup`.
             if active[outlier]
                 || (self.health[outlier] == TriadNodeHealth::Online
-                    && (responses[outlier].available || is_mutating))
+                    && (responses[outlier].available || commit_ok))
             {
                 self.health[outlier] = TriadNodeHealth::Isolated;
             }
@@ -2841,7 +2880,7 @@ impl TriadIngressVoter {
             return Err(ServiceError::Unauthenticated);
         }
         let idx = node_id as usize;
-        if idx >= 3 {
+        if idx >= 3 || self.health[idx] != TriadNodeHealth::Online {
             return Err(ServiceError::SandboxTrap);
         }
         // Ensure the other 2 nodes are Online so 2-of-3 quorum is preserved during the morph:
@@ -2898,7 +2937,7 @@ impl TriadIngressVoter {
                 if self.health[i] == TriadNodeHealth::Online {
                     peers_online += 1;
                     if (self.node_hash[i] != 0 && self.node_hash[i] != synced_hash)
-                        || synced_seq < self.node_seq[i]
+                        || synced_seq != self.node_seq[i]
                     {
                         return Err(ServiceError::SandboxTrap);
                     }
@@ -2963,7 +3002,7 @@ impl TriadIngressVoter {
         }
         let healed_hash = recovered_db_out.state_hash();
         if (self.node_hash[p_idx] != 0 && healed_hash != self.node_hash[p_idx])
-            || recovered_db_out.tx_seq < self.node_seq[p_idx]
+            || recovered_db_out.tx_seq != self.node_seq[p_idx]
         {
             return Err(ServiceError::ImaVerificationFailed);
         }
@@ -3003,6 +3042,13 @@ fn status_body(boots: u64, out: &mut [u8]) -> usize {
 fn build_service_error_response(err: crate::svc_runtime::ServiceError, out: &mut [u8]) -> usize {
     use crate::svc_runtime::ServiceError;
     match err {
+        ServiceError::BadRequest => HttpImpl::build_response(
+            400,
+            b"text/plain",
+            b"error: EINVAL (malformed request path or body)\n",
+            out,
+        )
+        .unwrap_or(0),
         ServiceError::Unauthenticated => {
             HttpImpl::build_response(401, b"text/plain", b"error: unauthorized\n", out).unwrap_or(0)
         }
@@ -5715,7 +5761,7 @@ mod tests {
                 node_id: 0,
                 available: true,
                 status_code: 200,
-                state_hash: 0xBB22,
+                state_hash: 0xAA11,
                 body: b"k|v\nrole|leader\n",
             },
             TriadNodeVoteInput {
@@ -5729,7 +5775,7 @@ mod tests {
                 node_id: 2,
                 available: true,
                 status_code: 200,
-                state_hash: 0xBB22,
+                state_hash: 0xAA11,
                 body: b"k|v\nrole|leader\n",
             },
         ];
@@ -5739,7 +5785,7 @@ mod tests {
             outcome_morph,
             TriadVoteOutcome::Majority2of3 {
                 status_code: 200,
-                state_hash: 0xBB22,
+                state_hash: 0xAA11,
                 outlier_node: 1,
             }
         );
@@ -5750,9 +5796,15 @@ mod tests {
             "unavailable morphing node must remain Morphing until catchup completes"
         );
 
-        // Complete Node 1 catch-up with fresh seed `909` and synced hash `0xBB22`:
+        // Complete Node 1 catch-up with fresh seed `909` and synced hash `0xAA11` at `tx_seq == 8`:
         voter
-            .complete_rolling_morph_catchup(1, 909, 2, 0xBB22, true)
+            .complete_rolling_morph_catchup(
+                1,
+                909,
+                crate::sql::SQL_GENESIS_TX_SEQ + 1,
+                0xAA11,
+                true,
+            )
             .unwrap();
         assert_eq!(voter.health[1], TriadNodeHealth::Online);
         assert_eq!(voter.variant_seeds[1], 909);
@@ -5762,6 +5814,14 @@ mod tests {
         let mut db0 = crate::sql::SqlDb::new();
         let mut db2_expected = crate::sql::SqlDb::new();
         let mut sql_scratch = [0u8; 128];
+        let _ = db0.exec(
+            b"INSERT INTO kv VALUES ('init.key', 'v0', 1)",
+            &mut sql_scratch,
+        );
+        let _ = db2_expected.exec(
+            b"INSERT INTO kv VALUES ('init.key', 'v0', 1)",
+            &mut sql_scratch,
+        );
         let _ = db0.exec(
             b"INSERT INTO kv VALUES ('healed.key', 'raid5_ok', 7)",
             &mut sql_scratch,
@@ -5777,14 +5837,14 @@ mod tests {
                 available: true,
                 status_code: 200,
                 state_hash: clean_hash,
-                body: b"status=clean\n",
+                body: b"INSERT 1\n",
             },
             TriadNodeVoteInput {
                 node_id: 1,
                 available: true,
                 status_code: 200,
                 state_hash: clean_hash,
-                body: b"status=clean\n",
+                body: b"INSERT 1\n",
             },
             TriadNodeVoteInput {
                 node_id: 2,
@@ -5795,7 +5855,7 @@ mod tests {
             },
         ];
         let (outcome_byz, len_byz) =
-            voter.vote_ingress_request(false, false, &byz_resps, &mut out);
+            voter.vote_ingress_request(true, true, &byz_resps, &mut out);
         assert_eq!(
             outcome_byz,
             TriadVoteOutcome::Majority2of3 {
@@ -5804,11 +5864,16 @@ mod tests {
                 outlier_node: 2,
             }
         );
-        assert_eq!(&out[..len_byz], b"status=clean\n");
+        assert_eq!(&out[..len_byz], b"INSERT 1\n");
         assert_eq!(
             voter.health[2],
             TriadNodeHealth::Isolated,
             "Byzantine outlier Node 2 must be automatically isolated by TriadIngressVoter"
+        );
+        assert_eq!(
+            voter.begin_rolling_morph(2, true),
+            Err(ServiceError::SandboxTrap),
+            "Isolated Node 2 must not be allowed to enter Morphing without RAID-5 XOR healing"
         );
 
         // 5. Heal Isolated Node 2 via 4 KiB (`8 × 512B`) RAID-5 XOR Parity Reconstruction:
@@ -5874,9 +5939,10 @@ mod tests {
 
         let cluster_key = [0x91u8; 32];
         let mut voter = TriadIngressVoter::new(NodeRole::Wfe, cluster_key, [111, 222, 333]);
+        assert_eq!(voter.node_seq, [crate::sql::SQL_GENESIS_TX_SEQ; 3]);
         let mut out = [0u8; 64];
 
-        // 1. Real SQL partitions across 3 nodes: Commit #1 (unanimous 3-of-3).
+        // 1. Real SQL partitions across 3 nodes: Commit #1 (unanimous 3-of-3, advancing `tx_seq` from 7 to 8).
         let mut db0 = crate::sql::SqlDb::new();
         let mut db1 = crate::sql::SqlDb::new();
         let mut db2 = crate::sql::SqlDb::new();
@@ -5885,8 +5951,10 @@ mod tests {
         let _ = db1.exec(b"INSERT INTO kv VALUES ('epoch', 'v1', 1)", &mut scratch);
         let _ = db2.exec(b"INSERT INTO kv VALUES ('epoch', 'v1', 1)", &mut scratch);
         let h1 = db0.state_hash();
+        let seq1 = db0.tx_seq;
+        assert_eq!(seq1, crate::sql::SQL_GENESIS_TX_SEQ + 1);
 
-        // Save snapshot of stale `tx_seq == 1` partition from Node 2 for later anti-rollback test:
+        // Save snapshot of stale `tx_seq == 8` partition from Node 2 for later anti-rollback test:
         let mut d0_seq1 = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
         let mut d2_seq1 = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
         db0.save_partition(&cluster_key, &mut d0_seq1);
@@ -5929,15 +5997,45 @@ mod tests {
                 state_hash: h1,
             }
         );
-        assert_eq!(voter.node_seq, [1, 1, 1]);
+        assert_eq!(voter.node_seq, [seq1, seq1, seq1]);
+
+        // 1b. A mutating request that all nodes reject (`error:` or `status_code >= 400`) must NOT advance `node_seq`:
+        let rejected_mut = [
+            TriadNodeVoteInput {
+                node_id: 0,
+                available: true,
+                status_code: 200,
+                state_hash: h1,
+                body: b"error: syntax error\n",
+            },
+            TriadNodeVoteInput {
+                node_id: 1,
+                available: true,
+                status_code: 200,
+                state_hash: h1,
+                body: b"error: syntax error\n",
+            },
+            TriadNodeVoteInput {
+                node_id: 2,
+                available: true,
+                status_code: 200,
+                state_hash: h1,
+                body: b"error: syntax error\n",
+            },
+        ];
+        let _ = voter.vote_ingress_request(true, true, &rejected_mut, &mut out);
+        assert_eq!(
+            voter.node_seq,
+            [seq1, seq1, seq1],
+            "rejected mutating request must not advance node_seq"
+        );
 
         // 2. Mid-Commit Node Drop on Mutating Write #2:
-        // Nodes 0 and 1 commit `tx_seq == 2`, while Node 2 drops mid-commit (`available: false`).
-        // Voter must commit on 2-of-3 majority AND immediately isolate Node 2 so its stale
-        // `tx_seq == 1` state cannot vote on subsequent requests without RAID-5 healing.
+        // Nodes 0 and 1 commit `tx_seq == 9`, while Node 2 drops mid-commit (`available: false`).
         let _ = db0.exec(b"INSERT INTO kv VALUES ('cfg', 'strict', 2)", &mut scratch);
         let _ = db1.exec(b"INSERT INTO kv VALUES ('cfg', 'strict', 2)", &mut scratch);
         let h2 = db0.state_hash();
+        let seq2 = db0.tx_seq;
         let commit2_drop = [
             TriadNodeVoteInput {
                 node_id: 0,
@@ -5975,12 +6073,10 @@ mod tests {
             TriadNodeHealth::Isolated,
             "Node 2 dropping mid-commit on a mutating request must transition to Isolated"
         );
-        assert_eq!(voter.node_seq, [2, 2, 1]);
+        assert_eq!(voter.node_seq, [seq2, seq2, seq1]);
 
         // 3. Stale Node 2 comes back on the wire claiming `available: true` with stale `h1` while
         // Node 1 has a transient read timeout (`available: false`):
-        // Because Node 2 is `Isolated`, its stale response is ignored and the voter fails closed
-        // (`SplitBrainOrQuorumLost`) instead of serving stale data or forming a false quorum.
         let stale_rejoin = [
             TriadNodeVoteInput {
                 node_id: 0,
@@ -6009,15 +6105,18 @@ mod tests {
             (TriadVoteOutcome::SplitBrainOrQuorumLost, 0)
         );
 
-        // 4. Isolated Node 2 cannot bypass RAID-5 XOR healing by calling `complete_rolling_morph_catchup`:
+        // 4. Isolated Node 2 cannot bypass RAID-5 XOR healing via `begin_rolling_morph` or `complete_rolling_morph_catchup`:
         assert_eq!(
-            voter.complete_rolling_morph_catchup(2, 444, 2, h2, true),
+            voter.begin_rolling_morph(2, true),
+            Err(ServiceError::SandboxTrap)
+        );
+        assert_eq!(
+            voter.complete_rolling_morph_catchup(2, 444, seq2, h2, true),
             Err(ServiceError::SandboxTrap)
         );
 
         // 5. Anti-Rollback RAID-5 XOR Check:
-        // Attempting to heal Node 2 using the old `tx_seq == 1` partition + parity (which has a
-        // valid HMAC-SHA256 under `cluster_key`, but `tx_seq == 1 < voter.node_seq[0] == 2`)
+        // Attempting to heal Node 2 using the old `tx_seq == 8` partition + parity (`seq1 < seq2`)
         // must be refused with `ImaVerificationFailed`!
         let mut recovered = crate::sql::SqlDb::empty();
         assert_eq!(
@@ -6030,11 +6129,11 @@ mod tests {
                 &mut recovered,
             ),
             Err(ServiceError::ImaVerificationFailed),
-            "replay of older valid-HMAC partition (tx_seq=1 < donor node_seq=2) must be rejected"
+            "replay of older valid-HMAC partition (tx_seq=8 < donor node_seq=9) must be rejected"
         );
         assert_eq!(voter.health[2], TriadNodeHealth::Isolated);
 
-        // 6. Bit-Flipped RAID-5 XOR Parity Rejection + Valid `tx_seq == 2` Reconstruction:
+        // 6. Bit-Flipped RAID-5 XOR Parity Rejection + Valid `tx_seq == 9` Reconstruction:
         let _ = db2.exec(b"INSERT INTO kv VALUES ('cfg', 'strict', 2)", &mut scratch);
         let mut d0_seq2 = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
         let mut d2_seq2 = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
@@ -6062,22 +6161,22 @@ mod tests {
         );
         assert_eq!(voter.health[2], TriadNodeHealth::Isolated);
 
-        // Valid RAID-5 heal at `tx_seq == 2` succeeds:
+        // Valid RAID-5 heal at `tx_seq == 9` succeeds and leaves `voter.node_seq == [9, 9, 9]` WITHOUT manual patching:
         let healed_h = voter
             .heal_isolated_node_via_raid5_xor(2, 0, true, &d0_seq2, &parity_seq2, &mut recovered)
-            .expect("valid tx_seq=2 RAID-5 XOR heal must succeed");
+            .expect("valid tx_seq=9 RAID-5 XOR heal must succeed");
         assert_eq!(healed_h, h2);
         assert_eq!(voter.health[2], TriadNodeHealth::Online);
-        assert_eq!(voter.node_seq[2], db2.tx_seq);
-        voter.node_seq = [2, 2, 2];
+        assert_eq!(voter.node_seq, [seq2, seq2, seq2]);
 
         // 7. Rolling Morph with Concurrent Write Advancement:
-        // Start rolling morph on Node 0 -> Nodes 1 & 2 commit Write #3 (`tx_seq` advances to 3) ->
-        // Node 0 tries to complete morph catch-up with stale `synced_seq == 2` or stale `h2` -> refused!
+        // Start rolling morph on Node 0 -> Nodes 1 & 2 commit Write #3 (`tx_seq` advances to 10) ->
+        // Node 0 tries to complete morph catch-up with stale `synced_seq == 9` or stale `h2` -> refused!
         voter.begin_rolling_morph(0, true).unwrap();
         let _ = db1.exec(b"INSERT INTO kv VALUES ('rot', 'ok', 3)", &mut scratch);
         let _ = db2.exec(b"INSERT INTO kv VALUES ('rot', 'ok', 3)", &mut scratch);
         let h3 = db1.state_hash();
+        let seq3 = db1.tx_seq;
         let commit3 = [
             TriadNodeVoteInput {
                 node_id: 0,
@@ -6115,23 +6214,55 @@ mod tests {
             TriadNodeHealth::Morphing,
             "Morphing node must stay Morphing (not Isolated) when peers commit a write during rotation"
         );
-        assert_eq!(voter.node_seq, [2, 3, 3]);
+        assert_eq!(voter.node_seq, [seq2, seq3, seq3]);
 
-        // Stale catch-up (`synced_seq = 2 < 3` or `synced_hash = h2 != h3`) is rejected:
+        // Stale catch-up (`synced_seq = 9 < 10` or `synced_hash = h2 != h3`) is rejected:
         assert_eq!(
-            voter.complete_rolling_morph_catchup(0, 777, 2, h3, true),
+            voter.complete_rolling_morph_catchup(0, 777, seq2, h3, true),
             Err(ServiceError::SandboxTrap)
         );
         assert_eq!(
-            voter.complete_rolling_morph_catchup(0, 777, 3, h2, true),
+            voter.complete_rolling_morph_catchup(0, 777, seq3, h2, true),
             Err(ServiceError::SandboxTrap)
         );
-        // Up-to-date catch-up (`synced_seq = 3`, `synced_hash = h3`, fresh seed `777`) succeeds:
+        // Up-to-date catch-up (`synced_seq = 10`, `synced_hash = h3`, fresh seed `777`) succeeds:
         voter
-            .complete_rolling_morph_catchup(0, 777, 3, h3, true)
+            .complete_rolling_morph_catchup(0, 777, seq3, h3, true)
             .expect("up-to-date morph catchup must succeed");
         assert_eq!(voter.health, [TriadNodeHealth::Online; 3]);
-        assert_eq!(voter.node_seq, [3, 3, 3]);
+        assert_eq!(voter.node_seq, [seq3, seq3, seq3]);
+
+        // 7b. Two-node rollback to a prior committed state hash (`h2`) is refused on both reads and writes:
+        let mut voter_rb = voter;
+        let rb_read = [
+            TriadNodeVoteInput {
+                node_id: 0,
+                available: true,
+                status_code: 200,
+                state_hash: h2,
+                body: b"stale\n",
+            },
+            TriadNodeVoteInput {
+                node_id: 1,
+                available: true,
+                status_code: 200,
+                state_hash: h2,
+                body: b"stale\n",
+            },
+            TriadNodeVoteInput {
+                node_id: 2,
+                available: true,
+                status_code: 200,
+                state_hash: h3,
+                body: b"fresh\n",
+            },
+        ];
+        assert_eq!(
+            voter_rb.vote_ingress_request(false, false, &rb_read, &mut out),
+            (TriadVoteOutcome::SplitBrainOrQuorumLost, 0),
+            "2-node rollback on read must be refused and must not move node_hash backwards"
+        );
+        assert_eq!(voter_rb.node_hash, [h3, h3, h3]);
 
         // 8. Oversized response body (> `winning_body_out.len()`) from a Byzantine node is isolated:
         let oversized_body = [b'X'; 128];
@@ -6169,5 +6300,196 @@ mod tests {
         );
         assert_eq!(&out[..len4], b"OK\n");
         assert_eq!(voter.health[0], TriadNodeHealth::Isolated);
+    }
+
+    #[test]
+    fn http_request_prefilter_accepts_binary_vfs_valid_sql_and_shell_and_returns_400_without_counter_inflation()
+    {
+        use crate::svc_runtime::ServiceId;
+
+        let mut net = LivedNet::new(MAC);
+        let mut sh = crate::shell::OsShell::new();
+        let sid = sh.create_session(b"admin", b"prefilter-test");
+        let mut sid_hdr = [0u8; 64];
+        sid_hdr[..17].copy_from_slice(b"X-Session-Token: ");
+        sid_hdr[17..49].copy_from_slice(&sid);
+        sid_hdr[49..51].copy_from_slice(b"\r\n");
+
+        let http_call = |net: &mut LivedNet,
+                         sh: &mut crate::shell::OsShell,
+                         method: &[u8],
+                         path: &[u8],
+                         extra_hdr: &[u8],
+                         body: &[u8]|
+         -> ([u8; 1380], usize) {
+            let mut req = [0u8; 1024];
+            let mut p = 0usize;
+            p += copy_msg(method, &mut req[p..]);
+            p += copy_msg(b" ", &mut req[p..]);
+            p += copy_msg(path, &mut req[p..]);
+            p += copy_msg(b" HTTP/1.1\r\nHost: x\r\n", &mut req[p..]);
+            p += copy_msg(extra_hdr, &mut req[p..]);
+            p += copy_msg(b"\r\n", &mut req[p..]);
+            p += copy_msg(body, &mut req[p..]);
+            let mut out = [0u8; 1380];
+            let n = net.handle_http_request(&req[..p], 1, Some(sh), &mut out);
+            (out, n)
+        };
+
+        // 1. Binary `PUT /fs/var/blob.bin` succeeds (`201 Created`) and `GET /fs/var/blob.bin` round-trips exact bytes:
+        let bin_payload: &[u8] = b"\x00\x01\x02\x7f\xfe\xffCUTTLE_BIN";
+        let (resp_put, n_put) = http_call(
+            &mut net,
+            &mut sh,
+            b"PUT",
+            b"/fs/var/blob.bin",
+            &sid_hdr[..51],
+            bin_payload,
+        );
+        assert!(
+            resp_put[..n_put].starts_with(b"HTTP/1.1 201 Created\r\n")
+                || resp_put[..n_put].starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "binary PUT /fs must succeed: {:?}",
+            core::str::from_utf8(&resp_put[..n_put])
+        );
+        let (resp_get, n_get) = http_call(
+            &mut net,
+            &mut sh,
+            b"GET",
+            b"/fs/var/blob.bin",
+            b"",
+            b"",
+        );
+        assert!(resp_get[..n_get].starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(resp_get[..n_get].ends_with(bin_payload));
+
+        // 2. `POST /sh` accepts `write /var/note it's`, `write /var/note a;b`, and `write /var/note fish&chips`:
+        for (cmd, expected_txt) in [
+            (b"write /var/note it's".as_slice(), b"it's\n".as_slice()),
+            (b"write /var/note a;b".as_slice(), b"a;b\n".as_slice()),
+            (
+                b"write /var/note fish&chips".as_slice(),
+                b"fish&chips\n".as_slice(),
+            ),
+        ] {
+            let (r_sh, n_sh) = http_call(
+                &mut net,
+                &mut sh,
+                b"POST",
+                b"/sh",
+                &sid_hdr[..51],
+                cmd,
+            );
+            assert!(
+                r_sh[..n_sh].starts_with(b"HTTP/1.1 200 OK\r\n"),
+                "POST /sh {:?} must return 200 OK, got {:?}",
+                core::str::from_utf8(cmd).unwrap(),
+                core::str::from_utf8(&r_sh[..n_sh])
+            );
+            let (r_cat, n_cat) = http_call(
+                &mut net,
+                &mut sh,
+                b"GET",
+                b"/fs/var/note",
+                b"",
+                b"",
+            );
+            assert!(r_cat[..n_cat].ends_with(expected_txt));
+        }
+
+        // 3. `POST /sql` accepts empty body (`""`), `SELECT * FROM kv ;;`, `.TABLES`, and `.dump kv` without session auth:
+        for (sql_q, expected_sub) in [
+            (
+                b"".as_slice(),
+                b"services (rows=3, cols=4)\nkv (rows=2, cols=3)\n".as_slice(),
+            ),
+            (
+                b"SELECT v FROM kv WHERE k = 'cluster.role' ;;".as_slice(),
+                b"v\nprimary\n".as_slice(),
+            ),
+            (
+                b".TABLES".as_slice(),
+                b"services (rows=3, cols=4)\nkv (rows=2, cols=3)\n".as_slice(),
+            ),
+            (
+                b".dump kv".as_slice(),
+                b"sqldump table=kv ".as_slice(),
+            ),
+        ] {
+            let (r_sql, n_sql) = http_call(
+                &mut net,
+                &mut sh,
+                b"POST",
+                b"/sql",
+                b"",
+                sql_q,
+            );
+            assert!(
+                r_sql[..n_sql].starts_with(b"HTTP/1.1 200 OK\r\n"),
+                "POST /sql {:?} must succeed with 200 OK, got {:?}",
+                core::str::from_utf8(sql_q).unwrap(),
+                core::str::from_utf8(&r_sql[..n_sql])
+            );
+            assert!(
+                r_sql[..n_sql].windows(expected_sub.len()).any(|w| w == expected_sub),
+                "POST /sql {:?} missing expected substring {:?} in {:?}",
+                core::str::from_utf8(sql_q).unwrap(),
+                core::str::from_utf8(expected_sub).unwrap(),
+                core::str::from_utf8(&r_sql[..n_sql])
+            );
+        }
+
+        // 4. `/*triad*/` and `/*t*/` prefixes over HTTP are refused even with an authenticated session:
+        let (r_triad_unauth, n_tu) = http_call(
+            &mut net,
+            &mut sh,
+            b"POST",
+            b"/sql",
+            b"",
+            b"/*triad*/ SELECT * FROM kv",
+        );
+        assert!(r_triad_unauth[..n_tu].starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+        let (r_triad_auth, n_ta) = http_call(
+            &mut net,
+            &mut sh,
+            b"POST",
+            b"/sql",
+            &sid_hdr[..51],
+            b"/*t*/ INSERT INTO kv VALUES ('pwn', '1', 1)",
+        );
+        assert!(
+            r_triad_auth[..n_ta]
+                .windows(b"error: EACCES (/*triad*/ prefix reserved for Triad controller)\n".len())
+                .any(|w| w == b"error: EACCES (/*triad*/ prefix reserved for Triad controller)\n"),
+            "authenticated HTTP caller must be refused /*t*/ prefix: {:?}",
+            core::str::from_utf8(&r_triad_auth[..n_ta])
+        );
+
+        // 5. Malformed requests return HTTP `400 Bad Request` BEFORE incrementing `requests_served` or `policy_denials`:
+        let sql_served_before = sh.svc.services[ServiceId::Sql.index()].requests_served;
+        let sql_denials_before = sh.svc.services[ServiceId::Sql.index()].policy_denials;
+        let (r_bad_sql, n_bad) = http_call(
+            &mut net,
+            &mut sh,
+            b"POST",
+            b"/sql",
+            &sid_hdr[..51],
+            b"SELECT * FROM kv WHERE k = 'unterminated",
+        );
+        assert!(
+            r_bad_sql[..n_bad].starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+            "malformed SQL must return 400 Bad Request, got {:?}",
+            core::str::from_utf8(&r_bad_sql[..n_bad])
+        );
+        assert_eq!(
+            sh.svc.services[ServiceId::Sql.index()].requests_served,
+            sql_served_before,
+            "400 Bad Request must not increment requests_served"
+        );
+        assert_eq!(
+            sh.svc.services[ServiceId::Sql.index()].policy_denials,
+            sql_denials_before,
+            "400 Bad Request must not increment policy_denials"
+        );
     }
 }

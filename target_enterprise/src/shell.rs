@@ -759,15 +759,24 @@ impl OsShell {
 
         let target = op.target_service();
         let prev_seq = self.svc.services[target.index()].mailbox.req_seq;
-        // 1. Mediate role availability, session requirement, IPC bus routing (`svc-http -> target`),
-        //    and target service Seccomp/Capability/IMA/KPTI invariants BEFORE staging mailbox state.
+        // 1. Check role availability (`RoleDisabled`) and session credential requirements
+        //    (`Unauthenticated`) BEFORE staging or pre-filtering the request.
+        self.svc
+            .check_endpoint_access(op, via_http_gateway, session_verified, &mut self.audit)?;
+
+        // 2. Stage request path & body into the target service's IpcMailbox and run the
+        //    kernel-mode lexical pre-filter BEFORE `mediate_endpoint` increments `requests_served`,
+        //    `ipc_total`, `req_seq`, or `cpl3_runs`.
+        self.svc.stage_mailbox_request(target, req_path, req_body)?;
+        let _r3_summary = self
+            .svc
+            .validate_mailbox_request_prefilter(op, &mut self.audit)?;
+
+        // 2b. Mediate IPC bus routing (`svc-http -> target`), target service Seccomp/Capability/IMA/KPTI
+        //     invariants, and hardware `CPL=3` stub execution.
         let resp_tag =
             self.svc
                 .mediate_endpoint(op, via_http_gateway, session_verified, &mut self.audit)?;
-
-        // 2. Stage request path & body into the target service's isolated IpcMailbox and verify
-        //    that `mediate_endpoint` advanced `req_seq`, recorded `last_op`, and left `canary != 0`.
-        self.svc.stage_mailbox_request(target, req_path, req_body)?;
         {
             let mb = &self.svc.services[target.index()].mailbox;
             if mb.req_seq != prev_seq.wrapping_add(1)
@@ -778,12 +787,6 @@ impl OsShell {
                 return Err(ServiceError::SandboxTrap);
             }
         }
-
-        // 2b. Execute the target service's isolated Ring-3 (`CPL=3`, `PTE_U`) user-space request
-        //     parser & lexical validator over the staged mailbox before Ring-0 touches the payload.
-        let _r3_summary = self
-            .svc
-            .parse_and_validate_ring3_mailbox(op, &mut self.audit)?;
 
         // 3. Copy the request out of the target service's mailbox so the service handler
         //    operates exclusively on the mailbox message.
@@ -880,6 +883,8 @@ impl OsShell {
                 };
                 let owner = if session_verified {
                     self.last_session_owner.max(1)
+                } else if self.sql_owner_override == crate::sql::SQL_OWNER_CONSOLE {
+                    crate::sql::SQL_OWNER_HTTP_ANON
                 } else {
                     self.sql_owner_override
                 };
@@ -892,6 +897,8 @@ impl OsShell {
                 }
                 let owner = if session_verified {
                     self.last_session_owner.max(1)
+                } else if self.sql_owner_override == crate::sql::SQL_OWNER_CONSOLE {
+                    crate::sql::SQL_OWNER_HTTP_ANON
                 } else {
                     self.sql_owner_override
                 };
@@ -918,6 +925,8 @@ impl OsShell {
                 let prev_owner = self.sql_owner_override;
                 if session_verified {
                     self.sql_owner_override = self.last_session_owner.max(1);
+                } else if self.sql_owner_override == crate::sql::SQL_OWNER_CONSOLE {
+                    self.sql_owner_override = crate::sql::SQL_OWNER_HTTP_ANON;
                 }
                 let n = self
                     .exec_line(mb_body, boots, 0, 0, resp_out)
@@ -6723,7 +6732,7 @@ mod tests {
                 &mut out,
             );
             if trapped_by_ring3 {
-                assert_eq!(res_put, Err(crate::svc_runtime::ServiceError::SandboxTrap));
+                assert_eq!(res_put, Err(crate::svc_runtime::ServiceError::BadRequest));
             } else {
                 let (status_put, n_put) = res_put.unwrap();
                 assert_eq!(status_put, 403);
@@ -6740,7 +6749,7 @@ mod tests {
                 &mut out,
             );
             if trapped_by_ring3 {
-                assert_eq!(res_del, Err(crate::svc_runtime::ServiceError::SandboxTrap));
+                assert_eq!(res_del, Err(crate::svc_runtime::ServiceError::BadRequest));
             } else {
                 let (status_del, n_del) = res_del.unwrap();
                 assert_eq!(status_del, 403);

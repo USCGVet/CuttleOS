@@ -442,6 +442,8 @@ pub enum ServiceError {
     SandboxTrap,
     /// Incoming request path (`> 64` bytes) or body (`> 256` bytes) exceeds [`IpcMailbox`] capacity (`413` / `E2BIG`).
     PayloadTooLarge,
+    /// Incoming request path or body failed lexical pre-filter validation (`400 Bad Request` / `EINVAL`).
+    BadRequest,
 }
 
 /// Bounded zero-allocation IPC message recorded on the kernel [`IpcBus`].
@@ -1033,13 +1035,15 @@ impl ServiceSupervisor {
     /// 4. Mediates the target service's required syscall and capability (`NetIo`, `StorageIo`,
     ///    `Exec`, or `Open`) and executes the target service's ELF64 eBPF policy program with
     ///    an in-stack [`StackCanaryImpl`] guard.
-    pub fn mediate_endpoint<const N: usize>(
+    /// Check role availability (`RoleDisabled`) and session credential requirements (`Unauthenticated`)
+    /// before staging or pre-filtering an incoming mailbox request.
+    pub fn check_endpoint_access<const N: usize>(
         &mut self,
         op: IpcOp,
         via_http_gateway: bool,
         session_verified: bool,
         audit: &mut AuditLogImpl<N>,
-    ) -> Result<u64, ServiceError> {
+    ) -> Result<(), ServiceError> {
         let target = op.target_service();
 
         // 1. Check role availability first so requests to services disabled by the node's role
@@ -1070,6 +1074,21 @@ impl ServiceSupervisor {
             record_svc_audit(audit, 45, AuditVerdict::Denied, b"svc:auth:unauthenticated");
             return Err(ServiceError::Unauthenticated);
         }
+
+        Ok(())
+    }
+
+    /// Mediate an external HTTP/TCP/TLS endpoint or service entry point.
+    pub fn mediate_endpoint<const N: usize>(
+        &mut self,
+        op: IpcOp,
+        via_http_gateway: bool,
+        session_verified: bool,
+        audit: &mut AuditLogImpl<N>,
+    ) -> Result<u64, ServiceError> {
+        let target = op.target_service();
+        let target_idx = target.index();
+        self.check_endpoint_access(op, via_http_gateway, session_verified, audit)?;
 
         // 3. When arriving over HTTP/HTTPS, `svc-http` must be loaded and allowed `NetIo`.
         if via_http_gateway {
@@ -1162,21 +1181,38 @@ impl ServiceSupervisor {
         mb.last_resp_len = resp_len.min(u16::MAX as usize) as u16;
     }
 
-    /// Execute the target service's isolated Ring-3 (`CPL=3`, `PTE_U`) user-space request
-    /// parser and lexical validator over the staged [`IpcMailbox`] (`req_path`, `req_body`)
-    /// BEFORE any Ring-0 subsystem engine (`SqlDb`, `OsShell`, VFS) touches the payload.
+    /// Kernel-mode (`CPL=0`) mailbox lexical pre-filter and structural validator over the
+    /// staged [`IpcMailbox`] (`req_path`, `req_body`), executed before [`ServiceSupervisor::mediate_endpoint`]
+    /// increments request counters or invokes the downstream engine (`SqlDb`, `OsShell`, VFS).
+    ///
+    /// Note on execution privilege: This pre-filter runs in kernel mode (`CPL=0`) over the fixed-size
+    /// mailbox buffers and verifies the software `PageTable<8>` KPTI invariant model (`user_l4`), while
+    /// hardware `CPL=3` execution (`iretq -> int 0x80`) is performed on bare metal by the registered
+    /// `ring3_hw_hook` stub during [`ServiceSupervisor::mediate_endpoint`].
     ///
     /// Enforces:
-    /// 1. Live KPTI user page-table isolation (`verify_service_kpti_isolation`) and non-zero mailbox canary.
-    /// 2. Path sanitization in user space: non-empty, leading `/`, no NUL or control bytes, and no `..` traversal.
-    /// 3. Body sanitization in user space: no NUL bytes or non-whitespace ASCII control characters.
-    /// 4. Service-specific lexical tokenization in user space:
-    ///    - `svc-sql`: classifies SQL verb ([`Ring3SqlVerb`]), rejects unbalanced single quotes,
-    ///      rejects SQL comment smuggling (`--`, `/*`), rejects stacked multi-statement queries (`; ...`),
-    ///      and refuses mutating SQL verbs on read-only `IpcOp::SqlQuery` channels.
-    ///    - `svc-sh`: rejects empty commands, unbalanced quotes, and shell command-chaining /
-    ///      subshell metacharacters (`;`, `&&`, `||`, `|`, `` ` ``, `$(`) in `ShellExec` / `UserElfExec`.
+    /// 1. Software KPTI user page-table invariant check (`verify_service_kpti_isolation`) and non-zero mailbox canary.
+    /// 2. Path validation (`ring3_validate_path`): non-empty, leading `/`, printable ASCII, no `..` traversal.
+    /// 3. Body byte validation: binary payloads permitted on VFS operations (`VfsWrite`, `VfsRead`, `VfsDelete`);
+    ///    text commands/queries reject NUL bytes, non-whitespace ASCII control bytes, and embedded newlines.
+    /// 4. Shared engine-aligned lexical classification:
+    ///    - `svc-sql`: classifies via [`crate::sql::SqlDb::is_readonly_query`], allows empty body on
+    ///      `IpcOp::SqlQuery` (`.tables`), allows `.TABLES`/`.schema`/`.dump` and trailing semicolons (`SELECT ... ;;`),
+    ///      rejects unbalanced quotes or stacked statements (`; <stmt>`) with [`ServiceError::BadRequest`],
+    ///      and refuses mutating SQL verbs on read-only `IpcOp::SqlQuery` channels with [`ServiceError::Unauthenticated`].
+    ///    - `svc-sh`: validates single-line printable commands (including `write /var/note it's`, `a;b`, `fish&chips`)
+    ///      and rejects empty or multi-line commands with [`ServiceError::BadRequest`].
     /// 5. Computes a `variant_seed`-diversified structural digest over the tokenized mailbox state.
+    pub fn validate_mailbox_request_prefilter<const N: usize>(
+        &mut self,
+        op: IpcOp,
+        audit: &mut AuditLogImpl<N>,
+    ) -> Result<Ring3ParseSummary, ServiceError> {
+        self.parse_and_validate_ring3_mailbox(op, audit)
+    }
+
+    /// Backwards-compatible alias for [`ServiceSupervisor::validate_mailbox_request_prefilter`].
+    /// Runs in kernel mode (`CPL=0`) as a lexical pre-filter before [`ServiceSupervisor::mediate_endpoint`].
     pub fn parse_and_validate_ring3_mailbox<const N: usize>(
         &mut self,
         op: IpcOp,
@@ -1211,42 +1247,41 @@ impl ServiceSupervisor {
         let path = &path_copy[..plen];
         let body = &body_copy[..blen];
 
-        // 1. Validate request path in Ring-3 user space.
-        if !ring3_validate_path(path, matches!(op, IpcOp::VfsRead | IpcOp::VfsWrite | IpcOp::VfsDelete)) {
+        let is_vfs_op = matches!(op, IpcOp::VfsRead | IpcOp::VfsWrite | IpcOp::VfsDelete);
+
+        // 1. Validate request path.
+        if !ring3_validate_path(path, is_vfs_op) {
             self.services[idx].mailbox.ring3_parser_rejects = self.services[idx]
                 .mailbox
                 .ring3_parser_rejects
                 .wrapping_add(1);
-            self.services[idx].policy_denials =
-                self.services[idx].policy_denials.wrapping_add(1);
-            record_svc_audit(audit, 46, AuditVerdict::Denied, b"svc:ring3:bad-path");
-            return Err(ServiceError::SandboxTrap);
+            record_svc_audit(audit, 46, AuditVerdict::Denied, b"svc:prefilter:bad-path");
+            return Err(ServiceError::BadRequest);
         }
 
-        // 2. Reject embedded NUL or non-whitespace ASCII control bytes in request body.
-        if !ring3_validate_body_bytes(body) {
+        // 2. Reject embedded NUL or non-whitespace ASCII control bytes in text request bodies
+        //    (binary bodies are permitted on VFS operations such as `PUT /fs/<path>`).
+        if !is_vfs_op && !ring3_validate_body_bytes(body) {
             self.services[idx].mailbox.ring3_parser_rejects = self.services[idx]
                 .mailbox
                 .ring3_parser_rejects
                 .wrapping_add(1);
-            self.services[idx].policy_denials =
-                self.services[idx].policy_denials.wrapping_add(1);
-            record_svc_audit(audit, 46, AuditVerdict::Denied, b"svc:ring3:ctrl-byte");
-            return Err(ServiceError::SandboxTrap);
+            record_svc_audit(audit, 46, AuditVerdict::Denied, b"svc:prefilter:ctrl-byte");
+            return Err(ServiceError::BadRequest);
         }
 
-        // 3. Service-specific lexical tokenization & structural validation in Ring-3 user space.
+        // 3. Service-specific lexical tokenization & structural pre-filter validation.
         let (token_count, sql_verb, is_mutating) = match svc {
             ServiceId::Sql => {
-                let Some((toks, verb, mutating)) = ring3_parse_sql_body(body) else {
+                let allow_empty = op == IpcOp::SqlQuery;
+                let Some((toks, verb, mutating)) = ring3_parse_sql_body_for_op(body, allow_empty)
+                else {
                     self.services[idx].mailbox.ring3_parser_rejects = self.services[idx]
                         .mailbox
                         .ring3_parser_rejects
                         .wrapping_add(1);
-                    self.services[idx].policy_denials =
-                        self.services[idx].policy_denials.wrapping_add(1);
-                    record_svc_audit(audit, 46, AuditVerdict::Denied, b"svc:ring3:sql-syntax");
-                    return Err(ServiceError::SandboxTrap);
+                    record_svc_audit(audit, 46, AuditVerdict::Denied, b"svc:prefilter:sql-syntax");
+                    return Err(ServiceError::BadRequest);
                 };
                 if op == IpcOp::SqlQuery && mutating {
                     self.services[idx].mailbox.ring3_parser_rejects = self.services[idx]
@@ -1255,7 +1290,12 @@ impl ServiceSupervisor {
                         .wrapping_add(1);
                     self.services[idx].policy_denials =
                         self.services[idx].policy_denials.wrapping_add(1);
-                    record_svc_audit(audit, 46, AuditVerdict::Denied, b"svc:ring3:sql-ro-violation");
+                    record_svc_audit(
+                        audit,
+                        46,
+                        AuditVerdict::Denied,
+                        b"svc:prefilter:sql-ro-violation",
+                    );
                     return Err(ServiceError::Unauthenticated);
                 }
                 (toks, verb, mutating)
@@ -1267,13 +1307,29 @@ impl ServiceSupervisor {
                             .mailbox
                             .ring3_parser_rejects
                             .wrapping_add(1);
-                        self.services[idx].policy_denials =
-                            self.services[idx].policy_denials.wrapping_add(1);
-                        record_svc_audit(audit, 46, AuditVerdict::Denied, b"svc:ring3:sh-injection");
-                        return Err(ServiceError::SandboxTrap);
+                        record_svc_audit(
+                            audit,
+                            46,
+                            AuditVerdict::Denied,
+                            b"svc:prefilter:sh-syntax",
+                        );
+                        return Err(ServiceError::BadRequest);
                     };
                     (toks, Ring3SqlVerb::None, true)
                 } else {
+                    if !is_vfs_op && !ring3_is_single_line(body) {
+                        self.services[idx].mailbox.ring3_parser_rejects = self.services[idx]
+                            .mailbox
+                            .ring3_parser_rejects
+                            .wrapping_add(1);
+                        record_svc_audit(
+                            audit,
+                            46,
+                            AuditVerdict::Denied,
+                            b"svc:prefilter:multiline",
+                        );
+                        return Err(ServiceError::BadRequest);
+                    }
                     let toks = ring3_count_generic_tokens(path, body);
                     let mutating = matches!(
                         op,
@@ -1293,7 +1349,7 @@ impl ServiceSupervisor {
             }
         };
 
-        // 4. Execute diversified Ring-3 bytecode structural mixer over the validated tokens.
+        // 4. Compute variant_seed-diversified structural digest over the validated tokens.
         let parser_digest = ring3_compute_parser_digest(
             self.services[idx].variant_seed,
             &self.services[idx].ring3_code,
@@ -1780,20 +1836,65 @@ fn ring3_validate_body_bytes(body: &[u8]) -> bool {
     true
 }
 
-/// Tokenize and validate a SQL statement inside `svc-sql`'s Ring-3 user-space sandbox.
-/// Returns `Some((token_count, sql_verb, is_mutating))` or `None` on malformed/injected input.
-pub fn ring3_parse_sql_body(body: &[u8]) -> Option<(u8, Ring3SqlVerb, bool)> {
+fn ring3_is_single_line(body: &[u8]) -> bool {
     let trimmed = trim_ring3_ws(body);
-    if trimmed.is_empty() || trimmed.len() > IPC_MAILBOX_BODY_CAP {
+    let mut i = 0usize;
+    while i < trimmed.len() {
+        if trimmed[i] == b'\n' || trimmed[i] == b'\r' {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Tokenize and validate a SQL statement in the kernel-mode mailbox lexical pre-filter.
+/// Returns `Some((token_count, sql_verb, is_mutating))` or `None` on malformed input.
+pub fn ring3_parse_sql_body(body: &[u8]) -> Option<(u8, Ring3SqlVerb, bool)> {
+    ring3_parse_sql_body_for_op(body, false)
+}
+
+fn ring3_parse_sql_body_for_op(
+    body: &[u8],
+    allow_empty_as_tables: bool,
+) -> Option<(u8, Ring3SqlVerb, bool)> {
+    let ws_trimmed = trim_ring3_ws(body);
+    if ws_trimmed.len() > IPC_MAILBOX_BODY_CAP {
+        return None;
+    }
+    if ws_trimmed.is_empty() {
+        if allow_empty_as_tables {
+            return Some((1, Ring3SqlVerb::Meta, false));
+        }
         return None;
     }
 
-    // 1. Scan character-by-character for balanced single quotes, comment smuggling, and stacked queries.
+    // Strip trailing whitespace and trailing semicolons (`SELECT ... ;;` -> `SELECT ...`),
+    // matching `SqlDb`'s `trim_sql`.
+    let mut end = ws_trimmed.len();
+    while end > 0
+        && (ws_trimmed[end - 1] == b' '
+            || ws_trimmed[end - 1] == b'\t'
+            || ws_trimmed[end - 1] == b'\r'
+            || ws_trimmed[end - 1] == b'\n'
+            || ws_trimmed[end - 1] == b';')
+    {
+        end -= 1;
+    }
+    let trimmed = &ws_trimmed[..end];
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // 1. Scan character-by-character for single-line structure, balanced single quotes,
+    //    and absence of interior unquoted semicolons (stacked multi-statement queries).
     let mut in_quote = false;
-    let mut saw_semicolon = false;
     let mut i = 0usize;
     while i < trimmed.len() {
         let b = trimmed[i];
+        if b == b'\n' || b == b'\r' {
+            return None;
+        }
         if in_quote {
             if b == b'\'' {
                 if i + 1 < trimmed.len() && trimmed[i + 1] == b'\'' {
@@ -1805,29 +1906,13 @@ pub fn ring3_parse_sql_body(body: &[u8]) -> Option<(u8, Ring3SqlVerb, bool)> {
             i += 1;
             continue;
         }
-        if saw_semicolon {
-            // Any non-whitespace token after an unquoted `;` is a stacked multi-statement query!
-            if b != b' ' && b != b'\t' && b != b'\r' && b != b'\n' {
-                return None;
-            }
-            i += 1;
-            continue;
-        }
         if b == b'\'' {
             in_quote = true;
             i += 1;
             continue;
         }
-        // Reject SQL comment smuggling (`--` or `/*` or `*/`) outside string literals.
-        if i + 1 < trimmed.len()
-            && ((b == b'-' && trimmed[i + 1] == b'-')
-                || (b == b'/' && trimmed[i + 1] == b'*')
-                || (b == b'*' && trimmed[i + 1] == b'/'))
-        {
-            return None;
-        }
         if b == b';' {
-            saw_semicolon = true;
+            return None;
         }
         i += 1;
     }
@@ -1835,10 +1920,18 @@ pub fn ring3_parse_sql_body(body: &[u8]) -> Option<(u8, Ring3SqlVerb, bool)> {
         return None;
     }
 
-    // 2. Extract leading verb and count lexical tokens in user space.
+    // 2. Classify using the shared `SqlDb::is_readonly_query` predicate and extract the leading SQL verb.
+    let is_ro = crate::sql::SqlDb::is_readonly_query(trimmed);
+    let after_prefix = if trimmed.len() >= 9 && eq_ascii_nocase(&trimmed[..9], b"/*triad*/") {
+        trim_ring3_ws(&trimmed[9..])
+    } else if trimmed.len() >= 5 && eq_ascii_nocase(&trimmed[..5], b"/*t*/") {
+        trim_ring3_ws(&trimmed[5..])
+    } else {
+        trimmed
+    };
     let mut first_end = 0usize;
-    while first_end < trimmed.len() {
-        let c = trimmed[first_end];
+    while first_end < after_prefix.len() {
+        let c = after_prefix[first_end];
         if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' || c == b';' || c == b'(' {
             break;
         }
@@ -1847,34 +1940,36 @@ pub fn ring3_parse_sql_body(body: &[u8]) -> Option<(u8, Ring3SqlVerb, bool)> {
     if first_end == 0 {
         return None;
     }
-    let verb_bytes = &trimmed[..first_end];
-    let (verb, is_mutating) = if eq_ascii_nocase(verb_bytes, b"SELECT") {
-        (Ring3SqlVerb::Select, false)
-    } else if bytes_eq(verb_bytes, b".tables")
-        || bytes_eq(verb_bytes, b".schema")
+    let verb_bytes = &after_prefix[..first_end];
+    let verb = if eq_ascii_nocase(verb_bytes, b"SELECT") {
+        Ring3SqlVerb::Select
+    } else if eq_ascii_nocase(verb_bytes, b".tables")
+        || eq_ascii_nocase(verb_bytes, b".schema")
+        || eq_ascii_nocase(verb_bytes, b".dump")
         || eq_ascii_nocase(verb_bytes, b"SHOW")
         || eq_ascii_nocase(verb_bytes, b"DESCRIBE")
     {
-        (Ring3SqlVerb::Meta, false)
+        Ring3SqlVerb::Meta
     } else if eq_ascii_nocase(verb_bytes, b"INSERT") {
-        (Ring3SqlVerb::Insert, true)
+        Ring3SqlVerb::Insert
     } else if eq_ascii_nocase(verb_bytes, b"UPDATE") {
-        (Ring3SqlVerb::Update, true)
+        Ring3SqlVerb::Update
     } else if eq_ascii_nocase(verb_bytes, b"DELETE") {
-        (Ring3SqlVerb::Delete, true)
+        Ring3SqlVerb::Delete
     } else if eq_ascii_nocase(verb_bytes, b"CREATE") {
-        (Ring3SqlVerb::Create, true)
+        Ring3SqlVerb::Create
     } else if eq_ascii_nocase(verb_bytes, b"DROP") {
-        (Ring3SqlVerb::Drop, true)
+        Ring3SqlVerb::Drop
     } else if eq_ascii_nocase(verb_bytes, b"BEGIN") {
-        (Ring3SqlVerb::Begin, true)
+        Ring3SqlVerb::Begin
     } else if eq_ascii_nocase(verb_bytes, b"COMMIT") {
-        (Ring3SqlVerb::Commit, true)
+        Ring3SqlVerb::Commit
     } else if eq_ascii_nocase(verb_bytes, b"ROLLBACK") {
-        (Ring3SqlVerb::Rollback, true)
+        Ring3SqlVerb::Rollback
     } else {
-        (Ring3SqlVerb::Unknown, true)
+        return None;
     };
+    let is_mutating = !is_ro;
 
     let toks = ring3_count_sql_tokens(trimmed);
     if toks == 0 {
@@ -1931,10 +2026,13 @@ fn ring3_count_sql_tokens(s: &[u8]) -> u8 {
     count
 }
 
-/// Tokenize and validate a shell or user-ELF command inside `svc-sh`'s Ring-3 user-space sandbox.
+/// Tokenize and validate a single-line shell or user-ELF command in the mailbox lexical pre-filter.
 pub fn ring3_parse_shell_body(body: &[u8], is_elf_exec: bool) -> Option<u8> {
     let trimmed = trim_ring3_ws(body);
     if trimmed.is_empty() || trimmed.len() > IPC_MAILBOX_BODY_CAP {
+        return None;
+    }
+    if !ring3_is_single_line(trimmed) {
         return None;
     }
 
@@ -1946,54 +2044,22 @@ pub fn ring3_parse_shell_body(body: &[u8], is_elf_exec: bool) -> Option<u8> {
     let first_word = &trimmed[..first_end];
     if !is_elf_exec && eq_ascii_nocase(first_word, b"sql") {
         let rest = trim_ring3_ws(&trimmed[first_end..]);
-        let (sql_toks, _, _) = ring3_parse_sql_body(rest)?;
+        let (sql_toks, _, _) = ring3_parse_sql_body_for_op(rest, false)?;
         return Some(sql_toks.saturating_add(1));
     }
 
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut i = 0usize;
-    while i < trimmed.len() {
-        let b = trimmed[i];
-        if in_single {
-            if b == b'\'' {
-                in_single = false;
+    if is_elf_exec {
+        let mut i = 0usize;
+        while i < trimmed.len() {
+            let b = trimmed[i];
+            if b == b'.' && i + 1 < trimmed.len() && trimmed[i + 1] == b'.' {
+                return None;
+            }
+            if b == b';' || b == b'|' || b == b'`' || b == b'&' || b == b'\'' || b == b'"' {
+                return None;
             }
             i += 1;
-            continue;
         }
-        if in_double {
-            if b == b'"' {
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-        if b == b'\'' {
-            in_single = true;
-            i += 1;
-            continue;
-        }
-        if b == b'"' {
-            in_double = true;
-            i += 1;
-            continue;
-        }
-        // Reject command chaining, pipe smuggling, and subshell expansion outside quotes.
-        if b == b';' || b == b'|' || b == b'`' || b == b'&' {
-            return None;
-        }
-        if b == b'$' && i + 1 < trimmed.len() && (trimmed[i + 1] == b'(' || trimmed[i + 1] == b'{')
-        {
-            return None;
-        }
-        if is_elf_exec && b == b'.' && i + 1 < trimmed.len() && trimmed[i + 1] == b'.' {
-            return None;
-        }
-        i += 1;
-    }
-    if in_single || in_double {
-        return None;
     }
 
     let mut toks = 0u8;
@@ -2679,31 +2745,55 @@ mod tests {
             );
         }
 
-        // 3. Edge-case & Adversarial SQL payloads (empty, unbalanced quotes, comment smuggling,
-        //    stacked multi-statement injection, NUL bytes, control characters) rejected in Ring-3:
+        // 3. Edge-case & Malformed SQL payloads (empty on SqlMutate, unbalanced quotes,
+        //    stacked multi-statement injection, unknown verb, NUL/control bytes, embedded newlines)
+        //    are rejected with `BadRequest` without inflating `policy_denials` or `requests_served`:
+        let sql_denials_before = sup.services[ServiceId::Sql.index()].policy_denials;
         let bad_sql_payloads: &[&[u8]] = &[
             b"",
             b"   \t\r\n  ",
+            b";;;",
             b"SELECT * FROM kv WHERE k = 'unterminated",
-            b"SELECT * FROM kv -- comment smuggling",
-            b"SELECT /* inline comment */ * FROM kv",
             b"SELECT * FROM kv; DROP TABLE kv",
             b"INSERT INTO kv VALUES ('a', 'b', 1); DELETE FROM kv",
+            b"SELECT * FROM kv\nDROP TABLE kv",
             b"SELECT * FROM kv WHERE k = 'a\0b'",
             b"SELECT * FROM kv WHERE k = 'a\x07b'",
+            b"FOOBAR * FROM kv",
         ];
         for bad in bad_sql_payloads {
             sup.stage_mailbox_request(ServiceId::Sql, b"/sql", bad)
                 .unwrap();
             assert_eq!(
-                sup.parse_and_validate_ring3_mailbox(IpcOp::SqlMutate, &mut audit),
-                Err(ServiceError::SandboxTrap),
-                "malformed/injected SQL {:?} must be trapped in Ring-3 user space",
+                sup.validate_mailbox_request_prefilter(IpcOp::SqlMutate, &mut audit),
+                Err(ServiceError::BadRequest),
+                "malformed SQL {:?} must return BadRequest",
                 core::str::from_utf8(bad).unwrap_or("<binary>")
             );
         }
+        assert_eq!(
+            sup.services[ServiceId::Sql.index()].policy_denials,
+            sql_denials_before,
+            "BadRequest pre-filter rejections must not inflate policy_denials"
+        );
 
-        // 4. Adversarial Path Traversal & Malformed Paths rejected in Ring-3:
+        // Valid SQL edge cases (`""` on SqlQuery -> `.tables`, `SELECT ... ;;`, `.TABLES`, `.dump`):
+        for valid_ro_sql in [
+            b"".as_slice(),
+            b"SELECT * FROM kv ;;".as_slice(),
+            b".TABLES".as_slice(),
+            b".dump kv".as_slice(),
+        ] {
+            sup.stage_mailbox_request(ServiceId::Sql, b"/sql", valid_ro_sql)
+                .unwrap();
+            let sum_ro = sup
+                .validate_mailbox_request_prefilter(IpcOp::SqlQuery, &mut audit)
+                .expect("valid read-only SQL edge case must pass pre-filter");
+            assert!(!sum_ro.is_mutating);
+        }
+
+        // 4. Adversarial Path Traversal & Malformed Paths rejected with `BadRequest`:
+        let sh_denials_before = sup.services[ServiceId::Shell.index()].policy_denials;
         let bad_paths: &[&[u8]] = &[
             b"",
             b"relative/path",
@@ -2717,35 +2807,69 @@ mod tests {
             sup.stage_mailbox_request(ServiceId::Shell, bad_p, b"ok")
                 .unwrap();
             assert_eq!(
-                sup.parse_and_validate_ring3_mailbox(IpcOp::VfsWrite, &mut audit),
-                Err(ServiceError::SandboxTrap),
-                "bad path {:?} must be trapped in Ring-3 user space",
+                sup.validate_mailbox_request_prefilter(IpcOp::VfsWrite, &mut audit),
+                Err(ServiceError::BadRequest),
+                "bad path {:?} must return BadRequest",
                 core::str::from_utf8(bad_p).unwrap_or("<binary>")
             );
         }
 
-        // 5. Adversarial Shell & ELF command chaining (`;`, `&&`, `||`, `|`, `` ` ``, `$()`) rejected in Ring-3:
+        // Binary bodies are permitted on `IpcOp::VfsWrite`:
+        sup.stage_mailbox_request(
+            ServiceId::Shell,
+            b"/var/blob.bin",
+            b"\x00\x01\x02\x7f\xfe\xff",
+        )
+        .unwrap();
+        assert!(sup
+            .validate_mailbox_request_prefilter(IpcOp::VfsWrite, &mut audit)
+            .is_ok());
+
+        // 5. Valid single-line shell arguments (`write /var/note it's`, `a;b`, `fish&chips`) pass,
+        //    while empty/multi-line commands and `..` ELF paths are rejected with `BadRequest`:
+        for valid_sh in [
+            b"write /var/note it's".as_slice(),
+            b"write /var/note a;b".as_slice(),
+            b"write /var/note fish&chips".as_slice(),
+        ] {
+            sup.stage_mailbox_request(ServiceId::Shell, b"/sh", valid_sh)
+                .unwrap();
+            assert!(
+                sup.validate_mailbox_request_prefilter(IpcOp::ShellExec, &mut audit)
+                    .is_ok(),
+                "valid single-line shell command {:?} must pass pre-filter",
+                core::str::from_utf8(valid_sh).unwrap()
+            );
+        }
         let bad_shell_cmds: &[&[u8]] = &[
             b"",
-            b"status; reboot",
-            b"status && halt",
-            b"status || write /var/pwn 1",
-            b"cat /etc/hostname | sh",
-            b"echo `uname`",
-            b"echo $(uname)",
-            b"write /var/x \"unbalanced",
+            b"   \t  ",
+            b"status\nreboot",
+            b"status\r\nhalt",
+            b"sql SELECT * FROM kv; DROP TABLE kv",
         ];
         for bad_sh in bad_shell_cmds {
             sup.stage_mailbox_request(ServiceId::Shell, b"/sh", bad_sh)
                 .unwrap();
             assert_eq!(
-                sup.parse_and_validate_ring3_mailbox(IpcOp::ShellExec, &mut audit),
-                Err(ServiceError::SandboxTrap),
-                "shell injection {:?} must be trapped in Ring-3 user space",
+                sup.validate_mailbox_request_prefilter(IpcOp::ShellExec, &mut audit),
+                Err(ServiceError::BadRequest),
+                "malformed shell command {:?} must return BadRequest",
                 core::str::from_utf8(bad_sh).unwrap_or("<binary>")
             );
         }
-        assert!(sup.services[ServiceId::Sql.index()].mailbox.ring3_parser_rejects >= 9);
-        assert!(sup.services[ServiceId::Shell.index()].mailbox.ring3_parser_rejects >= 14);
+        sup.stage_mailbox_request(ServiceId::Shell, b"/exec", b"/bin/../sbin/init")
+            .unwrap();
+        assert_eq!(
+            sup.validate_mailbox_request_prefilter(IpcOp::UserElfExec, &mut audit),
+            Err(ServiceError::BadRequest)
+        );
+        assert_eq!(
+            sup.services[ServiceId::Shell.index()].policy_denials,
+            sh_denials_before,
+            "BadRequest pre-filter rejections must not inflate policy_denials"
+        );
+        assert!(sup.services[ServiceId::Sql.index()].mailbox.ring3_parser_rejects >= 10);
+        assert!(sup.services[ServiceId::Shell.index()].mailbox.ring3_parser_rejects >= 13);
     }
 }

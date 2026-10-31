@@ -1,23 +1,34 @@
-//! Sealed 4 KiB B+Tree Block Storage Engine (`CTTLBTP1`) with RAID-5 XOR Parity Recovery.
+//! Standalone `#![no_std]` Sealed 4 KiB B+Tree Block Storage Library (`CTTLBTP1`)
+//! with Per-Tree Key Derivation, Sealed Anti-Rollback Manifest, Link Validation,
+//! Free-Page Reclamation, and RAID-5 XOR Parity Recovery.
 //!
-//! Scales structured key-value and relational row storage beyond a single 4 KiB partition
-//! by organizing 4 KiB (`8 × 512B` AHCI/NVMe sector) disk blocks into a B+Tree of
-//! internal index pages and sibling-linked leaf pages:
+//! Note: This module is a standalone `#![no_std]` B+Tree storage library component
+//! (separate from [`crate::sql::SqlDb`]'s 4 KiB `CTTLSQL1` partition).
+//!
+//! Key guarantees:
 //! - Every 4 KiB page (`[u8; 4096]`) carries an 8-byte `"CTTLBTP1"` magic header, page ID,
-//!   node kind (`Leaf` vs. `Internal`), entry count, sibling/parent links, monotonic LSN,
-//!   and a constant-time keyed `HMAC-SHA256` authentication tag (`[32..64]`).
-//! - Automatic leaf splits at 64 records per 4 KiB page promote separator keys into the
-//!   internal root page and link leaf sibling pointers (`next_leaf`) for ordered range scans.
-//! - Every read (`get`, `scan_range`, `verify_all_page_seals`) verifies the visited 4 KiB
-//!   page's keyed `HMAC-SHA256` tag in constant time before trusting any on-page pointer or cell.
-//! - Supports 4 KiB RAID-5 XOR parity ($D_1 \oplus D_2 = P$) computation and single-page
-//!   catastrophic corruption recovery (`heal_corrupted_page_with_xor_parity`).
+//!   node kind (`Leaf` vs. `Internal`), entry count, sibling/parent links, `tree_id` tag,
+//!   monotonic LSN, and a constant-time keyed `HMAC-SHA256` authentication tag (`[32..64]`)
+//!   computed under a per-tree derived key (`HMAC-SHA256(seal_key, "CTTLBTP1-TREE-KEY" || tree_id)`).
+//! - A sealed [`BTreeManifest`] (`"CTTLMNF1"`) binds `tree_id`, `epoch`, `root_page`,
+//!   `allocated_pages`, `free_mask`, `lsn`, `total_records`, and the expected `page_lsns`
+//!   array under `HMAC-SHA256`, catching single-page rollback, stale-parity healing, and
+//!   cross-tree page substitution.
+//! - Every read and traversal validates on-page `next_leaf`, `parent`, `rightmost_child`,
+//!   and internal `left_child` links before indexing into the page pool.
+//! - Emptied non-root leaf pages are unlinked and reclaimed via `free_mask` on `delete`.
+//! - `scan_range` never silently truncates: returns [`BTreeError::BufferTooSmall`] if the
+//!   caller's output slice cannot hold all matching records.
 
 #![allow(clippy::needless_range_loop)]
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::durable_seal::{
     is_seal_key_set, seal_bytes_keyed, seal_matches_keyed, DURABLE_DIGEST_LEN,
 };
+
+static NEXT_BTREE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Byte size of a single B+Tree storage page (`4 KiB` = `8` × 512-byte sectors).
 pub const BTREE_PAGE_SIZE: usize = 4096;
@@ -27,9 +38,11 @@ pub const BTREE_SECTORS_PER_PAGE: usize = 8;
 pub const BTREE_MAX_PAGES: usize = 32;
 /// 8-byte magic header on every sealed 4 KiB B+Tree page.
 pub const BTREE_PAGE_MAGIC: &[u8; 8] = b"CTTLBTP1";
+/// 8-byte magic header on every sealed [`BTreeManifest`].
+pub const BTREE_MANIFEST_MAGIC: &[u8; 8] = b"CTTLMNF1";
 /// Sentinel page ID indicating no sibling or parent page (`0xFFFF`).
 pub const BTREE_NO_PAGE: u16 = 0xFFFF;
-/// Maximum number of records stored in a single 4 KiB leaf page before splitting (`64` × 56B = `3,584B`).
+/// Maximum number of records stored in a single 4 KiB leaf page before splitting (`64` × 60B = `3,840B`).
 pub const BTREE_LEAF_MAX_ENTRIES: usize = 64;
 /// Maximum number of separator keys stored in an internal index page (`31` separators -> `32` children).
 pub const BTREE_INTERNAL_MAX_KEYS: usize = 31;
@@ -63,15 +76,44 @@ pub enum BTreeError {
     InvalidInput,
     /// Input exceeds [`BTREE_KEY_LABEL_CAP`] (`16B`) or [`BTREE_VAL_CAP`] (`24B`).
     InputTooLarge,
+    /// Output buffer provided to [`BTreePager::scan_range`] is too small for all matching records.
+    BufferTooSmall,
     /// Page pool (`BTREE_MAX_PAGES`) is exhausted.
     PagerFull,
     /// Requested page ID is out of range or unallocated.
     InvalidPageId,
-    /// Constant-time `HMAC-SHA256` verification failed or page header is corrupted.
+    /// Sealed [`BTreeManifest`] failed `HMAC-SHA256` or structural verification.
+    ManifestTampered,
+    /// Constant-time `HMAC-SHA256` verification, LSN anti-rollback check, or link validation failed.
     PageTampered {
-        /// Page index whose seal or header failed verification.
+        /// Page index whose seal, LSN, or header failed verification.
         page_id: u16,
     },
+}
+
+/// Sealed root & per-page LSN anti-rollback manifest for a [`BTreePager`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BTreeManifest {
+    /// 8-byte `"CTTLMNF1"` magic header.
+    pub magic: [u8; 8],
+    /// Unique 64-bit tree identifier bound into the per-tree derived HMAC key.
+    pub tree_id: u64,
+    /// Monotonic structural/seal epoch.
+    pub epoch: u64,
+    /// Current root page ID (`0..BTREE_MAX_PAGES`).
+    pub root_page: u16,
+    /// High-water number of page slots initialized (`1..=BTREE_MAX_PAGES`).
+    pub allocated_pages: u16,
+    /// Bitmask of reclaimed free page slots (`bit i == 1` means page `i` is free).
+    pub free_mask: u32,
+    /// Latest committed Log Sequence Number.
+    pub lsn: u64,
+    /// Total live records stored across all leaf pages.
+    pub total_records: u32,
+    /// Expected LSN for every page slot (`0` for free/unallocated pages).
+    pub page_lsns: [u64; BTREE_MAX_PAGES],
+    /// Constant-time `HMAC-SHA256` tag over all manifest fields under the per-tree derived key.
+    pub hmac_tag: [u8; DURABLE_DIGEST_LEN],
 }
 
 /// Structured record stored in a [`BTreePager`] leaf page.
@@ -155,21 +197,32 @@ impl BTreeRecord {
     }
 }
 
-/// Paged 4 KiB B+Tree Block Storage Engine with per-page `HMAC-SHA256` sealing.
+/// Standalone Paged 4 KiB B+Tree Block Storage Engine with per-tree derived `HMAC-SHA256`
+/// sealing and sealed per-page LSN anti-rollback manifest.
 #[derive(Clone)]
 pub struct BTreePager {
-    /// 256-bit `HMAC-SHA256` key used to seal and verify every 4 KiB page.
+    /// Master 256-bit `HMAC-SHA256` key from which the per-tree key is derived.
     pub seal_key: [u8; DURABLE_DIGEST_LEN],
+    /// Unique 64-bit tree identifier bound into every page seal and the manifest key.
+    pub tree_id: u64,
+    /// Monotonic manifest epoch incremented on every page seal or structural update.
+    pub epoch: u64,
     /// Page ID of the current B+Tree root page (`0..BTREE_MAX_PAGES`).
     pub root_page: u16,
-    /// Number of allocated 4 KiB pages (`1..=BTREE_MAX_PAGES`).
+    /// High-water number of initialized 4 KiB page slots (`1..=BTREE_MAX_PAGES`).
     pub allocated_pages: u16,
+    /// Bitmask of reclaimed free page slots (`bit i == 1` means page `i` is free).
+    pub free_mask: u32,
     /// Monotonic Log Sequence Number incremented on every page seal operation.
     pub lsn: u64,
     /// Total leaf page split operations performed.
     pub leaf_splits: u64,
     /// Total records currently stored across all leaf pages.
     pub total_records: usize,
+    /// Expected committed LSN for each page slot (`0` for free/unallocated pages).
+    pub page_lsns: [u64; BTREE_MAX_PAGES],
+    /// Sealed `HMAC-SHA256` tag over the current manifest state.
+    pub manifest_tag: [u8; DURABLE_DIGEST_LEN],
     /// Fixed pool of 4 KiB (`4096`-byte) sealed disk pages.
     pub pages: [[u8; BTREE_PAGE_SIZE]; BTREE_MAX_PAGES],
 }
@@ -179,26 +232,176 @@ impl BTreePager {
     pub const fn empty() -> Self {
         Self {
             seal_key: [0u8; DURABLE_DIGEST_LEN],
+            tree_id: 0,
+            epoch: 0,
             root_page: 0,
             allocated_pages: 0,
+            free_mask: 0,
             lsn: 0,
             leaf_splits: 0,
             total_records: 0,
+            page_lsns: [0u64; BTREE_MAX_PAGES],
+            manifest_tag: [0u8; DURABLE_DIGEST_LEN],
             pages: [[0u8; BTREE_PAGE_SIZE]; BTREE_MAX_PAGES],
         }
     }
 
-    /// Construct and initialize a provisioned [`BTreePager`] with a sealed empty root leaf page (`page 0`).
+    /// Construct and initialize a provisioned [`BTreePager`] with a fresh unique `tree_id`
+    /// and a sealed empty root leaf page (`page 0`).
     pub fn new(seal_key: [u8; DURABLE_DIGEST_LEN]) -> Result<Self, BTreeError> {
+        let tid = NEXT_BTREE_ID.fetch_add(1, Ordering::Relaxed);
+        Self::new_with_tree_id(seal_key, tid)
+    }
+
+    /// Construct and initialize a provisioned [`BTreePager`] bound to an explicit `tree_id`.
+    pub fn new_with_tree_id(
+        seal_key: [u8; DURABLE_DIGEST_LEN],
+        tree_id: u64,
+    ) -> Result<Self, BTreeError> {
         if !is_seal_key_set(&seal_key) {
             return Err(BTreeError::SealKeyUnset);
         }
+        if tree_id == 0 {
+            return Err(BTreeError::InvalidInput);
+        }
         let mut pager = Self::empty();
         pager.seal_key = seal_key;
+        pager.tree_id = tree_id;
         pager.allocated_pages = 1;
         pager.root_page = 0;
-        pager.init_page_header(0, BTreePageKind::Leaf, 0, BTREE_NO_PAGE, BTREE_NO_PAGE, BTREE_NO_PAGE);
+        pager.init_page_header(
+            0,
+            BTreePageKind::Leaf,
+            0,
+            BTREE_NO_PAGE,
+            BTREE_NO_PAGE,
+            BTREE_NO_PAGE,
+        );
         pager.seal_page(0)?;
+        Ok(pager)
+    }
+
+    fn derived_tree_key(&self) -> [u8; DURABLE_DIGEST_LEN] {
+        let mut kdf_msg = [0u8; 25];
+        kdf_msg[0..17].copy_from_slice(b"CTTLBTP1-TREE-KEY");
+        kdf_msg[17..25].copy_from_slice(&self.tree_id.to_le_bytes());
+        let mut out = [0u8; DURABLE_DIGEST_LEN];
+        seal_bytes_keyed(&self.seal_key, &kdf_msg, &mut out);
+        out
+    }
+
+    #[inline]
+    fn is_page_free(&self, page_id: u16) -> bool {
+        (page_id as usize) >= BTREE_MAX_PAGES || ((self.free_mask >> page_id) & 1) != 0
+    }
+
+    fn compute_manifest_tag(&self) -> [u8; DURABLE_DIGEST_LEN] {
+        let mut buf = [0u8; 8 + 8 + 8 + 2 + 2 + 4 + 8 + 4 + (BTREE_MAX_PAGES * 8)];
+        buf[0..8].copy_from_slice(BTREE_MANIFEST_MAGIC);
+        buf[8..16].copy_from_slice(&self.tree_id.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.epoch.to_le_bytes());
+        buf[24..26].copy_from_slice(&self.root_page.to_le_bytes());
+        buf[26..28].copy_from_slice(&self.allocated_pages.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.free_mask.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.lsn.to_le_bytes());
+        buf[40..44].copy_from_slice(&(self.total_records as u32).to_le_bytes());
+        let mut i = 0usize;
+        while i < BTREE_MAX_PAGES {
+            let off = 44 + i * 8;
+            buf[off..off + 8].copy_from_slice(&self.page_lsns[i].to_le_bytes());
+            i += 1;
+        }
+        let tree_key = self.derived_tree_key();
+        let mut tag = [0u8; DURABLE_DIGEST_LEN];
+        seal_bytes_keyed(&tree_key, &buf, &mut tag);
+        tag
+    }
+
+    fn refresh_manifest(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.manifest_tag = self.compute_manifest_tag();
+    }
+
+    /// Verify the constant-time `HMAC-SHA256` seal of the pager's internal manifest.
+    pub fn verify_manifest(&self) -> Result<(), BTreeError> {
+        if !is_seal_key_set(&self.seal_key) {
+            return Err(BTreeError::SealKeyUnset);
+        }
+        if self.tree_id == 0
+            || self.allocated_pages == 0
+            || (self.allocated_pages as usize) > BTREE_MAX_PAGES
+            || (self.root_page as usize) >= (self.allocated_pages as usize)
+            || self.is_page_free(self.root_page)
+        {
+            return Err(BTreeError::ManifestTampered);
+        }
+        let mut buf = [0u8; 8 + 8 + 8 + 2 + 2 + 4 + 8 + 4 + (BTREE_MAX_PAGES * 8)];
+        buf[0..8].copy_from_slice(BTREE_MANIFEST_MAGIC);
+        buf[8..16].copy_from_slice(&self.tree_id.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.epoch.to_le_bytes());
+        buf[24..26].copy_from_slice(&self.root_page.to_le_bytes());
+        buf[26..28].copy_from_slice(&self.allocated_pages.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.free_mask.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.lsn.to_le_bytes());
+        buf[40..44].copy_from_slice(&(self.total_records as u32).to_le_bytes());
+        let mut i = 0usize;
+        while i < BTREE_MAX_PAGES {
+            let off = 44 + i * 8;
+            buf[off..off + 8].copy_from_slice(&self.page_lsns[i].to_le_bytes());
+            i += 1;
+        }
+        let tree_key = self.derived_tree_key();
+        if !seal_matches_keyed(&tree_key, &buf, &self.manifest_tag) {
+            return Err(BTreeError::ManifestTampered);
+        }
+        Ok(())
+    }
+
+    /// Export a verified, `HMAC-SHA256`-sealed [`BTreeManifest`] for persistent storage.
+    pub fn export_manifest(&self) -> Result<BTreeManifest, BTreeError> {
+        self.verify_manifest()?;
+        Ok(BTreeManifest {
+            magic: *BTREE_MANIFEST_MAGIC,
+            tree_id: self.tree_id,
+            epoch: self.epoch,
+            root_page: self.root_page,
+            allocated_pages: self.allocated_pages,
+            free_mask: self.free_mask,
+            lsn: self.lsn,
+            total_records: self.total_records as u32,
+            page_lsns: self.page_lsns,
+            hmac_tag: self.manifest_tag,
+        })
+    }
+
+    /// Reconstruct and verify a [`BTreePager`] from a sealed [`BTreeManifest`] and 4 KiB page pool,
+    /// verifying both the manifest `HMAC-SHA256` and every active page's seal, LSN, and links.
+    pub fn load_from_manifest_and_pages(
+        seal_key: [u8; DURABLE_DIGEST_LEN],
+        manifest: &BTreeManifest,
+        pages: &[[u8; BTREE_PAGE_SIZE]; BTREE_MAX_PAGES],
+    ) -> Result<Self, BTreeError> {
+        if !is_seal_key_set(&seal_key) {
+            return Err(BTreeError::SealKeyUnset);
+        }
+        if &manifest.magic != BTREE_MANIFEST_MAGIC {
+            return Err(BTreeError::ManifestTampered);
+        }
+        let pager = Self {
+            seal_key,
+            tree_id: manifest.tree_id,
+            epoch: manifest.epoch,
+            root_page: manifest.root_page,
+            allocated_pages: manifest.allocated_pages,
+            free_mask: manifest.free_mask,
+            lsn: manifest.lsn,
+            leaf_splits: 0,
+            total_records: manifest.total_records as usize,
+            page_lsns: manifest.page_lsns,
+            manifest_tag: manifest.hmac_tag,
+            pages: *pages,
+        };
+        pager.verify_all_page_seals()?;
         Ok(pager)
     }
 
@@ -220,34 +423,43 @@ impl BTreePager {
         p[13..15].copy_from_slice(&next_leaf.to_le_bytes());
         p[15..17].copy_from_slice(&parent.to_le_bytes());
         p[17..19].copy_from_slice(&rightmost_child.to_le_bytes());
+        p[20..24].copy_from_slice(&(self.tree_id as u32).to_le_bytes());
     }
 
     fn seal_page(&mut self, page_id: u16) -> Result<(), BTreeError> {
         if !is_seal_key_set(&self.seal_key) {
             return Err(BTreeError::SealKeyUnset);
         }
-        if (page_id as usize) >= (self.allocated_pages as usize) {
+        if (page_id as usize) >= (self.allocated_pages as usize) || self.is_page_free(page_id) {
             return Err(BTreeError::InvalidPageId);
         }
         self.lsn = self.lsn.wrapping_add(1);
+        let new_lsn = self.lsn;
+        let tree_id = self.tree_id;
+        let tree_key = self.derived_tree_key();
         let p = &mut self.pages[page_id as usize];
-        p[24..32].copy_from_slice(&self.lsn.to_le_bytes());
-        // Compute HMAC-SHA256 over header `[0..32]` || payload `[64..4096]`.
-        let mut msg = [0u8; 32 + (BTREE_PAGE_SIZE - BTREE_HEADER_BYTES)];
-        msg[0..32].copy_from_slice(&p[0..32]);
-        msg[32..].copy_from_slice(&p[BTREE_HEADER_BYTES..]);
+        p[20..24].copy_from_slice(&(tree_id as u32).to_le_bytes());
+        p[24..32].copy_from_slice(&new_lsn.to_le_bytes());
+        // Compute HMAC-SHA256 over `tree_id` `[0..8]` || header `[0..32]` || payload `[64..4096]`.
+        let mut msg = [0u8; 8 + 32 + (BTREE_PAGE_SIZE - BTREE_HEADER_BYTES)];
+        msg[0..8].copy_from_slice(&tree_id.to_le_bytes());
+        msg[8..40].copy_from_slice(&p[0..32]);
+        msg[40..].copy_from_slice(&p[BTREE_HEADER_BYTES..]);
         let mut tag = [0u8; DURABLE_DIGEST_LEN];
-        seal_bytes_keyed(&self.seal_key, &msg, &mut tag);
+        seal_bytes_keyed(&tree_key, &msg, &mut tag);
         p[32..64].copy_from_slice(&tag);
+        self.page_lsns[page_id as usize] = new_lsn;
+        self.refresh_manifest();
         Ok(())
     }
 
-    /// Verify in constant time the `CTTLBTP1` header and `HMAC-SHA256` seal of `page_id`.
+    /// Verify in constant time the `CTTLBTP1` header, `tree_id`, expected LSN, structural links,
+    /// and per-tree `HMAC-SHA256` seal of `page_id`.
     pub fn verify_page_seal(&self, page_id: u16) -> Result<BTreePageKind, BTreeError> {
         if !is_seal_key_set(&self.seal_key) {
             return Err(BTreeError::SealKeyUnset);
         }
-        if (page_id as usize) >= (self.allocated_pages as usize) {
+        if (page_id as usize) >= (self.allocated_pages as usize) || self.is_page_free(page_id) {
             return Err(BTreeError::InvalidPageId);
         }
         let p = &self.pages[page_id as usize];
@@ -256,6 +468,17 @@ impl BTreePager {
         }
         let pid = u16::from_le_bytes([p[8], p[9]]);
         if pid != page_id {
+            return Err(BTreeError::PageTampered { page_id });
+        }
+        let tid_lo = u32::from_le_bytes([p[20], p[21], p[22], p[23]]);
+        if tid_lo != (self.tree_id as u32) {
+            return Err(BTreeError::PageTampered { page_id });
+        }
+        let on_page_lsn = u64::from_le_bytes([
+            p[24], p[25], p[26], p[27], p[28], p[29], p[30], p[31],
+        ]);
+        let expected_lsn = self.page_lsns[page_id as usize];
+        if expected_lsn == 0 || on_page_lsn != expected_lsn {
             return Err(BTreeError::PageTampered { page_id });
         }
         let kind = match p[10] {
@@ -269,26 +492,116 @@ impl BTreePager {
         {
             return Err(BTreeError::PageTampered { page_id });
         }
-        let mut msg = [0u8; 32 + (BTREE_PAGE_SIZE - BTREE_HEADER_BYTES)];
-        msg[0..32].copy_from_slice(&p[0..32]);
-        msg[32..].copy_from_slice(&p[BTREE_HEADER_BYTES..]);
+
+        let mut msg = [0u8; 8 + 32 + (BTREE_PAGE_SIZE - BTREE_HEADER_BYTES)];
+        msg[0..8].copy_from_slice(&self.tree_id.to_le_bytes());
+        msg[8..40].copy_from_slice(&p[0..32]);
+        msg[40..].copy_from_slice(&p[BTREE_HEADER_BYTES..]);
         let mut expected = [0u8; DURABLE_DIGEST_LEN];
         expected.copy_from_slice(&p[32..64]);
-        if !seal_matches_keyed(&self.seal_key, &msg, &expected) {
+        let tree_key = self.derived_tree_key();
+        if !seal_matches_keyed(&tree_key, &msg, &expected) {
             return Err(BTreeError::PageTampered { page_id });
         }
+
+        // Validate all on-page links (`next_leaf`, `parent`, `rightmost_child`, and internal `left_child`s)
+        // before any caller indexes `self.pages` using those links:
+        let next_leaf = u16::from_le_bytes([p[13], p[14]]);
+        let parent = u16::from_le_bytes([p[15], p[16]]);
+        let rightmost = u16::from_le_bytes([p[17], p[18]]);
+        let alloc = self.allocated_pages;
+
+        if page_id == self.root_page {
+            if parent != BTREE_NO_PAGE {
+                return Err(BTreeError::PageTampered { page_id });
+            }
+        } else if parent != BTREE_NO_PAGE
+            && (parent >= alloc || parent == page_id || self.is_page_free(parent))
+        {
+            return Err(BTreeError::PageTampered { page_id });
+        }
+
+        match kind {
+            BTreePageKind::Leaf => {
+                if rightmost != BTREE_NO_PAGE {
+                    return Err(BTreeError::PageTampered { page_id });
+                }
+                if next_leaf != BTREE_NO_PAGE
+                    && (next_leaf >= alloc
+                        || next_leaf == page_id
+                        || self.is_page_free(next_leaf))
+                {
+                    return Err(BTreeError::PageTampered { page_id });
+                }
+            }
+            BTreePageKind::Internal => {
+                if next_leaf != BTREE_NO_PAGE
+                    || rightmost >= alloc
+                    || rightmost == page_id
+                    || self.is_page_free(rightmost)
+                {
+                    return Err(BTreeError::PageTampered { page_id });
+                }
+                let mut i = 0usize;
+                while i < count {
+                    let (_, left_child) = self.read_internal_entry(page_id, i);
+                    if left_child >= alloc
+                        || left_child == page_id
+                        || self.is_page_free(left_child)
+                    {
+                        return Err(BTreeError::PageTampered { page_id });
+                    }
+                    i += 1;
+                }
+            }
+            BTreePageKind::Free => return Err(BTreeError::PageTampered { page_id }),
+        }
+
         Ok(kind)
     }
 
-    /// Verify the constant-time `HMAC-SHA256` seal on every allocated 4 KiB page in the pool.
+    /// Verify the sealed [`BTreeManifest`] and the constant-time `HMAC-SHA256` seal on every
+    /// active 4 KiB page in the pool.
     pub fn verify_all_page_seals(&self) -> Result<usize, BTreeError> {
+        self.verify_manifest()?;
         let n = self.allocated_pages as usize;
+        let mut active = 0usize;
         let mut i = 0usize;
         while i < n {
-            self.verify_page_seal(i as u16)?;
+            let pid = i as u16;
+            if !self.is_page_free(pid) {
+                self.verify_page_seal(pid)?;
+                active += 1;
+            }
             i += 1;
         }
-        Ok(n)
+        Ok(active)
+    }
+
+    fn available_page_slots(&self) -> usize {
+        let free_reclaimable = self.free_mask.count_ones() as usize;
+        let unallocated = BTREE_MAX_PAGES.saturating_sub(self.allocated_pages as usize);
+        free_reclaimable + unallocated
+    }
+
+    fn alloc_page_slot(&mut self) -> Result<u16, BTreeError> {
+        if self.free_mask != 0 {
+            let pid = self.free_mask.trailing_zeros() as u16;
+            self.free_mask &= !(1u32 << pid);
+            return Ok(pid);
+        }
+        if (self.allocated_pages as usize) >= BTREE_MAX_PAGES {
+            return Err(BTreeError::PagerFull);
+        }
+        let pid = self.allocated_pages;
+        self.allocated_pages += 1;
+        Ok(pid)
+    }
+
+    fn mark_page_free(&mut self, page_id: u16) {
+        self.pages[page_id as usize] = [0u8; BTREE_PAGE_SIZE];
+        self.page_lsns[page_id as usize] = 0;
+        self.free_mask |= 1u32 << page_id;
     }
 
     fn page_count(&self, page_id: u16) -> usize {
@@ -304,6 +617,11 @@ impl BTreePager {
     fn page_next_leaf(&self, page_id: u16) -> u16 {
         let p = &self.pages[page_id as usize];
         u16::from_le_bytes([p[13], p[14]])
+    }
+
+    fn set_page_next_leaf(&mut self, page_id: u16, next_leaf: u16) {
+        let p = &mut self.pages[page_id as usize];
+        p[13..15].copy_from_slice(&next_leaf.to_le_bytes());
     }
 
     fn page_parent(&self, page_id: u16) -> u16 {
@@ -367,8 +685,9 @@ impl BTreePager {
     }
 
     /// Route from `self.root_page` down to the target leaf page for `key`, verifying every
-    /// visited page's `HMAC-SHA256` seal in constant time.
+    /// visited page's `HMAC-SHA256` seal, LSN, and links in constant time.
     fn find_leaf_page(&self, key: i64) -> Result<u16, BTreeError> {
+        self.verify_manifest()?;
         let mut curr = self.root_page;
         let mut depth = 0usize;
         while depth < 8 {
@@ -387,7 +706,7 @@ impl BTreePager {
                 }
                 i += 1;
             }
-            if (chosen as usize) >= (self.allocated_pages as usize) {
+            if (chosen as usize) >= (self.allocated_pages as usize) || self.is_page_free(chosen) {
                 return Err(BTreeError::PageTampered { page_id: curr });
             }
             curr = chosen;
@@ -472,23 +791,27 @@ impl BTreePager {
             }
             self.write_leaf_record(leaf_id, pos, &rec);
             self.set_page_count(leaf_id, count + 1);
-            self.seal_page(leaf_id)?;
             self.total_records += 1;
+            self.seal_page(leaf_id)?;
             return Ok(leaf_id);
         }
 
         // Otherwise, split the full 64-entry leaf page across two 4 KiB leaf pages!
-        let needed_pages = if self.page_parent(leaf_id) == BTREE_NO_PAGE {
+        let parent_id = self.page_parent(leaf_id);
+        let needed_pages = if parent_id == BTREE_NO_PAGE {
             2usize // new right leaf + new internal root page
         } else {
             1usize // new right leaf
         };
-        if (self.allocated_pages as usize) + needed_pages > BTREE_MAX_PAGES {
+        if self.available_page_slots() < needed_pages {
             return Err(BTreeError::PagerFull);
         }
-        if self.page_parent(leaf_id) != BTREE_NO_PAGE {
-            let p_id = self.page_parent(leaf_id);
-            if self.page_count(p_id) >= BTREE_INTERNAL_MAX_KEYS {
+        if parent_id != BTREE_NO_PAGE {
+            let p_kind = self.verify_page_seal(parent_id)?;
+            if p_kind != BTreePageKind::Internal {
+                return Err(BTreeError::PageTampered { page_id: parent_id });
+            }
+            if self.page_count(parent_id) >= BTREE_INTERNAL_MAX_KEYS {
                 return Err(BTreeError::PagerFull);
             }
         }
@@ -514,10 +837,8 @@ impl BTreePager {
         let right_count = (BTREE_LEAF_MAX_ENTRIES + 1) - left_count; // 33
         let sep_key = all[left_count].key;
 
-        let right_id = self.allocated_pages;
-        self.allocated_pages += 1;
+        let right_id = self.alloc_page_slot()?;
         let old_next = self.page_next_leaf(leaf_id);
-        let parent_id = self.page_parent(leaf_id);
 
         // Rewrite left leaf (`leaf_id`):
         self.init_page_header(
@@ -549,10 +870,12 @@ impl BTreePager {
             ri += 1;
         }
 
+        self.total_records += 1;
+        self.leaf_splits += 1;
+
         if parent_id == BTREE_NO_PAGE {
             // Allocate new internal root page:
-            let new_root = self.allocated_pages;
-            self.allocated_pages += 1;
+            let new_root = self.alloc_page_slot()?;
             self.init_page_header(
                 new_root,
                 BTreePageKind::Internal,
@@ -569,7 +892,6 @@ impl BTreePager {
             self.seal_page(right_id)?;
             self.seal_page(new_root)?;
         } else {
-            self.verify_page_seal(parent_id)?;
             let p_count = self.page_count(parent_id);
             // Insert `(sep_key, leaf_id)` into `parent_id` and update child pointer after `sep_key` to `right_id`:
             let mut ins_at = p_count;
@@ -583,7 +905,6 @@ impl BTreePager {
                 pi += 1;
             }
             if ins_at == p_count {
-                // `leaf_id` was `rightmost_child`; now `leaf_id` becomes entry `p_count` and `right_id` is `rightmost_child`.
                 self.write_internal_entry(parent_id, p_count, sep_key, leaf_id);
                 self.set_page_rightmost_child(parent_id, right_id);
             } else {
@@ -603,13 +924,11 @@ impl BTreePager {
             self.seal_page(parent_id)?;
         }
 
-        self.leaf_splits += 1;
-        self.total_records += 1;
         Ok(if key < sep_key { leaf_id } else { right_id })
     }
 
     /// Point lookup for `key` across the B+Tree, verifying the constant-time `HMAC-SHA256`
-    /// seal of the root and target leaf pages before binary-searching the leaf.
+    /// seal of the manifest, root, and target leaf pages before binary-searching the leaf.
     pub fn get(&self, key: i64) -> Result<Option<BTreeRecord>, BTreeError> {
         let leaf_id = self.find_leaf_page(key)?;
         let count = self.page_count(leaf_id);
@@ -631,7 +950,8 @@ impl BTreePager {
         Ok(None)
     }
 
-    /// Delete `key` from its B+Tree leaf page and re-seal the modified 4 KiB page.
+    /// Delete `key` from its B+Tree leaf page, reclaiming the leaf page into `free_mask`
+    /// if it becomes empty and is not the sole root page.
     pub fn delete(&mut self, key: i64) -> Result<bool, BTreeError> {
         let leaf_id = self.find_leaf_page(key)?;
         let count = self.page_count(leaf_id);
@@ -662,21 +982,92 @@ impl BTreePager {
             k += 1;
         }
         self.write_leaf_record(leaf_id, count - 1, &BTreeRecord::empty());
-        self.set_page_count(leaf_id, count - 1);
-        self.seal_page(leaf_id)?;
+        let new_count = count - 1;
+        self.set_page_count(leaf_id, new_count);
         self.total_records = self.total_records.saturating_sub(1);
+
+        let parent_id = self.page_parent(leaf_id);
+        if new_count == 0 && leaf_id != self.root_page && parent_id != BTREE_NO_PAGE {
+            let p_kind = self.verify_page_seal(parent_id)?;
+            if p_kind != BTreePageKind::Internal {
+                return Err(BTreeError::PageTampered { page_id: parent_id });
+            }
+            let p_count = self.page_count(parent_id);
+            if p_count >= 1 {
+                // 1. Unlink `leaf_id` from any predecessor leaf whose `next_leaf == leaf_id`:
+                let succ_leaf = self.page_next_leaf(leaf_id);
+                let mut pid = 0u16;
+                while pid < self.allocated_pages {
+                    if pid != leaf_id
+                        && !self.is_page_free(pid)
+                        && self.pages[pid as usize][10] == (BTreePageKind::Leaf as u8)
+                        && self.page_next_leaf(pid) == leaf_id
+                    {
+                        self.verify_page_seal(pid)?;
+                        self.set_page_next_leaf(pid, succ_leaf);
+                        self.seal_page(pid)?;
+                    }
+                    pid += 1;
+                }
+
+                // 2. Remove `leaf_id` from `parent_id`:
+                let mut child_idx = None;
+                let mut ci = 0usize;
+                while ci < p_count {
+                    let (_, lc) = self.read_internal_entry(parent_id, ci);
+                    if lc == leaf_id {
+                        child_idx = Some(ci);
+                        break;
+                    }
+                    ci += 1;
+                }
+                if let Some(c_at) = child_idx {
+                    let mut s = c_at;
+                    while s + 1 < p_count {
+                        let (nk, nc) = self.read_internal_entry(parent_id, s + 1);
+                        self.write_internal_entry(parent_id, s, nk, nc);
+                        s += 1;
+                    }
+                    self.write_internal_entry(parent_id, p_count - 1, 0, 0);
+                } else if self.page_rightmost_child(parent_id) == leaf_id {
+                    let (_, prev_lc) = self.read_internal_entry(parent_id, p_count - 1);
+                    self.set_page_rightmost_child(parent_id, prev_lc);
+                    self.write_internal_entry(parent_id, p_count - 1, 0, 0);
+                }
+
+                let new_p_count = p_count - 1;
+                self.mark_page_free(leaf_id);
+                if new_p_count == 0 && parent_id == self.root_page {
+                    let sole_child = self.page_rightmost_child(parent_id);
+                    self.verify_page_seal(sole_child)?;
+                    self.root_page = sole_child;
+                    self.set_page_parent(sole_child, BTREE_NO_PAGE);
+                    self.mark_page_free(parent_id);
+                    self.seal_page(sole_child)?;
+                } else {
+                    self.set_page_count(parent_id, new_p_count);
+                    self.seal_page(parent_id)?;
+                }
+                return Ok(true);
+            }
+        }
+
+        self.seal_page(leaf_id)?;
         Ok(true)
     }
 
     /// Ordered range scan over `[min_key ..= max_key]`, routing to the starting 4 KiB leaf page
     /// and following sibling `next_leaf` links while verifying every visited page's `HMAC-SHA256` seal.
+    ///
+    /// Never silently truncates: returns [`BTreeError::BufferTooSmall`] if the number of matching
+    /// records exceeds `out.len()`.
     pub fn scan_range(
         &self,
         min_key: i64,
         max_key: i64,
         out: &mut [BTreeRecord],
     ) -> Result<usize, BTreeError> {
-        if min_key > max_key || out.is_empty() {
+        if min_key > max_key {
             return Ok(0);
         }
         let mut leaf_id = self.find_leaf_page(min_key)?;
@@ -698,7 +1089,7 @@ impl BTreePager {
                 }
                 if rec.key >= min_key {
                     if written >= out.len() {
-                        return Ok(written);
+                        return Err(BTreeError::BufferTooSmall);
                     }
                     out[written] = rec;
                     written += 1;
@@ -742,14 +1133,16 @@ impl BTreePager {
 
     /// Reconstruct a corrupted or lost 4 KiB B+Tree page (`corrupted_page_id`) from a peer
     /// 4 KiB page and their 4 KiB RAID-5 XOR parity block ($D_{\text{rec}} = D_{\text{peer}} \oplus P$),
-    /// verifying its `CTTLBTP1` header and constant-time `HMAC-SHA256` seal before committing.
+    /// verifying its `CTTLBTP1` header, expected LSN, links, and constant-time `HMAC-SHA256` seal before committing.
     pub fn heal_corrupted_page_with_xor_parity(
         &mut self,
         corrupted_page_id: u16,
         peer_page: &[u8; BTREE_PAGE_SIZE],
         parity_page: &[u8; BTREE_PAGE_SIZE],
     ) -> Result<(), BTreeError> {
-        if (corrupted_page_id as usize) >= (self.allocated_pages as usize) {
+        if (corrupted_page_id as usize) >= (self.allocated_pages as usize)
+            || self.is_page_free(corrupted_page_id)
+        {
             return Err(BTreeError::InvalidPageId);
         }
         let mut recovered = [0u8; BTREE_PAGE_SIZE];
@@ -830,6 +1223,13 @@ mod tests {
             assert_eq!(scan_out[idx].key, 100 + (idx as i64));
         }
 
+        // Undersized range scan output buffer must return `Err(BTreeError::BufferTooSmall)` without silent truncation:
+        let mut tiny_out = [BTreeRecord::empty(); 10];
+        assert_eq!(
+            pager.scan_range(100, 249, &mut tiny_out),
+            Err(BTreeError::BufferTooSmall)
+        );
+
         // Delete 50 keys and confirm point lookup returns None while remaining 462 keys verify:
         for k in 200..250i64 {
             assert!(pager.delete(k).unwrap());
@@ -870,6 +1270,134 @@ mod tests {
             .expect("4 KiB RAID-5 XOR parity reconstruction must restore and verify HMAC seal");
         assert_eq!(pager.pages[0], page0_backup);
         assert_eq!(pager.get(1).unwrap().unwrap().val_bytes(), b"balance_ok");
+    }
+
+    #[test]
+    fn btree_pager_rejects_rollback_stale_parity_cross_tree_swap_corrupt_links_and_reclaims_deleted_pages()
+    {
+        let mut pager = BTreePager::new(TEST_BTREE_KEY).unwrap();
+        for k in 1..=160i64 {
+            pager.insert(k, b"acct_key", b"v1", k).unwrap();
+        }
+
+        // Snapshot Page 0 and its RAID-5 XOR parity at `v1` (`LSN` before update):
+        let stale_page0 = pager.pages[0];
+        let page1_snapshot = pager.pages[1];
+        let mut stale_parity = [0u8; BTREE_PAGE_SIZE];
+        BTreePager::compute_xor_parity_page(&stale_page0, &page1_snapshot, &mut stale_parity);
+
+        // Advance Page 0 by updating key 1 to `v2` and deleting key 2:
+        pager.insert(1, b"acct_key", b"v2", 99).unwrap();
+        assert!(pager.delete(2).unwrap());
+        let fresh_page0 = pager.pages[0];
+
+        // 1. Single-page rollback: restoring `stale_page0` (which has a valid HMAC under the tree key,
+        //    but an older LSN than `pager.page_lsns[0]`) is rejected!
+        pager.pages[0] = stale_page0;
+        assert_eq!(
+            pager.verify_page_seal(0),
+            Err(BTreeError::PageTampered { page_id: 0 }),
+            "restoring an older sealed snapshot of page 0 must be caught by expected LSN check"
+        );
+        assert_eq!(
+            pager.get(1),
+            Err(BTreeError::PageTampered { page_id: 0 })
+        );
+        pager.pages[0] = fresh_page0;
+
+        // 2. Stale parity heal: healing Page 0 with `stale_parity` is rejected!
+        pager.pages[0] = [0xAAu8; BTREE_PAGE_SIZE];
+        assert_eq!(
+            pager.heal_corrupted_page_with_xor_parity(0, &page1_snapshot, &stale_parity),
+            Err(BTreeError::PageTampered { page_id: 0 }),
+            "healing with stale parity must be rejected by expected LSN check"
+        );
+        pager.pages[0] = fresh_page0;
+        assert_eq!(pager.get(1).unwrap().unwrap().val_bytes(), b"v2");
+        assert!(pager.get(2).unwrap().is_none());
+
+        // 3. Cross-tree page substitution: a sealed page from another BTreePager initialized with
+        //    the same `TEST_BTREE_KEY` (and even at the same LSN!) is rejected due to per-tree key derivation.
+        let mut other_pager = BTreePager::new(TEST_BTREE_KEY).unwrap();
+        while other_pager.page_lsns[0] < pager.page_lsns[0] {
+            other_pager.insert(1, b"other_k", b"other_v", 1).unwrap();
+        }
+        assert_eq!(other_pager.page_lsns[0], pager.page_lsns[0]);
+        pager.pages[0] = other_pager.pages[0];
+        assert_eq!(
+            pager.verify_page_seal(0),
+            Err(BTreeError::PageTampered { page_id: 0 }),
+            "page from another BTreePager with the same master key and LSN must fail verification"
+        );
+        pager.pages[0] = fresh_page0;
+
+        // 4. Out-of-range link validation: a page with an out-of-range `next_leaf` (`99`) or `parent` (`99`),
+        //    even if re-sealed with the pager's own key and LSN, is rejected with `PageTampered` instead of panicking.
+        let saved_lsn = pager.lsn;
+        let saved_p0_lsn = pager.page_lsns[0];
+        let saved_epoch = pager.epoch;
+        let saved_mtag = pager.manifest_tag;
+        pager.lsn = saved_p0_lsn - 1;
+        pager.set_page_next_leaf(0, 99);
+        pager.seal_page(0).unwrap();
+        assert_eq!(
+            pager.verify_page_seal(0),
+            Err(BTreeError::PageTampered { page_id: 0 }),
+            "sealed page with out-of-range next_leaf link must be rejected without panicking"
+        );
+        assert_eq!(
+            pager.insert(3, b"acct_key", b"v3", 3),
+            Err(BTreeError::PageTampered { page_id: 0 })
+        );
+        pager.pages[0] = fresh_page0;
+        pager.lsn = saved_lsn;
+        pager.page_lsns[0] = saved_p0_lsn;
+        pager.epoch = saved_epoch;
+        pager.manifest_tag = saved_mtag;
+
+        // 5. Sealed Manifest export & load path (`export_manifest` + `load_from_manifest_and_pages`):
+        let manifest = pager.export_manifest().unwrap();
+        let loaded =
+            BTreePager::load_from_manifest_and_pages(TEST_BTREE_KEY, &manifest, &pager.pages)
+                .expect("valid manifest + pages must load cleanly");
+        assert_eq!(loaded.get(1).unwrap().unwrap().val_bytes(), b"v2");
+        let mut tampered_manifest = manifest;
+        tampered_manifest.epoch ^= 1;
+        assert_eq!(
+            BTreePager::load_from_manifest_and_pages(
+                TEST_BTREE_KEY,
+                &tampered_manifest,
+                &pager.pages
+            )
+            .err(),
+            Some(BTreeError::ManifestTampered)
+        );
+
+        // 6. Delete page reclamation: filling the pager with 512 rows, deleting all 512 rows,
+        //    and inserting 512 new rows succeeds by reclaiming freed leaf pages via `free_mask`.
+        let mut churn_pager = BTreePager::new(TEST_BTREE_KEY).unwrap();
+        for k in 1..=512i64 {
+            churn_pager.insert(k, b"churn_k", b"pass1", k).unwrap();
+        }
+        assert_eq!(churn_pager.total_records, 512);
+        for k in 1..=512i64 {
+            assert!(churn_pager.delete(k).unwrap());
+        }
+        assert_eq!(churn_pager.total_records, 0);
+        assert!(
+            churn_pager.free_mask != 0,
+            "emptying split leaves must reclaim pages into free_mask"
+        );
+        for k in 1001..=1512i64 {
+            churn_pager
+                .insert(k, b"churn_k", b"pass2", k)
+                .expect("re-inserting 512 rows after full delete must reuse reclaimed pages");
+        }
+        assert_eq!(churn_pager.total_records, 512);
+        assert_eq!(
+            churn_pager.get(1512).unwrap().unwrap().val_bytes(),
+            b"pass2"
+        );
     }
 
     #[test]

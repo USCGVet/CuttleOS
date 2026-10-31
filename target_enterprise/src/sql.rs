@@ -45,6 +45,10 @@ pub const SQL_OWNER_CRON: u64 = 0xFFFF_0002;
 pub const SQL_OWNER_TRIAD: u64 = 0xFFFF_0003;
 /// SQL session owner ID for the UDP `:8080` control-plane service.
 pub const SQL_OWNER_UDP: u64 = 0xFFFF_0004;
+/// SQL session owner ID for unauthenticated HTTP gateway queries (`GET /sql`, `POST /sql`).
+pub const SQL_OWNER_HTTP_ANON: u64 = 0xFFFF_0005;
+/// Initial `tx_seq` value after `SqlDb::new()` seeds default system tables (`services`, `kv`).
+pub const SQL_GENESIS_TX_SEQ: u64 = 7;
 
 /// Column data type in [`SqlDb`].
 #[repr(u8)]
@@ -621,24 +625,22 @@ impl SqlDb {
         }
     }
 
-    /// Return `true` if `query` is strictly read-only (`SELECT`, `.tables`, `.schema`, `SHOW`, `DESCRIBE`).
+    /// Return `true` if `query` is strictly read-only (`SELECT`, `.tables`, `.schema`, `.dump`, `SHOW`, `DESCRIBE`).
     pub fn is_readonly_query(query: &[u8]) -> bool {
-        let mut q = trim_sql(query);
-        if q.starts_with(b"/*triad*/") {
-            q = trim_sql(&q[9..]);
-        } else if q.starts_with(b"/*t*/") {
-            q = trim_sql(&q[5..]);
+        let q = trim_sql(query);
+        if q.starts_with(b"/*triad*/") || q.starts_with(b"/*t*/") {
+            return false;
         }
         if q.is_empty() {
-            return true;
-        }
-        if q.starts_with(b".") {
             return true;
         }
         let (kw, _) = next_token(q);
         eq_ignore_ascii_case(kw, b"SELECT")
             || eq_ignore_ascii_case(kw, b"SHOW")
             || eq_ignore_ascii_case(kw, b"DESCRIBE")
+            || eq_ignore_ascii_case(kw, b".tables")
+            || eq_ignore_ascii_case(kw, b".schema")
+            || eq_ignore_ascii_case(kw, b".dump")
     }
 
     /// Execute a SQL statement or meta-command on behalf of the default interactive console (`owner = SQL_OWNER_CONSOLE`).
@@ -659,9 +661,21 @@ impl SqlDb {
     pub fn exec_as(&mut self, mut owner: u64, query: &[u8], out: &mut [u8]) -> usize {
         let mut q = trim_sql(query);
         if q.starts_with(b"/*triad*/") {
+            if owner != SQL_OWNER_CONSOLE && owner != SQL_OWNER_TRIAD {
+                return copy_str(
+                    b"error: EACCES (/*triad*/ prefix reserved for Triad controller)\n",
+                    out,
+                );
+            }
             owner = SQL_OWNER_TRIAD;
             q = trim_sql(&q[9..]);
         } else if q.starts_with(b"/*t*/") {
+            if owner != SQL_OWNER_CONSOLE && owner != SQL_OWNER_TRIAD {
+                return copy_str(
+                    b"error: EACCES (/*triad*/ prefix reserved for Triad controller)\n",
+                    out,
+                );
+            }
             owner = SQL_OWNER_TRIAD;
             q = trim_sql(&q[5..]);
         }
@@ -671,11 +685,11 @@ impl SqlDb {
         if eq_ignore_ascii_case(q, b".tables") || eq_ignore_ascii_case(q, b"SHOW TABLES") {
             return self.exec_show_tables(owner, out);
         }
-        if q.starts_with(b".schema") || starts_with_ignore_case(q, b"DESCRIBE") {
+        if starts_with_ignore_case(q, b".schema") || starts_with_ignore_case(q, b"DESCRIBE") {
             let (_, rest) = next_token(q);
             return self.exec_schema(trim_sql(rest), out);
         }
-        if q.starts_with(b".dump") {
+        if starts_with_ignore_case(q, b".dump") {
             let (_, rest) = next_token(q);
             return self.exec_dump(owner, trim_sql(rest), out);
         }
@@ -3219,5 +3233,52 @@ mod tests {
             core::str::from_utf8(&out[..n_bad_upd])
         );
         assert!(SqlVal::try_from_text(&[b'x'; 25]).is_none());
+    }
+
+    #[test]
+    fn sql_owner_triad_prefix_refused_for_non_triad_and_non_console_owners() {
+        let mut db = SqlDb::new();
+        assert_eq!(db.tx_seq, SQL_GENESIS_TX_SEQ);
+        let mut out = [0u8; 256];
+
+        // 1. Non-Triad / non-console callers (HTTP anonymous, HTTP session slots 1..=4, UDP, cron, vault)
+        //    must be refused when supplying `/*triad*/` or `/*t*/` owner override prefixes.
+        for bad_owner in [
+            1u64,
+            2u64,
+            4u64,
+            SQL_OWNER_HTTP_ANON,
+            SQL_OWNER_UDP,
+            SQL_OWNER_CRON,
+            SQL_OWNER_VAULT,
+        ] {
+            for q in [
+                b"/*triad*/ INSERT INTO kv VALUES ('pwn', '1', 1)".as_slice(),
+                b"/*t*/ INSERT INTO kv VALUES ('pwn', '1', 1)".as_slice(),
+                b"/*triad*/ SELECT * FROM kv".as_slice(),
+                b"/*t*/ .dump kv".as_slice(),
+            ] {
+                let n = db.exec_as(bad_owner, q, &mut out);
+                assert_eq!(
+                    &out[..n],
+                    b"error: EACCES (/*triad*/ prefix reserved for Triad controller)\n",
+                    "owner={bad_owner} must not be allowed to use Triad prefix in {q:?}"
+                );
+            }
+        }
+
+        // 2. Triad controller (`SQL_OWNER_TRIAD`) and local serial console (`SQL_OWNER_CONSOLE`) succeed.
+        let n_triad = db.exec_as(
+            SQL_OWNER_TRIAD,
+            b"/*t*/ INSERT INTO kv VALUES ('triad.ok', '1', 1)",
+            &mut out,
+        );
+        assert_eq!(&out[..n_triad], b"INSERT 1\n");
+        let n_con = db.exec_as(
+            SQL_OWNER_CONSOLE,
+            b"/*triad*/ SELECT v FROM kv WHERE k = 'triad.ok'",
+            &mut out,
+        );
+        assert_eq!(&out[..n_con], b"v\n1\n");
     }
 }
