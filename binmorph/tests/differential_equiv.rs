@@ -12,7 +12,7 @@
 //! - Stack pointer (`RSP`)
 //! - Full 64 KiB stack & scratch data memory arena
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cuttle_binmorph::rewrite_elf_bytes;
 use iced_x86::{Code, ConditionCode, Decoder, DecoderOptions, Instruction, OpKind, Register};
@@ -40,6 +40,11 @@ struct CpuState {
     of: bool,
     /// 64 KiB memory arena (`MEM_BASE .. MEM_BASE + MEM_SIZE`).
     mem: Vec<u8>,
+    /// Sparse copy-on-write byte overlay for ELF `.data` / `.bss` globals mutated during execution.
+    elf_writes: BTreeMap<u64, u8>,
+    /// Valid ELF `.data` / `.bss` address ranges `(vaddr_start, vaddr_end)` that read as `0`
+    /// when not backed by `ro_segments` and accept stores into `elf_writes`.
+    writable_elf_ranges: Vec<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +92,8 @@ impl CpuState {
             sf: (flags_bits & 16) != 0,
             of: (flags_bits & 32) != 0,
             mem,
+            elf_writes: BTreeMap::new(),
+            writable_elf_ranges: Vec::new(),
         }
     }
 
@@ -119,8 +126,30 @@ impl CpuState {
                 let off = (addr - seg_vaddr) as usize;
                 let mut buf = [0u8; 8];
                 buf[..size].copy_from_slice(&seg_bytes[off..off + size]);
+                if !self.elf_writes.is_empty() {
+                    for b in 0..size {
+                        if let Some(&ov) = self.elf_writes.get(&(addr + b as u64)) {
+                            buf[b] = ov;
+                        }
+                    }
+                }
                 return Ok(u64::from_le_bytes(buf));
             }
+        }
+        if self
+            .writable_elf_ranges
+            .iter()
+            .any(|&(lo, hi)| addr >= lo && addr.saturating_add(size as u64) <= hi)
+        {
+            let mut buf = [0u8; 8];
+            if !self.elf_writes.is_empty() {
+                for b in 0..size {
+                    if let Some(&ov) = self.elf_writes.get(&(addr + b as u64)) {
+                        buf[b] = ov;
+                    }
+                }
+            }
+            return Ok(u64::from_le_bytes(buf));
         }
         Err(VmFault::MemOutOfBounds(addr, size))
     }
@@ -130,6 +159,17 @@ impl CpuState {
             let off = (addr - MEM_BASE) as usize;
             let bytes = val.to_le_bytes();
             self.mem[off..off + size].copy_from_slice(&bytes[..size]);
+            return Ok(());
+        }
+        if self
+            .writable_elf_ranges
+            .iter()
+            .any(|&(lo, hi)| addr >= lo && addr.saturating_add(size as u64) <= hi)
+        {
+            let bytes = val.to_le_bytes();
+            for b in 0..size {
+                self.elf_writes.insert(addr + b as u64, bytes[b]);
+            }
             return Ok(());
         }
         Err(VmFault::MemOutOfBounds(addr, size))
@@ -1121,6 +1161,43 @@ fn execute_function_with_ro(
                 }
                 rip = next_rip;
             }
+            iced_x86::Mnemonic::Idiv => {
+                let bits = state.dst_bits(&insn, 0)?;
+                let (divisor, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                if (divisor & mask_for_bits(bits)) == 0 {
+                    return Err(VmFault::DivisionByZero);
+                }
+                if bits == 64 {
+                    let dividend =
+                        ((state.regs[2] as i64 as i128) << 64) | ((state.regs[0] as u128) as i128);
+                    let d = divisor as i64 as i128;
+                    let q = dividend.checked_div(d).ok_or(VmFault::DivisionByZero)?;
+                    let r = dividend.checked_rem(d).ok_or(VmFault::DivisionByZero)?;
+                    if q < (i64::MIN as i128) || q > (i64::MAX as i128) {
+                        return Err(VmFault::DivisionByZero);
+                    }
+                    state.regs[0] = (q as i64) as u64;
+                    state.regs[2] = (r as i64) as u64;
+                } else if bits == 32 {
+                    let dividend = ((state.regs[2] as u32 as i32 as i64) << 32)
+                        | (state.regs[0] as u32 as i64);
+                    let d = divisor as u32 as i32 as i64;
+                    let q = dividend.checked_div(d).ok_or(VmFault::DivisionByZero)?;
+                    let r = dividend.checked_rem(d).ok_or(VmFault::DivisionByZero)?;
+                    if q < (i32::MIN as i64) || q > (i32::MAX as i64) {
+                        return Err(VmFault::DivisionByZero);
+                    }
+                    state.regs[0] = (q as i32 as u32) as u64;
+                    state.regs[2] = (r as i32 as u32) as u64;
+                } else {
+                    return Err(VmFault::UnsupportedInstruction(
+                        insn.code(),
+                        "idiv width".into(),
+                    ));
+                }
+                rip = next_rip;
+            }
             iced_x86::Mnemonic::Cbw => {
                 let sign = (state.regs[0] as u8 as i8 as i16) as u16 as u64;
                 state.regs[0] = (state.regs[0] & !0xFFFF) | sign;
@@ -1583,6 +1660,54 @@ fn build_corpus_functions() -> Vec<FnSpec> {
                 0xC3, // ret
             ],
         },
+        // 8. Partial register writes (8/16-bit preserving upper bits vs 32-bit zero-extending
+        //    bits 63:32) and 0x66 operand-size + REX prefix combinations across callee-saved
+        //    and leaf-scratch registers:
+        FnSpec {
+            name: "fn8_partial_regs_and_0x66_rex_prefixes",
+            pointer_in_rdi: false,
+            bytes: vec![
+                0x41, 0x54, // push r12
+                0x41, 0x55, // push r13
+                0x49, 0x89, 0xFC, // mov r12, rdi
+                0x49, 0x89, 0xF5, // mov r13, rsi
+                0x48, 0x89, 0xD0, // mov rax, rdx
+                0x40, 0x88, 0xF8, // mov al, dil
+                0x66, 0x01, 0xC8, // add ax, cx
+                0x66, 0x45, 0x31, 0xEC, // xor r12w, r13w
+                0x45, 0x28, 0xEC, // sub r12b, r13b
+                0x41, 0x89, 0xC0, // mov r8d, eax
+                0x66, 0x45, 0x01, 0xE0, // add r8w, r12w
+                0x4C, 0x31, 0xE0, // xor rax, r12
+                0x4C, 0x01, 0xC0, // add rax, r8
+                0x41, 0x5D, // pop r13
+                0x41, 0x5C, // pop r12
+                0xC3, // ret
+            ],
+        },
+        // 9. RIP-relative `[rip + disp32]` displacement recomputation under `schedule_commute`
+        //    (commuting 7-byte RIP-relative `lea` and 8-byte RIP-relative `movzx` memory load
+        //    across 2-byte, 4-byte, and 5-byte independent instructions) combined with cross-width
+        //    `5+5 <-> 7+3` immediate load boundary shifts and live CF/OF/SF/ZF flag consumption
+        //    (`adc`, `sbb`, `cmovo`):
+        FnSpec {
+            name: "fn9_rip_relative_commute_and_cross_width_flags",
+            pointer_in_rdi: false,
+            bytes: vec![
+                0x89, 0xF8, // 0..2 (2B): mov eax, edi
+                0x4C, 0x8D, 0x05, 0xF7, 0xFF, 0xFF, 0xFF, // 2..9 (7B): lea r8, [rip - 9] (-> fn9_vaddr + 0)
+                0x4C, 0x8D, 0x4E, 0x33, // 9..13 (4B): lea r9, [rsi + 0x33]
+                0x44, 0x0F, 0xB6, 0x15, 0x1A, 0x00, 0x00, 0x00, // 13..21 (8B): movzx r10d, byte ptr [rip + 26] (-> fn9_vaddr + 47 = 0xC3 ret!)
+                0xB9, 0x05, 0x00, 0x00, 0x00, // 21..26 (5B): mov ecx, 5
+                0xBA, 0x09, 0x00, 0x00, 0x00, // 26..31 (5B): mov edx, 9
+                0x4C, 0x01, 0xC0, // 31..34 (3B): add rax, r8
+                0x4C, 0x11, 0xC8, // 34..37 (3B): adc rax, r9
+                0x4C, 0x29, 0xD0, // 37..40 (3B): sub rax, r10
+                0x48, 0x19, 0xC8, // 40..43 (3B): sbb rax, rcx
+                0x48, 0x0F, 0x40, 0xC2, // 43..47 (4B): cmovo rax, rdx
+                0xC3, // 47..48 (1B): ret (invariant 0xC3 byte read by movzx above)
+            ],
+        },
     ]
 }
 
@@ -1903,6 +2028,90 @@ fn differential_equivalence_catches_injected_semantic_bugs_meta_test() {
         caught_3.is_err(),
         "differential harness must catch memory store displacement corruption"
     );
+
+    // Fault 4: Partial-register / 32-bit zero-extension bug in `fn8_partial_regs_and_0x66_rex_prefixes`:
+    // Replace 16-bit `add ax, cx` (`66 01 C8`, which preserves bits 63:16 of RAX) with `nop; add eax, ecx`
+    // (`90 01 C8`, which zero-extends and clobbers bits 63:32 of RAX).
+    let mut bad_text_4 = orig_text.to_vec();
+    let (_, fn8_vaddr, fn8_len, _) = &layout[8];
+    let fn8_off = (*fn8_vaddr - TEXT_VADDR) as usize;
+    let p16_pos = bad_text_4[fn8_off..fn8_off + fn8_len]
+        .windows(3)
+        .position(|w| w == [0x66, 0x01, 0xC8])
+        .expect("locate 66 01 C8 (add ax, cx)");
+    bad_text_4[fn8_off + p16_pos] = 0x90; // drop 0x66 operand-size prefix -> 32-bit `add eax, ecx`!
+    let caught_4 = std::panic::catch_unwind(|| {
+        assert_function_equivalent(
+            "fn8_fault_partial_reg_0x66",
+            orig_text,
+            &bad_text_4,
+            TEXT_VADDR,
+            *fn8_vaddr,
+            1,
+            8,
+            false,
+        );
+    });
+    assert!(
+        caught_4.is_err(),
+        "differential harness must catch 16-bit vs 32-bit zero-extension partial-register corruption"
+    );
+
+    // Fault 5: Off-by-instruction-length RIP-relative displacement bug in `fn9_rip_relative_commute_and_cross_width_flags`:
+    // Perturb `disp32` of `lea r8, [rip - 9]` (`4C 8D 05 F7 FF FF FF`) by +2 bytes (`F9 FF FF FF`),
+    // simulating a commutation pass that swapped a 7-byte RIP-relative instruction past a 2-byte `mov`
+    // without recomputing `disp32`.
+    let mut bad_text_5 = orig_text.to_vec();
+    let (_, fn9_vaddr, fn9_len, _) = &layout[9];
+    let fn9_off = (*fn9_vaddr - TEXT_VADDR) as usize;
+    let rip_pos = bad_text_5[fn9_off..fn9_off + fn9_len]
+        .windows(7)
+        .position(|w| w == [0x4C, 0x8D, 0x05, 0xF7, 0xFF, 0xFF, 0xFF])
+        .expect("locate lea r8, [rip - 9]");
+    bad_text_5[fn9_off + rip_pos + 3] = 0xF9;
+    let caught_5 = std::panic::catch_unwind(|| {
+        assert_function_equivalent(
+            "fn9_fault_rip_disp32",
+            orig_text,
+            &bad_text_5,
+            TEXT_VADDR,
+            *fn9_vaddr,
+            1,
+            8,
+            false,
+        );
+    });
+    assert!(
+        caught_5.is_err(),
+        "differential harness must catch off-by-length RIP-relative disp32 corruption"
+    );
+
+    // Fault 6: Live carry-flag (`CF`) corruption in `fn6_flags_adc_sbb_cmov_setcc`:
+    // Mutate `adc rax, rdx` (`48 11 D0`) -> `add rax, rdx` (`48 01 D0`), dropping the incoming carry flag `CF`.
+    let mut bad_text_6 = orig_text.to_vec();
+    let (_, fn6_vaddr, fn6_len, _) = &layout[6];
+    let fn6_off = (*fn6_vaddr - TEXT_VADDR) as usize;
+    let adc_pos = bad_text_6[fn6_off..fn6_off + fn6_len]
+        .windows(3)
+        .position(|w| w == [0x48, 0x11, 0xD0])
+        .expect("locate adc rax, rdx");
+    bad_text_6[fn6_off + adc_pos + 1] = 0x01;
+    let caught_6 = std::panic::catch_unwind(|| {
+        assert_function_equivalent(
+            "fn6_fault_live_cf",
+            orig_text,
+            &bad_text_6,
+            TEXT_VADDR,
+            *fn6_vaddr,
+            1,
+            8,
+            false,
+        );
+    });
+    assert!(
+        caught_6.is_err(),
+        "differential harness must catch live carry-flag (CF) corruption across adc/sbb chains"
+    );
 }
 
 #[test]
@@ -1963,21 +2172,30 @@ enum AbiProfile {
     TwoPtrsAndLen,
     ThreePtrs,
     StructSelfZeroed,
+    SelfSliceAndOutSlice,
+    TwoSlicesAndOutSlice,
+    FourPtrsAndStackArgs,
+    StructWithSliceFields,
 }
 
 impl AbiProfile {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 10] = [
         Self::PureScalar,
         Self::SmallBounds,
         Self::SinglePtrAndLen,
         Self::TwoPtrsAndLen,
         Self::ThreePtrs,
         Self::StructSelfZeroed,
+        Self::SelfSliceAndOutSlice,
+        Self::TwoSlicesAndOutSlice,
+        Self::FourPtrsAndStackArgs,
+        Self::StructWithSliceFields,
     ];
 
-    fn make_input(self, input_idx: usize) -> CpuState {
+    fn make_input(self, input_idx: usize, writable_elf_ranges: &[(u64, u64)]) -> CpuState {
         let seed = ((input_idx as u64) + 1).wrapping_mul(0x517C_C1B7_2722_0A95);
         let mut init = CpuState::from_seed(seed);
+        init.writable_elf_ranges = writable_elf_ranges.to_vec();
         match self {
             Self::PureScalar => {}
             Self::SmallBounds => {
@@ -2015,6 +2233,62 @@ impl AbiProfile {
                 init.regs[6] = (input_idx as u64) & 0x07;
                 init.regs[2] = ((input_idx as u64).wrapping_mul(5)) & 0x07;
                 init.regs[1] = ((input_idx as u64).wrapping_mul(7)) & 0x07;
+            }
+            Self::SelfSliceAndOutSlice => {
+                // `(&mut self, input: &[u8], out: &mut [u8])`:
+                // RDI = self_ptr, RSI = in_ptr, RDX = in_len (8..23), RCX = out_ptr, R8 = out_len (128), R9 = small scalar
+                init.regs[7] = MEM_BASE + (DATA_OFFSET as u64) + 128;
+                init.regs[6] = MEM_BASE + (DATA_OFFSET as u64) + 512;
+                init.regs[2] = 8 + ((input_idx as u64) & 0x0F);
+                init.regs[1] = MEM_BASE + (DATA_OFFSET as u64) + 1024;
+                init.regs[8] = 128;
+                init.regs[9] = (input_idx as u64) & 0x07;
+            }
+            Self::TwoSlicesAndOutSlice => {
+                // `(a: &[u8], b: &[u8], out: &mut [u8])`:
+                // RDI = a_ptr, RSI = a_len, RDX = b_ptr, RCX = b_len, R8 = out_ptr, R9 = out_len
+                init.regs[7] = MEM_BASE + (DATA_OFFSET as u64) + 128;
+                init.regs[6] = 8 + ((input_idx as u64) & 0x07);
+                init.regs[2] = MEM_BASE + (DATA_OFFSET as u64) + 512;
+                init.regs[1] = 8 + (((input_idx as u64) >> 1) & 0x07);
+                init.regs[8] = MEM_BASE + (DATA_OFFSET as u64) + 1024;
+                init.regs[9] = 128;
+            }
+            Self::FourPtrsAndStackArgs => {
+                // 4 pointer args + R8 ptr + R9 len + valid caller stack args at `[RSP + 8 .. RSP + 48]`
+                init.regs[7] = MEM_BASE + (DATA_OFFSET as u64) + 128;
+                init.regs[6] = MEM_BASE + (DATA_OFFSET as u64) + 384;
+                init.regs[2] = MEM_BASE + (DATA_OFFSET as u64) + 640;
+                init.regs[1] = MEM_BASE + (DATA_OFFSET as u64) + 896;
+                init.regs[8] = MEM_BASE + (DATA_OFFSET as u64) + 1152;
+                init.regs[9] = 64;
+                let p_stack = MEM_BASE + (DATA_OFFSET as u64) + 1408;
+                init.mem[INITIAL_RSP_OFFSET + 8..INITIAL_RSP_OFFSET + 16]
+                    .copy_from_slice(&p_stack.to_le_bytes());
+                init.mem[INITIAL_RSP_OFFSET + 16..INITIAL_RSP_OFFSET + 24]
+                    .copy_from_slice(&64u64.to_le_bytes());
+                init.mem[INITIAL_RSP_OFFSET + 24..INITIAL_RSP_OFFSET + 32]
+                    .copy_from_slice(&p_stack.to_le_bytes());
+                init.mem[INITIAL_RSP_OFFSET + 32..INITIAL_RSP_OFFSET + 40]
+                    .copy_from_slice(&64u64.to_le_bytes());
+            }
+            Self::StructWithSliceFields => {
+                // Struct at `[RDI]` whose fields are valid `(ptr, len)` slice pairs inside the data arena.
+                let struct_off = DATA_OFFSET + 128;
+                let buf1 = MEM_BASE + (DATA_OFFSET as u64) + 640;
+                let buf2 = MEM_BASE + (DATA_OFFSET as u64) + 896;
+                let len = 8 + ((input_idx as u64) & 0x07);
+                init.mem[struct_off..struct_off + 256].fill(0);
+                init.mem[struct_off..struct_off + 8].copy_from_slice(&buf1.to_le_bytes());
+                init.mem[struct_off + 8..struct_off + 16].copy_from_slice(&len.to_le_bytes());
+                init.mem[struct_off + 16..struct_off + 24].copy_from_slice(&buf2.to_le_bytes());
+                init.mem[struct_off + 24..struct_off + 32].copy_from_slice(&len.to_le_bytes());
+                init.regs[7] = MEM_BASE + (struct_off as u64);
+                init.regs[6] = buf1;
+                init.regs[2] = len;
+                init.regs[1] = buf2;
+                init.regs[8] = 64;
+                init.regs[9] = (input_idx as u64) & 0x07;
             }
         }
         init
@@ -2070,21 +2344,31 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
     let orig_text = &base_elf[text_file_off as usize..(text_file_off + text_len) as usize];
 
     // Map all non-`.text` file-backed ELF sections (`.rodata`, `.data.rel.ro`, `.data`, etc.)
-    // as read-only reference segments so real kernel functions that read lookup tables, constants,
-    // or static slices via `[rip + disp32]` execute cleanly inside `X86MicroVm`.
+    // as read-only reference segments, and map `.data` / `.bss` (`SHT_NOBITS`) as copy-on-write
+    // writable segments so real kernel functions that read or mutate static/global state via
+    // `[rip + disp32]` execute cleanly inside `X86MicroVm`.
     let mut ro_segments: Vec<(u64, &[u8])> = Vec::new();
+    let mut writable_elf_ranges: Vec<(u64, u64)> = Vec::new();
     for sec in obj.sections() {
-        if sec.name() == Ok(".text") {
+        let sec_name = sec.name().unwrap_or("");
+        if sec_name == ".text" {
             continue;
         }
         let vaddr = sec.address();
-        if vaddr == 0 {
+        let vsize = sec.size();
+        if vaddr == 0 || vsize == 0 {
             continue;
         }
         if let Some((foff, flen)) = sec.file_range() {
             if flen > 0 && (foff + flen) as usize <= base_elf.len() {
                 ro_segments.push((vaddr, &base_elf[foff as usize..(foff + flen) as usize]));
             }
+            if sec_name.starts_with(".data") || sec_name.starts_with(".bss") {
+                writable_elf_ranges.push((vaddr, vaddr.saturating_add(vsize)));
+            }
+        } else {
+            // SHT_NOBITS (e.g. `.bss`): zero-initialized and writable via `elf_writes`.
+            writable_elf_ranges.push((vaddr, vaddr.saturating_add(vsize)));
         }
     }
 
@@ -2093,11 +2377,13 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
     const MAX_STEPS: usize = 1024;
     let expected_ret_rsp = MEM_BASE + (INITIAL_RSP_OFFSET as u64) + 8;
 
-    // Discover all `.text` functions (`STT_FUNC`, size 12..=2048) that execute cleanly to `ret`
+    // Discover all `.text` functions (`STT_FUNC`, size 4..=4096) that execute cleanly to `ret`
     // with balanced `RSP` across all `NUM_INPUTS` inputs under one of the realistic ABI profiles.
     let mut verified_kernel_fns: Vec<(String, u64, usize, AbiProfile)> = Vec::new();
     let mut input_sensitive_fns = 0usize;
     let mut mem_mutating_fns = 0usize;
+    let mut global_bss_data_fns = 0usize;
+    let mut contract_and_boundary_fns = 0usize;
 
     for sym in obj.symbols() {
         if sym.kind() != SymbolKind::Text {
@@ -2105,7 +2391,7 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
         }
         let addr = sym.address();
         let size = sym.size() as usize;
-        if !(12..=2048).contains(&size) {
+        if !(4..=4096).contains(&size) {
             continue;
         }
         if addr < text_vaddr || addr + (size as u64) > text_vaddr + text_len {
@@ -2119,9 +2405,10 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
             let mut first_data_hash: Option<[u8; 32]> = None;
             let mut varies_across_inputs = false;
             let mut mutates_data_arena = false;
+            let mut mutates_elf_globals = false;
 
             for input_idx in 0..NUM_INPUTS {
-                let init = profile.make_input(input_idx);
+                let init = profile.make_input(input_idx, &writable_elf_ranges);
                 let init_data_slice = init.mem[..0x4000].to_vec();
                 match execute_function_with_ro(
                     orig_text,
@@ -2134,17 +2421,23 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
                     Ok(out) if out.regs[4] == expected_ret_rsp => {
                         let ret_pair = (out.regs[0], out.regs[2]);
                         // Compute the XOR-delta between `out.mem[..0x4000]` and `init_data_slice`
-                        // so we measure only the bytes actually written by the function, not the
-                        // varying initial random contents of `init.mem`.
+                        // plus any `.data`/`.bss` global writes in `out.elf_writes`.
                         let mut delta_hasher = Sha256::new();
                         for (&after, &before) in
                             out.mem[..0x4000].iter().zip(init_data_slice.iter())
                         {
                             delta_hasher.update([after ^ before]);
                         }
+                        for (&g_addr, &g_byte) in &out.elf_writes {
+                            delta_hasher.update(g_addr.to_le_bytes());
+                            delta_hasher.update([g_byte]);
+                        }
                         let write_delta_hash: [u8; 32] = delta_hasher.finalize().into();
-                        if out.mem[..0x4000] != init_data_slice[..] {
+                        if out.mem[..0x4000] != init_data_slice[..] || !out.elf_writes.is_empty() {
                             mutates_data_arena = true;
+                        }
+                        if !out.elf_writes.is_empty() {
+                            mutates_elf_globals = true;
                         }
                         if let (Some(prev_ret), Some(prev_hash)) = (first_ret_pair, first_data_hash)
                         {
@@ -2169,6 +2462,12 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
                 if mutates_data_arena {
                     mem_mutating_fns += 1;
                 }
+                if mutates_elf_globals {
+                    global_bss_data_fns += 1;
+                }
+                if name.contains("cuttle_contracts") || name.contains("target_enterprise_kernel") {
+                    contract_and_boundary_fns += 1;
+                }
                 verified_kernel_fns.push((name, addr, size, profile));
                 break;
             }
@@ -2176,19 +2475,24 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
     }
 
     assert!(
-        verified_kernel_fns.len() >= 500,
-        "expected at least 500 real compiled kernel functions in target_enterprise_kernel .text, got {}",
+        verified_kernel_fns.len() >= 700,
+        "expected at least 700 real compiled kernel functions in target_enterprise_kernel .text, got {}",
         verified_kernel_fns.len()
     );
     assert!(
-        input_sensitive_fns >= 450,
-        "expected at least 450 real kernel functions with input-dependent dynamic return/memory outputs, got {}",
+        input_sensitive_fns >= 700,
+        "expected at least 700 real kernel functions with input-dependent dynamic return/memory outputs, got {}",
         input_sensitive_fns
     );
     assert!(
-        mem_mutating_fns >= 250,
-        "expected at least 250 real kernel functions that concretely mutate the 16 KiB data/struct arena, got {}",
+        mem_mutating_fns >= 340,
+        "expected at least 340 real kernel functions that concretely mutate the 16 KiB data/struct arena, got {}",
         mem_mutating_fns
+    );
+    assert!(
+        contract_and_boundary_fns >= 100,
+        "expected at least 100 cuttle_contracts / target_enterprise_kernel boundary functions verified, got {}",
+        contract_and_boundary_fns
     );
 
     // Rewrite the entire real kernel ELF across 32 seeds (`1..=32`) and verify that every discovered
@@ -2212,7 +2516,7 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
             }
 
             for input_idx in 0..NUM_INPUTS {
-                let init = profile.make_input(input_idx);
+                let init = profile.make_input(input_idx, &writable_elf_ranges);
                 let out_orig = execute_function_with_ro(
                     orig_text,
                     text_vaddr,
@@ -2263,10 +2567,8 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
                         "callee-saved register {reg_name} mismatch in real kernel fn {fn_name} (seed={seed}, input={input_idx})"
                     );
                 }
-                // Compare the entire 16 KiB data arena `[0 .. 0x4000]` and caller stack frame
-                // `[INITIAL_RSP_OFFSET .. MEM_SIZE]` (excluding the dead callee stack scratch region
-                // `[0x4000 .. INITIAL_RSP_OFFSET]` below RSP where `pass_prologue_epilogue_perm`
-                // intentionally permutes saved register push/pop slots).
+                // Compare the entire 16 KiB data arena `[0 .. 0x4000]`, caller stack frame
+                // `[INITIAL_RSP_OFFSET .. MEM_SIZE]`, and `.data`/`.bss` ELF global writes.
                 assert_eq!(
                     &out_orig.mem[..0x4000],
                     &out_morph.mem[..0x4000],
@@ -2276,6 +2578,10 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
                     &out_orig.mem[INITIAL_RSP_OFFSET..],
                     &out_morph.mem[INITIAL_RSP_OFFSET..],
                     "caller stack frame mismatch in real kernel fn {fn_name} (seed={seed}, input={input_idx})"
+                );
+                assert_eq!(
+                    out_orig.elf_writes, out_morph.elf_writes,
+                    ".data/.bss global memory write mismatch in real kernel fn {fn_name} (seed={seed}, input={input_idx})"
                 );
             }
         }
@@ -2327,7 +2633,7 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
 
             let mut caught_divergence = false;
             for input_idx in 0..NUM_INPUTS {
-                let init = profile.make_input(input_idx);
+                let init = profile.make_input(input_idx, &writable_elf_ranges);
                 let Ok(out_orig) = execute_function_with_ro(
                     orig_text,
                     text_vaddr,
@@ -2361,6 +2667,7 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
                     || out_orig.regs[15] != out_bad.regs[15]
                     || out_orig.mem[..0x4000] != out_bad.mem[..0x4000]
                     || out_orig.mem[INITIAL_RSP_OFFSET..] != out_bad.mem[INITIAL_RSP_OFFSET..]
+                    || out_orig.elf_writes != out_bad.elf_writes
                 {
                     caught_divergence = true;
                     break;
@@ -2373,10 +2680,12 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
     }
 
     eprintln!(
-        "real kernel ELF differential check: verified {} real kernel functions ({} input-sensitive, {} memory-mutating, {} distinct mutated functions, {} mutated fn×seed instances, {} total concrete executions across {} seeds, {} real-kernel injected faults caught)",
+        "real kernel ELF differential check: verified {} real kernel functions ({} input-sensitive, {} memory-mutating, {} .data/.bss-mutating, {} contract/kernel-boundary, {} distinct mutated functions, {} mutated fn×seed instances, {} total concrete executions across {} seeds, {} real-kernel injected faults caught)",
         verified_kernel_fns.len(),
         input_sensitive_fns,
         mem_mutating_fns,
+        global_bss_data_fns,
+        contract_and_boundary_fns,
         distinct_mutated_fns.len(),
         mutated_fn_seed_instances,
         verified_kernel_fns.len() * (NUM_SEEDS as usize) * NUM_INPUTS,
@@ -2384,18 +2693,18 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
         real_kernel_semantic_faults_caught
     );
     assert!(
-        distinct_mutated_fns.len() >= 480,
-        "expected at least 480 distinct real kernel functions mutated by cuttle-binmorph, got {}",
+        distinct_mutated_fns.len() >= 650,
+        "expected at least 650 distinct real kernel functions mutated by cuttle-binmorph, got {}",
         distinct_mutated_fns.len()
     );
     assert!(
-        mutated_fn_seed_instances >= 14_000,
-        "expected at least 14000 mutated (function, seed) instances verified on real kernel ELF, got {}",
+        mutated_fn_seed_instances >= 18_500,
+        "expected at least 18500 mutated (function, seed) instances verified on real kernel ELF, got {}",
         mutated_fn_seed_instances
     );
     assert!(
-        real_kernel_semantic_faults_caught >= 400,
-        "expected concrete execution comparator to catch injected 1-byte instruction corruptions on at least 400 real kernel functions, got {}",
+        real_kernel_semantic_faults_caught >= 600,
+        "expected concrete execution comparator to catch injected 1-byte instruction corruptions on at least 600 real kernel functions, got {}",
         real_kernel_semantic_faults_caught
     );
 }

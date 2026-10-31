@@ -4239,6 +4239,27 @@ mod tests {
     }
 
     #[test]
+    fn cross_width_pair_morph_refuses_to_shift_interior_rip_relative_instr() {
+        let orig = vec![
+            0x31, 0xC0, // xor eax, eax (2B)
+            0x48, 0x8D, 0x3D, 0x20, 0x00, 0x00, 0x00, // lea rdi, [rip + 0x20] (7B)
+            0x48, 0x83, 0xC1, 0x01, // add rcx, 1 (4B)
+            0xC3, // ret (1B)
+        ];
+        for seed in 0..64u64 {
+            let mut code = orig.clone();
+            let mut prng = Prng::new(seed);
+            let mut stats = Stats::default();
+            pass_cross_width_pair_morph(&mut code, 0x1000, &mut prng, &mut stats);
+            assert_eq!(
+                code, orig,
+                "pass_cross_width_pair_morph must never shift an interior [rip + disp32] instruction (seed={seed})"
+            );
+            assert_eq!(stats.swapped, 0);
+        }
+    }
+
+    #[test]
     fn cross_width_pair_morph_shifts_interior_instruction_boundaries() {
         // Window:
         //   0x1000: xor eax, eax      (31 C0, 2 bytes)      -> widens to `xor rax, rax` (48 31 C0, 3 bytes)
