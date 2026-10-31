@@ -73,6 +73,7 @@ Review of the 8 commits after `db46a14`, up to `e9c10f5`: `924d655` (#1), `4b315
   - Or send the DDL in a separate header-only call.
   - In the controller, reject a row whose cell count isn't the column count.
   - Add a max-width test that goes through `feed_byte`, so the prompt shares the buffer as it does on the kernel.
+- `Status: Fixed — test: shell::tests::sqldump_max_width_table_via_feed_byte_never_truncates_rows_or_prompt, tools/triad_controller.py::run_unit_self_tests (Medium #2a max-width 4-column table checkpoint/heal via RealOsShellHarness, #2b truncated row cell-count rejection) — commit: 556ec3b`
 
 ### 3. The "immutable system file" guard compares the raw path, so equivalent spellings get through
 - **Where:** `target_enterprise/src/shell.rs:2748` (`writehex`), `:2823` (`write`), `:2880` (`rm`) and `:937` (HTTP `VfsWrite`). Each compares the argument byte-for-byte with `/etc/os-release`. The VFS then normalizes the path before opening it.
