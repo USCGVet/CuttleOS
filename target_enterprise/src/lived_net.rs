@@ -2499,6 +2499,409 @@ pub fn nat_reply_ip(src: [u8; 4]) -> [u8; 4] {
     }
 }
 
+/// Lifecycle and availability state of a node inside [`TriadIngressVoter`].
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TriadNodeHealth {
+    /// Healthy and participating in 2-of-3 / 3-of-3 TMR voting.
+    Online = 0,
+    /// Draining in-flight requests prior to a rolling binary morph.
+    Draining = 1,
+    /// Rebooting into a freshly diversified binary variant (`seed'`).
+    Morphing = 2,
+    /// Replaying WAL delta entries from the 2 online quorum peers before rejoining.
+    CatchingUp = 3,
+    /// Automatically isolated after returning a Byzantine divergent state hash or body.
+    Isolated = 4,
+}
+
+/// Result of a 3-node Triple-Modular-Redundancy (TMR) ingress vote in [`TriadIngressVoter`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TriadVoteOutcome {
+    /// All 3 online nodes returned identical `(status_code, state_hash, body)`.
+    Unanimous3of3 {
+        /// Agreed HTTP/control-plane status code.
+        status_code: u16,
+        /// Agreed 64-bit SQL/system state hash.
+        state_hash: u64,
+    },
+    /// 2 of 3 nodes returned identical `(status_code, state_hash, body)`; the 3rd node
+    /// (`outlier_node`) was either offline/morphing or diverged (and was automatically isolated).
+    Majority2of3 {
+        /// Agreed 2-of-3 majority status code.
+        status_code: u16,
+        /// Agreed 2-of-3 majority state hash.
+        state_hash: u64,
+        /// Node index (`0..=2`) that diverged or was unavailable.
+        outlier_node: u8,
+    },
+    /// Fewer than 2 online nodes agreed (`0/3`, `1/3`, or 3-way split-brain $N_0 \neq N_1 \neq N_2$).
+    SplitBrainOrQuorumLost,
+    /// Request refused because the ingress voter's [`crate::svc_runtime::NodeRole`] disables HTTP ingress (`503`).
+    RoleDisabled,
+    /// Mutating request refused because no valid operator session/HMAC credential was presented (`401`).
+    Unauthenticated,
+}
+
+/// Per-node response candidate submitted to [`TriadIngressVoter::vote_ingress_request`].
+#[derive(Copy, Clone, Debug)]
+pub struct TriadNodeVoteInput<'a> {
+    /// Node index (`0..=2`).
+    pub node_id: u8,
+    /// Whether this node responded within the ingress timeout window.
+    pub available: bool,
+    /// HTTP or control-plane status code returned by this node.
+    pub status_code: u16,
+    /// 64-bit FNV-1a SQL/system state hash reported by this node.
+    pub state_hash: u64,
+    /// Response payload bytes returned by this node.
+    pub body: &'a [u8],
+}
+
+/// Self-contained `#![no_std]` Pure-Rust Triad Ingress Quorum Voter & Rolling Morph Coordinator.
+///
+/// Enables a `Wfe`- or `Full`-role Cuttle OS gateway VM (or standalone Rust appliance proxy)
+/// to perform 2-of-3 TMR response voting, automatic Byzantine node isolation, zero-downtime
+/// rolling binary morph coordination, and 4 KiB (`CTTLSQL1`) RAID-5 XOR parity reconstruction
+/// natively in Rust without depending on the host Python coordinator in the critical path.
+#[derive(Copy, Clone, Debug)]
+pub struct TriadIngressVoter {
+    /// Active appliance role profile (`Wfe` or `Full` required to serve ingress traffic).
+    pub role: crate::svc_runtime::NodeRole,
+    /// Shared 256-bit `HMAC-SHA256` cluster key used to verify sealed `CTTLSQL1` partitions.
+    pub cluster_key: [u8; 32],
+    /// Whether a non-zero `cluster_key` has been provisioned.
+    pub key_provisioned: bool,
+    /// Per-node health state (`Online`, `Draining`, `Morphing`, `CatchingUp`, `Isolated`).
+    pub health: [TriadNodeHealth; 3],
+    /// Active binary diversification seed on each Triad node (`0..3`).
+    pub variant_seeds: [u64; 3],
+    /// Latest committed transaction sequence number per node (`0..3`).
+    pub node_seq: [u64; 3],
+    /// Latest verified 64-bit state hash per node (`0..3`).
+    pub node_hash: [u64; 3],
+    /// Total 3-of-3 unanimous TMR votes completed.
+    pub unanimous_votes: u64,
+    /// Total 2-of-3 majority TMR votes completed (degraded or Byzantine outlier masked).
+    pub majority_2of3_votes: u64,
+    /// Total requests refused due to quorum loss (`< 2` nodes) or 3-way split-brain.
+    pub split_brain_refusals: u64,
+    /// Total mutating or administrative requests refused due to missing credentials.
+    pub unauth_refusals: u64,
+    /// Total 4 KiB `CTTLSQL1` partitions reconstructed and healed via RAID-5 XOR parity.
+    pub parity_reconstructions: u64,
+    /// Total zero-downtime rolling node morph rotations completed.
+    pub rolling_morphs_completed: u64,
+}
+
+impl TriadIngressVoter {
+    /// Construct an unprovisioned ingress voter (`key_provisioned = false`).
+    pub const fn empty() -> Self {
+        Self {
+            role: crate::svc_runtime::NodeRole::Wfe,
+            cluster_key: [0u8; 32],
+            key_provisioned: false,
+            health: [TriadNodeHealth::Online; 3],
+            variant_seeds: [0u64; 3],
+            node_seq: [0u64; 3],
+            node_hash: [0u64; 3],
+            unanimous_votes: 0,
+            majority_2of3_votes: 0,
+            split_brain_refusals: 0,
+            unauth_refusals: 0,
+            parity_reconstructions: 0,
+            rolling_morphs_completed: 0,
+        }
+    }
+
+    /// Construct a provisioned 3-node ingress voter bound to `role`, `cluster_key`, and distinct `variant_seeds`.
+    pub fn new(
+        role: crate::svc_runtime::NodeRole,
+        cluster_key: [u8; 32],
+        variant_seeds: [u64; 3],
+    ) -> Self {
+        let key_ok = crate::durable_seal::is_seal_key_set(&cluster_key);
+        Self {
+            role,
+            cluster_key,
+            key_provisioned: key_ok,
+            health: [TriadNodeHealth::Online; 3],
+            variant_seeds,
+            node_seq: [0u64; 3],
+            node_hash: [0u64; 3],
+            unanimous_votes: 0,
+            majority_2of3_votes: 0,
+            split_brain_refusals: 0,
+            unauth_refusals: 0,
+            parity_reconstructions: 0,
+            rolling_morphs_completed: 0,
+        }
+    }
+
+    /// Count of nodes currently in [`TriadNodeHealth::Online`].
+    pub fn online_count(&self) -> usize {
+        let mut c = 0usize;
+        let mut i = 0usize;
+        while i < 3 {
+            if self.health[i] == TriadNodeHealth::Online {
+                c += 1;
+            }
+            i += 1;
+        }
+        c
+    }
+
+    fn responses_match(a: &TriadNodeVoteInput<'_>, b: &TriadNodeVoteInput<'_>) -> bool {
+        a.status_code == b.status_code
+            && a.state_hash == b.state_hash
+            && bytes_eq_const(a.body, b.body)
+    }
+
+    /// Perform a 2-of-3 Triple-Modular-Redundancy (TMR) majority vote across the 3 Triad nodes:
+    /// - Enforces [`crate::svc_runtime::NodeRole`] availability first (`Wfe` or `Full` required;
+    ///   `Sql` and `Shell` roles refuse ingress routing with [`TriadVoteOutcome::RoleDisabled`]).
+    /// - Enforces the standing credential gate: any mutating request (`is_mutating == true`)
+    ///   without `session_authenticated == true` (or on an unprovisioned voter) is refused with
+    ///   [`TriadVoteOutcome::Unauthenticated`].
+    /// - If 3 of 3 online nodes agree, returns [`TriadVoteOutcome::Unanimous3of3`].
+    /// - If 2 of 3 online nodes agree and the 3rd node returned a divergent response, automatically
+    ///   marks the divergent node [`TriadNodeHealth::Isolated`] and returns [`TriadVoteOutcome::Majority2of3`].
+    /// - If fewer than 2 online nodes agree (`0/3`, `1/3`, or 3-way split-brain $N_0 \neq N_1 \neq N_2$),
+    ///   refuses the response with [`TriadVoteOutcome::SplitBrainOrQuorumLost`].
+    pub fn vote_ingress_request(
+        &mut self,
+        is_mutating: bool,
+        session_authenticated: bool,
+        responses: &[TriadNodeVoteInput<'_>; 3],
+        winning_body_out: &mut [u8],
+    ) -> (TriadVoteOutcome, usize) {
+        if !self.role.allows(crate::svc_runtime::ServiceId::Http) {
+            return (TriadVoteOutcome::RoleDisabled, 0);
+        }
+        if is_mutating && (!self.key_provisioned || !session_authenticated) {
+            self.unauth_refusals = self.unauth_refusals.wrapping_add(1);
+            return (TriadVoteOutcome::Unauthenticated, 0);
+        }
+
+        let mut active = [false; 3];
+        let mut i = 0usize;
+        while i < 3 {
+            let r = &responses[i];
+            if r.available
+                && (r.node_id as usize) == i
+                && self.health[i] == TriadNodeHealth::Online
+                && r.body.len() <= winning_body_out.len()
+            {
+                active[i] = true;
+            }
+            i += 1;
+        }
+
+        // Case 1: All 3 nodes are online, available, and unanimous (`0 == 1 == 2`).
+        if active[0]
+            && active[1]
+            && active[2]
+            && Self::responses_match(&responses[0], &responses[1])
+            && Self::responses_match(&responses[1], &responses[2])
+        {
+            let win = &responses[0];
+            winning_body_out[..win.body.len()].copy_from_slice(win.body);
+            self.node_hash = [win.state_hash; 3];
+            self.unanimous_votes = self.unanimous_votes.wrapping_add(1);
+            return (
+                TriadVoteOutcome::Unanimous3of3 {
+                    status_code: win.status_code,
+                    state_hash: win.state_hash,
+                },
+                win.body.len(),
+            );
+        }
+
+        // Case 2: 2-of-3 majority match (`(0, 1)`, `(0, 2)`, or `(1, 2)`).
+        let pair_match: Option<(usize, usize, usize)> =
+            if active[0] && active[1] && Self::responses_match(&responses[0], &responses[1]) {
+                Some((0, 1, 2))
+            } else if active[0] && active[2] && Self::responses_match(&responses[0], &responses[2])
+            {
+                Some((0, 2, 1))
+            } else if active[1] && active[2] && Self::responses_match(&responses[1], &responses[2])
+            {
+                Some((1, 2, 0))
+            } else {
+                None
+            };
+
+        if let Some((a, b, outlier)) = pair_match {
+            let win = &responses[a];
+            winning_body_out[..win.body.len()].copy_from_slice(win.body);
+            self.node_hash[a] = win.state_hash;
+            self.node_hash[b] = win.state_hash;
+            // If the 3rd node was Online and returned an incompatible response, isolate it!
+            if active[outlier]
+                || (self.health[outlier] == TriadNodeHealth::Online && responses[outlier].available)
+            {
+                self.health[outlier] = TriadNodeHealth::Isolated;
+            }
+            self.majority_2of3_votes = self.majority_2of3_votes.wrapping_add(1);
+            return (
+                TriadVoteOutcome::Majority2of3 {
+                    status_code: win.status_code,
+                    state_hash: win.state_hash,
+                    outlier_node: outlier as u8,
+                },
+                win.body.len(),
+            );
+        }
+
+        // Case 3: Split-brain (`0 != 1 != 2`) or fewer than 2 online nodes available.
+        self.split_brain_refusals = self.split_brain_refusals.wrapping_add(1);
+        (TriadVoteOutcome::SplitBrainOrQuorumLost, 0)
+    }
+
+    /// Initiate a zero-downtime rolling binary morph on `node_id` (`0..=2`), transitioning it
+    /// to [`TriadNodeHealth::Morphing`] only if the remaining 2 peer nodes are both [`TriadNodeHealth::Online`].
+    pub fn begin_rolling_morph(
+        &mut self,
+        node_id: u8,
+        session_authenticated: bool,
+    ) -> Result<(), crate::svc_runtime::ServiceError> {
+        use crate::svc_runtime::{ServiceError, ServiceId};
+        if !self.role.allows(ServiceId::Http) {
+            return Err(ServiceError::RoleDisabled);
+        }
+        if !self.key_provisioned || !session_authenticated {
+            self.unauth_refusals = self.unauth_refusals.wrapping_add(1);
+            return Err(ServiceError::Unauthenticated);
+        }
+        let idx = node_id as usize;
+        if idx >= 3 {
+            return Err(ServiceError::SandboxTrap);
+        }
+        // Ensure the other 2 nodes are Online so 2-of-3 quorum is preserved during the morph:
+        let mut peers_online = 0usize;
+        let mut i = 0usize;
+        while i < 3 {
+            if i != idx && self.health[i] == TriadNodeHealth::Online {
+                peers_online += 1;
+            }
+            i += 1;
+        }
+        if peers_online < 2 {
+            return Err(ServiceError::SandboxTrap);
+        }
+        self.health[idx] = TriadNodeHealth::Morphing;
+        Ok(())
+    }
+
+    /// Complete a rolling binary morph on `node_id` after it boots with `new_seed` (which must
+    /// differ from both peer nodes' seeds) and replays WAL delta entries to match the 2-of-3
+    /// quorum `synced_hash`.
+    pub fn complete_rolling_morph_catchup(
+        &mut self,
+        node_id: u8,
+        new_seed: u64,
+        synced_seq: u64,
+        synced_hash: u64,
+        session_authenticated: bool,
+    ) -> Result<(), crate::svc_runtime::ServiceError> {
+        use crate::svc_runtime::{ServiceError, ServiceId};
+        if !self.role.allows(ServiceId::Http) {
+            return Err(ServiceError::RoleDisabled);
+        }
+        if !self.key_provisioned || !session_authenticated {
+            self.unauth_refusals = self.unauth_refusals.wrapping_add(1);
+            return Err(ServiceError::Unauthenticated);
+        }
+        let idx = node_id as usize;
+        if idx >= 3 || new_seed == 0 {
+            return Err(ServiceError::SandboxTrap);
+        }
+        // Enforce heterogenous MTD invariant: `new_seed` must differ from both peer seeds
+        // and `synced_hash` must match the online quorum peers' state hash.
+        let mut i = 0usize;
+        while i < 3 {
+            if i != idx {
+                if self.variant_seeds[i] == new_seed {
+                    return Err(ServiceError::SandboxTrap);
+                }
+                if self.health[i] == TriadNodeHealth::Online
+                    && self.node_hash[i] != 0
+                    && self.node_hash[i] != synced_hash
+                {
+                    return Err(ServiceError::SandboxTrap);
+                }
+            }
+            i += 1;
+        }
+        self.variant_seeds[idx] = new_seed;
+        self.node_seq[idx] = synced_seq;
+        self.node_hash[idx] = synced_hash;
+        self.health[idx] = TriadNodeHealth::Online;
+        self.rolling_morphs_completed = self.rolling_morphs_completed.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Reconstruct an isolated or disk-corrupted node's 4 KiB (`8 × 512B`) `CTTLSQL1` SQL
+    /// partition from a surviving peer's 8 sectors and the 8 RAID-5 XOR parity sectors
+    /// ($D_{\text{lost}} = D_{\text{peer}} \oplus P$), verifying the constant-time keyed
+    /// `HMAC-SHA256` partition seal before re-admitting `lost_node` to [`TriadNodeHealth::Online`].
+    pub fn heal_isolated_node_via_raid5_xor(
+        &mut self,
+        lost_node: u8,
+        peer_node: u8,
+        session_authenticated: bool,
+        peer_sectors: &[[u8; 512]; crate::sql::SQL_PART_SECTORS],
+        parity_sectors: &[[u8; 512]; crate::sql::SQL_PART_SECTORS],
+        recovered_db_out: &mut crate::sql::SqlDb,
+    ) -> Result<u64, crate::svc_runtime::ServiceError> {
+        use crate::svc_runtime::{ServiceError, ServiceId};
+        if !self.role.allows(ServiceId::Http) {
+            return Err(ServiceError::RoleDisabled);
+        }
+        if !self.key_provisioned || !session_authenticated {
+            self.unauth_refusals = self.unauth_refusals.wrapping_add(1);
+            return Err(ServiceError::Unauthenticated);
+        }
+        let l_idx = lost_node as usize;
+        let p_idx = peer_node as usize;
+        if l_idx >= 3 || p_idx >= 3 || l_idx == p_idx {
+            return Err(ServiceError::SandboxTrap);
+        }
+        let mut reconstructed = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
+        let mut s = 0usize;
+        while s < crate::sql::SQL_PART_SECTORS {
+            let mut b = 0usize;
+            while b < 512 {
+                reconstructed[s][b] = peer_sectors[s][b] ^ parity_sectors[s][b];
+                b += 1;
+            }
+            s += 1;
+        }
+        if !recovered_db_out.load_partition(&self.cluster_key, &reconstructed) {
+            return Err(ServiceError::ImaVerificationFailed);
+        }
+        let healed_hash = recovered_db_out.state_hash();
+        self.node_hash[l_idx] = healed_hash;
+        self.node_seq[l_idx] = recovered_db_out.tx_seq;
+        self.health[l_idx] = TriadNodeHealth::Online;
+        self.parity_reconstructions = self.parity_reconstructions.wrapping_add(1);
+        Ok(healed_hash)
+    }
+}
+
+fn bytes_eq_const(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    let mut i = 0usize;
+    while i < a.len() {
+        diff |= a[i] ^ b[i];
+        i += 1;
+    }
+    diff == 0
+}
+
 fn status_body(boots: u64, out: &mut [u8]) -> usize {
     let p = b"CUTTLE-STATUS boots=";
     if out.len() < p.len() + 22 {
@@ -4975,6 +5378,267 @@ mod tests {
             0,
             "reclaimed slots must release inflated Vec capacities via shrink_to_fit"
         );
+    }
 
+    #[test]
+    fn triad_ingress_voter_enforces_2of3_tmr_byzantine_isolation_rolling_morph_and_role_auth() {
+        use crate::svc_runtime::{NodeRole, ServiceError};
+
+        let cluster_key: [u8; 32] = *b"Cuttle-Triad-Ingress-Voter-Key01";
+        let mut out = [0u8; 128];
+
+        // 1. Standing Rule: Verify unauthenticated refusal in every applicable role (`Wfe`, `Full`),
+        //    and `RoleDisabled` refusal on non-ingress roles (`Sql`, `Shell`):
+        let dummy_resps = [
+            TriadNodeVoteInput {
+                node_id: 0,
+                available: true,
+                status_code: 200,
+                state_hash: 0xAA11,
+                body: b"INSERT 1\n",
+            },
+            TriadNodeVoteInput {
+                node_id: 1,
+                available: true,
+                status_code: 200,
+                state_hash: 0xAA11,
+                body: b"INSERT 1\n",
+            },
+            TriadNodeVoteInput {
+                node_id: 2,
+                available: true,
+                status_code: 200,
+                state_hash: 0xAA11,
+                body: b"INSERT 1\n",
+            },
+        ];
+
+        for non_ingress_role in [NodeRole::Sql, NodeRole::Shell] {
+            let mut v_dis = TriadIngressVoter::new(non_ingress_role, cluster_key, [101, 202, 303]);
+            assert_eq!(
+                v_dis.vote_ingress_request(false, false, &dummy_resps, &mut out),
+                (TriadVoteOutcome::RoleDisabled, 0)
+            );
+            assert_eq!(
+                v_dis.vote_ingress_request(true, true, &dummy_resps, &mut out),
+                (TriadVoteOutcome::RoleDisabled, 0)
+            );
+            assert_eq!(
+                v_dis.begin_rolling_morph(0, true),
+                Err(ServiceError::RoleDisabled)
+            );
+            assert_eq!(
+                v_dis.complete_rolling_morph_catchup(0, 404, 1, 0xAA11, true),
+                Err(ServiceError::RoleDisabled)
+            );
+        }
+
+        for ingress_role in [NodeRole::Wfe, NodeRole::Full] {
+            let mut v = TriadIngressVoter::new(ingress_role, cluster_key, [101, 202, 303]);
+            assert_eq!(
+                v.vote_ingress_request(true, false, &dummy_resps, &mut out),
+                (TriadVoteOutcome::Unauthenticated, 0),
+                "unauthenticated mutating vote on {ingress_role:?} must be refused"
+            );
+            assert_eq!(
+                v.begin_rolling_morph(0, false),
+                Err(ServiceError::Unauthenticated)
+            );
+            assert_eq!(
+                v.complete_rolling_morph_catchup(0, 404, 1, 0xAA11, false),
+                Err(ServiceError::Unauthenticated)
+            );
+            let mut dummy_db = crate::sql::SqlDb::empty();
+            let empty_secs = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
+            assert_eq!(
+                v.heal_isolated_node_via_raid5_xor(
+                    2,
+                    0,
+                    false,
+                    &empty_secs,
+                    &empty_secs,
+                    &mut dummy_db,
+                ),
+                Err(ServiceError::Unauthenticated)
+            );
+        }
+
+        // 2. 3-of-3 Unanimous TMR Vote on a `Wfe` gateway appliance:
+        let mut voter = TriadIngressVoter::new(NodeRole::Wfe, cluster_key, [101, 202, 303]);
+        let (outcome_3of3, len_3of3) =
+            voter.vote_ingress_request(true, true, &dummy_resps, &mut out);
+        assert_eq!(
+            outcome_3of3,
+            TriadVoteOutcome::Unanimous3of3 {
+                status_code: 200,
+                state_hash: 0xAA11,
+            }
+        );
+        assert_eq!(&out[..len_3of3], b"INSERT 1\n");
+        assert_eq!(voter.unanimous_votes, 1);
+
+        // 3. Zero-Downtime Rolling Morph of Node 1 while Nodes 0 & 2 serve 2-of-3 Quorum:
+        voter.begin_rolling_morph(1, true).unwrap();
+        assert_eq!(voter.health[1], TriadNodeHealth::Morphing);
+        // Attempting to morph a second node while Node 1 is already Morphing is refused to preserve 2-of-3 quorum:
+        assert_eq!(
+            voter.begin_rolling_morph(2, true),
+            Err(ServiceError::SandboxTrap)
+        );
+        let morph_resps = [
+            TriadNodeVoteInput {
+                node_id: 0,
+                available: true,
+                status_code: 200,
+                state_hash: 0xBB22,
+                body: b"k|v\nrole|leader\n",
+            },
+            TriadNodeVoteInput {
+                node_id: 1,
+                available: false,
+                status_code: 0,
+                state_hash: 0,
+                body: b"",
+            },
+            TriadNodeVoteInput {
+                node_id: 2,
+                available: true,
+                status_code: 200,
+                state_hash: 0xBB22,
+                body: b"k|v\nrole|leader\n",
+            },
+        ];
+        let (outcome_morph, len_m) =
+            voter.vote_ingress_request(false, false, &morph_resps, &mut out);
+        assert_eq!(
+            outcome_morph,
+            TriadVoteOutcome::Majority2of3 {
+                status_code: 200,
+                state_hash: 0xBB22,
+                outlier_node: 1,
+            }
+        );
+        assert_eq!(&out[..len_m], b"k|v\nrole|leader\n");
+        assert_eq!(
+            voter.health[1],
+            TriadNodeHealth::Morphing,
+            "unavailable morphing node must remain Morphing until catchup completes"
+        );
+
+        // Complete Node 1 catch-up with fresh seed `909` and synced hash `0xBB22`:
+        voter
+            .complete_rolling_morph_catchup(1, 909, 2, 0xBB22, true)
+            .unwrap();
+        assert_eq!(voter.health[1], TriadNodeHealth::Online);
+        assert_eq!(voter.variant_seeds[1], 909);
+        assert_eq!(voter.rolling_morphs_completed, 1);
+
+        // 4. Byzantine Single-Node Divergence -> Automatic Isolation of Node 2 + 2-of-3 Majority Masking:
+        let byz_resps = [
+            TriadNodeVoteInput {
+                node_id: 0,
+                available: true,
+                status_code: 200,
+                state_hash: 0xCC33,
+                body: b"status=clean\n",
+            },
+            TriadNodeVoteInput {
+                node_id: 1,
+                available: true,
+                status_code: 200,
+                state_hash: 0xCC33,
+                body: b"status=clean\n",
+            },
+            TriadNodeVoteInput {
+                node_id: 2,
+                available: true,
+                status_code: 200,
+                state_hash: 0xDEAD_BEEF,
+                body: b"status=compromised\n",
+            },
+        ];
+        let (outcome_byz, len_byz) =
+            voter.vote_ingress_request(false, false, &byz_resps, &mut out);
+        assert_eq!(
+            outcome_byz,
+            TriadVoteOutcome::Majority2of3 {
+                status_code: 200,
+                state_hash: 0xCC33,
+                outlier_node: 2,
+            }
+        );
+        assert_eq!(&out[..len_byz], b"status=clean\n");
+        assert_eq!(
+            voter.health[2],
+            TriadNodeHealth::Isolated,
+            "Byzantine outlier Node 2 must be automatically isolated by TriadIngressVoter"
+        );
+
+        // 5. Heal Isolated Node 2 via 4 KiB (`8 × 512B`) RAID-5 XOR Parity Reconstruction:
+        let mut db0 = crate::sql::SqlDb::new();
+        let mut db2_expected = crate::sql::SqlDb::new();
+        let mut sql_scratch = [0u8; 128];
+        let _ = db0.exec(
+            b"INSERT INTO kv VALUES ('healed.key', 'raid5_ok', 7)",
+            &mut sql_scratch,
+        );
+        let _ = db2_expected.exec(
+            b"INSERT INTO kv VALUES ('healed.key', 'raid5_ok', 7)",
+            &mut sql_scratch,
+        );
+        let mut d0_secs = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
+        let mut d2_secs = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
+        db0.save_partition(&cluster_key, &mut d0_secs);
+        db2_expected.save_partition(&cluster_key, &mut d2_secs);
+        let mut parity_secs = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
+        for s in 0..crate::sql::SQL_PART_SECTORS {
+            for b in 0..512 {
+                parity_secs[s][b] = d0_secs[s][b] ^ d2_secs[s][b];
+            }
+        }
+        let mut recovered_db2 = crate::sql::SqlDb::empty();
+        let healed_hash = voter
+            .heal_isolated_node_via_raid5_xor(
+                2,
+                0,
+                true,
+                &d0_secs,
+                &parity_secs,
+                &mut recovered_db2,
+            )
+            .expect("heal Node 2 via 4 KiB RAID-5 XOR parity");
+        assert_eq!(healed_hash, db2_expected.state_hash());
+        assert_eq!(voter.health[2], TriadNodeHealth::Online);
+        assert_eq!(voter.parity_reconstructions, 1);
+
+        // 6. 3-Way Split-Brain ($N_0 \neq N_1 \neq N_2$) is refused with `SplitBrainOrQuorumLost`:
+        let split_resps = [
+            TriadNodeVoteInput {
+                node_id: 0,
+                available: true,
+                status_code: 200,
+                state_hash: 0x1111,
+                body: b"a\n",
+            },
+            TriadNodeVoteInput {
+                node_id: 1,
+                available: true,
+                status_code: 200,
+                state_hash: 0x2222,
+                body: b"b\n",
+            },
+            TriadNodeVoteInput {
+                node_id: 2,
+                available: true,
+                status_code: 200,
+                state_hash: 0x3333,
+                body: b"c\n",
+            },
+        ];
+        assert_eq!(
+            voter.vote_ingress_request(false, false, &split_resps, &mut out),
+            (TriadVoteOutcome::SplitBrainOrQuorumLost, 0)
+        );
+        assert_eq!(voter.split_brain_refusals, 1);
     }
 }

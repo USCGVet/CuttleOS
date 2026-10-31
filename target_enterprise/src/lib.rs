@@ -40,6 +40,7 @@ pub mod arp;
 pub mod attest_tlv;
 pub mod audit;
 pub mod base64;
+pub mod btree_pager;
 pub mod crc32c;
 pub mod dhcp;
 pub mod dns;
@@ -114,8 +115,12 @@ pub use crate::iommu::{
     MAX_DEVICES, MAX_DOMAINS, PAGE_MASK, PAGE_SHIFT, PAGE_SIZE,
 };
 pub use crate::memory::{BitmapAllocator, FRAME_SIZE};
+pub use crate::btree_pager::{
+    BTreeError, BTreePageKind, BTreePager, BTreeRecord, BTREE_MAX_PAGES, BTREE_PAGE_SIZE,
+};
 pub use crate::lived_net::{
-    LivedNet, ReplySet, GUEST_IP, HTTPS_PORT, HTTP_PORT, TCP_MAX_SLOTS, UDP_STATUS_PORT,
+    LivedNet, ReplySet, TriadIngressVoter, TriadNodeHealth, TriadNodeVoteInput, TriadVoteOutcome,
+    GUEST_IP, HTTPS_PORT, HTTP_PORT, TCP_MAX_SLOTS, UDP_STATUS_PORT,
 };
 pub use crate::net::{
     build_udp_datagram, ipv4_header_checksum, parse_ipv4_header, parse_udp_datagram, udp_checksum,
@@ -125,8 +130,8 @@ pub use crate::scheduler::{RoundRobin, Task, TaskId, TaskState};
 pub use crate::shell::{OsShell, ShellAction, SHELL_PROMPT};
 pub use crate::sql::{SqlDb, SQL_PART_SECTORS};
 pub use crate::svc_runtime::{
-    IpcOp, NodeRole, ServiceError, ServiceId, ServicePolicy, ServiceState, ServiceSupervisor,
-    SvcSyscall,
+    IpcOp, NodeRole, Ring3ParseSummary, Ring3SqlVerb, ServiceError, ServiceId, ServicePolicy,
+    ServiceState, ServiceSupervisor, SvcSyscall,
 };
 pub use crate::syscall::{
     BufferSink, CapTableImpl, Errno, NullSink, SyscallDispatchImpl, WriteSink, CAP_TABLE_TASKS,

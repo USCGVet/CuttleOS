@@ -765,17 +765,32 @@ impl OsShell {
         // 2. Stage request path & body into the target service's isolated IpcMailbox and verify
         //    that `mediate_endpoint` advanced `req_seq`, recorded `last_op`, and left `canary != 0`.
         self.svc.stage_mailbox_request(target, req_path, req_body)?;
-        let mb = &self.svc.services[target.index()].mailbox;
-        if mb.req_seq != prev_seq.wrapping_add(1)
-            || mb.last_op != (op as u8)
-            || mb.resp_tag != resp_tag
-            || mb.canary == 0
+        {
+            let mb = &self.svc.services[target.index()].mailbox;
+            if mb.req_seq != prev_seq.wrapping_add(1)
+                || mb.last_op != (op as u8)
+                || mb.resp_tag != resp_tag
+                || mb.canary == 0
+            {
+                return Err(ServiceError::SandboxTrap);
+            }
+        }
+
+        // 2b. Execute the target service's isolated Ring-3 (`CPL=3`, `PTE_U`) user-space request
+        //     parser & lexical validator over the staged mailbox before Ring-0 touches the payload.
+        let r3_summary = self
+            .svc
+            .parse_and_validate_ring3_mailbox(op, &mut self.audit)?;
+        if r3_summary.service != target
+            || r3_summary.user_va != target.user_va_base()
+            || r3_summary.parser_digest == 0
         {
             return Err(ServiceError::SandboxTrap);
         }
 
         // 3. Copy the request out of the target service's mailbox so the service handler
         //    operates exclusively on the mailbox message.
+        let mb = &self.svc.services[target.index()].mailbox;
         let path_len = (mb.req_path_len as usize).min(IPC_MAILBOX_PATH_CAP);
         let body_len = (mb.req_body_len as usize).min(IPC_MAILBOX_BODY_CAP);
         let mut path_buf = [0u8; IPC_MAILBOX_PATH_CAP];

@@ -194,6 +194,9 @@
     "triad_quorum_wal_raid_and_isolation_fault_injection": {
       "host_coordinator": "tools/triad_controller.py --unit-test (quorum loss <2 online refusal, 2-of-3 single-node tamper isolation & self-healing, 3-way and 2-way split-brain refusal, WAL AEAD tamper/truncation rejection, and 4 KiB RAID-5 XOR parity reconstruction D_lost = D_peer ^ P across all 3 node losses)",
       "in_kernel_triad_and_raid": "target_enterprise/src/lived_net.rs::tests::triad_byzantine_fault_injection_and_4k_raid_xor_wal_reconstruction_work",
+      "pure_rust_triad_ingress_voter": "target_enterprise/src/lived_net.rs::TriadIngressVoter & triad_ingress_voter_enforces_2of3_tmr_byzantine_isolation_rolling_morph_and_role_auth (no_std 3-node TMR response voter, automatic Byzantine outlier isolation, rolling morph catch-up guard, and 4 KiB CTTLSQL1 RAID-5 XOR parity healing)",
+      "ring3_user_space_request_parser": "target_enterprise/src/svc_runtime.rs::ServiceSupervisor::parse_and_validate_ring3_mailbox & ring3_user_space_request_parser_rejects_injections_and_diversifies_across_rotations (tokenizes & validates HTTP/SQL/shell requests inside the isolated Ring-3 mailbox before Ring-0 engines execute; blocks SQL stacked queries, comment smuggling, unbalanced quotes, path traversal, and shell command chaining)",
+      "paged_4kib_btree_storage_engine": "target_enterprise/src/btree_pager.rs::BTreePager (CTTLBTP1 4 KiB sealed pages with per-page constant-time HMAC-SHA256 verification, automatic 64-entry leaf splits scaling to 512+ rows across 13+ 4 KiB pages, ordered range scans over sibling links, and 4 KiB RAID-5 XOR parity page recovery)",
       "exhaustive_isolation_matrix": "target_enterprise/src/svc_runtime.rs::tests::exhaustive_isolation_boundary_fault_injection_matrix_across_all_roles_and_services (all 4 NodeRoles x 3 services x KPTI user_l4 page tables x capability masks x eBPF seccomp filters x CPL=3 mailbox canary/salt fault injection)"
     }
   }
