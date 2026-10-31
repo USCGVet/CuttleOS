@@ -286,6 +286,8 @@ pub struct OsShell {
     line_buf: [u8; SHELL_LINE_MAX],
     /// Current byte count in `line_buf`.
     line_len: usize,
+    /// Set when the current interactive input line exceeded `SHELL_LINE_MAX` (`256` bytes).
+    line_overflow: bool,
 }
 
 impl OsShell {
@@ -337,6 +339,7 @@ impl OsShell {
             cmd_seq: 1,
             line_buf: [0u8; SHELL_LINE_MAX],
             line_len: 0,
+            line_overflow: false,
         }
     }
 
@@ -1810,6 +1813,18 @@ impl OsShell {
         if b == b'\r' || b == b'\n' {
             let mut elen = 0usize;
             elen += copy_into(b"\r\n", &mut echo_out[elen..]);
+            if self.line_overflow {
+                self.line_len = 0;
+                self.line_overflow = false;
+                self.record_audit(22, AuditVerdict::Denied, b"shell:line:overflow");
+                let mut rlen = 0usize;
+                rlen += copy_into(
+                    b"error: command line exceeds 256-byte limit\n",
+                    &mut reply_out[rlen..],
+                );
+                rlen += copy_into(SHELL_PROMPT, &mut reply_out[rlen..]);
+                return (elen, ShellAction::Continue(rlen));
+            }
             let mut cmd = [0u8; SHELL_LINE_MAX];
             let clen = self.line_len;
             let mut i = 0usize;
@@ -1830,7 +1845,7 @@ impl OsShell {
 
         // Backspace (0x08) or DEL (0x7F).
         if b == 0x08 || b == 0x7F {
-            if self.line_len > 0 {
+            if !self.line_overflow && self.line_len > 0 {
                 self.line_len -= 1;
                 let n = copy_into(b"\x08 \x08", echo_out);
                 return (n, ShellAction::Continue(0));
@@ -1838,8 +1853,12 @@ impl OsShell {
             return (0, ShellAction::Continue(0));
         }
 
-        // Printable ASCII + tab.
-        if (0x20..=0x7E).contains(&b) && self.line_len < SHELL_LINE_MAX {
+        // Printable ASCII.
+        if (0x20..=0x7E).contains(&b) {
+            if self.line_overflow || self.line_len >= SHELL_LINE_MAX {
+                self.line_overflow = true;
+                return (0, ShellAction::Continue(0));
+            }
             self.line_buf[self.line_len] = b;
             self.line_len += 1;
             if !echo_out.is_empty() {
@@ -6743,5 +6762,71 @@ mod tests {
         // Verify `/etc/os-release` remained completely intact!
         let check_act = sh.exec_line(b"cat /etc/os-release", 1, 0, 0, &mut out);
         assert_eq!(&out[..check_act.bytes_written()], &orig_release[..orig_len]);
+    }
+
+    #[test]
+    fn feed_byte_rejects_overlong_command_line_without_truncating() {
+        let mut sh = OsShell::new();
+        let mut echo = [0u8; 16];
+        let mut reply = [0u8; 1024];
+
+        let run_via_feed_byte =
+            |sh: &mut OsShell, cmd: &[u8], echo: &mut [u8], reply: &mut [u8]| -> usize {
+                for &b in cmd {
+                    let _ = sh.feed_byte(b, 1, 0, 0, echo, reply);
+                }
+                let (_el, act) = sh.feed_byte(b'\n', 1, 0, 0, echo, reply);
+                act.bytes_written()
+            };
+
+        // 1. Exactly 256-byte `writehex` command line (`"writehex /exact256.bin 0 "` = 25 bytes + 230 hex chars + 1 trailing space = 256 bytes) succeeds.
+        let mut exact_256 = [b' '; 256];
+        let prefix = b"writehex /exact256.bin 0 ";
+        exact_256[..prefix.len()].copy_from_slice(prefix);
+        let mut i = prefix.len();
+        while i + 1 < 256 {
+            exact_256[i] = b'4';
+            exact_256[i + 1] = b'1';
+            i += 2;
+        }
+        let n_ok = run_via_feed_byte(&mut sh, &exact_256, &mut echo, &mut reply);
+        assert_eq!(
+            &reply[..n_ok],
+            b"wrote 115 bytes to /exact256.bin at offset 0\ncuttle> "
+        );
+
+        // 2. 257-byte and 300-byte lines (such as a `writehex` with a >45-char path and 192 hex chars)
+        //    are rejected with an error instead of dropping trailing bytes and executing a truncated command.
+        let mut over_257 = [b'4'; 257];
+        let bad_prefix = b"writehex /over257.bin 0 ";
+        over_257[..bad_prefix.len()].copy_from_slice(bad_prefix);
+        let n_257 = run_via_feed_byte(&mut sh, &over_257, &mut echo, &mut reply);
+        assert_eq!(
+            &reply[..n_257],
+            b"error: command line exceeds 256-byte limit\ncuttle> "
+        );
+        let n_stat = run_via_feed_byte(&mut sh, b"stat /over257.bin", &mut echo, &mut reply);
+        assert_eq!(&reply[..n_stat], b"error: path not found\ncuttle> ");
+
+        // 3. Even if backspaces arrive after overflowing 256 bytes, the line remains marked overflowed
+        //    and cannot be truncated into a 256-byte command.
+        for &b in &over_257 {
+            let _ = sh.feed_byte(b, 1, 0, 0, &mut echo, &mut reply);
+        }
+        let _ = sh.feed_byte(0x08, 1, 0, 0, &mut echo, &mut reply);
+        let (_el, act_bs) = sh.feed_byte(b'\n', 1, 0, 0, &mut echo, &mut reply);
+        assert_eq!(
+            &reply[..act_bs.bytes_written()],
+            b"error: command line exceeds 256-byte limit\ncuttle> "
+        );
+        let n_stat2 = run_via_feed_byte(&mut sh, b"stat /over257.bin", &mut echo, &mut reply);
+        assert_eq!(&reply[..n_stat2], b"error: path not found\ncuttle> ");
+
+        // 4. Subsequent normal command executes cleanly (`line_overflow` is reset on newline).
+        let n_uname = run_via_feed_byte(&mut sh, b"uname", &mut echo, &mut reply);
+        assert_eq!(
+            &reply[..n_uname],
+            b"Cuttle-TE x86_64 1.0-mtd (Moving Target Defense Kernel)\ncuttle> "
+        );
     }
 }

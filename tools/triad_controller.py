@@ -496,12 +496,20 @@ class RealOsShellHarness:
         self._lock = threading.Lock()
 
     def exec(self, node, cmd: str, timeout: float = 4.0) -> str:
+        if any(not (0x20 <= ord(ch) <= 0x7E) for ch in cmd):
+            raise ValueError("command contains non-printable or control characters")
+        clean_cmd = cmd.strip()
+        if not clean_cmd:
+            return ""
         with self._lock:
             assert self.proc.stdin is not None and self.proc.stdout is not None
-            self.proc.stdin.write(f"{node.node_id}\t{cmd}\n")
+            self.proc.stdin.write(f"{node.node_id}\t{clean_cmd}\n")
             self.proc.stdin.flush()
             line = self.proc.stdout.readline()
-            return bytes.fromhex(line.strip()).decode("utf-8", errors="replace").strip()
+            raw = bytes.fromhex(line.strip()).decode("utf-8", errors="replace")
+            if raw.endswith("cuttle> "):
+                raw = raw[: -len("cuttle> ")]
+            return raw.strip()
 
     def reset_node(self, node_id: int) -> None:
         with self._lock:
@@ -1078,9 +1086,15 @@ class TriadController:
                             formatted.append(str(int(val)))
                         else:
                             val_bytes = bytes(val) if isinstance(val, (bytes, bytearray)) else str(val).encode("utf-8")
-                            formatted.append(f"X'{val_bytes.hex()}'")
+                            hex_lit = f"X'{val_bytes.hex()}'"
+                            if all(0x20 <= b <= 0x7E for b in val_bytes):
+                                esc = val_bytes.decode("ascii").replace("'", "''")
+                                str_lit = f"'{esc}'"
+                                formatted.append(str_lit if len(str_lit) < len(hex_lit) else hex_lit)
+                            else:
+                                formatted.append(hex_lit)
                     verb = "INSERT OR REPLACE INTO" if table == "kv" else "INSERT INTO"
-                    cp_stmts.append(f"{verb} {table} VALUES ({', '.join(formatted)})")
+                    cp_stmts.append(f"{verb} {table} VALUES({','.join(formatted)})")
 
             for vkey, vstmt in vault_records.items():
                 if vkey not in seen_vault_keys:
@@ -1586,18 +1600,22 @@ class TriadController:
         self, node: TriadNode, fpath: str, expected_len: int | None = None
     ) -> bytes | None:
         """
-        Read `fpath` from `node` in 128-byte chunks via `cathex <path> <offset> <len>` so
+        Read `fpath` from `node` in chunks via `cathex <path> <offset> <len>` so
         empty, multi-line, UTF-8, and binary files are read losslessly without serial framing
         ambiguity. Parses the kernel's `hex len=<N> off=<O> data=<hex>` output (`CATHEX_REPLY_RE`)
         and verifies the final byte length matches `total_size` (and `expected_len` if given).
         """
+        shell_line_max = 256
         chunk_size = 128
         offset = 0
         buf = bytearray()
         total_size: int | None = None
         qpath = quote_shell_path(fpath)
         while True:
-            out = self.send_shell_cmd(node, f"cathex {qpath} {offset} {chunk_size}", timeout=3.0)
+            cmd = f"cathex {qpath} {offset} {chunk_size}"
+            if len(cmd) > shell_line_max:
+                return None
+            out = self.send_shell_cmd(node, cmd, timeout=3.0)
             if out.lower().startswith("error") or out.lower().startswith("usage"):
                 return None
             m = CATHEX_REPLY_RE.match(out.strip())
@@ -1626,22 +1644,31 @@ class TriadController:
     def _write_node_file_bytes(self, node: TriadNode, fpath: str, data: bytes) -> bool:
         """
         Write arbitrary `data` (including empty, multi-line, UTF-8, or binary bytes) to `fpath`
-        on `node` in 96-byte chunks via `writehex <path> <offset> <hex>`, verifying the kernel's
-        `wrote <N> bytes to <path> at offset <O>` reply (`WRITEHEX_REPLY_RE`) on each chunk as
-        well as the post-write size and SHA-256 digest on `node`.
+        on `node` in chunks via `writehex <path> <offset> <hex>` sized dynamically from
+        `SHELL_LINE_MAX` (256), the quoted path length, and the offset width, verifying the
+        kernel's `wrote <N> bytes to <path> at offset <O>` reply (`WRITEHEX_REPLY_RE`) on each
+        chunk as well as the post-write size and SHA-256 digest on `node`.
         """
-        chunk_size = 96
+        shell_line_max = 256
         qpath = quote_shell_path(fpath)
         if len(data) == 0:
-            out = self.send_shell_cmd(node, f"writehex {qpath} 0", timeout=3.0)
+            cmd = f"writehex {qpath} 0"
+            if len(cmd) > shell_line_max:
+                return False
+            out = self.send_shell_cmd(node, cmd, timeout=3.0)
             m = WRITEHEX_REPLY_RE.match(out.strip())
             if not m or int(m.group(1)) != 0 or m.group(2) != fpath or int(m.group(3)) != 0:
                 return False
         else:
             offset = 0
             while offset < len(data):
-                chunk = data[offset : offset + chunk_size]
-                out = self.send_shell_cmd(node, f"writehex {qpath} {offset} {chunk.hex()}", timeout=3.0)
+                prefix = f"writehex {qpath} {offset} "
+                max_chunk_bytes = (shell_line_max - len(prefix)) // 2
+                step_chunk_size = min(96, max_chunk_bytes)
+                if step_chunk_size <= 0:
+                    return False
+                chunk = data[offset : offset + step_chunk_size]
+                out = self.send_shell_cmd(node, f"{prefix}{chunk.hex()}", timeout=3.0)
                 m = WRITEHEX_REPLY_RE.match(out.strip())
                 if not m or int(m.group(1)) != len(chunk) or m.group(2) != fpath or int(m.group(3)) != offset:
                     return False
@@ -2521,7 +2548,10 @@ class TriadController:
         elif s.lower().startswith("vault "):
             self.send_shell_cmd(node, s)
         else:
-            self.send_shell_cmd(node, f"sql /*triad*/ {s}")
+            full_cmd = f"sql /*triad*/ {s}"
+            if len(full_cmd) > 256:
+                full_cmd = f"sql /*t*/ {s}"
+            self.send_shell_cmd(node, full_cmd)
 
     def _replay_checkpoint_on_node(self, node: TriadNode, cp_stmts: list[str]):
         for stmt in cp_stmts:
@@ -4591,6 +4621,38 @@ def run_unit_self_tests():
             assert wfe_ctrl._read_node_file_bytes(wfe_ctrl.nodes[1], "/empty.txt") == b""
             assert wfe_ctrl._read_node_file_bytes(wfe_ctrl.nodes[1], "/my page.html") == b"space path\n"
             assert wfe_ctrl._state_probe(wfe_ctrl.nodes[1]) == p1
+
+            # Low #4 (Round 8):
+            # 4a. `shell_harness` drives `feed_byte` byte-by-byte and rejects >256-byte lines with
+            #     `error: command line exceeds 256-byte limit` instead of truncating.
+            overlong_cmd = f"writehex /never_created.bin 0 {'41' * 120}"
+            assert len(overlong_cmd) > 256
+            overlong_out = wfe_harness.exec(wfe_ctrl.nodes[0], overlong_cmd)
+            assert overlong_out == "error: command line exceeds 256-byte limit", (
+                f"Expected 256-byte limit rejection from feed_byte harness, got: {overlong_out!r}"
+            )
+            assert wfe_ctrl._read_node_file_bytes(wfe_ctrl.nodes[0], "/never_created.bin") is None
+
+            # 4b. Long multi-segment paths (>45 chars, up to FS_PATH_MAX) dynamically size `writehex`
+            #     chunks from `SHELL_LINE_MAX` (256), quoted path length, and offset width so multi-chunk
+            #     writes and `_sync_files_from_peer` succeed without exceeding 256 bytes per line.
+            long_fpath = "/dir_alpha_12345/dir_bravo_12345/dir_charlie_123/long_page_name.html"
+            assert len(long_fpath) > 60
+            long_payload = bytes((i * 37 + 11) & 0xFF for i in range(320))
+            for idx in (0, 2):
+                assert wfe_ctrl._write_node_file_bytes(wfe_ctrl.nodes[idx], long_fpath, long_payload), (
+                    f"_write_node_file_bytes failed on long path ({len(long_fpath)} chars)"
+                )
+            assert wfe_ctrl._write_node_file_bytes(wfe_ctrl.nodes[1], long_fpath, b"stale")
+            assert wfe_ctrl._sync_files_from_peer(wfe_ctrl.nodes[1], wfe_ctrl.nodes[0]), (
+                "_sync_files_from_peer failed to sync multi-chunk file at >60-char path"
+            )
+            assert wfe_ctrl._read_node_file_bytes(wfe_ctrl.nodes[1], long_fpath) == long_payload
+            assert (
+                wfe_ctrl._state_probe(wfe_ctrl.nodes[0])
+                == wfe_ctrl._state_probe(wfe_ctrl.nodes[1])
+                == wfe_ctrl._state_probe(wfe_ctrl.nodes[2])
+            )
 
             # Verify /api/sh enforces auth (401 without token) and read-only policy (`writehex` -> 403,
             # `cathex` -> 200) across every node role (`full`, `wfe`, `sql`, `gw`).

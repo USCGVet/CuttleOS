@@ -610,6 +610,8 @@ impl SqlDb {
         let mut q = trim_sql(query);
         if q.starts_with(b"/*triad*/") {
             q = trim_sql(&q[9..]);
+        } else if q.starts_with(b"/*t*/") {
+            q = trim_sql(&q[5..]);
         }
         if q.is_empty() {
             return true;
@@ -643,6 +645,9 @@ impl SqlDb {
         if q.starts_with(b"/*triad*/") {
             owner = SQL_OWNER_TRIAD;
             q = trim_sql(&q[9..]);
+        } else if q.starts_with(b"/*t*/") {
+            owner = SQL_OWNER_TRIAD;
+            q = trim_sql(&q[5..]);
         }
         if q.is_empty() {
             return copy_str(b"error: empty SQL query\n", out);
@@ -1274,7 +1279,16 @@ impl SqlDb {
             return copy_str(b"error: table not found\n", out);
         };
         let after_tname = trim_sql(after_tname);
-        let (kw_values, after_values) = next_token(after_tname);
+        let (kw_values, after_values) = if starts_with_ignore_case(after_tname, b"VALUES")
+            && (after_tname.len() == 6
+                || after_tname[6] == b' '
+                || after_tname[6] == b'\t'
+                || after_tname[6] == b'(')
+        {
+            (&after_tname[..6], trim_sql(&after_tname[6..]))
+        } else {
+            next_token(after_tname)
+        };
         if !eq_ignore_ascii_case(kw_values, b"VALUES") {
             return copy_str(b"error: expected VALUES (...)\n", out);
         }

@@ -1,10 +1,11 @@
 //! Host-side stdio harness driving three real `target_enterprise::OsShell`
 //! instances with the kernel's exact 1,024-byte console reply buffer
-//! (`target_enterprise_kernel/src/main.rs:846`).
+//! (`target_enterprise_kernel/src/main.rs:846`) and byte-by-byte `feed_byte`
+//! serial line discipline (`SHELL_LINE_MAX = 256`).
 //!
 //! Used by `tools/triad_controller.py --unit-test` so controller unit tests
-//! exercise the real kernel shell parser and output formatting rather than
-//! hand-written Python mocks.
+//! exercise the real kernel shell parser, 256-byte input line limit, and
+//! 1,024-byte shared output+prompt buffer rather than hand-written Python mocks.
 
 use std::io::{self, BufRead, Write};
 use target_enterprise::OsShell;
@@ -43,8 +44,12 @@ fn main() {
             let _ = stdout.flush();
             continue;
         }
+        let mut echo = [0u8; 16];
         let mut reply = [0u8; CONSOLE_REPLY_CAP];
-        let act = shells[idx].exec_line(cmd.as_bytes(), 1, 0, 0, &mut reply);
+        for &b in cmd.as_bytes() {
+            let _ = shells[idx].feed_byte(b, 1, 0, 0, &mut echo, &mut reply);
+        }
+        let (_elen, act) = shells[idx].feed_byte(b'\n', 1, 0, 0, &mut echo, &mut reply);
         let n = act.bytes_written().min(reply.len());
         for &b in &reply[..n] {
             let _ = write!(stdout, "{:02x}", b);
