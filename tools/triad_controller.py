@@ -5468,9 +5468,14 @@ def run_unit_self_tests():
         orig_base_elf = globals()["BASE_ELF"]
         orig_base_bios = globals()["BASE_BIOS"]
         orig_find_qemu = globals()["find_qemu"]
+        orig_resolve_accelerator = globals()["resolve_accelerator"]
         try:
             globals()["BASE_ELF"] = tmp_dir / "definitely_missing_kernel_elf"
             globals()["BASE_BIOS"] = tmp_dir / "definitely_missing_bios.img"
+            # Keep this self-test hermetic: stub QEMU discovery so the missing-ELF
+            # check is exercised even on hosts (e.g. CI) without QEMU installed.
+            globals()["find_qemu"] = lambda: "qemu-system-x86_64"
+            globals()["resolve_accelerator"] = lambda qemu_bin, requested: ("tcg", ["-accel", "tcg"])
             try:
                 TriadController(
                     show_gui=False,
@@ -5506,6 +5511,7 @@ def run_unit_self_tests():
             globals()["BASE_ELF"] = orig_base_elf
             globals()["BASE_BIOS"] = orig_base_bios
             globals()["find_qemu"] = orig_find_qemu
+            globals()["resolve_accelerator"] = orig_resolve_accelerator
 
         # #15.2: Dropped legacy/non-read-only cron jobs log a WARN event on startup
         cron_warn_dir = tmp_dir / "cron_warn"
