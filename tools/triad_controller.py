@@ -501,20 +501,18 @@ class RealOsShellHarness:
 
     def __init__(self):
         exe_name = "shell_harness.exe" if os.name == "nt" else "shell_harness"
+        subprocess.run(
+            ["cargo", "build", "-p", "target_enterprise", "--example", "shell_harness", "--quiet"],
+            cwd=str(ROOT),
+            check=True,
+        )
         candidates = [
             ROOT / "target" / "debug" / "examples" / exe_name,
             ROOT / "target" / "release" / "examples" / exe_name,
         ]
         exe = next((p for p in candidates if p.exists()), None)
         if exe is None:
-            subprocess.run(
-                ["cargo", "build", "-p", "target_enterprise", "--example", "shell_harness", "--quiet"],
-                cwd=str(ROOT),
-                check=True,
-            )
-            exe = next((p for p in candidates if p.exists()), None)
-            if exe is None:
-                raise RuntimeError("Failed to locate built shell_harness binary")
+            raise RuntimeError("Failed to locate built shell_harness binary")
         self.proc = subprocess.Popen(
             [str(exe)],
             stdin=subprocess.PIPE,
@@ -5090,6 +5088,29 @@ def run_unit_self_tests():
                 == wfe_ctrl._state_probe(wfe_ctrl.nodes[1])
                 == wfe_ctrl._state_probe(wfe_ctrl.nodes[2])
             )
+
+            # Low #7 (Round 8):
+            # 7a. Unquoted paths with spaces (including numeric-looking tokens) are rejected in
+            #     `cathex` and `writehex`, while quoted paths with numeric tokens round-trip cleanly.
+            unq_wh = wfe_harness.exec(wfe_ctrl.nodes[0], "writehex /www/report 10 20 0 4142")
+            assert unq_wh.startswith("usage: writehex "), f"Unquoted space path must be rejected: {unq_wh!r}"
+            unq_ch = wfe_harness.exec(wfe_ctrl.nodes[0], "cathex /www/report 10 20 0 64")
+            assert unq_ch.startswith("usage: cathex "), f"Unquoted space path must be rejected: {unq_ch!r}"
+            assert wfe_ctrl._write_node_file_bytes(wfe_ctrl.nodes[0], "/www/report 10 20", b"quoted-ok")
+            assert wfe_ctrl._read_node_file_bytes(wfe_ctrl.nodes[0], "/www/report 10 20") == b"quoted-ok"
+
+            # 7b. SQL `TEXT` (`'...'`) and hex (`X'...'`) literals exceeding 24 bytes are rejected
+            #     with `error:` instead of silently truncating to 24 bytes.
+            over_txt = wfe_harness.exec(
+                wfe_ctrl.nodes[0],
+                "sql /*triad*/ INSERT OR REPLACE INTO kv VALUES ('over24', '0123456789abcdef012345678', 1)",
+            )
+            assert over_txt.startswith("error:"), f"25-byte TEXT literal must be rejected: {over_txt!r}"
+            over_hex = wfe_harness.exec(
+                wfe_ctrl.nodes[0],
+                f"sql /*triad*/ INSERT OR REPLACE INTO kv VALUES ('over24', X'{'41' * 25}', 1)",
+            )
+            assert over_hex.startswith("error:"), f"25-byte hex literal must be rejected: {over_hex!r}"
 
             # Verify /api/sh enforces auth (401 without token) and read-only policy (`writehex` -> 403,
             # `cathex` -> 200) across every node role (`full`, `wfe`, `sql`, `gw`).

@@ -71,7 +71,23 @@ impl SqlVal {
         SqlVal::Int(0)
     }
 
-    /// Construct a `TEXT` value from a byte slice (truncated to [`SQL_TEXT_LEN`]).
+    /// Construct a `TEXT` value from a byte slice up to [`SQL_TEXT_LEN`] bytes,
+    /// returning `None` if `s.len() > SQL_TEXT_LEN` rather than silently truncating.
+    pub fn try_from_text(s: &[u8]) -> Option<Self> {
+        if s.len() > SQL_TEXT_LEN {
+            return None;
+        }
+        let mut buf = [0u8; SQL_TEXT_LEN];
+        let n = s.len();
+        let mut i = 0usize;
+        while i < n {
+            buf[i] = s[i];
+            i += 1;
+        }
+        Some(SqlVal::Text(buf, n as u8))
+    }
+
+    /// Construct a `TEXT` value from a validated byte slice (`s.len() <= SQL_TEXT_LEN`).
     pub fn from_text(s: &[u8]) -> Self {
         let mut buf = [0u8; SQL_TEXT_LEN];
         let n = s.len().min(SQL_TEXT_LEN);
@@ -2420,7 +2436,7 @@ fn parse_literal(raw: &[u8], expected: SqlType) -> Option<SqlVal> {
                 && raw[raw.len() - 1] == b'\''
             {
                 let hex = &raw[2..raw.len() - 1];
-                if hex.len() % 2 != 0 {
+                if hex.len() % 2 != 0 || hex.len() > SQL_TEXT_LEN * 2 {
                     return None;
                 }
                 let mut decoded = [0u8; SQL_TEXT_LEN];
@@ -2429,13 +2445,14 @@ fn parse_literal(raw: &[u8], expected: SqlType) -> Option<SqlVal> {
                 while i < hex.len() {
                     let hi = parse_hex_nibble(hex[i])?;
                     let lo = parse_hex_nibble(hex[i + 1])?;
-                    if out_len < SQL_TEXT_LEN {
-                        decoded[out_len] = (hi << 4) | lo;
-                        out_len += 1;
+                    if out_len >= SQL_TEXT_LEN {
+                        return None;
                     }
+                    decoded[out_len] = (hi << 4) | lo;
+                    out_len += 1;
                     i += 2;
                 }
-                Some(SqlVal::from_text(&decoded[..out_len]))
+                SqlVal::try_from_text(&decoded[..out_len])
             } else if raw.len() >= 2
                 && ((raw[0] == b'\'' && raw[raw.len() - 1] == b'\'')
                     || (raw[0] == b'"' && raw[raw.len() - 1] == b'"'))
@@ -2448,22 +2465,24 @@ fn parse_literal(raw: &[u8], expected: SqlType) -> Option<SqlVal> {
                 while i < inner.len() {
                     if inner[i] == q {
                         if i + 1 < inner.len() && inner[i + 1] == q {
-                            if out_len < SQL_TEXT_LEN {
-                                decoded[out_len] = q;
-                                out_len += 1;
+                            if out_len >= SQL_TEXT_LEN {
+                                return None;
                             }
+                            decoded[out_len] = q;
+                            out_len += 1;
                             i += 2;
                             continue;
                         }
                         return None;
                     }
-                    if out_len < SQL_TEXT_LEN {
-                        decoded[out_len] = inner[i];
-                        out_len += 1;
+                    if out_len >= SQL_TEXT_LEN {
+                        return None;
                     }
+                    decoded[out_len] = inner[i];
+                    out_len += 1;
                     i += 1;
                 }
-                Some(SqlVal::from_text(&decoded[..out_len]))
+                SqlVal::try_from_text(&decoded[..out_len])
             } else {
                 None
             }
@@ -3167,5 +3186,54 @@ mod tests {
         assert!(out_z[..n_bad1].starts_with(b"usage: .dump"));
         let n_bad2 = db.exec(b".dump kv 0 -1", &mut out_z);
         assert!(out_z[..n_bad2].starts_with(b"usage: .dump"));
+    }
+
+    #[test]
+    fn parse_literal_rejects_text_and_hex_literals_exceeding_24_bytes_without_truncating() {
+        let mut db = SqlDb::new();
+        let mut out = [0u8; 256];
+
+        // 1. Exactly 24-byte TEXT ('24 chars') and 24-byte hex (X'48 hex chars') succeed.
+        let n_ok1 = db.exec(
+            b"INSERT OR REPLACE INTO kv VALUES ('ok.24.str', '0123456789abcdef01234567', 1)",
+            &mut out,
+        );
+        assert_eq!(&out[..n_ok1], b"REPLACE 1\n");
+        let n_ok2 = db.exec(
+            b"INSERT OR REPLACE INTO kv VALUES ('ok.24.hex', X'303132333435363738396162636465663031323334353637', 1)",
+            &mut out,
+        );
+        assert_eq!(&out[..n_ok2], b"REPLACE 1\n");
+
+        // 2. 25-byte TEXT ('25 chars') and 25-byte hex (X'50 hex chars') in INSERT and UPDATE
+        //    are rejected with `error:` rather than silently truncated to 24 bytes.
+        let n_bad_str = db.exec(
+            b"INSERT OR REPLACE INTO kv VALUES ('bad.25.str', '0123456789abcdef012345678', 1)",
+            &mut out,
+        );
+        assert!(
+            out[..n_bad_str].starts_with(b"error:"),
+            "25-byte TEXT literal must be rejected: {:?}",
+            core::str::from_utf8(&out[..n_bad_str])
+        );
+        let n_bad_hex = db.exec(
+            b"INSERT OR REPLACE INTO kv VALUES ('bad.25.hex', X'30313233343536373839616263646566303132333435363738', 1)",
+            &mut out,
+        );
+        assert!(
+            out[..n_bad_hex].starts_with(b"error:"),
+            "25-byte X'..' literal must be rejected: {:?}",
+            core::str::from_utf8(&out[..n_bad_hex])
+        );
+        let n_bad_upd = db.exec(
+            b"UPDATE kv SET v = '0123456789abcdef012345678' WHERE k = 'ok.24.str'",
+            &mut out,
+        );
+        assert!(
+            out[..n_bad_upd].starts_with(b"error:"),
+            "25-byte UPDATE SET TEXT literal must be rejected: {:?}",
+            core::str::from_utf8(&out[..n_bad_upd])
+        );
+        assert!(SqlVal::try_from_text(&[b'x'; 25]).is_none());
     }
 }

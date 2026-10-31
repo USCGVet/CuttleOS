@@ -59,6 +59,10 @@ pub const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
 /// connection slots (`512 KiB`), bounding total network buffer memory well
 /// inside the 8 MiB kernel heap even when all 16 slots are active concurrently.
 pub const MAX_TOTAL_BUFFERED_BYTES: usize = 512 * 1024;
+/// Maximum aggregate buffered HTTP/TLS bytes permitted for any single remote
+/// IPv4 peer (`256 KiB`, half of [`MAX_TOTAL_BUFFERED_BYTES`]), preventing one
+/// client IP from exhausting the entire 512 KiB buffer budget across slots.
+pub const MAX_PEER_BUFFERED_BYTES: usize = 256 * 1024;
 /// High-water mark on a [`TlsSession`]'s outbound ciphertext queue (`pending_tx`)
 /// above which `handle_https_slot` pauses draining new decrypted HTTP requests.
 pub const HTTPS_TX_HIGH_WATER: usize = 16 * 1024;
@@ -340,6 +344,27 @@ impl LivedNet {
                 .saturating_add(self.http_bufs[i].len())
                 .saturating_add(self.http_tx[i].len())
                 .saturating_add(self.slot_tls_buffered[i]);
+            i += 1;
+        }
+        total
+    }
+
+    /// Return total unread input and queued output bytes buffered across all
+    /// connection slots belonging to `peer_ip`.
+    pub fn peer_buffered_bytes(&self, peer_ip: [u8; 4]) -> usize {
+        let mut total = 0usize;
+        let mut i = 0usize;
+        while i < TCP_MAX_SLOTS {
+            let st = self.tcbs[i].state;
+            if st != TcpState::Closed
+                && st != TcpState::Listen
+                && self.tcbs[i].remote_ip == peer_ip
+            {
+                total = total
+                    .saturating_add(self.http_bufs[i].len())
+                    .saturating_add(self.http_tx[i].len())
+                    .saturating_add(self.slot_tls_buffered[i]);
+            }
             i += 1;
         }
         total
@@ -1218,30 +1243,46 @@ impl LivedNet {
         }
 
         let mut overflow_413 = false;
+        let mut busy_503 = false;
         if !effective_payload.is_empty() && self.tcbs[idx].state != TcpState::Listen {
             let next_slot_len = self.http_bufs[idx]
                 .len()
                 .saturating_add(effective_payload.len());
+            let peer_ip = self.tcbs[idx].remote_ip;
+            let next_peer_len = self
+                .peer_buffered_bytes(peer_ip)
+                .saturating_add(effective_payload.len());
             let next_total_len = self
                 .total_buffered_bytes()
                 .saturating_add(effective_payload.len());
-            if next_slot_len > MAX_HTTP_BUFFER_BYTES || next_total_len > MAX_TOTAL_BUFFERED_BYTES {
+            if next_slot_len > MAX_HTTP_BUFFER_BYTES {
                 self.http_bufs[idx].clear();
                 self.http_bufs[idx].shrink_to_fit();
                 self.http_input_closed[idx] = true;
                 overflow_413 = true;
+            } else if next_peer_len > MAX_PEER_BUFFERED_BYTES
+                || next_total_len > MAX_TOTAL_BUFFERED_BYTES
+            {
+                self.http_bufs[idx].clear();
+                self.http_bufs[idx].shrink_to_fit();
+                self.http_input_closed[idx] = true;
+                busy_503 = true;
             } else {
                 self.http_bufs[idx].extend_from_slice(effective_payload);
             }
         }
 
         let mut framing_exhausted = false;
-        if overflow_413 {
+        if overflow_413 || busy_503 {
             self.http_input_closed[idx] = true;
             self.http_bufs[idx].clear();
             self.http_bufs[idx].shrink_to_fit();
             let mut single = [0u8; TCP_SEGMENT_PAYLOAD];
-            let n = build_http_413_response(&mut single);
+            let n = if busy_503 {
+                build_http_503_response(&mut single)
+            } else {
+                build_http_413_response(&mut single)
+            };
             if n > 0 {
                 self.http_tx[idx].extend_from_slice(&single[..n]);
             }
@@ -1435,15 +1476,22 @@ impl LivedNet {
 
         if let Some(mut session) = self.tls[idx].take() {
             let mut overflow_413 = false;
+            let mut busy_503 = false;
             if !inbound.is_empty() && !self.http_input_closed[idx] {
                 let other_slots_buffered =
                     self.total_buffered_bytes().saturating_sub(self.slot_tls_buffered[idx]);
+                let other_peer_buffered = self
+                    .peer_buffered_bytes(self.tcbs[idx].remote_ip)
+                    .saturating_sub(self.slot_tls_buffered[idx]);
                 let projected_slot = session
                     .plaintext()
                     .len()
                     .saturating_add(session.pending_tx().len())
                     .saturating_add(inbound.len());
-                if other_slots_buffered.saturating_add(projected_slot) > MAX_TOTAL_BUFFERED_BYTES {
+                if other_peer_buffered.saturating_add(projected_slot) > MAX_PEER_BUFFERED_BYTES
+                    || other_slots_buffered.saturating_add(projected_slot)
+                        > MAX_TOTAL_BUFFERED_BYTES
+                {
                     let is_http_overflow = session.is_established() && !session.is_failed();
                     if let Some(sh) = shell.as_deref_mut() {
                         sh.record_net_audit(
@@ -1456,7 +1504,7 @@ impl LivedNet {
                         );
                     }
                     if is_http_overflow {
-                        overflow_413 = true;
+                        busy_503 = true;
                     } else {
                         self.http_input_closed[idx] = true;
                     }
@@ -1480,12 +1528,16 @@ impl LivedNet {
                 }
             }
             let mut framing_exhausted = false;
-            if overflow_413 {
+            if overflow_413 || busy_503 {
                 self.http_input_closed[idx] = true;
                 session.plaintext().clear();
                 session.plaintext().shrink_to_fit();
                 let mut response = [0u8; TCP_SEGMENT_PAYLOAD];
-                let n = build_http_413_response(&mut response);
+                let n = if overflow_413 {
+                    build_http_413_response(&mut response)
+                } else {
+                    build_http_503_response(&mut response)
+                };
                 if n > 0 {
                     let _ = session.send(&response[..n]);
                 }
@@ -2953,6 +3005,16 @@ fn build_http_413_response(out: &mut [u8]) -> usize {
         413,
         b"text/plain",
         b"error: EMSGSIZE (HTTP request exceeds buffer capacity)\n",
+        out,
+    )
+    .unwrap_or(0)
+}
+
+fn build_http_503_response(out: &mut [u8]) -> usize {
+    HttpImpl::build_response(
+        503,
+        b"text/plain",
+        b"error: EBUSY (server or per-peer HTTP buffer budget exhausted)\n",
         out,
     )
     .unwrap_or(0)
@@ -5234,66 +5296,65 @@ mod tests {
     fn cross_slot_buffer_cap_and_capacity_shrink_bound_heap_footprint() {
         let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x9F];
         let peer_mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
-        let peer_ip = [10, 0, 2, 2];
+        let peer_a = [10, 0, 2, 2];
+        let peer_b = [192, 168, 1, 10];
+        let peer_c = [192, 168, 1, 11];
         let mut net = LivedNet::new(mac);
 
-        let build_tcp_frame =
-            |sport: u16, dport: u16, seq: u32, ack: u32, flags: u8, payload: &[u8]| -> alloc::vec::Vec<u8> {
-                let mut frame = alloc::vec![0u8; 54 + payload.len()];
-                let tcp_len = TcpImpl::build_segment(
-                    sport,
-                    dport,
-                    seq,
-                    ack,
-                    flags,
-                    65535,
-                    payload,
-                    peer_ip,
-                    GUEST_IP,
-                    &mut frame[34..],
-                )
-                .unwrap();
-                let ip_len = 20 + tcp_len;
-                frame.truncate(14 + ip_len);
-                frame[..6].copy_from_slice(&mac);
-                frame[6..12].copy_from_slice(&peer_mac);
-                frame[12..14].copy_from_slice(&[0x08, 0x00]);
-                frame[14] = 0x45;
-                frame[16..18].copy_from_slice(&(ip_len as u16).to_be_bytes());
-                frame[20] = 0x40;
-                frame[22] = 64;
-                frame[23] = IP_PROTO_TCP;
-                frame[26..30].copy_from_slice(&peer_ip);
-                frame[30..34].copy_from_slice(&GUEST_IP);
-                let ck = ipv4_header_checksum(&frame[14..34]);
-                frame[24..26].copy_from_slice(&ck.to_be_bytes());
-                frame
+        let build_tcp_frame = |peer_ip: [u8; 4],
+                               sport: u16,
+                               dport: u16,
+                               seq: u32,
+                               ack: u32,
+                               flags: u8,
+                               payload: &[u8]|
+         -> alloc::vec::Vec<u8> {
+            let mut frame = alloc::vec![0u8; 54 + payload.len()];
+            let tcp_len = TcpImpl::build_segment(
+                sport,
+                dport,
+                seq,
+                ack,
+                flags,
+                65535,
+                payload,
+                peer_ip,
+                GUEST_IP,
+                &mut frame[34..],
+            )
+            .unwrap();
+            let ip_len = 20 + tcp_len;
+            frame.truncate(14 + ip_len);
+            frame[..6].copy_from_slice(&mac);
+            frame[6..12].copy_from_slice(&peer_mac);
+            frame[12..14].copy_from_slice(&[0x08, 0x00]);
+            frame[14] = 0x45;
+            frame[16..18].copy_from_slice(&(ip_len as u16).to_be_bytes());
+            frame[20] = 0x40;
+            frame[22] = 64;
+            frame[23] = IP_PROTO_TCP;
+            frame[26..30].copy_from_slice(&peer_ip);
+            frame[30..34].copy_from_slice(&GUEST_IP);
+            let ck = ipv4_header_checksum(&frame[14..34]);
+            frame[24..26].copy_from_slice(&ck.to_be_bytes());
+            frame
+        };
+
+        let open_conn =
+            |net: &mut LivedNet, peer_ip: [u8; 4], sport: u16, init_seq: u32| -> (u32, u32) {
+                let mut out = ReplySet::new();
+                let syn = build_tcp_frame(peer_ip, sport, 80, init_seq, 0, tcp_flags::SYN, b"");
+                net.handle_frame(&syn, 1, &mut out);
+                let synack =
+                    TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, peer_ip).unwrap();
+                let cseq = init_seq.wrapping_add(1);
+                let sseq = synack.seq.wrapping_add(1);
+                out = ReplySet::new();
+                let ack = build_tcp_frame(peer_ip, sport, 80, cseq, sseq, tcp_flags::ACK, b"");
+                net.handle_frame(&ack, 1, &mut out);
+                (cseq, sseq)
             };
 
-        // Open 10 concurrent TCP connections on port 80 and buffer ~56 KiB of incomplete pipelined
-        // HTTP headers on the first 9 slots (`9 * 56 KiB = 504 KiB <= MAX_TOTAL_BUFFERED_BYTES`).
-        let mut cseqs = [0u32; 10];
-        let mut sseqs = [0u32; 10];
-        for slot in 0..10usize {
-            let sport = 44000 + slot as u16;
-            let mut out = ReplySet::new();
-            let syn = build_tcp_frame(sport, 80, 20_000 + (slot as u32) * 100_000, 0, tcp_flags::SYN, b"");
-            net.handle_frame(&syn, 1, &mut out);
-            let synack =
-                TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, peer_ip).unwrap();
-            cseqs[slot] = 20_001 + (slot as u32) * 100_000;
-            sseqs[slot] = synack.seq.wrapping_add(1);
-            out = ReplySet::new();
-            let ack = build_tcp_frame(sport, 80, cseqs[slot], sseqs[slot], tcp_flags::ACK, b"");
-            net.handle_frame(&ack, 1, &mut out);
-        }
-
-        // Each 1,024-byte chunk is a valid complete `GET /healthz` request EXCEPT we keep a
-        // trailing incomplete request at the head so `frame_next_http_request` stops at Incomplete.
-        // Wait: if the first request is incomplete (>8 KiB would 413), how can a slot hold 56 KiB?
-        // In `handle_tcp`, `while responses < 8` drains at most 8 requests per inbound segment!
-        // So if we send 40 tiny 40-byte `GET /healthz` requests per segment across multiple segments,
-        // `http_bufs[slot]` accumulates the remaining unread requests up to 56 KiB!
         let single_req = b"GET /healthz HTTP/1.1\r\nHost: a\r\n\r\n"; // 34 bytes
         let mut batch = alloc::vec::Vec::new();
         while batch.len() + single_req.len() <= 1360 {
@@ -5301,26 +5362,156 @@ mod tests {
         }
         // Each `batch` has 40 requests (1,360 bytes), and each segment drains 8 requests (272 bytes),
         // leaving +1,088 bytes in `http_bufs[slot]` per segment!
-        // 50 segments on each of slots 0..9 accumulates ~54,400 bytes per slot (~489,600 bytes total).
-        for slot in 0..9usize {
-            let sport = 44000 + slot as u16;
+        // 50 segments on each slot accumulates ~54,400 bytes per slot.
+
+        // 1. Peer A (`10.0.2.2`) buffers ~54.4 KiB on each of 4 connections (~217.6 KiB total)
+        //    and then opens a 5th connection that exceeds `MAX_PEER_BUFFERED_BYTES` (256 KiB).
+        let mut a_cseqs = [0u32; 5];
+        let mut a_sseqs = [0u32; 5];
+        for i in 0..5usize {
+            let sport = 44000 + i as u16;
+            let (cseq, sseq) = open_conn(&mut net, peer_a, sport, 20_000 + (i as u32) * 100_000);
+            a_cseqs[i] = cseq;
+            a_sseqs[i] = sseq;
+        }
+        for i in 0..4usize {
+            let sport = 44000 + i as u16;
             for _ in 0..50 {
                 let mut out = ReplySet::new();
                 let seg = build_tcp_frame(
+                    peer_a,
                     sport,
                     80,
-                    cseqs[slot],
-                    sseqs[slot],
+                    a_cseqs[i],
+                    a_sseqs[i],
                     tcp_flags::ACK | tcp_flags::PSH,
                     &batch,
                 );
                 net.handle_frame(&seg, 1, &mut out);
-                cseqs[slot] = cseqs[slot].wrapping_add(batch.len() as u32);
-                for i in 0..out.len() {
-                    let s = TcpImpl::parse_segment(&out.get(i).unwrap()[34..], GUEST_IP, peer_ip)
+                a_cseqs[i] = a_cseqs[i].wrapping_add(batch.len() as u32);
+                for j in 0..out.len() {
+                    let s = TcpImpl::parse_segment(&out.get(j).unwrap()[34..], GUEST_IP, peer_a)
                         .unwrap();
-                    sseqs[slot] = sseqs[slot].wrapping_add(s.payload.len() as u32);
+                    a_sseqs[i] = a_sseqs[i].wrapping_add(s.payload.len() as u32);
                 }
+            }
+        }
+        assert!(net.peer_buffered_bytes(peer_a) > 200 * 1024);
+        assert!(net.peer_buffered_bytes(peer_a) <= MAX_PEER_BUFFERED_BYTES);
+
+        // Push Peer A's 5th connection over `MAX_PEER_BUFFERED_BYTES` (256 KiB) while its per-slot
+        // buffer stays well below `MAX_HTTP_BUFFER_BYTES` (64 KiB) and global total stays well below
+        // `MAX_TOTAL_BUFFERED_BYTES` (512 KiB). Must emit `503 Service Unavailable` (not 413).
+        let mut hit_peer_503 = false;
+        let mut hit_peer_413 = false;
+        for _ in 0..45 {
+            let mut out = ReplySet::new();
+            let seg = build_tcp_frame(
+                peer_a,
+                44004,
+                80,
+                a_cseqs[4],
+                a_sseqs[4],
+                tcp_flags::ACK | tcp_flags::PSH,
+                &batch,
+            );
+            net.handle_frame(&seg, 1, &mut out);
+            a_cseqs[4] = a_cseqs[4].wrapping_add(batch.len() as u32);
+            for j in 0..out.len() {
+                let s =
+                    TcpImpl::parse_segment(&out.get(j).unwrap()[34..], GUEST_IP, peer_a).unwrap();
+                a_sseqs[4] = a_sseqs[4].wrapping_add(s.payload.len() as u32);
+                let text = core::str::from_utf8(s.payload).unwrap_or("");
+                if text.contains("HTTP/1.1 503 ") {
+                    hit_peer_503 = true;
+                }
+                if text.contains("HTTP/1.1 413 ") {
+                    hit_peer_413 = true;
+                }
+            }
+            if hit_peer_503 {
+                break;
+            }
+        }
+        assert!(
+            hit_peer_503 && !hit_peer_413,
+            "exceeding MAX_PEER_BUFFERED_BYTES must emit 503 Service Unavailable (not 413)"
+        );
+        assert!(net.peer_buffered_bytes(peer_a) <= MAX_PEER_BUFFERED_BYTES);
+
+        // Complete the close handshake on Peer A's rejected 5th connection so the slot is free.
+        {
+            let mut out = ReplySet::new();
+            let fin = build_tcp_frame(
+                peer_a,
+                44004,
+                80,
+                a_cseqs[4],
+                a_sseqs[4],
+                tcp_flags::FIN | tcp_flags::ACK,
+                b"",
+            );
+            net.handle_frame(&fin, 1, &mut out);
+        }
+
+        // 2. Verify another client IP (`peer_b = 10.0.2.3`) is NOT starved when Peer A hits its
+        //    per-peer cap, and can still open connections and receive `200 OK`.
+        let mut b_cseqs = [0u32; 4];
+        let mut b_sseqs = [0u32; 4];
+        for i in 0..4usize {
+            let sport = 45000 + i as u16;
+            let (cseq, sseq) = open_conn(&mut net, peer_b, sport, 90_000 + (i as u32) * 100_000);
+            b_cseqs[i] = cseq;
+            b_sseqs[i] = sseq;
+        }
+        for i in 0..4usize {
+            let sport = 45000 + i as u16;
+            for _ in 0..50 {
+                let mut out = ReplySet::new();
+                let seg = build_tcp_frame(
+                    peer_b,
+                    sport,
+                    80,
+                    b_cseqs[i],
+                    b_sseqs[i],
+                    tcp_flags::ACK | tcp_flags::PSH,
+                    &batch,
+                );
+                net.handle_frame(&seg, 1, &mut out);
+                b_cseqs[i] = b_cseqs[i].wrapping_add(batch.len() as u32);
+                for j in 0..out.len() {
+                    let s = TcpImpl::parse_segment(&out.get(j).unwrap()[34..], GUEST_IP, peer_b)
+                        .unwrap();
+                    b_sseqs[i] = b_sseqs[i].wrapping_add(s.payload.len() as u32);
+                }
+            }
+        }
+        assert!(net.peer_buffered_bytes(peer_b) > 200 * 1024);
+        assert!(net.peer_buffered_bytes(peer_b) <= MAX_PEER_BUFFERED_BYTES);
+
+        // 3. Peer C (`10.0.2.4`) opens 2 connections; its own per-peer buffered bytes stay < 80 KiB
+        //    (well under `MAX_PEER_BUFFERED_BYTES = 256 KiB`), and each slot stays < 64 KiB, but
+        //    combined with Peer A + Peer B (~435 KiB), Peer C's second connection crosses the global
+        //    `MAX_TOTAL_BUFFERED_BYTES` (512 KiB) cap and receives `503 Service Unavailable`.
+        let (mut c0_cseq, mut c0_sseq) = open_conn(&mut net, peer_c, 46000, 200_000);
+        let (mut c1_cseq, mut c1_sseq) = open_conn(&mut net, peer_c, 46001, 300_000);
+        for _ in 0..50 {
+            let mut out = ReplySet::new();
+            let seg = build_tcp_frame(
+                peer_c,
+                46000,
+                80,
+                c0_cseq,
+                c0_sseq,
+                tcp_flags::ACK | tcp_flags::PSH,
+                &batch,
+            );
+            net.handle_frame(&seg, 1, &mut out);
+            c0_cseq = c0_cseq.wrapping_add(batch.len() as u32);
+            for j in 0..out.len() {
+                let s =
+                    TcpImpl::parse_segment(&out.get(j).unwrap()[34..], GUEST_IP, peer_c).unwrap();
+                c0_sseq = c0_sseq.wrapping_add(s.payload.len() as u32);
             }
         }
         assert!(
@@ -5331,40 +5522,40 @@ mod tests {
         );
         assert!(net.total_buffered_bytes() > 450 * 1024);
 
-        // Now push slot 9 over the global `MAX_TOTAL_BUFFERED_BYTES` (512 KiB) cap even though
-        // slot 9's per-slot buffer is well below `MAX_HTTP_BUFFER_BYTES` (64 KiB):
-        let sport9 = 44009u16;
+        let mut hit_global_503 = false;
         let mut hit_global_413 = false;
         for _ in 0..40 {
             let mut out = ReplySet::new();
             let seg = build_tcp_frame(
-                sport9,
+                peer_c,
+                46001,
                 80,
-                cseqs[9],
-                sseqs[9],
+                c1_cseq,
+                c1_sseq,
                 tcp_flags::ACK | tcp_flags::PSH,
                 &batch,
             );
             net.handle_frame(&seg, 1, &mut out);
-            cseqs[9] = cseqs[9].wrapping_add(batch.len() as u32);
-            for i in 0..out.len() {
+            c1_cseq = c1_cseq.wrapping_add(batch.len() as u32);
+            for j in 0..out.len() {
                 let s =
-                    TcpImpl::parse_segment(&out.get(i).unwrap()[34..], GUEST_IP, peer_ip).unwrap();
-                sseqs[9] = sseqs[9].wrapping_add(s.payload.len() as u32);
-                if core::str::from_utf8(s.payload)
-                    .unwrap_or("")
-                    .contains("HTTP/1.1 413 ")
-                {
+                    TcpImpl::parse_segment(&out.get(j).unwrap()[34..], GUEST_IP, peer_c).unwrap();
+                c1_sseq = c1_sseq.wrapping_add(s.payload.len() as u32);
+                let text = core::str::from_utf8(s.payload).unwrap_or("");
+                if text.contains("HTTP/1.1 503 ") {
+                    hit_global_503 = true;
+                }
+                if text.contains("HTTP/1.1 413 ") {
                     hit_global_413 = true;
                 }
             }
-            if hit_global_413 {
+            if hit_global_503 {
                 break;
             }
         }
         assert!(
-            hit_global_413,
-            "exceeding MAX_TOTAL_BUFFERED_BYTES across slots must trigger 413 Content Too Large"
+            hit_global_503 && !hit_global_413,
+            "exceeding MAX_TOTAL_BUFFERED_BYTES across slots must trigger 503 Service Unavailable (not 413)"
         );
         assert!(net.total_buffered_bytes() <= MAX_TOTAL_BUFFERED_BYTES);
 
