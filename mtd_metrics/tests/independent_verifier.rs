@@ -282,3 +282,179 @@ fn cross_check_mtd_metrics_against_independent_python_verifier() {
         "independent verifier positional suffix survival should be < 0.5, got {pos_surv}"
     );
 }
+
+#[test]
+fn cross_check_real_compiled_kernel_elf_with_independent_python_verifier_and_dataflow_chains() {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir.parent().expect("workspace root");
+    let script = root.join("tools").join("verify_metrics_independent.py");
+    assert!(script.exists(), "missing {}", script.display());
+
+    let candidate_paths = [
+        root.join("target_enterprise_kernel")
+            .join("target")
+            .join("x86_64-unknown-none")
+            .join("release")
+            .join("target_enterprise_kernel"),
+        root.join("target")
+            .join("x86_64-unknown-none")
+            .join("release")
+            .join("target_enterprise_kernel"),
+    ];
+    let kernel_elf_path = if let Some(found) = candidate_paths.iter().find(|p| p.exists()) {
+        found.clone()
+    } else {
+        let kernel_dir = root.join("target_enterprise_kernel");
+        let status = Command::new("cargo")
+            .arg("build")
+            .arg("--release")
+            .current_dir(&kernel_dir)
+            .status()
+            .expect("invoke cargo build --release in target_enterprise_kernel");
+        assert!(status.success(), "target_enterprise_kernel build failed");
+        candidate_paths
+            .into_iter()
+            .find(|p| p.exists())
+            .expect("target_enterprise_kernel ELF missing after build")
+    };
+
+    let base_elf = std::fs::read(&kernel_elf_path).expect("read real kernel ELF");
+    let mut variant_elf = base_elf.clone();
+    let stats = rewrite_elf_bytes(&mut variant_elf, 42).expect("rewrite real kernel ELF");
+    assert!(
+        stats.functions >= 2000 && stats.swapped >= 25_000,
+        "expected >= 2000 functions and >= 25000 instructions rewritten on real kernel ELF, got {stats:?}"
+    );
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "cuttle_real_kernel_indep_verify_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let base_path = tmp_dir.join("kernel_base.elf");
+    let var_path = tmp_dir.join("kernel_seed42.elf");
+    std::fs::write(&base_path, &base_elf).expect("write kernel_base.elf");
+    std::fs::write(&var_path, &variant_elf).expect("write kernel_seed42.elf");
+
+    let out = ["python", "python3"]
+        .into_iter()
+        .find_map(|bin| {
+            Command::new(bin)
+                .arg(&script)
+                .arg("--base")
+                .arg(&base_path)
+                .arg("--variant")
+                .arg(&var_path)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+        })
+        .expect("invoke python/python3 tools/verify_metrics_independent.py on real kernel ELF");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    let json_val: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("parse independent verifier JSON on real kernel");
+    let fns_total = json_val["functions_total"].as_u64().expect("functions_total");
+    let fns_mutated = json_val["functions_mutated"]
+        .as_u64()
+        .expect("functions_mutated");
+    let hamming_frac = json_val["hamming_changed_fraction"]
+        .as_f64()
+        .expect("hamming_changed_fraction");
+    let c3_base = json_val["interior_c3_cf_bytes_base"]
+        .as_u64()
+        .expect("interior_c3_cf_bytes_base");
+    let c3_var = json_val["interior_c3_cf_bytes_variant"]
+        .as_u64()
+        .expect("interior_c3_cf_bytes_variant");
+    let pos_surv = json_val["positional_suffix_survival_rate"]
+        .as_f64()
+        .expect("positional_suffix_survival_rate");
+    let jaccard_dist = json_val["distinct_suffix_jaccard_distance"]
+        .as_f64()
+        .expect("distinct_suffix_jaccard_distance");
+
+    eprintln!(
+        "real kernel ELF independent verification: functions={}/{} ({:.1}% mutated), hamming_diff={:.2}%, pos_survival={:.2}%, jaccard_dist={:.2}%, interior_c3_cf={} -> {} ({} scrubbed)",
+        fns_mutated,
+        fns_total,
+        (fns_mutated as f64 / fns_total as f64) * 100.0,
+        hamming_frac * 100.0,
+        pos_surv * 100.0,
+        jaccard_dist * 100.0,
+        c3_base,
+        c3_var,
+        c3_base.saturating_sub(c3_var)
+    );
+
+    assert!(fns_total >= 2000, "expected >= 2000 kernel functions, got {fns_total}");
+    assert!(
+        fns_mutated >= 1800,
+        "expected >= 1800 mutated kernel functions, got {fns_mutated}"
+    );
+    assert!(
+        hamming_frac > 0.18,
+        "expected > 18% .text byte Hamming difference on real kernel ELF, got {hamming_frac}"
+    );
+    assert!(
+        c3_var < c3_base && c3_base - c3_var >= 500,
+        "expected >= 500 interior 0xC3/0xCF gadget bytes scrubbed on real kernel ELF, got {c3_base} -> {c3_var}"
+    );
+    assert!(
+        pos_surv < 0.55 && jaccard_dist > 0.50,
+        "expected positional suffix survival < 0.55 and Jaccard distance > 0.50, got pos={pos_surv} jaccard={jaccard_dist}"
+    );
+
+    // Also evaluate 6-seed pairwise diversity and dataflow-constrained chain simulation on a
+    // 64 KiB slice of the real kernel `.text`:
+    let (base_text_bytes, base_text_vaddr) =
+        cuttle_mtd_metrics::read_text_section(&kernel_elf_path)
+            .expect("read_text_section on real kernel ELF");
+    let text_file_pos = base_elf
+        .windows(64)
+        .position(|w| w == &base_text_bytes[..64])
+        .expect("locate .text offset in real kernel ELF");
+    let slice_len = base_text_bytes.len().min(65_536);
+    let mut seed_variants: Vec<(String, Vec<u8>)> = Vec::new();
+    for seed in 1u64..=6 {
+        let mut elf_copy = base_elf.clone();
+        rewrite_elf_bytes(&mut elf_copy, seed).expect("rewrite real kernel ELF seed");
+        seed_variants.push((
+            format!("kernel_seed_{seed}"),
+            elf_copy[text_file_pos..text_file_pos + slice_len].to_vec(),
+        ));
+    }
+    let refs: Vec<(&str, &[u8], u64)> = seed_variants
+        .iter()
+        .map(|(lbl, b)| (lbl.as_str(), b.as_slice(), base_text_vaddr))
+        .collect();
+    let pw = evaluate_pairwise_diversity(&refs, DEFAULT_MAX_INSTRS);
+    assert_eq!(pw.variant_count, 6);
+    assert_eq!(pw.pair_count, 15);
+    assert_eq!(pw.unique_sha256_count, 6);
+    assert!(
+        pw.min_pairwise_byte_diff_fraction > 0.12,
+        "expected min pairwise byte diff > 12% across 6 real kernel seeds, got {}",
+        pw.min_pairwise_byte_diff_fraction
+    );
+
+    let base_gs = extract_gadgets(
+        &base_text_bytes[..slice_len],
+        base_text_vaddr,
+        DEFAULT_MAX_INSTRS,
+    );
+    let var_gs = extract_gadgets(&seed_variants[0].1, base_text_vaddr, DEFAULT_MAX_INSTRS);
+    let df_report =
+        evaluate_dataflow_chains(&base_gs, &var_gs, &[7, 6, 2, 0], 500, 2026).expect("dataflow chains on real kernel");
+    eprintln!(
+        "real kernel 64KiB .text dataflow chains (n=500, [rdi,rsi,rdx,rax]): static_viable={:.2}%, mean_step_survival={:.2}%, relocated_pool_satisfiable={}",
+        df_report.static_dataflow_viable_rate * 100.0,
+        df_report.mean_step_dataflow_survival * 100.0,
+        df_report.relocated_pool_satisfiable
+    );
+    assert!(
+        df_report.static_dataflow_viable_rate < 0.12,
+        "expected static 4-step dataflow chain survival < 12% under in-place binmorph alone on real kernel .text, got {}",
+        df_report.static_dataflow_viable_rate
+    );
+}

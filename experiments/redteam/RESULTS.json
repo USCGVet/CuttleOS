@@ -135,5 +135,66 @@
   "blue_side": {
     "semantic_equivalence": "1647 contract KAT/unit tests green; verifier 23/23; kernel churn gate 4/4",
     "instrument_validation": "base-vs-self control = 100% viable on both attacker models"
+  },
+  "verification_and_fault_injection_suite_2026_10_30": {
+    "differential_equivalence_x86_64": {
+      "harness": "binmorph/tests/differential_equiv.rs (X86MicroVm concrete x86-64 machine-code emulator with .rodata/.data.rel.ro mapping and 6 ABI input profiles)",
+      "real_kernel_elf": "target_enterprise_kernel (x86_64-unknown-none release ELF, 719,232-byte .text, 2,201 functions)",
+      "real_kernel_functions_verified": 522,
+      "real_kernel_input_sensitive_functions": 498,
+      "real_kernel_memory_mutating_functions": 275,
+      "real_kernel_distinct_mutated_functions": 510,
+      "real_kernel_seeds_tested": 32,
+      "real_kernel_inputs_per_seed": 16,
+      "real_kernel_mutated_fn_seed_instances": 15244,
+      "real_kernel_total_concrete_executions": 267264,
+      "real_kernel_injected_faults_caught": 421,
+      "synthetic_multi_pass_corpus": "10 functions x 64 seeds x 24 inputs = 15,360 concrete differential executions + 3 negative fault-injection meta-tests",
+      "bug_found_and_fixed": "pass_reg_reg_morph in binmorph/src/lib.rs could replace a clean instruction (clean_count == 0) with an encoding containing an interior 0xC3/0xCF byte when !orig_has_ret; fixed and locked down across 50 seeds"
+    },
+    "independent_metrics_verifier": {
+      "harness": "tools/verify_metrics_independent.py (zero-dependency standalone Python ELF64 parser + table-driven x86-64 decoder) & mtd_metrics/tests/independent_verifier.rs",
+      "real_kernel_elf_seed42": {
+        "base_sha256": "b8ea349a8262f96f9fa4af9cf805b09e7960801188c6a4180d6edb0c378cb25c",
+        "variant_sha256": "4033f5730a29ace476472f2a83d75918c142da5f71871de515ab78c8888ff53f",
+        "text_size_bytes": 719232,
+        "functions_total": 2201,
+        "functions_mutated": 1911,
+        "functions_mutated_fraction": 0.8682417083144026,
+        "instrs_total": 174406,
+        "candidates": 45774,
+        "swapped_instrs": 32726,
+        "reg_swapped_fns": 802,
+        "reg_remapped_instrs": 18118,
+        "hamming_changed_bytes": 145571,
+        "hamming_changed_fraction": 0.20239783546894466,
+        "base_suffix_windows": 46866,
+        "positional_suffix_survivors": 23234,
+        "positional_suffix_survival_rate": 0.49575385140613665,
+        "distinct_suffix_jaccard_distance": 0.5595773821170025,
+        "interior_c3_cf_bytes_base": 2900,
+        "interior_c3_cf_bytes_variant": 2299,
+        "interior_c3_cf_bytes_scrubbed": 601
+      },
+      "real_kernel_64kib_dataflow_chainsim": {
+        "chains": 500,
+        "target_regs": ["rdi", "rsi", "rdx", "rax"],
+        "static_dataflow_viable_rate": 0.068,
+        "mean_step_dataflow_survival": 0.55,
+        "relocated_pool_satisfiable": true
+      },
+      "pairwise_multi_seed_diversity": "mtd_metrics/src/lib.rs (PairwiseDiversityReport, evaluate_pairwise_diversity across all C(N,2) seed pairs: 6/6 real kernel seeds unique SHA-256, >12% min pairwise byte diff)"
+    },
+    "multi_seed_qemu_boot_continuity": {
+      "harness": "factory_builder/tests/qemu_smoke.rs::morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu",
+      "distinct_morphed_seeds_verified": 10,
+      "sequential_qemu_boots": [101, 202, 303],
+      "verdict": "10 morphed kernel ELF seeds verified pairwise distinct; 3 consecutive bare-metal QEMU boots across distinct morphed seeds (101 -> 202 -> 303) emitted all 130 required boot banners + SHELL resume OK while preserving cryptographically sealed CTTLSHL1/CTTLFS01/CTTLSQL1 AHCI disk state"
+    },
+    "triad_quorum_wal_raid_and_isolation_fault_injection": {
+      "host_coordinator": "tools/triad_controller.py --unit-test (quorum loss <2 online refusal, 2-of-3 single-node tamper isolation & self-healing, 3-way and 2-way split-brain refusal, WAL AEAD tamper/truncation rejection, and 4 KiB RAID-5 XOR parity reconstruction D_lost = D_peer ^ P across all 3 node losses)",
+      "in_kernel_triad_and_raid": "target_enterprise/src/lived_net.rs::tests::triad_byzantine_fault_injection_and_4k_raid_xor_wal_reconstruction_work",
+      "exhaustive_isolation_matrix": "target_enterprise/src/svc_runtime.rs::tests::exhaustive_isolation_boundary_fault_injection_matrix_across_all_roles_and_services (all 4 NodeRoles x 3 services x KPTI user_l4 page tables x capability masks x eBPF seccomp filters x CPL=3 mailbox canary/salt fault injection)"
+    }
   }
 }

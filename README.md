@@ -143,17 +143,21 @@ Because each 4-core Cuttle OS VM requires only **3.5 MB of disk**, **128 MB of R
 
 ---
 
-## Attacker Models & Measured MTD Metrics
+## Attacker Models, Measured MTD Metrics & Real-Kernel Verification Suite
 
-Evaluated via `cuttle-binmorph` and `cuttle-mtd-metrics` (`churn` and `chainsim`) across seeded builds of `target_enterprise_kernel` (`787` functions, `76,193` instructions, `2,000` 8-gadget ROP chains):
+Evaluated via `cuttle-binmorph`, `cuttle-mtd-metrics` (`churn`, `chainsim`, `evaluate_dataflow_chains`, `evaluate_pairwise_diversity`), and the standalone zero-dependency verifier [`tools/verify_metrics_independent.py`](tools/verify_metrics_independent.py) across seeded builds of `target_enterprise_kernel`:
 
 | Metric / Attacker Model | Scope | Measured Result |
 | :--- | :--- | :--- |
-| **Morphed `.text` instructions (`binmorph`)** | Instructions rewritten in place per build (~140ms) | **`29.5%`** (`73%+` of eligible candidates; `~285` functions register-swapped) |
+| **Real kernel `.text` functions mutated (`binmorph`)** | Functions and instructions rewritten in place per seed (~140ms) on `target_enterprise_kernel` (`719,232` B `.text`, `2,201` functions, `174,406` instructions) | **`86.8%` of functions** (`1,911 / 2,201` functions mutated; `32,726 / 45,774` (`71.5%`) candidate instructions swapped; `802` functions register-permuted; `145,571` bytes (`20.24%`) Hamming diff) |
+| **Unintended interior `0xC3`/`0xCF` gadget bytes scrubbed** | Interior `ret` (`0xC3`) and `iretq` (`0xCF`) bytes inside non-terminator instructions (`verify_metrics_independent.py`) | **`2,900 → 2,299`** (**`601` unintended gadget bytes scrubbed**, `0` injected) |
 | **Positional gadget survival (`binmorph` only)** | Gadgets remaining at the same offset with identical disassembly | **`25.8%`** (`0.0%` when combined with source + linker morphing) |
 | **Attacker A — Static 8-step ROP chain** | Stockpiled exploit with hardcoded gadget offsets from build $N$ fired at build $N+1$ | **`0.0%`** (`0 / 2,000` chains survive) |
 | **Attacker B — Exact-register 8-step chain relocation** | Attacker with a full `.text` dump of build $N+1$ who relocates each step to any offset containing the same address-masked gadget with the same registers | **`1.15%`** (`23 / 2,000` chains rebuildable; **`98.85%` broken**) |
 | **Attacker B\_reg — Register-adapting 8-step chain relocation** | Attacker with a full `.text` dump of build $N+1$ who can both relocate gadgets and freely substitute any general-purpose register of matching width (`r64`/`r32`/`r16`/`r8`) | **`8.80%`** (`176 / 2,000` chains rebuildable; **`91.20%` broken**) |
+| **x86-64 Differential Execution & Equivalence ([`differential_equiv.rs`](binmorph/tests/differential_equiv.rs))** | Concrete machine-code execution (`X86MicroVm`) comparing post-`ret` `RAX`, `RDX`, `RSP`, `RBX`/`RBP`/`R12`–`R15`, and 16 KiB data/stack RAM on real compiled `target_enterprise_kernel` `.text` functions | **`522` real kernel functions** (`498` input-sensitive, `275` memory-mutating, `510` distinct mutated functions, **`15,244` mutated `fn × seed` instances**, **`267,264` concrete executions across `32` seeds**, **`421` injected real-kernel instruction faults caught**) |
+| **Multi-Seed Morphed Kernel QEMU Boot Continuity ([`qemu_smoke.rs`](factory_builder/tests/qemu_smoke.rs))** | `10` morphed kernel ELF seeds verified pairwise distinct + `3` consecutive bare-metal QEMU boots (`seeds 101 → 202 → 303`) against persistent AHCI disks | **`10 / 10` seeds distinct**; **`3 / 3` sequential QEMU boots** emit all `130` required banners + `SHELL resume OK` with intact sealed `CTTLSHL1`/`CTTLFS01`/`CTTLSQL1` state |
+| **Triad Byzantine Quorum, RAID-5 XOR & Isolation Fault Injection** | Quorum loss (`< 2` online), 2-of-3 tamper self-healing, 3-way/2-way split-brain refusal, 4 KiB RAID-5 XOR parity reconstruction ($D_{\text{lost}} = D_{\text{peer}} \oplus P$), and exhaustive 4-role × 3-service isolation matrix | **100% pass** across [`tools/triad_controller.py --unit-test`](tools/triad_controller.py), [`lived_net.rs`](target_enterprise/src/lived_net.rs), and [`svc_runtime.rs`](target_enterprise/src/svc_runtime.rs) |
 
 ---
 
