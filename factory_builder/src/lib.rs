@@ -526,6 +526,17 @@ pub fn build_kernel_with_layout_seed_and_prod(
     layout_seed: Option<u64>,
     prod: bool,
 ) -> Result<PathBuf> {
+    // Resolve to an absolute path up front: cargo is spawned with
+    // `current_dir(kernel_crate_dir)` below, so a relative
+    // `--manifest-path` (e.g. `--kernel-crate target_enterprise_kernel`)
+    // would otherwise be re-resolved against the kernel dir and not exist.
+    let kernel_crate_dir_abs = fs::canonicalize(kernel_crate_dir).with_context(|| {
+        format!(
+            "factory_builder: kernel crate dir {} does not exist",
+            kernel_crate_dir.display()
+        )
+    })?;
+    let kernel_crate_dir: &Path = &kernel_crate_dir_abs;
     let manifest = kernel_crate_dir.join("Cargo.toml");
     if !manifest.exists() {
         bail!(
