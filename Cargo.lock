@@ -303,6 +303,7 @@ dependencies = [
  "anyhow",
  "iced-x86",
  "object",
+ "sha2",
 ]
 
 [[package]]
@@ -350,6 +351,7 @@ name = "cuttle-mtd-metrics"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "cuttle-binmorph",
  "cuttle-diversifier",
  "iced-x86",
  "object",

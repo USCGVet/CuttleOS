@@ -3486,6 +3486,9 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
             .iter()
             .filter(|(b, _)| !has_ret_opcode_byte(b))
             .count();
+        if clean_count == 0 && !orig_has_ret {
+            continue;
+        }
         let pick_idx = (draw >> 1) as usize;
         let chosen = if sem_clean_count > 0 {
             let mut k = pick_idx % sem_clean_count;
@@ -3549,6 +3552,50 @@ pub fn rewrite_function(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &
     pass_schedule_commute(code, base_ip, prng, stats);
     pass_reg_reg_morph(code, base_ip, prng, stats);
     pass_cross_width_pair_morph(code, base_ip, prng, stats);
+}
+
+/// Parse an ELF64 image in memory, locate all `STT_FUNC` symbols inside `.text`,
+/// and rewrite each function in place using `seed`.
+pub fn rewrite_elf_bytes(elf: &mut [u8], seed: u64) -> anyhow::Result<Stats> {
+    use anyhow::{bail, Context};
+    use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
+
+    let (text_off, text_size, text_vaddr, funcs) = {
+        let file = object::File::parse(&*elf).context("parse ELF64 image")?;
+        let text = file.section_by_name(".text").context("no .text section")?;
+        let (off, size) = text
+            .file_range()
+            .context(".text section has no file range (NOBITS?)")?;
+        let vaddr = text.address();
+        let mut funcs: Vec<(u64, u64)> = file
+            .symbols()
+            .filter(|s| s.kind() == SymbolKind::Text && s.size() > 0)
+            .map(|s| (s.address(), s.size()))
+            .filter(|&(a, sz)| a >= vaddr && a + sz <= vaddr + size)
+            .collect();
+        funcs.sort_unstable();
+        funcs.dedup();
+        (off as usize, size as usize, vaddr, funcs)
+    };
+
+    if funcs.is_empty() {
+        bail!("no .text function symbols found in ELF image");
+    }
+
+    let mut prng = Prng::new(seed);
+    let mut stats = Stats::default();
+    for (vaddr, size) in funcs {
+        let start = text_off + (vaddr - text_vaddr) as usize;
+        let end = start + size as usize;
+        if end > text_off + text_size || end > elf.len() {
+            continue;
+        }
+        rewrite_function(&mut elf[start..end], vaddr, &mut prng, &mut stats);
+    }
+    Ok(stats)
+}
+
+fn _noop_guard() {
 }
 
 #[cfg(test)]

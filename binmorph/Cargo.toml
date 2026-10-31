@@ -20,3 +20,6 @@ anyhow = { workspace = true }
 iced-x86 = "1"
 # Parse the ELF, locate `.text` and the function symbol table.
 object = "0.36"
+
+[dev-dependencies]
+sha2 = { workspace = true }
