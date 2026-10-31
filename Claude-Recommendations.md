@@ -100,6 +100,7 @@ Review of the 8 commits after `db46a14`, up to `e9c10f5`: `924d655` (#1), `4b315
 - **Where:** `tools/triad_controller.py:1740` (the probe text now includes `#rows=` and the kernel digest), `:900-914` (the WAL file has no format version), and the boot-time verify and adopt steps.
 - **Problem:** Digests saved by round-7 code can never match the new probes. On the first boot after upgrading, every node fails verification and all three are rebuilt from the WAL. The default `target/cuttle_images/triad` state on this machine has 7 entries and no checkpoint, so it would rebuild cleanly. A state directory holding a round-7 checkpoint (built from truncated `SELECT` output) would rebuild all three nodes from that lossy checkpoint.
 - **Fix:** Store a probe/digest format version in `triad_wal.json`. On a mismatch, recompute the digests from a 3/3-agreeing majority instead of treating every node as rolled back, and refuse to replay a pre-`.dump` checkpoint.
+- `Status: Fixed — test: tools/triad_controller.py --unit-test (RealOsShellHarness probe_format_version v2 3/3 digest upgrade & pre-.dump checkpoint refusal) — commit: 849a638`
 
 ### 6. Each write now triggers a full chunked dump of every vote table, one node at a time
 - **Where:** `tools/triad_controller.py:2126` (the vote runs after every SQL write), `:1859` (nodes probed one after another) and `:976` (checkpoint dumps taken while holding `wal_lock`).
