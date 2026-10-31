@@ -106,6 +106,7 @@ Review of the 8 commits after `db46a14`, up to `e9c10f5`: `924d655` (#1), `4b315
 - **Where:** `tools/triad_controller.py:2126` (the vote runs after every SQL write), `:1859` (nodes probed one after another) and `:976` (checkpoint dumps taken while holding `wal_lock`).
 - **Problem:** A probe costs about one serial round trip per 3 rows, per table, per node. In the live test, writes took about 1.5–2 s with a 6-row `kv` table. A 64-row table needs 22 round trips per node, which by the same per-command cost (about 130 ms) means roughly 10 s per write per full table. Checkpoints block all writes for that long.
 - **Fix:** Add a digest-only `.dump` mode (header with `rows=` and `digest=`, no rows) for the vote, and fetch rows only for checkpoints or to diagnose a mismatch. Probe the three nodes in parallel; each already has its own `cmd_lock`.
+- `Status: Fixed — test: sql::tests::sqldump_digest_only_mode_matches_full_dump_header_and_rejects_bad_args, tools/triad_controller.py --unit-test (RealOsShellHarness digest-only vote, mismatch row diagnosis & lockless checkpoint dump) — commit: 04838f7`
 
 ### 7. Smaller items
 - **`RealOsShellHarness` (`triad_controller.py:458`):** reuses whatever `shell_harness.exe` already exists. If `shell.rs` or `sql.rs` changes and only `--unit-test` is run, the tests use a stale binary. Always run `cargo build --example shell_harness` (it's incremental) before starting it.
