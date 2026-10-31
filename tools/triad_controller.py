@@ -369,15 +369,20 @@ def format_kernel_sqldump_reply(
     is_kv = table.lower() == "kv"
 
     def _row_sort_key(r: tuple) -> tuple:
-        if is_kv and len(r) > 0 and isinstance(r[0], str) and r[0].startswith("v:"):
-            return (0, r[0].encode("utf-8"))
+        if is_kv and len(r) > 0:
+            c0 = r[0]
+            if isinstance(c0, (bytes, bytearray)) and bytes(c0).startswith(b"v:"):
+                return (0, bytes(c0))
+            if isinstance(c0, str) and c0.startswith("v:"):
+                return (0, c0.encode("utf-8"))
         key_parts = []
         for idx, val in enumerate(r):
             ctype = cols[idx][1].upper() if idx < len(cols) else ("INT" if isinstance(val, int) else "TEXT")
             if ctype.startswith("INT"):
                 key_parts.append((1, int(val)))
             else:
-                key_parts.append((2, str(val).encode("utf-8")))
+                tb = bytes(val) if isinstance(val, (bytes, bytearray)) else str(val).encode("utf-8")
+                key_parts.append((2, tb))
         return tuple(key_parts)
 
     sorted_rows = sorted(rows, key=_row_sort_key)
@@ -401,9 +406,14 @@ def format_kernel_sqldump_reply(
         h = _mix(h, b)
 
     for r in sorted_rows:
-        if is_kv and len(r) > 0 and isinstance(r[0], str) and r[0].startswith("v:"):
+        c0_bytes = (
+            bytes(r[0])
+            if (len(r) > 0 and isinstance(r[0], (bytes, bytearray)))
+            else (r[0].encode("utf-8") if (len(r) > 0 and isinstance(r[0], str)) else b"")
+        )
+        if is_kv and len(r) > 0 and c0_bytes.startswith(b"v:"):
             h = _mix(h, 0x5B)
-            kb = r[0].encode("utf-8")
+            kb = c0_bytes
             h = _mix(h, len(kb))
             for b in kb:
                 h = _mix(h, b)
@@ -418,7 +428,7 @@ def format_kernel_sqldump_reply(
                     for b in int(val).to_bytes(8, "little", signed=True):
                         h = _mix(h, b)
                 else:
-                    tb = str(val).encode("utf-8")
+                    tb = bytes(val) if isinstance(val, (bytes, bytearray)) else str(val).encode("utf-8")
                     h = _mix(h, 2)
                     h = _mix(h, len(tb))
                     for b in tb:
@@ -441,7 +451,8 @@ def format_kernel_sqldump_reply(
             if ctype.startswith("INT"):
                 cell_parts.append(f"I:{int(val)}")
             else:
-                cell_parts.append(f"T:{str(val).encode('utf-8').hex()}")
+                tb = bytes(val) if isinstance(val, (bytes, bytearray)) else str(val).encode("utf-8")
+                cell_parts.append(f"T:{tb.hex()}")
         out_lines.append("row " + "|".join(cell_parts))
     return "\n".join(out_lines)
 
@@ -1044,9 +1055,9 @@ class TriadController:
                         table == "kv"
                         and cells
                         and cells[0][0] == "TEXT"
-                        and str(cells[0][1]).startswith("v:")
+                        and bytes(cells[0][1]).startswith(b"v:")
                     ):
-                        vkey = str(cells[0][1])[2:]
+                        vkey = bytes(cells[0][1])[2:].decode("utf-8", errors="replace")
                         if vkey in vault_records:
                             cp_stmts.append(vault_records[vkey])
                             seen_vault_keys.add(vkey)
@@ -1056,9 +1067,8 @@ class TriadController:
                         if ctype == "INT":
                             formatted.append(str(int(val)))
                         else:
-                            sval = str(val)
-                            escaped = sval.replace("'", "''")
-                            formatted.append(f"'{escaped}'")
+                            val_bytes = bytes(val) if isinstance(val, (bytes, bytearray)) else str(val).encode("utf-8")
+                            formatted.append(f"X'{val_bytes.hex()}'")
                     verb = "INSERT OR REPLACE INTO" if table == "kv" else "INSERT INTO"
                     cp_stmts.append(f"{verb} {table} VALUES ({', '.join(formatted)})")
 
@@ -1692,7 +1702,7 @@ class TriadController:
                 if not rln.startswith("row "):
                     return None
                 raw_cells = rln[4:].split("|") if rln[4:] else []
-                parsed_cells: list[tuple[str, str | int]] = []
+                parsed_cells: list[tuple[str, bytes | int]] = []
                 for rc in raw_cells:
                     if rc.startswith("I:"):
                         try:
@@ -1704,8 +1714,8 @@ class TriadController:
                         if len(hex_part) % 2 != 0:
                             return None
                         try:
-                            parsed_cells.append(("TEXT", bytes.fromhex(hex_part).decode("utf-8")))
-                        except Exception:
+                            parsed_cells.append(("TEXT", bytes.fromhex(hex_part)))
+                        except ValueError:
                             return None
                     else:
                         return None
@@ -1721,18 +1731,22 @@ class TriadController:
         select_lines = [col_hdr]
         probe_rows: list[str] = []
         for cells in all_rows:
-            select_lines.append("|".join(str(v) for _, v in cells))
+            select_lines.append(
+                "|".join(
+                    str(v) if ct == "INT" else bytes(v).decode("utf-8", errors="replace")
+                    for ct, v in cells
+                )
+            )
             if (
                 table.lower() == "kv"
                 and cells
                 and cells[0][0] == "TEXT"
-                and str(cells[0][1]).startswith("v:")
+                and bytes(cells[0][1]).startswith(b"v:")
             ):
-                k_esc = str(cells[0][1]).replace("\\", "\\\\").replace("|", "\\|")
-                probe_rows.append(f"{k_esc}|<HW_SEALED>")
+                probe_rows.append(f"T:{bytes(cells[0][1]).hex()}|<HW_SEALED>")
             else:
                 escaped = [
-                    str(v) if ct == "INT" else str(v).replace("\\", "\\\\").replace("|", "\\|")
+                    f"I:{int(v)}" if ct == "INT" else f"T:{bytes(v).hex()}"
                     for ct, v in cells
                 ]
                 probe_rows.append("|".join(escaped))
@@ -1855,13 +1869,17 @@ class TriadController:
         if len(online_nodes) >= 2:
             with self.wal_lock:
                 probed_tx_seq = self.triad_tx_seq
-            # Read each online node's replicated state to verify 2-of-3 majority consistency
+            # Read each online node's replicated state to verify 2-of-3 majority consistency.
+            # Retry any None probe once before evaluating consensus.
             outputs = {n.node_id: self._state_probe(n) for n in online_nodes}
+            for n in online_nodes:
+                if outputs.get(n.node_id) is None:
+                    outputs[n.node_id] = self._state_probe(n)
 
             # Check if any node diverges from the 2-of-3 majority!
-            if len(online_nodes) == 3 and all(outputs.get(i) is not None for i in (1, 2, 3)):
-                o1, o2, o3 = outputs[1], outputs[2], outputs[3]
-                if o1 == o2 == o3:
+            if len(online_nodes) == 3:
+                o1, o2, o3 = outputs.get(1), outputs.get(2), outputs.get(3)
+                if o1 is not None and o1 == o2 == o3:
                     for n in online_nodes:
                         n.consecutive_heals = 0
                     self.parity_syndrome_ok = True
@@ -1884,13 +1902,13 @@ class TriadController:
                     with self.wal_lock:
                         if self.triad_tx_seq != probed_tx_seq:
                             return
-                    # 2-of-3 Majority Vote identifies the exact tampered/corrupted node!
+                    # 2-of-3 Majority Vote identifies the exact tampered/corrupted (or unreadable) node!
                     corrupted = None
-                    if o2 == o3 and o1 != o2:
+                    if o2 is not None and o3 is not None and o2 == o3 and o1 != o2:
                         corrupted = n1
-                    elif o1 == o3 and o2 != o1:
+                    elif o1 is not None and o3 is not None and o1 == o3 and o2 != o1:
                         corrupted = n2
-                    elif o1 == o2 and o3 != o1:
+                    elif o1 is not None and o2 is not None and o1 == o2 and o3 != o1:
                         corrupted = n3
                     if corrupted:
                         if corrupted.state == "HEALING":
@@ -1898,12 +1916,11 @@ class TriadController:
                         if not self.spec.has_sql:
                             # Confirm non-SQL (wfe) divergence across a second probe before wiping disks
                             recheck = {n.node_id: self._state_probe(n) for n in online_nodes}
-                            if any(recheck.get(i) is None for i in (1, 2, 3)):
-                                return
                             peer_ids = [i for i in (1, 2, 3) if i != corrupted.node_id]
-                            if not (
-                                recheck[peer_ids[0]] == recheck[peer_ids[1]]
-                                and recheck[corrupted.node_id] != recheck[peer_ids[0]]
+                            if (
+                                recheck.get(peer_ids[0]) is None
+                                or recheck.get(peer_ids[0]) != recheck.get(peer_ids[1])
+                                or recheck.get(corrupted.node_id) == recheck.get(peer_ids[0])
                             ):
                                 return
                         if corrupted.consecutive_heals >= MAX_CONSECUTIVE_HEALS:
@@ -1929,14 +1946,28 @@ class TriadController:
                         corrupted.state = "HEALING"
                         self.parity_syndrome_ok = False
                         self.quorum_status = f"TMR PARITY FAULT ON {corrupted.name} — 2/3 MAJORITY HEALING!"
+                        reason = (
+                            "unreadable state probe after retry"
+                            if outputs.get(corrupted.node_id) is None
+                            else "state mismatch"
+                        )
                         self.log_event(
                             "ALERT",
-                            f"RAID Parity & 2/3 Majority mismatch on {corrupted.name}! "
+                            f"RAID Parity & 2/3 Majority {reason} on {corrupted.name}! "
                             f"Outvoted 2-to-1 by peers. Triggering automatic RAID reconstruction + Emergency Morph!",
                         )
                         threading.Thread(
                             target=self.heal_and_remorph_node, args=(corrupted,), daemon=True
                         ).start()
+                        return
+                    if any(outputs.get(i) is None for i in (1, 2, 3)):
+                        unreadable = [n.name for n in online_nodes if outputs.get(n.node_id) is None]
+                        self.parity_syndrome_ok = False
+                        self.quorum_status = "TMR PARITY PROBE FAULT (UNREADABLE NODE STATE)"
+                        self.log_event(
+                            "ALERT",
+                            f"TMR parity vote could not verify 2/3 majority: unreadable state probe on {unreadable}!",
+                        )
                         return
                     # 3-way Byzantine split-brain: o1 != o2, o2 != o3, o1 != o3 (no 2-of-3 majority!)
                     self.parity_syndrome_ok = False
@@ -1950,7 +1981,16 @@ class TriadController:
                 if len(online_nodes) == 2:
                     n_a, n_b = online_nodes[0], online_nodes[1]
                     o_a, o_b = outputs.get(n_a.node_id), outputs.get(n_b.node_id)
-                    if o_a is not None and o_b is not None and o_a != o_b:
+                    if o_a is None or o_b is None:
+                        unreadable = [n.name for n in online_nodes if outputs.get(n.node_id) is None]
+                        self.parity_syndrome_ok = False
+                        self.quorum_status = "2/3 DEGRADED PROBE FAULT (UNREADABLE NODE STATE)"
+                        self.log_event(
+                            "ALERT",
+                            f"Degraded 2/3 parity probe failed: unreadable state probe on {unreadable}!",
+                        )
+                        return
+                    if o_a != o_b:
                         self.parity_syndrome_ok = False
                         self.quorum_status = "2/3 DEGRADED SPLIT-BRAIN FAULT (ONLINE PEERS DISAGREE)"
                         self.log_event(
@@ -4245,15 +4285,114 @@ def run_unit_self_tests():
                 f"Healed node lost rows after checkpoint replay: {healed_dump}"
             )
             row_map = {r[0][1]: (r[1][1], r[2][1]) for r in healed_dump["rows"]}
-            assert row_map.get("pipe.key") == ("left|mid|right", 1), f"Pipe row corrupted: {row_map.get('pipe.key')}"
-            assert row_map.get("quote.key") == ("it's|quoted", 1), f"Quote row corrupted: {row_map.get('quote.key')}"
-            assert row_map.get("partial.key") == ("updated|v", 9), f"Partial update row corrupted: {row_map.get('partial.key')}"
-            assert row_map.get("row.41") == ("val_41_padding_text", 41), f"Tail row.41 not healed: {row_map.get('row.41')}"
+            assert row_map.get(b"pipe.key") == (b"left|mid|right", 1), f"Pipe row corrupted: {row_map.get(b'pipe.key')}"
+            assert row_map.get(b"quote.key") == (b"it's|quoted", 1), f"Quote row corrupted: {row_map.get(b'quote.key')}"
+            assert row_map.get(b"partial.key") == (b"updated|v", 9), f"Partial update row corrupted: {row_map.get(b'partial.key')}"
+            assert row_map.get(b"row.41") == (b"val_41_padding_text", 41), f"Tail row.41 not healed: {row_map.get(b'row.41')}"
             assert (
                 cp_ctrl._state_probe(cp_ctrl.nodes[0])
                 == cp_ctrl._state_probe(cp_ctrl.nodes[1])
                 == cp_ctrl._state_probe(cp_ctrl.nodes[2])
             ), "All 3 nodes must converge 3/3 after healing from chunked checkpoint + tail"
+
+            # High #1 (Round 8):
+            # 1a. A single node tampered with non-UTF-8 binary SQL literal (`X'ff'`) does NOT cause
+            #     `_dump_node_sql_table` / `_state_probe` to return None; `compute_and_verify_raid_parity`
+            #     detects the divergence, logs ALERT, and heals the tampered node back to 3/3.
+            cp_harness.exec(
+                cp_ctrl.nodes[1],
+                "sql /*triad*/ INSERT OR REPLACE INTO kv VALUES ('tamper.bin', X'ff', 1)",
+            )
+            tampered_bin_dump = cp_ctrl._dump_node_sql_table(cp_ctrl.nodes[1], "kv")
+            assert tampered_bin_dump is not None, "_dump_node_sql_table must not return None on non-UTF-8 X'ff' cell"
+            assert cp_ctrl._state_probe(cp_ctrl.nodes[1]) is not None
+            assert cp_ctrl._state_probe(cp_ctrl.nodes[1]) != cp_ctrl._state_probe(cp_ctrl.nodes[0])
+            cp_ctrl.events.clear()
+            cp_ctrl.compute_and_verify_raid_parity()
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if (
+                    cp_ctrl.nodes[1].state == "ONLINE"
+                    and cp_ctrl._state_probe(cp_ctrl.nodes[1]) == cp_ctrl._state_probe(cp_ctrl.nodes[0])
+                ):
+                    break
+                time.sleep(0.05)
+            assert any(
+                e["level"] == "ALERT" and "OS-2" in e["msg"] for e in cp_ctrl.events
+            ), f"Expected ALERT on OS-2 X'ff' tamper: {cp_ctrl.events}"
+            assert (
+                cp_ctrl._state_probe(cp_ctrl.nodes[0])
+                == cp_ctrl._state_probe(cp_ctrl.nodes[1])
+                == cp_ctrl._state_probe(cp_ctrl.nodes[2])
+            ), "Node tampered with X'ff' was not healed back to 3/3 majority"
+
+            # 1b. Vote-table rows holding `X'0a'` (newline) and `X'ff'` (non-UTF-8) survive
+            #     `checkpoint_wal()` -> `heal_and_remorph_node()` -> 3/3 convergence because
+            #     checkpoint_wal emits `X'<hex>'` literals (pure printable ASCII).
+            assert cp_ctrl.execute_triad_sql(
+                "INSERT OR REPLACE INTO kv VALUES ('nl.row', X'0a', 10)"
+            )["ok"]
+            assert cp_ctrl.execute_triad_sql(
+                "INSERT OR REPLACE INTO kv VALUES ('bin.row', X'fffe', 11)"
+            )["ok"]
+            assert cp_ctrl.checkpoint_wal(), "checkpoint_wal must succeed with X'0a' and X'fffe' rows"
+            assert all(
+                is_printable_ascii_command(s) for s in cp_ctrl.wal_checkpoint["stmts"]
+            ), f"All checkpoint statements must be printable ASCII: {cp_ctrl.wal_checkpoint['stmts']}"
+            cp_harness.exec(cp_ctrl.nodes[1], "sql /*triad*/ DELETE FROM kv")
+            cp_ctrl.heal_and_remorph_node(cp_ctrl.nodes[1])
+            bin_healed_dump = cp_ctrl._dump_node_sql_table(cp_ctrl.nodes[1], "kv")
+            assert bin_healed_dump is not None
+            bin_row_map = {r[0][1]: (r[1][1], r[2][1]) for r in bin_healed_dump["rows"]}
+            assert bin_row_map.get(b"nl.row") == (b"\n", 10), f"X'0a' row lost/corrupted across checkpoint heal: {bin_row_map.get(b'nl.row')}"
+            assert bin_row_map.get(b"bin.row") == (b"\xff\xfe", 11), f"X'fffe' row lost/corrupted across checkpoint heal: {bin_row_map.get(b'bin.row')}"
+            assert (
+                cp_ctrl._state_probe(cp_ctrl.nodes[0])
+                == cp_ctrl._state_probe(cp_ctrl.nodes[1])
+                == cp_ctrl._state_probe(cp_ctrl.nodes[2])
+            ), "3/3 nodes must converge with X'0a' and X'fffe' rows after checkpoint heal"
+
+            # 1c. A single persistently unreadable (`None`) probe alongside 2 agreeing non-None probes
+            #     in `compute_and_verify_raid_parity` logs ALERT and triggers heal after retry;
+            #     2 unreadable probes log ALERT and set parity_syndrome_ok = False.
+            orig_cp_probe = cp_ctrl._state_probe
+            none_probe_calls = {"n2": 0}
+
+            def probe_node2_none_twice(node):
+                if node.node_id == 2 and none_probe_calls["n2"] < 2:
+                    none_probe_calls["n2"] += 1
+                    return None
+                return orig_cp_probe(node)
+
+            cp_ctrl.events.clear()
+            cp_ctrl._state_probe = probe_node2_none_twice
+            try:
+                cp_ctrl.compute_and_verify_raid_parity()
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    if cp_ctrl.nodes[1].state == "ONLINE" and cp_ctrl.parity_syndrome_ok:
+                        break
+                    time.sleep(0.05)
+            finally:
+                cp_ctrl._state_probe = orig_cp_probe
+            assert none_probe_calls["n2"] == 2, f"Expected 1 retry on None probe, got {none_probe_calls['n2']} calls"
+            assert any(
+                e["level"] == "ALERT" and "unreadable state probe after retry on OS-2" in e["msg"]
+                for e in cp_ctrl.events
+            ), f"Expected ALERT for single unreadable probe on OS-2: {cp_ctrl.events}"
+
+            cp_ctrl.events.clear()
+            cp_ctrl._state_probe = lambda node: None if node.node_id in (1, 2) else orig_cp_probe(node)
+            try:
+                cp_ctrl.compute_and_verify_raid_parity()
+            finally:
+                cp_ctrl._state_probe = orig_cp_probe
+            assert not cp_ctrl.parity_syndrome_ok
+            assert any(
+                e["level"] == "ALERT" and "unreadable state probe" in e["msg"] for e in cp_ctrl.events
+            ), f"Expected ALERT when 2 probes return None: {cp_ctrl.events}"
+            cp_ctrl.compute_and_verify_raid_parity()
+            assert cp_ctrl.parity_syndrome_ok
 
             # Low #9.3: When 1 node is OFFLINE, checkpoint_wal logs WARN and succeeds with 2/3 agreeing nodes.
             cp_ctrl.nodes[2].state = "OFFLINE"
