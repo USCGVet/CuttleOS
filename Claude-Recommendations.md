@@ -80,6 +80,7 @@ Review of the 8 commits after `db46a14`, up to `e9c10f5`: `924d655` (#1), `4b315
 - **Problem:** A path that normalizes to `/etc/os-release` but is spelled differently (an extra `/` or a `./` segment) passes the check and then opens the protected file. I confirmed with the real shell that `writehex`, `write` and `rm` all modify or remove `/etc/os-release` this way. The bug predates this round for `write`, `rm` and HTTP; `writehex` (round 7) inherited it.
 - **Effect:** The "immutable" protection is bypassable by anyone with VFS write permission. The file itself is low-value, but the pattern (checking policy before normalizing) is the defect, and any future protected path would have the same hole.
 - **Fix:** Normalize the path once, with the same `normalise_path` the VFS uses, and run every policy check on the normalized form, in one helper used by all shell and HTTP write and delete paths. Add tests for alternate spellings.
+- `Status: Fixed — test: shell::tests::immutable_system_file_guard_normalizes_paths_across_shell_and_http — commit: 5f2db72`
 
 ---
 
