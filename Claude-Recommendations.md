@@ -51,6 +51,7 @@ Review of the 8 commits after `db46a14`, up to `e9c10f5`: `924d655` (#1), `4b315
   - Write checkpoint cells as `X'<hex>'` literals (always, or at least for any byte outside printable ASCII). The statement then stays printable and replays losslessly.
   - When two nodes agree and the third node's probe stays unreadable after retries, treat the third node as divergent and heal it, rather than skipping the vote. Log an ALERT whenever a vote can't run.
   - Add tests with the real shell: a vote-table row holding `X'ff'` on one node gets healed, and a row holding `X'0a'` survives checkpoint → heal → 3/3.
+- `Status: Fixed — test: tools/triad_controller.py::run_unit_self_tests (High #1a X'ff' tamper heal, #1b X'0a'/X'fffe' checkpoint -> heal -> 3/3, #1c unreadable None probe retry/ALERT/heal via RealOsShellHarness) — commit: 66955c7`
 
 ---
 
