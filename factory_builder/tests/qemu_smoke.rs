@@ -67,9 +67,12 @@ fn factory_builder_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_factory_builder"))
 }
 
+static QEMU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 #[ignore]
 fn boots_under_qemu_and_emits_banner() {
+    let _guard = QEMU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = workspace_root();
     let kernel_crate = root.join("target_enterprise_kernel");
     let pkg_crate = root.join("factory_builder_pkg");
@@ -937,6 +940,7 @@ fn halted(log: &str) -> bool {
 #[test]
 #[ignore = "requires nightly rust-src + factory_builder_pkg + qemu-system-x86_64"]
 fn tampered_ahci_seal_is_rejected_under_qemu() {
+    let _guard = QEMU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(qemu) = find_qemu() else {
         panic!("qemu-system-x86_64 not found");
     };
@@ -1031,6 +1035,171 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
         log2
     );
     eprintln!("smoke: tampered AHCI seal was rejected as expected; TAMPER TEST PASSED");
+}
+
+#[test]
+#[ignore = "requires nightly rust-src + factory_builder_pkg + qemu-system-x86_64"]
+fn morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu() {
+    let _guard = QEMU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use sha2::{Digest, Sha256};
+    use std::collections::HashSet;
+
+    let Some(qemu) = find_qemu() else {
+        panic!("qemu-system-x86_64 not found");
+    };
+    let root = workspace_root();
+    let images_dir = root.join("target").join("cuttle_images");
+    std::fs::create_dir_all(&images_dir).expect("create images_dir");
+
+    let kernel_crate = root.join("target_enterprise_kernel");
+    let pkg_crate = factory_builder::locate_pkg_crate().expect("locate_pkg_crate");
+    let base_elf = factory_builder::build_kernel(&kernel_crate).expect("build_kernel");
+    let base_elf_bytes = std::fs::read(&base_elf).expect("read base kernel ELF");
+
+    // 1. Run `cuttle-binmorph` across 10 distinct seeds and prove all 10 morphed kernel ELFs
+    //    have mutually distinct SHA-256 digests and identical byte size.
+    let all_seeds: [u64; 10] = [101, 202, 303, 404, 505, 606, 707, 808, 909, 1010];
+    let mut seen_digests: HashSet<[u8; 32]> = HashSet::new();
+    let mut boot_elf_bytes: Vec<(u64, Vec<u8>)> = Vec::new();
+
+    for &seed in &all_seeds {
+        let out_elf = images_dir.join(format!("qemu_multiseed_{seed}.elf"));
+        let bm = Command::new("cargo")
+            .current_dir(&root)
+            .args(["run", "--release", "-p", "cuttle-binmorph", "--", "--in"])
+            .arg(&base_elf)
+            .arg("--out")
+            .arg(&out_elf)
+            .arg("--seed")
+            .arg(seed.to_string())
+            .output()
+            .expect("run cuttle-binmorph for multi-seed test");
+        assert!(
+            bm.status.success(),
+            "cuttle-binmorph failed on seed {seed}: {}",
+            String::from_utf8_lossy(&bm.stderr)
+        );
+        let morphed = std::fs::read(&out_elf).expect("read morphed ELF");
+        assert_eq!(
+            morphed.len(),
+            base_elf_bytes.len(),
+            "in-place morphed ELF size changed on seed {seed}"
+        );
+        let dig: [u8; 32] = Sha256::digest(&morphed).into();
+        assert!(
+            seen_digests.insert(dig),
+            "duplicate SHA-256 digest produced for morphed kernel seed {seed}"
+        );
+        if seed == 101 || seed == 202 || seed == 303 {
+            boot_elf_bytes.push((seed, morphed));
+        } else {
+            let _ = std::fs::remove_file(&out_elf);
+        }
+    }
+    assert_eq!(seen_digests.len(), all_seeds.len());
+
+    // 2. Package seed 101 into a bootable BIOS image and locate the contiguous kernel ELF slice
+    //    so seeds 202 and 303 can be spliced into their own BIOS images (matching Triad hot-swap).
+    let elf_101_path = images_dir.join("qemu_multiseed_101.elf");
+    let bios_101_path = images_dir.join("qemu_multiseed_bios_101.img");
+    factory_builder::package_kernel_via_pkg(&pkg_crate, &elf_101_path, &bios_101_path, None)
+        .expect("package_kernel_via_pkg for seed 101");
+    let base_bios_bytes = std::fs::read(&bios_101_path).expect("read bios_101");
+    let elf_101_bytes = &boot_elf_bytes[0].1;
+    let elf_offset = base_bios_bytes
+        .windows(elf_101_bytes.len())
+        .position(|w| w == elf_101_bytes.as_slice())
+        .expect("locate contiguous kernel ELF inside packaged BIOS image");
+
+    // 3. Create fresh persistent scratch disks shared across the 3 consecutive cross-seed boots:
+    let virtio_disk = images_dir.join("virtio_multiseed_test.img");
+    let ahci_disk = images_dir.join("ahci_multiseed_test.img");
+    let nvme_disk = images_dir.join("nvme_multiseed_test.img");
+    let scratch_disks = [&virtio_disk, &ahci_disk, &nvme_disk];
+    for disk in scratch_disks {
+        std::fs::write(disk, vec![0u8; 1024 * 1024]).expect("init multiseed scratch disk");
+    }
+    let device_key_path = root.join(factory_builder::DEVICE_SECRET_KEY_FILENAME);
+    factory_builder::ensure_device_secret_key(&device_key_path)
+        .expect("provision 32-byte CSPRNG device_secret_key.bin");
+
+    let milestone_banners: &[&str] = &[
+        "CUTTLE-TE OK",
+        "TLS hkdf OK prk_sha=",
+        "TLS kat OK aead=2 kx=2 sig=1",
+        "TLS cert OK alg=ecdsa-p256 sha=c1a5d92d1e129087",
+        "KPTI build_user_view OK secrets=4",
+        "KPTI validate_user_view OK violations=0",
+        "RING3 transition OK cpl=3->0 vec=0x80 ist1=ok rsp0=ok syscall=43",
+        "TPM2_TIS driver OK did_vid=000115d1 locality=0 pcr10=extended",
+        "AHCI_HW probe OK slot=",
+        "NVME_HW probe OK slot=",
+        "WEB+SQL+SESSION compose OK tables=2 rows=6 magic=CTTLSQL1",
+        "SECCOMP: OK engine=ebpf filter=enforced",
+        "FS partition OK lba=1042..1057 sectors=16 files=1 magic=CTTLFS01",
+        "HTTPS compose OK slots=16 port=443 tls13=rustls bytes=882 sha=83e47624",
+        "SVC_RUNTIME: OK role=full->wfe->full svcs=3 kpti=isolated seccomp=deny-default rot=1",
+        "SHELL compose OK tasks=5 files=5 audit=5",
+        "SMP_HW init OK cpus=4 threads=4 ctx_sw=4",
+        "CUTTLE-TE HALT",
+    ];
+
+    for (boot_idx, (seed, elf_bytes)) in boot_elf_bytes.iter().enumerate() {
+        let boot_num = boot_idx + 1;
+        let bios_path = images_dir.join(format!("qemu_multiseed_bios_{seed}.img"));
+        if *seed != 101 {
+            let mut spliced = base_bios_bytes.clone();
+            spliced[elf_offset..elf_offset + elf_bytes.len()].copy_from_slice(elf_bytes);
+            std::fs::write(&bios_path, &spliced).expect("write spliced morphed BIOS image");
+        }
+        let serial_log = images_dir.join(format!("qemu_multiseed_serial_{seed}.log"));
+        let vm = SmokeVm {
+            qemu: &qemu,
+            bios: &bios_path,
+            virtio_disk: &virtio_disk,
+            ahci_disk: &ahci_disk,
+            nvme_disk: &nvme_disk,
+            device_key: &device_key_path,
+        };
+        eprintln!(
+            "smoke[multiseed]: booting morphed kernel #{boot_num} (seed={seed}) against persistent disks..."
+        );
+        let (log, reached) = vm.boot(&serial_log, halted);
+        assert!(
+            reached,
+            "morphed kernel seed={seed} (boot #{boot_num}) did not reach CUTTLE-TE HALT within 45s!\nSerial log:\n{log}"
+        );
+        for &banner in milestone_banners {
+            assert!(
+                log.contains(banner),
+                "morphed kernel seed={seed} (boot #{boot_num}) missing milestone banner {banner:?}!\nSerial log:\n{log}"
+            );
+        }
+        assert!(
+            !log.contains("SHELL resume REJECTED"),
+            "morphed kernel seed={seed} (boot #{boot_num}) unexpectedly rejected sealed disk state!\nSerial log:\n{log}"
+        );
+        if boot_num == 1 {
+            assert!(
+                log.contains("CONTINUITY genesis"),
+                "boot #1 (seed={seed}) expected CONTINUITY genesis!\nSerial log:\n{log}"
+            );
+        } else {
+            assert!(
+                log.contains("CONTINUITY resume OK") && log.contains("SHELL resume OK"),
+                "cross-seed boot #{boot_num} (seed={seed}) failed to resume sealed state written by prior seed!\nSerial log:\n{log}"
+            );
+        }
+        let _ = std::fs::remove_file(&bios_path);
+        let _ = std::fs::remove_file(images_dir.join(format!("qemu_multiseed_{seed}.elf")));
+    }
+
+    for disk in scratch_disks {
+        let _ = std::fs::remove_file(disk);
+    }
+    eprintln!(
+        "smoke[multiseed]: 10 morphed seeds verified distinct & 3 consecutive cross-seed QEMU boots (seeds 101 -> 202 -> 303) preserved sealed state; MULTI-SEED QEMU TEST PASSED"
+    );
 }
 
 #[test]
