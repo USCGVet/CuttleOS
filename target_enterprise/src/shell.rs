@@ -949,36 +949,61 @@ impl OsShell {
                 }
             }
             IpcOp::VfsWrite => {
-                if bytes_eq(mb_path, b"/etc/os-release") {
-                    self.record_net_audit(AuditVerdict::Denied, b"net:http:fs-protected");
-                    let n = copy_into(b"error: immutable system file\n", resp_out);
-                    (403u16, n)
-                } else if let Ok(fh) =
-                    self.fs.open(mb_path, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC)
-                {
-                    let written = self.fs.write(fh, 0, mb_body).unwrap_or(0);
-                    let _ = self.fs.close(fh);
-                    self.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-put");
-                    let mut mpos = 0usize;
-                    mpos += copy_into(b"wrote ", &mut resp_out[mpos..]);
-                    mpos += dec_u64(written as u64, &mut resp_out[mpos..]);
-                    mpos += copy_into(b" bytes to ", &mut resp_out[mpos..]);
-                    mpos += copy_into(mb_path, &mut resp_out[mpos..]);
-                    mpos += copy_into(b"\n", &mut resp_out[mpos..]);
-                    (201u16, mpos)
-                } else {
-                    let n = copy_into(b"error: open failed\n", resp_out);
-                    (500u16, n)
+                let mut norm_path = [0u8; cuttle_contracts::FS_PATH_MAX];
+                match check_writable_vfs_path(mb_path, &mut norm_path) {
+                    WritablePathPolicy::Protected => {
+                        self.record_net_audit(AuditVerdict::Denied, b"net:http:fs-protected");
+                        let n = copy_into(b"error: immutable system file\n", resp_out);
+                        (403u16, n)
+                    }
+                    WritablePathPolicy::Allowed(nlen) => {
+                        let cpath = &norm_path[..nlen];
+                        if let Ok(fh) =
+                            self.fs.open(cpath, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC)
+                        {
+                            let written = self.fs.write(fh, 0, mb_body).unwrap_or(0);
+                            let _ = self.fs.close(fh);
+                            self.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-put");
+                            let mut mpos = 0usize;
+                            mpos += copy_into(b"wrote ", &mut resp_out[mpos..]);
+                            mpos += dec_u64(written as u64, &mut resp_out[mpos..]);
+                            mpos += copy_into(b" bytes to ", &mut resp_out[mpos..]);
+                            mpos += copy_into(cpath, &mut resp_out[mpos..]);
+                            mpos += copy_into(b"\n", &mut resp_out[mpos..]);
+                            (201u16, mpos)
+                        } else {
+                            let n = copy_into(b"error: open failed\n", resp_out);
+                            (500u16, n)
+                        }
+                    }
+                    WritablePathPolicy::Invalid => {
+                        let n = copy_into(b"error: open failed\n", resp_out);
+                        (500u16, n)
+                    }
                 }
             }
             IpcOp::VfsDelete => {
-                if self.fs.unlink(mb_path).is_ok() {
-                    self.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-del");
-                    let n = copy_into(b"removed\n", resp_out);
-                    (200u16, n)
-                } else {
-                    let n = copy_into(b"not found\n", resp_out);
-                    (404u16, n)
+                let mut norm_path = [0u8; cuttle_contracts::FS_PATH_MAX];
+                match check_writable_vfs_path(mb_path, &mut norm_path) {
+                    WritablePathPolicy::Protected => {
+                        self.record_net_audit(AuditVerdict::Denied, b"net:http:fs-protected");
+                        let n = copy_into(b"error: immutable system file\n", resp_out);
+                        (403u16, n)
+                    }
+                    WritablePathPolicy::Allowed(nlen) => {
+                        if self.fs.unlink(&norm_path[..nlen]).is_ok() {
+                            self.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-del");
+                            let n = copy_into(b"removed\n", resp_out);
+                            (200u16, n)
+                        } else {
+                            let n = copy_into(b"not found\n", resp_out);
+                            (404u16, n)
+                        }
+                    }
+                    WritablePathPolicy::Invalid => {
+                        let n = copy_into(b"not found\n", resp_out);
+                        (404u16, n)
+                    }
                 }
             }
             IpcOp::GuardQuery | IpcOp::GuardControl => {
@@ -2760,7 +2785,9 @@ impl OsShell {
             self.record_audit(9, AuditVerdict::Error, b"shell:writehex:bad-off");
             return copy_into(b"usage: writehex <path> <offset> [hex]\n", out);
         };
-        if bytes_eq(path, b"/etc/os-release") {
+        let mut norm_path = [0u8; cuttle_contracts::FS_PATH_MAX];
+        let path_policy = check_writable_vfs_path(path, &mut norm_path);
+        if path_policy == WritablePathPolicy::Protected {
             self.record_audit(9, AuditVerdict::Denied, b"shell:writehex:protected");
             return copy_into(b"error: permission denied (immutable system file)\n", out);
         }
@@ -2774,15 +2801,20 @@ impl OsShell {
             };
             decoded_len
         };
+        let WritablePathPolicy::Allowed(nlen) = path_policy else {
+            self.record_audit(9, AuditVerdict::Error, b"shell:writehex:open-failed");
+            return copy_into(b"error: cannot open path for write\n", out);
+        };
+        let cpath = &norm_path[..nlen];
         if offset == 0 {
-            let _ = self.fs.unlink(path);
+            let _ = self.fs.unlink(cpath);
         }
         let flags = if offset == 0 {
             FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC
         } else {
             FS_O_RDWR | FS_O_CREATE
         };
-        let h = match self.fs.open(path, flags) {
+        let h = match self.fs.open(cpath, flags) {
             Ok(h) => h,
             Err(_) => {
                 self.record_audit(9, AuditVerdict::Error, b"shell:writehex:open-failed");
@@ -2835,11 +2867,19 @@ impl OsShell {
             self.record_audit(9, AuditVerdict::Error, b"shell:write:bad-args");
             return copy_into(b"usage: write <path> <text>\n", out);
         }
-        if bytes_eq(path, b"/etc/os-release") {
-            self.record_audit(9, AuditVerdict::Denied, b"shell:write:protected");
-            return copy_into(b"error: permission denied (immutable system file)\n", out);
-        }
-        let h = match self.fs.open(path, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC) {
+        let mut norm_path = [0u8; cuttle_contracts::FS_PATH_MAX];
+        let cpath = match check_writable_vfs_path(path, &mut norm_path) {
+            WritablePathPolicy::Protected => {
+                self.record_audit(9, AuditVerdict::Denied, b"shell:write:protected");
+                return copy_into(b"error: permission denied (immutable system file)\n", out);
+            }
+            WritablePathPolicy::Allowed(nlen) => &norm_path[..nlen],
+            WritablePathPolicy::Invalid => {
+                self.record_audit(9, AuditVerdict::Error, b"shell:write:open-failed");
+                return copy_into(b"error: cannot open path for write\n", out);
+            }
+        };
+        let h = match self.fs.open(cpath, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC) {
             Ok(h) => h,
             Err(_) => {
                 self.record_audit(9, AuditVerdict::Error, b"shell:write:open-failed");
@@ -2892,11 +2932,19 @@ impl OsShell {
             self.record_audit(10, AuditVerdict::Error, b"shell:rm:no-arg");
             return copy_into(b"usage: rm <path>\n", out);
         }
-        if bytes_eq(path, b"/etc/os-release") {
-            self.record_audit(10, AuditVerdict::Denied, b"shell:rm:protected");
-            return copy_into(b"error: permission denied (immutable system file)\n", out);
-        }
-        match self.fs.unlink(path) {
+        let mut norm_path = [0u8; cuttle_contracts::FS_PATH_MAX];
+        let cpath = match check_writable_vfs_path(path, &mut norm_path) {
+            WritablePathPolicy::Protected => {
+                self.record_audit(10, AuditVerdict::Denied, b"shell:rm:protected");
+                return copy_into(b"error: permission denied (immutable system file)\n", out);
+            }
+            WritablePathPolicy::Allowed(nlen) => &norm_path[..nlen],
+            WritablePathPolicy::Invalid => {
+                self.record_audit(10, AuditVerdict::Error, b"shell:rm:not-found");
+                return copy_into(b"error: cannot remove path\n", out);
+            }
+        };
+        match self.fs.unlink(cpath) {
             Ok(()) => {
                 self.record_audit(10, AuditVerdict::Allowed, b"shell:rm");
                 let mut pos = 0usize;
@@ -5034,6 +5082,29 @@ fn split_writehex_args(arg: &[u8]) -> (&[u8], &[u8], &[u8]) {
     (p0, o0, h0_trim)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritablePathPolicy {
+    Allowed(usize),
+    Protected,
+    Invalid,
+}
+
+/// Normalize `raw_path` using the VFS path normalizer (`crate::vfs::normalise_path`) into
+/// `norm_out` and run immutable-system-file policy checks on the canonical normalized path.
+fn check_writable_vfs_path(
+    raw_path: &[u8],
+    norm_out: &mut [u8; cuttle_contracts::FS_PATH_MAX],
+) -> WritablePathPolicy {
+    let Ok(nlen) = crate::vfs::normalise_path(raw_path, norm_out) else {
+        return WritablePathPolicy::Invalid;
+    };
+    let norm = &norm_out[..nlen];
+    if bytes_eq(norm, b"/etc/os-release") {
+        return WritablePathPolicy::Protected;
+    }
+    WritablePathPolicy::Allowed(nlen)
+}
+
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -6564,5 +6635,113 @@ mod tests {
             row_count_1 += 1;
         }
         assert_eq!(row_count_1, 1);
+    }
+
+    #[test]
+    fn immutable_system_file_guard_normalizes_paths_across_shell_and_http() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 512];
+
+        let mut orig_release = [0u8; 256];
+        let orig_act = sh.exec_line(b"cat /etc/os-release", 1, 0, 0, &mut orig_release);
+        let orig_len = orig_act.bytes_written();
+        assert!(orig_len > 0);
+
+        let spellings: [&[u8]; 7] = [
+            b"/etc/os-release",
+            b"//etc/os-release",
+            b"/etc//os-release",
+            b"/./etc/os-release",
+            b"/etc/./os-release",
+            b"/var/../etc/os-release",
+            b"/etc/os-release/",
+        ];
+
+        for &sp in &spellings {
+            // 1. `write <path> pwned`
+            let mut cmd_w = [0u8; 128];
+            let mut pw = 0usize;
+            pw += copy_into(b"write ", &mut cmd_w[pw..]);
+            pw += copy_into(sp, &mut cmd_w[pw..]);
+            pw += copy_into(b" pwned", &mut cmd_w[pw..]);
+            let act_w = sh.exec_line(&cmd_w[..pw], 1, 0, 0, &mut out);
+            assert_eq!(
+                &out[..act_w.bytes_written()],
+                b"error: permission denied (immutable system file)\n"
+            );
+
+            // 2. `writehex <path> 0 414243`
+            let mut cmd_wh = [0u8; 128];
+            let mut pwh = 0usize;
+            pwh += copy_into(b"writehex ", &mut cmd_wh[pwh..]);
+            pwh += copy_into(sp, &mut cmd_wh[pwh..]);
+            pwh += copy_into(b" 0 414243", &mut cmd_wh[pwh..]);
+            let act_wh = sh.exec_line(&cmd_wh[..pwh], 1, 0, 0, &mut out);
+            assert_eq!(
+                &out[..act_wh.bytes_written()],
+                b"error: permission denied (immutable system file)\n"
+            );
+
+            // 3. `rm <path>`
+            let mut cmd_rm = [0u8; 128];
+            let mut prm = 0usize;
+            prm += copy_into(b"rm ", &mut cmd_rm[prm..]);
+            prm += copy_into(sp, &mut cmd_rm[prm..]);
+            let act_rm = sh.exec_line(&cmd_rm[..prm], 1, 0, 0, &mut out);
+            assert_eq!(
+                &out[..act_rm.bytes_written()],
+                b"error: permission denied (immutable system file)\n"
+            );
+
+            // 4. Direct helper + HTTP `IpcOp::VfsWrite` / `IpcOp::VfsDelete`
+            let mut norm_buf = [0u8; cuttle_contracts::FS_PATH_MAX];
+            assert_eq!(
+                check_writable_vfs_path(sp, &mut norm_buf),
+                WritablePathPolicy::Protected
+            );
+
+            let trapped_by_ring3 = bytes_eq(sp, b"//etc/os-release")
+                || bytes_eq(sp, b"/etc//os-release")
+                || bytes_eq(sp, b"/var/../etc/os-release")
+                || bytes_eq(sp, b"/etc/os-release/");
+
+            let res_put = sh.dispatch_mailbox_op(
+                crate::svc_runtime::IpcOp::VfsWrite,
+                true,
+                true,
+                1,
+                sp,
+                b"pwned",
+                &mut out,
+            );
+            if trapped_by_ring3 {
+                assert_eq!(res_put, Err(crate::svc_runtime::ServiceError::SandboxTrap));
+            } else {
+                let (status_put, n_put) = res_put.unwrap();
+                assert_eq!(status_put, 403);
+                assert_eq!(&out[..n_put], b"error: immutable system file\n");
+            }
+
+            let res_del = sh.dispatch_mailbox_op(
+                crate::svc_runtime::IpcOp::VfsDelete,
+                true,
+                true,
+                1,
+                sp,
+                b"",
+                &mut out,
+            );
+            if trapped_by_ring3 {
+                assert_eq!(res_del, Err(crate::svc_runtime::ServiceError::SandboxTrap));
+            } else {
+                let (status_del, n_del) = res_del.unwrap();
+                assert_eq!(status_del, 403);
+                assert_eq!(&out[..n_del], b"error: immutable system file\n");
+            }
+        }
+
+        // Verify `/etc/os-release` remained completely intact!
+        let check_act = sh.exec_line(b"cat /etc/os-release", 1, 0, 0, &mut out);
+        assert_eq!(&out[..check_act.bytes_written()], &orig_release[..orig_len]);
     }
 }
