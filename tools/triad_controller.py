@@ -113,6 +113,18 @@ class TriadSpec:
 MAX_HTTP_BODY_BYTES = 64 * 1024
 MAX_WAL_ENTRIES = 64
 MAX_CONSECUTIVE_HEALS = 3
+WAL_PROBE_FORMAT_VERSION = 2
+
+
+def _is_genesis_sql_probe(probe_str: str) -> bool:
+    """True when `probe_str` holds only the 3 default genesis `kv` rows (`cluster.role`, `mtd.policy`, `boot.state`)."""
+    return (
+        (
+            "cluster.role|primary|1" in probe_str
+            or "T:636c75737465722e726f6c65|T:7072696d617279|I:1" in probe_str
+        )
+        and len(probe_str.splitlines()) <= 4
+    )
 
 
 def safe_token_eq(provided: str, expected: str) -> bool:
@@ -832,7 +844,13 @@ class TriadController:
         self.wal_file = state_dir / "triad_wal.json"
         self.triad_tx_seq = 0
         self.triad_state_digest = ""
-        self.wal_checkpoint: dict = {"tx_seq": 0, "stmts": []}
+        self.wal_checkpoint: dict = {
+            "tx_seq": 0,
+            "stmts": [],
+            "format_version": WAL_PROBE_FORMAT_VERSION,
+        }
+        self.wal_probe_format_mismatch: bool = False
+        self.wal_checkpoint_legacy: bool = False
         self.wal_entries: list[tuple[int, str]] = []  # (tx_seq, sql_stmt)
         self.wal_pending_tx: int | None = None
         self.wal_pending_pre_digest: str = ""
@@ -862,6 +880,12 @@ class TriadController:
             tx_seq = data.get("triad_tx_seq", 0)
             if not isinstance(tx_seq, int) or isinstance(tx_seq, bool) or tx_seq < 0:
                 raise ValueError(f"invalid triad_tx_seq: {tx_seq!r}")
+            raw_fmt_ver = data.get("probe_format_version")
+            if raw_fmt_ver is not None and (
+                not isinstance(raw_fmt_ver, int) or isinstance(raw_fmt_ver, bool) or raw_fmt_ver < 1
+            ):
+                raise ValueError(f"invalid probe_format_version: {raw_fmt_ver!r}")
+            self.wal_probe_format_mismatch = raw_fmt_ver != WAL_PROBE_FORMAT_VERSION
             raw_cp = data.get("wal_checkpoint")
             if raw_cp is not None:
                 if not isinstance(raw_cp, dict):
@@ -874,7 +898,19 @@ class TriadController:
                     not isinstance(s, str) or not is_printable_ascii_command(s) for s in cp_stmts
                 ):
                     raise ValueError("invalid wal_checkpoint.stmts")
-                self.wal_checkpoint = {"tx_seq": cp_seq, "stmts": list(cp_stmts)}
+                cp_fmt = raw_cp.get("format_version", raw_fmt_ver)
+                if cp_fmt is not None and (
+                    not isinstance(cp_fmt, int) or isinstance(cp_fmt, bool) or cp_fmt < 1
+                ):
+                    raise ValueError(f"invalid wal_checkpoint.format_version: {cp_fmt!r}")
+                self.wal_checkpoint_legacy = (
+                    cp_seq > 0 and bool(cp_stmts) and cp_fmt != WAL_PROBE_FORMAT_VERSION
+                )
+                self.wal_checkpoint = {
+                    "tx_seq": cp_seq,
+                    "stmts": list(cp_stmts),
+                    "format_version": cp_fmt if cp_fmt is not None else 1,
+                }
             raw_entries = data.get("wal_entries", [])
             if not isinstance(raw_entries, list):
                 raise ValueError("wal_entries must be a list")
@@ -931,10 +967,16 @@ class TriadController:
             [tid, stmt, "pending" if tid == self.wal_pending_tx else "committed"]
             for tid, stmt in self.wal_entries
         ]
+        cp_payload = dict(self.wal_checkpoint)
+        if not self.wal_checkpoint_legacy:
+            cp_payload["format_version"] = WAL_PROBE_FORMAT_VERSION
         payload = {
+            "probe_format_version": (
+                1 if self.wal_probe_format_mismatch else WAL_PROBE_FORMAT_VERSION
+            ),
             "triad_tx_seq": self.triad_tx_seq,
             "triad_state_digest": self.triad_state_digest,
-            "wal_checkpoint": self.wal_checkpoint,
+            "wal_checkpoint": cp_payload,
             "wal_entries": serialized_entries,
             "wal_pending_pre_digest": self.wal_pending_pre_digest if self.wal_pending_tx is not None else "",
             "node_tx_seq": {str(n.node_id): n.tx_seq for n in self.nodes},
@@ -984,7 +1026,10 @@ class TriadController:
         if not self.spec.has_sql:
             return False
         with self.wal_lock:
-            if self.wal_pending_tx is not None or self.triad_tx_seq <= self.wal_checkpoint.get("tx_seq", 0):
+            if self.wal_pending_tx is not None or (
+                not self.wal_checkpoint_legacy
+                and self.triad_tx_seq <= self.wal_checkpoint.get("tx_seq", 0)
+            ):
                 return False
             ready_nodes = [
                 n for n in self.nodes if n.state == "ONLINE" and n.tx_seq == self.triad_tx_seq
@@ -1101,7 +1146,13 @@ class TriadController:
                     cp_stmts.append(vstmt)
 
             cp_seq = self.triad_tx_seq
-            self.wal_checkpoint = {"tx_seq": cp_seq, "stmts": cp_stmts}
+            self.wal_checkpoint = {
+                "tx_seq": cp_seq,
+                "stmts": cp_stmts,
+                "format_version": WAL_PROBE_FORMAT_VERSION,
+            }
+            self.wal_checkpoint_legacy = False
+            self.wal_probe_format_mismatch = False
             self.wal_entries = [(tid, s) for tid, s in self.wal_entries if tid > cp_seq]
             digest = hashlib.sha256(probes[0].encode("utf-8")).hexdigest()
             self.triad_state_digest = digest
@@ -2553,7 +2604,14 @@ class TriadController:
                 full_cmd = f"sql /*t*/ {s}"
             self.send_shell_cmd(node, full_cmd)
 
-    def _replay_checkpoint_on_node(self, node: TriadNode, cp_stmts: list[str]):
+    def _replay_checkpoint_on_node(self, node: TriadNode, cp_stmts: list[str]) -> bool:
+        if self.wal_checkpoint_legacy:
+            self.log_event(
+                "ALERT",
+                f"{node.name}: Refusing to replay pre-.dump legacy WAL checkpoint at "
+                f"tx_seq={self.wal_checkpoint.get('tx_seq', 0)} (lossy format v1)!",
+            )
+            return False
         for stmt in cp_stmts:
             if not is_printable_ascii_command(stmt):
                 continue
@@ -2561,14 +2619,21 @@ class TriadController:
                 self._replay_wal_entry(node, stmt)
             except Exception as e:
                 self.log_event("WARN", f"{node.name}: Error replaying checkpoint statement: {e}")
+        return True
 
     def _rebuild_node_sql_from_committed_wal_locked(self, node: TriadNode):
         """Rebuild `node`'s SQL vote tables from `self.wal_checkpoint` + committed `self.wal_entries` (wal_lock held)."""
         if not self.spec.has_sql:
             return
-        self._reset_sql_vote_tables(node)
         cp_seq = int(self.wal_checkpoint.get("tx_seq", 0))
         cp_stmts = list(self.wal_checkpoint.get("stmts", []))
+        if cp_seq > 0 and cp_stmts and self.wal_checkpoint_legacy:
+            self.log_event(
+                "ALERT",
+                f"{node.name}: Refusing to replay pre-.dump legacy WAL checkpoint at tx_seq={cp_seq} (lossy format v1)!",
+            )
+            return
+        self._reset_sql_vote_tables(node)
         last_tid = 0
         if cp_seq > 0 and cp_stmts:
             self._replay_checkpoint_on_node(node, cp_stmts)
@@ -2659,6 +2724,13 @@ class TriadController:
                 cp_stmts = list(self.wal_checkpoint.get("stmts", []))
                 need_cp = self.spec.has_sql and cp_seq > node.tx_seq and bool(cp_stmts)
                 if need_cp:
+                    if self.wal_checkpoint_legacy:
+                        self.log_event(
+                            "ALERT",
+                            f"{node.name}: Refusing to replay pre-.dump legacy WAL checkpoint at tx_seq={cp_seq} during catch-up (lossy format v1)!",
+                        )
+                        node.state = "OFFLINE"
+                        return False
                     self._reset_sql_vote_tables(node)
                     self._replay_checkpoint_on_node(node, cp_stmts)
                     node.tx_seq = cp_seq
@@ -2779,11 +2851,18 @@ class TriadController:
                 # Reset all vote tables (`kv`, `idx`, etc.) and replay a WAL checkpoint + snapshot
                 # without holding `wal_lock` across the bulk serial I/O; then briefly take `wal_lock`
                 # to apply any tail entries committed during the heal.
-                self._reset_sql_vote_tables(node)
                 with self.wal_lock:
                     cp_seq = int(self.wal_checkpoint.get("tx_seq", 0))
                     cp_stmts = list(self.wal_checkpoint.get("stmts", []))
+                    cp_legacy = self.wal_checkpoint_legacy
                     snapshot = list(self.wal_entries)
+                if cp_seq > 0 and cp_stmts and cp_legacy:
+                    self.log_event(
+                        "ALERT",
+                        f"{node.name}: Refusing to replay pre-.dump legacy WAL checkpoint at tx_seq={cp_seq} during heal (lossy format v1)!",
+                    )
+                    return
+                self._reset_sql_vote_tables(node)
                 last_tid = 0
                 if cp_seq > 0 and cp_stmts:
                     self._replay_checkpoint_on_node(node, cp_stmts)
@@ -3011,9 +3090,52 @@ class TriadController:
         Verify each restored node's on-disk state fingerprint against the digest saved in the
         WAL file. A node whose disk was rolled back or tampered while offline does not match
         the persisted digest, so its `tx_seq` is reset to 0 before majority adoption / parity check.
+        When upgrading from an older probe format (`self.wal_probe_format_mismatch`), if all 3
+        online nodes agree 3/3 on their live non-genesis state, recomputes and adopts the v2
+        digests (and upgrades any legacy pre-`.dump` checkpoint from the 3/3 live state) instead
+        of treating all 3 nodes as rolled back.
         Retries transient serial `None` reads before acting, and leaves unreadable nodes out of the
         vote rather than falsely resetting their `tx_seq = 0`.
         """
+        if self.wal_probe_format_mismatch and self.triad_tx_seq > 0:
+            online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
+            if len(online_nodes) == 3:
+                probes: dict[int, str] = {}
+                for node in online_nodes:
+                    p = None
+                    for attempt in range(3):
+                        p = self._state_probe(node)
+                        if p is not None:
+                            break
+                        if attempt < 2:
+                            time.sleep(0.05)
+                    if p is not None:
+                        probes[node.node_id] = p
+                if len(probes) == 3 and len(set(probes.values())) == 1:
+                    common_probe = next(iter(probes.values()))
+                    genesis_only = _is_genesis_sql_probe(common_probe) and (
+                        len(self.wal_entries) > 0 or self.wal_checkpoint.get("tx_seq", 0) > 0
+                    )
+                    if not genesis_only:
+                        new_fp = hashlib.sha256(common_probe.encode("utf-8")).hexdigest()
+                        self.triad_state_digest = new_fp
+                        for node in online_nodes:
+                            node.tx_seq = self.triad_tx_seq
+                            node.state_digest = new_fp
+                            self.restored_node_digests[node.node_id] = new_fp
+                            self.restored_tx_seq_nodes.add(node.node_id)
+                        self.wal_probe_format_mismatch = False
+                        self.log_event(
+                            "RESYNC",
+                            f"Probe format upgraded to v{WAL_PROBE_FORMAT_VERSION}: 3/3 nodes agree on live state; "
+                            f"recomputed digest {new_fp[:12]} at tx_seq={self.triad_tx_seq}.",
+                        )
+                        if self.wal_checkpoint_legacy:
+                            self.checkpoint_wal()
+                        else:
+                            self._save_wal_to_disk()
+                        return
+
         if not self.restored_tx_seq_nodes:
             return
         for n in list(self.restored_tx_seq_nodes):
@@ -3034,10 +3156,10 @@ class TriadController:
                 )
                 continue
             expected_fp = self.restored_node_digests.get(node.node_id) or self.triad_state_digest
-            if expected_fp and actual_fp != expected_fp:
+            if (expected_fp and actual_fp != expected_fp) or self.wal_probe_format_mismatch:
                 self.log_event(
                     "WARN",
-                    f"{node.name}: on-disk state digest ({actual_fp[:12]}) != WAL digest ({expected_fp[:12]}) "
+                    f"{node.name}: on-disk state digest ({actual_fp[:12]}) != WAL digest ({(expected_fp or 'v1')[:12]}) "
                     f"at tx_seq={node.tx_seq}; resetting tx_seq=0.",
                 )
                 node.tx_seq = 0
@@ -3053,7 +3175,8 @@ class TriadController:
         `self.spec.vote_tables` across online nodes; nodes that match the 2-of-3 majority AND
         match `triad_state_digest` (if recorded) adopt `self.triad_tx_seq`. If 2 or 3 nodes were
         rolled back so the on-disk majority disagrees with `triad_state_digest`, replays the WAL
-        checkpoint + entries onto all `pending` nodes while preserving any already-verified node.
+        checkpoint + entries onto all `pending` nodes while preserving any already-verified node
+        (refusing to replay any legacy pre-`.dump` checkpoint).
         Any single node that disagrees with the verified 2-of-3 majority keeps `tx_seq=0` and is
         healed by `compute_and_verify_raid_parity()`.
         """
@@ -3078,20 +3201,25 @@ class TriadController:
 
         # Check if 2 or 3 disks were rolled back so the on-disk majority disagrees with the WAL's
         # recorded state digest (or holds only the 3 genesis rows while the WAL has writes).
-        genesis_only = (
-            "cluster.role|primary|1" in majority
-            and len(majority.splitlines()) <= 4
-            and (len(self.wal_entries) > 0 or self.wal_checkpoint.get("tx_seq", 0) > 0)
+        genesis_only = _is_genesis_sql_probe(majority) and (
+            len(self.wal_entries) > 0 or self.wal_checkpoint.get("tx_seq", 0) > 0
         )
-        if (self.triad_state_digest and maj_fp != self.triad_state_digest) or genesis_only:
+        if (self.triad_state_digest and maj_fp != self.triad_state_digest) or genesis_only or self.wal_probe_format_mismatch:
             if vals.count(majority) >= 2:
+                cp_seq = int(self.wal_checkpoint.get("tx_seq", 0))
+                cp_stmts = list(self.wal_checkpoint.get("stmts", []))
+                if cp_seq > 0 and cp_stmts and self.wal_checkpoint_legacy:
+                    self.log_event(
+                        "ALERT",
+                        f"Refusing to replay pre-.dump legacy WAL checkpoint at tx_seq={cp_seq} "
+                        f"onto {[n.name.split()[0] for n in pending]} (lossy format v1).",
+                    )
+                    return
                 self.log_event(
                     "WARN",
                     f"On-disk majority does not match WAL at tx_seq={self.triad_tx_seq}; replaying WAL on rolled-back nodes {[n.name.split()[0] for n in pending]}.",
                 )
                 with self.wal_lock:
-                    cp_seq = int(self.wal_checkpoint.get("tx_seq", 0))
-                    cp_stmts = list(self.wal_checkpoint.get("stmts", []))
                     for n in pending:
                         if n.state != "ONLINE":
                             continue
@@ -3116,6 +3244,7 @@ class TriadController:
                             n.state_digest = fp
                             self.triad_state_digest = fp
                         self.restored_tx_seq_nodes.add(n.node_id)
+                    self.wal_probe_format_mismatch = False
                     self._save_wal_to_disk()
                 return
 
@@ -4545,6 +4674,98 @@ def run_unit_self_tests():
                 )
             finally:
                 cp_ctrl.send_shell_cmd = orig_cp_send
+
+            # Low #5 (Round 8):
+            # 5a. `triad_wal.json` stores `probe_format_version = 2` and `wal_checkpoint.format_version = 2`.
+            saved_wal_data = json.loads(cp_ctrl.wal_file.read_text(encoding="utf-8"))
+            assert saved_wal_data.get("probe_format_version") == WAL_PROBE_FORMAT_VERSION
+            assert saved_wal_data["wal_checkpoint"].get("format_version") == WAL_PROBE_FORMAT_VERSION
+
+            # 5b. On a format version mismatch (legacy v1 WAL without `probe_format_version`, stale v1
+            #     digests, and a lossy pre-`.dump` checkpoint missing rows), when all 3 nodes agree 3/3
+            #     on their live state at boot, `_verify_restored_tx_seq_at_boot` recomputes the v2
+            #     digests and upgrades the checkpoint from the 3/3 live state WITHOUT resetting `tx_seq`
+            #     or rebuilding the nodes from the lossy v1 checkpoint!
+            v2_digest = cp_ctrl.triad_state_digest
+            cur_tx = cp_ctrl.triad_tx_seq
+            legacy_v1_wal = {
+                "triad_tx_seq": cur_tx,
+                "triad_state_digest": "00" * 32,  # stale v1 digest
+                "wal_checkpoint": {
+                    "tx_seq": cur_tx,
+                    "stmts": ["DELETE FROM kv", "INSERT OR REPLACE INTO kv VALUES ('truncated.v1', 'lossy', 1)"],
+                },
+                "wal_entries": [],
+                "node_tx_seq": {"1": cur_tx, "2": cur_tx, "3": cur_tx},
+                "node_state_digest": {"1": "00" * 32, "2": "00" * 32, "3": "00" * 32},
+            }
+            cp_ctrl.wal_file.write_text(json.dumps(legacy_v1_wal), encoding="utf-8")
+            upg_ctrl = TriadController(
+                show_gui=False,
+                spec=TriadSpec(
+                    name="cp-upg",
+                    state_dir=cp_dir,
+                    role="sql",
+                    vote_tables=("kv", "idx", "t_sixteen_chars_"),
+                    write_operator_token=False,
+                ),
+                unit_test=True,
+            )
+            upg_ctrl.shutdown()
+            assert upg_ctrl.wal_probe_format_mismatch and upg_ctrl.wal_checkpoint_legacy
+            for n in upg_ctrl.nodes:
+                n.state = "ONLINE"
+            upg_ctrl.send_shell_cmd = cp_harness.exec
+            upg_ctrl._verify_restored_tx_seq_at_boot()
+            upg_ctrl._adopt_tx_seq_from_majority()
+            assert not upg_ctrl.wal_probe_format_mismatch and not upg_ctrl.wal_checkpoint_legacy
+            assert upg_ctrl.triad_state_digest == v2_digest, (
+                f"3/3 agreeing nodes must upgrade to v2 digest {v2_digest[:12]}, got {upg_ctrl.triad_state_digest[:12]}"
+            )
+            assert [n.tx_seq for n in upg_ctrl.nodes] == [cur_tx] * 3
+            assert any(
+                e["level"] == "RESYNC" and "Probe format upgraded" in e["msg"] for e in upg_ctrl.events
+            )
+            # Verify all 47 rows on `kv` and 4 rows on `t_sixteen_chars_` survived untouched (not overwritten by lossy v1 checkpoint)
+            kv_after_upg = upg_ctrl._dump_node_sql_table(upg_ctrl.nodes[0], "kv")
+            assert kv_after_upg is not None and kv_after_upg["rows_count"] == 49
+            assert not any("truncated.v1" in s for s in upg_ctrl.wal_checkpoint["stmts"])
+            persisted_upg = json.loads(upg_ctrl.wal_file.read_text(encoding="utf-8"))
+            assert persisted_upg.get("probe_format_version") == WAL_PROBE_FORMAT_VERSION
+            assert persisted_upg["wal_checkpoint"].get("format_version") == WAL_PROBE_FORMAT_VERSION
+
+            # 5c. When nodes do NOT agree 3/3 on a post-genesis state (e.g. node 2 diverged so no 3/3
+            #     live upgrade is possible) and the WAL holds a pre-`.dump` v1 checkpoint, the controller
+            #     refuses to replay the lossy pre-`.dump` checkpoint and logs an ALERT.
+            cp_ctrl.wal_file.write_text(json.dumps(legacy_v1_wal), encoding="utf-8")
+            cp_harness.exec(
+                cp_ctrl.nodes[1],
+                "sql /*triad*/ INSERT OR REPLACE INTO kv VALUES ('diverge.v1', 'mismatch', 99)",
+            )
+            refuse_ctrl = TriadController(
+                show_gui=False,
+                spec=TriadSpec(
+                    name="cp-refuse",
+                    state_dir=cp_dir,
+                    role="sql",
+                    vote_tables=("kv", "idx", "t_sixteen_chars_"),
+                    write_operator_token=False,
+                ),
+                unit_test=True,
+            )
+            refuse_ctrl.shutdown()
+            for n in refuse_ctrl.nodes:
+                n.state = "ONLINE"
+            refuse_ctrl.send_shell_cmd = cp_harness.exec
+            refuse_ctrl._verify_restored_tx_seq_at_boot()
+            refuse_ctrl._adopt_tx_seq_from_majority()
+            assert any(
+                e["level"] == "ALERT" and "Refusing to replay pre-.dump legacy WAL checkpoint" in e["msg"]
+                for e in refuse_ctrl.events
+            ), f"Expected ALERT refusing pre-.dump checkpoint replay, got: {refuse_ctrl.events}"
+            # Verify nodes 1 and 3 still hold all 49 rows (not wiped by the lossy pre-.dump checkpoint)
+            kv_n1_intact = refuse_ctrl._dump_node_sql_table(refuse_ctrl.nodes[0], "kv")
+            assert kv_n1_intact is not None and kv_n1_intact["rows_count"] == 49
         finally:
             cp_harness.close()
 
