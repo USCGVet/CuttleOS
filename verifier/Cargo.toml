@@ -15,8 +15,8 @@ name = "verify"
 path = "src/main.rs"
 
 [dependencies]
-cuttle-contracts = { path = "../contracts", features = ["property_tests"] }
-cuttle-diversifier = { path = "../diversifier" }
+cuttle-contracts = { version = "0.0.1", path = "../contracts", features = ["property_tests"] }
+cuttle-diversifier = { version = "0.0.1", path = "../diversifier" }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
 syn = { workspace = true }

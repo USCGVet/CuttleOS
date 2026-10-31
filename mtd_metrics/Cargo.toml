@@ -21,13 +21,13 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 # Parse compiled artifacts (COFF on Windows hosts, ELF for the kernel
 # target) and pull their `.text` section.
-object = "0.36"
+object = { version = "0.36", default-features = false, features = ["read", "std"] }
 # Pure-Rust x86-64 decoder + formatter. Used to enumerate gadgets in a
 # `.text` byte stream and to render each gadget's normalized identity.
 iced-x86 = "1"
 # Diversify the built-in specimen in-process so the harness measures the
 # project's real morph pipeline, not a reimplementation of it.
-cuttle-diversifier = { path = "../diversifier" }
+cuttle-diversifier = { version = "0.0.1", path = "../diversifier" }
 
 [dev-dependencies]
-cuttle-binmorph = { path = "../binmorph" }
+cuttle-binmorph = { version = "0.0.1", path = "../binmorph" }

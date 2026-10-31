@@ -11,7 +11,7 @@ name = "target_enterprise"
 path = "src/lib.rs"
 
 [dependencies]
-cuttle-contracts = { path = "../contracts" }
+cuttle-contracts = { version = "0.0.1", path = "../contracts" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 # SHA-256 + HMAC for the in-target TLS module. Both are no_std-compatible
 # with default-features off; `force-soft` prevents x86 SHA-NI/SSE2 XMM
@@ -50,13 +50,13 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 # property-test harness and the no_std skeleton modules (memory bitmap,
 # scheduler, etc.). Dev-deps do NOT leak std into the library build.
 [dev-dependencies]
-cuttle-contracts = { path = "../contracts", features = ["property_tests"] }
+cuttle-contracts = { version = "0.0.1", path = "../contracts", features = ["property_tests"] }
 # TASK-021: same proptest-driven 32-input p95 perf methodology as
 # target_minimal. Lands here so the net-stack work in TASK-011 inherits
 # adversarial-input-aware perf coverage from day one rather than needing
 # a retrofit.
 proptest = { workspace = true }
-cuttle-verifier = { path = "../verifier" }
+cuttle-verifier = { version = "0.0.1", path = "../verifier" }
 # Independent TLS client for the HTTPS interop tests: rustls with *ring*
 # crypto, so the server's RustCrypto provider is checked against a different
 # implementation. Test-only; never part of the kernel image.

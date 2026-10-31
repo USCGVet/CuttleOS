@@ -19,7 +19,7 @@ anyhow = { workspace = true }
 # so gadget identity and rewriting share one instruction model.
 iced-x86 = "1"
 # Parse the ELF, locate `.text` and the function symbol table.
-object = "0.36"
+object = { version = "0.36", default-features = false, features = ["read", "std"] }
 
 [dev-dependencies]
 sha2 = { workspace = true }

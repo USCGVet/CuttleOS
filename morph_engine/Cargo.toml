@@ -15,14 +15,14 @@ name = "morph"
 path = "src/main.rs"
 
 [dependencies]
-cuttle-diversifier = { path = "../diversifier" }
+cuttle-diversifier = { version = "0.0.1", path = "../diversifier" }
 # Host-side use of contract-locked TLV + Base64 codecs (TASK-102).
 # The factory embeds extension fields built by the same pure codecs
 # the enterprise target proves under morph — one wire surface.
-cuttle-contracts = { path = "../contracts" }
-target_enterprise = { path = "../target_enterprise" }
+cuttle-contracts = { version = "0.0.1", path = "../contracts" }
+target_enterprise = { version = "0.0.1", path = "../target_enterprise" }
 # TASK-124: gadget churn measurement for diversity evidence on attest entries.
-cuttle-mtd-metrics = { path = "../mtd_metrics" }
+cuttle-mtd-metrics = { version = "0.0.1", path = "../mtd_metrics" }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -50,4 +50,4 @@ crossterm = "0.28"
 # layout-seeded kernel and packages it for QEMU. Production morph
 # binary does not depend on factory_builder (deploy image emission
 # shells out to the factory_builder binary when --emit-image is set).
-factory_builder = { path = "../factory_builder" }
+factory_builder = { version = "0.0.1", path = "../factory_builder" }

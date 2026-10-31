@@ -57,3 +57,16 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
+
+[advisories]
+# Narrow, documented exceptions only. Everything else fails the gate.
+ignore = [
+    # crypto-bigint 0.5.5: constant-time timing variability. Fixed only in
+    # crypto-bigint >= 0.7.6, which no released p256/elliptic-curve 0.13.x
+    # accepts; pulled in solely via p256 0.13 in target_enterprise. Remove
+    # once we migrate to p256 0.14 / elliptic-curve 0.14.
+    { id = "RUSTSEC-2026-0387", reason = "no compatible fix for p256 0.13 (crypto-bigint 0.5 line); track p256 0.14 migration" },
+    # paste 1.0.15: unmaintained (informational, no vulnerability). Build-time
+    # proc-macro pulled in via ratatui 0.29 (operator TUI in morph_engine).
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro via ratatui; no safe upgrade available" },
+]
