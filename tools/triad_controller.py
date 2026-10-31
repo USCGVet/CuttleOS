@@ -435,15 +435,19 @@ def format_kernel_sqldump_reply(
                         h = _mix(h, b)
 
     chunk = sorted_rows[offset : offset + limit] if offset < mcount else []
-    hdr = f"sqldump table={table} rows={mcount} off={offset} count={len(chunk)} digest={h:016x}"
+    hdr_suffix = f" digest={h:016x}"
     if offset == 0:
         col_defs = ", ".join(f"{cname} {'INT' if ctype.upper().startswith('INT') else 'TEXT'}" for cname, ctype in cols)
         ddl_str = f"CREATE TABLE {table} ({col_defs})"
-        hdr += f" ddl={ddl_str.encode('ascii').hex()}"
+        hdr_suffix += f" ddl={ddl_str.encode('ascii').hex()}"
         if index_name and 0 <= indexed_col < len(cols):
             idx_ddl_str = f"CREATE INDEX {index_name} ON {table} ({cols[indexed_col][0]})"
-            hdr += f" idx_ddl={idx_ddl_str.encode('ascii').hex()}"
-    out_lines = [hdr]
+            hdr_suffix += f" idx_ddl={idx_ddl_str.encode('ascii').hex()}"
+    hdr_prefix = f"sqldump table={table} rows={mcount} off={offset} count="
+    # Reserve 8 bytes (`SHELL_PROMPT.len()`) out of the 1,024-byte console buffer (`max_out_len = 1016`).
+    max_out_len = 1024 - 8
+    cur_bytes = len(hdr_prefix) + 1 + len(hdr_suffix) + 1  # +1 for count digit, +1 for '\n'
+    fitted_rows: list[str] = []
     for r in chunk:
         cell_parts = []
         for idx, val in enumerate(r):
@@ -453,8 +457,14 @@ def format_kernel_sqldump_reply(
             else:
                 tb = bytes(val) if isinstance(val, (bytes, bytearray)) else str(val).encode("utf-8")
                 cell_parts.append(f"T:{tb.hex()}")
-        out_lines.append("row " + "|".join(cell_parts))
-    return "\n".join(out_lines)
+        rline = "row " + "|".join(cell_parts)
+        rline_bytes = len(rline) + 1
+        if (cur_bytes + rline_bytes > max_out_len and len(fitted_rows) > 0) or (cur_bytes + rline_bytes > 1024):
+            break
+        fitted_rows.append(rline)
+        cur_bytes += rline_bytes
+    hdr = f"{hdr_prefix}{len(fitted_rows)}{hdr_suffix}"
+    return "\n".join([hdr] + fitted_rows)
 
 
 class RealOsShellHarness:
@@ -1696,12 +1706,14 @@ class TriadController:
                 if rep_rows != total_rows or rep_digest != kernel_digest:
                     return None
             row_lines = lines[1:]
-            if len(row_lines) != rep_count:
+            if len(row_lines) != rep_count or not col_names:
                 return None
             for rln in row_lines:
                 if not rln.startswith("row "):
                     return None
                 raw_cells = rln[4:].split("|") if rln[4:] else []
+                if len(raw_cells) != len(col_names):
+                    return None
                 parsed_cells: list[tuple[str, bytes | int]] = []
                 for rc in raw_cells:
                     if rc.startswith("I:"):
@@ -4429,6 +4441,80 @@ def run_unit_self_tests():
                 == cp_ctrl._state_probe(cp_ctrl.nodes[1])
                 == cp_ctrl._state_probe(cp_ctrl.nodes[2])
             )
+
+            # Medium #2 (Round 8):
+            # 2a. Max-width vote table (`t_sixteen_chars_`, four 16-char TEXT columns, 16-char index,
+            #     and 24-byte TEXT values across 4 rows) sizes `.dump` chunk 0 to 2 rows (`<= 1016 B`)
+            #     so no row is truncated at the 1,024-byte console boundary, and survives
+            #     `checkpoint_wal() -> heal_and_remorph_node() -> 3/3` without losing any rows.
+            cp_ctrl.spec.vote_tables = ("kv", "idx", "t_sixteen_chars_")
+            assert cp_ctrl.execute_triad_sql(
+                "CREATE TABLE t_sixteen_chars_ (col_sixteen_chr0 TEXT, col_sixteen_chr1 TEXT, col_sixteen_chr2 TEXT, col_sixteen_chr3 TEXT)"
+            )["ok"]
+            assert cp_ctrl.execute_triad_sql(
+                "CREATE INDEX idx_sixteen_chr0 ON t_sixteen_chars_ (col_sixteen_chr0)"
+            )["ok"]
+            wide_rows = []
+            for ch in ("1", "2", "3", "4"):
+                v24 = ch * 24
+                wide_rows.append((v24, v24, v24, v24))
+                assert cp_ctrl.execute_triad_sql(
+                    f"INSERT INTO t_sixteen_chars_ VALUES ('{v24}', '{v24}', '{v24}', '{v24}')"
+                )["ok"]
+            raw_wide_d0 = cp_harness.exec(cp_ctrl.nodes[0], "sql /*triad*/ .dump t_sixteen_chars_ 0 3")
+            expected_wide_d0 = format_kernel_sqldump_reply(
+                "t_sixteen_chars_",
+                [
+                    ("col_sixteen_chr0", "TEXT"),
+                    ("col_sixteen_chr1", "TEXT"),
+                    ("col_sixteen_chr2", "TEXT"),
+                    ("col_sixteen_chr3", "TEXT"),
+                ],
+                wide_rows,
+                0,
+                3,
+                indexed_col=0,
+                index_name="idx_sixteen_chr0",
+            )
+            assert raw_wide_d0 == expected_wide_d0, (
+                f"Max-width .dump chunk 0 drifted:\nactual:   {raw_wide_d0!r}\nexpected: {expected_wide_d0!r}"
+            )
+            assert " count=2 " in raw_wide_d0.splitlines()[0], (
+                f"Expected count=2 on max-width chunk 0, got: {raw_wide_d0.splitlines()[0]}"
+            )
+            wide_dump = cp_ctrl._dump_node_sql_table(cp_ctrl.nodes[0], "t_sixteen_chars_")
+            assert wide_dump is not None and wide_dump["rows_count"] == 4, (
+                f"Expected 4 complete rows from max-width table dump, got: {wide_dump}"
+            )
+            assert cp_ctrl.checkpoint_wal(), "checkpoint_wal must succeed with max-width 4-column table"
+            cp_harness.exec(cp_ctrl.nodes[1], "sql /*triad*/ DROP TABLE t_sixteen_chars_")
+            cp_ctrl.heal_and_remorph_node(cp_ctrl.nodes[1])
+            healed_wide = cp_ctrl._dump_node_sql_table(cp_ctrl.nodes[1], "t_sixteen_chars_")
+            assert healed_wide is not None and healed_wide["rows_count"] == 4, (
+                f"Max-width table lost rows on heal: {healed_wide}"
+            )
+            assert (
+                cp_ctrl._state_probe(cp_ctrl.nodes[0])
+                == cp_ctrl._state_probe(cp_ctrl.nodes[1])
+                == cp_ctrl._state_probe(cp_ctrl.nodes[2])
+            )
+
+            # 2b. `_dump_node_sql_table` rejects any `.dump` row whose cell count doesn't match
+            #     the table's column count (`len(col_names)`).
+            orig_cp_send = cp_ctrl.send_shell_cmd
+            truncated_d0 = "\n".join(
+                raw_wide_d0.splitlines()[:-1]
+                + ["row T:3232|T:3232|T:3232"]  # 3 cells instead of 4
+            )
+            cp_ctrl.send_shell_cmd = lambda node, cmd, timeout=4.0: (
+                truncated_d0 if ".dump t_sixteen_chars_ 0" in cmd else orig_cp_send(node, cmd, timeout)
+            )
+            try:
+                assert cp_ctrl._dump_node_sql_table(cp_ctrl.nodes[0], "t_sixteen_chars_") is None, (
+                    "_dump_node_sql_table must reject a row whose cell count != column count"
+                )
+            finally:
+                cp_ctrl.send_shell_cmd = orig_cp_send
         finally:
             cp_harness.close()
 

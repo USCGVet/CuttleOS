@@ -950,11 +950,14 @@ impl SqlDb {
             k += 1;
         }
 
-        let chunk_count = if offset >= mcount {
+        let max_rows = if offset >= mcount {
             0usize
         } else {
             (mcount - offset).min(limit)
         };
+        // Reserve 8 bytes (`SHELL_PROMPT.len()`) so `OsShell::feed_byte` can append
+        // `cuttle> ` into the shared 1,024-byte console reply buffer without truncation.
+        let max_out_len = out.len().saturating_sub(8);
 
         let mut pos = 0usize;
         pos += append_bytes(out, pos, b"sqldump table=");
@@ -964,7 +967,8 @@ impl SqlDb {
         pos += append_bytes(out, pos, b" off=");
         pos += append_u64(out, pos, offset as u64);
         pos += append_bytes(out, pos, b" count=");
-        pos += append_u64(out, pos, chunk_count as u64);
+        let count_digit_pos = pos;
+        pos += append_u64(out, pos, 0);
         pos += append_bytes(out, pos, b" digest=");
         pos += append_hex_u64(out, pos, h);
         if offset == 0 {
@@ -1005,29 +1009,40 @@ impl SqlDb {
         }
         pos += append_bytes(out, pos, b"\n");
 
+        let mut actual_count = 0usize;
         let mut ri = 0usize;
-        while ri < chunk_count {
+        while ri < max_rows {
             let row = self.visible_row(t_idx, matched[offset + ri], use_committed);
-            pos += append_bytes(out, pos, b"row ");
+            let mut row_buf = [0u8; 256];
+            let mut rpos = 0usize;
+            rpos += append_bytes(&mut row_buf, rpos, b"row ");
             let mut col = 0usize;
             while col < col_count {
                 if col > 0 {
-                    pos += append_bytes(out, pos, b"|");
+                    rpos += append_bytes(&mut row_buf, rpos, b"|");
                 }
                 match &row.cells[col] {
                     SqlVal::Int(iv) => {
-                        pos += append_bytes(out, pos, b"I:");
-                        pos += append_i64(out, pos, *iv);
+                        rpos += append_bytes(&mut row_buf, rpos, b"I:");
+                        rpos += append_i64(&mut row_buf, rpos, *iv);
                     }
                     SqlVal::Text(tb, tl) => {
-                        pos += append_bytes(out, pos, b"T:");
-                        pos += append_hex_bytes(out, pos, &tb[..*tl as usize]);
+                        rpos += append_bytes(&mut row_buf, rpos, b"T:");
+                        rpos += append_hex_bytes(&mut row_buf, rpos, &tb[..*tl as usize]);
                     }
                 }
                 col += 1;
             }
-            pos += append_bytes(out, pos, b"\n");
+            rpos += append_bytes(&mut row_buf, rpos, b"\n");
+            if (pos + rpos > max_out_len && actual_count > 0) || pos + rpos > out.len() {
+                break;
+            }
+            pos += append_bytes(out, pos, &row_buf[..rpos]);
+            actual_count += 1;
             ri += 1;
+        }
+        if count_digit_pos < pos && actual_count <= 9 {
+            out[count_digit_pos] = b'0' + (actual_count as u8);
         }
         pos
     }

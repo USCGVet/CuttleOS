@@ -6472,4 +6472,97 @@ mod tests {
             b"error: EACCES (svc-sh disabled by node role or policy)\n"
         );
     }
+
+    #[test]
+    fn sqldump_max_width_table_via_feed_byte_never_truncates_rows_or_prompt() {
+        let mut sh = OsShell::new();
+        let mut echo = [0u8; 64];
+        let mut reply = [0u8; 1024];
+
+        let run_via_feed_byte = |sh: &mut OsShell, line: &[u8], echo: &mut [u8], reply: &mut [u8]| -> usize {
+            for &b in line {
+                let _ = sh.feed_byte(b, 1, 0, 0, echo, reply);
+            }
+            let (_, act) = sh.feed_byte(b'\n', 1, 0, 0, echo, reply);
+            act.bytes_written()
+        };
+
+        let n_tbl = run_via_feed_byte(
+            &mut sh,
+            b"sql /*triad*/ CREATE TABLE t_sixteen_chars_ (col_sixteen_chr0 TEXT, col_sixteen_chr1 TEXT, col_sixteen_chr2 TEXT, col_sixteen_chr3 TEXT)",
+            &mut echo,
+            &mut reply,
+        );
+        assert!(core::str::from_utf8(&reply[..n_tbl]).unwrap().contains("CREATE TABLE t_sixteen_chars_ OK"));
+
+        let n_idx = run_via_feed_byte(
+            &mut sh,
+            b"sql /*triad*/ CREATE INDEX idx_sixteen_chr0 ON t_sixteen_chars_ (col_sixteen_chr0)",
+            &mut echo,
+            &mut reply,
+        );
+        assert!(core::str::from_utf8(&reply[..n_idx]).unwrap().contains("CREATE INDEX idx_sixteen_chr0 OK"));
+
+        for r in [b"111111111111111111111111", b"222222222222222222222222", b"333333333333333333333333"] {
+            let mut cmd = [0u8; 200];
+            let mut p = 0usize;
+            p += copy_into(b"sql /*triad*/ INSERT INTO t_sixteen_chars_ VALUES ('", &mut cmd[p..]);
+            p += copy_into(r, &mut cmd[p..]);
+            p += copy_into(b"','", &mut cmd[p..]);
+            p += copy_into(r, &mut cmd[p..]);
+            p += copy_into(b"','", &mut cmd[p..]);
+            p += copy_into(r, &mut cmd[p..]);
+            p += copy_into(b"','", &mut cmd[p..]);
+            p += copy_into(r, &mut cmd[p..]);
+            p += copy_into(b"')", &mut cmd[p..]);
+            let n_ins = run_via_feed_byte(&mut sh, &cmd[..p], &mut echo, &mut reply);
+            assert!(core::str::from_utf8(&reply[..n_ins]).unwrap().contains("INSERT 1"));
+        }
+
+        // Chunk 0 (offset=0, limit=3): header + ddl + idx_ddl + 2 rows fit in 1024-byte buffer WITH trailing `cuttle> ` prompt.
+        let n_d0 = run_via_feed_byte(
+            &mut sh,
+            b"sql /*triad*/ .dump t_sixteen_chars_ 0 3",
+            &mut echo,
+            &mut reply,
+        );
+        assert!(n_d0 <= 1024);
+        let s_d0 = core::str::from_utf8(&reply[..n_d0]).unwrap();
+        assert!(
+            s_d0.ends_with("cuttle> "),
+            "First .dump chunk through feed_byte overflowed and lost prompt: {s_d0}"
+        );
+        assert!(
+            s_d0.starts_with("sqldump table=t_sixteen_chars_ rows=3 off=0 count=2 digest="),
+            "First .dump chunk must report count=2 when 3rd row would overflow 1016B budget: {s_d0}"
+        );
+        let mut row_count_0 = 0usize;
+        for rln in s_d0.trim_end_matches("cuttle> ").lines().skip(1) {
+            let body = rln.strip_prefix("row ").unwrap();
+            assert_eq!(body.split('|').count(), 4, "Truncated row cell count in chunk 0: {rln}");
+            assert!(body.split('|').all(|c| c.len() == 50 && c.starts_with("T:")));
+            row_count_0 += 1;
+        }
+        assert_eq!(row_count_0, 2);
+
+        // Chunk 1 (offset=2, limit=3): returns remaining 3rd row intact with prompt.
+        let n_d1 = run_via_feed_byte(
+            &mut sh,
+            b"sql /*triad*/ .dump t_sixteen_chars_ 2 3",
+            &mut echo,
+            &mut reply,
+        );
+        assert!(n_d1 <= 1024);
+        let s_d1 = core::str::from_utf8(&reply[..n_d1]).unwrap();
+        assert!(s_d1.ends_with("cuttle> "));
+        assert!(s_d1.starts_with("sqldump table=t_sixteen_chars_ rows=3 off=2 count=1 digest="));
+        let mut row_count_1 = 0usize;
+        for rln in s_d1.trim_end_matches("cuttle> ").lines().skip(1) {
+            let body = rln.strip_prefix("row ").unwrap();
+            assert_eq!(body.split('|').count(), 4);
+            assert!(body.split('|').all(|c| c.len() == 50 && c.starts_with("T:")));
+            row_count_1 += 1;
+        }
+        assert_eq!(row_count_1, 1);
+    }
 }
