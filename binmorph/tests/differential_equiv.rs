@@ -68,8 +68,8 @@ impl CpuState {
             *r = next_u64();
         }
         let mut mem = vec![0u8; MEM_SIZE];
-        // Populate the data region `[DATA_OFFSET .. DATA_OFFSET + 512]` with deterministic pseudo-random bytes.
-        for chunk in mem[DATA_OFFSET..DATA_OFFSET + 512].chunks_exact_mut(8) {
+        // Populate the data region `[DATA_OFFSET .. DATA_OFFSET + 2048]` with deterministic pseudo-random bytes.
+        for chunk in mem[DATA_OFFSET..DATA_OFFSET + 2048].chunks_exact_mut(8) {
             chunk.copy_from_slice(&next_u64().to_le_bytes());
         }
         // Set RSP to INITIAL_RSP_OFFSET and plant RET_SENTINEL at [RSP].
@@ -90,7 +90,14 @@ impl CpuState {
         }
     }
 
-    fn read_mem(&self, addr: u64, size: usize, text: &[u8], text_vaddr: u64) -> Result<u64, VmFault> {
+    fn read_mem(
+        &self,
+        addr: u64,
+        size: usize,
+        text: &[u8],
+        text_vaddr: u64,
+        ro_segments: &[(u64, &[u8])],
+    ) -> Result<u64, VmFault> {
         if addr >= MEM_BASE && addr.saturating_add(size as u64) <= MEM_BASE + (MEM_SIZE as u64) {
             let off = (addr - MEM_BASE) as usize;
             let mut buf = [0u8; 8];
@@ -104,6 +111,16 @@ impl CpuState {
             let mut buf = [0u8; 8];
             buf[..size].copy_from_slice(&text[off..off + size]);
             return Ok(u64::from_le_bytes(buf));
+        }
+        for &(seg_vaddr, seg_bytes) in ro_segments {
+            if addr >= seg_vaddr
+                && addr.saturating_add(size as u64) <= seg_vaddr + (seg_bytes.len() as u64)
+            {
+                let off = (addr - seg_vaddr) as usize;
+                let mut buf = [0u8; 8];
+                buf[..size].copy_from_slice(&seg_bytes[off..off + size]);
+                return Ok(u64::from_le_bytes(buf));
+            }
         }
         Err(VmFault::MemOutOfBounds(addr, size))
     }
@@ -201,6 +218,7 @@ impl CpuState {
         next_rip: u64,
         text: &[u8],
         text_vaddr: u64,
+        ro_segments: &[(u64, &[u8])],
         default_bits: u32,
     ) -> Result<(u64, u32), VmFault> {
         match insn.op_kind(op_idx) {
@@ -208,7 +226,7 @@ impl CpuState {
             OpKind::Memory => {
                 let size = mem_op_size_bytes(insn);
                 let addr = self.effective_address(insn, next_rip)?;
-                let val = self.read_mem(addr, size, text, text_vaddr)?;
+                let val = self.read_mem(addr, size, text, text_vaddr, ro_segments)?;
                 Ok((val, (size * 8) as u32))
             }
             OpKind::Immediate8 => Ok(((insn.immediate8() as i8 as i64 as u64) & mask_for_bits(default_bits), default_bits)),
@@ -447,6 +465,19 @@ fn execute_function(
     text: &[u8],
     text_vaddr: u64,
     fn_vaddr: u64,
+    state: CpuState,
+    max_steps: usize,
+) -> Result<CpuState, VmFault> {
+    execute_function_with_ro(text, text_vaddr, &[], fn_vaddr, state, max_steps)
+}
+
+/// Execute `fn_vaddr` inside `text` (mapped at `text_vaddr`) with additional read-only ELF
+/// segments (`ro_segments`, e.g. `.rodata`, `.data.rel.ro`) until `ret` pops `RET_SENTINEL`.
+fn execute_function_with_ro(
+    text: &[u8],
+    text_vaddr: u64,
+    ro_segments: &[(u64, &[u8])],
+    fn_vaddr: u64,
     mut state: CpuState,
     max_steps: usize,
 ) -> Result<CpuState, VmFault> {
@@ -468,11 +499,30 @@ fn execute_function(
         let mnemonic = insn.mnemonic();
 
         match mnemonic {
-            iced_x86::Mnemonic::Nop | iced_x86::Mnemonic::Endbr64 => {
+            iced_x86::Mnemonic::Nop
+            | iced_x86::Mnemonic::Endbr64
+            | iced_x86::Mnemonic::Cld
+            | iced_x86::Mnemonic::Pause
+            | iced_x86::Mnemonic::Lfence
+            | iced_x86::Mnemonic::Sfence
+            | iced_x86::Mnemonic::Mfence => {
+                rip = next_rip;
+            }
+            iced_x86::Mnemonic::Clc => {
+                state.cf = false;
+                rip = next_rip;
+            }
+            iced_x86::Mnemonic::Stc => {
+                state.cf = true;
+                rip = next_rip;
+            }
+            iced_x86::Mnemonic::Cmc => {
+                state.cf = !state.cf;
                 rip = next_rip;
             }
             iced_x86::Mnemonic::Push => {
-                let (val, _bits) = state.read_op(&insn, 0, next_rip, text, text_vaddr, 64)?;
+                let (val, _bits) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, 64)?;
                 let new_rsp = state.regs[4].wrapping_sub(8);
                 state.write_mem(new_rsp, 8, val)?;
                 state.regs[4] = new_rsp;
@@ -480,14 +530,14 @@ fn execute_function(
             }
             iced_x86::Mnemonic::Pop => {
                 let rsp = state.regs[4];
-                let val = state.read_mem(rsp, 8, text, text_vaddr)?;
+                let val = state.read_mem(rsp, 8, text, text_vaddr, ro_segments)?;
                 state.regs[4] = rsp.wrapping_add(8);
                 state.write_op(&insn, 0, next_rip, val)?;
                 rip = next_rip;
             }
             iced_x86::Mnemonic::Ret => {
                 let rsp = state.regs[4];
-                let ret_addr = state.read_mem(rsp, 8, text, text_vaddr)?;
+                let ret_addr = state.read_mem(rsp, 8, text, text_vaddr, ro_segments)?;
                 let imm_pop = if insn.op_count() > 0 {
                     insn.immediate16() as u64
                 } else {
@@ -500,7 +550,9 @@ fn execute_function(
                 let target = if insn.op_kind(0) == OpKind::NearBranch64 {
                     insn.near_branch64()
                 } else {
-                    state.read_op(&insn, 0, next_rip, text, text_vaddr, 64)?.0
+                    state
+                        .read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, 64)?
+                        .0
                 };
                 let new_rsp = state.regs[4].wrapping_sub(8);
                 state.write_mem(new_rsp, 8, next_rip)?;
@@ -509,14 +561,15 @@ fn execute_function(
             }
             iced_x86::Mnemonic::Leave => {
                 let rbp = state.regs[5];
-                let saved_rbp = state.read_mem(rbp, 8, text, text_vaddr)?;
+                let saved_rbp = state.read_mem(rbp, 8, text, text_vaddr, ro_segments)?;
                 state.regs[5] = saved_rbp;
                 state.regs[4] = rbp.wrapping_add(8);
                 rip = next_rip;
             }
             iced_x86::Mnemonic::Mov => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (val, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
+                let (val, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
                 state.write_op(&insn, 0, next_rip, val & mask_for_bits(bits))?;
                 rip = next_rip;
             }
@@ -526,7 +579,8 @@ fn execute_function(
                     OpKind::Memory => (mem_op_size_bytes(&insn) * 8) as u32,
                     _ => 8,
                 };
-                let (val, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, src_bits)?;
+                let (val, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, src_bits)?;
                 let zext = val & mask_for_bits(src_bits);
                 state.write_op(&insn, 0, next_rip, zext)?;
                 rip = next_rip;
@@ -538,7 +592,8 @@ fn execute_function(
                     OpKind::Memory => (mem_op_size_bytes(&insn) * 8) as u32,
                     _ => 32,
                 };
-                let (val, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, src_bits)?;
+                let (val, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, src_bits)?;
                 let sext = (sign_extend(val, src_bits) as u64) & mask_for_bits(dst_bits);
                 state.write_op(&insn, 0, next_rip, sext)?;
                 rip = next_rip;
@@ -551,15 +606,52 @@ fn execute_function(
             }
             iced_x86::Mnemonic::Xchg => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (v0, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (v1, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
+                let (v0, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (v1, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
                 state.write_op(&insn, 0, next_rip, v1 & mask_for_bits(bits))?;
                 state.write_op(&insn, 1, next_rip, v0 & mask_for_bits(bits))?;
                 rip = next_rip;
             }
+            iced_x86::Mnemonic::Xadd => {
+                let bits = state.dst_bits(&insn, 0)?;
+                let (v0, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (v1, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let sum = state.alu_add(v0, v1, false, bits);
+                state.write_op(&insn, 1, next_rip, v0 & mask_for_bits(bits))?;
+                state.write_op(&insn, 0, next_rip, sum)?;
+                rip = next_rip;
+            }
+            iced_x86::Mnemonic::Cmpxchg => {
+                let bits = state.dst_bits(&insn, 0)?;
+                let (dst_val, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (src_val, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let acc_val = state.regs[0] & mask_for_bits(bits);
+                let _ = state.alu_sub(acc_val, dst_val, false, bits);
+                if acc_val == (dst_val & mask_for_bits(bits)) {
+                    state.zf = true;
+                    state.write_op(&insn, 0, next_rip, src_val & mask_for_bits(bits))?;
+                } else {
+                    state.zf = false;
+                    let acc_reg = match bits {
+                        8 => Register::AL,
+                        16 => Register::AX,
+                        32 => Register::EAX,
+                        _ => Register::RAX,
+                    };
+                    state.write_reg(acc_reg, dst_val & mask_for_bits(bits))?;
+                }
+                rip = next_rip;
+            }
             iced_x86::Mnemonic::Bswap => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (v0, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
+                let (v0, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let swapped = match bits {
                     32 => (v0 as u32).swap_bytes() as u64,
                     64 => v0.swap_bytes(),
@@ -569,18 +661,107 @@ fn execute_function(
                 state.write_op(&insn, 0, next_rip, swapped)?;
                 rip = next_rip;
             }
+            iced_x86::Mnemonic::Bsf | iced_x86::Mnemonic::Tzcnt => {
+                let bits = state.dst_bits(&insn, 0)?;
+                let (src_val, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let v = src_val & mask_for_bits(bits);
+                if v == 0 {
+                    state.zf = true;
+                    state.cf = true;
+                    if mnemonic == iced_x86::Mnemonic::Tzcnt {
+                        state.write_op(&insn, 0, next_rip, bits as u64)?;
+                    }
+                } else {
+                    state.zf = false;
+                    state.cf = false;
+                    let tz = v.trailing_zeros() as u64;
+                    state.write_op(&insn, 0, next_rip, tz)?;
+                }
+                rip = next_rip;
+            }
+            iced_x86::Mnemonic::Bsr | iced_x86::Mnemonic::Lzcnt => {
+                let bits = state.dst_bits(&insn, 0)?;
+                let (src_val, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let v = src_val & mask_for_bits(bits);
+                if v == 0 {
+                    state.zf = true;
+                    state.cf = true;
+                    if mnemonic == iced_x86::Mnemonic::Lzcnt {
+                        state.write_op(&insn, 0, next_rip, bits as u64)?;
+                    }
+                } else {
+                    state.zf = false;
+                    state.cf = false;
+                    let highest_bit = 63 - v.leading_zeros();
+                    let res = if mnemonic == iced_x86::Mnemonic::Lzcnt {
+                        (bits - 1 - highest_bit) as u64
+                    } else {
+                        highest_bit as u64
+                    };
+                    state.write_op(&insn, 0, next_rip, res)?;
+                }
+                rip = next_rip;
+            }
+            iced_x86::Mnemonic::Popcnt => {
+                let bits = state.dst_bits(&insn, 0)?;
+                let (src_val, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let v = src_val & mask_for_bits(bits);
+                let cnt = v.count_ones() as u64;
+                state.cf = false;
+                state.of = false;
+                state.sf = false;
+                state.af = false;
+                state.pf = false;
+                state.zf = cnt == 0;
+                state.write_op(&insn, 0, next_rip, cnt)?;
+                rip = next_rip;
+            }
+            iced_x86::Mnemonic::Bt
+            | iced_x86::Mnemonic::Bts
+            | iced_x86::Mnemonic::Btr
+            | iced_x86::Mnemonic::Btc => {
+                let bits = state.dst_bits(&insn, 0)?;
+                let (base_val, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (bit_idx_raw, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let bit_idx = (bit_idx_raw as u32) % bits;
+                let mask = 1u64 << bit_idx;
+                state.cf = (base_val & mask) != 0;
+                match mnemonic {
+                    iced_x86::Mnemonic::Bt => {}
+                    iced_x86::Mnemonic::Bts => {
+                        state.write_op(&insn, 0, next_rip, (base_val | mask) & mask_for_bits(bits))?;
+                    }
+                    iced_x86::Mnemonic::Btr => {
+                        state.write_op(&insn, 0, next_rip, (base_val & !mask) & mask_for_bits(bits))?;
+                    }
+                    iced_x86::Mnemonic::Btc => {
+                        state.write_op(&insn, 0, next_rip, (base_val ^ mask) & mask_for_bits(bits))?;
+                    }
+                    _ => unreachable!(),
+                }
+                rip = next_rip;
+            }
             iced_x86::Mnemonic::Add => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (b, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (b, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let res = state.alu_add(a, b, false, bits);
                 state.write_op(&insn, 0, next_rip, res)?;
                 rip = next_rip;
             }
             iced_x86::Mnemonic::Adc => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (b, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (b, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let cf = state.cf;
                 let res = state.alu_add(a, b, cf, bits);
                 state.write_op(&insn, 0, next_rip, res)?;
@@ -588,16 +769,20 @@ fn execute_function(
             }
             iced_x86::Mnemonic::Sub => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (b, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (b, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let res = state.alu_sub(a, b, false, bits);
                 state.write_op(&insn, 0, next_rip, res)?;
                 rip = next_rip;
             }
             iced_x86::Mnemonic::Sbb => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (b, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (b, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let cf = state.cf;
                 let res = state.alu_sub(a, b, cf, bits);
                 state.write_op(&insn, 0, next_rip, res)?;
@@ -605,45 +790,56 @@ fn execute_function(
             }
             iced_x86::Mnemonic::Cmp => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (b, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (b, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let _ = state.alu_sub(a, b, false, bits);
                 rip = next_rip;
             }
             iced_x86::Mnemonic::And => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (b, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (b, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let res = state.alu_logic(a & b, bits);
                 state.write_op(&insn, 0, next_rip, res)?;
                 rip = next_rip;
             }
             iced_x86::Mnemonic::Or => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (b, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (b, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let res = state.alu_logic(a | b, bits);
                 state.write_op(&insn, 0, next_rip, res)?;
                 rip = next_rip;
             }
             iced_x86::Mnemonic::Xor => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (b, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (b, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let res = state.alu_logic(a ^ b, bits);
                 state.write_op(&insn, 0, next_rip, res)?;
                 rip = next_rip;
             }
             iced_x86::Mnemonic::Test => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (b, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (b, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let _ = state.alu_logic(a & b, bits);
                 rip = next_rip;
             }
             iced_x86::Mnemonic::Inc => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let saved_cf = state.cf;
                 let res = state.alu_add(a, 1, false, bits);
                 state.cf = saved_cf;
@@ -652,7 +848,8 @@ fn execute_function(
             }
             iced_x86::Mnemonic::Dec => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let saved_cf = state.cf;
                 let res = state.alu_sub(a, 1, false, bits);
                 state.cf = saved_cf;
@@ -661,7 +858,8 @@ fn execute_function(
             }
             iced_x86::Mnemonic::Neg => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let res = state.alu_sub(0, a, false, bits);
                 state.cf = (a & mask_for_bits(bits)) != 0;
                 state.write_op(&insn, 0, next_rip, res)?;
@@ -669,15 +867,18 @@ fn execute_function(
             }
             iced_x86::Mnemonic::Not => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
                 let res = (!a) & mask_for_bits(bits);
                 state.write_op(&insn, 0, next_rip, res)?;
                 rip = next_rip;
             }
             iced_x86::Mnemonic::Shl | iced_x86::Mnemonic::Sal => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (cnt_raw, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, 8)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (cnt_raw, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, 8)?;
                 let mask = if bits == 64 { 63 } else { 31 };
                 let cnt = (cnt_raw as u32) & mask;
                 let mut res = a & mask_for_bits(bits);
@@ -695,8 +896,10 @@ fn execute_function(
             }
             iced_x86::Mnemonic::Shr => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (cnt_raw, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, 8)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (cnt_raw, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, 8)?;
                 let mask = if bits == 64 { 63 } else { 31 };
                 let cnt = (cnt_raw as u32) & mask;
                 let orig = a & mask_for_bits(bits);
@@ -714,8 +917,10 @@ fn execute_function(
             }
             iced_x86::Mnemonic::Sar => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (cnt_raw, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, 8)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (cnt_raw, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, 8)?;
                 let mask = if bits == 64 { 63 } else { 31 };
                 let cnt = (cnt_raw as u32) & mask;
                 let signed = sign_extend(a, bits);
@@ -731,10 +936,54 @@ fn execute_function(
                 state.write_op(&insn, 0, next_rip, res)?;
                 rip = next_rip;
             }
+            iced_x86::Mnemonic::Shld => {
+                let bits = state.dst_bits(&insn, 0)?;
+                let (dst_val, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (src_val, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (cnt_raw, _) =
+                    state.read_op(&insn, 2, next_rip, text, text_vaddr, ro_segments, 8)?;
+                let mask = if bits == 64 { 63 } else { 31 };
+                let cnt = (cnt_raw as u32) & mask;
+                let d = dst_val & mask_for_bits(bits);
+                let s = src_val & mask_for_bits(bits);
+                let mut res = d;
+                if cnt > 0 && cnt < bits {
+                    state.cf = ((d >> (bits - cnt)) & 1) != 0;
+                    res = ((d << cnt) | (s >> (bits - cnt))) & mask_for_bits(bits);
+                    state.set_szp(res, bits);
+                }
+                state.write_op(&insn, 0, next_rip, res)?;
+                rip = next_rip;
+            }
+            iced_x86::Mnemonic::Shrd => {
+                let bits = state.dst_bits(&insn, 0)?;
+                let (dst_val, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (src_val, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (cnt_raw, _) =
+                    state.read_op(&insn, 2, next_rip, text, text_vaddr, ro_segments, 8)?;
+                let mask = if bits == 64 { 63 } else { 31 };
+                let cnt = (cnt_raw as u32) & mask;
+                let d = dst_val & mask_for_bits(bits);
+                let s = src_val & mask_for_bits(bits);
+                let mut res = d;
+                if cnt > 0 && cnt < bits {
+                    state.cf = ((d >> (cnt - 1)) & 1) != 0;
+                    res = ((d >> cnt) | (s << (bits - cnt))) & mask_for_bits(bits);
+                    state.set_szp(res, bits);
+                }
+                state.write_op(&insn, 0, next_rip, res)?;
+                rip = next_rip;
+            }
             iced_x86::Mnemonic::Rol => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (cnt_raw, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, 8)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (cnt_raw, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, 8)?;
                 let mask = if bits == 64 { 63 } else { 31 };
                 let cnt = ((cnt_raw as u32) & mask) % bits;
                 let orig = a & mask_for_bits(bits);
@@ -751,8 +1000,10 @@ fn execute_function(
             }
             iced_x86::Mnemonic::Ror => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                let (cnt_raw, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, 8)?;
+                let (a, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                let (cnt_raw, _) =
+                    state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, 8)?;
                 let mask = if bits == 64 { 63 } else { 31 };
                 let cnt = ((cnt_raw as u32) & mask) % bits;
                 let orig = a & mask_for_bits(bits);
@@ -770,8 +1021,10 @@ fn execute_function(
             iced_x86::Mnemonic::Imul => {
                 if insn.op_count() == 2 {
                     let bits = state.dst_bits(&insn, 0)?;
-                    let (a, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
-                    let (b, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
+                    let (a, _) =
+                        state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
+                    let (b, _) =
+                        state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
                     let sa = sign_extend(a, bits) as i128;
                     let sb = sign_extend(b, bits) as i128;
                     let prod = sa * sb;
@@ -782,8 +1035,10 @@ fn execute_function(
                     state.write_op(&insn, 0, next_rip, res)?;
                 } else if insn.op_count() == 3 {
                     let bits = state.dst_bits(&insn, 0)?;
-                    let (a, _) = state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
-                    let (b, _) = state.read_op(&insn, 2, next_rip, text, text_vaddr, bits)?;
+                    let (a, _) =
+                        state.read_op(&insn, 1, next_rip, text, text_vaddr, ro_segments, bits)?;
+                    let (b, _) =
+                        state.read_op(&insn, 2, next_rip, text, text_vaddr, ro_segments, bits)?;
                     let sa = sign_extend(a, bits) as i128;
                     let sb = sign_extend(b, bits) as i128;
                     let prod = sa * sb;
@@ -794,7 +1049,8 @@ fn execute_function(
                     state.write_op(&insn, 0, next_rip, res)?;
                 } else {
                     let bits = state.dst_bits(&insn, 0)?;
-                    let (b, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
+                    let (b, _) =
+                        state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
                     let sa = sign_extend(state.regs[0], bits) as i128;
                     let sb = sign_extend(b, bits) as i128;
                     let prod = sa * sb;
@@ -815,7 +1071,8 @@ fn execute_function(
             }
             iced_x86::Mnemonic::Mul => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (b, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
+                let (b, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
                 if bits == 64 {
                     let prod = (state.regs[0] as u128) * (b as u128);
                     state.regs[0] = prod as u64;
@@ -823,7 +1080,8 @@ fn execute_function(
                     state.cf = state.regs[2] != 0;
                     state.of = state.cf;
                 } else if bits == 32 {
-                    let prod = ((state.regs[0] & 0xFFFF_FFFF) as u128) * ((b & 0xFFFF_FFFF) as u128);
+                    let prod =
+                        ((state.regs[0] & 0xFFFF_FFFF) as u128) * ((b & 0xFFFF_FFFF) as u128);
                     state.regs[0] = (prod as u64) & 0xFFFF_FFFF;
                     state.regs[2] = ((prod >> 32) as u64) & 0xFFFF_FFFF;
                     state.cf = state.regs[2] != 0;
@@ -838,7 +1096,8 @@ fn execute_function(
             }
             iced_x86::Mnemonic::Div => {
                 let bits = state.dst_bits(&insn, 0)?;
-                let (divisor, _) = state.read_op(&insn, 0, next_rip, text, text_vaddr, bits)?;
+                let (divisor, _) =
+                    state.read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, bits)?;
                 if (divisor & mask_for_bits(bits)) == 0 {
                     return Err(VmFault::DivisionByZero);
                 }
@@ -849,7 +1108,8 @@ fn execute_function(
                     state.regs[0] = q as u64;
                     state.regs[2] = r as u64;
                 } else if bits == 32 {
-                    let dividend = ((state.regs[2] & 0xFFFF_FFFF) << 32) | (state.regs[0] & 0xFFFF_FFFF);
+                    let dividend =
+                        ((state.regs[2] & 0xFFFF_FFFF) << 32) | (state.regs[0] & 0xFFFF_FFFF);
                     let d = divisor & 0xFFFF_FFFF;
                     state.regs[0] = (dividend / d) & 0xFFFF_FFFF;
                     state.regs[2] = (dividend % d) & 0xFFFF_FFFF;
@@ -859,6 +1119,21 @@ fn execute_function(
                         "div width".into(),
                     ));
                 }
+                rip = next_rip;
+            }
+            iced_x86::Mnemonic::Cbw => {
+                let sign = (state.regs[0] as u8 as i8 as i16) as u16 as u64;
+                state.regs[0] = (state.regs[0] & !0xFFFF) | sign;
+                rip = next_rip;
+            }
+            iced_x86::Mnemonic::Cwd => {
+                let sign = (state.regs[0] as u16 as i16) < 0;
+                let dx = if sign { 0xFFFFu64 } else { 0 };
+                state.regs[2] = (state.regs[2] & !0xFFFF) | dx;
+                rip = next_rip;
+            }
+            iced_x86::Mnemonic::Cwde => {
+                state.regs[0] = (state.regs[0] as u16 as i16 as i32 as u32) as u64;
                 rip = next_rip;
             }
             iced_x86::Mnemonic::Cdq => {
@@ -875,11 +1150,76 @@ fn execute_function(
                 state.regs[0] = (state.regs[0] as u32 as i32 as i64) as u64;
                 rip = next_rip;
             }
+            iced_x86::Mnemonic::Stosb
+            | iced_x86::Mnemonic::Stosw
+            | iced_x86::Mnemonic::Stosd
+            | iced_x86::Mnemonic::Stosq => {
+                let elem_bytes = match mnemonic {
+                    iced_x86::Mnemonic::Stosb => 1usize,
+                    iced_x86::Mnemonic::Stosw => 2,
+                    iced_x86::Mnemonic::Stosd => 4,
+                    _ => 8,
+                };
+                let val = state.regs[0];
+                if insn.has_rep_prefix() {
+                    let count = state.regs[1];
+                    if count > 4096 {
+                        return Err(VmFault::StepBudgetExceeded(max_steps));
+                    }
+                    for _ in 0..count {
+                        let rdi = state.regs[7];
+                        state.write_mem(rdi, elem_bytes, val)?;
+                        state.regs[7] = rdi.wrapping_add(elem_bytes as u64);
+                    }
+                    state.regs[1] = 0;
+                } else {
+                    let rdi = state.regs[7];
+                    state.write_mem(rdi, elem_bytes, val)?;
+                    state.regs[7] = rdi.wrapping_add(elem_bytes as u64);
+                }
+                rip = next_rip;
+            }
+            iced_x86::Mnemonic::Movsb
+            | iced_x86::Mnemonic::Movsw
+            | iced_x86::Mnemonic::Movsd
+            | iced_x86::Mnemonic::Movsq => {
+                let elem_bytes = match mnemonic {
+                    iced_x86::Mnemonic::Movsb => 1usize,
+                    iced_x86::Mnemonic::Movsw => 2,
+                    iced_x86::Mnemonic::Movsd => 4,
+                    _ => 8,
+                };
+                if insn.has_rep_prefix() {
+                    let count = state.regs[1];
+                    if count > 4096 {
+                        return Err(VmFault::StepBudgetExceeded(max_steps));
+                    }
+                    for _ in 0..count {
+                        let rsi = state.regs[6];
+                        let rdi = state.regs[7];
+                        let v = state.read_mem(rsi, elem_bytes, text, text_vaddr, ro_segments)?;
+                        state.write_mem(rdi, elem_bytes, v)?;
+                        state.regs[6] = rsi.wrapping_add(elem_bytes as u64);
+                        state.regs[7] = rdi.wrapping_add(elem_bytes as u64);
+                    }
+                    state.regs[1] = 0;
+                } else {
+                    let rsi = state.regs[6];
+                    let rdi = state.regs[7];
+                    let v = state.read_mem(rsi, elem_bytes, text, text_vaddr, ro_segments)?;
+                    state.write_mem(rdi, elem_bytes, v)?;
+                    state.regs[6] = rsi.wrapping_add(elem_bytes as u64);
+                    state.regs[7] = rdi.wrapping_add(elem_bytes as u64);
+                }
+                rip = next_rip;
+            }
             iced_x86::Mnemonic::Jmp => {
                 if insn.op_kind(0) == OpKind::NearBranch64 {
                     rip = insn.near_branch64();
                 } else {
-                    rip = state.read_op(&insn, 0, next_rip, text, text_vaddr, 64)?.0;
+                    rip = state
+                        .read_op(&insn, 0, next_rip, text, text_vaddr, ro_segments, 64)?
+                        .0;
                 }
             }
             _ => {
@@ -899,8 +1239,15 @@ fn execute_function(
                         // zero-extends the destination register's upper 32 bits!).
                         let bits = state.dst_bits(&insn, 0)?;
                         if taken {
-                            let (src_val, _) =
-                                state.read_op(&insn, 1, next_rip, text, text_vaddr, bits)?;
+                            let (src_val, _) = state.read_op(
+                                &insn,
+                                1,
+                                next_rip,
+                                text,
+                                text_vaddr,
+                                ro_segments,
+                                bits,
+                            )?;
                             state.write_op(&insn, 0, next_rip, src_val & mask_for_bits(bits))?;
                         } else if bits == 32 && insn.op_kind(0) == OpKind::Register {
                             let (cur_val, _) = state.read_reg(insn.op_register(0))?;
@@ -1608,13 +1955,73 @@ fn multi_seed_elf_structural_and_gadget_byte_invariants_across_50_seeds() {
     }
 }
 
-#[test]
-fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
-    // Locate the compiled bare-metal `target_enterprise_kernel` ELF if present (or build/check
-    // its standard cargo target location) and run concrete differential execution on real
-    // compiler-emitted (`rustc` + LLVM) kernel functions rewritten by `cuttle-binmorph`!
-    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir.parent().expect("workspace root");
+#[derive(Clone, Copy, Debug)]
+enum AbiProfile {
+    PureScalar,
+    SmallBounds,
+    SinglePtrAndLen,
+    TwoPtrsAndLen,
+    ThreePtrs,
+    StructSelfZeroed,
+}
+
+impl AbiProfile {
+    const ALL: [Self; 6] = [
+        Self::PureScalar,
+        Self::SmallBounds,
+        Self::SinglePtrAndLen,
+        Self::TwoPtrsAndLen,
+        Self::ThreePtrs,
+        Self::StructSelfZeroed,
+    ];
+
+    fn make_input(self, input_idx: usize) -> CpuState {
+        let seed = ((input_idx as u64) + 1).wrapping_mul(0x517C_C1B7_2722_0A95);
+        let mut init = CpuState::from_seed(seed);
+        match self {
+            Self::PureScalar => {}
+            Self::SmallBounds => {
+                // RDI=7, RSI=6, RDX=2, RCX=1, R8=8, R9=9
+                for &reg in &[7usize, 6, 2, 1, 8, 9] {
+                    init.regs[reg] &= 0x0F;
+                }
+            }
+            Self::SinglePtrAndLen => {
+                init.regs[7] = MEM_BASE + (DATA_OFFSET as u64) + 128;
+                init.regs[6] &= 0x0F;
+                init.regs[2] &= 0x0F;
+                init.regs[1] &= 0x0F;
+            }
+            Self::TwoPtrsAndLen => {
+                init.regs[7] = MEM_BASE + (DATA_OFFSET as u64) + 128;
+                init.regs[6] = MEM_BASE + (DATA_OFFSET as u64) + 512;
+                init.regs[2] &= 0x0F;
+                init.regs[1] &= 0x0F;
+            }
+            Self::ThreePtrs => {
+                init.regs[7] = MEM_BASE + (DATA_OFFSET as u64) + 128;
+                init.regs[6] = MEM_BASE + (DATA_OFFSET as u64) + 512;
+                init.regs[2] = MEM_BASE + (DATA_OFFSET as u64) + 896;
+                init.regs[1] &= 0x0F;
+            }
+            Self::StructSelfZeroed => {
+                // Zero-initialize a 256-byte struct at DATA_OFFSET + 128 with small deterministic scalars
+                // at the first few words so `&self` / `&mut self` methods with internal length/state invariants
+                // execute cleanly without out-of-bounds slice panics.
+                init.mem[DATA_OFFSET + 128..DATA_OFFSET + 384].fill(0);
+                init.mem[DATA_OFFSET + 128] = (input_idx as u8) & 0x07;
+                init.mem[DATA_OFFSET + 136] = ((input_idx as u8).wrapping_mul(3)) & 0x07;
+                init.regs[7] = MEM_BASE + (DATA_OFFSET as u64) + 128;
+                init.regs[6] = (input_idx as u64) & 0x07;
+                init.regs[2] = ((input_idx as u64).wrapping_mul(5)) & 0x07;
+                init.regs[1] = ((input_idx as u64).wrapping_mul(7)) & 0x07;
+            }
+        }
+        init
+    }
+}
+
+fn ensure_compiled_kernel_elf_exists(root: &std::path::Path) -> std::path::PathBuf {
     let candidate_paths = [
         root.join("target_enterprise_kernel")
             .join("target")
@@ -1626,10 +2033,34 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
             .join("release")
             .join("target_enterprise_kernel"),
     ];
-    let Some(kernel_elf_path) = candidate_paths.into_iter().find(|p| p.exists()) else {
-        eprintln!("note: compiled target_enterprise_kernel ELF not yet on disk; skipping optional real-ELF pass in unit run");
-        return;
-    };
+    if let Some(found) = candidate_paths.iter().find(|p| p.exists()) {
+        return found.clone();
+    }
+    let kernel_dir = root.join("target_enterprise_kernel");
+    let status = std::process::Command::new("cargo")
+        .arg("build")
+        .arg("--release")
+        .current_dir(&kernel_dir)
+        .status()
+        .expect("failed to invoke `cargo build --release` in target_enterprise_kernel");
+    assert!(
+        status.success(),
+        "`cargo build --release` in target_enterprise_kernel failed with {status}"
+    );
+    candidate_paths
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("target_enterprise_kernel ELF missing after successful `cargo build --release`")
+}
+
+#[test]
+fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
+    // Always locate or build the bare-metal `target_enterprise_kernel` ELF (never skip)
+    // and run concrete differential execution on real compiler-emitted (`rustc` + LLVM)
+    // kernel `.text` functions rewritten by `cuttle-binmorph` across 32 seeds!
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir.parent().expect("workspace root");
+    let kernel_elf_path = ensure_compiled_kernel_elf_exists(root);
 
     let base_elf = std::fs::read(&kernel_elf_path).expect("read kernel ELF");
     let obj = object::File::parse(base_elf.as_slice()).expect("parse kernel ELF");
@@ -1638,76 +2069,185 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
     let (text_file_off, text_len) = text_sec.file_range().expect(".text file_range");
     let orig_text = &base_elf[text_file_off as usize..(text_file_off + text_len) as usize];
 
-    // Collect candidate pure `.text` functions (`STT_FUNC`, size 12..=512) that execute cleanly
-    // in `X86MicroVm` across 8 random register states without touching privileged I/O or external RAM.
-    let mut pure_kernel_fns: Vec<(String, u64, usize)> = Vec::new();
+    // Map all non-`.text` file-backed ELF sections (`.rodata`, `.data.rel.ro`, `.data`, etc.)
+    // as read-only reference segments so real kernel functions that read lookup tables, constants,
+    // or static slices via `[rip + disp32]` execute cleanly inside `X86MicroVm`.
+    let mut ro_segments: Vec<(u64, &[u8])> = Vec::new();
+    for sec in obj.sections() {
+        if sec.name() == Ok(".text") {
+            continue;
+        }
+        let vaddr = sec.address();
+        if vaddr == 0 {
+            continue;
+        }
+        if let Some((foff, flen)) = sec.file_range() {
+            if flen > 0 && (foff + flen) as usize <= base_elf.len() {
+                ro_segments.push((vaddr, &base_elf[foff as usize..(foff + flen) as usize]));
+            }
+        }
+    }
+
+    const NUM_INPUTS: usize = 16;
+    const NUM_SEEDS: u64 = 32;
+    const MAX_STEPS: usize = 1024;
+    let expected_ret_rsp = MEM_BASE + (INITIAL_RSP_OFFSET as u64) + 8;
+
+    // Discover all `.text` functions (`STT_FUNC`, size 12..=2048) that execute cleanly to `ret`
+    // with balanced `RSP` across all `NUM_INPUTS` inputs under one of the realistic ABI profiles.
+    let mut verified_kernel_fns: Vec<(String, u64, usize, AbiProfile)> = Vec::new();
     for sym in obj.symbols() {
         if sym.kind() != SymbolKind::Text {
             continue;
         }
         let addr = sym.address();
         let size = sym.size() as usize;
-        if !(12..=512).contains(&size) {
+        if !(12..=2048).contains(&size) {
             continue;
         }
         if addr < text_vaddr || addr + (size as u64) > text_vaddr + text_len {
             continue;
         }
         let name = sym.name().unwrap_or("<anon>").to_string();
-        // Test if this function is a self-contained pure function over registers/stack:
-        let mut pure_ok = true;
-        for input_idx in 0..8 {
-            let init = CpuState::from_seed(((input_idx as u64) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            if execute_function(orig_text, text_vaddr, addr, init, 512).is_err() {
-                pure_ok = false;
+
+        for profile in AbiProfile::ALL {
+            let mut profile_ok = true;
+            for input_idx in 0..NUM_INPUTS {
+                let init = profile.make_input(input_idx);
+                match execute_function_with_ro(
+                    orig_text,
+                    text_vaddr,
+                    &ro_segments,
+                    addr,
+                    init,
+                    MAX_STEPS,
+                ) {
+                    Ok(out) if out.regs[4] == expected_ret_rsp => {}
+                    _ => {
+                        profile_ok = false;
+                        break;
+                    }
+                }
+            }
+            if profile_ok {
+                verified_kernel_fns.push((name, addr, size, profile));
                 break;
             }
-        }
-        if pure_ok {
-            pure_kernel_fns.push((name, addr, size));
         }
     }
 
     assert!(
-        !pure_kernel_fns.is_empty(),
-        "expected to find self-contained pure functions in target_enterprise_kernel .text"
+        verified_kernel_fns.len() >= 500,
+        "expected at least 500 real compiled kernel functions in target_enterprise_kernel .text, got {}",
+        verified_kernel_fns.len()
     );
 
-    // Rewrite the entire kernel ELF across 8 seeds and verify that every pure function that was
-    // actually mutated by `cuttle-binmorph` produces bit-exact output across 16 random inputs!
-    let mut mutated_and_verified = 0usize;
-    for seed in [11u64, 22, 33, 42, 55, 77, 88, 99] {
+    // Rewrite the entire real kernel ELF across 32 seeds (`1..=32`) and verify that every discovered
+    // kernel function (including every mutated function-seed instance) produces bit-exact output
+    // across all 16 inputs per seed!
+    let mut mutated_fn_seed_instances = 0usize;
+    let mut distinct_mutated_fns = BTreeSet::new();
+
+    for seed in 1u64..=NUM_SEEDS {
         let mut morphed_elf = base_elf.clone();
         let stats = rewrite_elf_bytes(&mut morphed_elf, seed).expect("rewrite kernel ELF");
         assert!(stats.functions > 0 && stats.swapped > 0);
         let morph_text =
             &morphed_elf[text_file_off as usize..(text_file_off + text_len) as usize];
 
-        for (fn_name, fn_vaddr, fn_size) in &pure_kernel_fns {
+        for (fn_name, fn_vaddr, fn_size, profile) in &verified_kernel_fns {
             let fn_off = (*fn_vaddr - text_vaddr) as usize;
             if orig_text[fn_off..fn_off + *fn_size] != morph_text[fn_off..fn_off + *fn_size] {
-                mutated_and_verified += 1;
+                mutated_fn_seed_instances += 1;
+                distinct_mutated_fns.insert(fn_name.clone());
             }
-            assert_function_equivalent(
-                fn_name,
-                orig_text,
-                morph_text,
-                text_vaddr,
-                *fn_vaddr,
-                seed,
-                16,
-                false,
-            );
+
+            for input_idx in 0..NUM_INPUTS {
+                let init = profile.make_input(input_idx);
+                let out_orig = execute_function_with_ro(
+                    orig_text,
+                    text_vaddr,
+                    &ro_segments,
+                    *fn_vaddr,
+                    init.clone(),
+                    MAX_STEPS,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("original kernel fn {fn_name} faulted on input {input_idx}: {e:?}")
+                });
+                let out_morph = execute_function_with_ro(
+                    morph_text,
+                    text_vaddr,
+                    &ro_segments,
+                    *fn_vaddr,
+                    init,
+                    MAX_STEPS,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "morphed kernel fn {fn_name} (seed={seed}) faulted on input {input_idx}: {e:?}"
+                    )
+                });
+
+                assert_eq!(
+                    out_orig.regs[0], out_morph.regs[0],
+                    "RAX return value mismatch in real kernel fn {fn_name} (seed={seed}, input={input_idx})"
+                );
+                assert_eq!(
+                    out_orig.regs[2], out_morph.regs[2],
+                    "RDX secondary return register mismatch in real kernel fn {fn_name} (seed={seed}, input={input_idx})"
+                );
+                assert_eq!(
+                    out_orig.regs[4], out_morph.regs[4],
+                    "RSP mismatch at ret in real kernel fn {fn_name} (seed={seed}, input={input_idx})"
+                );
+                for &(reg_idx, reg_name) in &[
+                    (3usize, "RBX"),
+                    (5, "RBP"),
+                    (12, "R12"),
+                    (13, "R13"),
+                    (14, "R14"),
+                    (15, "R15"),
+                ] {
+                    assert_eq!(
+                        out_orig.regs[reg_idx], out_morph.regs[reg_idx],
+                        "callee-saved register {reg_name} mismatch in real kernel fn {fn_name} (seed={seed}, input={input_idx})"
+                    );
+                }
+                // Compare the entire 16 KiB data arena `[0 .. 0x4000]` and caller stack frame
+                // `[INITIAL_RSP_OFFSET .. MEM_SIZE]` (excluding the dead callee stack scratch region
+                // `[0x4000 .. INITIAL_RSP_OFFSET]` below RSP where `pass_prologue_epilogue_perm`
+                // intentionally permutes saved register push/pop slots).
+                assert_eq!(
+                    &out_orig.mem[..0x4000],
+                    &out_morph.mem[..0x4000],
+                    "data memory mismatch in real kernel fn {fn_name} (seed={seed}, input={input_idx})"
+                );
+                assert_eq!(
+                    &out_orig.mem[INITIAL_RSP_OFFSET..],
+                    &out_morph.mem[INITIAL_RSP_OFFSET..],
+                    "caller stack frame mismatch in real kernel fn {fn_name} (seed={seed}, input={input_idx})"
+                );
+            }
         }
     }
 
     eprintln!(
-        "real kernel ELF differential check: verified {} pure functions ({} mutated instances across 8 seeds)",
-        pure_kernel_fns.len(),
-        mutated_and_verified
+        "real kernel ELF differential check: verified {} real kernel functions ({} distinct mutated functions, {} mutated fn×seed instances, {} total concrete executions across {} seeds)",
+        verified_kernel_fns.len(),
+        distinct_mutated_fns.len(),
+        mutated_fn_seed_instances,
+        verified_kernel_fns.len() * (NUM_SEEDS as usize) * NUM_INPUTS,
+        NUM_SEEDS
     );
     assert!(
-        mutated_and_verified > 0,
-        "expected at least one pure kernel function to be mutated by cuttle-binmorph and differentially verified"
+        distinct_mutated_fns.len() >= 480,
+        "expected at least 480 distinct real kernel functions mutated by cuttle-binmorph, got {}",
+        distinct_mutated_fns.len()
+    );
+    assert!(
+        mutated_fn_seed_instances >= 14_000,
+        "expected at least 14000 mutated (function, seed) instances verified on real kernel ELF, got {}",
+        mutated_fn_seed_instances
     );
 }

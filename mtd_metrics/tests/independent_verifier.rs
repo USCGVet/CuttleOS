@@ -244,20 +244,21 @@ fn cross_check_mtd_metrics_against_independent_python_verifier() {
     std::fs::write(&base_path, &base_elf).expect("write base.elf");
     std::fs::write(&var_path, &variant_elf).expect("write variant.elf");
 
-    let out = Command::new("python")
-        .arg(&script)
-        .arg("--base")
-        .arg(&base_path)
-        .arg("--variant")
-        .arg(&var_path)
-        .output()
-        .expect("invoke python tools/verify_metrics_independent.py");
+    let out = ["python", "python3"]
+        .into_iter()
+        .find_map(|bin| {
+            Command::new(bin)
+                .arg(&script)
+                .arg("--base")
+                .arg(&base_path)
+                .arg("--variant")
+                .arg(&var_path)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+        })
+        .expect("invoke python/python3 tools/verify_metrics_independent.py");
     let _ = std::fs::remove_dir_all(&tmp_dir);
-    assert!(
-        out.status.success(),
-        "verify_metrics_independent.py failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 
     let json_val: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("parse independent verifier JSON");
