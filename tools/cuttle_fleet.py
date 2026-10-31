@@ -419,6 +419,8 @@ class FarmHandler(tc.TriadHttpHandler):
         return tc.TriadHttpHandler.do_GET(self)
 
     def do_POST(self):
+        if self._validate_content_length() is None:
+            return None
         if not self._is_authenticated():
             return self._send_json(401, {"ok": False, "error": "unauthorized"})
         if self.path in ("/api/load", "/api/shutdown"):
@@ -503,6 +505,7 @@ class Provider:
                 print(f"[WARN] client '{cid}' disabled due to malformed client_token.txt: {e}", flush=True)
         self.farm_secrets = {cid: secrets.token_hex(24) for cid in self.clients}
         self.procs: dict = {}
+        self.farm_jobs: dict = {}
         self.cache: dict = {cid: None for cid in self.clients}
         self.lock = threading.Lock()
         self.running = True
@@ -544,12 +547,14 @@ class Provider:
                 env=env,
                 creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
             )
+            self.farm_jobs[cid] = tc.apply_host_resource_limits(self.procs[cid], max_memory_mb=2048, cpu_rate_pct=90)
             self.status[cid] = "starting"
             self.cache[cid] = None
 
     def stop_farm(self, cid: str):
         p = self.procs.get(cid)
         if not p or p.poll() is not None:
+            tc.close_host_resource_limits(self.farm_jobs.pop(cid, None))
             self.status[cid] = "stopped"
             return
         self.status[cid] = "stopping"
@@ -561,6 +566,7 @@ class Provider:
             p.wait(timeout=30.0)
         except subprocess.TimeoutExpired:
             p.kill()
+        tc.close_host_resource_limits(self.farm_jobs.pop(cid, None))
         self.status[cid] = "stopped"
         self.cache[cid] = None
 
@@ -677,12 +683,6 @@ class ProviderHandler(tc.TriadHttpHandler):
         return self._dispatch("GET", b"")
 
     def do_POST(self):
-        scope, own = self._scope()
-        if scope is None:
-            return self._send_json(
-                401,
-                {"ok": False, "error": "unauthorized: provide a provider or client token"},
-            )
         raw_len = self.headers.get("Content-Length", "0")
         try:
             length = int(raw_len)
@@ -694,6 +694,12 @@ class ProviderHandler(tc.TriadHttpHandler):
             return self._send_json(
                 413,
                 {"ok": False, "error": f"payload exceeds {tc.MAX_HTTP_BODY_BYTES} bytes"},
+            )
+        scope, own = self._scope()
+        if scope is None:
+            return self._send_json(
+                401,
+                {"ok": False, "error": "unauthorized: provide a provider or client token"},
             )
         body = self.rfile.read(length) if length else b""
         return self._dispatch("POST", body, pre_auth=(scope, own))
@@ -902,6 +908,30 @@ def run_fleet_unit_tests(work: Path):
         else:
             os.environ["CUTTLE_WHPX_AVAILABLE"] = old_whpx_env
 
+    # R9: Per-process host resource limits (Windows Job Object memory cap + CPU rate control)
+    # terminate a runaway child that exceeds its memory limit without affecting a peer child.
+    runaway_proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.15); x = bytearray(96 * 1024 * 1024); print(len(x))"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    peer_proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.15); x = bytearray(1024 * 1024); print('peer-ok')"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    job_runaway = tc.apply_host_resource_limits(runaway_proc, max_memory_mb=32, cpu_rate_pct=50)
+    job_peer = tc.apply_host_resource_limits(peer_proc, max_memory_mb=256, cpu_rate_pct=50)
+    try:
+        runaway_rc = runaway_proc.wait(timeout=10.0)
+        peer_rc = peer_proc.wait(timeout=10.0)
+        if os.name == "nt" and job_runaway is not None:
+            assert runaway_rc != 0, "R9: runaway child must fail/terminate when exceeding Job Object memory cap"
+        assert peer_rc == 0, f"R9: peer child must succeed unaffected (rc={peer_rc})"
+    finally:
+        tc.close_host_resource_limits(job_runaway)
+        tc.close_host_resource_limits(job_peer)
+
 
 def run_self_test() -> int:
     import shutil
@@ -1013,21 +1043,21 @@ def run_self_test() -> int:
                 except urllib.error.HTTPError as e:
                     assert e.code == 401, f"farm {method} {path} expected 401, got {e.code}"
 
-        # #22: Content-Length validation on ProviderHandler
-        for bad_cl, expected_code in (("-5", 400), ("notanumber", 400), (str(tc.MAX_HTTP_BODY_BYTES + 1024), 413)):
-            with socket.create_connection(("127.0.0.1", port), timeout=5.0) as raw_sock:
-                raw_req = (
-                    f"POST /api/whoami HTTP/1.1\r\n"
-                    f"Host: 127.0.0.1:{port}\r\n"
-                    f"X-Cuttle-Session: {P}\r\n"
-                    f"Content-Length: {bad_cl}\r\n"
-                    f"Connection: close\r\n\r\n"
-                ).encode("ascii")
-                raw_sock.sendall(raw_req)
-                raw_resp = raw_sock.recv(4096).decode("utf-8", errors="replace")
-            assert f"HTTP/1.0 {expected_code}" in raw_resp or f"HTTP/1.1 {expected_code}" in raw_resp, (
-                f"Expected {expected_code} for Content-Length {bad_cl}, got: {raw_resp[:120]!r}"
-            )
+        # #22 / R13: Content-Length validation on ProviderHandler and FarmHandler (enforced even before auth)
+        for target_port, target_path in ((port, "/api/whoami"), (alpha_farm_port, "/api/load")):
+            for bad_cl, expected_code in (("-5", 400), ("notanumber", 400), (str(tc.MAX_HTTP_BODY_BYTES + 1024), 413)):
+                with socket.create_connection(("127.0.0.1", target_port), timeout=5.0) as raw_sock:
+                    raw_req = (
+                        f"POST {target_path} HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{target_port}\r\n"
+                        f"Content-Length: {bad_cl}\r\n"
+                        f"Connection: close\r\n\r\n"
+                    ).encode("ascii")
+                    raw_sock.sendall(raw_req)
+                    raw_resp = raw_sock.recv(4096).decode("utf-8", errors="replace")
+                assert f"HTTP/1.0 {expected_code}" in raw_resp or f"HTTP/1.1 {expected_code}" in raw_resp, (
+                    f"Expected {expected_code} for Content-Length {bad_cl} on port {target_port}, got: {raw_resp[:120]!r}"
+                )
         print("auth: all provider & farm endpoints across all 4 roles refused unauthenticated/bad/non-ASCII tokens", flush=True)
 
         # 2. Scopes: the provider sees both clients; a client sees only itself and nothing provider-only.
@@ -1076,13 +1106,19 @@ def run_self_test() -> int:
         print("roles: web=wfe, sql=sql, index=sql, cron=full on every node", flush=True)
 
         # 3b. Every Triad runs on the accelerator the fleet setting resolves to on this host.
+        #     Under "auto", a Triad starts on whpx if available and may fall back to tcg if WHPX
+        #     produced no guest serial output (#14).
         setting = provider.accel_setting
-        expected_accel = setting if setting != "auto" else ("whpx" if provider.whpx else "tcg")
+        allowed_accels = {"whpx", "tcg"} if setting == "auto" else {setting}
+        observed_accels = {}
         for cid in ("alpha", "bravo"):
             code, fm = call("GET", f"/api/c/{cid}/farm", P)
             accels = {t["job"]: t["accel"] for t in fm["farm"]["triads"]}
-            assert set(accels.values()) == {expected_accel}, f"{cid}: expected every Triad on {expected_accel}: {accels}"
-        print(f"accelerator: every Triad runs on {expected_accel} (setting {setting})", flush=True)
+            observed_accels[cid] = accels
+            assert set(accels.values()).issubset(allowed_accels), (
+                f"{cid}: expected every Triad in {allowed_accels}: {accels}"
+            )
+        print(f"accelerator: every Triad runs on {observed_accels} (setting {setting})", flush=True)
 
         # 4. Data isolation: a row written to alpha's SQL Triad never appears in bravo's.
         code, r = call("POST", "/api/c/alpha/t/sql/api/sql", A, b"INSERT INTO kv VALUES ('isolation.probe', 'alpha-only', 1)")
@@ -1169,10 +1205,23 @@ def main():
     ap.add_argument("--client", help="client id (farm mode)")
     ap.add_argument("--config", default=str(FLEET_CONFIG), help="fleet config (provider mode)")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--unit-test", action="store_true")
     ap.add_argument("--accel", choices=tc.ACCELERATORS, help="override every plan's QEMU accelerator")
     args = ap.parse_args()
     if args.accel:
         os.environ["CUTTLE_ACCEL"] = args.accel  # read by triad_specs; inherited by farm processes
+    if args.unit_test:
+        import shutil
+        import tempfile
+
+        tc.IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="cuttle_fleet_unittest_", dir=str(tc.IMAGES_DIR)))
+        try:
+            run_fleet_unit_tests(work)
+            print("FLEET UNIT TESTS PASSED", flush=True)
+            sys.exit(0)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
     if args.self_test:
         sys.exit(run_self_test())
     if args.mode == "farm":

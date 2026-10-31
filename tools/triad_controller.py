@@ -111,9 +111,151 @@ class TriadSpec:
 
 
 MAX_HTTP_BODY_BYTES = 64 * 1024
+MAX_HTTP_CONCURRENCY = 16
 MAX_WAL_ENTRIES = 64
 MAX_CONSECUTIVE_HEALS = 3
+MAX_HEARTBEAT_MISSES = 3
 WAL_PROBE_FORMAT_VERSION = 3
+CURRENT_STATE_SCHEMA = 2
+PINNED_QEMU_CPU_MODEL = "qemu64,+rdrand,+fsgsbase,+smap,+smep"
+ALERT_CODES = (
+    "QUORUM_LOST",
+    "NODE_ISOLATED",
+    "AB_ROLLBACK",
+    "CONTROLLER_LOCK_CONFLICT",
+    "WAL_CORRUPT",
+    "SCHEMA_MISMATCH",
+    "NODE_HUNG",
+    "SPLIT_BRAIN",
+)
+
+
+def migrate_v1_to_v2(data: dict) -> dict:
+    """Migrate a v1 `triad_wal.json` payload to `state_schema == 2`."""
+    migrated = dict(data)
+    migrated["state_schema"] = 2
+    if not isinstance(migrated.get("coordinator_epoch"), int) or isinstance(migrated.get("coordinator_epoch"), bool):
+        migrated["coordinator_epoch"] = 1
+    return migrated
+
+
+WAL_SCHEMA_MIGRATIONS = {
+    1: migrate_v1_to_v2,
+}
+
+
+def apply_host_resource_limits(
+    proc: subprocess.Popen | None, max_memory_mb: int = 512, cpu_rate_pct: int = 50
+) -> int | None:
+    """
+    Place `proc` inside a host OS resource-containment boundary (Windows Job Object with
+    per-process and per-job memory caps + kill-on-job-close + optional CPU rate cap, or
+    POSIX rlimit helper). Returns the native Job handle on Windows (or None).
+    """
+    if proc is None or proc.poll() is not None:
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+            kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+            kernel32.SetInformationJobObject.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            ]
+            kernel32.SetInformationJobObject.restype = ctypes.c_int
+            kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_int
+
+            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", ctypes.c_uint32),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", ctypes.c_uint32),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", ctypes.c_uint32),
+                    ("SchedulingClass", ctypes.c_uint32),
+                ]
+
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("ReadOperationCount", ctypes.c_uint64),
+                    ("WriteOperationCount", ctypes.c_uint64),
+                    ("OtherOperationCount", ctypes.c_uint64),
+                    ("ReadTransferCount", ctypes.c_uint64),
+                    ("WriteTransferCount", ctypes.c_uint64),
+                    ("OtherTransferCount", ctypes.c_uint64),
+                ]
+
+            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("ControlFlags", ctypes.c_uint32),
+                    ("CpuRate", ctypes.c_uint32),
+                ]
+
+            h_job = kernel32.CreateJobObjectW(None, None)
+            if not h_job:
+                return None
+
+            mem_bytes = max(8, int(max_memory_mb)) * 1024 * 1024
+            ext = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            # JOB_OBJECT_LIMIT_PROCESS_MEMORY (0x100) | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000)
+            ext.BasicLimitInformation.LimitFlags = 0x0100 | 0x2000
+            ext.ProcessMemoryLimit = mem_bytes
+            # JobObjectExtendedLimitInformation == 9
+            if not kernel32.SetInformationJobObject(
+                h_job, 9, ctypes.byref(ext), ctypes.sizeof(ext)
+            ):
+                kernel32.CloseHandle(h_job)
+                return None
+
+            if 1 <= int(cpu_rate_pct) <= 100:
+                cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
+                # JOB_OBJECT_CPU_RATE_CONTROL_ENABLE (0x1) | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP (0x4)
+                cpu_info.ControlFlags = 0x1 | 0x4
+                cpu_info.CpuRate = int(cpu_rate_pct) * 100
+                # JobObjectCpuRateControlInformation == 15
+                kernel32.SetInformationJobObject(
+                    h_job, 15, ctypes.byref(cpu_info), ctypes.sizeof(cpu_info)
+                )
+
+            proc_handle = int(getattr(proc, "_handle", 0))
+            if proc_handle and kernel32.AssignProcessToJobObject(h_job, proc_handle):
+                return int(h_job)
+            kernel32.CloseHandle(h_job)
+        except Exception:
+            return None
+    return None
+
+
+def close_host_resource_limits(job_handle: int | None) -> None:
+    """Close a Windows Job Object handle created by `apply_host_resource_limits`."""
+    if job_handle and os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(int(job_handle)))
+        except Exception:
+            pass
 
 
 def _is_genesis_sql_probe(probe_str: str) -> bool:
@@ -616,7 +758,7 @@ def whpx_available(qemu_bin: str) -> bool:
         if sys.platform == "win32":
             try:
                 p = subprocess.Popen(
-                    [qemu_bin, "-accel", "whpx", "-cpu", "max", "-M", "pc", "-display", "none", "-nodefaults",
+                    [qemu_bin, "-accel", "whpx", "-cpu", PINNED_QEMU_CPU_MODEL, "-M", "pc", "-display", "none", "-nodefaults",
                      "-S", "-no-reboot", "-monitor", "none", "-serial", "none"],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
@@ -682,6 +824,12 @@ class TriadNode:
         self.node_dir = state_dir / f"node{node_id}"
         self.node_dir.mkdir(parents=True, exist_ok=True)
         self.bios_img = self.node_dir / f"bios_node{node_id}.img"
+        self.slot_a_img = self.node_dir / f"slot_a_node{node_id}.img"
+        self.slot_b_img = self.node_dir / f"slot_b_node{node_id}.img"
+        self.release_file = self.node_dir / "release.json"
+        self.active_slot = "a"
+        self.release_version = 1
+        self._staged_slot = "a"
         self.morphed_elf = self.node_dir / f"kernel_node{node_id}.elf"
         self.ahci_img = self.node_dir / f"ahci_node{node_id}.img"
         self.virtio_img = self.node_dir / f"virtio_node{node_id}.img"
@@ -689,8 +837,10 @@ class TriadNode:
         self.serial_log = self.node_dir / f"serial_node{node_id}.log"
         self.device_key_path = self.node_dir / f"device_key_node{node_id}.bin"
 
-        self.state = "INITIALIZING"  # INITIALIZING, ONLINE, DRAINING, MORPHING, CATCHING_UP, HEALING
+        self.state = "INITIALIZING"  # INITIALIZING, ONLINE, DRAINING, MORPHING, CATCHING_UP, HEALING, HUNG
         self.proc: subprocess.Popen | None = None
+        self.job_handle: int | None = None
+        self.missed_heartbeats = 0
         self.cmd_lock = threading.Lock()
         self.response_lines: list[str] = []
         self.line_cond = threading.Condition()
@@ -776,9 +926,164 @@ class TriadController:
         state_dir = self.spec.state_dir
         state_dir.mkdir(parents=True, exist_ok=True)
         self.events: list[dict] = []
+        self.coordinator_epoch: int = 1
+        self.write_latencies_sec: list[float] = []
+        self.heals_total: dict[int, int] = {1: 0, 2: 0, 3: 0}
+        self.vote_skipped_total: dict[str, int] = {
+            "unreadable_probe": 0,
+            "quorum_lost": 0,
+            "split_brain": 0,
+        }
+        self.last_morph_duration_sec: float = 0.0
+        self.lock_file = state_dir / "controller.lock"
+        self._lock_fh = None
+        self._acquire_controller_lock()
+        try:
+            self._init_controller_state(state_dir, show_gui)
+        except Exception:
+            self._release_controller_lock()
+            raise
 
+    def _acquire_controller_lock(self) -> None:
+        """Acquire an exclusive OS-level non-blocking lock on `state_dir/controller.lock`."""
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self.lock_file, "a+b")
+        try:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b" ")
+                fh.flush()
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            fh.close()
+            self.log_event(
+                "ALERT",
+                f"Another TriadController instance already holds {self.lock_file}: {e}",
+                code="CONTROLLER_LOCK_CONFLICT",
+            )
+            raise RuntimeError(
+                f"CONTROLLER_LOCK_CONFLICT: another TriadController is already active on {self.lock_file}"
+            ) from e
+        try:
+            meta = json.dumps({"pid": os.getpid(), "started_unix": int(time.time())}).encode("utf-8")
+            fh.seek(1)
+            fh.truncate(1)
+            fh.write(meta)
+            fh.flush()
+        except OSError:
+            pass
+        self._lock_fh = fh
+
+    def _release_controller_lock(self) -> None:
+        fh = getattr(self, "_lock_fh", None)
+        if fh is None:
+            return
+        self._lock_fh = None
+        try:
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+    def _compute_min_version_hmac(self, version: int) -> str:
+        return hmac.new(
+            self.master_key_bytes,
+            f"cuttle-min-version-v1:{int(version)}".encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _save_min_allowed_version(self, version: int) -> None:
+        v = max(1, int(version))
+        atomic_write_json(
+            self.min_version_file,
+            {
+                "state_schema": CURRENT_STATE_SCHEMA,
+                "min_allowed_version": v,
+                "hmac": self._compute_min_version_hmac(v),
+            },
+        )
+
+    def _load_min_allowed_version(self) -> int:
+        if not self.min_version_file.exists():
+            self._save_min_allowed_version(1)
+            return 1
+        data = json.loads(self.min_version_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("min_allowed_version.json root must be a JSON object")
+        ver = data.get("min_allowed_version")
+        tag = str(data.get("hmac") or "")
+        if not isinstance(ver, int) or isinstance(ver, bool) or ver < 1:
+            raise ValueError(f"invalid min_allowed_version: {ver!r}")
+        if not safe_token_eq(tag, self._compute_min_version_hmac(ver)):
+            raise ValueError("min_allowed_version.json HMAC authentication tag mismatch")
+        return ver
+
+    def verify_and_record_release(
+        self,
+        node: TriadNode,
+        release_version: int,
+        image_sha256: str,
+        seed: int,
+        slot: str = "a",
+        attest_entry_sha256: str = "",
+    ) -> dict:
+        """
+        Verify `release_version >= self.min_allowed_version` (refusing downgrades with `AB_ROLLBACK`),
+        advance `min_allowed_version` if `release_version` is newer, and atomically record
+        `node.release_file` (`release.json`).
+        """
+        ver = int(release_version)
+        if ver < self.min_allowed_version:
+            self.log_event(
+                "ALERT",
+                f"{node.name}: Refused release rollback to version {ver} (< min_allowed_version {self.min_allowed_version})!",
+                code="AB_ROLLBACK",
+            )
+            raise ValueError(
+                f"AB_ROLLBACK: release version {ver} is below min_allowed_version {self.min_allowed_version}"
+            )
+        if ver > self.min_allowed_version:
+            self.min_allowed_version = ver
+            self._save_min_allowed_version(ver)
+        node.release_version = ver
+        node.active_slot = slot
+        manifest = {
+            "state_schema": CURRENT_STATE_SCHEMA,
+            "node_id": node.node_id,
+            "release_version": ver,
+            "slot": slot,
+            "image_sha256": image_sha256,
+            "seed": int(seed),
+            "attest_entry_sha256": attest_entry_sha256,
+        }
+        atomic_write_json(node.release_file, manifest)
+        return manifest
+
+    def _init_controller_state(self, state_dir: Path, show_gui: bool):
         key_path = self.spec.master_key_path
         self.master_key_bytes = load_or_create_secret_file(key_path, 32, binary=True)
+        self.min_version_file = state_dir / "min_allowed_version.json"
+        self.min_allowed_version = self._load_min_allowed_version()
+        self.epoch_file = state_dir / "coordinator_epoch.json"
 
         # Generate a fresh ephemeral 128-bit session token on every controller startup.
         self.coordinator_token = secrets.token_hex(16)
@@ -850,7 +1155,28 @@ class TriadController:
                 self.log_event("WARN", f"Dropping non-read-only or invalid spec cron job: ({t!r}, {c!r})")
         if self.cron_file.exists():
             try:
-                loaded_cron = json.loads(self.cron_file.read_text(encoding="utf-8"))
+                loaded_raw = json.loads(self.cron_file.read_text(encoding="utf-8"))
+                if isinstance(loaded_raw, dict):
+                    cron_schema = loaded_raw.get("state_schema", 1)
+                    if not isinstance(cron_schema, int) or isinstance(cron_schema, bool) or cron_schema < 1:
+                        raise ValueError(f"invalid cron state_schema: {cron_schema!r}")
+                    if cron_schema > CURRENT_STATE_SCHEMA:
+                        self.log_event(
+                            "ALERT",
+                            f"Refusing {self.cron_file.name} with newer state_schema={cron_schema} (> {CURRENT_STATE_SCHEMA})",
+                            code="SCHEMA_MISMATCH",
+                        )
+                        raise ValueError(f"SCHEMA_MISMATCH: cron state_schema {cron_schema} > {CURRENT_STATE_SCHEMA}")
+                    loaded_cron = loaded_raw.get("jobs", [])
+                elif isinstance(loaded_raw, list):
+                    pre_cron = self.cron_file.with_name(f"{self.cron_file.name}.pre-v1")
+                    try:
+                        shutil.copyfile(self.cron_file, pre_cron)
+                    except OSError:
+                        pass
+                    loaded_cron = loaded_raw
+                else:
+                    loaded_cron = []
                 filtered_cron: list[tuple[int, str]] = []
                 for item in loaded_cron:
                     if isinstance(item, (list, tuple)) and len(item) == 2:
@@ -862,6 +1188,15 @@ class TriadController:
                     else:
                         self.log_event("WARN", f"Dropping malformed cron entry from {self.cron_file.name}: {item!r}")
                 self.desired_cron = filtered_cron
+                if isinstance(loaded_raw, list):
+                    atomic_write_json(
+                        self.cron_file,
+                        {"state_schema": CURRENT_STATE_SCHEMA, "jobs": self.desired_cron},
+                    )
+            except ValueError as e:
+                if "SCHEMA_MISMATCH" in str(e):
+                    raise
+                self.log_event("WARN", f"Ignoring unreadable cron_jobs.json: {e}")
             except Exception as e:
                 self.log_event("WARN", f"Ignoring unreadable cron_jobs.json: {e}")
 
@@ -906,13 +1241,62 @@ class TriadController:
         self.morph_op_lock = threading.Lock()
 
     def _load_wal_from_disk(self):
+        prev_epoch = 0
+        if self.epoch_file.exists():
+            try:
+                ep_data = json.loads(self.epoch_file.read_text(encoding="utf-8"))
+                if isinstance(ep_data, dict):
+                    ep_val = ep_data.get("coordinator_epoch", 0)
+                    if isinstance(ep_val, int) and not isinstance(ep_val, bool) and ep_val >= 0:
+                        prev_epoch = ep_val
+            except Exception:
+                pass
         if not self.wal_file.exists():
+            self.coordinator_epoch = prev_epoch + 1
+            atomic_write_json(
+                self.epoch_file,
+                {"state_schema": CURRENT_STATE_SCHEMA, "coordinator_epoch": self.coordinator_epoch},
+            )
             return
         try:
             raw_text = self.wal_file.read_text(encoding="utf-8")
             data = json.loads(raw_text)
             if not isinstance(data, dict):
                 raise ValueError("WAL root must be a JSON object")
+            raw_schema = data.get("state_schema", 1)
+            if not isinstance(raw_schema, int) or isinstance(raw_schema, bool) or raw_schema < 1:
+                raise ValueError(f"invalid state_schema: {raw_schema!r}")
+            if raw_schema > CURRENT_STATE_SCHEMA:
+                self.log_event(
+                    "ALERT",
+                    f"Refusing Triad WAL {self.wal_file} with newer state_schema={raw_schema} (supported <= {CURRENT_STATE_SCHEMA})!",
+                    code="SCHEMA_MISMATCH",
+                )
+                raise ValueError(
+                    f"SCHEMA_MISMATCH: WAL state_schema {raw_schema} > supported {CURRENT_STATE_SCHEMA}"
+                )
+            if raw_schema < CURRENT_STATE_SCHEMA:
+                pre_backup = self.wal_file.with_name(f"{self.wal_file.name}.pre-v{raw_schema}")
+                try:
+                    shutil.copyfile(self.wal_file, pre_backup)
+                except OSError:
+                    pass
+                cur_ver = raw_schema
+                while cur_ver < CURRENT_STATE_SCHEMA:
+                    mig_fn = WAL_SCHEMA_MIGRATIONS.get(cur_ver)
+                    if mig_fn is None:
+                        raise ValueError(f"SCHEMA_MISMATCH: no migration path from state_schema v{cur_ver}")
+                    data = mig_fn(data)
+                    cur_ver = int(data.get("state_schema", cur_ver + 1))
+                self.log_event(
+                    "RESYNC",
+                    f"Migrated {self.wal_file.name} from state_schema v{raw_schema} to v{CURRENT_STATE_SCHEMA} (backup at {pre_backup.name}).",
+                )
+            wal_ep = data.get("coordinator_epoch", 0)
+            if isinstance(wal_ep, int) and not isinstance(wal_ep, bool) and wal_ep >= 0:
+                prev_epoch = max(prev_epoch, wal_ep)
+            self.coordinator_epoch = prev_epoch + 1
+
             tx_seq = data.get("triad_tx_seq", 0)
             if not isinstance(tx_seq, int) or isinstance(tx_seq, bool) or tx_seq < 0:
                 raise ValueError(f"invalid triad_tx_seq: {tx_seq!r}")
@@ -989,13 +1373,27 @@ class TriadController:
                     if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= self.triad_tx_seq:
                         n.tx_seq = v
                         self.restored_tx_seq_nodes.add(n.node_id)
+
+            atomic_write_json(
+                self.epoch_file,
+                {"state_schema": CURRENT_STATE_SCHEMA, "coordinator_epoch": self.coordinator_epoch},
+            )
+            data["state_schema"] = CURRENT_STATE_SCHEMA
+            data["coordinator_epoch"] = self.coordinator_epoch
+            atomic_write_json(self.wal_file, data)
         except Exception as e:
+            if "SCHEMA_MISMATCH" in str(e):
+                raise ValueError(str(e)) from e
             bad_copy = self.wal_file.with_suffix(".json.bad")
             try:
                 shutil.copyfile(self.wal_file, bad_copy)
             except OSError:
                 pass
-            self.log_event("ALERT", f"Corrupt Triad WAL {self.wal_file} (saved to {bad_copy}): {e}")
+            self.log_event(
+                "ALERT",
+                f"Corrupt Triad WAL {self.wal_file} (saved to {bad_copy}): {e}",
+                code="WAL_CORRUPT",
+            )
             raise ValueError(f"corrupt Triad WAL {self.wal_file}: {e}") from e
 
     def _save_wal_to_disk(self):
@@ -1007,6 +1405,8 @@ class TriadController:
         if not self.wal_checkpoint_legacy:
             cp_payload["format_version"] = WAL_PROBE_FORMAT_VERSION
         payload = {
+            "state_schema": CURRENT_STATE_SCHEMA,
+            "coordinator_epoch": self.coordinator_epoch,
             "probe_format_version": (
                 1 if self.wal_probe_format_mismatch else WAL_PROBE_FORMAT_VERSION
             ),
@@ -1279,53 +1679,130 @@ class TriadController:
             return f"vault put {parts[2]} [REDACTED]"
         return cmd_str.strip()
 
-    def log_event(self, level: str, msg: str):
+    def _infer_alert_code(self, msg: str, explicit_code: str | None = None) -> str:
+        if explicit_code in ALERT_CODES:
+            return explicit_code
+        low = msg.lower()
+        if "quorum lost" in low or "need 2 healthy peers" in low:
+            return "QUORUM_LOST"
+        if "consecutive heals" in low or "keeping node offline" in low or "isolated" in low:
+            return "NODE_ISOLATED"
+        if "rollback" in low or "ab_rollback" in low or "rolling back to slot" in low:
+            return "AB_ROLLBACK"
+        if "controller.lock" in low or "lock_conflict" in low:
+            return "CONTROLLER_LOCK_CONFLICT"
+        if "corrupt triad wal" in low:
+            return "WAL_CORRUPT"
+        if "state_schema" in low or "schema_mismatch" in low or "legacy wal checkpoint" in low:
+            return "SCHEMA_MISMATCH"
+        if "heartbeat" in low or "hung" in low:
+            return "NODE_HUNG"
+        return "SPLIT_BRAIN"
+
+    def log_event(self, level: str, msg: str, code: str | None = None):
         ts = time.strftime("%H:%M:%S")
-        entry = {"ts": ts, "level": level, "msg": msg}
+        entry: dict = {"ts": ts, "level": level, "msg": msg}
+        if level == "ALERT":
+            alert_code = self._infer_alert_code(msg, code)
+            entry["code"] = alert_code
+            entry["structured_json"] = json.dumps(
+                {
+                    "ts": ts,
+                    "level": "ALERT",
+                    "code": alert_code,
+                    "runbook": f"docs/runbooks/README.md#{alert_code.lower()}",
+                    "triad": getattr(self.spec, "name", "triad"),
+                    "epoch": getattr(self, "coordinator_epoch", 1),
+                    "msg": msg,
+                }
+            )
         self.events.insert(0, entry)
         if len(self.events) > 60:
             self.events.pop()
         safe_msg = msg.encode("ascii", errors="replace").decode("ascii")
         print(f"[{ts}] {self.spec.log_prefix}[{level}] {safe_msg}", flush=True)
 
-    def morph_node_image(self, node: TriadNode, new_seed: int):
-        """Run binmorph.exe (~250ms) and splice the morphed ELF directly into node's bios.img."""
+    def morph_node_image(
+        self, node: TriadNode, new_seed: int, release_version: int | None = None
+    ):
+        """
+        Run binmorph.exe (~250ms), stage the spliced BIOS image into the node's inactive A/B
+        slot (`slot_a_nodeN.img` or `slot_b_nodeN.img`), and copy it to `node.bios_img`.
+        Enforces anti-rollback against `self.min_allowed_version`.
+        """
+        ver = (
+            int(release_version)
+            if release_version is not None
+            else max(int(node.release_version), int(self.min_allowed_version))
+        )
+        if ver < self.min_allowed_version:
+            self.log_event(
+                "ALERT",
+                f"{node.name}: Refused morph with release_version={ver} (< min_allowed_version={self.min_allowed_version})!",
+                code="AB_ROLLBACK",
+            )
+            raise ValueError(
+                f"AB_ROLLBACK: release version {ver} is below min_allowed_version {self.min_allowed_version}"
+            )
         t0 = time.perf_counter()
         node.current_seed = new_seed
-        cmd = [
-            str(BINMORPH_EXE),
-            "--in",
-            str(BASE_ELF),
-            "--out",
-            str(node.morphed_elf),
-            "--seed",
-            str(new_seed),
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        stderr_line = res.stderr.strip().splitlines()[-1] if res.stderr.strip() else ""
-        morphed_bytes = node.morphed_elf.read_bytes()
+        if self.unit_test:
+            seed_digest = hashlib.sha256(f"unit-morph:{node.node_id}:{new_seed}:{ver}".encode("ascii")).digest()
+            morphed_bytes = seed_digest + self.base_elf_bytes[len(seed_digest) :]
+            node.morphed_elf.write_bytes(morphed_bytes)
+            stderr_line = f"binmorph: unit_test seed={new_seed} version={ver}"
+        else:
+            cmd = [
+                str(BINMORPH_EXE),
+                "--in",
+                str(BASE_ELF),
+                "--out",
+                str(node.morphed_elf),
+                "--seed",
+                str(new_seed),
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            stderr_line = res.stderr.strip().splitlines()[-1] if res.stderr.strip() else ""
+            morphed_bytes = node.morphed_elf.read_bytes()
         if len(morphed_bytes) != len(self.base_elf_bytes):
             raise RuntimeError("binmorph output ELF size mismatch")
 
         node.elf_sha256 = extract_text_sha256(morphed_bytes)
         node.morph_stats = stderr_line.replace("binmorph: ", "")
 
-        # Splice morphed ELF directly into BIOS image at exact offset
-        bios_copy = bytearray(self.base_bios_bytes)
-        off = self.elf_offset_in_bios
-        bios_copy[off : off + len(morphed_bytes)] = morphed_bytes
+        # Splice morphed ELF directly into BIOS image at exact offset and stage into A/B slot
+        bios_copy = bytes(
+            bytearray(self.base_bios_bytes[: self.elf_offset_in_bios])
+            + bytearray(morphed_bytes)
+            + bytearray(self.base_bios_bytes[self.elf_offset_in_bios + len(morphed_bytes) :])
+        )
+        if not node.slot_a_img.exists():
+            target_slot = "a"
+            target_slot_img = node.slot_a_img
+        elif node.active_slot == "a":
+            target_slot = "b"
+            target_slot_img = node.slot_b_img
+        else:
+            target_slot = "a"
+            target_slot_img = node.slot_a_img
+        target_slot_img.write_bytes(bios_copy)
         node.bios_img.write_bytes(bios_copy)
+        node._staged_slot = target_slot
+        node.release_version = ver
         node.morph_count += 1
-        node.last_morph_ms = int((time.perf_counter() - t0) * 1000)
+        elapsed_sec = max(0.0, time.perf_counter() - t0)
+        self.last_morph_duration_sec = elapsed_sec
+        node.last_morph_ms = int(elapsed_sec * 1000)
+        if not node.slot_b_img.exists() and target_slot == "a":
+            self.verify_and_record_release(node, ver, node.elf_sha256, new_seed, slot="a")
         self.log_event(
             "MORPH",
-            f"{node.name}: binmorph seed={new_seed} completed in {node.last_morph_ms}ms "
+            f"{node.name}: binmorph seed={new_seed} slot={target_slot} v{ver} completed in {node.last_morph_ms}ms "
             f"(sha256={node.elf_sha256[:12]}.. | {node.morph_stats})",
         )
 
-    def start_node_vm(self, node: TriadNode):
-        node.ensure_disks(self.master_key_bytes)
-        node.accel = self.accel
+    def build_qemu_cmd(self, node: TriadNode) -> list[str]:
+        """Construct the pinned, sandboxed QEMU command line for `node`."""
         mac_last = f"{0x50 + node.node_id:02x}"
         if self.spec.forward_node_ports:
             usernet_arg = (
@@ -1339,7 +1816,7 @@ class TriadController:
             self.qemu_bin,
             *self.accel_args,
             "-cpu",
-            "max",
+            PINNED_QEMU_CPU_MODEL,
             "-smp",
             str(self.spec.smp),
             "-m",
@@ -1386,13 +1863,23 @@ class TriadController:
             "stdio",
             "-no-reboot",
         ]
+        if sys.platform.startswith("linux"):
+            cmd.extend(["-sandbox", "on,obsolete=deny"])
         if not self.show_gui:
             cmd.extend(["-display", "none"])
+        return cmd
+
+    def start_node_vm(self, node: TriadNode):
+        node.ensure_disks(self.master_key_bytes)
+        node.accel = self.accel
+        cmd = self.build_qemu_cmd(node)
 
         with node.line_cond:
             node.serial_tail.clear()
             node.response_lines.clear()
 
+        close_host_resource_limits(node.job_handle)
+        node.job_handle = None
         node.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -1403,6 +1890,7 @@ class TriadController:
             errors="replace",
             bufsize=1,
         )
+        node.job_handle = apply_host_resource_limits(node.proc, max_memory_mb=2048, cpu_rate_pct=85)
         t = threading.Thread(target=self._serial_reader_loop, args=(node,), daemon=True)
         t.start()
 
@@ -1444,8 +1932,8 @@ class TriadController:
 
     def _guest_started(self, node: TriadNode, timeout: float) -> bool:
         """True once the guest prints a recognized bootloader/kernel serial marker."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             with node.line_cond:
                 if has_guest_serial_output(node.serial_tail):
                     return True
@@ -1479,8 +1967,8 @@ class TriadController:
         return self.wait_for_shell_ready(node, timeout=timeout)
 
     def wait_for_shell_ready(self, node: TriadNode, timeout: float = 25.0) -> bool:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             with node.line_cond:
                 for ln in node.serial_tail:
                     if "Web UI:" in ln or "interactive shell ready" in ln:
@@ -1496,11 +1984,9 @@ class TriadController:
 
     def apply_node_profile(self, node: TriadNode) -> bool:
         """
-        Re-apply what every boot resets: the kernel role profile (each boot starts as `full`)
-        and the desired cron jobs (held in node RAM). Called once the shell is ready, before
-        the node rejoins the pool. If applying the role fails after 3 attempts, terminates the
-        VM, marks the node OFFLINE, logs an ALERT, and returns False so the node never joins
-        the pool with an un-scoped `full` role.
+        Re-apply what every boot resets: the kernel role profile (each boot starts as `full`),
+        the monotonic coordinator epoch (`triad epoch <u64>`), and the desired cron jobs
+        (held in node RAM). Called once the shell is ready, before the node rejoins the pool.
         """
         role = self.spec.role
         if role != "full":
@@ -1516,6 +2002,7 @@ class TriadController:
                 self.log_event(
                     "ALERT",
                     f"{node.name}: failed to apply role '{role}' after 3 attempts ({last_out[:120]}); keeping node OFFLINE.",
+                    code="NODE_ISOLATED",
                 )
                 node.state = "OFFLINE"
                 if node.proc and node.proc.poll() is None:
@@ -1525,11 +2012,50 @@ class TriadController:
                     except Exception:
                         pass
                 return False
+        if self.coordinator_epoch > 0:
+            self.send_shell_cmd(node, f"triad epoch {self.coordinator_epoch}")
         if self.spec.has_shell:
             for ticks, cmd in self.desired_cron:
                 if is_readonly_shell_command(cmd):
                     self.send_shell_cmd(node, f"cron add {ticks} {cmd}")
         return True
+
+    def check_node_heartbeat(self, node: TriadNode, timeout: float = 2.5) -> bool:
+        """
+        Poll `node` with a short read-only serial probe (`uname`) and track consecutive
+        missed heartbeats. Marks the node `HUNG`, logs a `NODE_HUNG` alert, kills its QEMU
+        process, and triggers recovery once `node.missed_heartbeats >= MAX_HEARTBEAT_MISSES`.
+        """
+        if node.state not in ("ONLINE", "HUNG"):
+            return True
+        out = self.send_shell_cmd(node, "uname", timeout=timeout)
+        low = (out or "").strip().lower()
+        if low and not low.startswith("error:"):
+            node.missed_heartbeats = 0
+            return True
+        node.missed_heartbeats += 1
+        if node.missed_heartbeats >= MAX_HEARTBEAT_MISSES:
+            node.state = "HUNG"
+            self.log_event(
+                "ALERT",
+                f"{node.name}: Missed {node.missed_heartbeats} consecutive serial heartbeats; marking HUNG and triggering recovery.",
+                code="NODE_HUNG",
+            )
+            if node.proc and node.proc.poll() is None:
+                try:
+                    node.proc.kill()
+                    node.proc.wait(timeout=3.0)
+                except Exception:
+                    pass
+            threading.Thread(
+                target=self.heal_and_remorph_node, args=(node,), daemon=True
+            ).start()
+        return False
+
+    def poll_node_heartbeats(self) -> None:
+        for n in self.nodes:
+            if n.state == "ONLINE":
+                self.check_node_heartbeat(n)
 
     def send_shell_cmd(self, node: TriadNode, cmd_str: str, timeout: float = 5.0) -> str:
         """
@@ -1563,11 +2089,11 @@ class TriadController:
                 return "error: pipe closed"
 
             collected: list[str] = []
-            sent_at = time.time()
+            sent_at = time.monotonic()
             deadline = sent_at + timeout
             saw_prompt_end = False
             saw_cmd_or_output = False
-            while time.time() < deadline:
+            while time.monotonic() < deadline:
                 with node.line_cond:
                     while node.response_lines:
                         ln = node.response_lines.pop(0)
@@ -1597,7 +2123,7 @@ class TriadController:
                         collected.append(ln)
                     if saw_prompt_end or (
                         collected
-                        and (time.time() - sent_at) >= 0.30
+                        and (time.monotonic() - sent_at) >= 0.30
                         and self._response_looks_complete(clean_cmd, collected)
                     ):
                         break
@@ -1613,6 +2139,10 @@ class TriadController:
     def _response_looks_complete(self, cmd_str: str, lines: list[str]) -> bool:
         joined = "\n".join(lines)
         c = cmd_str.strip()
+        if c == "uname":
+            return "CuttleOS" in joined or "error:" in joined
+        if c.startswith("triad epoch"):
+            return "triad_min_epoch=" in joined or "error:" in joined
         if c.startswith("sql "):
             if ".dump " in c.lower():
                 if "error:" in joined or "usage:" in joined:
@@ -2231,6 +2761,7 @@ class TriadController:
                             )
                             return
                         corrupted.consecutive_heals += 1
+                        self.heals_total[corrupted.node_id] = self.heals_total.get(corrupted.node_id, 0) + 1
                         corrupted.state = "HEALING"
                         self.parity_syndrome_ok = False
                         self.quorum_status = f"TMR PARITY FAULT ON {corrupted.name} — 2/3 MAJORITY HEALING!"
@@ -2249,6 +2780,9 @@ class TriadController:
                         ).start()
                         return
                     if any(outputs.get(i) is None for i in (1, 2, 3)):
+                        self.vote_skipped_total["unreadable_probe"] = (
+                            self.vote_skipped_total.get("unreadable_probe", 0) + 1
+                        )
                         unreadable = [n.name for n in online_nodes if outputs.get(n.node_id) is None]
                         self.parity_syndrome_ok = False
                         self.quorum_status = "TMR PARITY PROBE FAULT (UNREADABLE NODE STATE)"
@@ -2258,6 +2792,9 @@ class TriadController:
                         )
                         return
                     # 3-way Byzantine split-brain: o1 != o2, o2 != o3, o1 != o3 (no 2-of-3 majority!)
+                    self.vote_skipped_total["split_brain"] = (
+                        self.vote_skipped_total.get("split_brain", 0) + 1
+                    )
                     self.parity_syndrome_ok = False
                     self.quorum_status = "3-WAY BYZANTINE SPLIT-BRAIN FAULT (NO 2/3 MAJORITY)"
                     self.log_event(
@@ -2270,6 +2807,9 @@ class TriadController:
                     n_a, n_b = online_nodes[0], online_nodes[1]
                     o_a, o_b = outputs.get(n_a.node_id), outputs.get(n_b.node_id)
                     if o_a is None or o_b is None:
+                        self.vote_skipped_total["unreadable_probe"] = (
+                            self.vote_skipped_total.get("unreadable_probe", 0) + 1
+                        )
                         unreadable = [n.name for n in online_nodes if outputs.get(n.node_id) is None]
                         self.parity_syndrome_ok = False
                         self.quorum_status = "2/3 DEGRADED PROBE FAULT (UNREADABLE NODE STATE)"
@@ -2279,6 +2819,9 @@ class TriadController:
                         )
                         return
                     if o_a != o_b:
+                        self.vote_skipped_total["split_brain"] = (
+                            self.vote_skipped_total.get("split_brain", 0) + 1
+                        )
                         self.parity_syndrome_ok = False
                         self.quorum_status = "2/3 DEGRADED SPLIT-BRAIN FAULT (ONLINE PEERS DISAGREE)"
                         self.log_event(
@@ -2290,6 +2833,9 @@ class TriadController:
                 names = " + ".join(n.name.split()[0] for n in online_nodes)
                 self.quorum_status = f"2/3 DEGRADED TMR MAJORITY ACTIVE ({names}) — 0ms Downtime During Morph"
         else:
+            self.vote_skipped_total["quorum_lost"] = (
+                self.vote_skipped_total.get("quorum_lost", 0) + 1
+            )
             self.parity_syndrome_ok = False
             self.quorum_status = f"{len(online_nodes)}/3 QUORUM LOST (MINIMUM 2 ONLINE NODES REQUIRED)"
             return
@@ -2434,6 +2980,7 @@ class TriadController:
         # Mutating SQL write: write-ahead to the Triad WAL (marked "pending") and fsync BEFORE
         # executing on any node, holding `self.wal_lock` across the write-ahead, replica execution,
         # and `n.tx_seq` + `state_digest` commit update.
+        write_t0 = time.monotonic()
         with self.wal_lock:
             online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
             if len(online_nodes) < 2:
@@ -2486,12 +3033,17 @@ class TriadController:
             self.wal_pending_pre_digest = self.triad_state_digest
             try:
                 self._save_wal_to_disk()
-            except Exception:
+            except Exception as e:
                 if self.wal_entries and self.wal_entries[-1][0] == tx_id:
                     self.wal_entries.pop()
                 self.triad_tx_seq = prev_tx_seq
                 self.wal_pending_tx = prev_pending_tx
                 self.wal_pending_pre_digest = prev_pre_digest
+                self.log_event(
+                    "ALERT",
+                    f"Failed to persist write-ahead WAL entry #{tx_id} to disk: {e}",
+                    code="WAL_CORRUPT",
+                )
                 raise
             if self._after_wal_write_ahead_hook is not None:
                 self._after_wal_write_ahead_hook(tx_id, q)
@@ -2585,6 +3137,9 @@ class TriadController:
                 if n.state != "ONLINE":
                     per_node[n.name] = f"[QUEUED IN WAL tx #{tx_id} — will replay on wakeup]"
 
+        self.write_latencies_sec.append(max(0.0, time.monotonic() - write_t0))
+        if len(self.write_latencies_sec) > 512:
+            self.write_latencies_sec = self.write_latencies_sec[-512:]
         if len(self.wal_entries) > MAX_WAL_ENTRIES:
             self.checkpoint_wal()
 
@@ -2900,7 +3455,10 @@ class TriadController:
                     self._rebuild_cron_table(n)
         else:
             return
-        atomic_write_json(self.cron_file, self.desired_cron)
+        atomic_write_json(
+            self.cron_file,
+            {"state_schema": CURRENT_STATE_SCHEMA, "jobs": self.desired_cron},
+        )
 
     def _rebuild_cron_table(self, node: TriadNode):
         """Delete every job on `node` and re-add the desired list in order (ids become 1..n)."""
@@ -2971,11 +3529,18 @@ class TriadController:
         self.send_shell_cmd(node, "sync")
 
     def bounce_and_morph_node(
-        self, node_id: int, _lock_held: bool = False, _wipe_disks: bool = False
+        self,
+        node_id: int,
+        _lock_held: bool = False,
+        _wipe_disks: bool = False,
+        release_version: int | None = None,
     ) -> bool:
         """
         Perform a live zero-downtime MTD Morph on a single node while the other 2 nodes
         keep the logical SQL Appliance 100% online, followed by automatic WAL Delta Catch-Up.
+        Stages the morphed BIOS image into the inactive A/B slot (`slot_a` / `slot_b`) and
+        automatically falls back to the previous working slot (`AB_ROLLBACK`) if the new slot
+        fails to reach `interactive shell ready`.
         """
         if not _lock_held and not self.morph_op_lock.acquire(blocking=False):
             self.log_event("WARN", "Another node is currently morphing; keeping 2/3 majority intact.")
@@ -2990,8 +3555,22 @@ class TriadController:
                 self.log_event(
                     "ALERT",
                     f"Cannot morph {node.name}: need 2 healthy peers for majority (state={node.state}).",
+                    code="QUORUM_LOST",
                 )
                 return False
+
+            # Preserve current working slot image before staging the new morphed image
+            if node.bios_img.exists() and not node.slot_a_img.exists():
+                try:
+                    shutil.copyfile(node.bios_img, node.slot_a_img)
+                    node.active_slot = "a"
+                except OSError:
+                    pass
+            prev_slot = node.active_slot
+            prev_slot_img = node.slot_a_img if prev_slot == "a" else node.slot_b_img
+            prev_seed = node.current_seed
+            prev_sha = node.elf_sha256
+            prev_ver = node.release_version
 
             # 1. DRAINING: Flush state to AHCI disk
             node.state = "DRAINING"
@@ -3012,28 +3591,72 @@ class TriadController:
                         node.proc.wait(timeout=5.0)
                     except Exception:
                         pass
-            time.sleep(0.3)
+            time.sleep(0.3 if not self.unit_test else 0.01)
             if _wipe_disks:
                 node.wipe_disks()
 
-            # 2. MORPHING: Rewrite kernel ELF with fresh seed via binmorph (~250ms)
+            # 2. MORPHING: Rewrite kernel ELF with fresh seed via binmorph (~250ms) into inactive A/B slot
             node.state = "MORPHING"
             self.quorum_status = f"2/3 TMR MAJORITY ACTIVE ({peers[0].name.split()[0]} + {peers[1].name.split()[0]}) | {node.name.split()[0]} MORPHING"
             new_seed = random.randint(100_000, 999_999)
-            self.morph_node_image(node, new_seed)
+            if release_version is None:
+                self.morph_node_image(node, new_seed)
+            else:
+                self.morph_node_image(node, new_seed, release_version=release_version)
 
-            # 3. Boot freshly morphed VM
+            # 3. Boot freshly morphed VM from staged A/B slot
             self.start_node_vm(node)
             ok = self.await_boot(node, timeout=35.0)
+            rolled_back = False
             if not ok:
                 tail_str = " | ".join(node.serial_tail[-5:])
                 self.log_event("ERROR", f"{node.name}: Timed out waiting for shell ready after morph (tail: {tail_str}).")
-                node.state = "OFFLINE"
-                return False
+                if prev_slot_img.exists():
+                    if node.proc and node.proc.poll() is None:
+                        try:
+                            node.proc.kill()
+                            node.proc.wait(timeout=3.0)
+                        except Exception:
+                            pass
+                    try:
+                        shutil.copyfile(prev_slot_img, node.bios_img)
+                    except OSError:
+                        node.state = "OFFLINE"
+                        return False
+                    staged = getattr(node, "_staged_slot", "b")
+                    node.active_slot = prev_slot
+                    node.current_seed = prev_seed
+                    node.elf_sha256 = prev_sha
+                    node.release_version = prev_ver
+                    self.log_event(
+                        "ALERT",
+                        f"{node.name}: Staged slot '{staged}' image failed to reach interactive shell ready; rolling back to slot '{prev_slot}' image!",
+                        code="AB_ROLLBACK",
+                    )
+                    self.start_node_vm(node)
+                    rb_ok = self.await_boot(node, timeout=35.0)
+                    if not rb_ok:
+                        node.state = "OFFLINE"
+                        return False
+                    rolled_back = True
+                else:
+                    node.state = "OFFLINE"
+                    return False
+
             if _wipe_disks and not self.spec.has_sql and peers:
                 self._sync_files_from_peer(node, peers[0])
             if not self.apply_node_profile(node):
                 return False
+
+            if not rolled_back:
+                committed_slot = getattr(node, "_staged_slot", node.active_slot)
+                self.verify_and_record_release(
+                    node,
+                    node.release_version,
+                    node.elf_sha256,
+                    node.current_seed,
+                    slot=committed_slot,
+                )
 
             # 4. CATCHING_UP: Replay any SQL transactions committed while this node was morphing,
             #    holding `self.wal_lock` across the replay AND the `node.state = "ONLINE"` transition
@@ -3048,6 +3671,7 @@ class TriadController:
                         self.log_event(
                             "ALERT",
                             f"{node.name}: Refusing to replay pre-.dump legacy WAL checkpoint at tx_seq={cp_seq} during catch-up (lossy format v1)!",
+                            code="SCHEMA_MISMATCH",
                         )
                         node.state = "OFFLINE"
                         return False
@@ -3083,19 +3707,20 @@ class TriadController:
                     self.triad_state_digest = fp
                 self._save_wal_to_disk()
                 node.tampered = False
+                node.missed_heartbeats = 0
                 node.state = "ONLINE"
 
             self.refresh_node_telemetry(node)
             self.log_event(
                 "ONLINE",
-                f"{node.name}: Rejoined 3/3 Triad Pool on new binary {node.elf_sha256[:12]}.. (boot #{node.boot_gen}, tx_seq={node.tx_seq}).",
+                f"{node.name}: Rejoined 3/3 Triad Pool on {'rolled-back' if rolled_back else 'new'} binary {node.elf_sha256[:12]}.. (slot={node.active_slot}, boot #{node.boot_gen}, tx_seq={node.tx_seq}).",
             )
         finally:
             if not _lock_held:
                 self.morph_op_lock.release()
 
         self.compute_and_verify_raid_parity()
-        return True
+        return not rolled_back
 
     def _reset_sql_vote_tables(self, node: TriadNode):
         """Drop and recreate all `self.spec.vote_tables` on `node` to clean genesis/schema state."""
@@ -3345,6 +3970,11 @@ class TriadController:
                         rebuilt_pre_fp = self._state_fingerprint(vnode) or rebuilt_pre_fp
 
             if len(post_nodes) >= required_quorum and pending_stmt and expected_post_fp:
+                self.log_event(
+                    "ALERT",
+                    f"Recovered mid-commit crash: pending WAL tx #{pending_tid} verified on {len(post_nodes)}/{len(online_nodes)} nodes; completing commit.",
+                    code="WAL_CORRUPT",
+                )
                 self.log_event(
                     "RESYNC",
                     f"Pending WAL tx #{pending_tid} verified on {len(post_nodes)}/{len(online_nodes)} nodes; "
@@ -3656,17 +4286,71 @@ class TriadController:
         return all_ok
 
     def _background_scheduler(self):
-        last_rot = time.time()
+        last_rot = time.monotonic()
         while self.running:
             time.sleep(2.0)
             if not self.provision_sql_complete and sum(1 for n in self.nodes if n.state == "ONLINE") >= 2:
                 self._provision_sql()
-            if self.auto_morph_enabled and (time.time() - last_rot) >= self.auto_morph_interval:
+            if self.auto_morph_enabled and (time.monotonic() - last_rot) >= self.auto_morph_interval:
                 nid = (self.next_rotate_idx % 3) + 1
                 self.next_rotate_idx += 1
-                last_rot = time.time()
+                last_rot = time.monotonic()
                 self.log_event("AUTO-MTD", f"Scheduled Rolling Morph triggered for OS-{nid}...")
                 self.bounce_and_morph_node(nid)
+
+    def render_prometheus_metrics(self) -> str:
+        """Render Prometheus exposition-format metrics (`GET /metrics`)."""
+        online_count = sum(1 for n in self.nodes if n.state == "ONLINE")
+        lines = [
+            "# HELP cuttle_triad_quorum_online_nodes Number of online Triad nodes in quorum.",
+            "# TYPE cuttle_triad_quorum_online_nodes gauge",
+            f"cuttle_triad_quorum_online_nodes {online_count}",
+            "# HELP cuttle_triad_tx_seq Current monotonic Triad WAL transaction sequence.",
+            "# TYPE cuttle_triad_tx_seq counter",
+            f"cuttle_triad_tx_seq {self.triad_tx_seq}",
+            "# HELP cuttle_triad_coordinator_epoch Monotonic coordinator leadership epoch.",
+            "# TYPE cuttle_triad_coordinator_epoch counter",
+            f"cuttle_triad_coordinator_epoch {self.coordinator_epoch}",
+            "# HELP cuttle_triad_wal_lag_entries WAL entries a node lags behind triad_tx_seq.",
+            "# TYPE cuttle_triad_wal_lag_entries gauge",
+        ]
+        for n in self.nodes:
+            lag = max(0, self.triad_tx_seq - n.tx_seq)
+            lines.append(f'cuttle_triad_wal_lag_entries{{node="{n.node_id}"}} {lag}')
+        lines.extend(
+            [
+                "# HELP cuttle_triad_heals_total Total 2-of-3 self-heal reconstructions per node.",
+                "# TYPE cuttle_triad_heals_total counter",
+            ]
+        )
+        for n in self.nodes:
+            cnt = self.heals_total.get(n.node_id, 0)
+            lines.append(f'cuttle_triad_heals_total{{node="{n.node_id}"}} {cnt}')
+        lines.extend(
+            [
+                "# HELP cuttle_triad_morph_duration_seconds Duration of the most recent binary morph.",
+                "# TYPE cuttle_triad_morph_duration_seconds gauge",
+                f"cuttle_triad_morph_duration_seconds {self.last_morph_duration_sec:.6f}",
+                "# HELP cuttle_triad_write_latency_seconds Quorum write latency histogram.",
+                "# TYPE cuttle_triad_write_latency_seconds histogram",
+            ]
+        )
+        samples = list(self.write_latencies_sec)
+        for le in (0.01, 0.05, 0.1, 0.5, 1.0, 5.0):
+            b_cnt = sum(1 for v in samples if v <= le)
+            lines.append(f'cuttle_triad_write_latency_seconds_bucket{{le="{le}"}} {b_cnt}')
+        lines.append(f'cuttle_triad_write_latency_seconds_bucket{{le="+Inf"}} {len(samples)}')
+        lines.append(f"cuttle_triad_write_latency_seconds_count {len(samples)}")
+        lines.append(f"cuttle_triad_write_latency_seconds_sum {sum(samples):.6f}")
+        lines.extend(
+            [
+                "# HELP cuttle_triad_vote_skipped_total Votes skipped or faulted by reason.",
+                "# TYPE cuttle_triad_vote_skipped_total counter",
+            ]
+        )
+        for reason, cnt in sorted(self.vote_skipped_total.items()):
+            lines.append(f'cuttle_triad_vote_skipped_total{{reason="{reason}"}} {cnt}')
+        return "\n".join(lines) + "\n"
 
     def shutdown(self):
         self.running = False
@@ -3676,6 +4360,9 @@ class TriadController:
                     n.proc.kill()
                 except Exception:
                     pass
+            close_host_resource_limits(n.job_handle)
+            n.job_handle = None
+        self._release_controller_lock()
 
 
 DASHBOARD_HTML = r"""<!doctype html>
@@ -4007,6 +4694,15 @@ refresh();
 class TriadHttpHandler(BaseHTTPRequestHandler):
     ctrl: TriadController = None
     timeout = 10
+    _http_semaphore = threading.BoundedSemaphore(MAX_HTTP_CONCURRENCY)
+
+    def handle_one_request(self):
+        if not self._http_semaphore.acquire(timeout=self.timeout):
+            return
+        try:
+            super().handle_one_request()
+        finally:
+            self._http_semaphore.release()
 
     def log_message(self, fmt, *args):
         pass
@@ -4093,6 +4789,19 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
             except OSError:
                 return self._send_text(404, "text/plain", "console page not found\n")
             return self._send_text(200, "text/html; charset=utf-8", page)
+
+        if base_path == "/metrics":
+            if not self._is_authenticated():
+                return self._send_text(
+                    401,
+                    "text/plain; charset=utf-8",
+                    "error: unauthorized (provide valid X-Cuttle-Session or Authorization: Bearer token)\n",
+                )
+            return self._send_text(
+                200,
+                "text/plain; version=0.0.4; charset=utf-8",
+                self.ctrl.render_prometheus_metrics(),
+            )
 
         if base_path == "/api/triad":
             c = self.ctrl
@@ -6194,6 +6903,230 @@ def run_unit_self_tests():
             assert sc_ctrl2._read_node_file_bytes(sc_ctrl2.nodes[0], path_200) == b"ok200"
             out_201 = sc_harness.exec(sc_ctrl2.nodes[0], f"writehex {path_201} 0 4142")
             assert out_201.startswith("error:"), f"201-byte writable VFS path must be rejected: {out_201!r}"
+
+            # Grok R6: Single-instance controller.lock & monotonic coordinator_epoch across restarts
+            r6_dir = tmp_dir / "r6_lock_epoch"
+            r6_c1 = TriadController(
+                show_gui=False,
+                spec=TriadSpec(name="r6-lock", state_dir=r6_dir, write_operator_token=False),
+                unit_test=True,
+            )
+            try:
+                assert r6_c1.coordinator_epoch == 1, f"Initial coordinator_epoch must be 1, got {r6_c1.coordinator_epoch}"
+                try:
+                    TriadController(
+                        show_gui=False,
+                        spec=TriadSpec(name="r6-lock-dup", state_dir=r6_dir, write_operator_token=False),
+                        unit_test=True,
+                    )
+                    raise AssertionError("second_controller_on_same_state_dir_refuses_to_start: expected RuntimeError")
+                except RuntimeError as e:
+                    assert "CONTROLLER_LOCK_CONFLICT" in str(e), f"Expected CONTROLLER_LOCK_CONFLICT, got {e}"
+            finally:
+                r6_c1.shutdown()
+
+            r6_c2 = TriadController(
+                show_gui=False,
+                spec=TriadSpec(name="r6-lock", state_dir=r6_dir, write_operator_token=False),
+                unit_test=True,
+            )
+            r6_c2.shutdown()
+            assert r6_c2.coordinator_epoch == 2, (
+                f"wal_epoch_increments_across_restarts: expected epoch 2 after restart, got {r6_c2.coordinator_epoch}"
+            )
+            r6_c2._save_wal_to_disk()
+            r6_c3 = TriadController(
+                show_gui=False,
+                spec=TriadSpec(name="r6-lock", state_dir=r6_dir, write_operator_token=False),
+                unit_test=True,
+            )
+            r6_c3.shutdown()
+            assert r6_c3.coordinator_epoch == 3, (
+                f"wal_epoch_increments_across_restarts: expected epoch 3 after WAL restart, got {r6_c3.coordinator_epoch}"
+            )
+            wal_r6 = json.loads((r6_dir / "triad_wal.json").read_text(encoding="utf-8"))
+            assert wal_r6.get("coordinator_epoch") == 3 and wal_r6.get("state_schema") == CURRENT_STATE_SCHEMA
+
+            # Grok R7: WAL & state schema v1 -> v2 migration with .pre-v1 backup, and refusal of newer schema (>2)
+            r7_dir = tmp_dir / "r7_schema"
+            r7_dir.mkdir(parents=True, exist_ok=True)
+            v1_wal_fixture = {
+                "triad_tx_seq": 2,
+                "triad_state_digest": "ab" * 32,
+                "wal_checkpoint": {"tx_seq": 0, "stmts": []},
+                "wal_entries": [
+                    [1, "INSERT INTO kv VALUES ('mig.k1', 'v1', 1)", "committed"],
+                    [2, "INSERT INTO kv VALUES ('mig.k2', 'v2', 2)", "committed"],
+                ],
+                "node_tx_seq": {"1": 2, "2": 2, "3": 2},
+                "node_state_digest": {"1": "ab" * 32, "2": "ab" * 32, "3": "ab" * 32},
+            }
+            (r7_dir / "triad_wal.json").write_text(json.dumps(v1_wal_fixture, indent=2), encoding="utf-8")
+            r7_ctrl = TriadController(
+                show_gui=False,
+                spec=TriadSpec(name="r7-mig", state_dir=r7_dir, write_operator_token=False),
+                unit_test=True,
+            )
+            r7_ctrl.shutdown()
+            assert (r7_dir / "triad_wal.json.pre-v1").exists(), "Migration from v1 must save triad_wal.json.pre-v1 backup"
+            migrated_wal = json.loads((r7_dir / "triad_wal.json").read_text(encoding="utf-8"))
+            assert migrated_wal.get("state_schema") == 2 and migrated_wal.get("triad_tx_seq") == 2
+            assert r7_ctrl.wal_entries == [
+                (1, "INSERT INTO kv VALUES ('mig.k1', 'v1', 1)"),
+                (2, "INSERT INTO kv VALUES ('mig.k2', 'v2', 2)"),
+            ]
+
+            r7_future_dir = tmp_dir / "r7_future_schema"
+            r7_future_dir.mkdir(parents=True, exist_ok=True)
+            (r7_future_dir / "triad_wal.json").write_text(
+                json.dumps({"state_schema": 99, "triad_tx_seq": 1, "wal_entries": []}),
+                encoding="utf-8",
+            )
+            try:
+                TriadController(
+                    show_gui=False,
+                    spec=TriadSpec(name="r7-future", state_dir=r7_future_dir, write_operator_token=False),
+                    unit_test=True,
+                )
+                raise AssertionError("Controller must refuse WAL with state_schema > CURRENT_STATE_SCHEMA")
+            except ValueError as e:
+                assert "SCHEMA_MISMATCH" in str(e), f"Expected SCHEMA_MISMATCH error, got {e}"
+
+            # Grok R2: A/B image slots automatic fallback on boot failure & anti-rollback version floor
+            r2_dir = tmp_dir / "r2_ab_slots"
+            r2_ctrl = TriadController(
+                show_gui=False,
+                spec=TriadSpec(name="r2-ab", state_dir=r2_dir, write_operator_token=False),
+                unit_test=True,
+            )
+            r2_ctrl.shutdown()
+            r2_ctrl.send_shell_cmd = sc_harness.exec
+            r2_ctrl.start_node_vm = lambda node: None
+            r2_ctrl.apply_node_profile = lambda node: True
+            for n in r2_ctrl.nodes:
+                n.state = "ONLINE"
+                r2_ctrl.morph_node_image(n, n.current_seed, release_version=2)
+                assert n.slot_a_img.exists() and n.active_slot == "a" and n.release_version == 2
+            slot_a_bytes_node1 = r2_ctrl.nodes[0].slot_a_img.read_bytes()
+            boot_attempts = {"count": 0}
+
+            def _fail_new_slot_then_succeed_fallback(node, timeout=35.0):
+                boot_attempts["count"] += 1
+                # First boot attempt is on newly staged slot 'b' -> simulate boot failure;
+                # second boot attempt is after automatic fallback to slot 'a' -> succeed!
+                return boot_attempts["count"] >= 2
+
+            r2_ctrl.await_boot = _fail_new_slot_then_succeed_fallback
+            morphed_ok = r2_ctrl.bounce_and_morph_node(1, release_version=2)
+            assert not morphed_ok, "bounce_and_morph_node must return False when staged slot rolled back"
+            assert boot_attempts["count"] == 2, f"Expected 2 boot attempts (staged slot + fallback slot), got {boot_attempts['count']}"
+            assert r2_ctrl.nodes[0].state == "ONLINE" and r2_ctrl.nodes[0].active_slot == "a", (
+                f"ab_slot_falls_back_when_new_image_never_reaches_shell_ready failed: state={r2_ctrl.nodes[0].state}, slot={r2_ctrl.nodes[0].active_slot}"
+            )
+            assert r2_ctrl.nodes[0].bios_img.read_bytes() == slot_a_bytes_node1, (
+                "bios_img must be restored to slot_a_img bytes after automatic A/B rollback"
+            )
+            assert any(e.get("code") == "AB_ROLLBACK" for e in r2_ctrl.events), (
+                f"Expected AB_ROLLBACK alert code in events: {r2_ctrl.events}"
+            )
+            try:
+                r2_ctrl.morph_node_image(r2_ctrl.nodes[0], 777777, release_version=1)
+                raise AssertionError("release_with_lower_version_is_refused: expected ValueError on downgrade v2 -> v1")
+            except ValueError as e:
+                assert "AB_ROLLBACK" in str(e), f"Expected AB_ROLLBACK on downgrade, got {e}"
+
+            # Grok R8: Monotonic clock deadlines & hung-node detection after MAX_HEARTBEAT_MISSES
+            orig_time_time = time.time
+            try:
+                # Jump wall-clock `time.time()` backwards by 1 hour while `time.monotonic()` is unaffected
+                time.time = lambda: orig_time_time() - 3600.0
+                t_mono0 = time.monotonic()
+                assert not r2_ctrl._guest_started(r2_ctrl.nodes[0], timeout=0.05)
+                assert (time.monotonic() - t_mono0) < 1.0, "deadlines_use_monotonic_clock: _guest_started affected by wall-clock jump"
+            finally:
+                time.time = orig_time_time
+
+            hung_heals = []
+            r2_ctrl.heal_and_remorph_node = lambda bad_node: hung_heals.append(bad_node.node_id)
+            r2_ctrl.send_shell_cmd = lambda node, cmd, timeout=2.5: (
+                "error: command timed out" if node.node_id == 3 else "CuttleOS x86_64"
+            )
+            for miss_idx in range(1, MAX_HEARTBEAT_MISSES + 1):
+                ok_hb = r2_ctrl.check_node_heartbeat(r2_ctrl.nodes[2], timeout=0.05)
+                assert not ok_hb
+                if miss_idx < MAX_HEARTBEAT_MISSES:
+                    assert r2_ctrl.nodes[2].state == "ONLINE"
+            deadline_hb = time.monotonic() + 2.0
+            while time.monotonic() < deadline_hb and not hung_heals:
+                time.sleep(0.01)
+            assert r2_ctrl.nodes[2].state == "HUNG" and hung_heals == [3], (
+                f"hung_node_detected_after_k_missed_heartbeats failed: state={r2_ctrl.nodes[2].state}, heals={hung_heals}"
+            )
+            assert any(e.get("code") == "NODE_HUNG" for e in r2_ctrl.events), "Expected NODE_HUNG alert code"
+
+            # Grok R9: Pinned QEMU CPU model (no `-cpu max`) & host resource containment
+            qemu_argv = r2_ctrl.build_qemu_cmd(r2_ctrl.nodes[0])
+            cpu_idx = qemu_argv.index("-cpu")
+            assert qemu_argv[cpu_idx + 1] == PINNED_QEMU_CPU_MODEL and "max" not in qemu_argv[cpu_idx + 1], (
+                f"QEMU argv must use PINNED_QEMU_CPU_MODEL ({PINNED_QEMU_CPU_MODEL}), got {qemu_argv[cpu_idx + 1]!r}"
+            )
+
+            # Grok R12, R13 & R14: Prometheus `/metrics`, structured JSON alerts, runbook anchors,
+            # and oversized/stalled HTTP body bounds
+            runbook_path = ROOT / "docs" / "runbooks" / "README.md"
+            assert runbook_path.exists(), f"Missing runbook at {runbook_path}"
+            runbook_txt = runbook_path.read_text(encoding="utf-8")
+            for alert_code in ALERT_CODES:
+                anchor = f"{{#{alert_code.lower()}}}"
+                assert anchor in runbook_txt, f"Runbook {runbook_path} missing section anchor {anchor} for {alert_code}"
+
+            TriadHttpHandler.ctrl = r2_ctrl
+            r12_srv = ThreadingHTTPServer(("127.0.0.1", 0), TriadHttpHandler)
+            r12_port = r12_srv.server_address[1]
+            threading.Thread(target=r12_srv.serve_forever, daemon=True).start()
+            try:
+                # Unauthenticated GET /metrics -> 401
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{r12_port}/metrics", timeout=5.0)
+                    raise AssertionError("Unauthenticated GET /metrics must return 401")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 401, f"Expected 401 on unauthenticated GET /metrics, got {e.code}"
+
+                # Authenticated GET /metrics -> 200 with required Prometheus series
+                r2_ctrl.heals_total[2] = 1
+                r2_ctrl.write_latencies_sec.append(0.012)
+                m_req = urllib.request.Request(
+                    f"http://127.0.0.1:{r12_port}/metrics",
+                    headers={"X-Cuttle-Session": r2_ctrl.coordinator_token},
+                    method="GET",
+                )
+                with urllib.request.urlopen(m_req, timeout=5.0) as resp:
+                    assert resp.status == 200
+                    m_txt = resp.read().decode("utf-8")
+                for req_series in (
+                    "cuttle_triad_quorum_online_nodes ",
+                    "cuttle_triad_tx_seq ",
+                    'cuttle_triad_wal_lag_entries{node="1"}',
+                    'cuttle_triad_heals_total{node="2"} 1',
+                    "cuttle_triad_morph_duration_seconds ",
+                    "cuttle_triad_write_latency_seconds_bucket",
+                    "cuttle_triad_vote_skipped_total",
+                ):
+                    assert req_series in m_txt, f"Missing Prometheus series {req_series!r} in /metrics:\n{m_txt}"
+
+                # Oversized POST body (> MAX_HTTP_BODY_BYTES) -> 413 even without valid auth token
+                with socket.create_connection(("127.0.0.1", r12_port), timeout=5.0) as raw_sock:
+                    raw_req = (
+                        f"POST /api/sql HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{r12_port}\r\n"
+                        f"Content-Length: {MAX_HTTP_BODY_BYTES + 4096}\r\n"
+                        f"Connection: close\r\n\r\n"
+                    ).encode("ascii")
+                    raw_sock.sendall(raw_req)
+                    raw_resp = raw_sock.recv(4096).decode("utf-8", errors="replace")
+                assert "413" in raw_resp.splitlines()[0], f"Expected HTTP 413 on oversized body, got {raw_resp[:120]!r}"
+            finally:
+                r12_srv.shutdown()
         finally:
             sc_harness.close()
     run_fault_injection_unit_tests()

@@ -266,6 +266,8 @@ pub struct OsShell {
     pub triad_node_id: u8,
     /// Highest replicated SQL transaction sequence number committed on this node.
     pub triad_tx_seq: u64,
+    /// Minimum accepted Triad coordinator fencing epoch (`R6`); stale epochs are rejected.
+    pub triad_min_epoch: u64,
     /// Latest reported SQL transaction sequence per Triad peer (`0..3`).
     pub triad_peer_seq: [u64; 3],
     /// Latest reported 64-bit FNV-1a SQL state hash per Triad peer (`0..3`).
@@ -329,6 +331,7 @@ impl OsShell {
             sql_owner_override: 0,
             triad_node_id: 0,
             triad_tx_seq: 0,
+            triad_min_epoch: 0,
             triad_peer_seq: [0u64; 3],
             triad_peer_hash: [0u64; 3],
             triad_quorum_commits: 0,
@@ -446,6 +449,7 @@ impl OsShell {
         self.sql_owner_override = 0;
         self.triad_node_id = 0;
         self.triad_tx_seq = 0;
+        self.triad_min_epoch = 0;
         let init_hash = self.db.state_hash();
         self.triad_peer_seq = [0u64; 3];
         self.triad_peer_hash = [init_hash, 0, 0];
@@ -4018,6 +4022,25 @@ impl OsShell {
             let mut pos = 0usize;
             pos += copy_into(b"triad: node_id=", &mut out[pos..]);
             pos += dec_u64(nid as u64, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            return pos;
+        }
+        if bytes_eq(sub, b"epoch") {
+            let Some(ep) = parse_u64_ascii(trim_ascii(rest)) else {
+                return copy_into(b"usage: triad epoch <u64>\n", out);
+            };
+            if ep < self.triad_min_epoch || ep == 0 {
+                self.record_audit(34, AuditVerdict::Denied, b"shell:triad:stale-epoch");
+                return copy_into(
+                    b"error: EACCES (stale triad coordinator epoch)\n",
+                    out,
+                );
+            }
+            self.triad_min_epoch = ep;
+            self.record_audit(34, AuditVerdict::Allowed, b"shell:triad:epoch");
+            let mut pos = 0usize;
+            pos += copy_into(b"triad: coordinator_epoch=", &mut out[pos..]);
+            pos += dec_u64(ep, &mut out[pos..]);
             pos += copy_into(b"\n", &mut out[pos..]);
             return pos;
         }

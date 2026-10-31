@@ -175,6 +175,8 @@ pub struct LivedNet {
     pub auth_enabled: bool,
     /// Highest accepted monotonic sequence number for anti-replay protection.
     pub last_auth_seq: u64,
+    /// Minimum accepted Triad coordinator fencing epoch (`R6`) on `TRIAD_PREPARE`.
+    pub triad_min_epoch: u64,
     /// TLS connections started on port 443 since boot.
     pub tls_sessions_started: u64,
     /// Total TCP retransmission / half-open reclamation events triggered by RTO timers.
@@ -204,6 +206,7 @@ impl LivedNet {
             auth_key: [0u8; 32],
             auth_enabled: false,
             last_auth_seq: 0,
+            triad_min_epoch: 0,
             tls_sessions_started: 0,
             rto_retransmits: 0,
             tcbs: [Tcb::EMPTY; TCP_MAX_SLOTS],
@@ -237,6 +240,7 @@ impl LivedNet {
             auth_key,
             auth_enabled: true,
             last_auth_seq: 0,
+            triad_min_epoch: 0,
             tls_sessions_started: 0,
             rto_retransmits: 0,
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
@@ -265,6 +269,7 @@ impl LivedNet {
             auth_key: [0u8; 32],
             auth_enabled: false,
             last_auth_seq: 0,
+            triad_min_epoch: 0,
             tls_sessions_started: 0,
             rto_retransmits: 0,
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
@@ -523,6 +528,30 @@ impl LivedNet {
         let mut msg = [0u8; 384];
         let mut pos = 0usize;
         pos += copy_msg(b"cuttle-triad-prep-v1:", &mut msg[pos..]);
+        pos += copy_msg(&seq_ascii[..seq_ascii.len().min(24)], &mut msg[pos..]);
+        pos += copy_msg(b":", &mut msg[pos..]);
+        pos += copy_msg(&node_ascii[..node_ascii.len().min(8)], &mut msg[pos..]);
+        pos += copy_msg(b":", &mut msg[pos..]);
+        pos += copy_msg(sql, &mut msg[pos..]);
+        hmac_sha256(key, &msg[..pos], out);
+    }
+
+    /// Compute the 32-byte HMAC-SHA256 tag over `"cuttle-triad-prep-v2:<epoch>:<seq>:<node_id>:<sql>"`
+    /// for epoch-fenced (`R6`) Triad replication (`TRIAD_PREPARE epoch=<epoch> <seq> <node_id> <hmac> <sql>`)
+    /// datagrams on UDP `:8081`.
+    pub fn compute_triad_prepare_tag_with_epoch(
+        key: &[u8; 32],
+        epoch_ascii: &[u8],
+        seq_ascii: &[u8],
+        node_ascii: &[u8],
+        sql: &[u8],
+        out: &mut [u8; 32],
+    ) {
+        let mut msg = [0u8; 416];
+        let mut pos = 0usize;
+        pos += copy_msg(b"cuttle-triad-prep-v2:", &mut msg[pos..]);
+        pos += copy_msg(&epoch_ascii[..epoch_ascii.len().min(24)], &mut msg[pos..]);
+        pos += copy_msg(b":", &mut msg[pos..]);
         pos += copy_msg(&seq_ascii[..seq_ascii.len().min(24)], &mut msg[pos..]);
         pos += copy_msg(b":", &mut msg[pos..]);
         pos += copy_msg(&node_ascii[..node_ascii.len().min(8)], &mut msg[pos..]);
@@ -840,7 +869,13 @@ impl LivedNet {
 
         if trimmed.len() > 14 && trimmed.starts_with(b"TRIAD_PREPARE ") {
             let rest = &trimmed[14..];
-            let (seq_tok, after_seq) = split_ws(rest);
+            let (first_tok, after_first) = split_ws(rest);
+            let (epoch_opt, seq_tok, after_seq) =
+                if first_tok.len() > 6 && first_tok.starts_with(b"epoch=") {
+                    (Some(&first_tok[6..]), split_ws(after_first).0, split_ws(after_first).1)
+                } else {
+                    (None, first_tok, after_first)
+                };
             let (node_tok, after_node) = split_ws(after_seq);
             let (hmac_tok, sql_raw) = split_ws(after_node);
             let sql = trim_ws(sql_raw);
@@ -848,17 +883,44 @@ impl LivedNet {
             else {
                 sh.record_net_audit(AuditVerdict::Error, b"net:triad:prep-syntax");
                 return copy_msg(
-                    b"usage: TRIAD_PREPARE <seq> <node_id> <hmac_hex64> <sql>\n",
+                    b"usage: TRIAD_PREPARE [epoch=<u64>] <seq> <node_id> <hmac_hex64> <sql>\n",
                     body,
                 );
             };
             if leader_id > 2 || hmac_tok.len() != 64 || sql.is_empty() {
                 sh.record_net_audit(AuditVerdict::Error, b"net:triad:prep-syntax");
                 return copy_msg(
-                    b"usage: TRIAD_PREPARE <seq> <node_id> <hmac_hex64> <sql>\n",
+                    b"usage: TRIAD_PREPARE [epoch=<u64>] <seq> <node_id> <hmac_hex64> <sql>\n",
                     body,
                 );
             }
+            let min_epoch = self.triad_min_epoch.max(sh.triad_min_epoch);
+            let parsed_epoch = if let Some(ep_ascii) = epoch_opt {
+                let Some(ep) = parse_u64_dec(ep_ascii) else {
+                    sh.record_net_audit(AuditVerdict::Error, b"net:triad:prep-syntax");
+                    return copy_msg(
+                        b"usage: TRIAD_PREPARE [epoch=<u64>] <seq> <node_id> <hmac_hex64> <sql>\n",
+                        body,
+                    );
+                };
+                if ep == 0 || ep < min_epoch {
+                    sh.record_net_audit(AuditVerdict::Denied, b"net:triad:stale-epoch");
+                    return copy_msg(
+                        b"error: EACCES (stale triad coordinator epoch)\n",
+                        body,
+                    );
+                }
+                Some((ep, ep_ascii))
+            } else {
+                if min_epoch > 0 {
+                    sh.record_net_audit(AuditVerdict::Denied, b"net:triad:stale-epoch");
+                    return copy_msg(
+                        b"error: EACCES (stale triad coordinator epoch)\n",
+                        body,
+                    );
+                }
+                None
+            };
             if seq <= sh.triad_tx_seq {
                 sh.record_net_audit(AuditVerdict::Denied, b"net:triad:replay");
                 return copy_msg(
@@ -872,13 +934,24 @@ impl LivedNet {
                 return copy_msg(b"error: EACCES (invalid triad HMAC hex)\n", body);
             }
             let mut expected_mac = [0u8; 32];
-            Self::compute_triad_prepare_tag(
-                &self.auth_key,
-                seq_tok,
-                node_tok,
-                sql,
-                &mut expected_mac,
-            );
+            if let Some((_, ep_ascii)) = parsed_epoch {
+                Self::compute_triad_prepare_tag_with_epoch(
+                    &self.auth_key,
+                    ep_ascii,
+                    seq_tok,
+                    node_tok,
+                    sql,
+                    &mut expected_mac,
+                );
+            } else {
+                Self::compute_triad_prepare_tag(
+                    &self.auth_key,
+                    seq_tok,
+                    node_tok,
+                    sql,
+                    &mut expected_mac,
+                );
+            }
             let mut diff = 0u8;
             let mut i = 0usize;
             while i < 32 {
@@ -891,6 +964,10 @@ impl LivedNet {
                     b"error: EACCES (triad HMAC-SHA256 verification failed)\n",
                     body,
                 );
+            }
+            if let Some((ep, _)) = parsed_epoch {
+                self.triad_min_epoch = ep;
+                sh.triad_min_epoch = ep;
             }
             if crate::sql::SqlDb::is_readonly_query(sql) {
                 sh.record_net_audit(AuditVerdict::Error, b"net:triad:ro-sql");
@@ -6491,5 +6568,108 @@ mod tests {
             sql_denials_before,
             "400 Bad Request must not increment policy_denials"
         );
+    }
+
+    #[test]
+    fn triad_prepare_with_stale_epoch_rejected() {
+        let mut net = LivedNet::new([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+        let mut sh = crate::shell::OsShell::new();
+        sh.triad_node_id = 1;
+
+        let build_prep_datagram = |epoch_opt: Option<&[u8]>, seq: &[u8], node: &[u8], sql: &[u8]| {
+            let mut mac = [0u8; 32];
+            if let Some(ep) = epoch_opt {
+                LivedNet::compute_triad_prepare_tag_with_epoch(
+                    &DEFAULT_NET_AUTH_KEY,
+                    ep,
+                    seq,
+                    node,
+                    sql,
+                    &mut mac,
+                );
+            } else {
+                LivedNet::compute_triad_prepare_tag(&DEFAULT_NET_AUTH_KEY, seq, node, sql, &mut mac);
+            }
+            let mut hex_mac = [0u8; 64];
+            hex_encode_bytes(&mac, &mut hex_mac);
+            let mut payload = alloc::vec::Vec::new();
+            payload.extend_from_slice(b"TRIAD_PREPARE ");
+            if let Some(ep) = epoch_opt {
+                payload.extend_from_slice(b"epoch=");
+                payload.extend_from_slice(ep);
+                payload.push(b' ');
+            }
+            payload.extend_from_slice(seq);
+            payload.push(b' ');
+            payload.extend_from_slice(node);
+            payload.push(b' ');
+            payload.extend_from_slice(&hex_mac);
+            payload.push(b' ');
+            payload.extend_from_slice(sql);
+            payload
+        };
+
+        // 1. Coordinator epoch 2 commits seq=1:
+        let mut body = [0u8; 512];
+        let p_ep2 = build_prep_datagram(
+            Some(b"2"),
+            b"1",
+            b"0",
+            b"INSERT INTO kv VALUES ('fenced.k1', 'ep2', 1)",
+        );
+        let n1 = net.handle_udp_triad(&p_ep2, &mut sh, &mut body);
+        assert!(
+            body[..n1].starts_with(b"TRIAD_ACK 1 1 "),
+            "epoch=2 TRIAD_PREPARE must succeed, got {:?}",
+            core::str::from_utf8(&body[..n1])
+        );
+        assert_eq!(net.triad_min_epoch, 2);
+        assert_eq!(sh.triad_min_epoch, 2);
+
+        // 2. Stale coordinator at epoch=1 with a valid HMAC and higher seq=2 must be rejected:
+        let p_stale_ep1 = build_prep_datagram(
+            Some(b"1"),
+            b"2",
+            b"0",
+            b"INSERT INTO kv VALUES ('fenced.k2', 'stale_ep1', 1)",
+        );
+        let n2 = net.handle_udp_triad(&p_stale_ep1, &mut sh, &mut body);
+        assert_eq!(
+            &body[..n2],
+            b"error: EACCES (stale triad coordinator epoch)\n",
+            "stale epoch=1 must be rejected"
+        );
+        assert_eq!(sh.triad_tx_seq, 1, "stale epoch must not advance triad_tx_seq");
+
+        // 3. Legacy epoch-less TRIAD_PREPARE after epoch=2 is active must also be rejected:
+        let p_no_ep = build_prep_datagram(
+            None,
+            b"2",
+            b"0",
+            b"INSERT INTO kv VALUES ('fenced.k2', 'no_epoch', 1)",
+        );
+        let n3 = net.handle_udp_triad(&p_no_ep, &mut sh, &mut body);
+        assert_eq!(
+            &body[..n3],
+            b"error: EACCES (stale triad coordinator epoch)\n",
+            "epoch-less TRIAD_PREPARE must be rejected once triad_min_epoch > 0"
+        );
+
+        // 4. Coordinator advancing to epoch=3 with seq=2 succeeds and advances triad_min_epoch to 3:
+        let p_ep3 = build_prep_datagram(
+            Some(b"3"),
+            b"2",
+            b"0",
+            b"INSERT INTO kv VALUES ('fenced.k2', 'ep3', 1)",
+        );
+        let n4 = net.handle_udp_triad(&p_ep3, &mut sh, &mut body);
+        assert!(
+            body[..n4].starts_with(b"TRIAD_ACK 2 1 "),
+            "epoch=3 TRIAD_PREPARE must succeed, got {:?}",
+            core::str::from_utf8(&body[..n4])
+        );
+        assert_eq!(net.triad_min_epoch, 3);
+        assert_eq!(sh.triad_min_epoch, 3);
+        assert_eq!(sh.triad_tx_seq, 2);
     }
 }
