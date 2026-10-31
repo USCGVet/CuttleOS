@@ -1795,6 +1795,192 @@ mod tests {
     }
 
     #[test]
+    fn exhaustive_isolation_boundary_fault_injection_matrix_across_all_roles_and_services() {
+        let mut audit: AuditLogImpl<64> = AuditLogImpl::new();
+
+        let roles = [NodeRole::Wfe, NodeRole::Sql, NodeRole::Shell, NodeRole::Full];
+        let syscalls = [
+            SvcSyscall::GetPid,
+            SvcSyscall::Yield,
+            SvcSyscall::GetTime,
+            SvcSyscall::Open,
+            SvcSyscall::IpcSend,
+            SvcSyscall::NetIo,
+            SvcSyscall::StorageIo,
+            SvcSyscall::Exec,
+        ];
+        let all_ops = [
+            IpcOp::HttpGetStatus,
+            IpcOp::HttpGetTelemetry,
+            IpcOp::HttpGetDashboard,
+            IpcOp::SessionLogin,
+            IpcOp::SessionWhoami,
+            IpcOp::SessionLogout,
+            IpcOp::SqlQuery,
+            IpcOp::SqlMutate,
+            IpcOp::ShellExec,
+            IpcOp::UserElfExec,
+            IpcOp::VfsRead,
+            IpcOp::VfsWrite,
+            IpcOp::VfsDelete,
+            IpcOp::VaultRead,
+            IpcOp::VaultWrite,
+            IpcOp::GuardQuery,
+            IpcOp::GuardControl,
+            IpcOp::CronQuery,
+            IpcOp::CronControl,
+        ];
+
+        // 1. Exhaustive 4 NodeRoles × 3 ServiceIds × 8 SvcSyscalls matrix (96 combinations):
+        for role in roles {
+            let mut sup = ServiceSupervisor::empty();
+            sup.init_role(role, 2026);
+            for svc in ServiceId::ALL {
+                let expected_policy = svc.policy();
+                for sys in syscalls {
+                    let res = sup.mediate_syscall(svc, sys, &mut audit);
+                    if !role.allows(svc) {
+                        assert_eq!(
+                            res,
+                            Err(ServiceError::RoleDisabled),
+                            "role={role:?} svc={svc:?} sys={sys:?} must be RoleDisabled"
+                        );
+                    } else if !expected_policy.allows_syscall(sys) {
+                        assert_eq!(
+                            res,
+                            Err(ServiceError::SeccompDenied),
+                            "role={role:?} svc={svc:?} sys={sys:?} must be SeccompDenied"
+                        );
+                    } else {
+                        assert_eq!(
+                            res,
+                            Ok(()),
+                            "role={role:?} svc={svc:?} sys={sys:?} must be permitted"
+                        );
+                    }
+                }
+            }
+
+            // 2. Exhaustive 4 NodeRoles × 19 IpcOps × {unauthenticated, authenticated} matrix (152 combinations):
+            for op in all_ops {
+                let target = op.target_service();
+                for authed in [false, true] {
+                    // Direct service invocation (`via_http_gateway = false`):
+                    let res_direct = sup.mediate_endpoint(op, false, authed, &mut audit);
+                    if !role.allows(target) {
+                        assert_eq!(
+                            res_direct,
+                            Err(ServiceError::RoleDisabled),
+                            "direct role={role:?} op={op:?} authed={authed} must be RoleDisabled"
+                        );
+                    } else if op.requires_session() && !authed {
+                        assert_eq!(
+                            res_direct,
+                            Err(ServiceError::Unauthenticated),
+                            "direct role={role:?} op={op:?} unauthed must be Unauthenticated"
+                        );
+                    } else {
+                        assert!(
+                            res_direct.is_ok(),
+                            "direct role={role:?} op={op:?} authed={authed} must succeed, got {res_direct:?}"
+                        );
+                    }
+
+                    // Via HTTP gateway (`via_http_gateway = true`): requires both `ServiceId::Http` and `target`:
+                    let res_gw = sup.mediate_endpoint(op, true, authed, &mut audit);
+                    if !role.allows(ServiceId::Http) || !role.allows(target) {
+                        assert_eq!(
+                            res_gw,
+                            Err(ServiceError::RoleDisabled),
+                            "gateway role={role:?} op={op:?} authed={authed} must be RoleDisabled"
+                        );
+                    } else if op.requires_session() && !authed {
+                        assert_eq!(
+                            res_gw,
+                            Err(ServiceError::Unauthenticated),
+                            "gateway role={role:?} op={op:?} unauthed must be Unauthenticated"
+                        );
+                    } else {
+                        assert!(
+                            res_gw.is_ok(),
+                            "gateway role={role:?} op={op:?} authed={authed} must succeed, got {res_gw:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 3. Fault Injection A — Capability Stripping (`CapabilityDenied` even when Seccomp allows):
+        let mut sup_cap = ServiceSupervisor::empty();
+        sup_cap.init_role(NodeRole::Full, 3030);
+        sup_cap.services[ServiceId::Sql.index()].policy.cap_mask = 0;
+        assert_eq!(
+            sup_cap.mediate_syscall(ServiceId::Sql, SvcSyscall::StorageIo, &mut audit),
+            Err(ServiceError::CapabilityDenied),
+            "stripping DURABLE_WAL_WRITE while Seccomp still allows StorageIo must fail with CapabilityDenied"
+        );
+
+        // 4. Fault Injection B — Live ELF64 Single-Bit Code Corruption (`ImaVerificationFailed`):
+        let mut sup_ima = ServiceSupervisor::empty();
+        sup_ima.init_role(NodeRole::Full, 4040);
+        for svc in ServiceId::ALL {
+            let idx = svc.index();
+            sup_ima.services[idx].elf_image[ELF_EHDR_LEN + ELF_PHDR_LEN + 2] ^= 0x01;
+            assert_eq!(
+                sup_ima.mediate_syscall(svc, SvcSyscall::GetPid, &mut audit),
+                Err(ServiceError::ImaVerificationFailed),
+                "single-bit flip in live ELF64 image of {svc:?} must be caught by constant-time IMA SHA-256 check"
+            );
+        }
+
+        // 5. Fault Injection C — Cross-Service KPTI Page-Table Mapping (`KptiIsolationFailed`):
+        for svc in ServiceId::ALL {
+            for peer in ServiceId::ALL {
+                if svc == peer {
+                    continue;
+                }
+                let mut sup_kpti = ServiceSupervisor::empty();
+                sup_kpti.init_role(NodeRole::Full, 5050);
+                let _ = sup_kpti.services[svc.index()]
+                    .user_l4
+                    .map(peer.user_va_base(), PTE_PRESENT | PTE_USER);
+                assert!(
+                    !sup_kpti.verify_all_kpti_isolated(),
+                    "cross-mapping peer {peer:?} VA into {svc:?} user_l4 must fail KPTI verification"
+                );
+                assert_eq!(
+                    sup_kpti.mediate_syscall(svc, SvcSyscall::GetPid, &mut audit),
+                    Err(ServiceError::KptiIsolationFailed),
+                    "mediate_syscall on {svc:?} with cross-mapped {peer:?} VA must return KptiIsolationFailed"
+                );
+            }
+        }
+
+        // 6. Fault Injection D — Hardware Ring-3 (`CPL=3`) Stub Verification Failure (`SandboxTrap`):
+        fn rejecting_ring3_hook(_code: &[u8; SVC_RING3_STUB_LEN], _req: u64, _exp: u64) -> bool {
+            false
+        }
+        fn accepting_ring3_hook(code: &[u8; SVC_RING3_STUB_LEN], req: u64, exp: u64) -> bool {
+            code.windows(2).any(|w| w == [0xCD, 0x80]) && (req >> 32) != 0 && exp != 0
+        }
+        let mut sup_r3 = ServiceSupervisor::empty();
+        sup_r3.init_role(NodeRole::Full, 6060);
+        sup_r3.set_ring3_hw_hook(rejecting_ring3_hook);
+        assert_eq!(
+            sup_r3.mediate_endpoint(IpcOp::HttpGetStatus, true, false, &mut audit),
+            Err(ServiceError::SandboxTrap),
+            "failing hardware CPL=3 stub hook must return SandboxTrap"
+        );
+        assert_eq!(sup_r3.services[ServiceId::Http.index()].mailbox.cpl3_runs, 0);
+
+        sup_r3.set_ring3_hw_hook(accepting_ring3_hook);
+        assert!(sup_r3
+            .mediate_endpoint(IpcOp::HttpGetStatus, true, false, &mut audit)
+            .is_ok());
+        assert_eq!(sup_r3.services[ServiceId::Http.index()].mailbox.cpl3_runs, 1);
+    }
+
+    #[test]
     fn regression_item2_mailbox_rejects_oversized_body() {
         let mut sup = ServiceSupervisor::empty();
         sup.init_role(NodeRole::Full, 777);

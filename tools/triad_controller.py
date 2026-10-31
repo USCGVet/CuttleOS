@@ -910,9 +910,33 @@ class TriadController:
                             target=self.heal_and_remorph_node, args=(corrupted,), daemon=True
                         ).start()
                         return
+                    # 3-way Byzantine split-brain: o1 != o2, o2 != o3, o1 != o3 (no 2-of-3 majority!)
+                    self.parity_syndrome_ok = False
+                    self.quorum_status = "3-WAY BYZANTINE SPLIT-BRAIN FAULT (NO 2/3 MAJORITY)"
+                    self.log_event(
+                        "ALERT",
+                        "3-way Byzantine split-brain detected across OS-1, OS-2, OS-3 (no 2-of-3 majority)!",
+                    )
+                    return
             else:
+                if len(online_nodes) == 2:
+                    n_a, n_b = online_nodes[0], online_nodes[1]
+                    o_a, o_b = outputs.get(n_a.node_id), outputs.get(n_b.node_id)
+                    if o_a is not None and o_b is not None and o_a != o_b:
+                        self.parity_syndrome_ok = False
+                        self.quorum_status = "2/3 DEGRADED SPLIT-BRAIN FAULT (ONLINE PEERS DISAGREE)"
+                        self.log_event(
+                            "ALERT",
+                            f"Degraded 2/3 split-brain: {n_a.name} and {n_b.name} disagree while 3rd node is offline!",
+                        )
+                        return
+                self.parity_syndrome_ok = True
                 names = " + ".join(n.name.split()[0] for n in online_nodes)
                 self.quorum_status = f"2/3 DEGRADED TMR MAJORITY ACTIVE ({names}) — 0ms Downtime During Morph"
+        else:
+            self.parity_syndrome_ok = False
+            self.quorum_status = f"{len(online_nodes)}/3 QUORUM LOST (MINIMUM 2 ONLINE NODES REQUIRED)"
+            return
 
         if not self.spec.has_sql:
             return  # no SQL partition to protect with parity on this role
@@ -923,6 +947,29 @@ class TriadController:
         p = bytes(a ^ b for a, b in zip(d1, d2))
         self.parity_Buffer = p
         self.parity_sha256 = hashlib.sha256(p).hexdigest()[:16]
+
+    def reconstruct_sql_partition_from_xor_parity(self, failed_node_id: int) -> bytes:
+        """
+        Reconstruct a corrupted or lost 4 KiB AHCI SQL partition on `failed_node_id` (1 or 2)
+        using RAID-5 bitwise XOR parity `P = D1 ^ D2`:
+          - `D1 = D2 ^ P` (when `failed_node_id == 1`)
+          - `D2 = D1 ^ P` (when `failed_node_id == 2`)
+        Writes the reconstructed 4 KiB partition directly to the failed node's AHCI image
+        at `SQL_PART_OFFSET` and returns the reconstructed 4 KiB payload.
+        """
+        if failed_node_id not in (1, 2):
+            raise ValueError("XOR data parity covers data nodes 1 (D1) and 2 (D2)")
+        surviving_node = self.nodes[1] if failed_node_id == 1 else self.nodes[0]
+        failed_node = self.nodes[0] if failed_node_id == 1 else self.nodes[1]
+        surviving_bytes = surviving_node.read_sql_partition_bytes()
+        if len(self.parity_Buffer) != SQL_PART_SIZE:
+            raise ValueError("RAID parity buffer not initialized")
+        reconstructed = bytes(a ^ b for a, b in zip(surviving_bytes, self.parity_Buffer))
+        if failed_node.ahci_img.exists():
+            with open(failed_node.ahci_img, "r+b") as f:
+                f.seek(SQL_PART_OFFSET)
+                f.write(reconstructed)
+        return reconstructed
 
     def execute_triad_sql(self, sql_query: str) -> dict:
         """
@@ -941,8 +988,18 @@ class TriadController:
         is_read = is_readonly_sql_query(q)
 
         online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
-        if not online_nodes:
-            return {"ok": False, "output": "error: no online nodes in triad", "quorum": "0/3"}
+        if len(online_nodes) < 2:
+            self.parity_syndrome_ok = False
+            self.log_event(
+                "ALERT",
+                f"Refused SQL query ({q}): quorum lost ({len(online_nodes)}/3 nodes online; >=2 required).",
+            )
+            return {
+                "ok": False,
+                "error": "quorum lost: minimum 2 of 3 online nodes required",
+                "output": "error: quorum lost (minimum 2 of 3 online nodes required)",
+                "quorum": f"{len(online_nodes)}/3 QUORUM LOST",
+            }
 
         if is_read:
             results = {}
@@ -956,10 +1013,24 @@ class TriadController:
                         "output": f"error: {e}",
                         "quorum": "0/3",
                     }
-            # Perform majority vote across online nodes
+            # Perform 2-of-3 majority vote across online nodes
             vals = list(results.values())
             chosen = max(set(vals), key=vals.count)
             agree = vals.count(chosen)
+            if agree < 2:
+                self.parity_syndrome_ok = False
+                self.log_event(
+                    "ALERT",
+                    f"Refused SQL read ({q}): split-brain disagreement across online nodes (no 2/3 majority)!",
+                )
+                return {
+                    "ok": False,
+                    "error": "split-brain: no 2-of-3 majority agreement across online nodes",
+                    "output": "error: split-brain detected (no 2-of-3 majority agreement)",
+                    "quorum": f"{agree}/{len(online_nodes)} SPLIT-BRAIN REFUSED",
+                    "tx_seq": self.triad_tx_seq,
+                    "per_node": results,
+                }
             return {
                 "ok": True,
                 "mode": "READ (2-of-3 Majority Verified)",
@@ -975,8 +1046,18 @@ class TriadController:
         # transition to `ONLINE`.
         with self.wal_lock:
             online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
-            if not online_nodes:
-                return {"ok": False, "output": "error: no online nodes in triad", "quorum": "0/3"}
+            if len(online_nodes) < 2:
+                self.parity_syndrome_ok = False
+                self.log_event(
+                    "ALERT",
+                    f"Refused SQL write ({q}): quorum lost ({len(online_nodes)}/3 nodes online; >=2 required).",
+                )
+                return {
+                    "ok": False,
+                    "error": "quorum lost: minimum 2 of 3 online nodes required",
+                    "output": "error: quorum lost (minimum 2 of 3 online nodes required)",
+                    "quorum": f"{len(online_nodes)}/3 QUORUM LOST",
+                }
             per_node = {}
             accepted_nodes = []
             for n in online_nodes:
@@ -1000,12 +1081,12 @@ class TriadController:
                     accepted_nodes.append(n)
 
             primary_out = next(iter(per_node.values()), "")
-            if not accepted_nodes:
+            if len(accepted_nodes) < 2:
                 return {
                     "ok": False,
-                    "error": primary_out or "error: SQL statement rejected by online nodes",
-                    "output": primary_out,
-                    "quorum": f"0/{len(online_nodes)} online nodes accepted",
+                    "error": primary_out or "error: SQL statement rejected or failed 2-of-3 quorum",
+                    "output": primary_out or "error: SQL statement did not reach 2-of-3 quorum",
+                    "quorum": f"{len(accepted_nodes)}/{len(online_nodes)} online nodes accepted",
                     "per_node": per_node,
                 }
 
@@ -1066,8 +1147,18 @@ class TriadController:
 
         if is_read:
             online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
-            if not online_nodes:
-                return {"ok": False, "error": "no online nodes in triad", "quorum": "0/3"}
+            if len(online_nodes) < 2:
+                self.parity_syndrome_ok = False
+                self.log_event(
+                    "ALERT",
+                    f"Refused app read ({self._redact_app_cmd(c)}): quorum lost ({len(online_nodes)}/3 nodes online; >=2 required).",
+                )
+                return {
+                    "ok": False,
+                    "error": "quorum lost: minimum 2 of 3 online nodes required",
+                    "output": "error: quorum lost (minimum 2 of 3 online nodes required)",
+                    "quorum": f"{len(online_nodes)}/3 QUORUM LOST",
+                }
             per_node = {}
             accepted_nodes = []
             for n in online_nodes:
@@ -1079,8 +1170,22 @@ class TriadController:
             vals = list(per_node.values())
             chosen = max(set(vals), key=vals.count) if vals else ""
             agree = vals.count(chosen)
+            if len(accepted_nodes) < 2 or agree < 2:
+                self.parity_syndrome_ok = False
+                self.log_event(
+                    "ALERT",
+                    f"Refused app read ({self._redact_app_cmd(c)}): split-brain disagreement across online nodes (no 2/3 majority)!",
+                )
+                return {
+                    "ok": False,
+                    "error": "split-brain: no 2-of-3 majority agreement across online nodes",
+                    "output": "error: split-brain detected (no 2-of-3 majority agreement)",
+                    "quorum": f"{agree}/{len(online_nodes)} SPLIT-BRAIN REFUSED",
+                    "tx_seq": self.triad_tx_seq,
+                    "per_node": per_node,
+                }
             return {
-                "ok": len(accepted_nodes) > 0,
+                "ok": True,
                 "mode": f"APP READ ({app.upper()} 2-of-3 Majority)",
                 "quorum": f"{agree}/{len(online_nodes)} ONLINE NODES AGREED",
                 "tx_seq": self.triad_tx_seq,
@@ -1092,8 +1197,18 @@ class TriadController:
         # executing the command, appending the encrypted WAL record, and updating `tx_seq`.
         with self.wal_lock:
             online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
-            if not online_nodes:
-                return {"ok": False, "error": "no online nodes in triad", "quorum": "0/3"}
+            if len(online_nodes) < 2:
+                self.parity_syndrome_ok = False
+                self.log_event(
+                    "ALERT",
+                    f"Refused app write ({self._redact_app_cmd(c)}): quorum lost ({len(online_nodes)}/3 nodes online; >=2 required).",
+                )
+                return {
+                    "ok": False,
+                    "error": "quorum lost: minimum 2 of 3 online nodes required",
+                    "output": "error: quorum lost (minimum 2 of 3 online nodes required)",
+                    "quorum": f"{len(online_nodes)}/3 QUORUM LOST",
+                }
             per_node = {}
             accepted_nodes = []
             for n in online_nodes:
@@ -1105,12 +1220,12 @@ class TriadController:
 
             vals = list(per_node.values())
             chosen = max(set(vals), key=vals.count) if vals else ""
-            if not accepted_nodes:
+            if len(accepted_nodes) < 2:
                 return {
                     "ok": False,
-                    "error": chosen or f"error: {app} command rejected by online nodes",
-                    "output": chosen,
-                    "quorum": f"0/{len(online_nodes)} online nodes accepted",
+                    "error": chosen or f"error: {app} command rejected or failed 2-of-3 quorum",
+                    "output": chosen or f"error: {app} command did not reach 2-of-3 quorum",
+                    "quorum": f"{len(accepted_nodes)}/{len(online_nodes)} online nodes accepted",
                     "per_node": per_node,
                 }
 
@@ -2029,6 +2144,194 @@ def https_probe(node: TriadNode, path: str = "/healthz") -> tuple[str, str, str]
     return sha, version, cipher
 
 
+def run_fault_injection_unit_tests() -> None:
+    """
+    Deterministic, fast (no-QEMU) fault-injection verification suite for:
+      1. 1-of-3 Quorum Loss (2 nodes offline -> reads & writes refused, WAL untouched)
+      2. 3-Way Byzantine Split-Brain (`A != B != C` -> reads & parity check fail closed)
+      3. 2-of-2 Degraded Split-Brain (`A != B` while 3rd node is morphing -> refused)
+      4. 2-of-3 Majority Vote Masking & Single-Node Write Rejection (<2 accepted -> refused)
+      5. 4 KiB RAID-5 XOR Parity Striping (D1 ^ D2 = P) & Bitwise Reconstruction under disk corruption
+      6. Encrypted WAL Vault (`ENC_WAL_V1:`) HMAC-SHA256 tamper rejection & replay
+    """
+    import tempfile
+
+    print("[triad-fault-suite] running deterministic Quorum, Split-Brain, WAL & RAID XOR fault-injection tests...")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        spec = TriadSpec(
+            name="fault-test-triad",
+            state_dir=tmp_path,
+            http_base=19100,
+            https_base=19500,
+            smp=2,
+            accel="tcg",
+        )
+        ctrl = TriadController(show_gui=False, spec=spec)
+
+        # Initialize 1 MiB scratch AHCI images for all 3 nodes:
+        for n in ctrl.nodes:
+            n.ahci_img.parent.mkdir(parents=True, exist_ok=True)
+            n.ahci_img.write_bytes(b"\x00" * (1024 * 1024))
+            n.state = "ONLINE"
+
+        # ------------------------------------------------------------------
+        # Fault 1: 1-of-3 Online Quorum Loss (OS-2 and OS-3 OFFLINE/MORPHING)
+        # ------------------------------------------------------------------
+        ctrl.nodes[0].state = "ONLINE"
+        ctrl.nodes[1].state = "MORPHING"
+        ctrl.nodes[2].state = "OFFLINE"
+        ctrl.send_shell_cmd = lambda node, cmd, timeout=4.0: "k|v|rev\ncluster.role|primary|1\n"
+
+        wal_before = len(ctrl.wal_entries)
+        tx_before = ctrl.triad_tx_seq
+
+        r_read_1of3 = ctrl.execute_triad_sql("SELECT * FROM kv")
+        assert not r_read_1of3["ok"], f"1-of-3 online read must fail closed: {r_read_1of3}"
+        assert "QUORUM LOST" in r_read_1of3["quorum"], f"Expected QUORUM LOST: {r_read_1of3}"
+
+        r_write_1of3 = ctrl.execute_triad_sql("INSERT INTO kv VALUES ('solo', 'bad', 1)")
+        assert not r_write_1of3["ok"], f"1-of-3 online write must fail closed: {r_write_1of3}"
+        assert len(ctrl.wal_entries) == wal_before, "1-of-3 refused write must not append to WAL"
+        assert ctrl.triad_tx_seq == tx_before, "1-of-3 refused write must not advance triad_tx_seq"
+
+        r_app_read_1of3 = ctrl.execute_triad_app("vault get secret.key")
+        assert not r_app_read_1of3["ok"], f"1-of-3 online app read must fail closed: {r_app_read_1of3}"
+        r_app_write_1of3 = ctrl.execute_triad_app("vault put secret.key val")
+        assert not r_app_write_1of3["ok"], f"1-of-3 online app write must fail closed: {r_app_write_1of3}"
+        assert len(ctrl.wal_entries) == wal_before
+
+        ctrl.compute_and_verify_raid_parity()
+        assert not ctrl.parity_syndrome_ok, "1-of-3 online must set parity_syndrome_ok=False"
+        assert "QUORUM LOST" in ctrl.quorum_status, f"Unexpected quorum_status: {ctrl.quorum_status}"
+
+        # ------------------------------------------------------------------
+        # Fault 2: 3-Way Byzantine Split-Brain (`A != B != C` across 3 ONLINE nodes)
+        # ------------------------------------------------------------------
+        for n in ctrl.nodes:
+            n.state = "ONLINE"
+        split3_outputs = {
+            1: "k|v|rev\nleader|node1_byz|1\n",
+            2: "k|v|rev\nleader|node2_byz|1\n",
+            3: "k|v|rev\nleader|node3_byz|1\n",
+        }
+        ctrl.send_shell_cmd = lambda node, cmd, timeout=4.0: split3_outputs[node.node_id]
+
+        r_split3 = ctrl.execute_triad_sql("SELECT * FROM kv")
+        assert not r_split3["ok"], f"3-way split-brain read must fail closed: {r_split3}"
+        assert "SPLIT-BRAIN REFUSED" in r_split3["quorum"], f"Expected SPLIT-BRAIN REFUSED: {r_split3}"
+        assert not ctrl.parity_syndrome_ok
+
+        r_app_split3 = ctrl.execute_triad_app("vault get k")
+        assert not r_app_split3["ok"], f"3-way split-brain app read must fail closed: {r_app_split3}"
+
+        ctrl.parity_syndrome_ok = True
+        ctrl.compute_and_verify_raid_parity()
+        assert not ctrl.parity_syndrome_ok, "compute_and_verify_raid_parity must flag 3-way split-brain"
+        assert "3-WAY BYZANTINE SPLIT-BRAIN" in ctrl.quorum_status, (
+            f"Expected 3-WAY BYZANTINE SPLIT-BRAIN status, got: {ctrl.quorum_status}"
+        )
+
+        # ------------------------------------------------------------------
+        # Fault 3: 2-of-2 Degraded Split-Brain (`A != B` while 3rd node is MORPHING)
+        # ------------------------------------------------------------------
+        ctrl.nodes[0].state = "ONLINE"
+        ctrl.nodes[1].state = "ONLINE"
+        ctrl.nodes[2].state = "MORPHING"
+        r_split2 = ctrl.execute_triad_sql("SELECT * FROM kv")
+        assert not r_split2["ok"], f"2-of-2 degraded disagreement must fail closed: {r_split2}"
+        assert "SPLIT-BRAIN REFUSED" in r_split2["quorum"]
+
+        ctrl.parity_syndrome_ok = True
+        ctrl.compute_and_verify_raid_parity()
+        assert not ctrl.parity_syndrome_ok, "2-of-2 degraded disagreement must set parity_syndrome_ok=False"
+        assert "2/3 DEGRADED SPLIT-BRAIN FAULT" in ctrl.quorum_status
+
+        # ------------------------------------------------------------------
+        # Fault 4: 2-of-3 Majority Vote Masking (1 Byzantine node outvoted 2-to-1)
+        #          & Write Rejected by 2 of 3 Nodes (<2 accepted -> refused)
+        # ------------------------------------------------------------------
+        for n in ctrl.nodes:
+            n.state = "ONLINE"
+        maj_outputs = {
+            1: "k|v|rev\nleader|consensus_val|1\n",
+            2: "k|v|rev\nleader|byzantine_corrupt|99\n",
+            3: "k|v|rev\nleader|consensus_val|1\n",
+        }
+        ctrl.send_shell_cmd = lambda node, cmd, timeout=4.0: maj_outputs[node.node_id]
+        r_maj = ctrl.execute_triad_sql("SELECT * FROM kv")
+        assert r_maj["ok"], f"2-of-3 majority read must succeed when 2 nodes agree: {r_maj}"
+        assert "2/3 ONLINE NODES AGREED" in r_maj["quorum"]
+        assert "consensus_val" in r_maj["output"] and "byzantine_corrupt" not in r_maj["output"]
+
+        # Write accepted by only 1 of 3 nodes (2 nodes return SQL error):
+        write_1of3_accept = {
+            1: "INSERT 1\n",
+            2: "error: EACCES (table locked)\n",
+            3: "error: EACCES (table locked)\n",
+        }
+        ctrl.send_shell_cmd = lambda node, cmd, timeout=4.0: write_1of3_accept[node.node_id]
+        r_w_reject = ctrl.execute_triad_sql("INSERT INTO kv VALUES ('x', 'y', 1)")
+        assert not r_w_reject["ok"], f"Write accepted by only 1/3 nodes must fail closed: {r_w_reject}"
+        assert len(ctrl.wal_entries) == wal_before, "Write without 2/3 acceptance must not enter WAL"
+
+        # ------------------------------------------------------------------
+        # Fault 5: 4 KiB RAID-5 XOR Parity Striping (D1 ^ D2 = P) & Exact Reconstruction
+        # ------------------------------------------------------------------
+        d1_orig = bytes((i * 73 + 19) & 0xFF for i in range(SQL_PART_SIZE))
+        d2_orig = bytes((i * 151 + 43) & 0xFF for i in range(SQL_PART_SIZE))
+        for node, payload in ((ctrl.nodes[0], d1_orig), (ctrl.nodes[1], d2_orig)):
+            with open(node.ahci_img, "r+b") as f:
+                f.seek(SQL_PART_OFFSET)
+                f.write(payload)
+
+        ctrl.send_shell_cmd = lambda node, cmd, timeout=4.0: "k|v|rev\nraid|ok|1\n"
+        ctrl.compute_and_verify_raid_parity()
+        assert ctrl.parity_syndrome_ok
+        assert len(ctrl.parity_Buffer) == SQL_PART_SIZE
+        assert ctrl.parity_Buffer == bytes(a ^ b for a, b in zip(d1_orig, d2_orig))
+
+        # Corrupt OS-1's 4 KiB SQL partition with bit flips and zeroed sectors:
+        with open(ctrl.nodes[0].ahci_img, "r+b") as f:
+            f.seek(SQL_PART_OFFSET)
+            f.write(b"\xFF" * 1024 + b"\x00" * (SQL_PART_SIZE - 1024))
+        assert ctrl.nodes[0].read_sql_partition_bytes() != d1_orig
+
+        # Reconstruct D1 from D2 ^ P:
+        recovered_d1 = ctrl.reconstruct_sql_partition_from_xor_parity(1)
+        assert recovered_d1 == d1_orig, "RAID-5 XOR reconstruction D1 = D2 ^ P failed"
+        assert ctrl.nodes[0].read_sql_partition_bytes() == d1_orig
+
+        # Corrupt OS-2's 4 KiB SQL partition and reconstruct D2 from D1 ^ P:
+        with open(ctrl.nodes[1].ahci_img, "r+b") as f:
+            f.seek(SQL_PART_OFFSET)
+            f.write(b"\xAA" * SQL_PART_SIZE)
+        assert ctrl.nodes[1].read_sql_partition_bytes() != d2_orig
+        recovered_d2 = ctrl.reconstruct_sql_partition_from_xor_parity(2)
+        assert recovered_d2 == d2_orig, "RAID-5 XOR reconstruction D2 = D1 ^ P failed"
+        assert ctrl.nodes[1].read_sql_partition_bytes() == d2_orig
+
+        # ------------------------------------------------------------------
+        # Fault 6: Encrypted WAL Vault (`ENC_WAL_V1:`) Tamper Rejection
+        # ------------------------------------------------------------------
+        plain_vault_cmd = "vault put cluster.master_key TopSecretKey99"
+        enc_record = ctrl._encrypt_wal_vault_cmd(plain_vault_cmd)
+        assert enc_record.startswith("ENC_WAL_V1:") and "TopSecretKey99" not in enc_record
+        assert ctrl._decrypt_wal_vault_cmd(enc_record) == plain_vault_cmd
+
+        # Flip 1 hex nibble in the HMAC-SHA256 tag of `ENC_WAL_V1:<nonce>:<ct>:<tag>`:
+        parts = enc_record.split(":")
+        tampered_tag = ("0" if parts[3][0] != "0" else "1") + parts[3][1:]
+        tampered_record = ":".join([parts[0], parts[1], parts[2], tampered_tag])
+        try:
+            ctrl._decrypt_wal_vault_cmd(tampered_record)
+            raise AssertionError("Tampered ENC_WAL_V1 tag must raise ValueError")
+        except ValueError as e:
+            assert "authentication tag mismatch" in str(e)
+
+    print("[triad-fault-suite] ALL 6 FAULT-INJECTION SUITES PASSED")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Cuttle 3-as-1 Triad Hypervisor Controller")
     parser.add_argument("--port", type=int, default=18080, help="Unified Triad HTTP port")
@@ -2039,6 +2342,11 @@ def main():
         help="Boot the 3-node Triad, test SQL RAID writes during a live node morph, test 2-of-3 self-healing, and exit",
     )
     parser.add_argument(
+        "--fault-test",
+        action="store_true",
+        help="Run deterministic Quorum, Split-Brain, WAL & RAID XOR parity fault-injection unit tests and exit",
+    )
+    parser.add_argument(
         "--accel",
         choices=ACCELERATORS,
         default=os.environ.get("CUTTLE_ACCEL") or "auto",
@@ -2046,7 +2354,12 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.fault_test:
+        run_fault_injection_unit_tests()
+        return
+
     if args.self_test:
+        run_fault_injection_unit_tests()
         # Start from a clean Triad: the WAL and the desired cron jobs (restored onto every
         # node at boot) would otherwise accumulate across self-test runs.
         for stale in (TRIAD_DIR / "triad_wal.json", TRIAD_DIR / "cron_jobs.json"):

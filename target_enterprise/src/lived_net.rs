@@ -770,7 +770,11 @@ impl LivedNet {
                     body,
                 );
             }
-            if seq < sh.triad_tx_seq || seq == 0 {
+            if peer_id as usize == (sh.triad_node_id as usize) % 3 {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:ack-self");
+                return copy_msg(b"error: EACCES (triad ACK self-peer loop rejected)\n", body);
+            }
+            if seq != sh.triad_tx_seq || seq == 0 {
                 sh.record_net_audit(AuditVerdict::Denied, b"net:triad:ack-stale");
                 return copy_msg(b"error: EACCES (stale triad ACK sequence)\n", body);
             }
@@ -799,11 +803,15 @@ impl LivedNet {
             }
 
             sh.sync_triad_local();
+            let already_recorded = sh.triad_peer_seq[peer_id as usize] == seq
+                && sh.triad_peer_hash[peer_id as usize] == peer_hash;
             sh.triad_peer_seq[peer_id as usize] = seq;
             sh.triad_peer_hash[peer_id as usize] = peer_hash;
             let local_hash = sh.db.state_hash();
             if seq == sh.triad_tx_seq && peer_hash != local_hash {
-                sh.triad_divergences = sh.triad_divergences.wrapping_add(1);
+                if !already_recorded {
+                    sh.triad_divergences = sh.triad_divergences.wrapping_add(1);
+                }
                 sh.record_net_audit(AuditVerdict::Denied, b"net:triad:tmr-divergence");
                 let mut loc_hex = [0u8; 16];
                 hex_encode_bytes(&local_hash.to_be_bytes(), &mut loc_hex);
@@ -820,7 +828,7 @@ impl LivedNet {
                 return pos;
             }
             let quorum = sh.triad_quorum_count();
-            if quorum >= 2 {
+            if quorum >= 2 && !already_recorded {
                 sh.triad_quorum_commits = sh.triad_quorum_commits.wrapping_add(1);
             }
             sh.record_net_audit(AuditVerdict::Allowed, b"net:triad:quorum-ok");
@@ -3567,5 +3575,234 @@ mod tests {
 
         let (r5, l5) = mk_sid_req(&sid1, b"ROLLBACK");
         let _ = net.handle_http_request(&r5[..l5], 1, Some(&mut sh), &mut out);
+    }
+
+    #[test]
+    fn triad_byzantine_fault_injection_and_4k_raid_xor_wal_reconstruction_work() {
+        let mut net0 = LivedNet::new(MAC);
+        let mut sh0 = crate::shell::OsShell::new();
+        sh0.triad_node_id = 0;
+
+        let mut net1 = LivedNet::new(MAC);
+        let mut sh1 = crate::shell::OsShell::new();
+        sh1.triad_node_id = 1;
+
+        let mut net2 = LivedNet::new(MAC);
+        let mut sh2 = crate::shell::OsShell::new();
+        sh2.triad_node_id = 2;
+
+        let send_triad_udp = |net: &mut LivedNet,
+                              sh: &mut crate::shell::OsShell,
+                              payload: &[u8]|
+         -> ReplySet {
+            let udp_len = 8 + payload.len();
+            let mut udp = [0u8; 512];
+            udp[0..2].copy_from_slice(&41000u16.to_be_bytes());
+            udp[2..4].copy_from_slice(&TRIAD_REPL_PORT.to_be_bytes());
+            udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+            udp[8..udp_len].copy_from_slice(payload);
+            let uc = crate::net::udp_checksum(PEER_IP, GUEST_IP, &udp[..udp_len]);
+            udp[6..8].copy_from_slice(&uc.to_be_bytes());
+            let (frame, flen) = eth_ip(IP_PROTO_UDP, PEER_IP, GUEST_IP, &udp[..udp_len]);
+            let mut out = ReplySet::new();
+            net.handle_frame_with_shell(&frame[..flen], 1, sh, &mut out);
+            out
+        };
+
+        // 1. Node 0 proposes seq=1:
+        let sql1 = b"INSERT INTO kv VALUES ('byz.test', 'v1', 1)";
+        let mut cmd = [0u8; 128];
+        let mut cp = 0usize;
+        cp += copy_msg(b"triad propose ", &mut cmd[cp..]);
+        cp += copy_msg(sql1, &mut cmd[cp..]);
+        let mut sh_out = [0u8; 256];
+        let _ = sh0.exec_line(&cmd[..cp], 1, 0, 0, &mut sh_out);
+        let h0 = sh0.db.state_hash();
+        let mut h0_hex = [0u8; 16];
+        hex_encode_bytes(&h0.to_be_bytes(), &mut h0_hex);
+
+        // 2. Fault A: Bit-flipped HMAC on `TRIAD_PREPARE` is rejected with EACCES:
+        let mut prep_mac = [0u8; 32];
+        LivedNet::compute_triad_prepare_tag(&DEFAULT_NET_AUTH_KEY, b"1", b"0", sql1, &mut prep_mac);
+        prep_mac[15] ^= 0x01; // single-bit flip in HMAC
+        let mut bad_prep_hex = [0u8; 64];
+        hex_encode_bytes(&prep_mac, &mut bad_prep_hex);
+        let mut bad_prep = [0u8; 256];
+        let mut bp = 0usize;
+        bp += copy_msg(b"TRIAD_PREPARE 1 0 ", &mut bad_prep[bp..]);
+        bp += copy_msg(&bad_prep_hex, &mut bad_prep[bp..]);
+        bp += copy_msg(b" ", &mut bad_prep[bp..]);
+        bp += copy_msg(sql1, &mut bad_prep[bp..]);
+        let r_bad_prep = send_triad_udp(&mut net1, &mut sh1, &bad_prep[..bp]);
+        let s_bad_prep = core::str::from_utf8(&r_bad_prep.get(0).unwrap()[42..]).unwrap();
+        assert!(
+            s_bad_prep.contains("error: EACCES (triad HMAC-SHA256 verification failed)"),
+            "got: {s_bad_prep}"
+        );
+
+        // 3. Fault B: Self-peer loop spoofing (`peer_id == 0` sent to Node 0) is rejected!
+        //    Without this check, a single compromised node could forge or replay its own ACK to itself.
+        let mut self_ack_mac = [0u8; 32];
+        LivedNet::compute_triad_ack_tag(
+            &DEFAULT_NET_AUTH_KEY,
+            b"1",
+            b"0",
+            &h0_hex,
+            &mut self_ack_mac,
+        );
+        let mut self_ack_hex = [0u8; 64];
+        hex_encode_bytes(&self_ack_mac, &mut self_ack_hex);
+        let mut self_ack = [0u8; 160];
+        let mut sap = 0usize;
+        sap += copy_msg(b"TRIAD_ACK 1 0 ", &mut self_ack[sap..]);
+        sap += copy_msg(&h0_hex, &mut self_ack[sap..]);
+        sap += copy_msg(b" ", &mut self_ack[sap..]);
+        sap += copy_msg(&self_ack_hex, &mut self_ack[sap..]);
+        let r_self_ack = send_triad_udp(&mut net0, &mut sh0, &self_ack[..sap]);
+        let s_self_ack = core::str::from_utf8(&r_self_ack.get(0).unwrap()[42..]).unwrap();
+        assert!(
+            s_self_ack.contains("error: EACCES (triad ACK self-peer loop rejected)"),
+            "self-peer TRIAD_ACK must be rejected, got: {s_self_ack}"
+        );
+        assert_eq!(sh0.triad_quorum_count(), 1);
+        assert_eq!(sh0.triad_quorum_commits, 0);
+
+        // 4. Fault C: Future sequence ACK (`seq = 99 != sh0.triad_tx_seq`) is rejected!
+        let mut fut_ack_mac = [0u8; 32];
+        LivedNet::compute_triad_ack_tag(
+            &DEFAULT_NET_AUTH_KEY,
+            b"99",
+            b"1",
+            &h0_hex,
+            &mut fut_ack_mac,
+        );
+        let mut fut_ack_hex = [0u8; 64];
+        hex_encode_bytes(&fut_ack_mac, &mut fut_ack_hex);
+        let mut fut_ack = [0u8; 160];
+        let mut fap = 0usize;
+        fap += copy_msg(b"TRIAD_ACK 99 1 ", &mut fut_ack[fap..]);
+        fap += copy_msg(&h0_hex, &mut fut_ack[fap..]);
+        fap += copy_msg(b" ", &mut fut_ack[fap..]);
+        fap += copy_msg(&fut_ack_hex, &mut fut_ack[fap..]);
+        let r_fut_ack = send_triad_udp(&mut net0, &mut sh0, &fut_ack[..fap]);
+        let s_fut_ack = core::str::from_utf8(&r_fut_ack.get(0).unwrap()[42..]).unwrap();
+        assert!(
+            s_fut_ack.contains("error: EACCES (stale triad ACK sequence)"),
+            "future sequence TRIAD_ACK must be rejected, got: {s_fut_ack}"
+        );
+
+        // 5. Fault D: 3-Way Byzantine Split-Brain (`H0 != H1 != H2`):
+        //    Node 1 reports state hash `1111111111111111` and Node 2 reports `2222222222222222`.
+        //    Neither matches Node 0 (`h0_hex`), so quorum MUST stay 1/3 and `triad_quorum_commits == 0`.
+        for (peer_tok, bad_hash) in [
+            (b"1".as_slice(), b"1111111111111111".as_slice()),
+            (b"2".as_slice(), b"2222222222222222".as_slice()),
+        ] {
+            let mut bmac = [0u8; 32];
+            LivedNet::compute_triad_ack_tag(&DEFAULT_NET_AUTH_KEY, b"1", peer_tok, bad_hash, &mut bmac);
+            let mut bhex = [0u8; 64];
+            hex_encode_bytes(&bmac, &mut bhex);
+            let mut bpkt = [0u8; 160];
+            let mut p = 0usize;
+            p += copy_msg(b"TRIAD_ACK 1 ", &mut bpkt[p..]);
+            p += copy_msg(peer_tok, &mut bpkt[p..]);
+            p += copy_msg(b" ", &mut bpkt[p..]);
+            p += copy_msg(bad_hash, &mut bpkt[p..]);
+            p += copy_msg(b" ", &mut bpkt[p..]);
+            p += copy_msg(&bhex, &mut bpkt[p..]);
+            let r_div = send_triad_udp(&mut net0, &mut sh0, &bpkt[..p]);
+            let s_div = core::str::from_utf8(&r_div.get(0).unwrap()[42..]).unwrap();
+            assert!(s_div.contains("TRIAD_ALERT seq=1"), "got: {s_div}");
+        }
+        assert_eq!(sh0.triad_quorum_count(), 1, "3-way split-brain must have 1/3 quorum");
+        assert_eq!(sh0.triad_quorum_commits, 0, "3-way split-brain must never commit");
+        assert_eq!(sh0.triad_divergences, 2);
+
+        // 6. Fault E: Duplicate `TRIAD_ACK` replay idempotence:
+        //    When Node 1 legitimately replicates `seq=1` and sends its valid `TRIAD_ACK 1 1`,
+        //    `triad_quorum_commits` increments to 1. Replaying that exact `TRIAD_ACK 1 1` packet
+        //    5 times must NOT inflate `triad_quorum_commits` beyond 1!
+        let mut good_prep_mac = [0u8; 32];
+        LivedNet::compute_triad_prepare_tag(
+            &DEFAULT_NET_AUTH_KEY,
+            b"1",
+            b"0",
+            sql1,
+            &mut good_prep_mac,
+        );
+        let mut good_prep_hex = [0u8; 64];
+        hex_encode_bytes(&good_prep_mac, &mut good_prep_hex);
+        let mut good_prep = [0u8; 256];
+        let mut gp = 0usize;
+        gp += copy_msg(b"TRIAD_PREPARE 1 0 ", &mut good_prep[gp..]);
+        gp += copy_msg(&good_prep_hex, &mut good_prep[gp..]);
+        gp += copy_msg(b" ", &mut good_prep[gp..]);
+        gp += copy_msg(sql1, &mut good_prep[gp..]);
+        let ack1_reply = send_triad_udp(&mut net1, &mut sh1, &good_prep[..gp]);
+        let ack1_pkt = &ack1_reply.get(0).unwrap()[42..];
+
+        for _ in 0..5 {
+            let q_rep = send_triad_udp(&mut net0, &mut sh0, ack1_pkt);
+            let q_str = core::str::from_utf8(&q_rep.get(0).unwrap()[42..]).unwrap();
+            assert!(q_str.starts_with("TRIAD_QUORUM seq=1 quorum=2/3"), "got: {q_str}");
+        }
+        assert_eq!(
+            sh0.triad_quorum_commits, 1,
+            "Replaying identical TRIAD_ACK must be idempotent and not inflate triad_quorum_commits"
+        );
+
+        // 7. Fault F: 4 KiB (`8 × 512B`) Sealed `CTTLSQL1` Partition RAID-5 XOR Parity Reconstruction:
+        //    Save Node 0's SQL DB (`D1`) and Node 2's SQL DB (`D2`) to 8-sector (4 KiB) partitions,
+        //    compute RAID-5 XOR parity `P = D1 ^ D2`, corrupt 3 sectors of `D1` (including header
+        //    and row payload), verify `SqlDb::load_partition` rejects the corrupted image's
+        //    HMAC-SHA256 seal, reconstruct `D1 = D2 ^ P`, and verify `SqlDb::load_partition`
+        //    restores Node 0's exact SQL state hash and rows!
+        let _ = send_triad_udp(&mut net2, &mut sh2, &good_prep[..gp]);
+        let mut sql_out = [0u8; 128];
+        let _ = sh2
+            .db
+            .exec(b"INSERT INTO kv VALUES ('node2.local', 'paritypeer', 2)", &mut sql_out);
+
+        let seal_key: [u8; 32] = *b"cuttle-raid5-xor-sql-seal-key-v1";
+        let mut d1_sectors = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
+        let mut d2_sectors = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
+        sh0.db.save_partition(&seal_key, &mut d1_sectors);
+        sh2.db.save_partition(&seal_key, &mut d2_sectors);
+
+        // Compute 8-sector (4 KiB) XOR parity P = D1 ^ D2:
+        let mut parity_sectors = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
+        for s in 0..crate::sql::SQL_PART_SECTORS {
+            for b in 0..512 {
+                parity_sectors[s][b] = d1_sectors[s][b] ^ d2_sectors[s][b];
+            }
+        }
+
+        // Inject catastrophic multi-sector disk corruption into D1 (sectors 0, 1, and 3):
+        let mut d1_corrupted = d1_sectors;
+        d1_corrupted[0][24] ^= 0x80; // flip 1 bit in HMAC-SHA256 tag
+        d1_corrupted[1] = [0xFFu8; 512]; // wipe entire sector 1
+        d1_corrupted[3] = [0xAAu8; 512]; // wipe entire sector 3
+
+        let mut test_db = crate::sql::SqlDb::empty();
+        assert!(
+            !test_db.load_partition(&seal_key, &d1_corrupted),
+            "Corrupted 4 KiB CTTLSQL1 partition must be rejected by keyed HMAC-SHA256 verification"
+        );
+
+        // Reconstruct D1 from surviving D2 and XOR parity P (`D1_rec = D2 ^ P`):
+        let mut d1_reconstructed = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
+        for s in 0..crate::sql::SQL_PART_SECTORS {
+            for b in 0..512 {
+                d1_reconstructed[s][b] = d2_sectors[s][b] ^ parity_sectors[s][b];
+            }
+        }
+        assert_eq!(d1_reconstructed, d1_sectors);
+        assert!(
+            test_db.load_partition(&seal_key, &d1_reconstructed),
+            "RAID-5 XOR reconstructed 4 KiB CTTLSQL1 partition must pass keyed HMAC-SHA256 verification"
+        );
+        assert_eq!(test_db.state_hash(), sh0.db.state_hash());
+        let n_sel = test_db.exec(b"SELECT v FROM kv WHERE k = 'byz.test'", &mut sql_out);
+        assert_eq!(&sql_out[..n_sel], b"v\nv1\n");
     }
 }
