@@ -28,3 +28,6 @@ iced-x86 = "1"
 # Diversify the built-in specimen in-process so the harness measures the
 # project's real morph pipeline, not a reimplementation of it.
 cuttle-diversifier = { path = "../diversifier" }
+
+[dev-dependencies]
+cuttle-binmorph = { path = "../binmorph" }

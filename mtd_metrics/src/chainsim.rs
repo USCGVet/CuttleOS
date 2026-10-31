@@ -349,3 +349,276 @@ pub fn cadence_curve(ratios: &[f64]) -> Vec<(f64, f64)> {
         .map(|&r| (r, cadence_break_even(r, 1.0)))
         .collect()
 }
+
+/// Map an x86-64 general-purpose register name (in NASM lowercase format) to its
+/// canonical architectural index `0..16`:
+/// `0=rax, 1=rcx, 2=rdx, 3=rbx, 4=rsp, 5=rbp, 6=rsi, 7=rdi, 8..15=r8..r15`.
+pub fn gpr_name_to_index(tok: &str) -> Option<u8> {
+    Some(match tok.trim() {
+        "rax" | "eax" | "ax" | "al" | "ah" => 0,
+        "rcx" | "ecx" | "cx" | "cl" | "ch" => 1,
+        "rdx" | "edx" | "dx" | "dl" | "dh" => 2,
+        "rbx" | "ebx" | "bx" | "bl" | "bh" => 3,
+        "rsp" | "esp" | "sp" | "spl" => 4,
+        "rbp" | "ebp" | "bp" | "bpl" => 5,
+        "rsi" | "esi" | "si" | "sil" => 6,
+        "rdi" | "edi" | "di" | "dil" => 7,
+        "r8" | "r8d" | "r8w" | "r8b" => 8,
+        "r9" | "r9d" | "r9w" | "r9b" => 9,
+        "r10" | "r10d" | "r10w" | "r10b" => 10,
+        "r11" | "r11d" | "r11w" | "r11b" => 11,
+        "r12" | "r12d" | "r12w" | "r12b" => 12,
+        "r13" | "r13d" | "r13w" | "r13b" => 13,
+        "r14" | "r14d" | "r14w" | "r14b" => 14,
+        "r15" | "r15d" | "r15w" | "r15b" => 15,
+        _ => return None,
+    })
+}
+
+/// Analyze a formatted gadget (`"pop rdi; xor eax,eax; ret"`) and return:
+/// `(defs_mask, clobbers_rsp_arbitrarily)` where:
+/// - `defs_mask` has bit `r` (`0..16`) set for every GP register written by the gadget
+///   (excluding normal stack adjustments on `rsp`),
+/// - `clobbers_rsp_arbitrarily` is `true` if any instruction overwrites `rsp` with a
+///   non-constant stack pivot (`pop rsp`, `mov rsp, ...`, `xchg rsp, ...`, `lea rsp, ...`).
+pub fn analyze_gadget_dataflow(gadget_text: &str) -> (u16, bool) {
+    let mut defs_mask = 0u16;
+    let mut clobbers_rsp = false;
+
+    for raw_stmt in gadget_text.split(';') {
+        let stmt = raw_stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let (mnem, rest) = match stmt.split_once(' ') {
+            Some((m, r)) => (m.trim(), r.trim()),
+            None => (stmt, ""),
+        };
+        match mnem {
+            "ret" | "retn" | "nop" | "cmp" | "test" => {}
+            "leave" => {
+                clobbers_rsp = true;
+                defs_mask |= 1 << 5; // rbp
+            }
+            "pop" => {
+                if let Some(reg_idx) = gpr_name_to_index(rest) {
+                    if reg_idx == 4 {
+                        clobbers_rsp = true;
+                    } else {
+                        defs_mask |= 1 << reg_idx;
+                    }
+                }
+            }
+            "push" | "call" | "jmp" => {}
+            "xchg" => {
+                for op in rest.split(',') {
+                    if let Some(reg_idx) = gpr_name_to_index(op) {
+                        if reg_idx == 4 {
+                            clobbers_rsp = true;
+                        } else {
+                            defs_mask |= 1 << reg_idx;
+                        }
+                    }
+                }
+            }
+            "cdq" | "cqo" => {
+                defs_mask |= 1 << 2; // rdx
+            }
+            "mul" | "imul" if !rest.contains(',') => {
+                defs_mask |= (1 << 0) | (1 << 2); // rax, rdx
+            }
+            _ => {
+                let dst = rest.split(',').next().unwrap_or("").trim();
+                if let Some(reg_idx) = gpr_name_to_index(dst) {
+                    if reg_idx == 4 {
+                        let is_const_adj = (mnem == "add" || mnem == "sub")
+                            && rest
+                                .split(',')
+                                .nth(1)
+                                .map(|rhs| gpr_name_to_index(rhs).is_none() && !rhs.contains('['))
+                                .unwrap_or(false);
+                        if !is_const_adj {
+                            clobbers_rsp = true;
+                        }
+                    } else {
+                        defs_mask |= 1 << reg_idx;
+                    }
+                }
+            }
+        }
+    }
+    (defs_mask, clobbers_rsp)
+}
+
+/// One step in a register-dataflow-constrained ROP chain.
+#[derive(Debug, Clone, Serialize)]
+pub struct DataflowStep {
+    /// Offset of the chosen gadget within the base `.text` section.
+    pub offset: u64,
+    /// Target architectural register index (`0..16`) this step is responsible for setting.
+    pub goal_reg: u8,
+    /// Bitmask of all GP registers defined by this gadget in the base binary.
+    pub defs_mask: u16,
+}
+
+/// An ordered register-dataflow-constrained ROP chain where each step $i$ defines
+/// `goal_regs[i]` without clobbering `RSP` or any register already defined by steps $0..i$.
+#[derive(Debug, Clone, Serialize)]
+pub struct DataflowChain {
+    pub steps: Vec<DataflowStep>,
+}
+
+/// Synthesize a register-dataflow-constrained ROP chain for the ordered `goal_regs`
+/// sequence (`0..16`, e.g. `[7, 6, 2, 0]` for System V `rdi, rsi, rdx, rax`).
+pub fn synthesize_dataflow_chain(
+    base: &GadgetSet,
+    goal_regs: &[u8],
+    rng: &mut Prng,
+) -> Result<DataflowChain> {
+    let analyzed: Vec<(u64, u16, bool)> = base
+        .by_offset
+        .iter()
+        .map(|(&off, text)| {
+            let (defs, clobbers_rsp) = analyze_gadget_dataflow(text);
+            (off, defs, clobbers_rsp)
+        })
+        .collect();
+
+    let mut established_mask = 0u16;
+    let mut steps = Vec::with_capacity(goal_regs.len());
+    for &goal_reg in goal_regs {
+        let goal_bit = 1u16 << goal_reg;
+        let candidates: Vec<(u64, u16)> = analyzed
+            .iter()
+            .filter(|&&(_off, defs, clobbers_rsp)| {
+                !clobbers_rsp && (defs & goal_bit) != 0 && (defs & established_mask) == 0
+            })
+            .map(|&(off, defs, _)| (off, defs))
+            .collect();
+        if candidates.is_empty() {
+            anyhow::bail!(
+                "no non-clobbering gadget found for goal_reg={} with established_mask=0x{:04x}",
+                goal_reg,
+                established_mask
+            );
+        }
+        let idx = rng.below(candidates.len() as u64) as usize;
+        let (offset, defs_mask) = candidates[idx];
+        steps.push(DataflowStep {
+            offset,
+            goal_reg,
+            defs_mask,
+        });
+        established_mask |= goal_bit;
+    }
+    Ok(DataflowChain { steps })
+}
+
+/// Aggregate result of evaluating register-dataflow-constrained ROP chains against a morphed variant.
+#[derive(Debug, Clone, Serialize)]
+pub struct DataflowChainReport {
+    pub chains: usize,
+    pub chain_len: usize,
+    pub static_dataflow_viable: usize,
+    pub static_dataflow_viable_rate: f64,
+    pub mean_step_dataflow_survival: f64,
+    pub relocated_pool_satisfiable: bool,
+}
+
+/// Evaluate `n_chains` register-dataflow-constrained chains for `goal_regs` against `variant`.
+pub fn evaluate_dataflow_chains(
+    base: &GadgetSet,
+    variant: &GadgetSet,
+    goal_regs: &[u8],
+    n_chains: usize,
+    seed: u64,
+) -> Result<DataflowChainReport> {
+    let mut rng = Prng::new(seed);
+    let mut static_viable = 0usize;
+    let mut total_step_hits = 0usize;
+
+    for _ in 0..n_chains {
+        let chain = synthesize_dataflow_chain(base, goal_regs, &mut rng)?;
+        let mut established_mask = 0u16;
+        let mut chain_ok = true;
+        for step in &chain.steps {
+            let goal_bit = 1u16 << step.goal_reg;
+            let step_ok = match variant.by_offset.get(&step.offset) {
+                Some(v_text) => {
+                    let (v_defs, v_clobbers_rsp) = analyze_gadget_dataflow(v_text);
+                    !v_clobbers_rsp && (v_defs & goal_bit) != 0 && (v_defs & established_mask) == 0
+                }
+                None => false,
+            };
+            if step_ok {
+                total_step_hits += 1;
+            } else {
+                chain_ok = false;
+            }
+            established_mask |= goal_bit;
+        }
+        if chain_ok {
+            static_viable += 1;
+        }
+    }
+
+    let mut check_rng = Prng::new(seed ^ 0xA5A5_5A5A);
+    let relocated_pool_satisfiable =
+        synthesize_dataflow_chain(variant, goal_regs, &mut check_rng).is_ok();
+
+    let total_steps = (n_chains * goal_regs.len()).max(1) as f64;
+    Ok(DataflowChainReport {
+        chains: n_chains,
+        chain_len: goal_regs.len(),
+        static_dataflow_viable: static_viable,
+        static_dataflow_viable_rate: static_viable as f64 / (n_chains.max(1) as f64),
+        mean_step_dataflow_survival: total_step_hits as f64 / total_steps,
+        relocated_pool_satisfiable,
+    })
+}
+
+#[cfg(test)]
+mod dataflow_tests {
+    use super::*;
+    use crate::{extract_gadgets, DEFAULT_MAX_INSTRS};
+
+    #[test]
+    fn analyze_gadget_dataflow_tracks_defs_and_rsp_clobbers() {
+        let (defs1, rsp1) = analyze_gadget_dataflow("pop rdi; pop rsi; ret");
+        assert_eq!(defs1, (1 << 7) | (1 << 6));
+        assert!(!rsp1);
+
+        let (defs2, rsp2) = analyze_gadget_dataflow("mov eax, 1; add rsp, 18h; ret");
+        assert_eq!(defs2, 1 << 0);
+        assert!(!rsp2, "constant add rsp, imm must not be flagged as arbitrary rsp clobber");
+
+        let (_defs3, rsp3) = analyze_gadget_dataflow("pop rsp; ret");
+        assert!(rsp3, "pop rsp is a stack pivot and must be flagged");
+    }
+
+    #[test]
+    fn dataflow_chain_synthesis_enforces_non_clobbering_order_and_detects_morph_disruption() {
+        let base_bytes = [0x5F, 0xC3, 0x5E, 0xC3, 0x5A, 0xC3, 0x89, 0xC8, 0xC3];
+        let morph_bytes = [0x41, 0x5C, 0xC3, 0x41, 0x5D, 0xC3, 0x31, 0xC0, 0xC3];
+
+        let base_gs = extract_gadgets(&base_bytes, 0x1000, DEFAULT_MAX_INSTRS);
+        let morph_gs = extract_gadgets(&morph_bytes, 0x1000, DEFAULT_MAX_INSTRS);
+        let goals = [7u8, 6, 2, 0];
+
+        let self_rep = evaluate_dataflow_chains(&base_gs, &base_gs, &goals, 16, 42).unwrap();
+        assert_eq!(self_rep.static_dataflow_viable, 16);
+        assert_eq!(self_rep.static_dataflow_viable_rate, 1.0);
+
+        let morph_rep = evaluate_dataflow_chains(&base_gs, &morph_gs, &goals, 16, 42).unwrap();
+        assert_eq!(morph_rep.static_dataflow_viable, 0);
+        assert!(morph_rep.mean_step_dataflow_survival < 0.5);
+        assert!(!morph_rep.relocated_pool_satisfiable);
+    }
+}
+
+fn _chainsim_tail(ratios: &[f64]) -> Vec<(f64, f64)> {
+    ratios
+        .iter()
+        .map(|&r| (r, cadence_break_even(r, 1.0)))
+        .collect()
+}

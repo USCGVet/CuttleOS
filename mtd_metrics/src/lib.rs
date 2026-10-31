@@ -456,6 +456,85 @@ pub fn read_text_section(path: &std::path::Path) -> Result<(Vec<u8>, u64)> {
     Ok((out, base))
 }
 
+/// Summary of evaluating all $\binom{K}{2}$ pairs across $K$ morphed `.text` variants.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PairwiseDiversityReport {
+    pub variant_count: usize,
+    pub pair_count: usize,
+    pub unique_sha256_count: usize,
+    pub max_pairwise_positional_survival: f64,
+    pub mean_pairwise_positional_survival: f64,
+    pub min_pairwise_byte_diff_fraction: f64,
+    pub mean_pairwise_byte_diff_fraction: f64,
+}
+
+/// Evaluate all $\binom{K}{2}$ pairs among `variants` (`(seed_label, text_bytes, base_ip)`)
+/// to verify that multi-seed diversification produces genuinely distinct pairwise skins
+/// rather than a 2-state involution.
+pub fn evaluate_pairwise_diversity(
+    variants: &[(&str, &[u8], u64)],
+    max_instrs: usize,
+) -> PairwiseDiversityReport {
+    use sha2::{Digest, Sha256};
+
+    let k = variants.len();
+    let mut digests = HashSet::new();
+    let mut gadget_sets = Vec::with_capacity(k);
+
+    for &(_label, bytes, base_ip) in variants {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let d: [u8; 32] = h.finalize().into();
+        digests.insert(d);
+        gadget_sets.push(extract_gadgets(bytes, base_ip, max_instrs));
+    }
+
+    let mut pair_count = 0usize;
+    let mut max_pos_surv = 0.0f64;
+    let mut sum_pos_surv = 0.0f64;
+    let mut min_byte_diff = if k >= 2 { 1.0f64 } else { 0.0f64 };
+    let mut sum_byte_diff = 0.0f64;
+
+    for i in 0..k {
+        for j in (i + 1)..k {
+            pair_count += 1;
+            let rep = churn(&gadget_sets[i], &gadget_sets[j]);
+            let pos = rep.positional_survival();
+            if pos > max_pos_surv {
+                max_pos_surv = pos;
+            }
+            sum_pos_surv += pos;
+
+            let b_i = variants[i].1;
+            let b_j = variants[j].1;
+            let min_len = b_i.len().min(b_j.len());
+            let max_len = b_i.len().max(b_j.len()).max(1);
+            let mut diffs = b_i.len().abs_diff(b_j.len());
+            for idx in 0..min_len {
+                if b_i[idx] != b_j[idx] {
+                    diffs += 1;
+                }
+            }
+            let diff_frac = (diffs as f64) / (max_len as f64);
+            if diff_frac < min_byte_diff {
+                min_byte_diff = diff_frac;
+            }
+            sum_byte_diff += diff_frac;
+        }
+    }
+
+    let denom = (pair_count.max(1)) as f64;
+    PairwiseDiversityReport {
+        variant_count: k,
+        pair_count,
+        unique_sha256_count: digests.len(),
+        max_pairwise_positional_survival: max_pos_surv,
+        mean_pairwise_positional_survival: sum_pos_surv / denom,
+        min_pairwise_byte_diff_fraction: min_byte_diff,
+        mean_pairwise_byte_diff_fraction: sum_byte_diff / denom,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,5 +656,25 @@ mod tests {
         // pop rax (0x58) ; call rax (0xff 0xd0)
         let g = extract_gadgets(&[0x58, 0xFF, 0xD0], 0, DEFAULT_MAX_INSTRS);
         assert_eq!(g.by_offset.get(&0).map(String::as_str), Some("pop rax; call rax"));
+    }
+
+    #[test]
+    fn pairwise_diversity_matrix_proves_multi_seed_variants_are_mutually_distinct() {
+        let v1: &[u8] = &[0x58, 0x48, 0x89, 0xD8, 0xC3];
+        let v2: &[u8] = &[0x5B, 0x48, 0x8D, 0x03, 0xC3];
+        let v3: &[u8] = &[0x59, 0x48, 0x31, 0xC0, 0xC3];
+        let v4: &[u8] = &[0x5A, 0x48, 0x29, 0xC0, 0xC3];
+        let rep = evaluate_pairwise_diversity(
+            &[("s1", v1, 0x1000), ("s2", v2, 0x1000), ("s3", v3, 0x1000), ("s4", v4, 0x1000)],
+            DEFAULT_MAX_INSTRS,
+        );
+        assert_eq!(rep.variant_count, 4);
+        assert_eq!(rep.pair_count, 6);
+        assert_eq!(rep.unique_sha256_count, 4);
+        assert!(rep.min_pairwise_byte_diff_fraction >= 0.4);
+        assert!(rep.mean_pairwise_positional_survival < 0.6);
+    }
+
+    fn _tail_marker() {
     }
 }
