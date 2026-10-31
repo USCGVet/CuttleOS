@@ -826,8 +826,14 @@ impl SqlDb {
             return copy_str(b"error: table not found\n", out);
         };
         let (off_tok, after_off) = next_token(after_tname);
-        let offset = if off_tok.is_empty() {
-            0usize
+        let (offset, limit) = if off_tok.is_empty() {
+            (0usize, 3usize)
+        } else if eq_ignore_ascii_case(off_tok, b"digest") {
+            let (extra_tok, _) = next_token(after_off);
+            if !extra_tok.is_empty() {
+                return copy_str(b"usage: .dump <table> [offset] [limit]\n", out);
+            }
+            (0usize, 0usize)
         } else {
             let Some(v) = parse_i64(off_tok) else {
                 return copy_str(b"usage: .dump <table> [offset] [limit]\n", out);
@@ -835,19 +841,23 @@ impl SqlDb {
             if v < 0 {
                 return copy_str(b"usage: .dump <table> [offset] [limit]\n", out);
             }
-            v as usize
-        };
-        let (lim_tok, _) = next_token(after_off);
-        let limit = if lim_tok.is_empty() {
-            3usize
-        } else {
-            let Some(v) = parse_i64(lim_tok) else {
-                return copy_str(b"usage: .dump <table> [offset] [limit]\n", out);
+            let (lim_tok, _) = next_token(after_off);
+            let lim = if lim_tok.is_empty() {
+                3usize
+            } else {
+                let Some(lv) = parse_i64(lim_tok) else {
+                    return copy_str(b"usage: .dump <table> [offset] [limit]\n", out);
+                };
+                if lv < 0 {
+                    return copy_str(b"usage: .dump <table> [offset] [limit]\n", out);
+                }
+                if lv == 0 {
+                    0usize
+                } else {
+                    (lv as usize).clamp(1, 3)
+                }
             };
-            if v <= 0 {
-                return copy_str(b"usage: .dump <table> [offset] [limit]\n", out);
-            }
-            (v as usize).clamp(1, 3)
+            (v as usize, lim)
         };
 
         let use_committed = self.tx_active && self.tx_owner != owner;
@@ -3114,5 +3124,48 @@ mod tests {
         let na = db_a.exec(b".dump t 0 3", &mut out_a);
         let nb = db_b.exec(b".dump t 0 3", &mut out_b);
         assert_eq!(&out_a[..na], &out_b[..nb]);
+    }
+
+    #[test]
+    fn sqldump_digest_only_mode_matches_full_dump_header_and_rejects_bad_args() {
+        let mut db = SqlDb::new();
+        let mut out_full = [0u8; 1024];
+        let mut out_dig = [0u8; 1024];
+        let _ = db.exec(
+            b"INSERT OR REPLACE INTO kv VALUES ('v:secret', 'cipher-a', 100)",
+            &mut out_full,
+        );
+        let _ = db.exec(
+            b"INSERT OR REPLACE INTO kv VALUES ('app.k', 'val', 2)",
+            &mut out_full,
+        );
+
+        let n_full = db.exec(b".dump kv 0 3", &mut out_full);
+        let s_full = core::str::from_utf8(&out_full[..n_full]).unwrap();
+        let full_hdr = s_full.lines().next().unwrap();
+
+        let n_dig = db.exec(b".dump kv digest", &mut out_dig);
+        let s_dig = core::str::from_utf8(&out_dig[..n_dig]).unwrap();
+        let dig_lines: [&str; 1] = [s_dig.trim_end_matches('\n')];
+        assert!(!s_dig.contains("\nrow "), "digest-only .dump must not emit row lines: {s_dig}");
+        assert!(
+            dig_lines[0].starts_with("sqldump table=kv rows=4 off=0 count=0 digest="),
+            "unexpected digest header: {}",
+            dig_lines[0]
+        );
+        // Header matches full dump header except count=0 instead of count=3
+        let expected_dig_hdr = full_hdr.replace(" count=3 ", " count=0 ");
+        assert_eq!(dig_lines[0], expected_dig_hdr);
+
+        // `.dump kv 0 0` also returns the same digest-only header
+        let mut out_z = [0u8; 1024];
+        let n_z = db.exec(b".dump kv 0 0", &mut out_z);
+        assert_eq!(&out_z[..n_z], &out_dig[..n_dig]);
+
+        // Extra token after `digest` or negative limit is rejected with usage
+        let n_bad1 = db.exec(b".dump kv digest extra", &mut out_z);
+        assert!(out_z[..n_bad1].starts_with(b"usage: .dump"));
+        let n_bad2 = db.exec(b".dump kv 0 -1", &mut out_z);
+        assert!(out_z[..n_bad2].starts_with(b"usage: .dump"));
     }
 }

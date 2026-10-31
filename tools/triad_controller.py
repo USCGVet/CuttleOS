@@ -118,6 +118,8 @@ WAL_PROBE_FORMAT_VERSION = 2
 
 def _is_genesis_sql_probe(probe_str: str) -> bool:
     """True when `probe_str` holds only the 3 default genesis `kv` rows (`cluster.role`, `mtd.policy`, `boot.state`)."""
+    if _GENESIS_KV_PROBE_MARKER in probe_str and len(probe_str.splitlines()) <= 2:
+        return True
     return (
         (
             "cluster.role|primary|1" in probe_str
@@ -376,7 +378,7 @@ def format_kernel_sqldump_reply(
     Format a `.dump <table> [offset] [limit]` reply chunk using the exact 64-bit FNV-1a
     table digest and hex cell framing emitted by `SqlDb::exec_dump` (`sql.rs:815`).
     """
-    limit = max(1, min(3, int(limit)))
+    limit = max(0, min(3, int(limit)))
     offset = max(0, int(offset))
     is_kv = table.lower() == "kv"
 
@@ -477,6 +479,21 @@ def format_kernel_sqldump_reply(
         cur_bytes += rline_bytes
     hdr = f"{hdr_prefix}{len(fitted_rows)}{hdr_suffix}"
     return "\n".join([hdr] + fitted_rows)
+
+
+_GENESIS_KV_PROBE_MARKER = (
+    "k|v|rev #rows=3 digest="
+    + re.search(
+        r"digest=([0-9a-f]{16})",
+        format_kernel_sqldump_reply(
+            "kv",
+            [("k", "TEXT"), ("v", "TEXT"), ("rev", "INT")],
+            [("cluster.role", "primary", 1), ("mtd.policy", "binmorph-7pass", 1), ("boot.state", "ready", 1)],
+            0,
+            0,
+        ),
+    ).group(1)
+)
 
 
 class RealOsShellHarness:
@@ -1019,9 +1036,9 @@ class TriadController:
         Take a consistent full-state checkpoint when all 3 nodes (or a 2-of-3 online majority
         when 1 node is offline/catching up) are at `triad_tx_seq` and agree on every vote
         table's lossless chunked `.dump` (row count, kernel table digest, and normalized rows).
-        Records each non-`kv` table's DDL (`CREATE TABLE` / `CREATE INDEX`), `DELETE FROM <table>`,
-        and lossless `INSERT` statements (plus encrypted `vault` records for active `v:*` keys)
-        into `self.wal_checkpoint` at `checkpoint_tx_seq`, clearing superseded `self.wal_entries`.
+        Fetches the table dumps across `ready_nodes` in parallel outside `wal_lock` so
+        checkpoints do not hold `wal_lock` across serial round trips, then re-acquires
+        `wal_lock` to verify `triad_tx_seq` is unchanged and persist `self.wal_checkpoint`.
         """
         if not self.spec.has_sql:
             return False
@@ -1031,10 +1048,51 @@ class TriadController:
                 and self.triad_tx_seq <= self.wal_checkpoint.get("tx_seq", 0)
             ):
                 return False
+            target_tx_seq = self.triad_tx_seq
             ready_nodes = [
-                n for n in self.nodes if n.state == "ONLINE" and n.tx_seq == self.triad_tx_seq
+                n for n in self.nodes if n.state == "ONLINE" and n.tx_seq == target_tx_seq
             ]
             if len(ready_nodes) < 2:
+                return False
+
+        # Dump each vote table across `ready_nodes` in parallel outside `self.wal_lock`.
+        table_dumps: dict[str, dict] = {}
+        probe_parts_per_node: list[list[str]] = [[] for _ in ready_nodes]
+        digest_parts_per_node: list[list[str]] = [[] for _ in ready_nodes]
+        fallback_col_types: dict[str, list[str]] = {}
+        for table in self.spec.vote_tables:
+            dumps = self._dump_nodes_table_in_parallel(ready_nodes, table)
+            if any(d is None for d in dumps):
+                return False
+            first = dumps[0]
+            assert first is not None
+            for d in dumps[1:]:
+                assert d is not None
+                if (
+                    d["rows_count"] != first["rows_count"]
+                    or d["kernel_digest"] != first["kernel_digest"]
+                    or d["probe_text"] != first["probe_text"]
+                ):
+                    return False
+            table_dumps[table] = first
+            if table != "kv" and not first.get("ddl"):
+                fallback_col_types[table] = self._extract_table_col_types(table, ready_nodes[0])
+            for idx, d in enumerate(dumps):
+                assert d is not None
+                probe_parts_per_node[idx].append(d["probe_text"])
+                digest_parts_per_node[idx].append(d["digest_probe_text"])
+
+        probes = ["\n--\n".join(parts) for parts in probe_parts_per_node]
+        if not all(p == probes[0] for p in probes):
+            return False
+        digest_probes = ["\n--\n".join(parts) for parts in digest_parts_per_node]
+
+        with self.wal_lock:
+            if (
+                self.wal_pending_tx is not None
+                or self.triad_tx_seq != target_tx_seq
+                or any(n.state != "ONLINE" or n.tx_seq != target_tx_seq for n in ready_nodes)
+            ):
                 return False
             if len(ready_nodes) < len(self.nodes):
                 down_names = [n.name.split()[0] for n in self.nodes if n not in ready_nodes]
@@ -1043,31 +1101,6 @@ class TriadController:
                     f"Taking {len(ready_nodes)}/3 majority WAL checkpoint at tx_seq={self.triad_tx_seq} "
                     f"while {down_names} is offline/catching up; lagging node will rebuild from checkpoint.",
                 )
-
-            table_dumps: dict[str, dict] = {}
-            probe_parts_per_node: list[list[str]] = [[] for _ in ready_nodes]
-            for table in self.spec.vote_tables:
-                dumps = [self._dump_node_sql_table(n, table) for n in ready_nodes]
-                if any(d is None for d in dumps):
-                    return False
-                first = dumps[0]
-                assert first is not None
-                for d in dumps[1:]:
-                    assert d is not None
-                    if (
-                        d["rows_count"] != first["rows_count"]
-                        or d["kernel_digest"] != first["kernel_digest"]
-                        or d["probe_text"] != first["probe_text"]
-                    ):
-                        return False
-                table_dumps[table] = first
-                for idx, d in enumerate(dumps):
-                    assert d is not None
-                    probe_parts_per_node[idx].append(d["probe_text"])
-
-            probes = ["\n--\n".join(parts) for parts in probe_parts_per_node]
-            if not all(p == probes[0] for p in probes):
-                return False
 
             # Collect active encrypted/plain vault put commands in order up to triad_tx_seq.
             vault_records: dict[str, str] = {}
@@ -1095,7 +1128,7 @@ class TriadController:
                 if table != "kv":
                     ddl_str = tdump.get("ddl") or ""
                     if not ddl_str:
-                        col_types = self._extract_table_col_types(table, ready_nodes[0])
+                        col_types = fallback_col_types.get(table) or self._extract_table_col_types(table, None)
                         if col_types:
                             ddl_str = f"CREATE TABLE {table} (" + ", ".join(
                                 f"c{i} {ct}" for i, ct in enumerate(col_types)
@@ -1154,7 +1187,7 @@ class TriadController:
             self.wal_checkpoint_legacy = False
             self.wal_probe_format_mismatch = False
             self.wal_entries = [(tid, s) for tid, s in self.wal_entries if tid > cp_seq]
-            digest = hashlib.sha256(probes[0].encode("utf-8")).hexdigest()
+            digest = hashlib.sha256(digest_probes[0].encode("utf-8")).hexdigest()
             self.triad_state_digest = digest
             for n in ready_nodes:
                 n.state_digest = digest
@@ -1845,6 +1878,9 @@ class TriadController:
         if idx_ddl:
             probe_hdr += f" idx={idx_ddl}"
         probe_text = "\n".join([probe_hdr] + probe_rows)
+        select_text = "\n".join(select_lines)
+        if table.lower() == "kv":
+            node.last_sql_table = select_text
         return {
             "table": table,
             "rows_count": total_rows,
@@ -1852,16 +1888,120 @@ class TriadController:
             "ddl": ddl,
             "idx_ddl": idx_ddl,
             "rows": all_rows,
+            "digest_probe_text": probe_hdr,
             "probe_text": probe_text,
-            "select_text": "\n".join(select_lines),
+            "select_text": select_text,
         }
+
+    def _probe_node_sql_table_digest(self, node: TriadNode, table: str) -> str | None:
+        """
+        Query `table` on `node` using the single-round-trip digest-only `.dump <table> digest`
+        command (returning `rows=` and the kernel's 64-bit FNV-1a table `digest=` with `count=0`
+        and no row lines).
+        """
+        out = self.send_shell_cmd(
+            node, f"sql /*triad*/ .dump {table} digest", timeout=4.0
+        )
+        if not out or out.lower().startswith("error") or out.lower().startswith("usage"):
+            return None
+        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        if len(lines) != 1:
+            return None
+        m = SQLDUMP_HEADER_RE.match(lines[0])
+        if not m:
+            return None
+        rep_table, rep_rows_s, rep_off_s, rep_count_s, rep_digest, ddl_hex, idx_ddl_hex = m.groups()
+        rep_rows, rep_off, rep_count = int(rep_rows_s), int(rep_off_s), int(rep_count_s)
+        if rep_table.lower() != table.lower() or rep_off != 0 or rep_count != 0:
+            return None
+        col_names: list[str] = []
+        if ddl_hex:
+            try:
+                ddl = bytes.fromhex(ddl_hex).decode("ascii")
+            except Exception:
+                return None
+            m_ddl = re.search(r"\(([^)]+)\)", ddl)
+            if m_ddl:
+                for cdef in m_ddl.group(1).split(","):
+                    parts = cdef.strip().split()
+                    if parts:
+                        col_names.append(parts[0])
+        if not col_names:
+            return None
+        idx_ddl = ""
+        if idx_ddl_hex:
+            try:
+                idx_ddl = bytes.fromhex(idx_ddl_hex).decode("ascii")
+            except Exception:
+                return None
+        col_hdr = "|".join(col_names)
+        probe_hdr = f"{col_hdr} #rows={rep_rows} digest={rep_digest}"
+        if idx_ddl:
+            probe_hdr += f" idx={idx_ddl}"
+        return probe_hdr
+
+    def _dump_nodes_table_in_parallel(
+        self, nodes: list[TriadNode], table: str
+    ) -> list[dict | None]:
+        """Fetch full chunked `.dump` for `table` across `nodes` in parallel threads."""
+        if not nodes:
+            return []
+        if len(nodes) == 1:
+            return [self._dump_node_sql_table(nodes[0], table)]
+        results: list[dict | None] = [None] * len(nodes)
+
+        def _worker(idx: int, n: TriadNode):
+            results[idx] = self._dump_node_sql_table(n, table)
+
+        threads = [
+            threading.Thread(target=_worker, args=(idx, n), daemon=True)
+            for idx, n in enumerate(nodes)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return results
+
+    def _probe_nodes_in_parallel(
+        self, nodes: list[TriadNode], retry_none: bool = False, max_attempts: int = 2
+    ) -> dict[int, str | None]:
+        """
+        Probe `self._state_probe(n)` across `nodes` in parallel (each `TriadNode` has its own
+        `cmd_lock`). When `retry_none` is True, retries any `None` probe up to `max_attempts`.
+        """
+        attempts = max(2, max_attempts) if retry_none else 1
+        outputs: dict[int, str | None] = {}
+
+        def _worker(n: TriadNode):
+            res = None
+            for attempt in range(attempts):
+                res = self._state_probe(n)
+                if res is not None:
+                    break
+                if attempt + 1 < attempts:
+                    time.sleep(0.05)
+            outputs[n.node_id] = res
+
+        if len(nodes) <= 1:
+            for n in nodes:
+                _worker(n)
+            return outputs
+
+        threads = [threading.Thread(target=_worker, args=(n,), daemon=True) for n in nodes]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return outputs
 
     def _state_probe(self, node: TriadNode) -> str | None:
         """
         The node's replicated state as compared by the 2-of-3 vote, or None if unreadable.
-        SQL-capable roles compare the spec's vote tables via lossless chunked `.dump`; a web
-        front end (`wfe`, no svc-sql) compares every served file's path, size, and SHA-256
-        content digest.
+        SQL-capable roles compare the spec's vote tables via single-round-trip digest-only
+        `.dump <table> digest` (fetching full rows only for checkpoints or to diagnose a
+        mismatch); a web front end (`wfe`, no svc-sql) compares every served file's path,
+        size, and SHA-256 content digest.
         """
         if not self.spec.has_sql:
             ls_out = self.send_shell_cmd(node, "ls", timeout=4.0)
@@ -1896,12 +2036,10 @@ class TriadController:
             return "\n".join(file_entries)
         parts = []
         for table in self.spec.vote_tables:
-            tdump = self._dump_node_sql_table(node, table)
-            if tdump is None:
+            hdr = self._probe_node_sql_table_digest(node, table)
+            if hdr is None:
                 return None
-            if table == "kv":
-                node.last_sql_table = tdump["select_text"]
-            parts.append(tdump["probe_text"])
+            parts.append(hdr)
         return "\n--\n".join(parts)
 
     def _state_fingerprint(self, node: TriadNode) -> str | None:
@@ -1959,12 +2097,9 @@ class TriadController:
         if len(online_nodes) >= 2:
             with self.wal_lock:
                 probed_tx_seq = self.triad_tx_seq
-            # Read each online node's replicated state to verify 2-of-3 majority consistency.
-            # Retry any None probe once before evaluating consensus.
-            outputs = {n.node_id: self._state_probe(n) for n in online_nodes}
-            for n in online_nodes:
-                if outputs.get(n.node_id) is None:
-                    outputs[n.node_id] = self._state_probe(n)
+            # Probe all online nodes in parallel (each node has its own `cmd_lock`),
+            # retrying any None probe once before evaluating consensus.
+            outputs = self._probe_nodes_in_parallel(online_nodes, retry_none=True, max_attempts=2)
 
             # Check if any node diverges from the 2-of-3 majority!
             if len(online_nodes) == 3:
@@ -1992,6 +2127,11 @@ class TriadController:
                     with self.wal_lock:
                         if self.triad_tx_seq != probed_tx_seq:
                             return
+                    # When a digest mismatch is detected on a SQL role, fetch full rows in parallel
+                    # to diagnose the mismatch across vote tables.
+                    if self.spec.has_sql and len({x for x in (o1, o2, o3) if x is not None}) >= 2:
+                        for table in self.spec.vote_tables:
+                            self._dump_nodes_table_in_parallel(online_nodes, table)
                     # 2-of-3 Majority Vote identifies the exact tampered/corrupted (or unreadable) node!
                     corrupted = None
                     if o2 is not None and o3 is not None and o2 == o3 and o1 != o2:
@@ -2005,7 +2145,7 @@ class TriadController:
                             return
                         if not self.spec.has_sql:
                             # Confirm non-SQL (wfe) divergence across a second probe before wiping disks
-                            recheck = {n.node_id: self._state_probe(n) for n in online_nodes}
+                            recheck = self._probe_nodes_in_parallel(online_nodes, retry_none=False)
                             peer_ids = [i for i in (1, 2, 3) if i != corrupted.node_id]
                             if (
                                 recheck.get(peer_ids[0]) is None
@@ -2953,8 +3093,9 @@ class TriadController:
         node_fps: dict[int, str | None] = {}
         pre_nodes: list[TriadNode] = []
         cand_nodes: list[TriadNode] = []
+        probes_by_id = self._probe_nodes_in_parallel(online_nodes, retry_none=True, max_attempts=2)
         for n in online_nodes:
-            probe = self._state_probe(n)
+            probe = probes_by_id.get(n.node_id)
             fp = hashlib.sha256(probe.encode("utf-8")).hexdigest() if probe is not None else None
             node_fps[n.node_id] = fp
             node_expected_pre = self.restored_node_digests.get(n.node_id) or expected_pre
@@ -2965,7 +3106,7 @@ class TriadController:
                     cand_nodes.append(n)
             else:
                 p_str = probe or ""
-                is_genesis = "cluster.role|primary|1" in p_str and len(p_str.splitlines()) <= 4
+                is_genesis = _is_genesis_sql_probe(p_str)
                 if is_genesis:
                     pre_nodes.append(n)
                 elif fp is not None:
@@ -3100,17 +3241,8 @@ class TriadController:
         if self.wal_probe_format_mismatch and self.triad_tx_seq > 0:
             online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
             if len(online_nodes) == 3:
-                probes: dict[int, str] = {}
-                for node in online_nodes:
-                    p = None
-                    for attempt in range(3):
-                        p = self._state_probe(node)
-                        if p is not None:
-                            break
-                        if attempt < 2:
-                            time.sleep(0.05)
-                    if p is not None:
-                        probes[node.node_id] = p
+                raw_probes = self._probe_nodes_in_parallel(online_nodes, retry_none=True, max_attempts=3)
+                probes = {nid: p for nid, p in raw_probes.items() if p is not None}
                 if len(probes) == 3 and len(set(probes.values())) == 1:
                     common_probe = next(iter(probes.values()))
                     genesis_only = _is_genesis_sql_probe(common_probe) and (
@@ -3138,17 +3270,38 @@ class TriadController:
 
         if not self.restored_tx_seq_nodes:
             return
-        for n in list(self.restored_tx_seq_nodes):
-            node = self.nodes[n - 1]
-            if node.state != "ONLINE":
-                continue
-            actual_fp = None
+        restored_online = [
+            self.nodes[nid - 1]
+            for nid in sorted(self.restored_tx_seq_nodes)
+            if self.nodes[nid - 1].state == "ONLINE"
+        ]
+        fps_by_id: dict[int, str | None] = {}
+
+        def _fp_worker(node: TriadNode):
+            fp = None
             for attempt in range(3):
-                actual_fp = self._state_fingerprint(node)
-                if actual_fp is not None:
+                fp = self._state_fingerprint(node)
+                if fp is not None:
                     break
                 if attempt < 2:
                     time.sleep(0.05)
+            fps_by_id[node.node_id] = fp
+
+        if len(restored_online) <= 1:
+            for node in restored_online:
+                _fp_worker(node)
+        else:
+            threads = [
+                threading.Thread(target=_fp_worker, args=(node,), daemon=True)
+                for node in restored_online
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        for node in restored_online:
+            actual_fp = fps_by_id.get(node.node_id)
             if actual_fp is None:
                 self.log_event(
                     "WARN",
@@ -3186,13 +3339,9 @@ class TriadController:
         ]
         if not pending or self.triad_tx_seq == 0 or not self.spec.has_sql:
             return
-        probes = {}
-        for n in self.nodes:
-            if n.state != "ONLINE":
-                continue
-            p = self._state_probe(n)
-            if p is not None:
-                probes[n.node_id] = p
+        online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
+        raw_probes = self._probe_nodes_in_parallel(online_nodes, retry_none=True, max_attempts=2)
+        probes = {nid: p for nid, p in raw_probes.items() if p is not None}
         vals = list(probes.values())
         if len(vals) < 2:
             return
@@ -4766,6 +4915,73 @@ def run_unit_self_tests():
             # Verify nodes 1 and 3 still hold all 49 rows (not wiped by the lossy pre-.dump checkpoint)
             kv_n1_intact = refuse_ctrl._dump_node_sql_table(refuse_ctrl.nodes[0], "kv")
             assert kv_n1_intact is not None and kv_n1_intact["rows_count"] == 49
+
+            # Low #6 (Round 8):
+            # 6a. `_state_probe` uses digest-only `.dump <table> digest` (1 command per vote table,
+            #     0 chunked `.dump <table> <off> 3` commands) even when `kv` holds 49 rows!
+            cp_ctrl.heal_and_remorph_node(cp_ctrl.nodes[1])
+            seen_cmds: list[str] = []
+            seen_lock = threading.Lock()
+            orig_send_6 = cp_ctrl.send_shell_cmd
+
+            def track_send_6(node, cmd, timeout=4.0):
+                with seen_lock:
+                    seen_cmds.append(f"{node.node_id}:{cmd}")
+                return orig_send_6(node, cmd, timeout)
+
+            cp_ctrl.send_shell_cmd = track_send_6
+            try:
+                cp_ctrl.compute_and_verify_raid_parity()
+                assert cp_ctrl.parity_syndrome_ok
+                digest_cmds = [c for c in seen_cmds if ".dump " in c and c.endswith(" digest")]
+                chunk_cmds = [c for c in seen_cmds if re.search(r"\.dump\s+\S+\s+\d+\s+\d+", c)]
+                assert len(digest_cmds) == 3 * len(cp_ctrl.spec.vote_tables), (
+                    f"Expected exactly 1 digest-only .dump per table per node (9 total), got {digest_cmds}"
+                )
+                assert len(chunk_cmds) == 0, (
+                    f"Agreeing 3/3 parity vote must not issue chunked row dumps: {chunk_cmds}"
+                )
+
+                # 6b. When a node diverges, `compute_and_verify_raid_parity` detects the digest
+                #     mismatch via `.dump <table> digest` and only then fetches full chunked row
+                #     dumps to diagnose the mismatch and heal the diverged node.
+                seen_cmds.clear()
+                orig_send_6(
+                    cp_ctrl.nodes[1],
+                    "sql /*triad*/ INSERT OR REPLACE INTO kv VALUES ('tamper.6b', 'bad', 77)",
+                )
+                cp_ctrl.compute_and_verify_raid_parity()
+                deadline_6b = time.time() + 5.0
+                while cp_ctrl.nodes[1].state != "ONLINE" and time.time() < deadline_6b:
+                    time.sleep(0.02)
+                chunk_cmds_on_mismatch = [
+                    c for c in seen_cmds if re.search(r"\.dump\s+\S+\s+\d+\s+\d+", c)
+                ]
+                assert len(chunk_cmds_on_mismatch) > 0, (
+                    "Mismatch in compute_and_verify_raid_parity must fetch full row dumps to diagnose"
+                )
+
+                # 6c. `checkpoint_wal` does NOT hold `wal_lock` while fetching table `.dump`s across nodes.
+                wal_locked_during_dump = []
+
+                def check_lock_send(node, cmd, timeout=4.0):
+                    if ".dump " in cmd:
+                        acquired = cp_ctrl.wal_lock.acquire(blocking=False)
+                        if acquired:
+                            cp_ctrl.wal_lock.release()
+                        wal_locked_during_dump.append(not acquired)
+                    return orig_send_6(node, cmd, timeout)
+
+                cp_ctrl.send_shell_cmd = check_lock_send
+                cp_ctrl.triad_tx_seq += 1
+                for n in cp_ctrl.nodes:
+                    n.tx_seq = cp_ctrl.triad_tx_seq
+                assert cp_ctrl.checkpoint_wal()
+                assert wal_locked_during_dump and not any(wal_locked_during_dump), (
+                    f"checkpoint_wal must release wal_lock during .dump round trips: {wal_locked_during_dump}"
+                )
+            finally:
+                cp_ctrl.send_shell_cmd = orig_send_6
         finally:
             cp_harness.close()
 
@@ -4967,9 +5183,13 @@ def run_unit_self_tests():
 
         def fake_idx_cmd(node, cmd, timeout=4.0):
             t = idx_tables[node.node_id]
-            m_dump = re.search(r"\.dump\s+(\S+)\s+(\d+)\s+(\d+)", cmd)
+            m_dump = re.search(r"\.dump\s+(\S+)\s+(?:(digest)|(\d+)\s+(\d+))", cmd, re.I)
             if m_dump:
-                tname, off, lim = m_dump.group(1), int(m_dump.group(2)), int(m_dump.group(3))
+                tname = m_dump.group(1)
+                if m_dump.group(2):
+                    off, lim = 0, 0
+                else:
+                    off, lim = int(m_dump.group(3)), int(m_dump.group(4))
                 if tname == "kv":
                     parsed = [
                         (parts[0], parts[1], int(parts[2]))
@@ -5062,10 +5282,13 @@ def run_unit_self_tests():
                     s = s[len("sql /*triad*/") :].strip()
                 elif s.startswith("sql "):
                     s = s[4:].strip()
-                m_dump = re.match(r"^\.dump\s+kv(?:\s+(\d+)(?:\s+(\d+))?)?$", s, re.I)
+                m_dump = re.match(r"^\.dump\s+kv(?:\s+(?:(digest)|(\d+)(?:\s+(\d+))?))?$", s, re.I)
                 if m_dump:
-                    off = int(m_dump.group(1)) if m_dump.group(1) else 0
-                    lim = int(m_dump.group(2)) if m_dump.group(2) else 3
+                    if m_dump.group(1):
+                        off, lim = 0, 0
+                    else:
+                        off = int(m_dump.group(2)) if m_dump.group(2) else 0
+                        lim = int(m_dump.group(3)) if m_dump.group(3) else 3
                     return format_kernel_sqldump_reply(
                         "kv", [("k", "TEXT"), ("v", "TEXT"), ("rev", "INT")], rows, off, lim
                     )
