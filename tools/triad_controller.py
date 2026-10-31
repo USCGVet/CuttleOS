@@ -3978,6 +3978,12 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self._is_authenticated():
+            try:
+                cl = int(self.headers.get("Content-Length", "0"))
+                if 0 < cl <= MAX_HTTP_BODY_BYTES:
+                    self.rfile.read(cl)
+            except Exception:
+                pass
             return self._send_json(
                 401,
                 {"ok": False, "error": "unauthorized: provide valid X-Cuttle-Session or Authorization: Bearer token"},
@@ -4121,6 +4127,52 @@ def https_probe(node: TriadNode, path: str = "/healthz") -> tuple[str, str, str]
     return sha, version, cipher
 
 
+# Explicit Triad 2-of-3 TMR + WAL + RAID-5 XOR Failure Model:
+# Specifies which faults are masked/healed automatically ("tolerated") versus which faults
+# must fail closed without serving unverified data or blindly overwriting replicas ("fail_closed").
+TRIAD_FAILURE_MODEL = {
+    "tolerated": {
+        "single_node_crash_or_morph": (
+            "1 of 3 nodes offline/morphing while remaining 2 online nodes agree (2/3 majority active)."
+        ),
+        "single_node_mid_commit_drop": (
+            "1 of 3 nodes drops mid-write while 2 nodes commit; dropped node stays at prior tx_seq "
+            "or is isolated until WAL delta replay / RAID-5 XOR heal completes."
+        ),
+        "single_node_byzantine_divergence": (
+            "1 of 3 nodes returns divergent SQL/WFE state or corrupted 4 KiB CTTLSQL1 partition; "
+            "outvoted 2-to-1 by healthy peers, isolated, reconstructed via D_lost = D_peer ^ P + WAL, "
+            "and emergency-remorphed with a fresh binmorph seed."
+        ),
+        "torn_tmp_wal_or_pending_tx_crash": (
+            "Coordinator crash leaving orphan triad_wal.json.tmp or uncommitted wal_pending_tx; "
+            "reconciled at boot by verifying 2/3 post-state digest or rolling back uncommitted entry."
+        ),
+    },
+    "fail_closed": {
+        "quorum_loss_0of3_or_1of3": (
+            "Fewer than 2 online nodes available (0/3 or 1/3); all reads, writes, and rolling morphs refused."
+        ),
+        "three_way_byzantine_split_brain": (
+            "All 3 online nodes return pairwise-distinct states (N1 != N2 != N3); reads and parity "
+            "heals fail closed without overwriting any replica."
+        ),
+        "degraded_2of2_split_brain": (
+            "1 node offline/morphing and the 2 remaining online nodes disagree (N1 != N2); "
+            "reads and writes fail closed."
+        ),
+        "tampered_or_rolled_back_raid5_parity": (
+            "Reconstructed 4 KiB CTTLSQL1 partition fails constant-time HMAC-SHA256 seal or has "
+            "stale state_hash / tx_seq < donor peer; heal refused (ImaVerificationFailed)."
+        ),
+        "persistent_heal_loop": (
+            f"Node diverges > MAX_CONSECUTIVE_HEALS ({MAX_CONSECUTIVE_HEALS}) consecutive times; "
+            "permanently marked OFFLINE until operator intervention."
+        ),
+    },
+}
+
+
 def run_fault_injection_unit_tests() -> None:
     """
     Deterministic, fast (no-QEMU) fault-injection verification suite for:
@@ -4133,6 +4185,8 @@ def run_fault_injection_unit_tests() -> None:
     """
     import tempfile
 
+    assert set(TRIAD_FAILURE_MODEL.keys()) == {"tolerated", "fail_closed"}
+    assert len(TRIAD_FAILURE_MODEL["tolerated"]) == 4 and len(TRIAD_FAILURE_MODEL["fail_closed"]) == 5
     print("[triad-fault-suite] running deterministic Quorum, Split-Brain, WAL & RAID XOR fault-injection tests...")
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -5705,6 +5759,112 @@ def run_unit_self_tests():
             e["level"] == "ALERT" and "exceeded" in e["msg"] and "consecutive heals" in e["msg"]
             for e in hm_ctrl.events
         )
+
+        # Sustained Multi-Fault Campaign on RealOsShellHarness:
+        # Tests (a) mid-commit node drop during a mutating write, (b) torn/orphan `.tmp` WAL file
+        # + controller restart catch-up, (c) multi-round interleaved writes + single-node Byzantine
+        # state tamper + heal + morph, and (d) 3-way split-brain fail-closed refusal.
+        sustained_dir = tmp_dir / "sustained_campaign"
+        sc_ctrl = TriadController(
+            show_gui=False,
+            spec=TriadSpec(name="sustained-campaign", state_dir=sustained_dir, write_operator_token=False),
+            unit_test=True,
+        )
+        sc_ctrl.shutdown()
+        for n in sc_ctrl.nodes:
+            n.state = "ONLINE"
+        sc_harness = RealOsShellHarness()
+        try:
+            sc_ctrl.send_shell_cmd = sc_harness.exec
+            for n in sc_ctrl.nodes:
+                sc_ctrl._reset_sql_vote_tables(n)
+
+            # Stage A: Mid-commit node drop on Node 3 during mutating Write #1
+            drop_node3 = {"active": True}
+
+            def _send_with_mid_commit_drop(node: TriadNode, cmd: str, timeout: float = 4.0) -> str:
+                if drop_node3["active"] and node.node_id == 3 and "INSERT" in cmd:
+                    return ""  # Simulate Node 3 dropping mid-commit before executing write
+                return sc_harness.exec(node, cmd, timeout)
+
+            sc_ctrl.send_shell_cmd = _send_with_mid_commit_drop
+            sc_ctrl.heal_and_remorph_node = lambda bad_node: None
+            res_w1 = sc_ctrl.execute_triad_sql("INSERT OR REPLACE INTO kv VALUES ('campaign.step1', 'committed_2of3', 1)")
+            assert res_w1["ok"] and "2/3" in res_w1["quorum"], f"Expected 2/3 commit when Node 3 drops mid-write: {res_w1}"
+            assert sc_ctrl.nodes[0].tx_seq == 1 and sc_ctrl.nodes[1].tx_seq == 1, "Nodes 1 & 2 must advance tx_seq to 1"
+            assert sc_ctrl.nodes[2].tx_seq == 0, f"Dropped Node 3 must remain at tx_seq=0, got {sc_ctrl.nodes[2].tx_seq}"
+
+            # Stage B: Leave an orphan/torn `triad_wal.json.tmp` file on disk alongside `triad_wal.json`,
+            # restart the controller against the same `sustained_dir`, and verify `bounce_and_morph_node(3)`
+            # replays missed WAL entries to bring stale Node 3 up to `tx_seq == 1` without corrupting the WAL.
+            drop_node3["active"] = False
+            torn_tmp = sustained_dir / "triad_wal.json.tmp"
+            torn_tmp.write_text('{"triad_tx_seq": 999, "wal_entries": [[999, "CORRUPT', encoding="utf-8")
+            sc_ctrl2 = TriadController(
+                show_gui=False,
+                spec=TriadSpec(name="sustained-campaign", state_dir=sustained_dir, write_operator_token=False),
+                unit_test=True,
+            )
+            sc_ctrl2.shutdown()
+            sc_ctrl2.send_shell_cmd = sc_harness.exec
+            sc_ctrl2.morph_node_image = lambda node, seed: setattr(node, "morph_count", node.morph_count + 1)
+            sc_ctrl2.start_node_vm = lambda node: None
+            sc_ctrl2.await_boot = lambda node, timeout=35.0: True
+            sc_ctrl2.apply_node_profile = lambda node: True
+            for n in sc_ctrl2.nodes:
+                n.state = "ONLINE"
+            assert sc_ctrl2.triad_tx_seq == 1, f"Controller must load committed triad_wal.json (tx_seq=1), got {sc_ctrl2.triad_tx_seq}"
+            assert sc_ctrl2.nodes[2].tx_seq == 0, f"Persisted per-node tx_seq for Node 3 must be 0, got {sc_ctrl2.nodes[2].tx_seq}"
+            assert sc_ctrl2.bounce_and_morph_node(3), "Node 3 rolling morph + WAL delta replay must succeed"
+            assert sc_ctrl2.nodes[2].tx_seq == 1, "Node 3 must catch up to tx_seq=1 after WAL resync"
+            probed_after_resync = [sc_ctrl2._state_probe(n) for n in sc_ctrl2.nodes]
+            assert probed_after_resync[0] == probed_after_resync[1] == probed_after_resync[2], (
+                f"All 3 nodes must converge after mid-commit drop + WAL resync: {probed_after_resync}"
+            )
+
+            # Stage C: 4 rounds of interleaved quorum writes, single-node Byzantine row tamper,
+            # and automatic 2-of-3 self-healing on the real Rust `OsShell`.
+            for round_idx in range(2, 6):
+                w_res = sc_ctrl2.execute_triad_sql(
+                    f"INSERT OR REPLACE INTO kv VALUES ('campaign.r{round_idx}', 'val_{round_idx}', {round_idx})"
+                )
+                assert w_res["ok"] and "3/3" in w_res["quorum"], f"Round {round_idx} write failed: {w_res}"
+                victim_idx = (round_idx - 2) % 3
+                victim_node = sc_ctrl2.nodes[victim_idx]
+                prev_morph = victim_node.morph_count
+                sc_harness.exec(
+                    victim_node,
+                    f"sql /*triad*/ INSERT OR REPLACE INTO kv VALUES ('campaign.r{round_idx}', 'byz_{round_idx}', 99)",
+                )
+                sc_ctrl2.heal_and_remorph_node(victim_node)
+                assert victim_node.state == "ONLINE" and victim_node.morph_count > prev_morph, (
+                    f"Victim node {victim_node.name} must return ONLINE and increment morph_count after heal"
+                )
+                probes = [sc_ctrl2._state_probe(n) for n in sc_ctrl2.nodes]
+                assert probes[0] == probes[1] == probes[2], (
+                    f"Round {round_idx}: nodes failed to converge after single-node tamper + heal:\n{probes}"
+                )
+
+            # Stage D: Simultaneous 2-node corruption (3-way split-brain) must fail closed
+            # (`quorum_status` enters `3-WAY BYZANTINE SPLIT-BRAIN` and refuses blind overwrite).
+            sc_harness.exec(
+                sc_ctrl2.nodes[0],
+                "sql /*triad*/ INSERT OR REPLACE INTO kv VALUES ('campaign.r2', 'fork_node1', 77)",
+            )
+            sc_harness.exec(
+                sc_ctrl2.nodes[1],
+                "sql /*triad*/ INSERT OR REPLACE INTO kv VALUES ('campaign.r2', 'fork_node2', 88)",
+            )
+            morphs_before_split = [n.morph_count for n in sc_ctrl2.nodes]
+            sc_ctrl2.compute_and_verify_raid_parity()
+            assert "SPLIT-BRAIN" in sc_ctrl2.quorum_status and not sc_ctrl2.parity_syndrome_ok, (
+                f"3-way divergence must enter SPLIT-BRAIN fail-closed state, got {sc_ctrl2.quorum_status!r}"
+            )
+            assert [n.morph_count for n in sc_ctrl2.nodes] == morphs_before_split, (
+                "Split-brain must fail closed and refuse to blindly overwrite/remorph nodes without majority"
+            )
+        finally:
+            sc_harness.close()
     run_fault_injection_unit_tests()
 
 
