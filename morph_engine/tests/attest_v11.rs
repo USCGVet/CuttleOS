@@ -347,3 +347,49 @@ fn primary_key_file_fallback_rejects_fixture_seed() {
         "expected fixture rejection from fallback key file, got: {msg}"
     );
 }
+
+#[test]
+fn attest_entry_includes_sbom_digest() {
+    let (_g, guard) = Guard::new("sbom_digest");
+    let sk = test_key();
+    let fed = write_fed_toml(&guard.dir, &sk);
+    unsafe {
+        std::env::set_var(FEDERATION_CONFIG_ENV, &fed);
+    }
+    let sbom_dig = "4b".repeat(32);
+    let mut f = fields(1, "target_enterprise", sk);
+    f.diversity = Some(attest::DiversityEvidence {
+        layout_seed: Some(101),
+        sbom_sha256: Some(sbom_dig.clone()),
+        ..Default::default()
+    });
+    f.durable_seals.insert("cyclonedx_sbom".into(), sbom_dig.clone());
+    write_attestation(f).unwrap();
+
+    let entries = load_entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0]
+            .diversity
+            .as_ref()
+            .and_then(|d| d.sbom_sha256.as_deref()),
+        Some(sbom_dig.as_str())
+    );
+    assert_eq!(
+        entries[0].durable_seals.get("cyclonedx_sbom").map(String::as_str),
+        Some(sbom_dig.as_str())
+    );
+    let rep = verify_chain().expect("entry with sbom_sha256 must verify");
+    assert_eq!(rep.entries_ok, 1);
+
+    // Tampering with sbom_sha256 breaks the v11 signature over the entry content.
+    let mut tampered = entries;
+    tampered[0].diversity.as_mut().unwrap().sbom_sha256 = Some("9c".repeat(32));
+    rebuild_chain_after_cosign(&mut tampered, 0).unwrap();
+    let anchors = attest::load_anchors().unwrap();
+    write_chain_atomic(&tampered, &anchors).unwrap();
+    assert!(
+        verify_chain().is_err(),
+        "forged sbom_sha256 must fail v11 signature verification"
+    );
+}

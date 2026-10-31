@@ -8,6 +8,14 @@
 factory_signing_key.bin
 device_secret_key.bin
 *secret_key*.bin
+factory_keys.local.toml
+.cargo/config.toml
+operator_token.txt
+provider_token.txt
+client_token.txt
+**/operator_token.txt
+**/provider_token.txt
+**/client_token.txt
 *.key
 *.pem
 

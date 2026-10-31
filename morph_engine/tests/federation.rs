@@ -405,6 +405,7 @@ fn workspace_factory_keys_rejects_fixture_seeds_and_validates_threshold() {
                     pubkey_hex: pk_hex(&sk_real),
                 },
             ],
+            revoked: Vec::new(),
         };
         let msg = [0x42u8; 32];
         let cosigs = vec![
@@ -574,6 +575,7 @@ fn in_process_verify_cosignatures_smoke() {
             FedSigner { id: "a".into(), pubkey_hex: pk_hex(&sk_a) },
             FedSigner { id: "b".into(), pubkey_hex: pk_hex(&sk_b) },
         ],
+        revoked: Vec::new(),
     };
     let msg = [7u8; 32];
     let cosigs = vec![

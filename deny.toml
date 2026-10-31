@@ -50,7 +50,7 @@ ignore = false
 
 [bans]
 multiple-versions = "allow"
-wildcards = "allow"
+wildcards = "deny"
 
 [sources]
 unknown-registry = "deny"

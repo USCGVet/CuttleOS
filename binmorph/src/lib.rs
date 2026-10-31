@@ -4517,5 +4517,43 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn fuzz_harness_binmorph_rewrite_and_elf_parse_corpus_regression() {
+        // Exercises the exact logic of `fuzz/fuzz_targets/binmorph_rewrite.rs`
+        // and `fuzz/fuzz_targets/elf_parse.rs` across malformed/truncated ELFs
+        // and 256 pseudo-random instruction streams without panicking.
+        for bad_elf in [
+            &[][..],
+            &[0x7f, b'E', b'L', b'F'][..],
+            &[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0][..],
+            &[0xFFu8; 128][..],
+        ] {
+            let mut buf = bad_elf.to_vec();
+            assert!(rewrite_elf_bytes(&mut buf, 42).is_err());
+        }
+
+        let mut lcg = 0x1234_5678_9ABC_DEF0u64;
+        for i in 0..256u64 {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let len = ((lcg % 48) + 4) as usize;
+            let mut code = Vec::with_capacity(len + 1);
+            let mut s = lcg ^ i;
+            for _ in 0..len {
+                s = s.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+                code.push((s >> 32) as u8);
+            }
+            code.push(0xC3);
+            let orig_len = code.len();
+            let orig_c3 = count_c3_cf_bytes(&code);
+            let orig_ret = count_ret_family_bytes(&code);
+            let mut prng = Prng::new(lcg);
+            let mut stats = Stats::default();
+            rewrite_function(&mut code, 0x401000, &mut prng, &mut stats);
+            assert_eq!(code.len(), orig_len);
+            assert!(count_c3_cf_bytes(&code) <= orig_c3);
+            assert!(count_ret_family_bytes(&code) <= orig_ret);
+        }
+    }
 }
 

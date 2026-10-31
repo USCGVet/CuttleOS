@@ -728,6 +728,12 @@ fn build_cycle_diversity(
 
     if let Some(em) = emit {
         d.layout_seed = Some(em.layout_seed);
+        if let Ok(ws_root) = workspace_root_guess() {
+            let kernel_dir = ws_root.join("target_enterprise_kernel");
+            if let Ok((_sbom_json, sbom_sha)) = crate::factory::generate_cyclonedx_sbom(&kernel_dir) {
+                d.sbom_sha256 = Some(sbom_sha);
+            }
+        }
         match crate::diversity::text_sha256_of_elf(&em.div_elf) {
             Ok(sha) => {
                 eprintln!(
@@ -1026,6 +1032,16 @@ fn workspace_root_guess() -> Result<PathBuf> {
 fn ensure_not_locked(source_path: &Path) -> Result<()> {
     let lock = cuttle_diversifier::load_locked_modules(source_path)
         .map_err(|e| anyhow::anyhow!("locked-modules policy: {}", e))?;
+    let lock_path = lock.workspace_root.join("locked_modules.toml");
+    if let Ok(raw) = fs::read_to_string(&lock_path) {
+        if raw.contains(crate::factory::POLICY_SIG_PREFIX) {
+            let fed_path = lock.workspace_root.join(crate::federation::FEDERATION_CONFIG_PATH);
+            if fed_path.exists() {
+                let fed = crate::federation::load_federation(&fed_path)?;
+                crate::factory::verify_policy_toml_str(&raw, &fed, &lock_path.display().to_string())?;
+            }
+        }
+    }
     if lock.is_locked(source_path) {
         bail!(
             "refusing to morph locked module {} (workspace root {}); \

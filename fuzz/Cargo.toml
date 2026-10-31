@@ -1,0 +1,44 @@
+[package]
+name = "cuttle-fuzz"
+version = "0.0.1"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cuttle-binmorph = { path = "../binmorph" }
+cuttle-diversifier = { path = "../diversifier" }
+cuttle-contracts = { path = "../contracts" }
+
+[[bin]]
+name = "binmorph_rewrite"
+path = "fuzz_targets/binmorph_rewrite.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "elf_parse"
+path = "fuzz_targets/elf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diversify_roundtrip"
+path = "fuzz_targets/diversify_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "contracts_wire"
+path = "fuzz_targets/contracts_wire.rs"
+test = false
+doc = false
+bench = false

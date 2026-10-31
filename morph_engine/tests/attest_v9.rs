@@ -142,6 +142,7 @@ fn write_explicit_elf_diversity_and_verify() {
         layout_seed: Some(0x1234),
         pad_decision_count: Some(10),
         perturb_decision_count: Some(9),
+        sbom_sha256: None,
     };
     assert!(evidence.has_elf_metrics());
 

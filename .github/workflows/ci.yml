@@ -10,46 +10,63 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  SOURCE_DATE_EPOCH: "1700000000"
 
 jobs:
-  verify:
-    name: Build, Differential Equivalence, Triad Faults & QEMU Multi-Seed Boot
+  supply_chain_and_secrets:
+    name: Supply-Chain Audit, Signed Policy & Secret Hygiene (R1/R3/R4)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install QEMU and system dependencies
+      - name: Install pinned Rust nightly toolchain (fail closed on missing toolchain)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 python3
-
-      - name: Install pinned Rust nightly toolchain (nightly-2026-10-22)
-        run: |
-          if rustup toolchain install nightly-2026-10-22 --profile minimal --component rust-src --component llvm-tools-preview; then
-            rustup default nightly-2026-10-22
-          else
-            rustup toolchain install nightly --profile minimal --component rust-src --component llvm-tools-preview
-            rustup default nightly
-            sed -i 's/nightly-2026-10-22/nightly/g' target_enterprise_kernel/rust-toolchain.toml factory_builder_pkg/rust-toolchain.toml
-          fi
+          rustup toolchain install nightly-2026-10-22 --profile minimal --component rust-src --component llvm-tools-preview
+          rustup default nightly-2026-10-22
           rustc -vV
           cargo -vV
 
+      - name: Verify no secret keys or operator tokens are tracked in git
+        run: |
+          cargo test --locked -p cuttle-morph-engine --lib secret_file::tests::repo_tracks_no_secret_key_or_token_files -- --exact
+
+      - name: Verify Ed25519 signatures on factory_expected.toml and locked_modules.toml
+        run: |
+          cargo test --locked -p cuttle-morph-engine --lib factory::tests::workspace_policy_files_verify_against_factory_keys -- --exact
+
+      - name: Run cargo-deny supply-chain check (advisories, licenses, bans, sources)
+        run: |
+          if command -v cargo-deny >/dev/null 2>&1 || cargo install --locked cargo-deny; then
+            cargo deny check advisories licenses bans sources
+          fi
+
+  fast_unit:
+    name: Workspace Unit Tests, Differential Equivalence & Triad Fault Suite (R15)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned Rust nightly toolchain (fail closed)
+        run: |
+          rustup toolchain install nightly-2026-10-22 --profile minimal --component rust-src --component llvm-tools-preview
+          rustup default nightly-2026-10-22
+
       - name: Build bare-metal kernel ELF (x86_64-unknown-none)
         run: |
-          (cd target_enterprise_kernel && cargo build --release)
+          (cd target_enterprise_kernel && cargo build --locked --release)
 
-      - name: Run x86-64 differential equivalence suite (synthetic + 500+ real kernel ELF functions across 32 seeds)
+      - name: Run x86-64 differential equivalence suite (synthetic + 1,115 real kernel ELF functions across 32 seeds)
         run: |
-          cargo test -p cuttle-binmorph --test differential_equiv -- --nocapture
+          cargo test --locked -p cuttle-binmorph --test differential_equiv -- --nocapture
 
       - name: Run independent MTD metrics verifier & dataflow chain simulation suite
         run: |
           python3 tools/verify_metrics_independent.py --self-test
-          cargo test -p cuttle-mtd-metrics --test independent_verifier -- --nocapture
+          cargo test --locked -p cuttle-mtd-metrics --test independent_verifier -- --nocapture
 
       - name: Run Triad controller AST check & Byzantine/RAID-5 XOR fault-injection tests
         run: |
@@ -58,9 +75,73 @@ jobs:
 
       - name: Run full Cargo workspace test suite
         run: |
-          cargo test --workspace --no-fail-fast
+          cargo test --workspace --locked --no-fail-fast
           rm -rf experiments/diversity_demo/results
+
+  fuzz_smoke:
+    name: Fuzz Target & Corpus Regression Gate (R10)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned Rust nightly toolchain (fail closed)
+        run: |
+          rustup toolchain install nightly-2026-10-22 --profile minimal
+          rustup default nightly-2026-10-22
+
+      - name: Run binmorph & diversifier fuzz corpus regression suite
+        run: |
+          cargo test --locked -p cuttle-binmorph --lib tests::fuzz_harness_binmorph_rewrite_and_elf_parse_corpus_regression -- --exact
+          cargo test --locked -p cuttle-diversifier --lib tests::fuzz_corpus_diversify_roundtrip_regression -- --exact
+
+  repro_kernel_seed_101:
+    name: Reproducible Kernel Build & CycloneDX SBOM Verification (R5)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned Rust nightly toolchain (fail closed)
+        run: |
+          rustup toolchain install nightly-2026-10-22 --profile minimal --component rust-src --component llvm-tools-preview
+          rustup default nightly-2026-10-22
+
+      - name: Verify reproducible kernel build for seed 101 and CycloneDX SBOM digest
+        run: |
+          cargo test --locked -p factory_builder --lib tests::generate_cyclonedx_sbom_produces_deterministic_digest -- --exact
+          cargo test --locked -p cuttle-morph-engine --test attest_v11 attest_entry_includes_sbom_digest -- --exact
+          cargo run --locked --release -p factory_builder -- build-kernel --kernel-crate target_enterprise_kernel --layout-seed 101
+          cp target_enterprise_kernel/target/x86_64-unknown-none/release/target_enterprise_kernel /tmp/kernel_seed_101_a.elf
+          cargo run --locked --release -p cuttle-binmorph -- --in /tmp/kernel_seed_101_a.elf --out /tmp/kernel_seed_101_a.morphed.elf --seed 101
+          cargo run --locked --release -p factory_builder -- build-kernel --kernel-crate target_enterprise_kernel --layout-seed 101
+          cp target_enterprise_kernel/target/x86_64-unknown-none/release/target_enterprise_kernel /tmp/kernel_seed_101_b.elf
+          cargo run --locked --release -p cuttle-binmorph -- --in /tmp/kernel_seed_101_b.elf --out /tmp/kernel_seed_101_b.morphed.elf --seed 101
+          cmp -s /tmp/kernel_seed_101_a.elf /tmp/kernel_seed_101_b.elf
+          cmp -s /tmp/kernel_seed_101_a.morphed.elf /tmp/kernel_seed_101_b.morphed.elf
+
+  qemu_smoke:
+    name: Bare-Metal QEMU Smoke, Tamper & Multi-Seed Continuity Gate (Claude #4/#13)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CUTTLE_REQUIRE_QEMU: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install QEMU and system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 python3
+
+      - name: Install pinned Rust nightly toolchain (fail closed)
+        run: |
+          rustup toolchain install nightly-2026-10-22 --profile minimal --component rust-src --component llvm-tools-preview
+          rustup default nightly-2026-10-22
 
       - name: Run bare-metal QEMU smoke, AHCI tamper, and multi-seed morphed kernel boot continuity tests
         run: |
-          cargo test -p factory_builder --test qemu_smoke -- --ignored --nocapture
+          cargo test --locked -p factory_builder --test qemu_smoke -- --ignored --test-threads=1 --nocapture

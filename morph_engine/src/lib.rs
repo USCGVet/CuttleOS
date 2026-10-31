@@ -14,6 +14,7 @@ pub mod factory;
 pub mod federation;
 pub mod merkle;
 pub mod scheduler;
+pub mod secret_file;
 pub mod signing;
 pub mod synth;
 pub mod tui;
@@ -40,14 +41,17 @@ pub use durable_seal::{
     DurableSeal, DURABLE_SEAL_SCHEMA, DURABLE_SEALS_DIR_ENV,
 };
 pub use factory::{
-    fingerprint as fingerprint_factory, fingerprint_uncached as fingerprint_factory_uncached,
-    hash_file as hash_factory_file, load_factory_expected, resolve_factory_expected_path,
-    validate_factory_expected, verify_entry_factory_subset, FactoryExpected,
-    COMPONENT_DIVERSIFY, COMPONENT_MORPH, COMPONENT_RUSTC, COMPONENT_VERIFY,
-    FACTORY_BIN_DIR_ENV, FACTORY_EXPECTED_ENV, FACTORY_EXPECTED_PATH, FACTORY_OVERRIDE_ENV,
+    canonical_policy_bytes, fingerprint as fingerprint_factory,
+    fingerprint_uncached as fingerprint_factory_uncached, hash_file as hash_factory_file,
+    load_and_verify_signed_factory_expected, load_factory_expected, resolve_factory_expected_path,
+    sign_policy_toml_str, validate_factory_expected, verify_entry_factory_subset,
+    verify_policy_toml_str, verify_signed_locked_modules, FactoryExpected, COMPONENT_DIVERSIFY,
+    COMPONENT_MORPH, COMPONENT_RUSTC, COMPONENT_VERIFY, FACTORY_BIN_DIR_ENV, FACTORY_EXPECTED_ENV,
+    FACTORY_EXPECTED_PATH, FACTORY_OVERRIDE_ENV, POLICY_SIG_PREFIX,
 };
 pub use federation::{
-    load_federation, resolve_federation_path, verify_cosignatures, Cosignature, FederationConfig,
+    load_federation, reject_revoked_verifying_key, resolve_federation_path, verify_cosignatures,
+    verify_production_keyset, Cosignature, FederationConfig, RevokedSigner,
     Signer as FederationSigner, FEDERATION_CONFIG_ENV, FEDERATION_CONFIG_PATH,
 };
 pub use cycle::{
@@ -61,13 +65,17 @@ pub use daemon::{
 };
 pub use scheduler::{
     load_state, pick_next, pick_next_work, pick_next_work_at, record_success_bundle,
-    record_success_bundle_at, save_state, BundleConfig, ModuleConfig, ModuleState,
-    NextBundleChoice, NextChoice, NextWork, SchedulerConfig, SchedulerState, EX_NOINPUT,
-    SCHEDULER_CONFIG, SCHEDULER_STATE,
+    record_success_bundle_at, rollback_bundle, save_state, BundleConfig, ModuleConfig,
+    ModuleState, NextBundleChoice, NextChoice, NextWork, SchedulerConfig, SchedulerState,
+    EX_NOINPUT, SCHEDULER_CONFIG, SCHEDULER_STATE,
 };
 pub use signing::{
     init_signing_key, load_signing_key, resolve_signing_key_path, SIGNING_KEY_ENV,
     SIGNING_KEY_FILE,
+};
+pub use secret_file::{
+    default_user_keys_dir, load_or_create_strict_32, load_strict, restrict_file_owner_only,
+    write_exclusive, KEYS_DIR_ENV,
 };
 pub use synth::{
     parse_anthropic_response_text, AnthropicSynth, MutationBudget, PassThrough, PromptBuilder,

@@ -71,6 +71,8 @@ fn main() -> Result<()> {
         "recompute-merkle-root" => cmd_recompute_merkle_root(),
         "factory-fingerprint" => cmd_factory_fingerprint(&args[2..]),
         "cosign" => cmd_cosign(&args[2..]),
+        "rollback-bundle" => cmd_rollback_bundle(&args[2..]),
+        "sign-policy" => cmd_sign_policy(&args[2..]),
         "tui" => cmd_tui(&args[2..]),
         "-h" | "--help" => {
             usage();
@@ -94,6 +96,8 @@ fn usage() {
            atomic multi-module morph cycle. Every member diversifies under its own seed,\n    \
            the whole set verifies as one workspace build, the attestation entry records\n    \
            the bundle hash + per-module artefacts (schema v5).\n  \
+         morph rollback-bundle <NAME> [--config <PATH>]\n    \
+           atomically restore every module in bundle <NAME> from <module>.last_good.rs.\n  \
          morph init-key\n  \
          morph next\n  \
          morph tick      (now also handles [bundle.NAME] entries in scheduler.toml)\n  \
@@ -103,10 +107,11 @@ fn usage() {
            --no-perf-check: skip verifier perf gate (short soaks / semantics-only).\n  \
          morph verify-attest [--require-threshold] [--require-merkle-root] [--strict-factory]\n    \
            [--factory-expected <PATH>] [--require-ext-tlv] [--allow-missing-ext-tlv]\n    \
-           [--require-diversity] [--require-durable-seals]\n    \
+           [--require-diversity] [--require-durable-seals] [--production]\n    \
            default: require ext_tlv_b64 (schema v8+). Use --allow-missing-ext-tlv for pre-v8 logs.\n    \
            --require-diversity: accepted entries must carry non-empty diversity (TASK-125).\n    \
-           --require-durable-seals: accepted entries must carry non-empty durable_seals (TASK-144).\n  \
+           --require-durable-seals: accepted entries must carry non-empty durable_seals (TASK-144).\n    \
+           --production: enforce M-of-N threshold >= 2, merkle-root, strict-factory, and signed policy TOMLs.\n  \
          morph seal --label <L> --in <PATH> --out <SEAL.json>\n    \
            hash-seal a durable blob (TASK-143); writes DurableSeal JSON.\n  \
          morph verify-seal --seal <SEAL.json> --in <PATH>\n    \
@@ -313,9 +318,18 @@ fn cmd_tui(args: &[String]) -> Result<()> {
 /// `--require-diversity` (TASK-125), `--require-durable-seals` (TASK-144).
 fn cmd_verify_attest(args: &[String]) -> Result<()> {
     let mut opts = VerifyOptions::default();
+    let mut production = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--production" => {
+                production = true;
+                opts.require_threshold = true;
+                opts.require_merkle_root = true;
+                opts.require_strict_factory = true;
+                opts.require_ext_tlv = true;
+                i += 1;
+            }
             "--require-threshold" => {
                 opts.require_threshold = true;
                 i += 1;
@@ -360,6 +374,24 @@ fn cmd_verify_attest(args: &[String]) -> Result<()> {
                 i += 2;
             }
             other => bail!("unknown argument to verify-attest: {}", other),
+        }
+    }
+    if production {
+        let fed_path = opts
+            .federation_config
+            .clone()
+            .unwrap_or_else(federation::resolve_federation_path);
+        let fed = federation::load_federation(&fed_path)
+            .with_context(|| format!("load federation config {}", fed_path.display()))?;
+        federation::verify_production_keyset(&fed)?;
+        let exp_path = opts
+            .factory_expected_path
+            .clone()
+            .unwrap_or_else(factory::resolve_factory_expected_path);
+        factory::load_and_verify_signed_factory_expected(&exp_path, &fed)?;
+        let locked_path = PathBuf::from("locked_modules.toml");
+        if locked_path.exists() {
+            factory::verify_signed_locked_modules(&locked_path, &fed)?;
         }
     }
     match verify_chain_with_options(&opts) {
@@ -674,5 +706,65 @@ fn cmd_cosign(args: &[String]) -> Result<()> {
         "morph: cosign signer={} touched={} skipped={} (already-cosigned)",
         signer_id, touched, skipped
     );
+    Ok(())
+}
+
+/// `morph rollback-bundle <NAME> [--config <PATH>]` (`R15`).
+fn cmd_rollback_bundle(args: &[String]) -> Result<()> {
+    let mut bundle_name: Option<String> = None;
+    let mut cfg_path = PathBuf::from(SCHEDULER_CONFIG);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" => {
+                cfg_path = PathBuf::from(args.get(i + 1).context("--config needs value")?);
+                i += 2;
+            }
+            s if !s.starts_with('-') && bundle_name.is_none() => {
+                bundle_name = Some(s.to_string());
+                i += 1;
+            }
+            other => bail!("unknown argument to rollback-bundle: {}", other),
+        }
+    }
+    let bundle_name = bundle_name.context("morph rollback-bundle requires <NAME>")?;
+    let cfg = load_config(&cfg_path)?;
+    let restored = cuttle_morph_engine::rollback_bundle(&cfg, &bundle_name)?;
+    println!(
+        "rollback-bundle: bundle={} restored_modules={}",
+        bundle_name, restored
+    );
+    Ok(())
+}
+
+/// `morph sign-policy <PATH> [--signer <ID>]` (`R3`).
+fn cmd_sign_policy(args: &[String]) -> Result<()> {
+    let mut path: Option<PathBuf> = None;
+    let mut signer_id = String::from("primary");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--signer" => {
+                signer_id = args.get(i + 1).context("--signer needs value")?.clone();
+                i += 2;
+            }
+            s if !s.starts_with('-') && path.is_none() => {
+                path = Some(PathBuf::from(s));
+                i += 1;
+            }
+            other => bail!("unknown argument to sign-policy: {}", other),
+        }
+    }
+    let path = path.context("morph sign-policy requires <PATH>")?;
+    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let stripped: Vec<&str> = raw
+        .lines()
+        .filter(|l| !l.trim().starts_with(factory::POLICY_SIG_PREFIX))
+        .collect();
+    let base = stripped.join("\n") + "\n";
+    let sk = cuttle_morph_engine::load_signing_key()?;
+    let signed = factory::sign_policy_toml_str(&base, &signer_id, &sk);
+    fs::write(&path, signed).with_context(|| format!("write {}", path.display()))?;
+    println!("sign-policy: signed {} with signer={}", path.display(), signer_id);
     Ok(())
 }

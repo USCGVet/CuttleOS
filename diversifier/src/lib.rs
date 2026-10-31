@@ -3458,4 +3458,31 @@ mod tests {
         assert!(saw_inline_always && saw_inline_never && saw_no_attr, "inline decisions must ergodically visit all states across 500 cycles");
         assert!(saw_impl_semantic, "impl method Engine::step must receive semantic perturbation");
     }
+
+    #[test]
+    fn fuzz_corpus_diversify_roundtrip_regression() {
+        let corpus_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("fuzz")
+            .join("corpus")
+            .join("diversify_roundtrip");
+        for entry in std::fs::read_dir(&corpus_dir).expect("read fuzz corpus") {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                let src = std::fs::read_to_string(&path).expect("read corpus file");
+                for cycle in 1..=8u64 {
+                    let seed = Seed::derive(cycle, "fuzz_corpus");
+                    let (out1, log1) = diversify_with_log(&src, &seed).expect("diversify 1");
+                    let (out2, log2) = diversify_with_log(&src, &seed).expect("diversify 2");
+                    assert_eq!(out1, out2);
+                    assert_eq!(log1, log2);
+                }
+            }
+        }
+        // Malformed inputs must fail cleanly without panicking.
+        for bad in ["", "fn (", "pub struct { 123 }", "unsafe fn x() { let a = ; }"] {
+            let _ = diversify_with_log(bad, &Seed::derive(1, "bad"));
+        }
+    }
 }

@@ -4,7 +4,6 @@
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const SIGNING_KEY_FILE: &str = "factory_signing_key.bin";
@@ -13,7 +12,14 @@ pub const SIGNING_KEY_ENV: &str = "CUTTLE_SIGNING_KEY_PATH";
 pub fn resolve_signing_key_path() -> PathBuf {
     match std::env::var(SIGNING_KEY_ENV) {
         Ok(s) if !s.is_empty() => PathBuf::from(s),
-        _ => PathBuf::from(SIGNING_KEY_FILE),
+        _ => {
+            let local = PathBuf::from(SIGNING_KEY_FILE);
+            if local.exists() {
+                local
+            } else {
+                crate::secret_file::default_user_keys_dir().join(SIGNING_KEY_FILE)
+            }
+        }
     }
 }
 
@@ -23,7 +29,7 @@ pub fn init_signing_key() -> Result<()> {
         bail!("signing key already exists at {}", path.display());
     }
     let key = SigningKey::generate(&mut OsRng);
-    fs::write(&path, key.to_bytes())
+    crate::secret_file::write_exclusive(&path, &key.to_bytes())
         .with_context(|| format!("write {}", path.display()))?;
     eprintln!(
         "morph: generated factory signing key at {} (verifying key: {})",
@@ -43,17 +49,7 @@ pub fn load_signing_key() -> Result<SigningKey> {
 /// attestation verification to derive the primary verifying key from
 /// wherever the key file actually lives.
 pub fn load_signing_key_from(path: &Path) -> Result<SigningKey> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("read {}", path.display()))?;
-    if bytes.len() != 32 {
-        bail!(
-            "signing key file {} has wrong length: {}",
-            path.display(),
-            bytes.len()
-        );
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
+    let arr = crate::secret_file::load_strict(path)?;
     Ok(SigningKey::from_bytes(&arr))
 }
 

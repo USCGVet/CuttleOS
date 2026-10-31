@@ -277,6 +277,9 @@ pub struct DiversityEvidence {
     /// Number of codegen-perturb decisions recorded in `diversifier_log`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perturb_decision_count: Option<u32>,
+    /// Optional SHA-256 digest of the CycloneDX SBOM emitted for the kernel workspace (`R5`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sbom_sha256: Option<String>,
 }
 
 impl DiversityEvidence {
@@ -289,6 +292,7 @@ impl DiversityEvidence {
             && self.layout_seed.is_none()
             && self.pad_decision_count.is_none()
             && self.perturb_decision_count.is_none()
+            && self.sbom_sha256.is_none()
     }
 
     /// At least one ELF-side metric is present (text sha or survival bps).
@@ -1360,6 +1364,7 @@ fn resolve_primary_verifying_key(
             let vk = ed25519_dalek::VerifyingKey::from_bytes(&bytes)
                 .context("primary signer pubkey is not a valid ed25519 key")?;
             federation::reject_fixture_verifying_key(&vk, "primary")?;
+            federation::reject_revoked_verifying_key(&vk, &cfg, "primary")?;
             return Ok(Some(vk));
         }
         // Config exists but has no "primary" signer — fall through to the

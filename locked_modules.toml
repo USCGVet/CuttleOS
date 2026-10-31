@@ -47,3 +47,4 @@ locked = [
     # Deterministic test vectors and expected outputs used by boot self-checks.
     "target_enterprise/src/kernel_fixtures.rs",
 ]
+# cuttle-policy-sig-v1: signer=primary sig=5fac82a549891eb7470b608d5b44dbfe5579ff0cade5e60c598c20c77ccdcf5c10c86a24ab3b7cc0cffc5d603ad89312549e859e8bc07e91f542f3cd5209640a

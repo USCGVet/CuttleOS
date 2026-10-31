@@ -395,3 +395,120 @@ pub fn record_success_bundle_at(
     entry.last_cycle = cycle;
     entry.last_morph_unix = now;
 }
+
+/// Atomically restore every member of `bundle_name` in `cfg` from its
+/// `<workspace>/src/<module>.last_good.rs` backup (`R15`).
+///
+/// Pre-validates that all `<module>.last_good.rs` files exist and can be
+/// read into memory before modifying any `<module>.rs` file, then stages
+/// each restore to `<module>.rs.rollback.tmp`, `sync_all()`s it, and
+/// renames over `<module>.rs`. Returns the number of restored modules.
+pub fn rollback_bundle(cfg: &SchedulerConfig, bundle_name: &str) -> Result<usize> {
+    let bcfg = cfg
+        .bundles
+        .get(bundle_name)
+        .ok_or_else(|| anyhow::anyhow!("unknown bundle '{}' in scheduler config", bundle_name))?;
+    if bcfg.modules.is_empty() {
+        anyhow::bail!("bundle '{}' has no declared modules", bundle_name);
+    }
+    let src_dir = bcfg.workspace.join("src");
+    let mut staged_reads: Vec<(String, PathBuf, Vec<u8>)> = Vec::with_capacity(bcfg.modules.len());
+    for module in &bcfg.modules {
+        let last_good = src_dir.join(format!("{}.last_good.rs", module));
+        if !last_good.exists() {
+            anyhow::bail!(
+                "rollback-bundle '{}': missing last_good backup for module '{}' at {}",
+                bundle_name,
+                module,
+                last_good.display()
+            );
+        }
+        let bytes = fs::read(&last_good).with_context(|| {
+            format!(
+                "rollback-bundle '{}': read {}",
+                bundle_name,
+                last_good.display()
+            )
+        })?;
+        let target = src_dir.join(format!("{}.rs", module));
+        staged_reads.push((module.clone(), target, bytes));
+    }
+
+    use std::io::Write;
+    for (module, target, bytes) in &staged_reads {
+        let tmp = src_dir.join(format!("{}.rs.rollback.tmp", module));
+        {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)
+                .with_context(|| format!("open {}", tmp.display()))?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
+        if cfg!(windows) && target.exists() {
+            let _ = fs::remove_file(target);
+        }
+        fs::rename(&tmp, target)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), target.display()))?;
+    }
+    Ok(staged_reads.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollback_bundle_restores_all_crate_targets_from_last_good() {
+        let dir = std::env::temp_dir().join(format!(
+            "cuttle_rollback_bundle_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        fs::write(src_dir.join("alpha.rs"), b"// bad morphed alpha\n").unwrap();
+        fs::write(src_dir.join("alpha.last_good.rs"), b"// good alpha\n").unwrap();
+        fs::write(src_dir.join("beta.rs"), b"// bad morphed beta\n").unwrap();
+        fs::write(src_dir.join("beta.last_good.rs"), b"// good beta\n").unwrap();
+
+        let mut cfg = SchedulerConfig::default();
+        cfg.bundles.insert(
+            "kernel".into(),
+            BundleConfig {
+                priority: 10,
+                max_age_secs: 60,
+                workspace: dir.clone(),
+                modules: vec!["alpha".into(), "beta".into()],
+                manifest: None,
+            },
+        );
+
+        let count = rollback_bundle(&cfg, "kernel").expect("rollback_bundle must succeed");
+        assert_eq!(count, 2);
+        assert_eq!(
+            fs::read_to_string(src_dir.join("alpha.rs")).unwrap(),
+            "// good alpha\n"
+        );
+        assert_eq!(
+            fs::read_to_string(src_dir.join("beta.rs")).unwrap(),
+            "// good beta\n"
+        );
+
+        // If any module's .last_good.rs is missing, rollback_bundle fails closed
+        // before modifying the earlier modules.
+        fs::write(src_dir.join("alpha.rs"), b"// current alpha\n").unwrap();
+        fs::remove_file(src_dir.join("beta.last_good.rs")).unwrap();
+        assert!(rollback_bundle(&cfg, "kernel").is_err());
+        assert_eq!(
+            fs::read_to_string(src_dir.join("alpha.rs")).unwrap(),
+            "// current alpha\n",
+            "failed rollback must not partially overwrite earlier bundle members"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

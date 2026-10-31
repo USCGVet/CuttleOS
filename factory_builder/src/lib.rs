@@ -403,6 +403,98 @@ pub fn build_kernel_with_layout_seed(
     build_kernel_with_layout_seed_and_prod(kernel_crate_dir, layout_seed, false)
 }
 
+/// Pinned `SOURCE_DATE_EPOCH` set on reproducible kernel builds (`R5`).
+pub const REPRO_SOURCE_DATE_EPOCH: &str = "1700000000";
+
+/// Compose reproducible kernel `RUSTFLAGS` including `--remap-path-prefix`
+/// mappings for `workspace_root` and `cargo_home` (`R5`).
+pub fn compose_reproducible_kernel_rustflags(
+    inherited: &str,
+    layout_seed: Option<u64>,
+    prod: bool,
+    workspace_root: Option<&Path>,
+    cargo_home: Option<&Path>,
+) -> String {
+    let mut flags = compose_kernel_rustflags(inherited, layout_seed, prod);
+    if let Some(ws) = workspace_root {
+        let ws_s = ws.to_string_lossy();
+        if !ws_s.contains(' ') {
+            flags.push_str(&format!(" --remap-path-prefix={ws_s}=/cuttle_ws"));
+        }
+    }
+    if let Some(ch) = cargo_home {
+        let ch_s = ch.to_string_lossy();
+        if !ch_s.contains(' ') {
+            flags.push_str(&format!(" --remap-path-prefix={ch_s}=/cargo_home"));
+        }
+    }
+    flags.trim().to_string()
+}
+
+/// Generate a deterministic CycloneDX 1.5 JSON SBOM for `kernel_crate_dir`
+/// (parsing `Cargo.lock` packages in sorted `(name, version)` order) and
+/// return `(cyclonedx_json, sha256_hex)` (`R5`).
+pub fn generate_cyclonedx_sbom(kernel_crate_dir: &Path) -> Result<(String, String)> {
+    let lock_path = if kernel_crate_dir.join("Cargo.lock").exists() {
+        kernel_crate_dir.join("Cargo.lock")
+    } else if let Some(ws) = kernel_crate_dir.parent() {
+        ws.join("Cargo.lock")
+    } else {
+        kernel_crate_dir.join("Cargo.lock")
+    };
+    let text = fs::read_to_string(&lock_path)
+        .with_context(|| format!("factory_builder: read Cargo.lock at {}", lock_path.display()))?;
+    let mut pkgs: Vec<(String, String, String)> = Vec::new();
+    let mut cur_name = String::new();
+    let mut cur_ver = String::new();
+    let mut cur_chk = String::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line == "[[package]]" {
+            if !cur_name.is_empty() {
+                pkgs.push((
+                    std::mem::take(&mut cur_name),
+                    std::mem::take(&mut cur_ver),
+                    std::mem::take(&mut cur_chk),
+                ));
+            }
+        } else if let Some(v) = line.strip_prefix("name = ") {
+            cur_name = v.trim_matches('"').to_string();
+        } else if let Some(v) = line.strip_prefix("version = ") {
+            cur_ver = v.trim_matches('"').to_string();
+        } else if let Some(v) = line.strip_prefix("checksum = ") {
+            cur_chk = v.trim_matches('"').to_string();
+        }
+    }
+    if !cur_name.is_empty() {
+        pkgs.push((cur_name, cur_ver, cur_chk));
+    }
+    pkgs.sort();
+    pkgs.dedup();
+
+    let mut components_json = String::new();
+    for (idx, (name, ver, chk)) in pkgs.iter().enumerate() {
+        if idx > 0 {
+            components_json.push(',');
+        }
+        let purl = format!("pkg:cargo/{name}@{ver}");
+        if chk.is_empty() {
+            components_json.push_str(&format!(
+                "{{\"type\":\"library\",\"name\":\"{name}\",\"version\":\"{ver}\",\"purl\":\"{purl}\"}}"
+            ));
+        } else {
+            components_json.push_str(&format!(
+                "{{\"type\":\"library\",\"name\":\"{name}\",\"version\":\"{ver}\",\"purl\":\"{purl}\",\"hashes\":[{{\"alg\":\"SHA-256\",\"content\":\"{chk}\"}}]}}"
+            ));
+        }
+    }
+    let sbom = format!(
+        "{{\"bomFormat\":\"CycloneDX\",\"specVersion\":\"1.5\",\"version\":1,\"components\":[{components_json}]}}\n"
+    );
+    let dig: [u8; 32] = Sha256::digest(sbom.as_bytes()).into();
+    Ok((sbom, hex(&dig)))
+}
+
 fn configure_kernel_cargo_env(
     cmd: &mut Command,
     inherited_rustflags: &str,
@@ -415,6 +507,7 @@ fn configure_kernel_cargo_env(
     } else {
         cmd.env_remove("CUTTLE_VARIANT_SEED");
     }
+    cmd.env("SOURCE_DATE_EPOCH", REPRO_SOURCE_DATE_EPOCH);
     // Always set `RUSTFLAGS` on the child Cargo invocation so an inherited
     // `RUSTFLAGS=""` in the parent environment never overrides
     // `target_enterprise_kernel/.cargo/config.toml` with an empty flag string.
@@ -530,27 +623,71 @@ pub const DEVICE_SECRET_KEY_FILENAME: &str = "device_secret_key.bin";
 /// key to the guest kernel out-of-band (`-fw_cfg name=opt/cuttle_device_key,file=...`).
 pub const FW_CFG_DEVICE_KEY_NAME: &str = "opt/cuttle_device_key";
 
-/// Load an existing 32-byte device secret key from `path`, or generate a
-/// fresh 256-bit cryptographically random key via OS CSPRNG (`OsRng`) and
-/// persist it at `path`.
+/// Load an existing 32-byte device secret key from `path`, strictly refusing
+/// malformed or all-zero files without overwriting them, or generate a fresh
+/// 256-bit cryptographically random key via OS CSPRNG (`OsRng`) and persist
+/// it exclusively with owner-only permissions at `path` (`R1`).
 pub fn ensure_device_secret_key(path: &Path) -> Result<[u8; 32]> {
     use rand::RngCore;
-    if let Ok(bytes) = fs::read(path) {
-        if bytes.len() == 32 && bytes.iter().any(|&b| b != 0) {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            return Ok(key);
+    use std::io::Write;
+    if path.exists() {
+        let bytes = fs::read(path)
+            .with_context(|| format!("read device secret key at {}", path.display()))?;
+        if bytes.len() != 32 {
+            bail!(
+                "refusing to load or overwrite malformed device secret key at {}: expected 32 bytes, found {} bytes",
+                path.display(),
+                bytes.len()
+            );
         }
+        if bytes.iter().all(|&b| b == 0) {
+            bail!(
+                "refusing to load or overwrite all-zero device secret key at {}",
+                path.display()
+            );
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        return Ok(key);
     }
     let mut key = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut key);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create parent dir {}", parent.display()))?;
         }
     }
-    fs::write(path, &key)
-        .with_context(|| format!("write 32-byte CSPRNG device secret key to {}", path.display()))?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).with_context(|| {
+        format!(
+            "create exclusive 32-byte CSPRNG device secret key at {}",
+            path.display()
+        )
+    })?;
+    f.write_all(&key)?;
+    f.sync_all()?;
+    drop(f);
+    #[cfg(windows)]
+    {
+        if let Ok(username) = std::env::var("USERNAME") {
+            if !username.trim().is_empty() {
+                let grant_arg = format!("{}:(F)", username.trim());
+                let _ = Command::new("icacls")
+                    .arg(path)
+                    .arg("/inheritance:r")
+                    .arg("/grant:r")
+                    .arg(&grant_arg)
+                    .output();
+            }
+        }
+    }
     Ok(key)
 }
 
@@ -864,5 +1001,34 @@ mod tests {
     fn image_kind_as_str() {
         assert_eq!(ImageKind::Bios.as_str(), "bios");
         assert_eq!(ImageKind::Uefi.as_str(), "uefi");
+    }
+
+    #[test]
+    fn factory_builder_rejects_malformed_existing_device_key_without_overwrite() {
+        let dir = tmpdir();
+        let bad_path = dir.join("device_secret_key.bin");
+        fs::write(&bad_path, &[0xAAu8; 31]).unwrap();
+        let err = ensure_device_secret_key(&bad_path)
+            .expect_err("31-byte existing device key must fail closed without overwrite");
+        assert!(format!("{err:#}").contains("expected 32 bytes, found 31 bytes"));
+        assert_eq!(
+            fs::read(&bad_path).unwrap(),
+            vec![0xAAu8; 31],
+            "malformed device key file must not be overwritten"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generate_cyclonedx_sbom_produces_deterministic_digest() {
+        let ws_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let kernel_dir = ws_root.join("target_enterprise_kernel");
+        let (sbom1, dig1) = generate_cyclonedx_sbom(&kernel_dir).expect("generate sbom 1");
+        let (sbom2, dig2) = generate_cyclonedx_sbom(&kernel_dir).expect("generate sbom 2");
+        assert_eq!(sbom1, sbom2);
+        assert_eq!(dig1, dig2);
+        assert_eq!(dig1.len(), 64);
+        assert!(sbom1.contains("\"bomFormat\":\"CycloneDX\""));
+        assert!(sbom1.contains("pkg:cargo/"));
     }
 }

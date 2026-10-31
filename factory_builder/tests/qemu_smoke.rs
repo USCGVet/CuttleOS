@@ -27,27 +27,39 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn find_qemu() -> Option<PathBuf> {
-    // Try PATH first.
-    if let Ok(out) = Command::new("where")
-        .arg("qemu-system-x86_64")
-        .output()
-    {
-        if out.status.success() {
-            if let Some(line) = String::from_utf8_lossy(&out.stdout).lines().next() {
-                let p = PathBuf::from(line.trim());
-                if p.exists() {
-                    return Some(p);
-                }
+fn find_qemu_in_path_var(path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path_var = path_var?;
+    for dir in std::env::split_paths(path_var) {
+        for exe_name in ["qemu-system-x86_64", "qemu-system-x86_64.exe"] {
+            let candidate = dir.join(exe_name);
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
     }
-    let win_default = PathBuf::from("C:/Program Files/qemu/qemu-system-x86_64.exe");
-    if win_default.exists() {
-        return Some(win_default);
+    None
+}
+
+fn find_qemu() -> Option<PathBuf> {
+    if let Some(p) = find_qemu_in_path_var(std::env::var_os("PATH").as_deref()) {
+        return Some(p);
+    }
+    for fallback in [
+        "/usr/bin/qemu-system-x86_64",
+        "/usr/local/bin/qemu-system-x86_64",
+        "C:/Program Files/qemu/qemu-system-x86_64.exe",
+    ] {
+        let p = PathBuf::from(fallback);
+        if p.is_file() {
+            return Some(p);
+        }
     }
     None
 }
+
+/// Pinned QEMU CPU model (`R9`): named `qemu64` baseline with explicit
+/// `rdrand`, `fsgsbase`, `smap`, and `smep` capabilities instead of `-cpu max`.
+const PINNED_QEMU_CPU_MODEL: &str = "qemu64,+rdrand,+fsgsbase,+smap,+smep";
 
 /// QEMU accelerator arguments for the smoke boots. Default TCG: slower but deterministic,
 /// and on some Windows hosts WHPX accepts the guest but never advances the BIOS past reset
@@ -94,8 +106,13 @@ fn boots_under_qemu_and_emits_banner() {
     let qemu = match find_qemu() {
         Some(p) => p,
         None => {
+            if std::env::var("CUTTLE_REQUIRE_QEMU").as_deref() == Ok("1") {
+                panic!(
+                    "CUTTLE_REQUIRE_QEMU=1: qemu-system-x86_64 not found on PATH or standard install locations"
+                );
+            }
             eprintln!(
-                "SKIP: qemu-system-x86_64 not found on PATH or at C:/Program Files/qemu/"
+                "SKIP: qemu-system-x86_64 not found on PATH or standard install locations"
             );
             return;
         }
@@ -428,7 +445,7 @@ impl SmokeVm<'_> {
         let mut qproc = Command::new(self.qemu)
             .args(smoke_accel_args())
             .arg("-cpu")
-            .arg("max")
+            .arg(PINNED_QEMU_CPU_MODEL)
             .arg("-smp")
             .arg("4")
             .arg("-fw_cfg")
@@ -712,26 +729,9 @@ fn morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu() {
     factory_builder::ensure_device_secret_key(&device_key_path)
         .expect("provision 32-byte CSPRNG device_secret_key.bin");
 
-    let milestone_banners: &[&str] = &[
-        "CUTTLE-TE OK",
-        "TLS hkdf OK prk_sha=",
-        "TLS kat OK aead=2 kx=2 sig=1",
-        "TLS cert OK alg=ecdsa-p256 sha=c1a5d92d1e129087",
-        "KPTI build_user_view OK secrets=4",
-        "KPTI validate_user_view OK violations=0",
-        "RING3 transition OK cpl=3->0 vec=0x80 ist1=ok rsp0=ok syscall=43",
-        "TPM2_TIS driver OK did_vid=000115d1 locality=0 pcr10=extended",
-        "AHCI_HW probe OK slot=",
-        "NVME_HW probe OK slot=",
-        "WEB+SQL+SESSION compose OK tables=2 rows=6 magic=CTTLSQL1",
-        "SECCOMP: OK engine=ebpf filter=enforced",
-        "FS partition OK lba=1042..1057 sectors=16 files=1 magic=CTTLFS01",
-        "HTTPS compose OK slots=16 port=443 tls13=rustls bytes=882 sha=83e47624",
-        "SVC_RUNTIME: OK role=full->wfe->full svcs=3 kpti=isolated seccomp=deny-default rot=1",
-        "SHELL compose OK tasks=5 files=5 audit=5",
-        "SMP_HW init OK cpus=4 threads=4 ctx_sw=4",
-        "CUTTLE-TE HALT",
-    ];
+    let mut boot_1_shell_sector: Option<Vec<u8>> = None;
+    let mut boot_1_fs_magic: Option<Vec<u8>> = None;
+    let mut boot_1_sql_magic: Option<Vec<u8>> = None;
 
     for (boot_idx, (seed, elf_bytes)) in boot_elf_bytes.iter().enumerate() {
         let boot_num = boot_idx + 1;
@@ -758,26 +758,72 @@ fn morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu() {
             reached,
             "morphed kernel seed={seed} (boot #{boot_num}) did not reach CUTTLE-TE HALT within 45s!\nSerial log:\n{log}"
         );
-        for &banner in milestone_banners {
-            assert!(
-                log.contains(banner),
-                "morphed kernel seed={seed} (boot #{boot_num}) missing milestone banner {banner:?}!\nSerial log:\n{log}"
-            );
+        // Assert ALL 130 REQUIRED_BANNERS in order on every cross-seed boot (Claude #13).
+        let mut cursor = 0usize;
+        for &banner in REQUIRED_BANNERS {
+            match log[cursor..].find(banner) {
+                Some(rel) => cursor += rel + banner.len(),
+                None => panic!(
+                    "morphed kernel seed={seed} (boot #{boot_num}) missing or out-of-order required banner {banner:?} at-or-after offset {cursor}!\nSerial log:\n{log}"
+                ),
+            }
         }
         assert!(
             !log.contains("SHELL resume REJECTED"),
             "morphed kernel seed={seed} (boot #{boot_num}) unexpectedly rejected sealed disk state!\nSerial log:\n{log}"
+        );
+        // Inspect the persistent AHCI disk sectors for CTTLSHL1 header (LBA 1040),
+        // WAL backing (LBA 1041), CTTLFS01 (LBA 1042), and CTTLSQL1 (LBA 1058) across boots 1 -> 2 -> 3 (Claude #13).
+        let ahci_bytes = std::fs::read(&ahci_disk).expect("read persistent ahci_multiseed_test.img");
+        let shl_hdr = &ahci_bytes[1040 * 512..1041 * 512];
+        let shl_wal = &ahci_bytes[1041 * 512..1042 * 512];
+        let fs_slice = &ahci_bytes[1042 * 512..1042 * 512 + 8];
+        let sql_slice = &ahci_bytes[1058 * 512..1058 * 512 + 8];
+        assert_eq!(
+            &shl_hdr[..8],
+            b"CTTLSHL1",
+            "boot #{boot_num} (seed={seed}): missing CTTLSHL1 magic at AHCI LBA 1040"
+        );
+        assert_eq!(
+            fs_slice,
+            b"CTTLFS01",
+            "boot #{boot_num} (seed={seed}): missing CTTLFS01 magic at AHCI LBA 1042"
+        );
+        assert_eq!(
+            sql_slice,
+            b"CTTLSQL1",
+            "boot #{boot_num} (seed={seed}): missing CTTLSQL1 magic at AHCI LBA 1058"
+        );
+        let saved_boots = u64::from_le_bytes(shl_hdr[8..16].try_into().unwrap());
+        assert_eq!(
+            saved_boots, boot_num as u64,
+            "boot #{boot_num} (seed={seed}): expected CTTLSHL1 saved_boots == {boot_num}, got {saved_boots}"
+        );
+        assert_eq!(
+            &shl_wal[8..28],
+            b"F\x0c/var/boot.okready\n",
+            "boot #{boot_num} (seed={seed}): missing /var/boot.ok WAL record in LBA 1041"
         );
         if boot_num == 1 {
             assert!(
                 log.contains("CONTINUITY genesis"),
                 "boot #1 (seed={seed}) expected CONTINUITY genesis!\nSerial log:\n{log}"
             );
+            boot_1_shell_sector = Some(shl_wal[..28].to_vec());
+            boot_1_fs_magic = Some(fs_slice.to_vec());
+            boot_1_sql_magic = Some(sql_slice.to_vec());
         } else {
             assert!(
                 log.contains("CONTINUITY resume OK") && log.contains("SHELL resume OK"),
                 "cross-seed boot #{boot_num} (seed={seed}) failed to resume sealed state written by prior seed!\nSerial log:\n{log}"
             );
+            assert_eq!(
+                Some(&shl_wal[..28]),
+                boot_1_shell_sector.as_deref(),
+                "cross-seed boot #{boot_num} (seed={seed}) did not preserve sealed /var/boot.ok WAL record at LBA 1041 from boot #1"
+            );
+            assert_eq!(Some(fs_slice), boot_1_fs_magic.as_deref());
+            assert_eq!(Some(sql_slice), boot_1_sql_magic.as_deref());
         }
         let _ = std::fs::remove_file(&bios_path);
         let _ = std::fs::remove_file(images_dir.join(format!("qemu_multiseed_{seed}.elf")));
@@ -814,4 +860,23 @@ fn required_banners_include_https_up_with_rdrand_and_provisioned() {
     assert!(REQUIRED_BANNERS.contains(
         &"HTTPS UP port=443 tls13=rustls entropy=rdrand provisioned=1 cert_sha256="
     ));
+}
+
+#[test]
+fn find_qemu_searches_path_portably() {
+    let dir = std::env::temp_dir().join(format!(
+        "cuttle_find_qemu_test_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Create a portable Unix-style `qemu-system-x86_64` (no `.exe` extension)
+    // and verify `find_qemu_in_path_var` locates it via `std::env::split_paths`.
+    let fake_qemu = dir.join("qemu-system-x86_64");
+    std::fs::write(&fake_qemu, b"#!/bin/sh\n").unwrap();
+    let path_joined = std::env::join_paths([&dir]).unwrap();
+    let found = find_qemu_in_path_var(Some(&path_joined))
+        .expect("find_qemu_in_path_var must locate qemu-system-x86_64 on PATH without `where`");
+    assert_eq!(found, fake_qemu);
+    let _ = std::fs::remove_dir_all(&dir);
 }

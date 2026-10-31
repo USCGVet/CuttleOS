@@ -11,4 +11,4 @@ threshold = 1
 
 [[signers]]
 id = "primary"
-pubkey_hex = "90d8794cb0bf462c7fc422c8936cc6f133becddef71883794fb4931865da30df"
+pubkey_hex = "30d85c6aa5d3f1a1a3023e5d6b4c996d5c6f220e2e67e4a801204f2b7e7b61a5"

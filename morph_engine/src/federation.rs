@@ -58,12 +58,23 @@ pub fn resolve_federation_path() -> PathBuf {
 pub struct FederationConfig {
     pub threshold: u32,
     pub signers: Vec<Signer>,
+    #[serde(default)]
+    pub revoked: Vec<RevokedSigner>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Signer {
     pub id: String,
     pub pubkey_hex: String,
+}
+
+/// Revoked signer entry (`R3`): any primary or cosigner signature whose
+/// verifying key matches `pubkey_hex` is rejected by verification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevokedSigner {
+    pub pubkey_hex: String,
+    pub since_unix: u64,
+    pub reason: String,
 }
 
 /// A single cosignature attached to an attestation entry. `sig_ed25519`
@@ -239,8 +250,74 @@ pub fn load_federation(path: &Path) -> Result<FederationConfig> {
             );
         }
     }
+    for r in &cfg.revoked {
+        if r.pubkey_hex.len() != 64
+            || !r.pubkey_hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        {
+            bail!(
+                "federation config: revoked entry pubkey_hex '{}' must be 64 lowercase hex chars",
+                r.pubkey_hex
+            );
+        }
+        let _ = parse_pubkey(&r.pubkey_hex)
+            .with_context(|| format!("revoked entry '{}' has malformed pubkey_hex", r.pubkey_hex))?;
+        if r.reason.trim().is_empty() {
+            bail!("federation config: revoked entry '{}' must have a non-empty reason", r.pubkey_hex);
+        }
+    }
     reject_fixture_signers(&cfg)?;
     Ok(cfg)
+}
+
+/// Reject a [`VerifyingKey`] if its 32-byte key appears in `fed.revoked` (`R3`).
+pub fn reject_revoked_verifying_key(
+    vk: &VerifyingKey,
+    fed: &FederationConfig,
+    signer_desc: &str,
+) -> Result<()> {
+    let vk_bytes = vk.to_bytes();
+    for rev in &fed.revoked {
+        let rev_pk = parse_pubkey(&rev.pubkey_hex)
+            .with_context(|| format!("revoked entry '{}' has malformed pubkey_hex", rev.pubkey_hex))?;
+        if rev_pk.to_bytes() == vk_bytes {
+            bail!(
+                "federation config: signer '{}' uses revoked key {} (revoked since_unix={}, reason={:?})",
+                signer_desc,
+                rev.pubkey_hex,
+                rev.since_unix,
+                rev.reason
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Enforce production release keyset policy (`R3`): requires `threshold >= 2`
+/// and at least `threshold` active (non-revoked) signers.
+pub fn verify_production_keyset(fed: &FederationConfig) -> Result<()> {
+    reject_fixture_signers(fed)?;
+    if fed.threshold < 2 {
+        bail!(
+            "production mode requires federation threshold >= 2, got threshold={}",
+            fed.threshold
+        );
+    }
+    let mut active_signers = 0usize;
+    for s in &fed.signers {
+        let pk = parse_pubkey(&s.pubkey_hex)
+            .with_context(|| format!("signer '{}' has malformed pubkey_hex", s.id))?;
+        if reject_revoked_verifying_key(&pk, fed, &s.id).is_ok() {
+            active_signers += 1;
+        }
+    }
+    if active_signers < (fed.threshold as usize) || active_signers < 2 {
+        bail!(
+            "production mode requires at least {} non-revoked signers, have {}",
+            fed.threshold.max(2),
+            active_signers
+        );
+    }
+    Ok(())
 }
 
 fn parse_pubkey(hex_str: &str) -> Result<VerifyingKey> {
@@ -290,6 +367,7 @@ pub fn verify_cosignatures(
             .ok_or_else(|| anyhow::anyhow!("unknown signer '{}'", c.signer_id))?;
         let pk = parse_pubkey(&signer.pubkey_hex)
             .with_context(|| format!("signer '{}' has malformed pubkey_hex", signer.id))?;
+        reject_revoked_verifying_key(&pk, fed, &signer.id)?;
         let sig = parse_sig(&c.sig_ed25519)
             .with_context(|| format!("signer '{}' cosignature has malformed sig hex", signer.id))?;
         pk.verify(message, &sig)
@@ -403,6 +481,7 @@ mod tests {
                     id: format!("f{}", i),
                     pubkey_hex: (*fixture_pk).to_string(),
                 }],
+                revoked: Vec::new(),
             };
             let msg_bytes = [9u8; 32];
             let sk = random_sk();
@@ -444,6 +523,7 @@ mod tests {
                 Signer { id: "a".into(), pubkey_hex: pk_hex(&sk0) },
                 Signer { id: "b".into(), pubkey_hex: pk_hex(&sk0) },
             ],
+            revoked: Vec::new(),
         };
         let msg_bytes = [9u8; 32];
         let cosigs = vec![
@@ -532,6 +612,7 @@ mod tests {
                 Signer { id: "a".into(), pubkey_hex: pk_hex(&sk_a) },
                 Signer { id: "b".into(), pubkey_hex: pk_hex(&sk_b) },
             ],
+            revoked: Vec::new(),
         };
         let msg = [9u8; 32];
         let cosigs = vec![
@@ -547,6 +628,7 @@ mod tests {
         let cfg = FederationConfig {
             threshold: 1,
             signers: vec![Signer { id: "a".into(), pubkey_hex: pk_hex(&sk_a) }],
+            revoked: Vec::new(),
         };
         let msg = [9u8; 32];
         let cosigs = vec![Cosignature {
@@ -565,6 +647,7 @@ mod tests {
         let cfg = FederationConfig {
             threshold: 1,
             signers: vec![Signer { id: "a".into(), pubkey_hex: pk_hex(&sk_a) }],
+            revoked: Vec::new(),
         };
         let msg = [9u8; 32];
         // Sig produced by sk_b but claimed under id "a" — fails verify.
@@ -587,6 +670,7 @@ mod tests {
                 Signer { id: "a".into(), pubkey_hex: pk_hex(&sk_a) },
                 Signer { id: "b".into(), pubkey_hex: pk_hex(&sk_b) },
             ],
+            revoked: Vec::new(),
         };
         let msg = [9u8; 32];
         // Two valid cosigs from 'a' but none from 'b' — distinct count = 1.
@@ -609,6 +693,7 @@ mod tests {
                 Signer { id: "a".into(), pubkey_hex: pk_hex(&sk_a) },
                 Signer { id: "b".into(), pubkey_hex: pk_hex(&sk_b) },
             ],
+            revoked: Vec::new(),
         };
         let msg = [9u8; 32];
         let cosigs = vec![Cosignature {
@@ -618,5 +703,85 @@ mod tests {
         let err = verify_cosignatures(&msg, &cosigs, &cfg).unwrap_err();
         let m = format!("{:#}", err);
         assert!(m.contains("threshold not met"), "got: {}", m);
+    }
+
+    #[test]
+    fn revoked_signer_entries_fail_verification() {
+        let d = tmpdir("revoked");
+        let sk_a = random_sk();
+        let sk_b = random_sk();
+        let p = write_toml(
+            &d,
+            &format!(
+                "threshold = 1\n\
+                 [[signers]]\nid = \"a\"\npubkey_hex = \"{}\"\n\
+                 [[signers]]\nid = \"b\"\npubkey_hex = \"{}\"\n\
+                 [[revoked]]\npubkey_hex = \"{}\"\nsince_unix = 1700000000\nreason = \"key rotation R3\"\n",
+                pk_hex(&sk_a),
+                pk_hex(&sk_b),
+                pk_hex(&sk_a),
+            ),
+        );
+        let cfg = load_federation(&p).expect("load federation with revoked list");
+        assert_eq!(cfg.revoked.len(), 1);
+
+        let msg = [0xABu8; 32];
+        let revoked_cosig = vec![Cosignature {
+            signer_id: "a".into(),
+            sig_ed25519: sig_hex(&sk_a, &msg),
+        }];
+        let err = verify_cosignatures(&msg, &revoked_cosig, &cfg)
+            .expect_err("revoked signer must fail verification");
+        assert!(
+            format!("{err:#}").contains("uses revoked key"),
+            "unexpected error: {err:#}"
+        );
+
+        // Non-revoked signer b still verifies.
+        let active_cosig = vec![Cosignature {
+            signer_id: "b".into(),
+            sig_ed25519: sig_hex(&sk_b, &msg),
+        }];
+        verify_cosignatures(&msg, &active_cosig, &cfg).expect("active signer must verify");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn production_mode_rejects_threshold_1_keyset() {
+        let sk_a = random_sk();
+        let sk_b = random_sk();
+        let cfg_thr1 = FederationConfig {
+            threshold: 1,
+            signers: vec![
+                Signer { id: "a".into(), pubkey_hex: pk_hex(&sk_a) },
+                Signer { id: "b".into(), pubkey_hex: pk_hex(&sk_b) },
+            ],
+            revoked: Vec::new(),
+        };
+        let err = verify_production_keyset(&cfg_thr1)
+            .expect_err("threshold=1 must be rejected in production mode");
+        assert!(
+            format!("{err:#}").contains("threshold >= 2"),
+            "unexpected error: {err:#}"
+        );
+
+        let cfg_thr2_ok = FederationConfig {
+            threshold: 2,
+            signers: vec![
+                Signer { id: "a".into(), pubkey_hex: pk_hex(&sk_a) },
+                Signer { id: "b".into(), pubkey_hex: pk_hex(&sk_b) },
+            ],
+            revoked: Vec::new(),
+        };
+        verify_production_keyset(&cfg_thr2_ok).expect("threshold=2 with 2 active signers must pass");
+
+        // Revoking one of the 2 signers drops active_signers below threshold=2.
+        let mut cfg_thr2_revoked = cfg_thr2_ok.clone();
+        cfg_thr2_revoked.revoked.push(RevokedSigner {
+            pubkey_hex: pk_hex(&sk_a),
+            since_unix: 1700000000,
+            reason: "compromised".into(),
+        });
+        assert!(verify_production_keyset(&cfg_thr2_revoked).is_err());
     }
 }

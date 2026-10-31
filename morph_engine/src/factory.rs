@@ -284,8 +284,189 @@ fn default_required() -> Vec<String> {
 ///   (otherwise the required-but-no-hashes-listed combination would
 ///   reject every entry — almost certainly a misconfiguration).
 /// - Every hash string must be 64 lowercase-hex chars.
+/// Comment-trailer prefix used to embed detached-compatible Ed25519 signatures
+/// inside `factory_expected.toml` and `locked_modules.toml` (`R3`).
+pub const POLICY_SIG_PREFIX: &str = "# cuttle-policy-sig-v1:";
+
+/// Compute canonical policy bytes (LF-normalized content excluding any
+/// `# cuttle-policy-sig-v1:` signature trailer lines, trimmed + single `\n`).
+pub fn canonical_policy_bytes(raw_toml: &str) -> Vec<u8> {
+    let mut lines: Vec<&str> = Vec::new();
+    for line in raw_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(POLICY_SIG_PREFIX) {
+            continue;
+        }
+        lines.push(line.trim_end_matches('\r'));
+    }
+    let mut out = lines.join("\n").trim_end().to_string();
+    out.push('\n');
+    out.into_bytes()
+}
+
+/// Sign `raw_toml` with `sk` under `signer_id` and append a
+/// `# cuttle-policy-sig-v1: signer=<id> sig=<128hex>` line.
+pub fn sign_policy_toml_str(
+    raw_toml: &str,
+    signer_id: &str,
+    sk: &ed25519_dalek::SigningKey,
+) -> String {
+    use ed25519_dalek::Signer as _;
+    let canon = canonical_policy_bytes(raw_toml);
+    let dig: [u8; 32] = Sha256::digest(&canon).into();
+    let sig = sk.sign(&dig);
+    let sig_hex = hex_lower(&sig.to_bytes());
+    let mut out = raw_toml.replace("\r\n", "\n").trim_end().to_string();
+    out.push_str(&format!(
+        "\n{POLICY_SIG_PREFIX} signer={signer_id} sig={sig_hex}\n"
+    ));
+    out
+}
+
+/// Verify that `raw_toml` carries at least one valid `# cuttle-policy-sig-v1:`
+/// signature from a non-revoked signer in `fed`.
+pub fn verify_policy_toml_str(
+    raw_toml: &str,
+    fed: &crate::federation::FederationConfig,
+    policy_name: &str,
+) -> Result<()> {
+    let mut cosigs: Vec<crate::federation::Cosignature> = Vec::new();
+    for line in raw_toml.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(POLICY_SIG_PREFIX) {
+            let mut signer_id: Option<String> = None;
+            let mut sig_hex: Option<String> = None;
+            for tok in rest.split_whitespace() {
+                if let Some(s) = tok.strip_prefix("signer=") {
+                    signer_id = Some(s.to_string());
+                } else if let Some(sig) = tok.strip_prefix("sig=") {
+                    sig_hex = Some(sig.to_string());
+                }
+            }
+            let sid = signer_id.ok_or_else(|| {
+                anyhow::anyhow!("{policy_name}: malformed policy signature line (missing signer=)")
+            })?;
+            let sh = sig_hex.ok_or_else(|| {
+                anyhow::anyhow!("{policy_name}: malformed policy signature line (missing sig=)")
+            })?;
+            cosigs.push(crate::federation::Cosignature {
+                signer_id: sid,
+                sig_ed25519: sh,
+            });
+        }
+    }
+    if cosigs.is_empty() {
+        bail!("{policy_name}: missing `{POLICY_SIG_PREFIX}` signature");
+    }
+    let canon = canonical_policy_bytes(raw_toml);
+    let dig: [u8; 32] = Sha256::digest(&canon).into();
+    let mut policy_fed = fed.clone();
+    if cosigs.len() < (policy_fed.threshold as usize) {
+        // Policy files signed by primary or threshold signers verify against
+        // their present cosignatures if threshold=1, or require fed.threshold.
+    } else {
+        policy_fed.threshold = fed.threshold.max(1);
+    }
+    crate::federation::verify_cosignatures(&dig, &cosigs, &policy_fed)
+        .with_context(|| format!("verify signed policy TOML {policy_name}"))
+}
+
+/// Load, validate, and strictly verify the factory signature on `factory_expected.toml` (`R3`).
+pub fn load_and_verify_signed_factory_expected(
+    path: &Path,
+    fed: &crate::federation::FederationConfig,
+) -> Result<FactoryExpected> {
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    verify_policy_toml_str(&raw, fed, &path.display().to_string())?;
+    let cfg: FactoryExpected =
+        toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    validate_factory_expected(&cfg)
+        .with_context(|| format!("validate {}", path.display()))?;
+    Ok(cfg)
+}
+
+/// Strictly verify the factory signature on `locked_modules.toml` (`R3`).
+pub fn verify_signed_locked_modules(
+    path: &Path,
+    fed: &crate::federation::FederationConfig,
+) -> Result<()> {
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    verify_policy_toml_str(&raw, fed, &path.display().to_string())
+}
+
+/// Generate a deterministic CycloneDX 1.5 JSON SBOM for `kernel_crate_dir`
+/// (parsing `Cargo.lock` packages in sorted `(name, version)` order) and
+/// return `(cyclonedx_json, sha256_hex)` (`R5`).
+pub fn generate_cyclonedx_sbom(kernel_crate_dir: &Path) -> Result<(String, String)> {
+    let lock_path = if kernel_crate_dir.join("Cargo.lock").exists() {
+        kernel_crate_dir.join("Cargo.lock")
+    } else if let Some(ws) = kernel_crate_dir.parent() {
+        ws.join("Cargo.lock")
+    } else {
+        kernel_crate_dir.join("Cargo.lock")
+    };
+    let text = fs::read_to_string(&lock_path)
+        .with_context(|| format!("read Cargo.lock at {}", lock_path.display()))?;
+    let mut pkgs: Vec<(String, String, String)> = Vec::new();
+    let mut cur_name = String::new();
+    let mut cur_ver = String::new();
+    let mut cur_chk = String::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line == "[[package]]" {
+            if !cur_name.is_empty() {
+                pkgs.push((
+                    std::mem::take(&mut cur_name),
+                    std::mem::take(&mut cur_ver),
+                    std::mem::take(&mut cur_chk),
+                ));
+            }
+        } else if let Some(v) = line.strip_prefix("name = ") {
+            cur_name = v.trim_matches('"').to_string();
+        } else if let Some(v) = line.strip_prefix("version = ") {
+            cur_ver = v.trim_matches('"').to_string();
+        } else if let Some(v) = line.strip_prefix("checksum = ") {
+            cur_chk = v.trim_matches('"').to_string();
+        }
+    }
+    if !cur_name.is_empty() {
+        pkgs.push((cur_name, cur_ver, cur_chk));
+    }
+    pkgs.sort();
+    pkgs.dedup();
+
+    let mut components_json = String::new();
+    for (idx, (name, ver, chk)) in pkgs.iter().enumerate() {
+        if idx > 0 {
+            components_json.push(',');
+        }
+        let purl = format!("pkg:cargo/{name}@{ver}");
+        if chk.is_empty() {
+            components_json.push_str(&format!(
+                "{{\"type\":\"library\",\"name\":\"{name}\",\"version\":\"{ver}\",\"purl\":\"{purl}\"}}"
+            ));
+        } else {
+            components_json.push_str(&format!(
+                "{{\"type\":\"library\",\"name\":\"{name}\",\"version\":\"{ver}\",\"purl\":\"{purl}\",\"hashes\":[{{\"alg\":\"SHA-256\",\"content\":\"{chk}\"}}]}}"
+            ));
+        }
+    }
+    let sbom = format!(
+        "{{\"bomFormat\":\"CycloneDX\",\"specVersion\":\"1.5\",\"version\":1,\"components\":[{components_json}]}}\n"
+    );
+    let dig: [u8; 32] = Sha256::digest(sbom.as_bytes()).into();
+    Ok((sbom, hex_lower(&dig)))
+}
+
 pub fn load_factory_expected(path: &Path) -> Result<FactoryExpected> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    if raw.contains(POLICY_SIG_PREFIX) {
+        let fed_path = crate::federation::resolve_federation_path();
+        if fed_path.exists() {
+            let fed = crate::federation::load_federation(&fed_path)?;
+            verify_policy_toml_str(&raw, &fed, &path.display().to_string())?;
+        }
+    }
     let cfg: FactoryExpected =
         toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
     validate_factory_expected(&cfg)
@@ -556,5 +737,76 @@ mod tests {
         assert_eq!(back.required, cfg.required);
         assert_eq!(back.components, cfg.components);
         validate_factory_expected(&back).unwrap();
+    }
+
+    #[test]
+    fn tampered_factory_expected_toml_fails_strict_factory() {
+        use ed25519_dalek::SigningKey;
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let pk_hex = hex_lower(&sk.verifying_key().to_bytes());
+        let fed = crate::federation::FederationConfig {
+            threshold: 1,
+            signers: vec![crate::federation::Signer {
+                id: "primary".into(),
+                pubkey_hex: pk_hex,
+            }],
+            revoked: Vec::new(),
+        };
+
+        let cfg = good_expected();
+        let raw = toml::to_string(&cfg).unwrap();
+        let signed = sign_policy_toml_str(&raw, "primary", &sk);
+
+        let dir = std::env::temp_dir().join(format!(
+            "cuttle_signed_policy_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let exp_path = dir.join("factory_expected.toml");
+        fs::write(&exp_path, &signed).unwrap();
+
+        // Valid signed policy loads and verifies cleanly.
+        let loaded = load_and_verify_signed_factory_expected(&exp_path, &fed)
+            .expect("valid signed factory_expected.toml must verify");
+        assert_eq!(loaded.required, cfg.required);
+
+        // Tamper with a hash in factory_expected.toml while keeping the signature line.
+        let tampered = signed.replace(&h(0xa), &h(0x9));
+        fs::write(&exp_path, &tampered).unwrap();
+        let err = load_and_verify_signed_factory_expected(&exp_path, &fed)
+            .expect_err("tampered factory_expected.toml must fail strict verification");
+        assert!(
+            format!("{err:#}").contains("invalid signature"),
+            "unexpected error: {err:#}"
+        );
+
+        // Stripping the signature line completely must also fail.
+        fs::write(&exp_path, &raw).unwrap();
+        let err2 = load_and_verify_signed_factory_expected(&exp_path, &fed)
+            .expect_err("unsigned factory_expected.toml must fail strict signed verification");
+        assert!(
+            format!("{err2:#}").contains("missing"),
+            "unexpected error: {err2:#}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_policy_files_verify_against_factory_keys() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .to_path_buf();
+        let fed = crate::federation::load_federation(&root.join("factory_keys.toml"))
+            .expect("load workspace factory_keys.toml");
+        let exp_path = root.join("factory_expected.toml");
+        let lock_path = root.join("locked_modules.toml");
+
+        load_and_verify_signed_factory_expected(&exp_path, &fed)
+            .expect("workspace factory_expected.toml must carry valid primary signature");
+        verify_signed_locked_modules(&lock_path, &fed)
+            .expect("workspace locked_modules.toml must carry valid primary signature");
     }
 }

@@ -65,6 +65,7 @@ pub fn from_diversifier_log(
         layout_seed,
         pad_decision_count: pad,
         perturb_decision_count: perturb,
+        sbom_sha256: None,
     };
     if d.is_empty() {
         None
@@ -107,6 +108,7 @@ pub fn from_elf_pair(base_elf: &Path, variant_elf: &Path) -> Result<DiversityEvi
         layout_seed: None,
         pad_decision_count: None,
         perturb_decision_count: None,
+        sbom_sha256: None,
     })
 }
 
@@ -128,6 +130,7 @@ pub fn merge(base: DiversityEvidence, overlay: DiversityEvidence) -> DiversityEv
         perturb_decision_count: overlay
             .perturb_decision_count
             .or(base.perturb_decision_count),
+        sbom_sha256: overlay.sbom_sha256.or(base.sbom_sha256),
     }
 }
 
@@ -137,6 +140,7 @@ pub fn validate_evidence(d: &DiversityEvidence) -> Result<()> {
     for (name, v) in [
         ("base_text_sha256", &d.base_text_sha256),
         ("variant_text_sha256", &d.variant_text_sha256),
+        ("sbom_sha256", &d.sbom_sha256),
     ] {
         if let Some(h) = v {
             if h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -242,6 +246,7 @@ mod tests {
             layout_seed: Some(1),
             pad_decision_count: Some(10),
             perturb_decision_count: Some(10),
+            sbom_sha256: Some("ef".repeat(32)),
         };
         validate_evidence(&d).unwrap();
         assert!(d.satisfies_require());
