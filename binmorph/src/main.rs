@@ -10,9 +10,8 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
-use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
-use cuttle_binmorph::{rewrite_function, Prng, Stats};
+use anyhow::{Context, Result};
+pub use cuttle_binmorph::diversify_elf;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -43,63 +42,6 @@ fn main() -> Result<()> {
     // this can be piped into the packaging step.
     println!("{}", Path::new(&output).display());
     Ok(())
-}
-
-/// Read `input`, rewrite the code inside every `.text` function, write
-/// `output`. Returns the rewrite statistics.
-pub fn diversify_elf(input: &Path, output: &Path, seed: u64) -> Result<Stats> {
-    let data = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
-
-    // Determine `.text`'s file range + virtual address, and gather the
-    // function symbol ranges — all from an immutable parse, so the borrow
-    // ends before we mutate the bytes.
-    let (text_off, text_size, text_vaddr, funcs) = {
-        let file = object::File::parse(&*data)
-            .with_context(|| format!("parse ELF {}", input.display()))?;
-        let text = file
-            .section_by_name(".text")
-            .context("no .text section")?;
-        let (off, size) = text
-            .file_range()
-            .context(".text section has no file range (NOBITS?)")?;
-        let vaddr = text.address();
-
-        // Collect (vaddr, size) of every function symbol that lies wholly
-        // within .text. Bounding edits to real functions avoids treating
-        // embedded data/jump-tables as code.
-        let mut funcs: Vec<(u64, u64)> = file
-            .symbols()
-            .filter(|s| s.kind() == SymbolKind::Text && s.size() > 0)
-            .map(|s| (s.address(), s.size()))
-            .filter(|&(a, sz)| a >= vaddr && a + sz <= vaddr + size)
-            .collect();
-        funcs.sort_unstable();
-        funcs.dedup();
-        (off as usize, size as usize, vaddr, funcs)
-    };
-
-    if funcs.is_empty() {
-        bail!(
-            "no .text function symbols found in {} — refusing to linear-sweep \
-             a stripped binary (would risk rewriting embedded data)",
-            input.display()
-        );
-    }
-
-    let mut out = data;
-    let mut prng = Prng::new(seed);
-    let mut stats = Stats::default();
-    for (vaddr, size) in funcs {
-        let start = text_off + (vaddr - text_vaddr) as usize;
-        let end = start + size as usize;
-        if end > text_off + text_size || end > out.len() {
-            continue; // defensive: skip anything that would run past .text
-        }
-        rewrite_function(&mut out[start..end], vaddr, &mut prng, &mut stats);
-    }
-
-    std::fs::write(output, &out).with_context(|| format!("write {}", output.display()))?;
-    Ok(stats)
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {

@@ -377,19 +377,28 @@ pub fn gpr_name_to_index(tok: &str) -> Option<u8> {
 
 /// Analyze a formatted gadget (`"pop rdi; xor eax,eax; ret"`) and return:
 /// `(defs_mask, clobbers_rsp_arbitrarily)` where:
-/// - `defs_mask` has bit `r` (`0..16`) set for every GP register written by the gadget
-///   (excluding normal stack adjustments on `rsp`),
+/// - `defs_mask` has bit `r` (`0..16`) set for every GP register defined by the gadget
+///   (excluding normal constant stack adjustments on `rsp`),
 /// - `clobbers_rsp_arbitrarily` is `true` if any instruction overwrites `rsp` with a
-///   non-constant stack pivot (`pop rsp`, `mov rsp, ...`, `xchg rsp, ...`, `lea rsp, ...`).
+///   non-constant stack pivot (`pop rsp`, `mov rsp, ...`, `xchg rsp, ...`, `lea rsp, ...`)
+///   or if a `call` or `jmp` appears before the gadget's final terminator instruction.
+///
+/// Note: `defs_mask` tracks all GP register definitions (`pop`, `mov`, `lea`, ALU writes)
+/// so [`DataflowChain`] measures ordered non-clobbering register-definition survival; use
+/// [`analyze_stack_controlled_gadget_dataflow`] when restricting strictly to stack-fed
+/// (`pop <reg>` or `[rsp + ...]`) payload loads.
 pub fn analyze_gadget_dataflow(gadget_text: &str) -> (u16, bool) {
     let mut defs_mask = 0u16;
     let mut clobbers_rsp = false;
 
-    for raw_stmt in gadget_text.split(';') {
-        let stmt = raw_stmt.trim();
-        if stmt.is_empty() {
-            continue;
-        }
+    let stmts: Vec<&str> = gadget_text
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for (idx, &stmt) in stmts.iter().enumerate() {
+        let is_last = idx + 1 == stmts.len();
         let (mnem, rest) = match stmt.split_once(' ') {
             Some((m, r)) => (m.trim(), r.trim()),
             None => (stmt, ""),
@@ -409,7 +418,12 @@ pub fn analyze_gadget_dataflow(gadget_text: &str) -> (u16, bool) {
                     }
                 }
             }
-            "push" | "call" | "jmp" => {}
+            "push" => {}
+            "call" | "jmp" => {
+                if !is_last {
+                    clobbers_rsp = true;
+                }
+            }
             "xchg" => {
                 for op in rest.split(',') {
                     if let Some(reg_idx) = gpr_name_to_index(op) {
@@ -448,6 +462,63 @@ pub fn analyze_gadget_dataflow(gadget_text: &str) -> (u16, bool) {
         }
     }
     (defs_mask, clobbers_rsp)
+}
+
+/// Analyze a formatted gadget for stack-controlled register loads (`pop <reg>` or
+/// `mov <reg>, [rsp...]` without subsequent overwrite by a non-stack instruction).
+/// Returns `(stack_loads_mask, all_defs_mask, clobbers_rsp_arbitrarily)`.
+pub fn analyze_stack_controlled_gadget_dataflow(gadget_text: &str) -> (u16, u16, bool) {
+    let (all_defs, mut clobbers_rsp) = analyze_gadget_dataflow(gadget_text);
+    let mut stack_loads = 0u16;
+    let stmts: Vec<&str> = gadget_text
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    for (idx, &stmt) in stmts.iter().enumerate() {
+        let is_last = idx + 1 == stmts.len();
+        let (mnem, rest) = match stmt.split_once(' ') {
+            Some((m, r)) => (m.trim(), r.trim()),
+            None => (stmt, ""),
+        };
+        match mnem {
+            "pop" => {
+                if let Some(reg_idx) = gpr_name_to_index(rest) {
+                    if reg_idx != 4 {
+                        stack_loads |= 1 << reg_idx;
+                    }
+                }
+            }
+            "mov" | "movzx" | "movsx" | "movsxd" => {
+                let mut parts = rest.split(',');
+                let dst = parts.next().unwrap_or("").trim();
+                let src = parts.next().unwrap_or("").trim();
+                if let Some(reg_idx) = gpr_name_to_index(dst) {
+                    if reg_idx != 4 {
+                        if src.contains("[rsp") || src.contains("[esp") {
+                            stack_loads |= 1 << reg_idx;
+                        } else {
+                            stack_loads &= !(1 << reg_idx);
+                        }
+                    }
+                }
+            }
+            "call" | "jmp" => {
+                if !is_last {
+                    clobbers_rsp = true;
+                }
+            }
+            _ => {
+                let dst = rest.split(',').next().unwrap_or("").trim();
+                if let Some(reg_idx) = gpr_name_to_index(dst) {
+                    if reg_idx != 4 {
+                        stack_loads &= !(1 << reg_idx);
+                    }
+                }
+            }
+        }
+    }
+    (stack_loads, all_defs, clobbers_rsp)
 }
 
 /// One step in a register-dataflow-constrained ROP chain.
@@ -543,12 +614,13 @@ pub fn evaluate_dataflow_chains(
         let mut chain_ok = true;
         for step in &chain.steps {
             let goal_bit = 1u16 << step.goal_reg;
-            let step_ok = match variant.by_offset.get(&step.offset) {
-                Some(v_text) => {
+            let base_text = base.by_offset.get(&step.offset);
+            let step_ok = match (base_text, variant.by_offset.get(&step.offset)) {
+                (Some(b_text), Some(v_text)) if b_text == v_text => {
                     let (v_defs, v_clobbers_rsp) = analyze_gadget_dataflow(v_text);
                     !v_clobbers_rsp && (v_defs & goal_bit) != 0 && (v_defs & established_mask) == 0
                 }
-                None => false,
+                _ => false,
             };
             if step_ok {
                 total_step_hits += 1;
@@ -594,6 +666,18 @@ mod dataflow_tests {
 
         let (_defs3, rsp3) = analyze_gadget_dataflow("pop rsp; ret");
         assert!(rsp3, "pop rsp is a stack pivot and must be flagged");
+
+        let (_defs4, rsp4) = analyze_gadget_dataflow("pop rdi; call rax; ret");
+        assert!(rsp4, "interior call before final instruction must be flagged");
+
+        let (stack_defs, all_defs, _) =
+            analyze_stack_controlled_gadget_dataflow("mov rdi, rbx; pop rsi; ret");
+        assert_eq!(all_defs, (1 << 7) | (1 << 6));
+        assert_eq!(
+            stack_defs,
+            1 << 6,
+            "register-to-register mov without stack source must not count as stack-controlled"
+        );
     }
 
     #[test]
@@ -616,9 +700,3 @@ mod dataflow_tests {
     }
 }
 
-fn _chainsim_tail(ratios: &[f64]) -> Vec<(f64, f64)> {
-    ratios
-        .iter()
-        .map(|&r| (r, cadence_break_even(r, 1.0)))
-        .collect()
-}

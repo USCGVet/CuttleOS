@@ -538,6 +538,7 @@ fn execute_function_with_ro(
         let next_rip = insn.next_ip();
         let mnemonic = insn.mnemonic();
 
+        let prev_rsp = state.regs[4];
         match mnemonic {
             iced_x86::Mnemonic::Nop
             | iced_x86::Mnemonic::Endbr64
@@ -584,6 +585,15 @@ fn execute_function_with_ro(
                     0
                 };
                 state.regs[4] = rsp.wrapping_add(8).wrapping_add(imm_pop);
+                if ret_addr != RET_SENTINEL {
+                    // Canonicalize ABI-dead caller-saved non-return scratch registers
+                    // (`RCX, RSI, RDI, R8..R11`) on return from an internal callee so LLVM
+                    // `undef` union-padding stores in callers cannot leak callee scratch
+                    // register permutations.
+                    for r in [1usize, 6, 7, 8, 9, 10, 11] {
+                        state.regs[r] = 0;
+                    }
+                }
                 rip = ret_addr;
             }
             iced_x86::Mnemonic::Call => {
@@ -1345,6 +1355,20 @@ fn execute_function_with_ro(
                 }
             }
         }
+        // Scrub deallocated callee stack-frame bytes `[prev_rsp .. new_rsp)` when `RSP` moves upward
+        // within the stack arena (`[0x4000 .. INITIAL_RSP_OFFSET + 8]`) so uninitialized `Result`
+        // union padding copied from a reused stack frame cannot leak leftover spilled callee-saved
+        // register ordering from an earlier call.
+        let new_rsp = state.regs[4];
+        if new_rsp > prev_rsp {
+            let stack_lo = MEM_BASE + 0x4000;
+            let stack_hi = MEM_BASE + (INITIAL_RSP_OFFSET as u64) + 8;
+            if prev_rsp >= stack_lo && new_rsp <= stack_hi {
+                let lo = (prev_rsp - MEM_BASE) as usize;
+                let hi = (new_rsp - MEM_BASE) as usize;
+                state.mem[lo..hi].fill(0);
+            }
+        }
     }
     Err(VmFault::StepBudgetExceeded(max_steps))
 }
@@ -1706,6 +1730,42 @@ fn build_corpus_functions() -> Vec<FnSpec> {
                 0x48, 0x19, 0xC8, // 40..43 (3B): sbb rax, rcx
                 0x48, 0x0F, 0x40, 0xC2, // 43..47 (4B): cmovo rax, rdx
                 0xC3, // 47..48 (1B): ret (invariant 0xC3 byte read by movzx above)
+            ],
+        },
+        // 10. 64-bit register write with non-zero upper 32 bits followed by 32-bit self-test
+        //     (`test eax, eax`): exercises the `prev_instr_zeroed_upper32` guard in `pass_reg_reg_morph`.
+        //     If `test eax, eax` (`85 C0`) were morphed to `or eax, eax` (`09 C0`) or `and eax, eax`
+        //     (`21 C0`) when bits 63..32 of RAX are non-zero, the 32-bit ALU write would zero-extend
+        //     EAX and destroy the upper 32 bits of RAX!
+        FnSpec {
+            name: "fn10_upper32_nonzero_before_32bit_self_test",
+            pointer_in_rdi: false,
+            bytes: vec![
+                0x48, 0x89, 0xF8, // mov rax, rdi (full 64-bit write; bits 63..32 non-zero!)
+                0x48, 0x09, 0xF0, // or rax, rsi  (ensures upper 32 bits remain live & non-zero)
+                0x85, 0xC0, // test eax, eax (32-bit self-test; MUST NOT morph to or/and eax, eax!)
+                0x48, 0x0F, 0x44, 0xD1, // cmovz rdx, rcx
+                0x48, 0x01, 0xD0, // add rax, rdx (consumes all 64 bits of RAX)
+                0xC3, // ret
+            ],
+        },
+        // 11. Interior `[rip + disp32]` instruction inside a shiftable cross-width pair
+        //     (`xor ecx, ecx` [2B->3B] ; `lea rcx, [rip + 7]` [7B] ; `add rcx, 1` [4B->3B] ;
+        //     `xor edx, edx` [kills flags]): exercises the `is_ip_rel_memory_operand()` guard
+        //     in `pass_cross_width_pair_morph` when `schedule_commute` is blocked by WAW/RAW
+        //     dependence on `rcx` and `return_block_scratch_swap` is blocked by live `rsi`/`rdi`.
+        FnSpec {
+            name: "fn11_interior_rip_relative_in_cross_width_window",
+            pointer_in_rdi: false,
+            bytes: vec![
+                0x31, 0xC9, // 0..2 (2B): xor ecx, ecx (widens to 3B `48 29 C9`)
+                0x48, 0x8D, 0x0D, 0x07, 0x00, 0x00, 0x00, // 2..9 (7B): lea rcx, [rip + 7]
+                0x48, 0x83, 0xC1, 0x01, // 9..13 (4B): add rcx, 1 (shrinks to 3B `48 FF C1`)
+                0x31, 0xD2, // 13..15 (2B): xor edx, edx (kills flags after add rcx, 1)
+                0x48, 0x89, 0xC8, // 15..18 (3B): mov rax, rcx
+                0x48, 0x01, 0xF0, // 18..21 (3B): add rax, rsi
+                0x48, 0x01, 0xF8, // 21..24 (3B): add rax, rdi
+                0xC3, // 24..25 (1B): ret
             ],
         },
     ]
@@ -2112,6 +2172,62 @@ fn differential_equivalence_catches_injected_semantic_bugs_meta_test() {
         caught_6.is_err(),
         "differential harness must catch live carry-flag (CF) corruption across adc/sbb chains"
     );
+
+    // Fault 7: Upper-32 zero-extension bug in `fn10_upper32_nonzero_before_32bit_self_test`:
+    // Mutate `test eax, eax` (`85 C0`) -> `or eax, eax` (`09 C0`), which writes `eax` and
+    // zero-extends bits 63:32 of `RAX` when `RAX` holds a 64-bit value with non-zero upper 32 bits!
+    let mut bad_text_7 = orig_text.to_vec();
+    let (_, fn10_vaddr, fn10_len, _) = &layout[10];
+    let fn10_off = (*fn10_vaddr - TEXT_VADDR) as usize;
+    let test_pos = bad_text_7[fn10_off..fn10_off + fn10_len]
+        .windows(2)
+        .position(|w| w == [0x85, 0xC0])
+        .expect("locate test eax, eax in fn10");
+    bad_text_7[fn10_off + test_pos] = 0x09;
+    let caught_7 = std::panic::catch_unwind(|| {
+        assert_function_equivalent(
+            "fn10_fault_upper32_self_test",
+            orig_text,
+            &bad_text_7,
+            TEXT_VADDR,
+            *fn10_vaddr,
+            1,
+            8,
+            false,
+        );
+    });
+    assert!(
+        caught_7.is_err(),
+        "differential harness must catch test eax, eax -> or eax, eax upper-32 zero-extension bug"
+    );
+
+    // Fault 8: Cross-width interior RIP-relative shift bug in `fn11_interior_rip_relative_in_cross_width_window`:
+    // Shift `disp32` of `lea rcx, [rip + 7]` (`48 8D 0D 07 00 00 00`) by +1 (`08 00 00 00`),
+    // simulating an unadjusted ±1 byte cross-width boundary shift across an interior RIP-relative instruction.
+    let mut bad_text_8 = orig_text.to_vec();
+    let (_, fn11_vaddr, fn11_len, _) = &layout[11];
+    let fn11_off = (*fn11_vaddr - TEXT_VADDR) as usize;
+    let rip11_pos = bad_text_8[fn11_off..fn11_off + fn11_len]
+        .windows(7)
+        .position(|w| w == [0x48, 0x8D, 0x0D, 0x07, 0x00, 0x00, 0x00])
+        .expect("locate lea rcx, [rip + 7] in fn11");
+    bad_text_8[fn11_off + rip11_pos + 3] = 0x08;
+    let caught_8 = std::panic::catch_unwind(|| {
+        assert_function_equivalent(
+            "fn11_fault_cross_width_rip_shift",
+            orig_text,
+            &bad_text_8,
+            TEXT_VADDR,
+            *fn11_vaddr,
+            1,
+            8,
+            false,
+        );
+    });
+    assert!(
+        caught_8.is_err(),
+        "differential harness must catch ±1 byte cross-width interior RIP-relative shift bug"
+    );
 }
 
 #[test]
@@ -2327,6 +2443,50 @@ fn ensure_compiled_kernel_elf_exists(root: &std::path::Path) -> std::path::PathB
         .expect("target_enterprise_kernel ELF missing after successful `cargo build --release`")
 }
 
+fn apply_elf64_relative_relocations(elf_bytes: &mut [u8]) -> (usize, usize) {
+    const R_X86_64_RELATIVE: u32 = 8;
+
+    let (rela_off, rela_size, sec_ranges) = {
+        let obj = object::File::parse(&*elf_bytes).expect("parse ELF64 for relocations");
+        let Some(rela_sec) = obj.section_by_name(".rela.dyn") else {
+            return (0, 0);
+        };
+        let Some((roff, rsize)) = rela_sec.file_range() else {
+            return (0, 0);
+        };
+        let mut ranges: Vec<(u64, u64, usize)> = Vec::new();
+        for sec in obj.sections() {
+            if let Some((foff, flen)) = sec.file_range() {
+                if sec.address() != 0 && flen > 0 {
+                    ranges.push((sec.address(), flen, foff as usize));
+                }
+            }
+        }
+        (roff as usize, rsize as usize, ranges)
+    };
+
+    let entry_count = rela_size / 24;
+    let mut applied = 0usize;
+    for i in 0..entry_count {
+        let off = rela_off + i * 24;
+        let r_offset = u64::from_le_bytes(elf_bytes[off..off + 8].try_into().unwrap());
+        let r_info = u64::from_le_bytes(elf_bytes[off + 8..off + 16].try_into().unwrap());
+        let r_addend = i64::from_le_bytes(elf_bytes[off + 16..off + 24].try_into().unwrap());
+        let r_type = (r_info & 0xFFFF_FFFF) as u32;
+        if r_type == R_X86_64_RELATIVE {
+            for &(sec_vaddr, sec_flen, sec_foff) in &sec_ranges {
+                if r_offset >= sec_vaddr && r_offset + 8 <= sec_vaddr + sec_flen {
+                    let pos = sec_foff + ((r_offset - sec_vaddr) as usize);
+                    elf_bytes[pos..pos + 8].copy_from_slice(&(r_addend as u64).to_le_bytes());
+                    applied += 1;
+                    break;
+                }
+            }
+        }
+    }
+    (applied, entry_count)
+}
+
 #[test]
 fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
     // Always locate or build the bare-metal `target_enterprise_kernel` ELF (never skip)
@@ -2336,7 +2496,16 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
     let root = manifest_dir.parent().expect("workspace root");
     let kernel_elf_path = ensure_compiled_kernel_elf_exists(root);
 
-    let base_elf = std::fs::read(&kernel_elf_path).expect("read kernel ELF");
+    let mut base_elf = std::fs::read(&kernel_elf_path).expect("read kernel ELF");
+    let (rela_applied, rela_total) = apply_elf64_relative_relocations(&mut base_elf);
+    assert_eq!(
+        rela_applied, rela_total,
+        "all .rela.dyn R_X86_64_RELATIVE entries must be applied to the kernel image"
+    );
+    assert!(
+        rela_applied >= 4000,
+        "expected >= 4000 R_X86_64_RELATIVE relocations in target_enterprise_kernel, got {rela_applied}"
+    );
     let obj = object::File::parse(base_elf.as_slice()).expect("parse kernel ELF");
     let text_sec = obj.section_by_name(".text").expect(".text section");
     let text_vaddr = text_sec.address();
@@ -2475,23 +2644,23 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
     }
 
     assert!(
-        verified_kernel_fns.len() >= 700,
-        "expected at least 700 real compiled kernel functions in target_enterprise_kernel .text, got {}",
+        verified_kernel_fns.len() >= 1000,
+        "expected at least 1000 real compiled kernel functions in target_enterprise_kernel .text, got {}",
         verified_kernel_fns.len()
     );
     assert!(
-        input_sensitive_fns >= 700,
-        "expected at least 700 real kernel functions with input-dependent dynamic return/memory outputs, got {}",
+        input_sensitive_fns >= 1000,
+        "expected at least 1000 real kernel functions with input-dependent dynamic return/memory outputs, got {}",
         input_sensitive_fns
     );
     assert!(
-        mem_mutating_fns >= 340,
-        "expected at least 340 real kernel functions that concretely mutate the 16 KiB data/struct arena, got {}",
+        mem_mutating_fns >= 600,
+        "expected at least 600 real kernel functions that concretely mutate the 16 KiB data/struct arena, got {}",
         mem_mutating_fns
     );
     assert!(
-        contract_and_boundary_fns >= 100,
-        "expected at least 100 cuttle_contracts / target_enterprise_kernel boundary functions verified, got {}",
+        contract_and_boundary_fns >= 190,
+        "expected at least 190 cuttle_contracts / target_enterprise_kernel boundary functions verified, got {}",
         contract_and_boundary_fns
     );
 
@@ -2593,7 +2762,8 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
     // `mov` source/dest register bits, or immediate/displacement byte), and verify that the
     // concrete execution comparator catches the divergence!
     let mut base_morphed_elf = base_elf.clone();
-    rewrite_elf_bytes(&mut base_morphed_elf, 1).expect("rewrite kernel ELF for negative check");
+    let total_rewritten_stats =
+        rewrite_elf_bytes(&mut base_morphed_elf, 1).expect("rewrite kernel ELF for negative check");
     let base_morph_text =
         &base_morphed_elf[text_file_off as usize..(text_file_off + text_len) as usize];
     let mut real_kernel_semantic_faults_caught = 0usize;
@@ -2680,8 +2850,11 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
     }
 
     eprintln!(
-        "real kernel ELF differential check: verified {} real kernel functions ({} input-sensitive, {} memory-mutating, {} .data/.bss-mutating, {} contract/kernel-boundary, {} distinct mutated functions, {} mutated fn×seed instances, {} total concrete executions across {} seeds, {} real-kernel injected faults caught)",
+        "real kernel ELF differential check: {} verified of {} rewritten real kernel functions (.rela.dyn applied={}/{}, {} input-sensitive, {} memory-mutating, {} .data/.bss-mutating, {} contract/kernel-boundary, {} distinct mutated functions, {} mutated fn×seed instances, {} total concrete executions across {} seeds, {} real-kernel injected faults caught)",
         verified_kernel_fns.len(),
+        total_rewritten_stats.functions,
+        rela_applied,
+        rela_total,
         input_sensitive_fns,
         mem_mutating_fns,
         global_bss_data_fns,
@@ -2693,18 +2866,18 @@ fn differential_equivalence_on_real_compiled_kernel_elf_functions() {
         real_kernel_semantic_faults_caught
     );
     assert!(
-        distinct_mutated_fns.len() >= 650,
-        "expected at least 650 distinct real kernel functions mutated by cuttle-binmorph, got {}",
+        distinct_mutated_fns.len() >= 900,
+        "expected at least 900 distinct real kernel functions mutated by cuttle-binmorph, got {}",
         distinct_mutated_fns.len()
     );
     assert!(
-        mutated_fn_seed_instances >= 18_500,
-        "expected at least 18500 mutated (function, seed) instances verified on real kernel ELF, got {}",
+        mutated_fn_seed_instances >= 27_000,
+        "expected at least 27000 mutated (function, seed) instances verified on real kernel ELF, got {}",
         mutated_fn_seed_instances
     );
     assert!(
-        real_kernel_semantic_faults_caught >= 600,
-        "expected concrete execution comparator to catch injected 1-byte instruction corruptions on at least 600 real kernel functions, got {}",
+        real_kernel_semantic_faults_caught >= 900,
+        "expected concrete execution comparator to catch injected 1-byte instruction corruptions on at least 900 real kernel functions, got {}",
         real_kernel_semantic_faults_caught
     );
 }

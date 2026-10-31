@@ -490,8 +490,8 @@ pub fn evaluate_pairwise_diversity(
     }
 
     let mut pair_count = 0usize;
-    let mut max_pos_surv = 0.0f64;
-    let mut sum_pos_surv = 0.0f64;
+    let mut max_pos_surv = if k >= 2 { 0.0f64 } else { 1.0f64 };
+    let mut sum_pos_surv = if k >= 2 { 0.0f64 } else { 1.0f64 };
     let mut min_byte_diff = if k >= 2 { 1.0f64 } else { 0.0f64 };
     let mut sum_byte_diff = 0.0f64;
 
@@ -499,7 +499,12 @@ pub fn evaluate_pairwise_diversity(
         for j in (i + 1)..k {
             pair_count += 1;
             let rep = churn(&gadget_sets[i], &gadget_sets[j]);
-            let pos = rep.positional_survival();
+            let total_gadgets = rep.base_gadgets + rep.variant_gadgets;
+            let pos = if total_gadgets == 0 {
+                0.0
+            } else {
+                (2 * rep.positional_survivors) as f64 / (total_gadgets as f64)
+            };
             if pos > max_pos_surv {
                 max_pos_surv = pos;
             }
@@ -673,8 +678,27 @@ mod tests {
         assert_eq!(rep.unique_sha256_count, 4);
         assert!(rep.min_pairwise_byte_diff_fraction >= 0.4);
         assert!(rep.mean_pairwise_positional_survival < 0.6);
+
+        let single = evaluate_pairwise_diversity(&[("s1", v1, 0x1000)], DEFAULT_MAX_INSTRS);
+        assert_eq!(single.pair_count, 0);
+        assert_eq!(single.mean_pairwise_positional_survival, 1.0);
+        assert_eq!(single.max_pairwise_positional_survival, 1.0);
+
+        let a: &[u8] = &[0x58, 0x59, 0x5A, 0xC3];
+        let b: &[u8] = &[0x90, 0x90, 0x90, 0xC3];
+        let ab = evaluate_pairwise_diversity(
+            &[("a", a, 0x1000), ("b", b, 0x1000)],
+            DEFAULT_MAX_INSTRS,
+        );
+        let ba = evaluate_pairwise_diversity(
+            &[("b", b, 0x1000), ("a", a, 0x1000)],
+            DEFAULT_MAX_INSTRS,
+        );
+        assert!(
+            (ab.mean_pairwise_positional_survival - ba.mean_pairwise_positional_survival).abs()
+                < 1e-12,
+            "pairwise positional survival must be symmetric with respect to variant ordering"
+        );
     }
 
-    fn _tail_marker() {
-    }
 }

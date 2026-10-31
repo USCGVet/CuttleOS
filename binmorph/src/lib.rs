@@ -1325,20 +1325,25 @@ pub fn try_swap_callee_saved_family(
         if !touches_family(instr, fam_a) && !touches_family(instr, fam_b) {
             continue;
         }
+        let orig_bytes = &original[pos..pos + instr.len()];
         let ni = remap_family_pair(instr, fam_a, fam_b);
-        let mut enc = Encoder::new(64);
-        match enc.encode(&ni, instr.ip()) {
-            Ok(len) if len == instr.len() => edits.push((pos, enc.take_buffer())),
-            _ => return false,
+        match encode_remapped_without_adding_ret(&ni, instr.ip(), orig_bytes) {
+            Some(buf) => edits.push((pos, buf)),
+            None => return false,
         }
     }
 
     if edits.is_empty() {
         return false;
     }
+    let mut candidate = code.to_vec();
     for (pos, bytes) in &edits {
-        code[*pos..*pos + bytes.len()].copy_from_slice(bytes);
+        candidate[*pos..*pos + bytes.len()].copy_from_slice(bytes);
     }
+    if !gadget_counts_not_increased(&original, &candidate) {
+        return false;
+    }
+    code.copy_from_slice(&candidate);
     stats.reg_remapped_instrs += edits.len();
     true
 }
@@ -1362,21 +1367,26 @@ pub fn try_swap_r14_r15(code: &mut [u8], base_ip: u64, stats: &mut Stats) -> boo
         if !touches_pair(&instr, R14, R15) {
             continue;
         }
+        let orig_bytes = &original[pos..pos + instr.len()];
         let ni = remap_pair(&instr, R14, R15);
-        let mut enc = Encoder::new(64);
-        match enc.encode(&ni, instr.ip()) {
-            Ok(len) if len == instr.len() => edits.push((pos, enc.take_buffer())),
-            // Any surprise (encode error, or a length change we did not
-            // expect) aborts the whole-function swap to preserve consistency.
-            _ => return false,
+        match encode_remapped_without_adding_ret(&ni, instr.ip(), orig_bytes) {
+            Some(buf) => edits.push((pos, buf)),
+            // Any surprise (encode error, length change, or unavoidable ret-family byte)
+            // aborts the whole-function swap to preserve consistency.
+            None => return false,
         }
     }
     if edits.is_empty() {
         return false;
     }
+    let mut candidate = code.to_vec();
     for (pos, bytes) in &edits {
-        code[*pos..*pos + bytes.len()].copy_from_slice(bytes);
+        candidate[*pos..*pos + bytes.len()].copy_from_slice(bytes);
     }
+    if !gadget_counts_not_increased(&original, &candidate) {
+        return false;
+    }
+    code.copy_from_slice(&candidate);
     stats.reg_remapped_instrs += edits.len();
     true
 }
@@ -1561,26 +1571,30 @@ fn pass_leaf_scratch_reg_swap(code: &mut [u8], base_ip: u64, prng: &mut Prng, st
             if !touches_family(instr, fam_a) && !touches_family(instr, fam_b) {
                 continue;
             }
+            let orig_bytes = &code[pos..pos + instr.len()];
             let ni = remap_family_pair(instr, fam_a, fam_b);
-            let mut enc = Encoder::new(64);
-            match enc.encode(&ni, instr.ip()) {
-                Ok(len) if len == instr.len() => edits.push((pos, enc.take_buffer())),
-                _ => {
+            match encode_remapped_without_adding_ret(&ni, instr.ip(), orig_bytes) {
+                Some(buf) => edits.push((pos, buf)),
+                None => {
                     ok = false;
                     break;
                 }
             }
         }
         if ok && !edits.is_empty() {
+            let mut candidate = code.to_vec();
             for (pos, bytes) in &edits {
-                code[*pos..*pos + bytes.len()].copy_from_slice(bytes);
+                candidate[*pos..*pos + bytes.len()].copy_from_slice(bytes);
             }
-            stats.reg_remapped_instrs += edits.len();
-            // Re-decode `instrs` if a second pair is going to run.
-            let mut dec2 = Decoder::with_ip(64, code, base_ip, DecoderOptions::NONE);
-            instrs.clear();
-            while dec2.can_decode() {
-                instrs.push(dec2.decode());
+            if gadget_counts_not_increased(code, &candidate) {
+                code.copy_from_slice(&candidate);
+                stats.reg_remapped_instrs += edits.len();
+                // Re-decode `instrs` if a second pair is going to run.
+                let mut dec2 = Decoder::with_ip(64, code, base_ip, DecoderOptions::NONE);
+                instrs.clear();
+                while dec2.can_decode() {
+                    instrs.push(dec2.decode());
+                }
             }
         }
     }
@@ -1781,29 +1795,39 @@ fn pass_return_block_scratch_swap(code: &mut [u8], base_ip: u64, prng: &mut Prng
                         if !touches_family(ins, fam_a) {
                             continue;
                         }
+                        let p = positions[k];
+                        let orig_bytes = &code[p..p + ins.len()];
                         let ni = remap_family_pair(ins, fam_a, fam_b);
-                        let mut enc = Encoder::new(64);
-                        match enc.encode(&ni, ins.ip()) {
-                            Ok(len) if len == ins.len() => edits.push((positions[k], enc.take_buffer())),
-                            _ => {
+                        match encode_remapped_without_adding_ret(&ni, ins.ip(), orig_bytes) {
+                            Some(buf) => edits.push((p, buf)),
+                            None => {
                                 ok = false;
                                 break;
                             }
                         }
                     }
                     if ok && !edits.is_empty() {
+                        let mut candidate = code.to_vec();
                         for (pos, bytes) in &edits {
-                            code[*pos..*pos + bytes.len()].copy_from_slice(bytes);
+                            candidate[*pos..*pos + bytes.len()].copy_from_slice(bytes);
                         }
-                        stats.reg_remapped_instrs += edits.len();
-                        // Re-decode the modified instructions in `start_idx..ret_idx`.
-                        for k in start_idx..ret_idx {
-                            let p = positions[k];
-                            let l = instrs[k].len();
-                            let mut d = Decoder::with_ip(64, &code[p..p + l], instrs[k].ip(), DecoderOptions::NONE);
-                            instrs[k] = d.decode();
+                        if gadget_counts_not_increased(code, &candidate) {
+                            code.copy_from_slice(&candidate);
+                            stats.reg_remapped_instrs += edits.len();
+                            // Re-decode the modified instructions in `start_idx..ret_idx`.
+                            for k in start_idx..ret_idx {
+                                let p = positions[k];
+                                let l = instrs[k].len();
+                                let mut d = Decoder::with_ip(
+                                    64,
+                                    &code[p..p + l],
+                                    instrs[k].ip(),
+                                    DecoderOptions::NONE,
+                                );
+                                instrs[k] = d.decode();
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
             }
@@ -2295,7 +2319,15 @@ fn pass_schedule_commute(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: 
                         }
                     }
                 }
-                if ok && encoded_window.len() == total_bytes {
+                if ok
+                    && encoded_window.len() == total_bytes
+                    && slice_replacement_preserves_gadget_counts(
+                        code,
+                        start_pos,
+                        total_bytes,
+                        &encoded_window,
+                    )
+                {
                     code[start_pos..start_pos + total_bytes].copy_from_slice(&encoded_window);
                     stats.swapped += 1;
                     i = end;
@@ -3256,7 +3288,14 @@ fn pass_cross_width_pair_morph(
                     combined.extend_from_slice(&bi);
                     combined.extend_from_slice(mid_slice);
                     combined.extend_from_slice(&bj);
-                    if !has_ret_opcode_byte(&combined) {
+                    if !has_ret_opcode_byte(&combined)
+                        && slice_replacement_preserves_gadget_counts(
+                            code,
+                            pos_i,
+                            total_len,
+                            &combined,
+                        )
+                    {
                         matched_end = Some((j, combined));
                         break;
                     }
@@ -3365,6 +3404,87 @@ fn prev_instr_zeroed_upper32(
         }
     }
     false
+}
+
+#[inline]
+pub fn count_c3_cf_bytes(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b == 0xC3 || b == 0xCF).count()
+}
+
+#[inline]
+pub fn count_ret_family_bytes(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .filter(|&&b| b == 0xC3 || b == 0xC2 || b == 0xCB || b == 0xCA || b == 0xCF)
+        .count()
+}
+
+#[inline]
+fn count_indirect_call_jmp_bytes(bytes: &[u8]) -> usize {
+    bytes
+        .windows(2)
+        .filter(|w| w[0] == 0xFF && matches!((w[1] >> 3) & 0b111, 2..=5))
+        .count()
+}
+
+#[inline]
+fn gadget_counts_not_increased(before: &[u8], after: &[u8]) -> bool {
+    count_c3_cf_bytes(after) <= count_c3_cf_bytes(before)
+        && count_ret_family_bytes(after) <= count_ret_family_bytes(before)
+        && count_indirect_call_jmp_bytes(after) <= count_indirect_call_jmp_bytes(before)
+}
+
+#[inline]
+fn slice_replacement_preserves_gadget_counts(
+    code: &[u8],
+    pos: usize,
+    len: usize,
+    replacement: &[u8],
+) -> bool {
+    let win_start = pos.saturating_sub(1);
+    let win_end = (pos + len + 1).min(code.len());
+    let before = &code[win_start..win_end];
+    let mut after = Vec::with_capacity(before.len());
+    if pos > win_start {
+        after.push(code[win_start]);
+    }
+    after.extend_from_slice(replacement);
+    if pos + len < win_end {
+        after.push(code[pos + len]);
+    }
+    gadget_counts_not_increased(before, &after)
+}
+
+fn encode_remapped_without_adding_ret(
+    ni: &Instruction,
+    ip: u64,
+    orig_bytes: &[u8],
+) -> Option<Vec<u8>> {
+    let target_len = orig_bytes.len();
+    let mut enc = Encoder::new(64);
+    if enc.encode(ni, ip).ok() == Some(target_len) {
+        let buf = enc.take_buffer();
+        if gadget_counts_not_increased(orig_bytes, &buf) {
+            return Some(buf);
+        }
+    }
+    // If the direct encoding would introduce a `ret`-family byte (e.g., `mov r15, rcx`
+    // as `49 89 CF`), try the opposite-direction encoding (`4C 8B F9`) or `lea` before giving up.
+    if ni.op_count() == 2 && ni.op0_kind() == OpKind::Register && ni.op1_kind() == OpKind::Register {
+        if let Some(alt_code) = alternate_dir_code(ni.code()) {
+            if let Ok(alt_ins) = Instruction::with2(alt_code, ni.op0_register(), ni.op1_register())
+            {
+                let mut enc2 = Encoder::new(64);
+                if enc2.encode(&alt_ins, ip).ok() == Some(target_len) {
+                    let buf2 = enc2.take_buffer();
+                    if gadget_counts_not_increased(orig_bytes, &buf2) {
+                        return Some(buf2);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 #[inline]
@@ -3478,6 +3598,12 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
         //    `xor`↔`sub`, `test`↔`or`↔`and`, `add`↔`shl`, `add`↔`sub`↔`lea`,
         //    `mov imm32`↔`xor/sub+lea/add/sub/or/xor`, `r32`↔`r64`, SIB swap)
         //    rather than merely flipping the direction bit (`89`↔`8B`).
+        // Never allow any instruction rewrite to increase `ret`-family (`0xC3/0xC2/0xCB/0xCA/0xCF`),
+        // `0xC3/0xCF`, or indirect `call/jmp` (`0xFF /2..=5`) gadget byte counts.
+        alts.retain(|(b, _)| slice_replacement_preserves_gadget_counts(code, pos, ilen, b));
+        if alts.is_empty() {
+            continue;
+        }
         let sem_clean_count = alts
             .iter()
             .filter(|(b, sem)| *sem && !has_ret_opcode_byte(b))
@@ -3545,13 +3671,24 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
 ///    rewriting (`(L_i ∓ 1) + mid + (L_j ± 1)`), shifting interior instruction boundaries.
 pub fn rewrite_function(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mut Stats) {
     stats.functions += 1;
-    pass_callee_saved_reg_swap(code, base_ip, prng, stats);
-    pass_leaf_scratch_reg_swap(code, base_ip, prng, stats);
-    pass_return_block_scratch_swap(code, base_ip, prng, stats);
-    pass_prologue_epilogue_perm(code, base_ip, prng, stats);
-    pass_schedule_commute(code, base_ip, prng, stats);
-    pass_reg_reg_morph(code, base_ip, prng, stats);
-    pass_cross_width_pair_morph(code, base_ip, prng, stats);
+    let passes: [fn(&mut [u8], u64, &mut Prng, &mut Stats); 7] = [
+        pass_callee_saved_reg_swap,
+        pass_leaf_scratch_reg_swap,
+        pass_return_block_scratch_swap,
+        pass_prologue_epilogue_perm,
+        pass_schedule_commute,
+        pass_reg_reg_morph,
+        pass_cross_width_pair_morph,
+    ];
+    for pass in passes {
+        let snap = code.to_vec();
+        let snap_stats = *stats;
+        pass(code, base_ip, prng, stats);
+        if !gadget_counts_not_increased(&snap, code) {
+            code.copy_from_slice(&snap);
+            *stats = snap_stats;
+        }
+    }
 }
 
 /// Parse an ELF64 image in memory, locate all `STT_FUNC` symbols inside `.text`,
@@ -3579,7 +3716,10 @@ pub fn rewrite_elf_bytes(elf: &mut [u8], seed: u64) -> anyhow::Result<Stats> {
     };
 
     if funcs.is_empty() {
-        bail!("no .text function symbols found in ELF image");
+        bail!(
+            "no .text function symbols found in ELF image — refusing to linear-sweep \
+             a stripped binary (would risk rewriting embedded data)"
+        );
     }
 
     let mut prng = Prng::new(seed);
@@ -3595,7 +3735,21 @@ pub fn rewrite_elf_bytes(elf: &mut [u8], seed: u64) -> anyhow::Result<Stats> {
     Ok(stats)
 }
 
-fn _noop_guard() {
+/// Read `input` ELF64 file, rewrite every `.text` function in place using
+/// [`rewrite_elf_bytes`], and write `output`.
+pub fn diversify_elf(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    seed: u64,
+) -> anyhow::Result<Stats> {
+    use anyhow::Context;
+
+    let mut data =
+        std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
+    let stats = rewrite_elf_bytes(&mut data, seed)
+        .with_context(|| format!("diversify ELF {}", input.display()))?;
+    std::fs::write(output, &data).with_context(|| format!("write {}", output.display()))?;
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -3872,14 +4026,24 @@ mod tests {
 
     #[test]
     fn try_swap_r14_r15_applies_consistently() {
-        // mov r14, rcx (49 89 CE) ; ret (C3)
-        let mut code = vec![0x49, 0x89, 0xCE, 0xC3];
+        // 1. `mov r14, rdx (49 89 D6) ; ret (C3)` -> `mov r15, rdx (49 89 D7) ; ret (C3)`
+        let mut code_rdx = vec![0x49, 0x89, 0xD6, 0xC3];
         let mut stats = Stats::default();
-        let applied = try_swap_r14_r15(&mut code, 0x1000, &mut stats);
+        let applied = try_swap_r14_r15(&mut code_rdx, 0x1000, &mut stats);
         assert!(applied, "function uses r14 → swap should apply");
         assert_eq!(stats.reg_remapped_instrs, 1);
-        // mov r15, rcx (49 89 CF) ; ret unchanged
-        assert_eq!(code, vec![0x49, 0x89, 0xCF, 0xC3]);
+        assert_eq!(code_rdx, vec![0x49, 0x89, 0xD7, 0xC3]);
+
+        // 2. `mov r14, rcx (49 89 CE) ; ret (C3)` would encode as `49 89 CF` (`0xCF` = `iret`)
+        //    under `Mov_rm64_r64`, so `encode_remapped_without_adding_ret` automatically uses
+        //    the opposite-direction encoding `4C 8B F9` (`mov r15, rcx` via `Mov_r64_rm64`)
+        //    without injecting `0xCF`!
+        let mut code_rcx = vec![0x49, 0x89, 0xCE, 0xC3];
+        let mut stats2 = Stats::default();
+        let applied2 = try_swap_r14_r15(&mut code_rcx, 0x1000, &mut stats2);
+        assert!(applied2, "r14->r15 swap must use opposite-dir encoding to avoid 0xCF");
+        assert_eq!(code_rcx, vec![0x4C, 0x8B, 0xF9, 0xC3]);
+        assert!(!code_rcx[..3].contains(&0xCF) && !code_rcx[..3].contains(&0xC3));
     }
 
     #[test]
@@ -4291,6 +4455,67 @@ mod tests {
             saw_shifted,
             "pass_cross_width_pair_morph must shift interior instruction boundaries by ±1 byte"
         );
+    }
+
+    #[test]
+    fn real_kernel_functions_never_gain_ret_family_or_c3_cf_bytes_across_seeds() {
+        use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
+
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir.parent().expect("workspace root");
+        let candidates = [
+            root.join("target_enterprise_kernel")
+                .join("target")
+                .join("x86_64-unknown-none")
+                .join("release")
+                .join("target_enterprise_kernel"),
+            root.join("target")
+                .join("x86_64-unknown-none")
+                .join("release")
+                .join("target_enterprise_kernel"),
+        ];
+        let Some(kernel_path) = candidates.iter().find(|p| p.exists()) else {
+            return;
+        };
+        let base_elf = std::fs::read(kernel_path).expect("read kernel ELF");
+        let obj = object::File::parse(base_elf.as_slice()).expect("parse kernel ELF");
+        let text = obj.section_by_name(".text").expect(".text section");
+        let (text_off, text_size) = text.file_range().expect(".text file_range");
+        let text_vaddr = text.address();
+        let mut funcs: Vec<(String, usize, usize)> = obj
+            .symbols()
+            .filter(|s| s.kind() == SymbolKind::Text && s.size() > 0)
+            .filter(|s| s.address() >= text_vaddr && s.address() + s.size() <= text_vaddr + text_size)
+            .map(|s| {
+                let start = (text_off + (s.address() - text_vaddr)) as usize;
+                let end = start + (s.size() as usize);
+                (s.name().unwrap_or("<anon>").to_string(), start, end)
+            })
+            .collect();
+        funcs.sort_by_key(|(_, s, e)| (*s, *e));
+        funcs.dedup_by_key(|(_, s, e)| (*s, *e));
+        assert!(funcs.len() >= 2000);
+
+        for seed in [1u64, 7, 42, 99, 101, 202] {
+            let mut morphed = base_elf.clone();
+            rewrite_elf_bytes(&mut morphed, seed).expect("rewrite_elf_bytes");
+            for (name, start, end) in &funcs {
+                let before = &base_elf[*start..*end];
+                let after = &morphed[*start..*end];
+                assert!(
+                    count_c3_cf_bytes(after) <= count_c3_cf_bytes(before),
+                    "function {name} gained 0xC3/0xCF bytes at seed {seed}: {} -> {}",
+                    count_c3_cf_bytes(before),
+                    count_c3_cf_bytes(after)
+                );
+                assert!(
+                    count_ret_family_bytes(after) <= count_ret_family_bytes(before),
+                    "function {name} gained ret-family bytes at seed {seed}: {} -> {}",
+                    count_ret_family_bytes(before),
+                    count_ret_family_bytes(after)
+                );
+            }
+        }
     }
 }
 

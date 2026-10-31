@@ -265,6 +265,11 @@ fn cross_check_mtd_metrics_against_independent_python_verifier() {
     assert_eq!(json_val["functions_total"].as_u64(), Some(1));
     assert_eq!(json_val["functions_mutated"].as_u64(), Some(1));
     assert_eq!(
+        json_val["functions_gaining_c3_cf"].as_u64(),
+        Some(0),
+        "no function may gain 0xC3/0xCF bytes"
+    );
+    assert_eq!(
         json_val["interior_c3_cf_bytes_base"].as_u64(),
         Some(2),
         "base ELF had 2 embedded 0xC3 bytes (in mov rbx, rax and add ebx, imm32)"
@@ -277,9 +282,46 @@ fn cross_check_mtd_metrics_against_independent_python_verifier() {
     let pos_surv = json_val["positional_suffix_survival_rate"]
         .as_f64()
         .expect("positional_suffix_survival_rate");
+    let py_hamming = json_val["hamming_changed_fraction"]
+        .as_f64()
+        .expect("hamming_changed_fraction");
     assert!(
         pos_surv < 0.5,
         "independent verifier positional suffix survival should be < 0.5, got {pos_surv}"
+    );
+
+    // Cross-check Rust `cuttle_mtd_metrics` against Python independent verifier on the same bytes:
+    let var_fn_bytes = &variant_elf[text_off..text_off + fn_bytes.len()];
+    let rust_pw = evaluate_pairwise_diversity(
+        &[
+            ("base", &fn_bytes, text_vaddr),
+            ("var", var_fn_bytes, text_vaddr),
+        ],
+        DEFAULT_MAX_INSTRS,
+    );
+    assert!(
+        (rust_pw.min_pairwise_byte_diff_fraction - py_hamming).abs() < 1e-9,
+        "Rust pairwise byte diff ({}) must match Python independent verifier hamming_changed_fraction ({py_hamming})",
+        rust_pw.min_pairwise_byte_diff_fraction
+    );
+    let rust_churn = churn(
+        &extract_gadgets(&fn_bytes, text_vaddr, DEFAULT_MAX_INSTRS),
+        &extract_gadgets(var_fn_bytes, text_vaddr, DEFAULT_MAX_INSTRS),
+    );
+    assert!(
+        (rust_churn.positional_survival() - pos_surv).abs() < 0.15,
+        "Rust positional gadget survival ({}) and Python suffix survival ({pos_surv}) must agree within 0.15",
+        rust_churn.positional_survival()
+    );
+
+    // Verify no-arg invocation of `verify_metrics_independent.py` fails closed (non-zero exit):
+    let no_arg_ok = ["python", "python3"]
+        .into_iter()
+        .find_map(|bin| Command::new(bin).arg(&script).output().ok())
+        .expect("invoke python with no args");
+    assert!(
+        !no_arg_ok.status.success(),
+        "verify_metrics_independent.py with no arguments must return non-zero exit status"
     );
 }
 
@@ -367,6 +409,9 @@ fn cross_check_real_compiled_kernel_elf_with_independent_python_verifier_and_dat
     let c3_var = json_val["interior_c3_cf_bytes_variant"]
         .as_u64()
         .expect("interior_c3_cf_bytes_variant");
+    let fns_gaining_c3 = json_val["functions_gaining_c3_cf"]
+        .as_u64()
+        .expect("functions_gaining_c3_cf");
     let pos_surv = json_val["positional_suffix_survival_rate"]
         .as_f64()
         .expect("positional_suffix_survival_rate");
@@ -375,7 +420,7 @@ fn cross_check_real_compiled_kernel_elf_with_independent_python_verifier_and_dat
         .expect("distinct_suffix_jaccard_distance");
 
     eprintln!(
-        "real kernel ELF independent verification: functions={}/{} ({:.1}% mutated), hamming_diff={:.2}%, pos_survival={:.2}%, jaccard_dist={:.2}%, interior_c3_cf={} -> {} ({} scrubbed)",
+        "real kernel ELF independent verification: functions={}/{} ({:.1}% mutated), hamming_diff={:.2}%, pos_survival={:.2}%, jaccard_dist={:.2}%, interior_c3_cf={} -> {} ({} scrubbed), fns_gaining_c3_cf={}",
         fns_mutated,
         fns_total,
         (fns_mutated as f64 / fns_total as f64) * 100.0,
@@ -384,9 +429,14 @@ fn cross_check_real_compiled_kernel_elf_with_independent_python_verifier_and_dat
         jaccard_dist * 100.0,
         c3_base,
         c3_var,
-        c3_base.saturating_sub(c3_var)
+        c3_base.saturating_sub(c3_var),
+        fns_gaining_c3
     );
 
+    assert_eq!(
+        fns_gaining_c3, 0,
+        "binmorph must never increase 0xC3/0xCF byte count in any kernel function"
+    );
     assert!(fns_total >= 2000, "expected >= 2000 kernel functions, got {fns_total}");
     assert!(
         fns_mutated >= 1800,

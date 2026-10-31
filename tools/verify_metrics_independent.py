@@ -259,11 +259,16 @@ def compare_base_and_variant_independent(
     mutated_funcs = 0
     unintended_c3_base = 0
     unintended_c3_var = 0
+    functions_gaining_c3_cf = 0
     for fn in base.functions:
         b_slice = base.text_bytes[fn.text_offset : fn.text_offset + fn.size]
         v_slice = variant.text_bytes[fn.text_offset : fn.text_offset + fn.size]
         if b_slice != v_slice:
             mutated_funcs += 1
+        fn_c3_base = b_slice.count(0xC3) + b_slice.count(0xCF)
+        fn_c3_var = v_slice.count(0xC3) + v_slice.count(0xCF)
+        if fn_c3_var > fn_c3_base:
+            functions_gaining_c3_cf += 1
         # Count interior 0xC3/0xCF bytes prior to the final byte of the function
         if len(b_slice) > 1:
             unintended_c3_base += b_slice[:-1].count(0xC3) + b_slice[:-1].count(0xCF)
@@ -279,6 +284,7 @@ def compare_base_and_variant_independent(
         "text_size": len(base.text_bytes),
         "functions_total": len(base.functions),
         "functions_mutated": mutated_funcs,
+        "functions_gaining_c3_cf": functions_gaining_c3_cf,
         "hamming_changed_bytes": hamming_bytes,
         "hamming_changed_fraction": hamming_bytes / max(1, len(base.text_bytes)),
         "base_suffix_windows": len(base_pos),
@@ -572,118 +578,160 @@ def find_binmorph_cmd(repo_root: Path) -> List[str]:
     return ["cargo", "run", "--quiet", "-p", "cuttle-binmorph", "--"]
 
 
-def run_self_test(repo_root: Path) -> int:
+def _require(cond: bool, msg: str) -> None:
+    if not cond:
+        raise RuntimeError(msg)
+
+
+def run_self_test(repo_root: Path, allow_missing_kernel: bool = False) -> int:
     print("[independent-verifier] starting standalone ELF64 + multi-seed metric verification...")
     seeds = [1, 2, 3, 4, 5, 6, 7, 8]
     bm_prefix = find_binmorph_cmd(repo_root)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_dir = Path(tmp)
-        base_path = tmp_dir / "base_specimen.elf"
-        base_bytes = build_synthetic_elf64_specimen()
-        base_path.write_bytes(base_bytes)
-        base_view = parse_elf64_independent(base_bytes)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            base_path = tmp_dir / "base_specimen.elf"
+            base_bytes = build_synthetic_elf64_specimen()
+            base_path.write_bytes(base_bytes)
+            base_view = parse_elf64_independent(base_bytes)
 
-        assert len(base_view.functions) == 3, f"expected 3 functions, got {len(base_view.functions)}"
-
-        views: Dict[int, IndependentElfView] = {}
-        for seed in seeds:
-            out_path = tmp_dir / f"variant_{seed}.elf"
-            cmd = bm_prefix + [
-                "--in",
-                str(base_path),
-                "--out",
-                str(out_path),
-                "--seed",
-                str(seed),
-            ]
-            res = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True)
-            if res.returncode != 0:
-                print(f"ERROR: cuttle-binmorph failed for seed {seed}: {res.stderr}", file=sys.stderr)
-                return 1
-            v_view = parse_elf64_independent(out_path.read_bytes())
-            rep = compare_base_and_variant_independent(base_view, v_view)
-
-            # Assert every variant mutated functions, scrubbed the embedded 0xC3 byte in fn0,
-            # and reduced positional suffix survival:
-            assert int(rep["functions_mutated"]) >= 2, f"seed {seed} did not mutate >=2 functions: {rep}"
-            assert int(rep["interior_c3_cf_bytes_base"]) >= 1
-            assert int(rep["interior_c3_cf_bytes_variant"]) == 0, (
-                f"seed {seed} left unintended interior 0xC3/0xCF byte: {rep}"
+            _require(
+                len(base_view.functions) == 3,
+                f"expected 3 functions, got {len(base_view.functions)}",
             )
-            assert float(rep["positional_suffix_survival_rate"]) < 0.75, (
-                f"seed {seed} positional suffix survival too high: {rep}"
-            )
-            assert float(rep["distinct_suffix_jaccard_distance"]) > 0.25, (
-                f"seed {seed} suffix Jaccard distance too low: {rep}"
-            )
-            views[seed] = v_view
 
-        pw = evaluate_pairwise_seeds_independent(views)
-        assert int(pw["unique_sha256_count"]) >= 6, (
-            f"expected >= 6 unique SHA-256 variants across 8 seeds, got {pw['unique_sha256_count']}"
-        )
-        print(
-            f"[independent-verifier] synthetic ELF64 PASS: "
-            f"{pw['unique_sha256_count']}/{len(seeds)} unique SHA-256 digests across {pw['pair_count']} pairs"
-        )
+            views: Dict[int, IndependentElfView] = {}
+            for seed in seeds:
+                out_path = tmp_dir / f"variant_{seed}.elf"
+                cmd = bm_prefix + [
+                    "--in",
+                    str(base_path),
+                    "--out",
+                    str(out_path),
+                    "--seed",
+                    str(seed),
+                ]
+                res = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True)
+                if res.returncode != 0:
+                    print(
+                        f"ERROR: cuttle-binmorph failed for seed {seed}: {res.stderr}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                v_view = parse_elf64_independent(out_path.read_bytes())
+                rep = compare_base_and_variant_independent(base_view, v_view)
 
-        # Also independently verify the real compiled kernel ELF if present on disk:
-        kernel_candidates = [
-            repo_root
-            / "target_enterprise_kernel"
-            / "target"
-            / "x86_64-unknown-none"
-            / "release"
-            / "target_enterprise_kernel",
-            repo_root
-            / "target"
-            / "x86_64-unknown-none"
-            / "release"
-            / "target_enterprise_kernel",
-        ]
-        kernel_elf = next((p for p in kernel_candidates if p.exists()), None)
-        if kernel_elf is not None:
-            k_base = parse_elf64_independent(kernel_elf.read_bytes())
-            k_views: Dict[int, IndependentElfView] = {}
-            for seed in [101, 202, 303, 404]:
-                k_out = tmp_dir / f"kernel_{seed}.elf"
-                subprocess.run(
-                    bm_prefix
-                    + [
-                        "--in",
-                        str(kernel_elf),
-                        "--out",
-                        str(k_out),
-                        "--seed",
-                        str(seed),
-                    ],
-                    cwd=repo_root,
-                    check=True,
-                    capture_output=True,
+                _require(
+                    int(rep["functions_mutated"]) >= 2,
+                    f"seed {seed} did not mutate >=2 functions: {rep}",
                 )
-                kv = parse_elf64_independent(k_out.read_bytes())
-                k_rep = compare_base_and_variant_independent(k_base, kv)
-                assert int(k_rep["functions_mutated"]) > 50, (
-                    f"expected > 50 mutated kernel functions, got {k_rep['functions_mutated']}"
+                _require(
+                    int(rep["functions_gaining_c3_cf"]) == 0,
+                    f"seed {seed} increased 0xC3/0xCF count in a function: {rep}",
                 )
-                assert int(k_rep["interior_c3_cf_bytes_variant"]) <= int(
-                    k_rep["interior_c3_cf_bytes_base"]
-                ), "binmorph must never increase interior 0xC3/0xCF gadget bytes"
-                k_views[seed] = kv
+                _require(
+                    int(rep["interior_c3_cf_bytes_base"]) >= 1,
+                    f"expected interior 0xC3/0xCF in base specimen: {rep}",
+                )
+                _require(
+                    int(rep["interior_c3_cf_bytes_variant"]) == 0,
+                    f"seed {seed} left unintended interior 0xC3/0xCF byte: {rep}",
+                )
+                _require(
+                    float(rep["positional_suffix_survival_rate"]) < 0.75,
+                    f"seed {seed} positional suffix survival too high: {rep}",
+                )
+                _require(
+                    float(rep["distinct_suffix_jaccard_distance"]) > 0.25,
+                    f"seed {seed} suffix Jaccard distance too low: {rep}",
+                )
+                views[seed] = v_view
 
-            k_pw = evaluate_pairwise_seeds_independent(k_views)
-            assert int(k_pw["unique_sha256_count"]) == 4, (
-                f"all 4 kernel seeds must produce distinct .text SHA-256 digests: {k_pw}"
-            )
-            assert int(k_pw["min_pairwise_hamming_bytes"]) > 500, (
-                f"expected > 500 pairwise differing bytes across kernel seeds, got {k_pw['min_pairwise_hamming_bytes']}"
+            pw = evaluate_pairwise_seeds_independent(views)
+            _require(
+                int(pw["unique_sha256_count"]) >= 6,
+                f"expected >= 6 unique SHA-256 variants across 8 seeds, got {pw['unique_sha256_count']}",
             )
             print(
-                f"[independent-verifier] real kernel ELF64 PASS: "
-                f"{k_base.functions.__len__()} functions, "
-                f"4/4 unique morphed skins, min pairwise diff={k_pw['min_pairwise_hamming_bytes']} bytes"
+                f"[independent-verifier] synthetic ELF64 PASS: "
+                f"{pw['unique_sha256_count']}/{len(seeds)} unique SHA-256 digests across {pw['pair_count']} pairs"
             )
+
+            kernel_candidates = [
+                repo_root
+                / "target_enterprise_kernel"
+                / "target"
+                / "x86_64-unknown-none"
+                / "release"
+                / "target_enterprise_kernel",
+                repo_root
+                / "target"
+                / "x86_64-unknown-none"
+                / "release"
+                / "target_enterprise_kernel",
+            ]
+            kernel_elf = next((p for p in kernel_candidates if p.exists()), None)
+            if kernel_elf is None:
+                if not allow_missing_kernel:
+                    print(
+                        "ERROR: real kernel ELF not found for --self-test; build target_enterprise_kernel first",
+                        file=sys.stderr,
+                    )
+                    return 1
+            else:
+                k_base = parse_elf64_independent(kernel_elf.read_bytes())
+                k_views: Dict[int, IndependentElfView] = {}
+                for seed in [101, 202, 303, 404]:
+                    k_out = tmp_dir / f"kernel_{seed}.elf"
+                    subprocess.run(
+                        bm_prefix
+                        + [
+                            "--in",
+                            str(kernel_elf),
+                            "--out",
+                            str(k_out),
+                            "--seed",
+                            str(seed),
+                        ],
+                        cwd=repo_root,
+                        check=True,
+                        capture_output=True,
+                    )
+                    kv = parse_elf64_independent(k_out.read_bytes())
+                    k_rep = compare_base_and_variant_independent(k_base, kv)
+                    _require(
+                        int(k_rep["functions_mutated"]) > 50,
+                        f"expected > 50 mutated kernel functions, got {k_rep['functions_mutated']}",
+                    )
+                    _require(
+                        int(k_rep["functions_gaining_c3_cf"]) == 0,
+                        f"binmorph increased 0xC3/0xCF count in {k_rep['functions_gaining_c3_cf']} functions",
+                    )
+                    _require(
+                        int(k_rep["interior_c3_cf_bytes_variant"])
+                        <= int(k_rep["interior_c3_cf_bytes_base"]),
+                        "binmorph must never increase interior 0xC3/0xCF gadget bytes",
+                    )
+                    k_views[seed] = kv
+
+                k_pw = evaluate_pairwise_seeds_independent(k_views)
+                _require(
+                    int(k_pw["unique_sha256_count"]) == 4,
+                    f"all 4 kernel seeds must produce distinct .text SHA-256 digests: {k_pw}",
+                )
+                _require(
+                    int(k_pw["min_pairwise_hamming_bytes"]) > 500,
+                    f"expected > 500 pairwise differing bytes across kernel seeds, got {k_pw['min_pairwise_hamming_bytes']}",
+                )
+                print(
+                    f"[independent-verifier] real kernel ELF64 PASS: "
+                    f"{k_base.functions.__len__()} functions, "
+                    f"4/4 unique morphed skins, min pairwise diff={k_pw['min_pairwise_hamming_bytes']} bytes"
+                )
+    except Exception as exc:
+        print(f"ERROR: independent verification failed: {exc}", file=sys.stderr)
+        return 1
 
     print("[independent-verifier] ALL INDEPENDENT METRIC CHECKS PASSED")
     return 0
@@ -694,13 +742,18 @@ def main() -> int:
         description="Independent ELF64 & MTD gadget metric verifier (zero shared code with mtd_metrics)"
     )
     parser.add_argument("--self-test", action="store_true", help="Run standalone self-test suite")
+    parser.add_argument(
+        "--allow-missing-kernel",
+        action="store_true",
+        help="Allow --self-test to succeed when the bare-metal kernel ELF is not built yet",
+    )
     parser.add_argument("--base", type=Path, help="Base ELF64 binary path")
     parser.add_argument("--variant", type=Path, help="Morphed variant ELF64 binary path")
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
     if args.self_test:
-        return run_self_test(repo_root)
+        return run_self_test(repo_root, allow_missing_kernel=args.allow_missing_kernel)
 
     if args.base and args.variant:
         b_view = parse_elf64_independent(args.base.read_bytes())
@@ -709,8 +762,8 @@ def main() -> int:
         print(json.dumps(rep, indent=2))
         return 0
 
-    parser.print_help()
-    return 0
+    parser.print_help(sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

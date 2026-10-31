@@ -138,19 +138,19 @@
   },
   "verification_and_fault_injection_suite_2026_10_30": {
     "differential_equivalence_x86_64": {
-      "harness": "binmorph/tests/differential_equiv.rs (X86MicroVm concrete x86-64 machine-code emulator with .rodata/.data.rel.ro mapping and 6 ABI input profiles)",
-      "real_kernel_elf": "target_enterprise_kernel (x86_64-unknown-none release ELF, 719,232-byte .text, 2,201 functions)",
-      "real_kernel_functions_verified": 522,
-      "real_kernel_input_sensitive_functions": 498,
-      "real_kernel_memory_mutating_functions": 275,
-      "real_kernel_distinct_mutated_functions": 510,
+      "harness": "binmorph/tests/differential_equiv.rs (X86MicroVm concrete x86-64 machine-code emulator with 4,542 .rela.dyn R_X86_64_RELATIVE relocations applied, .rodata/.data.rel.ro/.data/.bss mapping, and 6 ABI input profiles)",
+      "real_kernel_elf": "target_enterprise_kernel (x86_64-unknown-none release ELF, 735,616-byte .text, 2,214 functions)",
+      "real_kernel_functions_verified": 1115,
+      "real_kernel_input_sensitive_functions": 1067,
+      "real_kernel_memory_mutating_functions": 634,
+      "real_kernel_distinct_mutated_functions": 974,
       "real_kernel_seeds_tested": 32,
       "real_kernel_inputs_per_seed": 16,
-      "real_kernel_mutated_fn_seed_instances": 15244,
-      "real_kernel_total_concrete_executions": 267264,
-      "real_kernel_injected_faults_caught": 421,
-      "synthetic_multi_pass_corpus": "10 functions x 64 seeds x 24 inputs = 15,360 concrete differential executions + 3 negative fault-injection meta-tests",
-      "bug_found_and_fixed": "pass_reg_reg_morph in binmorph/src/lib.rs could replace a clean instruction (clean_count == 0) with an encoding containing an interior 0xC3/0xCF byte when !orig_has_ret; fixed and locked down across 50 seeds"
+      "real_kernel_mutated_fn_seed_instances": 28555,
+      "real_kernel_total_concrete_executions": 570880,
+      "real_kernel_injected_faults_caught": 973,
+      "synthetic_multi_pass_corpus": "12 functions x 64 seeds x 24 inputs = 18,432 concrete differential executions + 8 negative fault-injection meta-tests",
+      "bug_found_and_fixed": "pass_reg_reg_morph and register-renaming passes in binmorph/src/lib.rs could introduce ret-family (0xC3/0xC2/0xCB/0xCA/0xCF) or boundary indirect call/jmp (0xFF /2..5) bytes; guarded all 7 passes with per-candidate and per-pass gadget-count preservation checks across 2,214 real kernel functions"
     },
     "independent_metrics_verifier": {
       "harness": "tools/verify_metrics_independent.py (zero-dependency standalone Python ELF64 parser + table-driven x86-64 decoder) & mtd_metrics/tests/independent_verifier.rs",
