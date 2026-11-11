@@ -36,8 +36,9 @@ jobs:
         run: |
           cargo test --locked -p cuttle-morph-engine --lib factory::tests::workspace_policy_files_verify_against_factory_keys -- --exact
 
-      - name: Run cargo-deny supply-chain check (advisories, licenses, bans, sources)
+      - name: Run cargo-deny supply-chain check and THIRD_PARTY_NOTICES.md verification
         run: |
+          python3 tools/third_party_notices.py --check
           if command -v cargo-deny >/dev/null 2>&1 || cargo install --locked cargo-deny; then
             cargo deny check advisories licenses bans sources
           fi
@@ -66,12 +67,15 @@ jobs:
       - name: Run independent MTD metrics verifier & dataflow chain simulation suite
         run: |
           python3 tools/verify_metrics_independent.py --self-test
+          python3 -O tools/verify_metrics_independent.py --self-test
           cargo test --locked -p cuttle-mtd-metrics --test independent_verifier -- --nocapture
 
-      - name: Run Triad controller AST check & Byzantine/RAID-5 XOR fault-injection tests
+      - name: Run Triad controller, Fleet manager & Chaos fault-injection suites
         run: |
           python3 -c "import ast; ast.parse(open('tools/triad_controller.py', encoding='utf-8').read())"
           python3 tools/triad_controller.py --unit-test
+          python3 tools/cuttle_fleet.py --unit-test
+          python3 tools/chaos.py --scenario all --seed 1
 
       - name: Run full Cargo workspace test suite
         run: |
@@ -109,15 +113,19 @@ jobs:
           rustup toolchain install nightly-2026-10-22 --profile minimal --component rust-src --component llvm-tools-preview
           rustup default nightly-2026-10-22
 
-      - name: Verify reproducible kernel build for seed 101 and CycloneDX SBOM digest
+      - name: Verify two-path reproducible kernel build for seed 101 and CycloneDX SBOM digest
         run: |
           cargo test --locked -p factory_builder --lib tests::generate_cyclonedx_sbom_produces_deterministic_digest -- --exact
           cargo test --locked -p cuttle-morph-engine --test attest_v11 attest_entry_includes_sbom_digest -- --exact
-          cargo run --locked --release -p factory_builder -- build-kernel --kernel-crate target_enterprise_kernel --layout-seed 101
-          cp target_enterprise_kernel/target/x86_64-unknown-none/release/target_enterprise_kernel /tmp/kernel_seed_101_a.elf
+          rm -rf /tmp/cuttle_repro_a /tmp/cuttle_repro_b
+          mkdir -p /tmp/cuttle_repro_a /tmp/cuttle_repro_b
+          tar --exclude='./target' --exclude='./target_enterprise_kernel/target' --exclude='./.git' -cf - . | tar -xf - -C /tmp/cuttle_repro_a
+          tar --exclude='./target' --exclude='./target_enterprise_kernel/target' --exclude='./.git' -cf - . | tar -xf - -C /tmp/cuttle_repro_b
+          (cd /tmp/cuttle_repro_a && cargo run --locked --release -p factory_builder -- build-kernel --kernel-crate target_enterprise_kernel --layout-seed 101)
+          cp /tmp/cuttle_repro_a/target_enterprise_kernel/target/x86_64-unknown-none/release/target_enterprise_kernel /tmp/kernel_seed_101_a.elf
           cargo run --locked --release -p cuttle-binmorph -- --in /tmp/kernel_seed_101_a.elf --out /tmp/kernel_seed_101_a.morphed.elf --seed 101
-          cargo run --locked --release -p factory_builder -- build-kernel --kernel-crate target_enterprise_kernel --layout-seed 101
-          cp target_enterprise_kernel/target/x86_64-unknown-none/release/target_enterprise_kernel /tmp/kernel_seed_101_b.elf
+          (cd /tmp/cuttle_repro_b && cargo run --locked --release -p factory_builder -- build-kernel --kernel-crate target_enterprise_kernel --layout-seed 101)
+          cp /tmp/cuttle_repro_b/target_enterprise_kernel/target/x86_64-unknown-none/release/target_enterprise_kernel /tmp/kernel_seed_101_b.elf
           cargo run --locked --release -p cuttle-binmorph -- --in /tmp/kernel_seed_101_b.elf --out /tmp/kernel_seed_101_b.morphed.elf --seed 101
           cmp -s /tmp/kernel_seed_101_a.elf /tmp/kernel_seed_101_b.elf
           cmp -s /tmp/kernel_seed_101_a.morphed.elf /tmp/kernel_seed_101_b.morphed.elf

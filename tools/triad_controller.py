@@ -57,8 +57,18 @@ BASE_ELF = (
     / "release"
     / "target_enterprise_kernel"
 )
+def resolve_binmorph_exe(search_dir: Path | None = None) -> Path:
+    """Locate the compiled binmorph binary across Windows (`.exe`) and POSIX hosts."""
+    d = search_dir if search_dir is not None else (ROOT / "target" / "release")
+    for candidate in ("binmorph.exe", "binmorph", "cuttle-binmorph.exe", "cuttle-binmorph"):
+        p = d / candidate
+        if p.exists():
+            return p
+    return d / ("binmorph.exe" if os.name == "nt" else "binmorph")
+
+
 BASE_BIOS = IMAGES_DIR / "run_bios.img"
-BINMORPH_EXE = ROOT / "target" / "release" / "binmorph.exe"
+BINMORPH_EXE = resolve_binmorph_exe()
 DEVICE_KEY = ROOT / "device_secret_key.bin"
 # Tabbed live operations console served at /console (static page; actions use the operator token).
 CONSOLE_HTML = ROOT / "tools" / "triad_console.html"
@@ -1200,6 +1210,30 @@ class TriadController:
             except Exception as e:
                 self.log_event("WARN", f"Ignoring unreadable cron_jobs.json: {e}")
 
+        self.guard_posture_file = state_dir / "guard_posture.json"
+        self.desired_guard_lockdown: bool = False
+        if self.guard_posture_file.exists():
+            try:
+                gp_raw = json.loads(self.guard_posture_file.read_text(encoding="utf-8"))
+                if isinstance(gp_raw, dict):
+                    gp_schema = gp_raw.get("state_schema", 1)
+                    if not isinstance(gp_schema, int) or isinstance(gp_schema, bool) or gp_schema < 1:
+                        raise ValueError(f"invalid guard_posture state_schema: {gp_schema!r}")
+                    if gp_schema > CURRENT_STATE_SCHEMA:
+                        self.log_event(
+                            "ALERT",
+                            f"Refusing {self.guard_posture_file.name} with newer state_schema={gp_schema} (> {CURRENT_STATE_SCHEMA})",
+                            code="SCHEMA_MISMATCH",
+                        )
+                        raise ValueError(f"SCHEMA_MISMATCH: guard_posture state_schema {gp_schema} > {CURRENT_STATE_SCHEMA}")
+                    self.desired_guard_lockdown = bool(gp_raw.get("lockdown", False))
+            except ValueError as e:
+                if "SCHEMA_MISMATCH" in str(e):
+                    raise
+                self.log_event("WARN", f"Ignoring unreadable guard_posture.json: {e}")
+            except Exception as e:
+                self.log_event("WARN", f"Ignoring unreadable guard_posture.json: {e}")
+
         # Monotonic Triad WAL for automatic catch-up after an OS morph bounce (persisted to disk)
         self.wal_lock = threading.Lock()
         self.wal_file = state_dir / "triad_wal.json"
@@ -1230,7 +1264,15 @@ class TriadController:
             self.wal_checkpoint.get("tx_seq", 0) > 0
             or all(any(w == stmt for _, w in self.wal_entries) for stmt in s.provision_sql)
         )
+        self.parity_file = state_dir / "parity_block.bin"
         self.parity_Buffer = b"\x00" * SQL_PART_SIZE
+        if s.has_sql and self.parity_file.exists():
+            try:
+                raw_parity = self.parity_file.read_bytes()
+                if len(raw_parity) == SQL_PART_SIZE:
+                    self.parity_Buffer = raw_parity
+            except OSError:
+                pass
         self.parity_sha256 = hashlib.sha256(self.parity_Buffer).hexdigest()[:16] if s.has_sql else "n/a"
         self.parity_syndrome_ok = True
         self.quorum_status = "3/3 TMR MAJORITY VERIFIED (D1 ^ D2 ^ D3 = P)" if s.has_sql else "3/3 TMR MAJORITY VERIFIED"
@@ -1752,8 +1794,9 @@ class TriadController:
             node.morphed_elf.write_bytes(morphed_bytes)
             stderr_line = f"binmorph: unit_test seed={new_seed} version={ver}"
         else:
+            bm_exe = BINMORPH_EXE if BINMORPH_EXE.exists() else resolve_binmorph_exe()
             cmd = [
-                str(BINMORPH_EXE),
+                str(bm_exe),
                 "--in",
                 str(BASE_ELF),
                 "--out",
@@ -2014,10 +2057,10 @@ class TriadController:
                 return False
         if self.coordinator_epoch > 0:
             self.send_shell_cmd(node, f"triad epoch {self.coordinator_epoch}")
+        if self.desired_guard_lockdown:
+            self.send_shell_cmd(node, "guard lockdown")
         if self.spec.has_shell:
-            for ticks, cmd in self.desired_cron:
-                if is_readonly_shell_command(cmd):
-                    self.send_shell_cmd(node, f"cron add {ticks} {cmd}")
+            self._rebuild_cron_table(node)
         return True
 
     def check_node_heartbeat(self, node: TriadNode, timeout: float = 2.5) -> bool:
@@ -2843,13 +2886,33 @@ class TriadController:
         if not self.spec.has_sql:
             return  # no SQL partition to protect with parity on this role
 
-        # Update 4 KiB bitwise XOR parity across D1, D2, and D3 AHCI SQL partitions (P = D1 ^ D2 ^ D3)
-        d1 = n1.read_sql_partition_bytes()
-        d2 = n2.read_sql_partition_bytes()
-        d3 = n3.read_sql_partition_bytes()
-        p = bytes(a ^ b ^ c for a, b, c in zip(d1, d2, d3))
-        self.parity_Buffer = p
-        self.parity_sha256 = hashlib.sha256(p).hexdigest()[:16]
+        # Only recompute 4 KiB bitwise XOR parity (P = D1 ^ D2 ^ D3) when all 3 nodes are ONLINE
+        # and verified in consensus; in degraded 2/3 mode, preserve the last verified 3/3 parity
+        # block so an offline/corrupted 3rd disk never poisons P!
+        if len(online_nodes) == 3:
+            d1 = n1.read_sql_partition_bytes()
+            d2 = n2.read_sql_partition_bytes()
+            d3 = n3.read_sql_partition_bytes()
+            p = bytes(a ^ b ^ c for a, b, c in zip(d1, d2, d3))
+            self.parity_Buffer = p
+            self.parity_sha256 = hashlib.sha256(p).hexdigest()[:16]
+            self._save_parity_block(p)
+
+    def _save_parity_block(self, data: bytes) -> None:
+        if len(data) != SQL_PART_SIZE:
+            return
+        tmp_p = self.parity_file.with_name(f".{self.parity_file.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+        try:
+            with open(tmp_p, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_p, self.parity_file)
+        except OSError:
+            try:
+                tmp_p.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def reconstruct_sql_partition_from_xor_parity(self, failed_node_id: int) -> bytes:
         """
@@ -3396,6 +3459,15 @@ class TriadController:
                     self._save_wal_to_disk()  # persist committed status, each node's applied tx_seq, and state digest
                 if app == "cron" and sub in ("add", "del"):
                     self._record_desired_cron(parts)
+                if app == "guard" and sub in ("lockdown", "unlock"):
+                    self.desired_guard_lockdown = sub == "lockdown"
+                    atomic_write_json(
+                        self.guard_posture_file,
+                        {
+                            "state_schema": CURRENT_STATE_SCHEMA,
+                            "lockdown": self.desired_guard_lockdown,
+                        },
+                    )
             finally:
                 if is_vault_mut and self.wal_pending_tx == tx_id:
                     self.wal_pending_tx = None
@@ -4285,18 +4357,26 @@ class TriadController:
         self.provision_sql_complete = all_ok
         return all_ok
 
+    def _scheduler_step(self, now_mono: float, last_rot: float) -> float:
+        online_count = sum(1 for n in self.nodes if n.state == "ONLINE")
+        if not self.unit_test and online_count >= 1:
+            self.poll_node_heartbeats()
+            self.compute_and_verify_raid_parity()
+        if not self.provision_sql_complete and online_count >= 2:
+            self._provision_sql()
+        if self.auto_morph_enabled and (now_mono - last_rot) >= self.auto_morph_interval:
+            nid = (self.next_rotate_idx % 3) + 1
+            self.next_rotate_idx += 1
+            last_rot = now_mono
+            self.log_event("AUTO-MTD", f"Scheduled Rolling Morph triggered for OS-{nid}...")
+            self.bounce_and_morph_node(nid)
+        return last_rot
+
     def _background_scheduler(self):
         last_rot = time.monotonic()
         while self.running:
             time.sleep(2.0)
-            if not self.provision_sql_complete and sum(1 for n in self.nodes if n.state == "ONLINE") >= 2:
-                self._provision_sql()
-            if self.auto_morph_enabled and (time.monotonic() - last_rot) >= self.auto_morph_interval:
-                nid = (self.next_rotate_idx % 3) + 1
-                self.next_rotate_idx += 1
-                last_rot = time.monotonic()
-                self.log_event("AUTO-MTD", f"Scheduled Rolling Morph triggered for OS-{nid}...")
-                self.bounce_and_morph_node(nid)
+            last_rot = self._scheduler_step(time.monotonic(), last_rot)
 
     def render_prometheus_metrics(self) -> str:
         """Render Prometheus exposition-format metrics (`GET /metrics`)."""
@@ -4770,6 +4850,72 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _drain_unread_body_nonblocking(self, length: int) -> None:
+        """
+        Best-effort non-blocking drain of up to `length` (<= MAX_HTTP_BODY_BYTES) already-buffered
+        request bytes before returning an early 401/403 so Windows Winsock does not emit a TCP RST
+        (`WinError 10053`) while unread bytes sit in the socket receive queue, without ever waiting
+        on a stalled/slowloris client.
+        """
+        if length <= 0 or length > MAX_HTTP_BODY_BYTES:
+            return
+        remaining = length
+        rfile = getattr(self, "rfile", None)
+        if rfile is not None and hasattr(rfile, "peek"):
+            try:
+                buffered = len(rfile.peek(remaining))
+                if buffered > 0:
+                    take = min(remaining, buffered)
+                    remaining -= len(rfile.read(take))
+            except OSError:
+                pass
+        if remaining <= 0:
+            return
+        conn = getattr(self, "connection", None)
+        if conn is None:
+            return
+        prev_timeout = conn.gettimeout()
+        try:
+            conn.setblocking(False)
+            for _ in range(3):
+                while remaining > 0:
+                    try:
+                        chunk = conn.recv(remaining)
+                    except (BlockingIOError, InterruptedError):
+                        chunk = None
+                        break
+                    if not chunk:
+                        remaining = 0
+                        break
+                    remaining -= len(chunk)
+                if remaining <= 0:
+                    break
+                time.sleep(0.002)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.settimeout(prev_timeout)
+            except OSError:
+                pass
+
+    def _check_browser_origin(self, length_for_drain: int = 0) -> bool:
+        """
+        Reject cross-origin browser POST requests (`Origin` header present with a non-loopback host)
+        with HTTP 403 to prevent cross-site request forgery even when `Cookie: triad_sid=...` is set.
+        Requests without an `Origin` header (CLI, urllib, curl, farm proxy) are allowed.
+        """
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return True
+        parsed = urllib.parse.urlparse(origin)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme in ("http", "https") and host in ("127.0.0.1", "localhost", "::1"):
+            return True
+        self._drain_unread_body_nonblocking(length_for_drain)
+        self._send_json(403, {"ok": False, "error": "forbidden: cross-origin POST rejected"})
+        return False
+
     def _read_bounded_body(self, length: int | None = None) -> str | None:
         if length is None:
             length = self._validate_content_length()
@@ -4887,7 +5033,10 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         cl = self._validate_content_length()
         if cl is None:
             return
+        if not self._check_browser_origin(cl):
+            return
         if not self._is_authenticated():
+            self._drain_unread_body_nonblocking(cl)
             return self._send_json(
                 401,
                 {"ok": False, "error": "unauthorized: provide valid X-Cuttle-Session or Authorization: Bearer token"},
@@ -5373,7 +5522,40 @@ def run_fault_injection_unit_tests() -> None:
         except ValueError as e:
             assert "authentication tag mismatch" in str(e)
 
-    print("[triad-fault-suite] ALL 6 FAULT-INJECTION SUITES PASSED")
+        # ------------------------------------------------------------------
+        # Fault 7: Degraded 2/3 Parity Preservation & Persistent parity_block.bin
+        # ------------------------------------------------------------------
+        for n in ctrl.nodes:
+            n.state = "ONLINE"
+        for node, payload in ((ctrl.nodes[0], d1_orig), (ctrl.nodes[1], d2_orig), (ctrl.nodes[2], d3_orig)):
+            with open(node.ahci_img, "r+b") as f:
+                f.seek(SQL_PART_OFFSET)
+                f.write(payload)
+        expected_p = bytes(a ^ b ^ c for a, b, c in zip(d1_orig, d2_orig, d3_orig))
+        ctrl.compute_and_verify_raid_parity()
+        assert ctrl.parity_Buffer == expected_p
+        assert (tmp_path / "parity_block.bin").exists(), "3/3 parity check must persist parity_block.bin"
+
+        # Take OS-3 OFFLINE and corrupt OS-3's on-disk SQL partition while OS-1 and OS-2 stay ONLINE:
+        ctrl.nodes[2].state = "OFFLINE"
+        with open(ctrl.nodes[2].ahci_img, "r+b") as f:
+            f.seek(SQL_PART_OFFSET)
+            f.write(b"\xCC" * SQL_PART_SIZE)
+        ctrl.compute_and_verify_raid_parity()
+        assert ctrl.parity_syndrome_ok, "Degraded 2/3 parity check with agreeing peers must stay healthy"
+        assert ctrl.parity_Buffer == expected_p, (
+            "Degraded 2/3 compute_and_verify_raid_parity must NOT overwrite parity_Buffer using offline OS-3 disk"
+        )
+
+        # Restart controller from tmp_path and verify persisted parity_block.bin reconstructs D3!
+        ctrl_restarted = TriadController(show_gui=False, spec=spec, unit_test=True)
+        ctrl_restarted.shutdown()
+        assert ctrl_restarted.parity_Buffer == expected_p, "Restarted TriadController must load parity_block.bin"
+        assert ctrl_restarted.reconstruct_sql_partition_from_xor_parity(3) == d3_orig, (
+            "Persisted parity_block.bin must reconstruct exact D3 bytes after controller restart"
+        )
+
+    print("[triad-fault-suite] ALL 7 FAULT-INJECTION SUITES PASSED")
 
 
 def run_unit_self_tests():
@@ -7131,8 +7313,115 @@ def run_unit_self_tests():
                     raw_sock.sendall(raw_req)
                     raw_resp = raw_sock.recv(4096).decode("utf-8", errors="replace")
                 assert "413" in raw_resp.splitlines()[0], f"Expected HTTP 413 on oversized body, got {raw_resp[:120]!r}"
+
+                # Cross-Origin POST CSRF protection: Origin from non-loopback host rejected with 403 even with valid token/cookie!
+                csrf_req = urllib.request.Request(
+                    f"http://127.0.0.1:{r12_port}/api/whoami",
+                    data=b"",
+                    headers={
+                        "X-Cuttle-Session": r2_ctrl.coordinator_token,
+                        "Cookie": f"triad_sid={r2_ctrl.coordinator_token}",
+                        "Origin": "https://evil.example",
+                    },
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(csrf_req, timeout=5.0)
+                    raise AssertionError("Cross-origin POST with Origin: https://evil.example must be rejected with 403")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 403, f"Expected 403 on cross-origin POST, got {e.code}"
+
+                # Same-origin loopback POST and CLI POST (no Origin header) both succeed with 200:
+                for ok_headers in (
+                    {"X-Cuttle-Session": r2_ctrl.coordinator_token, "Origin": f"http://127.0.0.1:{r12_port}"},
+                    {"X-Cuttle-Session": r2_ctrl.coordinator_token},
+                ):
+                    ok_req = urllib.request.Request(
+                        f"http://127.0.0.1:{r12_port}/api/whoami",
+                        data=b"",
+                        headers=ok_headers,
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(ok_req, timeout=5.0) as resp:
+                        assert resp.status == 200
             finally:
                 r12_srv.shutdown()
+
+            # Stage 5: Portable binmorph discovery, idempotent cron + persisted guard lockdown in apply_node_profile,
+            # and background _scheduler_step heartbeat + parity liveness!
+            bm_dir = tmp_dir / "binmorph_probe"
+            bm_dir.mkdir(parents=True, exist_ok=True)
+            (bm_dir / "cuttle-binmorph").write_bytes(b"\x7fELF")
+            assert resolve_binmorph_exe(bm_dir) == (bm_dir / "cuttle-binmorph")
+            (bm_dir / "binmorph.exe").write_bytes(b"MZ")
+            assert resolve_binmorph_exe(bm_dir) == (bm_dir / "binmorph.exe")
+
+            prof_dir = tmp_dir / "stage5_profile"
+            prof_ctrl = TriadController(
+                show_gui=False,
+                spec=TriadSpec(
+                    name="stage5-prof",
+                    state_dir=prof_dir,
+                    cron_jobs=[(4, "status")],
+                    write_operator_token=False,
+                ),
+                unit_test=True,
+            )
+            prof_ctrl.shutdown()
+            for n in prof_ctrl.nodes:
+                n.state = "ONLINE"
+            prof_ctrl._state_probe = lambda node: "k|v|rev #rows=2 digest=" + ("b" * 64)
+            prof_cmds: list[tuple[int, str]] = []
+
+            def _mock_prof_shell(node, cmd, timeout=4.0):
+                prof_cmds.append((node.node_id, cmd))
+                if cmd == "cron list":
+                    return 'cron: active=1/4 total_runs=2\n  id=1 every=4t elapsed=1t runs=2 cmd="status"'
+                if cmd.startswith("guard "):
+                    return "guard: posture=LOCKDOWN" if "lockdown" in cmd else "guard: posture=NORMAL"
+                return "OK"
+
+            prof_ctrl.send_shell_cmd = _mock_prof_shell
+            r_lock = prof_ctrl.execute_triad_app("guard lockdown")
+            assert r_lock["ok"], f"Expected guard lockdown to succeed: {r_lock}"
+            assert prof_ctrl.desired_guard_lockdown is True
+            assert (prof_dir / "guard_posture.json").exists()
+
+            prof_ctrl2 = TriadController(
+                show_gui=False,
+                spec=TriadSpec(
+                    name="stage5-prof",
+                    state_dir=prof_dir,
+                    cron_jobs=[(4, "status")],
+                    write_operator_token=False,
+                ),
+                unit_test=True,
+            )
+            prof_ctrl2.shutdown()
+            assert prof_ctrl2.desired_guard_lockdown is True, "guard_posture.json must restore desired_guard_lockdown across restarts"
+            prof_cmds.clear()
+            prof_ctrl2.send_shell_cmd = _mock_prof_shell
+            assert prof_ctrl2.apply_node_profile(prof_ctrl2.nodes[0])
+            n1_cmds = [c for nid, c in prof_cmds if nid == 1]
+            assert "cron del 1" in n1_cmds and n1_cmds.count("cron add 4 status") == 1, (
+                f"apply_node_profile must deduplicate/rebuild persisted cron jobs via _rebuild_cron_table, saw: {n1_cmds}"
+            )
+            assert "guard lockdown" in n1_cmds, (
+                f"apply_node_profile must re-apply persisted guard lockdown posture, saw: {n1_cmds}"
+            )
+
+            sched_calls = {"hb": 0, "parity": 0}
+            prof_ctrl2.unit_test = False
+            prof_ctrl2.nodes[0].state = "ONLINE"
+            prof_ctrl2.provision_sql_complete = True
+            prof_ctrl2.auto_morph_enabled = False
+            prof_ctrl2.poll_node_heartbeats = lambda: sched_calls.__setitem__("hb", sched_calls["hb"] + 1)
+            prof_ctrl2.compute_and_verify_raid_parity = lambda: sched_calls.__setitem__("parity", sched_calls["parity"] + 1)
+            new_last_rot = prof_ctrl2._scheduler_step(100.0, 100.0)
+            assert new_last_rot == 100.0
+            assert sched_calls["hb"] == 1 and sched_calls["parity"] == 1, (
+                f"_scheduler_step must poll heartbeats and verify RAID parity on online Triad, saw: {sched_calls}"
+            )
         finally:
             sc_harness.close()
     run_fault_injection_unit_tests()

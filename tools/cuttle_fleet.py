@@ -26,6 +26,7 @@ Trust boundaries:
 """
 
 import argparse
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -197,6 +198,17 @@ def _num(pattern: str, text: str):
     return int(m.group(1)) if m else None
 
 
+def _table_row_count(ctrl, node, table: str) -> int | None:
+    """Query exact row count via `.dump <table> digest` so 1 KiB console buffer limits never truncate `rows`."""
+    dump_out = ctrl.send_shell_cmd(node, f"sql /*triad*/ .dump {table} digest", timeout=3.0)
+    if dump_out and "sqldump" in dump_out:
+        n = _num(r"\brows=(\d+)", dump_out)
+        if n is not None:
+            return n
+    sel_out = ctrl.send_shell_cmd(node, f"sql /*triad*/ SELECT * FROM {table}", timeout=3.0)
+    return max(0, len(sel_out.splitlines()) - 1) if "|" in sel_out else None
+
+
 class Farm:
     """One client's Triads, their per-role telemetry and optional synthetic load."""
 
@@ -273,11 +285,9 @@ class Farm:
             "sampled_at": time.time(),
         }
         if ctrl.spec.has_sql and online:
-            out = ctrl.send_shell_cmd(online[0], "sql /*triad*/ SELECT * FROM kv", timeout=3.0)
-            k["rows"] = max(0, len(out.splitlines()) - 1) if "|" in out else None
+            k["rows"] = _table_row_count(ctrl, online[0], "kv")
             if "idx" in ctrl.spec.vote_tables:
-                out = ctrl.send_shell_cmd(online[0], "sql /*triad*/ SELECT * FROM idx", timeout=3.0)
-                k["index_rows"] = max(0, len(out.splitlines()) - 1) if "|" in out else None
+                k["index_rows"] = _table_row_count(ctrl, online[0], "idx")
         if ctrl.spec.role == "full" and online:  # running jobs needs svc-sh, `cron list` needs svc-http
             out = ctrl.send_shell_cmd(online[0], "cron list", timeout=3.0)
             k["cron_active"] = _num(r"active=(\d+)", out)
@@ -419,12 +429,16 @@ class FarmHandler(tc.TriadHttpHandler):
         return tc.TriadHttpHandler.do_GET(self)
 
     def do_POST(self):
-        if self._validate_content_length() is None:
+        cl = self._validate_content_length()
+        if cl is None:
+            return None
+        if not self._check_browser_origin(cl):
             return None
         if not self._is_authenticated():
+            self._drain_unread_body_nonblocking(cl)
             return self._send_json(401, {"ok": False, "error": "unauthorized"})
         if self.path in ("/api/load", "/api/shutdown"):
-            body = self._read_bounded_body()
+            body = self._read_bounded_body(cl)
             if body is None:
                 return None
             if self.path == "/api/load":
@@ -534,19 +548,19 @@ class Provider:
             p = self.procs.get(cid)
             if p and p.poll() is None:
                 return
-            log = open(fleet_dir() / cid / "farm.log", "a", encoding="utf-8")
             env = dict(os.environ)
             env[FARM_SECRET_ENV] = self.farm_secrets[cid]
             env[FLEET_DIR_ENV] = str(fleet_dir())
             env["CUTTLE_FLEET_CONFIG"] = str(self.config_path)
-            self.procs[cid] = subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "farm", "--client", cid],
-                stdin=subprocess.PIPE,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                env=env,
-                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-            )
+            with open(fleet_dir() / cid / "farm.log", "a", encoding="utf-8") as log:
+                self.procs[cid] = subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve()), "farm", "--client", cid],
+                    stdin=subprocess.PIPE,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                )
             self.farm_jobs[cid] = tc.apply_host_resource_limits(self.procs[cid], max_memory_mb=2048, cpu_rate_pct=90)
             self.status[cid] = "starting"
             self.cache[cid] = None
@@ -554,6 +568,11 @@ class Provider:
     def stop_farm(self, cid: str):
         p = self.procs.get(cid)
         if not p or p.poll() is not None:
+            if p and p.stdin:
+                try:
+                    p.stdin.close()
+                except OSError:
+                    pass
             tc.close_host_resource_limits(self.farm_jobs.pop(cid, None))
             self.status[cid] = "stopped"
             return
@@ -562,6 +581,11 @@ class Provider:
             self.farm_request(cid, "POST", "/api/shutdown", b"", timeout=5.0)
         except Exception:
             pass
+        if p.stdin:
+            try:
+                p.stdin.close()
+            except OSError:
+                pass
         try:
             p.wait(timeout=30.0)
         except subprocess.TimeoutExpired:
@@ -583,30 +607,40 @@ class Provider:
         except urllib.error.HTTPError as e:
             return e.code, e.headers.get("Content-Type", "application/json"), e.read()
 
+    def _poll_single_farm(self, cid: str) -> None:
+        p = self.procs.get(cid)
+        if not p:
+            return
+        if p.poll() is not None:
+            if self.status[cid] not in ("stopped", "stopping"):
+                self.status[cid] = "error"
+            return
+        try:
+            code, _, raw = self.farm_request(cid, "GET", "/api/farm", timeout=4.0)
+            if code == 200:
+                summary = json.loads(raw)
+                self.cache[cid] = summary
+                if summary.get("boot_error"):
+                    self.status[cid] = "error"
+                elif summary.get("booted"):
+                    self.status[cid] = "running"
+                else:
+                    self.status[cid] = "booting"
+        except Exception:
+            if self.status[cid] == "running":
+                self.status[cid] = "unreachable"
+
+    def poll_once(self) -> None:
+        cids = list(self.clients.keys())
+        if not cids:
+            return
+        max_workers = max(1, min(8, len(cids)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(self._poll_single_farm, cids))
+
     def poll_loop(self):
         while self.running:
-            for cid in self.clients:
-                p = self.procs.get(cid)
-                if not p:
-                    continue
-                if p.poll() is not None:
-                    if self.status[cid] not in ("stopped", "stopping"):
-                        self.status[cid] = "error"
-                    continue
-                try:
-                    code, _, raw = self.farm_request(cid, "GET", "/api/farm", timeout=4.0)
-                    if code == 200:
-                        summary = json.loads(raw)
-                        self.cache[cid] = summary
-                        if summary.get("boot_error"):
-                            self.status[cid] = "error"
-                        elif summary.get("booted"):
-                            self.status[cid] = "running"
-                        else:
-                            self.status[cid] = "booting"
-                except Exception:
-                    if self.status[cid] == "running":
-                        self.status[cid] = "unreachable"
+            self.poll_once()
             time.sleep(2.0)
 
     def fleet_view(self, scope: str, cid_scope) -> dict:
@@ -683,20 +717,14 @@ class ProviderHandler(tc.TriadHttpHandler):
         return self._dispatch("GET", b"")
 
     def do_POST(self):
-        raw_len = self.headers.get("Content-Length", "0")
-        try:
-            length = int(raw_len)
-        except ValueError:
-            return self._send_json(400, {"ok": False, "error": "invalid Content-Length"})
-        if length < 0:
-            return self._send_json(400, {"ok": False, "error": "negative Content-Length"})
-        if length > tc.MAX_HTTP_BODY_BYTES:
-            return self._send_json(
-                413,
-                {"ok": False, "error": f"payload exceeds {tc.MAX_HTTP_BODY_BYTES} bytes"},
-            )
+        length = self._validate_content_length()
+        if length is None:
+            return
+        if not self._check_browser_origin(length):
+            return
         scope, own = self._scope()
         if scope is None:
+            self._drain_unread_body_nonblocking(length)
             return self._send_json(
                 401,
                 {"ok": False, "error": "unauthorized: provide a provider or client token"},
@@ -931,6 +959,115 @@ def run_fleet_unit_tests(work: Path):
     finally:
         tc.close_host_resource_limits(job_runaway)
         tc.close_host_resource_limits(job_peer)
+
+    # Stage 5a: Farm._sample uses `.dump <table> digest` so row counts stay exact past 1 KiB SELECT truncation!
+    class _DummyNode:
+        state = "ONLINE"
+
+    class _DummySpec:
+        role = "sql"
+        has_sql = True
+        vote_tables = ("kv", "idx")
+
+    class _DummyCtrl:
+        spec = _DummySpec()
+        nodes = [_DummyNode()]
+
+        def send_shell_cmd(self, node, cmd, timeout=3.0):
+            if cmd == "service status":
+                return "services: role=sql running=1/3\n  svc-sql state=up reqs=42 denials=0"
+            if cmd == "status":
+                return "net_rx=10 net_tx=12"
+            if cmd == "sql /*triad*/ .dump kv digest":
+                return "sqldump table=kv rows=63 off=0 count=0 digest=" + ("a" * 64) + " ddl=4352\n"
+            if cmd == "sql /*triad*/ .dump idx digest":
+                return "sqldump table=idx rows=58 off=0 count=0 digest=" + ("b" * 64) + " ddl=4352\n"
+            if "SELECT * FROM" in cmd:
+                # Simulate 1 KiB console buffer truncation after only 11 rows!
+                return "k|v|rev\n" + "".join(f"k{i}|val{i}|1\n" for i in range(11))
+            return ""
+
+    dummy_farm = object.__new__(Farm)
+    dummy_farm.kpi = {"index": {}}
+    dummy_farm.history = {"index": {"reqs_rate": [], "online": []}}
+    dummy_farm._last_reqs = {}
+    dummy_farm._sample("index", _DummyCtrl())
+    assert dummy_farm.kpi["index"]["rows"] == 63, (
+        f"Farm._sample must report exact 63 rows via .dump kv digest instead of truncated SELECT *, got {dummy_farm.kpi['index']}"
+    )
+    assert dummy_farm.kpi["index"]["index_rows"] == 58, (
+        f"Farm._sample must report exact 58 index_rows via .dump idx digest, got {dummy_farm.kpi['index']}"
+    )
+
+    # Stage 5b: Provider.poll_once() polls multiple farms concurrently (no N * timeout head-of-line blocking)
+    # and ProviderHandler rejects cross-origin POST requests with HTTP 403!
+    poll_dir = work / "poll_state"
+    poll_cfg_path = work / "poll_fleet.toml"
+    poll_cfg_path.write_text(SELFTEST_CONFIG, encoding="utf-8")
+    old_fleet_env2 = os.environ.get(FLEET_DIR_ENV)
+    old_whpx_env2 = os.environ.get("CUTTLE_WHPX_AVAILABLE")
+    try:
+        os.environ[FLEET_DIR_ENV] = str(poll_dir)
+        os.environ["CUTTLE_WHPX_AVAILABLE"] = "0"
+        poll_cfg = load_fleet_config(poll_cfg_path)
+        poll_prov = Provider(poll_cfg, poll_cfg_path)
+
+        class _LiveProc:
+            def poll(self):
+                return None
+
+        poll_prov.procs["alpha"] = _LiveProc()
+        poll_prov.procs["bravo"] = _LiveProc()
+
+        def _slow_farm_req(cid, method, path, body=b"", timeout=4.0):
+            time.sleep(0.35)
+            return 200, "application/json", json.dumps({"booted": True, "boot_error": None}).encode("utf-8")
+
+        poll_prov.farm_request = _slow_farm_req
+        t_p0 = time.monotonic()
+        poll_prov.poll_once()
+        elapsed_poll = time.monotonic() - t_p0
+        assert poll_prov.status["alpha"] == "running" and poll_prov.status["bravo"] == "running", poll_prov.status
+        assert elapsed_poll < 0.65, (
+            f"Provider.poll_once() must poll client farms concurrently (<0.65s for two 0.35s farms), took {elapsed_poll:.3f}s"
+        )
+
+        ProviderHandler.provider = poll_prov
+        p_srv = ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
+        p_port = p_srv.server_address[1]
+        threading.Thread(target=p_srv.serve_forever, daemon=True).start()
+        try:
+            csrf_req = urllib.request.Request(
+                f"http://127.0.0.1:{p_port}/api/whoami",
+                data=b"",
+                headers={"X-Cuttle-Session": poll_prov.provider_token, "Origin": "https://evil.example"},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(csrf_req, timeout=5.0)
+                raise AssertionError("ProviderHandler must reject cross-origin POST with 403")
+            except urllib.error.HTTPError as e:
+                assert e.code == 403, f"Expected 403 on cross-origin Provider POST, got {e.code}"
+
+            ok_req = urllib.request.Request(
+                f"http://127.0.0.1:{p_port}/api/whoami",
+                data=b"",
+                headers={"X-Cuttle-Session": poll_prov.provider_token, "Origin": f"http://127.0.0.1:{p_port}"},
+                method="POST",
+            )
+            with urllib.request.urlopen(ok_req, timeout=5.0) as resp:
+                assert resp.status == 200
+        finally:
+            p_srv.shutdown()
+    finally:
+        if old_fleet_env2 is None:
+            os.environ.pop(FLEET_DIR_ENV, None)
+        else:
+            os.environ[FLEET_DIR_ENV] = old_fleet_env2
+        if old_whpx_env2 is None:
+            os.environ.pop("CUTTLE_WHPX_AVAILABLE", None)
+        else:
+            os.environ["CUTTLE_WHPX_AVAILABLE"] = old_whpx_env2
 
 
 def run_self_test() -> int:
