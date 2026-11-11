@@ -249,6 +249,9 @@ fn decode_small_int(tlv: &Tlv<'_>) -> Result<u64, X509Error> {
     if tlv.value[0] & 0x80 != 0 {
         return Err(X509Error::MalformedInteger);
     }
+    if tlv.value.len() > 1 && tlv.value[0] == 0x00 && (tlv.value[1] & 0x80) == 0 {
+        return Err(X509Error::MalformedInteger);
+    }
     if tlv.value.len() > 8 {
         return Err(X509Error::MalformedInteger);
     }
@@ -472,12 +475,15 @@ fn decode_spki<'a>(
         if !iw.finished() {
             return Err(X509Error::TrailingData);
         }
-        // RSA modulus must be > 1 byte (real keys are 128+ bytes).
-        // Public exponent must be odd (low bit set) and at least 1.
-        if modulus.is_empty() {
+        // RSA modulus must be at least 512 bits (64 octets) and odd.
+        // Public exponent must be odd (low bit set) and strictly greater than 1.
+        if modulus.len() < 64 || (modulus[modulus.len() - 1] & 1) == 0 {
             return Err(X509Error::MalformedPubKey);
         }
-        if exponent.is_empty() {
+        if exponent.is_empty()
+            || (exponent.len() == 1 && exponent[0] <= 1)
+            || (exponent[exponent.len() - 1] & 1) == 0
+        {
             return Err(X509Error::MalformedPubKey);
         }
         Ok((
@@ -553,9 +559,12 @@ impl X509Impl {
             return Err(X509Error::UnsupportedVersion);
         }
 
-        // serialNumber
+        // serialNumber (RFC 5280 §4.1.2.2: positive integer, at most 20 octets)
         let serial_tlv = w.next()?;
         let serial = decode_unsigned_int(&serial_tlv)?;
+        if (serial.len() == 1 && serial[0] == 0) || serial.len() > 20 {
+            return Err(X509Error::MalformedInteger);
+        }
 
         // signature (TBS-level AlgorithmIdentifier)
         let sig_alg_tlv = w.next()?;
@@ -608,6 +617,9 @@ impl X509Impl {
         let subject_tlv = w.next()?;
         if subject_tlv.tag != X509_TAG_SEQUENCE {
             return Err(X509Error::BadTag);
+        }
+        if subject_tlv.value.is_empty() {
+            return Err(X509Error::EmptyName);
         }
         let subject_der = Self::slice_from_tlv(tbs_slice, &subject_tlv)?;
 
@@ -759,7 +771,7 @@ impl X509 for X509Impl {
         // SET of AttributeTypeAndValue { OID, value }. Walk every RDN
         // and every ATV, returning the first ATV whose OID matches CN.
         let outer = read_tlv(dn).ok()?;
-        if outer.tag != X509_TAG_SEQUENCE {
+        if outer.tag != X509_TAG_SEQUENCE || outer.encoded_len() != dn.len() {
             return None;
         }
         let mut rdns = SeqWalker::new(outer.value);
@@ -781,6 +793,9 @@ impl X509 for X509Impl {
                 }
                 if oid_tlv.value == X509_OID_CN {
                     let val = fields.next().ok()?;
+                    if !fields.finished() {
+                        return None;
+                    }
                     return Some(val.value);
                 }
             }
@@ -1997,5 +2012,129 @@ mod tests {
             &cert,
             X509Time { unix: 1_700_000_000 }
         ));
+    }
+
+    #[test]
+    fn x509_rejects_empty_subject_nonminimal_version_bad_serial_weak_rsa_and_trailing_dn() {
+        let mk_cert_custom = |ver_int: Vec<u8>,
+                              serial_tlv: Vec<u8>,
+                              subject_tlv: Vec<u8>,
+                              spki_tlv: Vec<u8>|
+         -> Vec<u8> {
+            let mut tbs_body = Vec::new();
+            tbs_body.extend(explicit_ctx_0(&ver_int));
+            tbs_body.extend(serial_tlv);
+            tbs_body.extend(alg_ed25519());
+            tbs_body.extend(name_cn(b"issuer-ca"));
+            let mut v = Vec::new();
+            v.extend(utc_time(b"700101000000Z"));
+            v.extend(utc_time(b"491231235959Z"));
+            tbs_body.extend(seq(&v));
+            tbs_body.extend(subject_tlv);
+            tbs_body.extend(spki_tlv);
+            let tbs = seq(&tbs_body);
+            let mut outer = Vec::new();
+            outer.extend_from_slice(&tbs);
+            outer.extend(alg_ed25519());
+            outer.extend(bit_string(&[0x42; 64]));
+            seq(&outer)
+        };
+
+        let valid_spki = {
+            let mut s = Vec::new();
+            s.extend(alg_ed25519());
+            s.extend(bit_string(&[7u8; 32]));
+            seq(&s)
+        };
+
+        // 1. Empty subject SEQUENCE (`30 00`) must return `EmptyName` (per X509Error contract).
+        let empty_subj = mk_cert_custom(
+            int_unsigned(&[0x02]),
+            int_unsigned(&[0x01]),
+            seq(&[]),
+            valid_spki.clone(),
+        );
+        assert_eq!(X509Impl::parse(&empty_subj), Err(X509Error::EmptyName));
+
+        // 2. Non-minimal DER INTEGER for version (`02 02 00 02`) must return `MalformedInteger`.
+        let nonmin_ver = mk_cert_custom(
+            tlv(X509_TAG_INTEGER, &[0x00, 0x02]),
+            int_unsigned(&[0x01]),
+            name_cn(b"leaf"),
+            valid_spki.clone(),
+        );
+        assert_eq!(
+            X509Impl::parse(&nonmin_ver),
+            Err(X509Error::MalformedInteger)
+        );
+
+        // 3. Zero serial (`02 01 00`) and >20-byte serial (RFC 5280 §4.1.2.2) must return `MalformedInteger`.
+        let zero_serial = mk_cert_custom(
+            int_unsigned(&[0x02]),
+            int_unsigned(&[0x00]),
+            name_cn(b"leaf"),
+            valid_spki.clone(),
+        );
+        assert_eq!(
+            X509Impl::parse(&zero_serial),
+            Err(X509Error::MalformedInteger)
+        );
+        let huge_serial = mk_cert_custom(
+            int_unsigned(&[0x02]),
+            int_unsigned(&[0x11; 21]),
+            name_cn(b"leaf"),
+            valid_spki,
+        );
+        assert_eq!(
+            X509Impl::parse(&huge_serial),
+            Err(X509Error::MalformedInteger)
+        );
+
+        // 4. Degenerate RSA keys (short modulus, even modulus, or exponent=1 / even exponent) -> `MalformedPubKey`.
+        let mk_rsa_cert = |modulus: &[u8], exponent: &[u8]| -> Vec<u8> {
+            let mut pk = Vec::new();
+            pk.extend(int_unsigned(modulus));
+            pk.extend(int_unsigned(exponent));
+            let mut spki = Vec::new();
+            spki.extend(alg_rsa_encryption());
+            spki.extend(bit_string(&seq(&pk)));
+            let mut tbs_body = Vec::new();
+            tbs_body.extend(explicit_ctx_0(&int_unsigned(&[0x02])));
+            tbs_body.extend(int_unsigned(&[0x01]));
+            tbs_body.extend(alg_sha256_rsa());
+            tbs_body.extend(name_cn(b"ca"));
+            let mut v = Vec::new();
+            v.extend(utc_time(b"700101000000Z"));
+            v.extend(utc_time(b"491231235959Z"));
+            tbs_body.extend(seq(&v));
+            tbs_body.extend(name_cn(b"leaf"));
+            tbs_body.extend(seq(&spki));
+            let mut outer = Vec::new();
+            outer.extend(seq(&tbs_body));
+            outer.extend(alg_sha256_rsa());
+            outer.extend(bit_string(&[0xAA; 256]));
+            seq(&outer)
+        };
+        assert_eq!(
+            X509Impl::parse(&mk_rsa_cert(&[0x03], &[0x01, 0x00, 0x01])),
+            Err(X509Error::MalformedPubKey)
+        );
+        let mut even_mod = [0x81u8; 256];
+        even_mod[255] = 0x80; // even!
+        assert_eq!(
+            X509Impl::parse(&mk_rsa_cert(&even_mod, &[0x01, 0x00, 0x01])),
+            Err(X509Error::MalformedPubKey)
+        );
+        let mut odd_mod = [0x81u8; 256];
+        odd_mod[255] = 0x83;
+        assert_eq!(
+            X509Impl::parse(&mk_rsa_cert(&odd_mod, &[0x01])),
+            Err(X509Error::MalformedPubKey)
+        );
+
+        // 5. `find_cn` must reject trailing garbage bytes after the Name SEQUENCE or inside ATV.
+        let mut dn_trailing = name_cn(b"valid.local");
+        dn_trailing.push(0x00);
+        assert_eq!(X509Impl::find_cn(&dn_trailing), None);
     }
 }

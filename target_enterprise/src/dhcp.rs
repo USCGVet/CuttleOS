@@ -396,6 +396,9 @@ impl DhcpClient {
         if view.xid != self.xid {
             return Err(DhcpError::XidMismatch);
         }
+        if view.chaddr != self.mac {
+            return Err(DhcpError::XidMismatch);
+        }
         if view.yiaddr == [0u8; 4] {
             return Err(DhcpError::EmptyYiaddr);
         }
@@ -423,11 +426,15 @@ impl DhcpClient {
         Ok(n)
     }
 
-    /// Requesting → Bound: consume an ACK (xid match, yiaddr match
-    /// the captured offered IP, msg_type = ACK), capture full lease.
+    /// Requesting / Renewing / Rebinding → Bound: consume an ACK (`xid` and
+    /// `chaddr` match, `server_id` matches the selected server unless rebinding,
+    /// `msg_type = ACK`), capture full lease.
     /// `now_secs` is the caller's monotonic-clock wall time.
     pub fn on_ack(&mut self, ack_bytes: &[u8], now_secs: u64) -> Result<DhcpLease, DhcpError> {
-        if self.state != DhcpClientState::Requesting {
+        if !matches!(
+            self.state,
+            DhcpClientState::Requesting | DhcpClientState::Renewing | DhcpClientState::Rebinding
+        ) {
             return Err(DhcpError::UnexpectedState);
         }
         let view = DhcpImpl::parse_message(ack_bytes)?;
@@ -437,11 +444,19 @@ impl DhcpClient {
         if view.msg_type != dhcp_msg_type::ACK {
             return Err(DhcpError::UnexpectedState);
         }
-        if view.xid != self.xid {
+        if view.xid != self.xid || view.chaddr != self.mac {
             return Err(DhcpError::XidMismatch);
         }
         if view.yiaddr == [0u8; 4] {
             return Err(DhcpError::EmptyYiaddr);
+        }
+        if let Some(sid) = view.server_id {
+            if self.state != DhcpClientState::Rebinding
+                && self.server_id != [0u8; 4]
+                && sid != self.server_id
+            {
+                return Err(DhcpError::UnexpectedState);
+            }
         }
         // Per RFC 2131 §4.3.2: server MAY assign a different IP in
         // ACK than in OFFER (rare but allowed). The seed accepts
@@ -452,6 +467,8 @@ impl DhcpClient {
         let gateway = view.router.unwrap_or(self.lease.gateway);
         let dns = view.dns.unwrap_or(self.lease.dns);
 
+        self.offered_ip = view.yiaddr;
+        self.server_id = server_id;
         self.lease = DhcpLease {
             assigned_ip: view.yiaddr,
             subnet_mask,
@@ -465,18 +482,24 @@ impl DhcpClient {
         Ok(self.lease)
     }
 
-    /// Receive a NAK while in `Requesting` — drop back to `Init`.
+    /// Receive a NAK while in `Requesting`, `Renewing`, or `Rebinding` — drop back to `Init`.
     /// RFC 2131 §4.4.5 last paragraph: a NAK invalidates the
     /// current attempt; client must restart with a new `xid`.
     pub fn on_nak(&mut self, nak_bytes: &[u8]) -> Result<(), DhcpError> {
-        if self.state != DhcpClientState::Requesting {
+        if !matches!(
+            self.state,
+            DhcpClientState::Requesting | DhcpClientState::Renewing | DhcpClientState::Rebinding
+        ) {
             return Err(DhcpError::UnexpectedState);
         }
         let view = DhcpImpl::parse_message(nak_bytes)?;
+        if view.op != DHCP_OP_BOOTREPLY {
+            return Err(DhcpError::InvalidOp);
+        }
         if view.msg_type != dhcp_msg_type::NAK {
             return Err(DhcpError::UnexpectedState);
         }
-        if view.xid != self.xid {
+        if view.xid != self.xid || view.chaddr != self.mac {
             return Err(DhcpError::XidMismatch);
         }
         self.xid = 0;
@@ -1259,5 +1282,64 @@ mod tests {
         let lease = cli.on_ack(&ack[..n_ack], 42).unwrap();
         assert_eq!(lease.assigned_ip, TEST_OFFERED_IP);
         assert_eq!(cli.state(), DhcpClientState::Bound);
+    }
+
+    #[test]
+    fn client_enforces_chaddr_server_id_bootreply_nak_and_renew_ack() {
+        // 1. Wrong `chaddr` in OFFER must be rejected even if `xid` matches.
+        let mut cli = DhcpClient::new(TEST_MAC);
+        let mut disc = [0u8; DHCP_MAX_MESSAGE_LEN];
+        cli.start_discover(TEST_XID, &mut disc).unwrap();
+
+        let mut foreign_offer = [0u8; DHCP_MAX_MESSAGE_LEN];
+        let n_off = build_offer_fixture(&mut foreign_offer);
+        foreign_offer[28..34].copy_from_slice(&[0x02, 0x99, 0x88, 0x77, 0x66, 0x55]);
+        let mut req = [0u8; DHCP_MAX_MESSAGE_LEN];
+        assert!(
+            cli.on_offer(&foreign_offer[..n_off], &mut req).is_err(),
+            "OFFER addressed to another host's chaddr must be rejected"
+        );
+
+        // Advance legitimately to Requesting.
+        let mut valid_offer = [0u8; DHCP_MAX_MESSAGE_LEN];
+        let n_off = build_offer_fixture(&mut valid_offer);
+        cli.on_offer(&valid_offer[..n_off], &mut req).unwrap();
+        assert_eq!(cli.state(), DhcpClientState::Requesting);
+
+        // 2. Rogue server ACK with different `server_id` must be rejected.
+        let mut rogue_ack = [0u8; DHCP_MAX_MESSAGE_LEN];
+        let n_ack = build_ack_fixture(&mut rogue_ack);
+        // Server ID in build_offer_fixture is at the last option before END (`n_ack - 5..n_ack - 1`).
+        rogue_ack[n_ack - 5..n_ack - 1].copy_from_slice(&[10, 0, 0, 254]);
+        assert!(
+            cli.on_ack(&rogue_ack[..n_ack], 100).is_err(),
+            "ACK from unselected rogue DHCP server_id must be rejected"
+        );
+
+        // 3. Spoofed client BOOTREQUEST (`op = 1`) carrying NAK must be rejected; wrong `chaddr` NAK rejected.
+        let mut fake_nak = [0u8; DHCP_MAX_MESSAGE_LEN];
+        let n_nak = build_offer_fixture(&mut fake_nak);
+        fake_nak[242] = dhcp_msg_type::NAK;
+        fake_nak[0] = DHCP_OP_BOOTREQUEST;
+        assert_eq!(cli.on_nak(&fake_nak[..n_nak]), Err(DhcpError::InvalidOp));
+
+        fake_nak[0] = DHCP_OP_BOOTREPLY;
+        fake_nak[28..34].copy_from_slice(&[0x02, 1, 2, 3, 4, 5]);
+        assert!(cli.on_nak(&fake_nak[..n_nak]).is_err());
+
+        // 4. Legitimate ACK binds lease; advancing to Renewing allows `on_ack` renewal!
+        let mut valid_ack = [0u8; DHCP_MAX_MESSAGE_LEN];
+        let n_ack = build_ack_fixture(&mut valid_ack);
+        cli.on_ack(&valid_ack[..n_ack], 100).unwrap();
+        assert_eq!(cli.state(), DhcpClientState::Bound);
+
+        cli.tick(100 + (TEST_LEASE_SECS as u64) / 2 + 1);
+        assert_eq!(cli.state(), DhcpClientState::Renewing);
+
+        let renewed = cli
+            .on_ack(&valid_ack[..n_ack], 100 + (TEST_LEASE_SECS as u64) / 2 + 5)
+            .expect("Renewing client must accept renewal ACK from bound server");
+        assert_eq!(cli.state(), DhcpClientState::Bound);
+        assert_eq!(renewed.bound_at_secs, 100 + (TEST_LEASE_SECS as u64) / 2 + 5);
     }
 }

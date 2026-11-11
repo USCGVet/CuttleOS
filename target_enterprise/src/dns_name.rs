@@ -25,6 +25,9 @@ impl DnsName for DnsNameImpl {
     }
 }
 
+const DNS_MAX_WIRE_NAME_LEN: usize = 255;
+const DNS_MAX_PTR_HOPS: usize = 16;
+
 pub fn encode_impl(labels: &[&[u8]], out: &mut [u8]) -> Result<usize, DnsNameError> {
     if labels.len() > DNS_MAX_LABELS {
         return Err(DnsNameError::TooMany);
@@ -32,6 +35,9 @@ pub fn encode_impl(labels: &[&[u8]], out: &mut [u8]) -> Result<usize, DnsNameErr
     let mut pos = 0usize;
     for lab in labels {
         if lab.is_empty() || lab.len() > DNS_MAX_LABEL_LEN {
+            return Err(DnsNameError::BadLabel);
+        }
+        if pos + 1 + lab.len() + 1 > DNS_MAX_WIRE_NAME_LEN {
             return Err(DnsNameError::BadLabel);
         }
         if pos + 1 + lab.len() + 1 > out.len() {
@@ -59,12 +65,18 @@ pub fn decode_impl(
     let mut count = 0usize;
     let mut consumed = 0usize;
     let mut followed_ptr = false;
+    let mut hops = 0usize;
+    let mut wire_octets = 0usize;
     loop {
         if pos >= msg.len() {
             return Err(DnsNameError::Truncated);
         }
         let len = msg[pos];
         if len == 0 {
+            wire_octets += 1;
+            if wire_octets > DNS_MAX_WIRE_NAME_LEN {
+                return Err(DnsNameError::BadLabel);
+            }
             if !followed_ptr {
                 consumed = pos + 1 - offset;
             }
@@ -74,13 +86,24 @@ pub fn decode_impl(
             if pos + 1 >= msg.len() {
                 return Err(DnsNameError::Truncated);
             }
-            let ptr = (((len as u16) & 0x3F) << 8) | (msg[pos + 1] as u16);
+            let ptr = ((((len as u16) & 0x3F) << 8) | (msg[pos + 1] as u16)) as usize;
+            // RFC 1035 §4.1.4: compression pointers MUST strictly point backward (`ptr < pos`).
+            if ptr >= pos {
+                return Err(DnsNameError::BadLabel);
+            }
+            hops += 1;
+            if hops > DNS_MAX_PTR_HOPS {
+                return Err(DnsNameError::BadLabel);
+            }
             if !followed_ptr {
                 consumed = pos + 2 - offset;
             }
             followed_ptr = true;
-            pos = ptr as usize;
+            pos = ptr;
             continue;
+        }
+        if len & DNS_PTR_MASK != 0 {
+            return Err(DnsNameError::BadLabel);
         }
         if len as usize > DNS_MAX_LABEL_LEN {
             return Err(DnsNameError::BadLabel);
@@ -88,10 +111,14 @@ pub fn decode_impl(
         if pos + 1 + (len as usize) > msg.len() {
             return Err(DnsNameError::Truncated);
         }
+        let n = len as usize;
+        wire_octets += 1 + n;
+        if wire_octets >= DNS_MAX_WIRE_NAME_LEN {
+            return Err(DnsNameError::BadLabel);
+        }
         if count >= DNS_MAX_LABELS {
             return Err(DnsNameError::TooMany);
         }
-        let n = len as usize;
         out_labels[count][..n].copy_from_slice(&msg[pos + 1..pos + 1 + n]);
         out_lens[count] = n;
         count += 1;
@@ -305,5 +332,65 @@ mod tests {
     fn encode_single() {
         let mut out = [0u8; 8];
         assert_eq!(DnsNameImpl::encode(&[b"z"], &mut out).unwrap(), 3);
+    }
+
+    #[test]
+    fn decode_rejects_self_and_forward_compression_pointers_and_reserved_labels() {
+        extern crate std;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut labs = [[0u8; 64]; DNS_MAX_LABELS];
+            let mut lens = [0usize; DNS_MAX_LABELS];
+            let r_self = DnsNameImpl::decode(&[0xC0, 0x00], 0, &mut labs, &mut lens);
+            let r_fwd = DnsNameImpl::decode(&[0xC0, 0x02, 0x01, b'a', 0x00], 0, &mut labs, &mut lens);
+            let r_cycle = DnsNameImpl::decode(&[0xC0, 0x02, 0xC0, 0x00], 2, &mut labs, &mut lens);
+            let _ = tx.send((r_self, r_fwd, r_cycle));
+        });
+        let (r_self, r_fwd, r_cycle) = rx
+            .recv_timeout(std::time::Duration::from_millis(150))
+            .expect("DnsNameImpl::decode hung on compression pointer cycle");
+        assert!(r_self.is_err(), "self-pointer at offset 0 must fail");
+        assert!(r_fwd.is_err(), "forward compression pointer must fail");
+        assert!(r_cycle.is_err(), "compression pointer cycle must fail");
+
+        let mut labs = [[0u8; 64]; DNS_MAX_LABELS];
+        let mut lens = [0usize; DNS_MAX_LABELS];
+        // Reserved RFC 1035 label header bits 01xxxxxx (0x41) and 10xxxxxx (0x81)
+        assert_eq!(
+            DnsNameImpl::decode(&[0x41, b'a', 0x00], 0, &mut labs, &mut lens),
+            Err(DnsNameError::BadLabel)
+        );
+        assert_eq!(
+            DnsNameImpl::decode(&[0x81, b'a', 0x00], 0, &mut labs, &mut lens),
+            Err(DnsNameError::BadLabel)
+        );
+    }
+
+    #[test]
+    fn encode_and_decode_enforce_rfc1035_255_octet_wire_limit() {
+        // 4 labels of 63 octets = 4 * 64 + 1 = 257 wire octets (> 255 max).
+        let lab63 = [b'a'; 63];
+        let four_63: [&[u8]; 4] = [&lab63, &lab63, &lab63, &lab63];
+        let mut out = [0u8; 300];
+        assert!(
+            DnsNameImpl::encode(&four_63, &mut out).is_err(),
+            "RFC 1035 §2.3.4 forbids wire names exceeding 255 octets"
+        );
+
+        // Manually construct 257-octet wire name and verify decode also rejects it.
+        let mut raw = [0u8; 257];
+        let mut p = 0usize;
+        for _ in 0..4 {
+            raw[p] = 63;
+            raw[p + 1..p + 64].fill(b'x');
+            p += 64;
+        }
+        raw[p] = 0;
+        let mut labs = [[0u8; 64]; DNS_MAX_LABELS];
+        let mut lens = [0usize; DNS_MAX_LABELS];
+        assert!(
+            DnsNameImpl::decode(&raw, 0, &mut labs, &mut lens).is_err(),
+            "DnsNameImpl::decode must reject wire names > 255 octets"
+        );
     }
 }

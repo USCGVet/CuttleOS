@@ -588,17 +588,7 @@ impl LivedNet {
         cmd: &[u8],
         out: &mut [u8; 32],
     ) {
-        let mut msg = [0u8; 320];
-        let mut pos = 0usize;
-        let s_len = seq_ascii.len().min(32);
-        msg[..s_len].copy_from_slice(&seq_ascii[..s_len]);
-        pos += s_len;
-        msg[pos] = b':';
-        pos += 1;
-        let c_len = cmd.len().min(msg.len() - pos);
-        msg[pos..pos + c_len].copy_from_slice(&cmd[..c_len]);
-        pos += c_len;
-        hmac_sha256(key, &msg[..pos], out);
+        crate::tls::hmac_sha256_parts(key, &[seq_ascii, b":", cmd], out);
     }
 
     /// Compute the domain-separated 32-byte HMAC-SHA256 tag over
@@ -609,13 +599,11 @@ impl LivedNet {
         user: &[u8],
         out: &mut [u8; 32],
     ) {
-        let mut msg = [0u8; 128];
-        let mut pos = 0usize;
-        pos += copy_msg(b"cuttle-http-login-v1:", &mut msg[pos..]);
-        pos += copy_msg(&seq_ascii[..seq_ascii.len().min(32)], &mut msg[pos..]);
-        pos += copy_msg(b":", &mut msg[pos..]);
-        pos += copy_msg(&user[..user.len().min(32)], &mut msg[pos..]);
-        hmac_sha256(key, &msg[..pos], out);
+        crate::tls::hmac_sha256_parts(
+            key,
+            &[b"cuttle-http-login-v1:", seq_ascii, b":", user],
+            out,
+        );
     }
 
     /// Compute the 32-byte HMAC-SHA256 tag over `"cuttle-triad-prep-v1:<seq>:<node_id>:<sql>"`
@@ -627,15 +615,11 @@ impl LivedNet {
         sql: &[u8],
         out: &mut [u8; 32],
     ) {
-        let mut msg = [0u8; 384];
-        let mut pos = 0usize;
-        pos += copy_msg(b"cuttle-triad-prep-v1:", &mut msg[pos..]);
-        pos += copy_msg(&seq_ascii[..seq_ascii.len().min(24)], &mut msg[pos..]);
-        pos += copy_msg(b":", &mut msg[pos..]);
-        pos += copy_msg(&node_ascii[..node_ascii.len().min(8)], &mut msg[pos..]);
-        pos += copy_msg(b":", &mut msg[pos..]);
-        pos += copy_msg(sql, &mut msg[pos..]);
-        hmac_sha256(key, &msg[..pos], out);
+        crate::tls::hmac_sha256_parts(
+            key,
+            &[b"cuttle-triad-prep-v1:", seq_ascii, b":", node_ascii, b":", sql],
+            out,
+        );
     }
 
     /// Compute the 32-byte HMAC-SHA256 tag over `"cuttle-triad-prep-v2:<epoch>:<seq>:<node_id>:<sql>"`
@@ -649,17 +633,20 @@ impl LivedNet {
         sql: &[u8],
         out: &mut [u8; 32],
     ) {
-        let mut msg = [0u8; 416];
-        let mut pos = 0usize;
-        pos += copy_msg(b"cuttle-triad-prep-v2:", &mut msg[pos..]);
-        pos += copy_msg(&epoch_ascii[..epoch_ascii.len().min(24)], &mut msg[pos..]);
-        pos += copy_msg(b":", &mut msg[pos..]);
-        pos += copy_msg(&seq_ascii[..seq_ascii.len().min(24)], &mut msg[pos..]);
-        pos += copy_msg(b":", &mut msg[pos..]);
-        pos += copy_msg(&node_ascii[..node_ascii.len().min(8)], &mut msg[pos..]);
-        pos += copy_msg(b":", &mut msg[pos..]);
-        pos += copy_msg(sql, &mut msg[pos..]);
-        hmac_sha256(key, &msg[..pos], out);
+        crate::tls::hmac_sha256_parts(
+            key,
+            &[
+                b"cuttle-triad-prep-v2:",
+                epoch_ascii,
+                b":",
+                seq_ascii,
+                b":",
+                node_ascii,
+                b":",
+                sql,
+            ],
+            out,
+        );
     }
 
     /// Compute the 32-byte HMAC-SHA256 tag over `"cuttle-triad-ack-v1:<seq>:<peer_id>:<hash_hex16>"`
@@ -671,15 +658,11 @@ impl LivedNet {
         hash_hex16: &[u8],
         out: &mut [u8; 32],
     ) {
-        let mut msg = [0u8; 160];
-        let mut pos = 0usize;
-        pos += copy_msg(b"cuttle-triad-ack-v1:", &mut msg[pos..]);
-        pos += copy_msg(&seq_ascii[..seq_ascii.len().min(24)], &mut msg[pos..]);
-        pos += copy_msg(b":", &mut msg[pos..]);
-        pos += copy_msg(&peer_ascii[..peer_ascii.len().min(8)], &mut msg[pos..]);
-        pos += copy_msg(b":", &mut msg[pos..]);
-        pos += copy_msg(&hash_hex16[..hash_hex16.len().min(16)], &mut msg[pos..]);
-        hmac_sha256(key, &msg[..pos], out);
+        crate::tls::hmac_sha256_parts(
+            key,
+            &[b"cuttle-triad-ack-v1:", seq_ascii, b":", peer_ascii, b":", hash_hex16],
+            out,
+        );
     }
 
     /// Gratuitous ARP (broadcast who-has ourselves) so slirp/bridges
@@ -762,17 +745,40 @@ impl LivedNet {
         if total < ihl || ETH_HEADER_LEN + total > frame.len() {
             return;
         }
+        // Enforce RFC 791 / RFC 1071 IPv4 wire invariants BEFORE L4 firewall evaluation:
+        // reject TTL=0, fragmented packets (MF=0x2000 or non-zero fragment offset),
+        // corrupt IPv4 header checksums, Martian source IPs, and zero/multicast sender MACs.
+        if ip[8] == 0 {
+            return;
+        }
+        let flags_frag = u16::from_be_bytes([ip[6], ip[7]]);
+        if (flags_frag & 0x3FFF) != 0 {
+            return;
+        }
+        if !ipv4_header_checksum_valid(&ip[..ihl]) {
+            return;
+        }
         let dst_ip = [ip[16], ip[17], ip[18], ip[19]];
         if dst_ip != self.ip {
             return;
         }
         let src_ip = [ip[12], ip[13], ip[14], ip[15]];
+        if src_ip == [0, 0, 0, 0]
+            || src_ip == [255, 255, 255, 255]
+            || (src_ip[0] & 0xF0) == 0xE0
+            || src_ip == self.ip
+        {
+            return;
+        }
         let proto = ip[9];
         let payload = &ip[ihl..total];
         let sender_mac: [u8; 6] = match frame[6..12].try_into() {
             Ok(m) => m,
             Err(_) => return,
         };
+        if sender_mac == [0u8; 6] || (sender_mac[0] & 0x01) != 0 {
+            return;
+        }
 
         // Wire-boundary 5-tuple stateless CIDR packet filter enforcement.
         if let Some(sh) = shell.as_deref_mut() {
@@ -818,7 +824,20 @@ impl LivedNet {
         if frame.len() < 42 {
             return;
         }
+        let eth_src = &frame[6..12];
+        if eth_src == [0u8; 6] || (eth_src[0] & 0x01) != 0 {
+            return;
+        }
         let arp = &frame[14..42];
+        let htype = u16::from_be_bytes([arp[0], arp[1]]);
+        let ptype = u16::from_be_bytes([arp[2], arp[3]]);
+        if htype != 1 || ptype != 0x0800 || arp[4] != 6 || arp[5] != 4 {
+            return;
+        }
+        let sha = &arp[8..14];
+        if sha == [0u8; 6] || (sha[0] & 0x01) != 0 {
+            return;
+        }
         let op = u16::from_be_bytes([arp[6], arp[7]]);
         let tip = [arp[24], arp[25], arp[26], arp[27]];
         if op != 1 || tip != self.ip {
@@ -838,7 +857,7 @@ impl LivedNet {
         reply[22..28].copy_from_slice(&self.mac);
         reply[28..32].copy_from_slice(&self.ip);
         reply[32..38].copy_from_slice(&arp[8..14]);
-        reply[38..42].copy_from_slice(&arp[18..22]);
+        reply[38..42].copy_from_slice(&arp[14..18]);
         out.push(&reply);
     }
 
@@ -887,11 +906,18 @@ impl LivedNet {
         let src_port = u16::from_be_bytes([udp[0], udp[1]]);
         let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
         let ulen = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+        if ulen < 8 || ulen > udp.len() {
+            return;
+        }
+        let wire_ck = u16::from_be_bytes([udp[6], udp[7]]);
+        if wire_ck != 0 && crate::net::udp_checksum(src_ip, self.ip, &udp[..ulen]) != wire_ck {
+            return;
+        }
         if (dst_port != UDP_STATUS_PORT && dst_port != TRIAD_REPL_PORT) || src_port < 1024 {
             return;
         }
-        let payload_len = ulen.saturating_sub(8).min(udp.len().saturating_sub(8));
-        let payload = &udp[8..8 + payload_len];
+        let payload_len = ulen - 8;
+        let payload = &udp[8..ulen];
         // slirp bounce guard (same as the original UDP service).
         if payload_len >= 7 && payload.starts_with(b"CUTTLE-") {
             return;
@@ -958,15 +984,15 @@ impl LivedNet {
         use crate::svc_runtime::IpcOp;
 
         let trimmed = trim_ws(payload);
-        if trimmed == b"TRIAD_STATUS" {
-            return sh.cmd_triad(b"status", body);
-        }
         if !self.auth_enabled {
             sh.record_net_audit(AuditVerdict::Denied, b"net:triad:unprovisioned");
             return copy_msg(
                 b"error: EACCES (device key not provisioned; TRIAD disabled)\n",
                 body,
             );
+        }
+        if trimmed == b"TRIAD_STATUS" {
+            return sh.cmd_triad(b"status", body);
         }
 
         if trimmed.len() > 14 && trimmed.starts_with(b"TRIAD_PREPARE ") {
@@ -993,6 +1019,17 @@ impl LivedNet {
                 sh.record_net_audit(AuditVerdict::Error, b"net:triad:prep-syntax");
                 return copy_msg(
                     b"usage: TRIAD_PREPARE [epoch=<u64>] <seq> <node_id> <hmac_hex64> <sql>\n",
+                    body,
+                );
+            }
+            if sql.len() > crate::svc_runtime::IPC_MAILBOX_BODY_CAP {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:sql-oversize");
+                return copy_msg(b"error: E2BIG (triad SQL exceeds 256 bytes)\n", body);
+            }
+            if (leader_id as u8) == (sh.triad_node_id % 3) {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:self-peer");
+                return copy_msg(
+                    b"error: EACCES (triad PREPARE self-peer loop rejected)\n",
                     body,
                 );
             }
@@ -1067,10 +1104,6 @@ impl LivedNet {
                     body,
                 );
             }
-            if let Some((ep, _)) = parsed_epoch {
-                self.triad_min_epoch = ep;
-                sh.triad_min_epoch = ep;
-            }
             if crate::sql::SqlDb::is_readonly_query(sql) {
                 sh.record_net_audit(AuditVerdict::Error, b"net:triad:ro-sql");
                 return copy_msg(b"error: EINVAL (TRIAD_PREPARE requires mutating SQL)\n", body);
@@ -1098,6 +1131,10 @@ impl LivedNet {
             if sql_out[..slen].starts_with(b"error:") {
                 sh.record_net_audit(AuditVerdict::Error, b"net:triad:sql-err");
                 return copy_msg(&sql_out[..slen], body);
+            }
+            if let Some((ep, _)) = parsed_epoch {
+                self.triad_min_epoch = ep;
+                sh.triad_min_epoch = ep;
             }
             sh.triad_tx_seq = seq;
             let state_hash = sh.db.state_hash();
@@ -1270,6 +1307,10 @@ impl LivedNet {
                 return copy_msg(b"usage: AUTH <seq> <hmac_hex64> <cmd>\n", body);
             }
         };
+        if cmd.len() > 512 {
+            sh.record_net_audit(AuditVerdict::Denied, b"net:udp:cmd-oversize");
+            return copy_msg(b"error: E2BIG (AUTH command exceeds 512 bytes)\n", body);
+        }
         let watermark = self.last_auth_seq.max(sh.auth_seq);
         if seq <= watermark {
             sh.record_net_audit(AuditVerdict::Denied, b"net:udp:replay");
@@ -1746,7 +1787,7 @@ impl LivedNet {
                 && responses < 8
                 && session.pending_tx().len() < HTTPS_TX_HIGH_WATER
             {
-                let mut response = [0u8; TCP_SEGMENT_PAYLOAD];
+                let mut response = [0u8; 4096];
                 let close_after;
                 let n = match frame_next_http_request(session.plaintext()) {
                     HttpFrameOutcome::Incomplete => {
@@ -2388,32 +2429,7 @@ impl LivedNet {
         if view.path.len() > 4 && view.path.starts_with(b"/fs/") {
             let vfs_path = &view.path[3..]; // includes leading `/`
             if view.method == HttpMethod::Get {
-                let mut fbuf = [0u8; 384];
-                return match sh.dispatch_mailbox_op(
-                    IpcOp::VfsRead,
-                    true,
-                    false,
-                    boots,
-                    vfs_path,
-                    b"",
-                    &mut fbuf,
-                ) {
-                    Ok((200, flen)) => {
-                        let ctype: &[u8] = if vfs_path.ends_with(b".html") {
-                            b"text/html"
-                        } else if vfs_path.ends_with(b".json") {
-                            b"application/json"
-                        } else {
-                            b"text/plain"
-                        };
-                        HttpImpl::build_response(200, ctype, &fbuf[..flen], out).unwrap_or(0)
-                    }
-                    Ok((status, flen)) => {
-                        HttpImpl::build_response(status, b"text/plain", &fbuf[..flen], out)
-                            .unwrap_or(0)
-                    }
-                    Err(e) => build_service_error_response(e, out),
-                };
+                return serve_vfs_get_response(sh, boots, vfs_path, out);
             }
             if view.method == HttpMethod::Put {
                 let authed = extract_session_token(view.headers_raw)
@@ -3565,8 +3581,59 @@ fn split_ws(s: &[u8]) -> (&[u8], &[u8]) {
     (first, rest)
 }
 
+#[inline(never)]
+fn serve_vfs_get_response(
+    sh: &mut crate::shell::OsShell,
+    boots: u64,
+    vfs_path: &[u8],
+    out: &mut [u8],
+) -> usize {
+    let mut fbuf = [0u8; 2048];
+    match sh.dispatch_mailbox_op(
+        crate::svc_runtime::IpcOp::VfsRead,
+        true,
+        false,
+        boots,
+        vfs_path,
+        b"",
+        &mut fbuf,
+    ) {
+        Ok((200, flen)) => {
+            let ctype: &[u8] = if vfs_path.ends_with(b".html") {
+                b"text/html"
+            } else if vfs_path.ends_with(b".json") {
+                b"application/json"
+            } else {
+                b"text/plain"
+            };
+            HttpImpl::build_response(200, ctype, &fbuf[..flen], out).unwrap_or(0)
+        }
+        Ok((status, flen)) => {
+            HttpImpl::build_response(status, b"text/plain", &fbuf[..flen], out).unwrap_or(0)
+        }
+        Err(e) => build_service_error_response(e, out),
+    }
+}
+
+fn ipv4_header_checksum_valid(hdr: &[u8]) -> bool {
+    if hdr.len() < IPV4_HEADER_LEN || (hdr.len() & 1) != 0 {
+        return false;
+    }
+    let mut sum: u32 = 0;
+    let mut i = 0usize;
+    while i + 1 < hdr.len() {
+        let w = ((hdr[i] as u32) << 8) | (hdr[i + 1] as u32);
+        sum += w;
+        i += 2;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    (sum as u16) == 0xFFFF
+}
+
 fn parse_u64_dec(s: &[u8]) -> Option<u64> {
-    if s.is_empty() {
+    if s.is_empty() || (s.len() > 1 && s[0] == b'0') {
         return None;
     }
     let mut acc: u64 = 0;
@@ -7101,5 +7168,189 @@ mod tests {
             net.tcbs.iter().all(|t| t.state == TcpState::Established),
             "SYN flood must never evict an active Established TCB"
         );
+    }
+
+    #[test]
+    fn wire_hardening_rejects_fragments_bad_checksums_martians_bad_arp_and_hmac_truncation() {
+        let key = [0x5Au8; 32];
+        let mut net = LivedNet::with_auth_key(MAC, key);
+        let mut sh = crate::shell::OsShell::with_seal_key(key);
+
+        // 1. ARP reply target IP (`r[38..42]`) must equal requester SPA (`PEER_IP`), not `[0; 4]`,
+        //    and ARP request from a multicast SHA (`01:...`) must be ignored.
+        let mut arp_req = [0u8; 42];
+        arp_req[..6].copy_from_slice(&[0xFF; 6]);
+        arp_req[6..12].copy_from_slice(&PEER_MAC);
+        arp_req[12..14].copy_from_slice(&[0x08, 0x06]);
+        arp_req[14..22].copy_from_slice(&[0, 1, 0x08, 0x00, 6, 4, 0, 1]);
+        arp_req[22..28].copy_from_slice(&PEER_MAC);
+        arp_req[28..32].copy_from_slice(&PEER_IP);
+        arp_req[38..42].copy_from_slice(&GUEST_IP);
+        let mut out = ReplySet::new();
+        net.handle_frame(&arp_req, 1, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            &out.get(0).unwrap()[38..42],
+            &PEER_IP,
+            "ARP reply TPA must carry requester SPA, not zeroed THA"
+        );
+
+        let mut mcast_arp = arp_req;
+        mcast_arp[6] = 0x01;
+        mcast_arp[22] = 0x01; // multicast SHA bit set
+        let mut mcast_out = ReplySet::new();
+        net.handle_frame(&mcast_arp, 1, &mut mcast_out);
+        assert_eq!(mcast_out.len(), 0, "multicast SHA ARP request must be dropped");
+
+        // 2. IPv4 header validation: fragment (`MF=1` or `frag_offset != 0`), bad IPv4 checksum,
+        //    `TTL == 0`, and Martian `src_ip = 0.0.0.0` must all be dropped.
+        let mut icmp = [0u8; 16];
+        let nicmp = IcmpImpl::build_echo_request(0x1111, 1, b"x", &mut icmp).unwrap();
+        let (good_ip_frame, good_len) = eth_ip(IP_PROTO_ICMP, PEER_IP, GUEST_IP, &icmp[..nicmp]);
+
+        // 2a. Fragmented packet (`MF = 1`, flags_frag = 0x2000)
+        let mut frag_frame = good_ip_frame;
+        frag_frame[20] = 0x20;
+        frag_frame[21] = 0x00;
+        frag_frame[24..26].copy_from_slice(&[0, 0]);
+        let ck = ipv4_header_checksum(&frag_frame[14..34]);
+        frag_frame[24..26].copy_from_slice(&ck.to_be_bytes());
+        out = ReplySet::new();
+        net.handle_frame(&frag_frame[..good_len], 1, &mut out);
+        assert_eq!(out.len(), 0, "fragmented IPv4 packet must be dropped");
+
+        // 2b. Corrupt IPv4 header checksum
+        let mut bad_ck_frame = good_ip_frame;
+        bad_ck_frame[24] ^= 0xFF;
+        out = ReplySet::new();
+        net.handle_frame(&bad_ck_frame[..good_len], 1, &mut out);
+        assert_eq!(out.len(), 0, "corrupt IPv4 header checksum must be dropped");
+
+        // 2c. Zero TTL
+        let mut ttl0_frame = good_ip_frame;
+        ttl0_frame[22] = 0;
+        ttl0_frame[24..26].copy_from_slice(&[0, 0]);
+        let ck0 = ipv4_header_checksum(&ttl0_frame[14..34]);
+        ttl0_frame[24..26].copy_from_slice(&ck0.to_be_bytes());
+        out = ReplySet::new();
+        net.handle_frame(&ttl0_frame[..good_len], 1, &mut out);
+        assert_eq!(out.len(), 0, "TTL=0 IPv4 packet must be dropped");
+
+        // 2d. Martian `0.0.0.0` source IP
+        let (martian_frame, mlen) = eth_ip(IP_PROTO_ICMP, [0, 0, 0, 0], GUEST_IP, &icmp[..nicmp]);
+        out = ReplySet::new();
+        net.handle_frame(&martian_frame[..mlen], 1, &mut out);
+        assert_eq!(out.len(), 0, "Martian 0.0.0.0 source IP must be dropped");
+
+        // 3. UDP length > slice and bad non-zero UDP checksum must be dropped.
+        let payload = b"STATUS?";
+        let ulen = 8 + payload.len();
+        let mut udp = [0u8; 32];
+        udp[0..2].copy_from_slice(&42000u16.to_be_bytes());
+        udp[2..4].copy_from_slice(&UDP_STATUS_PORT.to_be_bytes());
+        udp[4..6].copy_from_slice(&(ulen as u16).to_be_bytes());
+        udp[8..ulen].copy_from_slice(payload);
+        let uc = crate::net::udp_checksum(PEER_IP, GUEST_IP, &udp[..ulen]);
+        udp[6..8].copy_from_slice(&(uc ^ 0x00FF).to_be_bytes());
+        let (bad_udp_frame, bad_ulen) = eth_ip(IP_PROTO_UDP, PEER_IP, GUEST_IP, &udp[..ulen]);
+        out = ReplySet::new();
+        net.handle_frame(&bad_udp_frame[..bad_ulen], 1, &mut out);
+        assert_eq!(out.len(), 0, "corrupt non-zero UDP checksum must be dropped");
+
+        let mut trunc_udp = udp;
+        trunc_udp[4..6].copy_from_slice(&((ulen + 8) as u16).to_be_bytes());
+        trunc_udp[6..8].copy_from_slice(&[0, 0]);
+        let (trunc_udp_frame, trunc_ulen) = eth_ip(IP_PROTO_UDP, PEER_IP, GUEST_IP, &trunc_udp[..ulen]);
+        out = ReplySet::new();
+        net.handle_frame(&trunc_udp_frame[..trunc_ulen], 1, &mut out);
+        assert_eq!(out.len(), 0, "UDP packet with ulen > actual payload must be dropped");
+
+        // 4. Streaming HMAC (zero truncation) & canonical decimal sequence numbers:
+        //    `compute_auth_tag` on two >320-byte commands differing ONLY after byte 320 MUST NOT collide!
+        let mut long_a = [b'a'; 360];
+        long_a[..16].copy_from_slice(b"write /var/long ");
+        let mut long_b = long_a;
+        long_b[355] = b'Z';
+        let (mut tag_a, mut tag_b) = ([0u8; 32], [0u8; 32]);
+        LivedNet::compute_auth_tag(&key, b"1", &long_a, &mut tag_a);
+        LivedNet::compute_auth_tag(&key, b"1", &long_b, &mut tag_b);
+        assert_ne!(
+            tag_a, tag_b,
+            "compute_auth_tag must authenticate the entire command with zero 320-byte truncation"
+        );
+
+        // Non-canonical leading-zero sequence `01` must be rejected by UDP AUTH.
+        let mut tag_01 = [0u8; 32];
+        LivedNet::compute_auth_tag(&key, b"01", b"uname", &mut tag_01);
+        let mut hex_01 = [0u8; 64];
+        hex_encode_bytes(&tag_01, &mut hex_01);
+        let mut auth_01 = alloc::vec::Vec::from(&b"AUTH 01 "[..]);
+        auth_01.extend_from_slice(&hex_01);
+        auth_01.extend_from_slice(b" uname");
+        let mut resp_buf = [0u8; 256];
+        let rn = net.handle_udp_auth(&auth_01[5..], 1, &mut sh, &mut resp_buf);
+        assert!(
+            resp_buf[..rn].starts_with(b"usage:"),
+            "non-canonical leading-zero sequence '01' must be rejected, got: {:?}",
+            core::str::from_utf8(&resp_buf[..rn])
+        );
+
+        // 5. UDP `:8081` Triad hardening:
+        //    - Unprovisioned `TRIAD_STATUS` refused
+        //    - Self-peer `TRIAD_PREPARE` (`leader_id == triad_node_id`) refused
+        //    - Read-only `TRIAD_PREPARE epoch=999 ... SELECT 1` rejected WITHOUT advancing `triad_min_epoch`!
+        let mut unprov_net = LivedNet::new_unprovisioned(MAC);
+        let mut unprov_out = [0u8; 256];
+        let un_len = unprov_net.handle_udp_triad(b"TRIAD_STATUS", &mut sh, &mut unprov_out);
+        assert!(
+            unprov_out[..un_len].starts_with(b"error: EACCES"),
+            "unprovisioned node must refuse TRIAD_STATUS on :8081"
+        );
+
+        sh.triad_node_id = 1;
+        // Self-peer loop (`leader_id = 1` sent to `triad_node_id = 1`)
+        let mut self_mac = [0u8; 32];
+        LivedNet::compute_triad_prepare_tag_with_epoch(
+            &key,
+            b"5",
+            b"1",
+            b"1",
+            b"INSERT INTO kv VALUES ('self', 'x', 1)",
+            &mut self_mac,
+        );
+        let mut self_hex = [0u8; 64];
+        hex_encode_bytes(&self_mac, &mut self_hex);
+        let mut self_prep = alloc::vec::Vec::from(&b"TRIAD_PREPARE epoch=5 1 1 "[..]);
+        self_prep.extend_from_slice(&self_hex);
+        self_prep.extend_from_slice(b" INSERT INTO kv VALUES ('self', 'x', 1)");
+        let self_n = net.handle_udp_triad(&self_prep, &mut sh, &mut resp_buf);
+        assert!(
+            resp_buf[..self_n].starts_with(b"error: EACCES"),
+            "self-peer TRIAD_PREPARE must be rejected"
+        );
+        assert_eq!(net.triad_min_epoch, 0);
+
+        // Read-only SQL with `epoch=999` from valid peer `0` must fail WITHOUT poisoning `triad_min_epoch`!
+        let mut ro_mac = [0u8; 32];
+        LivedNet::compute_triad_prepare_tag_with_epoch(
+            &key,
+            b"999",
+            b"1",
+            b"0",
+            b"SELECT * FROM kv",
+            &mut ro_mac,
+        );
+        let mut ro_hex = [0u8; 64];
+        hex_encode_bytes(&ro_mac, &mut ro_hex);
+        let mut ro_prep = alloc::vec::Vec::from(&b"TRIAD_PREPARE epoch=999 1 0 "[..]);
+        ro_prep.extend_from_slice(&ro_hex);
+        ro_prep.extend_from_slice(b" SELECT * FROM kv");
+        let ro_n = net.handle_udp_triad(&ro_prep, &mut sh, &mut resp_buf);
+        assert!(resp_buf[..ro_n].starts_with(b"error: EINVAL"));
+        assert_eq!(
+            net.triad_min_epoch, 0,
+            "rejected read-only TRIAD_PREPARE must not advance triad_min_epoch"
+        );
+        assert_eq!(sh.triad_min_epoch, 0);
     }
 }

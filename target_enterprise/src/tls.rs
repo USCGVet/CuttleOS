@@ -37,6 +37,16 @@ pub fn hmac_sha256(key: &[u8], data: &[u8], out: &mut [u8; HASH_LEN]) {
     out.copy_from_slice(&mac.finalize().into_bytes());
 }
 
+/// Streaming multi-part HMAC-SHA-256 (RFC 2104) over the concatenation of `parts` under `key`,
+/// without intermediate fixed-size buffer copies or truncation. Writes 32 bytes to `out`.
+pub fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]], out: &mut [u8; HASH_LEN]) {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    for part in parts {
+        mac.update(part);
+    }
+    out.copy_from_slice(&mac.finalize().into_bytes());
+}
+
 /// HKDF-Extract over SHA-256 (RFC 5869 §2.2): PRK = HMAC(salt, IKM). An empty
 /// `salt` means 32 zero bytes, per the RFC.
 pub fn hkdf_extract(salt: &[u8], ikm: &[u8], out: &mut [u8; HASH_LEN]) {
@@ -112,6 +122,20 @@ mod tests {
         let mut out = [0u8; 32];
         hmac_sha256(&[0x0b; 20], b"Hi There", &mut out);
         assert_eq!(out, hex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"));
+    }
+
+    #[test]
+    fn hmac_sha256_parts_rfc4231_test_case_2_streaming() {
+        let mut out = [0u8; 32];
+        hmac_sha256_parts(
+            b"Jefe",
+            &[b"what do ", b"ya want ", b"for ", b"nothing?"],
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            hex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+        );
     }
 
     #[test]

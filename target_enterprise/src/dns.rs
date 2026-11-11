@@ -308,6 +308,9 @@ fn scan_name(bytes: &[u8], start: usize) -> Result<usize, DnsError> {
         }
         let b = bytes[pos];
         if b == 0 {
+            if name_bytes + 1 > MAX_NAME_LEN {
+                return Err(DnsError::NameTooLong);
+            }
             if !following_pointer {
                 return Ok(pos + 1);
             }
@@ -326,10 +329,9 @@ fn scan_name(bytes: &[u8], start: usize) -> Result<usize, DnsError> {
             if !following_pointer {
                 return_after_first_pointer = pos + 2;
             }
-            if new_pos >= pos {
-                // RFC 1035 §4.1.4: pointers MUST be backward (to
-                // earlier in the message). Forward / equal pointers
-                // are malformed and a likely loop attack.
+            if new_pos < DNS_HEADER_LEN || new_pos >= pos {
+                // RFC 1035 §4.1.4: pointers MUST target a prior domain-name
+                // field after the 12-byte fixed DNS header (`DNS_HEADER_LEN <= new_pos < pos`).
                 return Err(DnsError::CompressionLoop);
             }
             following_pointer = true;
@@ -636,5 +638,42 @@ mod tests {
         // Confirm parseable.
         let view = DnsImpl::parse_message(&out[..n]).unwrap();
         assert_eq!(view.header.qdcount, 1);
+    }
+
+    #[test]
+    fn scan_name_rejects_pointer_into_dns_header_and_256_octet_wire_name() {
+        // 1. Compression pointer at offset 12 targeting offset 4 (inside 12-byte DNS header,
+        // where byte 4 is 0x00 of qdcount=0x0001) must be rejected.
+        let mut hdr_ptr = [0u8; 18];
+        write_u16_be(&mut hdr_ptr[4..6], 1); // qdcount = 1 -> bytes[4] == 0x00
+        hdr_ptr[12] = 0xC0;
+        hdr_ptr[13] = 0x04;
+        write_u16_be(&mut hdr_ptr[14..16], DnsRecordType::A as u16);
+        write_u16_be(&mut hdr_ptr[16..18], dns_class::IN);
+        assert!(
+            DnsImpl::parse_message(&hdr_ptr).is_err(),
+            "DNS compression pointer into the 12-byte fixed header must be rejected"
+        );
+
+        // 2. Wire QNAME of 256 octets (3 * 64 + 63 + 1 root = 256 > 255 RFC 1035 max) must fail with NameTooLong.
+        let mut msg = [0u8; 12 + 256 + 4];
+        write_u16_be(&mut msg[4..6], 1); // qdcount = 1
+        let mut pos = 12usize;
+        for _ in 0..3 {
+            msg[pos] = 63;
+            msg[pos + 1..pos + 64].fill(b'a');
+            pos += 64;
+        }
+        msg[pos] = 62;
+        msg[pos + 1..pos + 63].fill(b'b');
+        pos += 63;
+        msg[pos] = 0; // 192 + 63 + 1 = 256 wire octets (> 255)
+        pos += 1;
+        write_u16_be(&mut msg[pos..pos + 2], DnsRecordType::A as u16);
+        write_u16_be(&mut msg[pos + 2..pos + 4], dns_class::IN);
+        assert!(
+            matches!(DnsImpl::parse_message(&msg), Err(DnsError::NameTooLong)),
+            "256-octet wire QNAME including root label must fail with NameTooLong"
+        );
     }
 }

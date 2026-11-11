@@ -230,6 +230,8 @@ impl ArpEntry {
 ///    genuinely wants to replace the binding (e.g. interface flip).
 pub struct ArpCache<const N: usize> {
     slots: [ArpEntry; N],
+    evicted: [ArpEntry; N],
+    evict_cursor: usize,
     poison_window: u64,
 }
 
@@ -238,6 +240,8 @@ impl<const N: usize> ArpCache<N> {
     pub const fn new() -> Self {
         Self {
             slots: [ArpEntry::EMPTY; N],
+            evicted: [ArpEntry::EMPTY; N],
+            evict_cursor: 0,
             poison_window: DEFAULT_POISON_WINDOW_TICKS,
         }
     }
@@ -247,6 +251,8 @@ impl<const N: usize> ArpCache<N> {
     pub const fn with_poison_window(window: u64) -> Self {
         Self {
             slots: [ArpEntry::EMPTY; N],
+            evicted: [ArpEntry::EMPTY; N],
+            evict_cursor: 0,
             poison_window: window,
         }
     }
@@ -303,6 +309,20 @@ impl<const N: usize> ArpCache<N> {
                 return Ok(());
             }
         }
+        // 1b. Anti-flush poison tombstone check: if `ip` was recently LRU-evicted,
+        // reject a conflicting MAC within `poison_window` so cache-flush attacks
+        // cannot bypass anti-poisoning.
+        for i in 0..N {
+            if self.evicted[i].valid && self.evicted[i].ip == ip {
+                if self.evicted[i].mac != mac {
+                    let delta = now_ticks.saturating_sub(self.evicted[i].last_used);
+                    if delta < self.poison_window {
+                        return Err(ArpError::CachePoisonRejected);
+                    }
+                }
+                self.evicted[i] = ArpEntry::EMPTY;
+            }
+        }
         // 2. Free-slot path.
         for i in 0..N {
             if !self.slots[i].valid {
@@ -315,7 +335,10 @@ impl<const N: usize> ArpCache<N> {
                 return Ok(());
             }
         }
-        // 3. LRU eviction path — full cache.
+        if N == 0 {
+            return Ok(());
+        }
+        // 3. LRU eviction path — full cache. Record evicted binding in tombstone ring.
         let mut victim = 0usize;
         let mut victim_lu = self.slots[0].last_used;
         for i in 1..N {
@@ -324,6 +347,9 @@ impl<const N: usize> ArpCache<N> {
                 victim_lu = self.slots[i].last_used;
             }
         }
+        let tomb_slot = self.evict_cursor % N;
+        self.evicted[tomb_slot] = self.slots[victim];
+        self.evict_cursor = self.evict_cursor.wrapping_add(1);
         self.slots[victim] = ArpEntry {
             valid: true,
             ip,
@@ -360,20 +386,26 @@ impl<const N: usize> ArpCache<N> {
     /// freed. Required before re-inserting a different MAC for the
     /// same IP within the poison window.
     pub fn invalidate(&mut self, ip: &[u8; 4]) -> bool {
+        let mut freed = false;
         for i in 0..N {
             if self.slots[i].valid && &self.slots[i].ip == ip {
                 self.slots[i] = ArpEntry::EMPTY;
-                return true;
+                freed = true;
+            }
+            if self.evicted[i].valid && &self.evicted[i].ip == ip {
+                self.evicted[i] = ArpEntry::EMPTY;
             }
         }
-        false
+        freed
     }
 
     /// Drop every entry.
     pub fn clear(&mut self) {
         for i in 0..N {
             self.slots[i] = ArpEntry::EMPTY;
+            self.evicted[i] = ArpEntry::EMPTY;
         }
+        self.evict_cursor = 0;
     }
 }
 
@@ -769,5 +801,34 @@ mod tests {
     fn cache_default_constructor_uses_default_window() {
         let cache: ArpCache<4> = ArpCache::default();
         assert_eq!(cache.poison_window, DEFAULT_POISON_WINDOW_TICKS);
+    }
+
+    #[test]
+    fn cache_poison_defence_defeats_lru_eviction_flush_attack() {
+        let mut cache: ArpCache<3> = ArpCache::with_poison_window(300);
+        let gw_ip = [10, 0, 0, 1];
+        let gw_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let evil_mac = [0x02, 0xDE, 0xAD, 0xBE, 0xEF, 0x99];
+
+        // Legitimate gateway learned at tick 100.
+        cache.insert(gw_ip, gw_mac, 100).unwrap();
+
+        // Attacker floods 3 distinct decoy IPs at ticks 110..112 to LRU-evict `gw_ip`.
+        cache.insert([10, 0, 0, 50], [0x02, 0, 0, 0, 0, 50], 110).unwrap();
+        cache.insert([10, 0, 0, 51], [0x02, 0, 0, 0, 0, 51], 111).unwrap();
+        cache.insert([10, 0, 0, 52], [0x02, 0, 0, 0, 0, 52], 112).unwrap();
+        assert_eq!(cache.peek(&gw_ip), None);
+
+        // Attacker immediately injects a forged MAC for `gw_ip` within the poison window (tick 120 < 100 + 300).
+        assert_eq!(
+            cache.insert(gw_ip, evil_mac, 120),
+            Err(ArpError::CachePoisonRejected),
+            "LRU eviction flush must not bypass ARP anti-poison window"
+        );
+        assert_eq!(cache.peek(&gw_ip), None);
+
+        // Legitimate gateway re-resolving with its original MAC is still accepted immediately!
+        cache.insert(gw_ip, gw_mac, 121).unwrap();
+        assert_eq!(cache.peek(&gw_ip), Some(gw_mac));
     }
 }

@@ -352,6 +352,9 @@ pub fn process_segment(
     if tcb.state == TcpState::Closed {
         return Err(TcpProcessError::ClosedReceived);
     }
+    if seg.src_port == 0 || seg.dst_port == 0 {
+        return Err(TcpProcessError::WrongConnection);
+    }
 
     // Address/port matching — once we're past LISTEN, the TCB is bound.
     if tcb.state != TcpState::Listen {
@@ -376,8 +379,10 @@ pub fn process_segment(
         TcpState::Closed => unreachable!(), // handled above
 
         TcpState::Listen => {
-            // Expect SYN with no ACK.
-            if seg.flags & tcp_flags::SYN == 0 || seg.flags & tcp_flags::ACK != 0 {
+            // Expect pure SYN (no ACK, RST, or FIN).
+            if seg.flags & tcp_flags::SYN == 0
+                || seg.flags & (tcp_flags::ACK | tcp_flags::RST | tcp_flags::FIN) != 0
+            {
                 return Err(TcpProcessError::MalformedFlags);
             }
             // Remember the peer.
@@ -405,8 +410,8 @@ pub fn process_segment(
         }
 
         TcpState::SynReceived => {
-            // Expect ACK of our SYN.
-            if seg.flags & tcp_flags::ACK == 0 {
+            // Expect ACK of our SYN without duplicate/simultaneous SYN.
+            if seg.flags & tcp_flags::ACK == 0 || seg.flags & tcp_flags::SYN != 0 {
                 return Err(TcpProcessError::MalformedFlags);
             }
             if seg.ack != tcb.snd_nxt {
@@ -1233,5 +1238,90 @@ mod tests {
         let (closed_tcb, reply) = process_segment(tcb, &ok_rst, 0).unwrap();
         assert_eq!(closed_tcb.state, TcpState::Closed);
         assert!(!reply.present);
+    }
+
+    #[test]
+    fn listen_and_syn_received_reject_port_zero_syn_rst_syn_fin_and_syn_ack() {
+        let client_ip = [10, 0, 2, 2];
+        let server_ip = [10, 0, 2, 15];
+        let listen = Tcb::listen(server_ip, 80, 65535);
+        let mut buf = [0u8; 40];
+
+        // 1. Port 0 must be rejected as WrongConnection.
+        let n_p0 = TcpImpl::build_segment(
+            0,
+            80,
+            1000,
+            0,
+            tcp_flags::SYN,
+            65535,
+            b"",
+            client_ip,
+            server_ip,
+            &mut buf,
+        )
+        .unwrap();
+        let seg_p0 = TcpImpl::parse_segment(&buf[..n_p0], client_ip, server_ip).unwrap();
+        assert_eq!(
+            process_segment(listen, &seg_p0, 0),
+            Err(TcpProcessError::WrongConnection)
+        );
+
+        // 2. LISTEN must reject SYN|RST and SYN|FIN.
+        for bad_flags in [tcp_flags::SYN | tcp_flags::RST, tcp_flags::SYN | tcp_flags::FIN] {
+            let n = TcpImpl::build_segment(
+                41000,
+                80,
+                1000,
+                0,
+                bad_flags,
+                65535,
+                b"",
+                client_ip,
+                server_ip,
+                &mut buf,
+            )
+            .unwrap();
+            let seg = TcpImpl::parse_segment(&buf[..n], client_ip, server_ip).unwrap();
+            assert_eq!(
+                process_segment(listen, &seg, 0),
+                Err(TcpProcessError::MalformedFlags)
+            );
+        }
+
+        // 3. SynReceived must reject simultaneous/spoofed SYN|ACK.
+        let n_syn = TcpImpl::build_segment(
+            41000,
+            80,
+            1000,
+            0,
+            tcp_flags::SYN,
+            65535,
+            b"",
+            client_ip,
+            server_ip,
+            &mut buf,
+        )
+        .unwrap();
+        let seg_syn = TcpImpl::parse_segment(&buf[..n_syn], client_ip, server_ip).unwrap();
+        let (syn_rcvd, reply) = process_segment(listen, &seg_syn, 0).unwrap();
+        let n_synack = TcpImpl::build_segment(
+            41000,
+            80,
+            1001,
+            reply.seq.wrapping_add(1),
+            tcp_flags::SYN | tcp_flags::ACK,
+            65535,
+            b"",
+            client_ip,
+            server_ip,
+            &mut buf,
+        )
+        .unwrap();
+        let seg_synack = TcpImpl::parse_segment(&buf[..n_synack], client_ip, server_ip).unwrap();
+        assert_eq!(
+            process_segment(syn_rcvd, &seg_synack, 0),
+            Err(TcpProcessError::MalformedFlags)
+        );
     }
 }

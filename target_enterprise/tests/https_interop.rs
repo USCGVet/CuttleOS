@@ -770,3 +770,46 @@ fn record_golden() {
         sha
     );
 }
+
+#[test]
+fn https_multi_segment_response_and_full_vfs_read_succeed_over_tls13() {
+    let mut shell = Box::new(target_enterprise::OsShell::with_seal_key([0x44; 32]));
+    let mut scratch = [0u8; 512];
+    // Write a 1,600-byte file into `/var/report.txt` (exceeds both old 384B `fbuf` truncation and 1,380B `TCP_SEGMENT_PAYLOAD`).
+    shell.exec_line(b"write /var/report.txt header_start", 5, 0, 0, &mut scratch);
+    {
+        use cuttle_contracts::{Filesystem, FS_O_CREATE, FS_O_RDWR, FS_O_TRUNC};
+        let fh = shell
+            .fs
+            .open(b"/var/report.txt", FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC)
+            .unwrap();
+        let big_payload: Vec<u8> = (0..1600)
+            .map(|i| b'A' + ((i % 26) as u8))
+            .collect();
+        assert_eq!(shell.fs.write(fh, 0, &big_payload).unwrap(), 1600);
+        shell.fs.close(fh).unwrap();
+    }
+
+    let (mut lb, identity) = live_server(Some(shell), 50044);
+    let mut client = ring_client(identity.cert_der(), "localhost");
+    let mut wire = Wire::new();
+    wire.pump(&mut client, &mut lb).unwrap();
+
+    let resp = get(
+        &mut client,
+        &mut lb,
+        &mut wire,
+        b"GET /fs/var/report.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        resp.starts_with("HTTP/1.1 200 OK\r\n"),
+        "HTTPS :443 GET /fs/var/report.txt (1600B) must return 200 OK; got len={}: {resp:?}",
+        resp.len()
+    );
+    let (_, body) = resp.split_once("\r\n\r\n").expect("HTTP header delimiter");
+    assert_eq!(
+        body.len(),
+        1600,
+        "HTTPS :443 VFS read must return all 1,600 bytes without 384B truncation or 1380B drop"
+    );
+}
