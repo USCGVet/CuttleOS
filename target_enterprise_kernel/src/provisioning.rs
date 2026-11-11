@@ -20,8 +20,20 @@ pub(crate) use crate::*;
 /// QEMU `fw_cfg` selector path carrying the 32-byte CSPRNG device master key.
 pub(crate) const FW_CFG_DEVICE_KEY_PATH: &str = "opt/cuttle_device_key";
 
-/// Cached `(master_key, is_fw_cfg_provisioned)` resolved once on first use during boot.
+/// Cached `(master_key, is_fw_cfg_provisioned)` resolved once on first use during boot
+/// and scrubbed from `.bss` via [`scrub_cached_master_key`] before entering the live network loop.
 static PROVISIONED_MASTER_KEY: spin::Mutex<Option<([u8; 32], bool)>> = spin::Mutex::new(None);
+
+/// Domain-separated runtime subkeys derived from the master key during boot so durable AHCI
+/// persistence and remote attestation continue working after the root master key is zeroized.
+#[derive(Clone, Copy)]
+struct DerivedRuntimeSubkeys {
+    seal_key: [u8; 32],
+    legacy_seal_key: [u8; 32],
+    attest_key: [u8; 32],
+}
+
+static CACHED_SUBKEYS: spin::Mutex<Option<DerivedRuntimeSubkeys>> = spin::Mutex::new(None);
 
 /// Attempt to read a 32-byte out-of-band device secret key from QEMU `fw_cfg`
 /// (`opt/cuttle_device_key`), distinguishing an absent entry from a malformed
@@ -259,7 +271,50 @@ fn device_master_key_state() -> ([u8; 32], bool) {
         }
     };
     *guard = Some(state);
+    drop(guard);
+    ensure_derived_subkeys(&state.0);
     state
+}
+
+fn ensure_derived_subkeys(master: &[u8; 32]) {
+    let mut sub = CACHED_SUBKEYS.lock();
+    if sub.is_none() {
+        *sub = Some(DerivedRuntimeSubkeys {
+            seal_key: target_enterprise::durable_seal::derive_seal_key(
+                master,
+                b"cuttle-ahci-wal-seal-v1",
+            ),
+            legacy_seal_key: target_enterprise::durable_seal::derive_legacy_seal_key(
+                master,
+                b"proteus-ahci-wal-seal-v1",
+            ),
+            attest_key: target_enterprise::durable_seal::derive_attest_key(
+                master,
+                b"cuttle-quote-v1",
+            ),
+        });
+    }
+}
+
+/// Volatile-zeroize and clear the root `PROVISIONED_MASTER_KEY` in `.bss` once boot-time
+/// network and TLS identity keys have been derived, while retaining only domain-separated
+/// durable seal and attestation subkeys in `CACHED_SUBKEYS`.
+pub(crate) fn scrub_cached_master_key() {
+    let existing = {
+        let guard = PROVISIONED_MASTER_KEY.lock();
+        *guard
+    };
+    if let Some((mut master, _)) = existing {
+        ensure_derived_subkeys(&master);
+        target_enterprise::durable_seal::zeroize_secret_bytes(&mut master);
+    }
+    let mut guard = PROVISIONED_MASTER_KEY.lock();
+    if let Some((ref mut master, ref mut prov)) = *guard {
+        target_enterprise::durable_seal::zeroize_secret_bytes(master);
+        *prov = false;
+    }
+    *guard = None;
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 /// Derive the 256-bit `HMAC-SHA256` network control-plane key for `mac` from
@@ -340,6 +395,9 @@ pub(crate) fn tls_rng_seed(mac: [u8; 6], boot_count: u64) -> Option<([u8; 32], &
 /// out-of-band provisioned device master key (or the boot-ephemeral hardware
 /// key on unprovisioned boots).
 pub(crate) fn derive_runtime_seal_key() -> [u8; 32] {
+    if let Some(sub) = *CACHED_SUBKEYS.lock() {
+        return sub.seal_key;
+    }
     let (mut master, _) = device_master_key_state();
     let out = target_enterprise::durable_seal::derive_seal_key(&master, b"cuttle-ahci-wal-seal-v1");
     target_enterprise::durable_seal::zeroize_secret_bytes(&mut master);
@@ -350,6 +408,9 @@ pub(crate) fn derive_runtime_seal_key() -> [u8; 32] {
 /// seal key (`proteus-durable-seal-v1:proteus-ahci-wal-seal-v1`) from the device
 /// master key so pre-rebrand `PRTS*` disks can be verified and migrated to `CTTL*`.
 pub(crate) fn derive_runtime_legacy_seal_key() -> [u8; 32] {
+    if let Some(sub) = *CACHED_SUBKEYS.lock() {
+        return sub.legacy_seal_key;
+    }
     let (mut master, _) = device_master_key_state();
     let out = target_enterprise::durable_seal::derive_legacy_seal_key(
         &master,
@@ -362,6 +423,9 @@ pub(crate) fn derive_runtime_legacy_seal_key() -> [u8; 32] {
 /// Derive the 256-bit `HMAC-SHA256` remote attestation quote key from the
 /// out-of-band provisioned device master key (or boot-ephemeral hardware key).
 pub(crate) fn derive_runtime_attest_key() -> [u8; 32] {
+    if let Some(sub) = *CACHED_SUBKEYS.lock() {
+        return sub.attest_key;
+    }
     let (mut master, _) = device_master_key_state();
     let out = target_enterprise::durable_seal::derive_attest_key(&master, b"cuttle-quote-v1");
     target_enterprise::durable_seal::zeroize_secret_bytes(&mut master);

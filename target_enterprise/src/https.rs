@@ -363,7 +363,17 @@ impl TlsSession {
         &mut self.plaintext
     }
 
-    /// Ciphertext waiting to be transmitted.
+    /// Zeroize decrypted plaintext (including spare capacity) and clear the buffer.
+    pub fn clear_plaintext_and_scrub(&mut self) {
+        scrub_vec_all_bytes(&mut self.plaintext);
+    }
+
+    /// Unparsed inbound TLS record bytes currently buffered in `self.rx`.
+    pub fn rx_len(&self) -> usize {
+        self.rx.len()
+    }
+
+    /// Ciphertext waiting to be transmitted across the wire.
     pub fn pending_tx(&self) -> &[u8] {
         &self.tx
     }
@@ -492,7 +502,7 @@ impl TlsSession {
             }
             self.rx.drain(..discard.min(self.rx.len()));
             if plaintext_overflow {
-                self.plaintext.clear();
+                self.clear_plaintext_and_scrub();
                 return Err(SessionError::Overflow);
             }
             if overflow {
@@ -533,6 +543,32 @@ impl TlsSession {
             }
         }
     }
+}
+
+impl Drop for TlsSession {
+    fn drop(&mut self) {
+        scrub_vec_all_bytes(&mut self.plaintext);
+        scrub_vec_all_bytes(&mut self.rx);
+        scrub_vec_all_bytes(&mut self.tx);
+    }
+}
+
+/// Overwrite all `0..v.capacity()` bytes in `v` with volatile zeros before clearing `len`,
+/// preventing residual decrypted HTTP credentials, cookies, or TLS traffic from lingering in spare heap capacity.
+pub(crate) fn scrub_vec_all_bytes(v: &mut Vec<u8>) {
+    let cap = v.capacity();
+    if cap > 0 {
+        let ptr = v.as_mut_ptr();
+        let mut i = 0usize;
+        while i < cap {
+            // SAFETY: `ptr` owns `cap` bytes of heap storage; `write_volatile` writes `0u8` directly
+            // without ever forming a `&mut [u8]` over uninitialized spare capacity.
+            unsafe { core::ptr::write_volatile(ptr.add(i), 0) };
+            i += 1;
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+    v.clear();
 }
 
 /// Run `encrypt` against the tail of `tx`, growing it until the record fits.
@@ -923,5 +959,34 @@ mod tests {
         let oversized = alloc::vec![0u8; 0x1_0000];
         let mut out = Vec::new();
         der(0x04, &oversized, &mut out);
+    }
+
+    #[test]
+    fn tls_session_scrubs_plaintext_spare_capacity_on_clear() {
+        let _guard = crate::tls_provider::GOLDEN_LOCK.lock();
+        crate::tls_provider::reset_golden_rng([5u8; 32]);
+        let id = ServerIdentity::derive(&[3u8; 32], [0; 6]);
+        let config = server_config(&id, crate::tls_provider::golden_provider()).unwrap();
+        let mut session = TlsSession::new(config).unwrap();
+
+        let secret_req = b"POST /vault HTTP/1.1\r\nX-Session-Token: secret-session-hex\r\n\r\ntop_secret_value";
+        session.plaintext().reserve(128);
+        session.plaintext().extend_from_slice(secret_req);
+        let init_len = secret_req.len();
+        assert!(session.plaintext().capacity() >= init_len);
+
+        session.clear_plaintext_and_scrub();
+        assert_eq!(session.plaintext().len(), 0);
+        assert!(
+            session.plaintext().capacity() >= init_len,
+            "capacity remains allocated so we can inspect spare bytes"
+        );
+        // SAFETY: `0..init_len` was initialized by `extend_from_slice(secret_req)` and the backing
+        // allocation is still owned by `session.plaintext` with `capacity() >= init_len`.
+        let spare = unsafe { core::slice::from_raw_parts(session.plaintext().as_ptr(), init_len) };
+        assert!(
+            spare.iter().all(|&b| b == 0),
+            "clear_plaintext_and_scrub must zeroize residual plaintext in spare capacity"
+        );
     }
 }

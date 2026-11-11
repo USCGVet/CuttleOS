@@ -207,8 +207,42 @@ pub const CAP_TABLE_TASKS: usize = 32;
 /// downstream tests can confirm the seed is permissive.
 pub const PERMISSIVE_CAP_TABLE: [u64; CAP_TABLE_TASKS] = [u64::MAX; CAP_TABLE_TASKS];
 
+/// Live per-task capability table consulted by [`CapTableImpl::check_raw`].
+/// Defaults to [`PERMISSIVE_CAP_TABLE`] at boot and may be tightened per task via [`set_task_cap_mask`].
+static RUNTIME_CAP_TABLE: [AtomicU64; CAP_TABLE_TASKS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ALL_CAPS: AtomicU64 = AtomicU64::new(u64::MAX);
+    [ALL_CAPS; CAP_TABLE_TASKS]
+};
+
+/// Assign the runtime capability mask for `task_id` (`0..CAP_TABLE_TASKS`).
+pub fn set_task_cap_mask(task_id: u64, mask: u64) -> Result<(), Errno> {
+    if (task_id as usize) >= CAP_TABLE_TASKS {
+        return Err(Errno::EPERM);
+    }
+    RUNTIME_CAP_TABLE[task_id as usize].store(mask, Ordering::Release);
+    Ok(())
+}
+
+/// Read the runtime capability mask for `task_id` (`0..CAP_TABLE_TASKS`).
+pub fn get_task_cap_mask(task_id: u64) -> Result<u64, Errno> {
+    if (task_id as usize) >= CAP_TABLE_TASKS {
+        return Err(Errno::EPERM);
+    }
+    Ok(RUNTIME_CAP_TABLE[task_id as usize].load(Ordering::Acquire))
+}
+
+/// Reset all per-task capability masks back to [`PERMISSIVE_CAP_TABLE`].
+pub fn reset_task_cap_masks() {
+    let mut i = 0usize;
+    while i < CAP_TABLE_TASKS {
+        RUNTIME_CAP_TABLE[i].store(PERMISSIVE_CAP_TABLE[i], Ordering::Release);
+        i += 1;
+    }
+}
+
 /// Concrete [`cuttle_contracts::SyscallCapTable`] impl backed by the
-/// permissive seed table. Overrides `check_raw`; the trait's provided
+/// live per-task capability table. Overrides `check_raw`; the trait's provided
 /// `check` is the sole site that mints a [`cuttle_contracts::CapProof`].
 pub struct CapTableImpl;
 
@@ -222,12 +256,14 @@ impl cuttle_contracts::SyscallCapTable for CapTableImpl {
         syscall_nr: u32,
     ) -> Result<(), cuttle_contracts::CapError> {
         if (task_id as usize) >= CAP_TABLE_TASKS {
+            DENIED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return Err(cuttle_contracts::CapError::EPERM);
         }
         if (syscall_nr as u64) >= SYS_MAX {
             return Err(cuttle_contracts::CapError::ENOSYS);
         }
-        let task_mask = PERMISSIVE_CAP_TABLE[task_id as usize];
+        let task_mask = RUNTIME_CAP_TABLE[task_id as usize].load(Ordering::Acquire)
+            & PERMISSIVE_CAP_TABLE[task_id as usize];
         let effective = task_mask & cap;
         let required = SYSCALL_REQUIRED_CAPS[syscall_nr as usize];
         if (effective & required) == required {
@@ -239,8 +275,8 @@ impl cuttle_contracts::SyscallCapTable for CapTableImpl {
     }
 }
 
-/// Top-level dispatcher. Calls [`check_cap`] to obtain a
-/// [`cuttle_contracts::CapProof`], then hands it to [`dispatch_inner`]
+/// Top-level dispatcher. Calls [`check_task_cap`] to obtain a
+/// [`cuttle_contracts::CapProof`] scoped to `task_id`, then hands it to [`dispatch_inner`]
 /// by value. The compiler enforces that no caller can reach the
 /// privileged region without a fresh proof.
 pub fn dispatch_syscall(
@@ -254,13 +290,29 @@ pub fn dispatch_syscall(
     a4: u64,
     a5: u64,
 ) -> Result<u64, Errno> {
-    // Mint a proof on a successful capability check. The proof is the
+    // Mint a proof on a successful per-task capability check. The proof is the
     // type-state witness that the rest of the dispatch is allowed to
     // run; the compiler refuses to compile a `dispatch_inner` call
     // without one.
-    let proof = check_cap(nr, cap_mask)?;
-    let _ = task_id;
+    let proof = check_task_cap(task_id, nr, cap_mask)?;
     dispatch_inner(nr, a0, a1, a2, a3, a4, a5, proof)
+}
+
+/// Per-task capability check: return a freshly-minted [`cuttle_contracts::CapProof`]
+/// iff `task_id` is within `0..CAP_TABLE_TASKS` and `(RUNTIME_CAP_TABLE[task_id] & cap_mask)`
+/// includes every bit required by syscall `nr`.
+pub fn check_task_cap(
+    task_id: u64,
+    nr: u64,
+    cap_mask: u64,
+) -> Result<cuttle_contracts::CapProof, Errno> {
+    use cuttle_contracts::{CapError, SyscallCapTable};
+    let table = CapTableImpl;
+    match table.check(task_id, cap_mask, nr as u32) {
+        Ok(proof) => Ok(proof),
+        Err(CapError::ENOSYS) => Err(Errno::ENOSYS),
+        Err(CapError::EPERM) => Err(Errno::EPERM),
+    }
 }
 
 /// Capability check: return a freshly-minted
@@ -275,13 +327,7 @@ pub fn dispatch_syscall(
 /// verifier's old AST walker is therefore obsolete; the compiler
 /// itself enforces the type-state.
 pub fn check_cap(nr: u64, cap_mask: u64) -> Result<cuttle_contracts::CapProof, Errno> {
-    use cuttle_contracts::{CapError, SyscallCapTable};
-    let table = CapTableImpl;
-    match table.check(0, cap_mask, nr as u32) {
-        Ok(proof) => Ok(proof),
-        Err(CapError::ENOSYS) => Err(Errno::ENOSYS),
-        Err(CapError::EPERM) => Err(Errno::EPERM),
-    }
+    check_task_cap(0, nr, cap_mask)
 }
 
 // ---------- output sink ----------
@@ -499,7 +545,7 @@ pub fn dispatch_dma<const D: usize, const V: usize, const E: usize>(
     if nr != SYS_DMA_MAP && nr != SYS_DMA_UNMAP {
         return Err(Errno::ENOSYS);
     }
-    let proof = check_cap(nr, cap_mask)?;
+    let proof = check_task_cap(current_task.id as u64, nr, cap_mask)?;
     match nr {
         SYS_DMA_MAP => sys_dma_map(iommu, current_task, a0, a1, a2, proof),
         SYS_DMA_UNMAP => sys_dma_unmap(iommu, current_task, a0, proof),
@@ -1158,6 +1204,64 @@ mod tests {
         assert_eq!(
             SYSCALL_REQUIRED_CAPS[SYS_DMA_UNMAP as usize],
             cuttle_contracts::caps::NET_RAW
+        );
+    }
+
+    #[test]
+    fn per_task_cap_mask_restricts_dispatch_syscall_and_dma() {
+        struct ResetGuard(u64);
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                let _ = set_task_cap_mask(self.0, u64::MAX);
+            }
+        }
+        let tid: u64 = 29;
+        let _guard = ResetGuard(tid);
+
+        // Out-of-bounds task_id (>= CAP_TABLE_TASKS) must fail closed with EPERM even on SYS_GETPID.
+        assert_eq!(
+            dispatch_syscall(CAP_TABLE_TASKS as u64, u64::MAX, SYS_GETPID, 0, 0, 0, 0, 0, 0),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(set_task_cap_mask(CAP_TABLE_TASKS as u64, 0), Err(Errno::EPERM));
+
+        // Restricting task 29's runtime cap table entry to 0 must deny SYS_OPEN (requires FS_BYPASS)
+        // and SYS_DMA_MAP (requires NET_RAW) even if the caller passes `cap_mask = u64::MAX`!
+        set_task_cap_mask(tid, 0).expect("set_task_cap_mask(29, 0)");
+        assert_eq!(get_task_cap_mask(tid), Ok(0));
+        assert_eq!(
+            dispatch_syscall(tid, u64::MAX, SYS_OPEN, 0x1000, 4, 0, 0, 0, 0),
+            Err(Errno::EPERM),
+            "per-task cap table mask=0 must override caller cap_mask=u64::MAX"
+        );
+        // Unprivileged syscalls (SYS_GETPID requires 0) still succeed for task 29:
+        assert_eq!(
+            dispatch_syscall(tid, u64::MAX, SYS_GETPID, 0, 0, 0, 0, 0, 0),
+            Ok(1)
+        );
+
+        let mut iommu: IommuImpl<4, 8, 16> = IommuImpl::new();
+        let domain = iommu.create_domain().expect("create_domain");
+        let device = DeviceId::from_bdf(0, 0, 2, 0);
+        iommu.bind_device(device, domain).expect("bind_device");
+        let task29 = Task::new_ready_with_domain(tid as TaskId, 1, domain);
+        assert_eq!(
+            dispatch_dma(&mut iommu, &task29, u64::MAX, SYS_DMA_MAP, 0x4000, 0xC000_0000, 0b11),
+            Err(Errno::EPERM),
+            "dispatch_dma must consult task29's per-task cap table entry"
+        );
+
+        // Granting FS_BYPASS + NET_RAW in task 29's cap table restores access:
+        let granted = cuttle_contracts::caps::FS_BYPASS | cuttle_contracts::caps::NET_RAW;
+        set_task_cap_mask(tid, granted).unwrap();
+        assert_eq!(
+            dispatch_syscall(tid, u64::MAX, SYS_OPEN, 0x1000, 4, 0, 0, 0, 0),
+            Err(Errno::ENOENT),
+            "with FS_BYPASS in task cap table, SYS_OPEN reaches sys_open -> ENOENT"
+        );
+        assert_eq!(
+            dispatch_dma(&mut iommu, &task29, u64::MAX, SYS_DMA_MAP, 0x4000, 0xC000_0000, 0b11),
+            Ok(0)
         );
     }
 }

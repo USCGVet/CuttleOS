@@ -392,9 +392,9 @@ impl LivedNet {
 
     fn release_slot_buffers(&mut self, idx: usize) {
         self.http_input_closed[idx] = false;
-        self.http_bufs[idx].clear();
+        crate::https::scrub_vec_all_bytes(&mut self.http_bufs[idx]);
         self.http_bufs[idx].shrink_to_fit();
-        self.http_tx[idx].clear();
+        crate::https::scrub_vec_all_bytes(&mut self.http_tx[idx]);
         self.http_tx[idx].shrink_to_fit();
         self.slot_tls_buffered[idx] = 0;
         self.tls[idx] = None;
@@ -1561,8 +1561,8 @@ impl LivedNet {
                     .peer_buffered_bytes(self.tcbs[idx].remote_ip)
                     .saturating_sub(self.slot_tls_buffered[idx]);
                 let projected_slot = session
-                    .plaintext()
-                    .len()
+                    .rx_len()
+                    .saturating_add(session.plaintext().len())
                     .saturating_add(session.pending_tx().len())
                     .saturating_add(inbound.len());
                 if other_peer_buffered.saturating_add(projected_slot) > MAX_PEER_BUFFERED_BYTES
@@ -1607,7 +1607,7 @@ impl LivedNet {
             let mut framing_exhausted = false;
             if overflow_413 || busy_503 {
                 self.http_input_closed[idx] = true;
-                session.plaintext().clear();
+                session.clear_plaintext_and_scrub();
                 session.plaintext().shrink_to_fit();
                 let mut response = [0u8; TCP_SEGMENT_PAYLOAD];
                 let n = if overflow_413 {
@@ -1651,25 +1651,31 @@ impl LivedNet {
                         close_after = true;
                         build_http_not_implemented_response(&mut response)
                     }
-                    HttpFrameOutcome::Complete(request) => {
+                    HttpFrameOutcome::Complete(mut request) => {
                         close_after = http_wants_close(&request);
-                        self.handle_http_request(
+                        let written = self.handle_http_request(
                             &request,
                             boots,
                             shell.as_deref_mut(),
                             &mut response,
-                        )
+                        );
+                        crate::https::scrub_vec_all_bytes(&mut request);
+                        written
                     }
                 };
                 if n > 0 && session.send(&response[..n]).is_err() {
+                    crate::durable_seal::zeroize_secret_bytes(&mut response[..n]);
                     break;
+                }
+                if n > 0 {
+                    crate::durable_seal::zeroize_secret_bytes(&mut response[..n]);
                 }
                 responses += 1;
                 // `Connection: close`, malformed, or oversized request: end
                 // the TLS session after this response and discard trailing input.
                 if close_after {
                     self.http_input_closed[idx] = true;
-                    session.plaintext().clear();
+                    session.clear_plaintext_and_scrub();
                     session.plaintext().shrink_to_fit();
                     session.close();
                     framing_exhausted = true;
@@ -1687,14 +1693,15 @@ impl LivedNet {
                 session.close();
             }
             if session.plaintext().is_empty() && session.plaintext().capacity() > 4096 {
+                session.clear_plaintext_and_scrub();
                 session.plaintext().shrink_to_fit();
             }
             if session.pending_tx().len() > self.peak_tls_pending_tx {
                 self.peak_tls_pending_tx = session.pending_tx().len();
             }
             self.slot_tls_buffered[idx] = session
-                .plaintext()
-                .len()
+                .rx_len()
+                .saturating_add(session.plaintext().len())
                 .saturating_add(session.pending_tx().len());
             self.tls[idx] = Some(session);
         }
@@ -1784,8 +1791,8 @@ impl LivedNet {
             if let Some(session) = self.tls[idx].as_mut() {
                 session.consume_tx(n);
                 self.slot_tls_buffered[idx] = session
-                    .plaintext()
-                    .len()
+                    .rx_len()
+                    .saturating_add(session.plaintext().len())
                     .saturating_add(session.pending_tx().len());
             }
             sent = true;
@@ -6671,5 +6678,33 @@ mod tests {
         assert_eq!(net.triad_min_epoch, 3);
         assert_eq!(sh.triad_min_epoch, 3);
         assert_eq!(sh.triad_tx_seq, 2);
+    }
+
+    #[test]
+    fn https_slot_buffered_accounting_includes_unparsed_tls_rx_bytes() {
+        let _guard = crate::tls_provider::GOLDEN_LOCK.lock();
+        let net = crate::https::golden_server().expect("golden_server");
+        let mut client =
+            crate::https::LoopbackClient::connect(net, None, 54019, 1).expect("connect :443");
+
+        // Send a TLS 1.2/1.3 handshake record header claiming 8192 bytes (0x2000), followed by
+        // only 4100 bytes of incomplete record payload so rustls retains all 4105 bytes in `TlsSession.rx`.
+        let mut partial_record = alloc::vec![0x16, 0x03, 0x03, 0x20, 0x00];
+        partial_record.extend_from_slice(&[0x41u8; 4100]);
+        let _ = client.send(&partial_record).expect("send partial TLS record");
+
+        assert!(
+            client.net().total_buffered_bytes() >= partial_record.len(),
+            "total_buffered_bytes ({}) must account for {} unparsed TLS rx bytes",
+            client.net().total_buffered_bytes(),
+            partial_record.len()
+        );
+        assert!(
+            client
+                .net()
+                .peer_buffered_bytes(crate::https::LOOPBACK_PEER_IP)
+                >= partial_record.len(),
+            "peer_buffered_bytes must account for unparsed TLS rx bytes"
+        );
     }
 }

@@ -580,6 +580,181 @@ pub mod x86_pml4 {
         }
         max
     }
+
+    /// Extract PML4 index (bits `39..48`) from a 64-bit virtual address.
+    #[inline]
+    pub const fn pml4_index(va: u64) -> usize {
+        ((va >> 39) & 0x1FF) as usize
+    }
+
+    /// Extract PDPT index (bits `30..39`) from a 64-bit virtual address.
+    #[inline]
+    pub const fn pdpt_index(va: u64) -> usize {
+        ((va >> 30) & 0x1FF) as usize
+    }
+
+    /// Extract PD index (bits `21..30`) from a 64-bit virtual address.
+    #[inline]
+    pub const fn pd_index(va: u64) -> usize {
+        ((va >> 21) & 0x1FF) as usize
+    }
+
+    /// Extract PT index (bits `12..21`) from a 64-bit virtual address.
+    #[inline]
+    pub const fn pt_index(va: u64) -> usize {
+        ((va >> 12) & 0x1FF) as usize
+    }
+
+    /// Errors returned when materializing or validating an isolated 4-level user CR3 hierarchy.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum IsolatedUserLayoutError {
+        /// `user_va` is in the higher half (`>= 0x0000_8000_0000_0000`), slot `0`, or leaves fewer than 6 contiguous PT slots.
+        InvalidUserVa,
+        /// One of the physical backing frames is zero or not 4 KiB aligned.
+        MisalignedFrame,
+        /// A leaf PTE violates strict `W^X` (`PTE_WRITABLE` set without `PTE_NX`).
+        WritableAndExecutable {
+            /// Leaf PT index (`0..512`) where the `W^X` violation occurred.
+            pt_slot: usize,
+            /// Offending raw 64-bit PTE value.
+            pte: u64,
+        },
+    }
+
+    /// Physical frame specification for a hardware `CR3`-isolated 4-level Ring-3 service sandbox.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct IsolatedUserSandboxSpec {
+        /// Canonical lower-half virtual base address of the sandbox (`PT[base+0..base+5]`).
+        pub user_va: u64,
+        /// Physical address of the dedicated 4 KiB PDPT frame.
+        pub pdpt_phys: u64,
+        /// Physical address of the dedicated 4 KiB PD frame.
+        pub pd_phys: u64,
+        /// Physical address of the dedicated 4 KiB PT frame.
+        pub pt_phys: u64,
+        /// Physical address of `PT[base+0]`: Ring-3 code page (`PTE_PRESENT | PTE_USER`, RX only).
+        pub user_code_phys: u64,
+        /// Physical address of `PT[base+2]`: Ring-3 stack + IPC mailbox page (`PTE_PRESENT | PTE_WRITABLE | PTE_USER | PTE_NO_EXEC`, RW+NX).
+        /// Note: `PT[base+1]` is intentionally left `0` as an unmapped 4 KiB stack guard page.
+        pub user_data_phys: u64,
+        /// Physical address of `PT[base+3]`: Ring-0 entry/exit trampoline page (`PTE_PRESENT`, Supervisor RX only).
+        pub tramp_phys: u64,
+        /// Physical address of `PT[base+4]`: Ring-0 GDT/TSS/state/`RSP0`/`IST1` page (`PTE_PRESENT | PTE_WRITABLE | PTE_NO_EXEC`, Supervisor RW+NX).
+        pub gdt_phys: u64,
+        /// Physical address of `PT[base+5]`: Ring-0 256-entry IDT page (`PTE_PRESENT | PTE_NO_EXEC`, Supervisor RO+NX).
+        pub idt_phys: u64,
+    }
+
+    /// Materialize a complete 4-level (`PML4 -> PDPT -> PD -> PT`) isolated user `CR3` hierarchy
+    /// enforcing strict `W^X`, an unmapped stack guard page (`PT[base+1] == 0`), and zero higher-half
+    /// kernel PML4 mappings (`PML4[256..512] == 0`).
+    pub fn serialize_isolated_user_4level(
+        spec: &IsolatedUserSandboxSpec,
+        extra_pt_entry: Option<(usize, u64)>,
+        pml4_out: &mut [u8; PML4_BYTES],
+        pdpt_out: &mut [u8; PML4_BYTES],
+        pd_out: &mut [u8; PML4_BYTES],
+        pt_out: &mut [u8; PML4_BYTES],
+    ) -> Result<usize, IsolatedUserLayoutError> {
+        use super::{PTE_NX, PTE_PRESENT, PTE_USER, PTE_WRITABLE};
+
+        let pml4_slot = pml4_index(spec.user_va);
+        let pdpt_slot = pdpt_index(spec.user_va);
+        let pd_slot = pd_index(spec.user_va);
+        let pt_base = pt_index(spec.user_va);
+
+        // Must be canonical lower-half, 4 KiB aligned, non-zero PML4 slot (< 256), with 6 contiguous PT slots.
+        if (spec.user_va >> 47) != 0
+            || (spec.user_va & (PAGE_SIZE - 1)) != 0
+            || pml4_slot == 0
+            || pml4_slot >= 256
+            || pt_base + 6 > 512
+        {
+            return Err(IsolatedUserLayoutError::InvalidUserVa);
+        }
+
+        let frames = [
+            spec.pdpt_phys,
+            spec.pd_phys,
+            spec.pt_phys,
+            spec.user_code_phys,
+            spec.user_data_phys,
+            spec.tramp_phys,
+            spec.gdt_phys,
+            spec.idt_phys,
+        ];
+        for &phys in &frames {
+            if phys == 0 || (phys & 0x000F_FFFF_FFFF_F000) != phys {
+                return Err(IsolatedUserLayoutError::MisalignedFrame);
+            }
+        }
+
+        let check_wx = |pt_slot: usize, pte: u64| -> Result<(), IsolatedUserLayoutError> {
+            if (pte & PTE_PRESENT) != 0 && (pte & PTE_WRITABLE) != 0 && (pte & PTE_NX) == 0 {
+                return Err(IsolatedUserLayoutError::WritableAndExecutable { pt_slot, pte });
+            }
+            Ok(())
+        };
+
+        let leaf_ptes: [(usize, u64); 6] = [
+            (pt_base, spec.user_code_phys | PTE_PRESENT | PTE_USER),
+            (pt_base + 1, 0),
+            (
+                pt_base + 2,
+                spec.user_data_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER | PTE_NX,
+            ),
+            (pt_base + 3, spec.tramp_phys | PTE_PRESENT),
+            (
+                pt_base + 4,
+                spec.gdt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_NX,
+            ),
+            (pt_base + 5, spec.idt_phys | PTE_PRESENT | PTE_NX),
+        ];
+
+        for &(slot, pte) in &leaf_ptes {
+            check_wx(slot, pte)?;
+        }
+        if let Some((extra_slot, extra_pte)) = extra_pt_entry {
+            if extra_slot >= 512 {
+                return Err(IsolatedUserLayoutError::InvalidUserVa);
+            }
+            check_wx(extra_slot, extra_pte)?;
+        }
+
+        pml4_out.fill(0);
+        pdpt_out.fill(0);
+        pd_out.fill(0);
+        pt_out.fill(0);
+
+        let write_entry = |buf: &mut [u8; PML4_BYTES], idx: usize, pte: u64| {
+            let off = idx * 8;
+            buf[off..off + 8].copy_from_slice(&pte.to_le_bytes());
+        };
+
+        write_entry(
+            pml4_out,
+            pml4_slot,
+            spec.pdpt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER,
+        );
+        write_entry(
+            pdpt_out,
+            pdpt_slot,
+            spec.pd_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER,
+        );
+        write_entry(
+            pd_out,
+            pd_slot,
+            spec.pt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER,
+        );
+        for &(slot, pte) in &leaf_ptes {
+            write_entry(pt_out, slot, pte);
+        }
+        if let Some((extra_slot, extra_pte)) = extra_pt_entry {
+            write_entry(pt_out, extra_slot, extra_pte);
+        }
+
+        Ok(pml4_slot)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -962,5 +1137,91 @@ mod tests {
         let mut buf = [0u8; x86_pml4::PML4_BYTES];
         let n = x86_pml4::serialize_into(&t, &mut buf);
         assert_eq!(n, 512, "PML4 must serialize at most 512 entries");
+    }
+
+    #[test]
+    fn x86_pml4_isolated_4level_enforces_wx_and_excludes_kernel_slots() {
+        let spec = x86_pml4::IsolatedUserSandboxSpec {
+            user_va: 64u64 << 39,
+            pdpt_phys: 0x0022_5000,
+            pd_phys: 0x0022_6000,
+            pt_phys: 0x0022_7000,
+            user_code_phys: 0x0022_8000,
+            user_data_phys: 0x0022_9000,
+            tramp_phys: 0x0022_A000,
+            gdt_phys: 0x0022_C000,
+            idt_phys: 0x0022_B000,
+        };
+        let mut pml4 = [0xFFu8; x86_pml4::PML4_BYTES];
+        let mut pdpt = [0xFFu8; x86_pml4::PML4_BYTES];
+        let mut pd = [0xFFu8; x86_pml4::PML4_BYTES];
+        let mut pt = [0xFFu8; x86_pml4::PML4_BYTES];
+
+        let slot = x86_pml4::serialize_isolated_user_4level(
+            &spec, None, &mut pml4, &mut pdpt, &mut pd, &mut pt,
+        )
+        .expect("valid isolated user sandbox must serialize");
+        assert_eq!(slot, 64);
+
+        let read_entry = |table: &[u8; x86_pml4::PML4_BYTES], idx: usize| -> u64 {
+            let o = idx * 8;
+            u64::from_le_bytes(table[o..o + 8].try_into().unwrap())
+        };
+
+        // Only PML4[64] may be populated; all 256 higher-half kernel PML4 slots (256..512) must be zero!
+        for i in 0..512 {
+            let e = read_entry(&pml4, i);
+            if i == 64 {
+                assert_eq!(e, spec.pdpt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+            } else {
+                assert_eq!(e, 0, "PML4[{i}] must be unmapped in isolated user CR3");
+            }
+        }
+        assert_eq!(read_entry(&pdpt, 0), spec.pd_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+        assert_eq!(read_entry(&pd, 0), spec.pt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+
+        // Leaf PT[0..6] W^X and guard page invariants:
+        // PT[0]: User RX (PTE_PRESENT | PTE_USER; NOT writable, NOT NX)
+        assert_eq!(read_entry(&pt, 0), spec.user_code_phys | PTE_PRESENT | PTE_USER);
+        // PT[1]: Unmapped 4 KiB stack guard page
+        assert_eq!(read_entry(&pt, 1), 0);
+        // PT[2]: User RW+NX (PTE_PRESENT | PTE_WRITABLE | PTE_USER | PTE_NX)
+        assert_eq!(
+            read_entry(&pt, 2),
+            spec.user_data_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER | PTE_NX
+        );
+        // PT[3]: Supervisor RX trampoline (PTE_PRESENT; NOT user, NOT writable, NOT NX)
+        assert_eq!(read_entry(&pt, 3), spec.tramp_phys | PTE_PRESENT);
+        // PT[4]: Supervisor RW+NX GDT/TSS/state/stacks (PTE_PRESENT | PTE_WRITABLE | PTE_NX; NOT user)
+        assert_eq!(
+            read_entry(&pt, 4),
+            spec.gdt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_NX
+        );
+        // PT[5]: Supervisor RO+NX IDT (PTE_PRESENT | PTE_NX; NOT user, NOT writable)
+        assert_eq!(read_entry(&pt, 5), spec.idt_phys | PTE_PRESENT | PTE_NX);
+
+        // Reject RWX extra leaf PTE:
+        let rwx_err = x86_pml4::serialize_isolated_user_4level(
+            &spec,
+            Some((10, 0x0023_0000 | PTE_PRESENT | PTE_WRITABLE | PTE_USER)),
+            &mut pml4,
+            &mut pdpt,
+            &mut pd,
+            &mut pt,
+        );
+        assert!(matches!(
+            rwx_err,
+            Err(x86_pml4::IsolatedUserLayoutError::WritableAndExecutable { pt_slot: 10, .. })
+        ));
+
+        // Reject higher-half kernel VA in user_va:
+        let mut bad_va = spec;
+        bad_va.user_va = 0xFFFF_8000_0000_0000;
+        assert_eq!(
+            x86_pml4::serialize_isolated_user_4level(
+                &bad_va, None, &mut pml4, &mut pdpt, &mut pd, &mut pt
+            ),
+            Err(x86_pml4::IsolatedUserLayoutError::InvalidUserVa)
+        );
     }
 }

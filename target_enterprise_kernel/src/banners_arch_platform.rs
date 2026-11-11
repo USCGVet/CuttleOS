@@ -133,64 +133,195 @@ pub(crate) fn banner_dma() {
 /// `iretq` -> `int 0x80` on `TSS.RSP0`, verifying the `IST1` breakpoint stack switch,
 /// `CPL=3` `USER_CODE_SEL`/`USER_DATA_SEL` selectors, user-mapped IPC mailbox request/canary
 /// read (`[rsp - 0x20]`) and signed response write (`[rsp - 0x18]`), `SYS_GETPID` trap, and `expected_arg0`.
+/// Enable hardware `IA32_EFER.NXE` (`bit 11`), `CR0.WP` (`bit 16`), and CPUID-advertised
+/// `CR4.SMEP` (`bit 20`) on the calling logical processor.
+// SAFETY: Caller must execute at CPL=0 in 64-bit Long Mode where all supervisor code pages have `PTE_U = 0`.
+pub(crate) unsafe fn enable_cpu_memory_protections() {
+    let max_leaf: u32;
+    // SAFETY: CPUID leaf 0 is supported on all x86-64 CPUs; `rbx` is preserved across `cpuid`.
+    unsafe {
+        asm!(
+            "push rbx",
+            "xor eax, eax",
+            "cpuid",
+            "pop rbx",
+            out("eax") max_leaf,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem, preserves_flags),
+        );
+    }
+    let has_smep = if max_leaf >= 7 {
+        let ebx_7: u32;
+        // SAFETY: `max_leaf >= 7` verified leaf 7 support; `rbx` is saved in `r9` and restored.
+        unsafe {
+            asm!(
+                "mov r9, rbx",
+                "mov eax, 7",
+                "xor ecx, ecx",
+                "cpuid",
+                "mov {out_ebx:e}, ebx",
+                "mov rbx, r9",
+                out_ebx = out(reg) ebx_7,
+                out("eax") _,
+                out("ecx") _,
+                out("edx") _,
+                out("r9") _,
+                options(nomem, preserves_flags),
+            );
+        }
+        (ebx_7 & (1 << 7)) != 0
+    } else {
+        false
+    };
+
+    // SAFETY: Setting IA32_EFER.NXE (1<<11), CR0.WP (1<<16), and CR4.SMEP (1<<20 when supported) at CPL=0.
+    unsafe {
+        let efer_lo: u32;
+        let efer_hi: u32;
+        asm!(
+            "mov ecx, 0xC0000080",
+            "rdmsr",
+            out("ecx") _,
+            out("eax") efer_lo,
+            out("edx") efer_hi,
+            options(nomem, nostack, preserves_flags),
+        );
+        if (efer_lo & (1 << 11)) == 0 {
+            let new_lo = efer_lo | (1 << 11);
+            asm!(
+                "mov ecx, 0xC0000080",
+                "wrmsr",
+                in("eax") new_lo,
+                in("edx") efer_hi,
+                out("ecx") _,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+
+        let mut cr0_val: u64;
+        asm!("mov {}, cr0", out(reg) cr0_val, options(nomem, nostack, preserves_flags));
+        if (cr0_val & (1 << 16)) == 0 {
+            cr0_val |= 1 << 16;
+            asm!("mov cr0, {}", in(reg) cr0_val, options(nomem, nostack, preserves_flags));
+        }
+
+        if has_smep {
+            let mut cr4_val: u64;
+            asm!("mov {}, cr4", out(reg) cr4_val, options(nomem, nostack, preserves_flags));
+            if (cr4_val & (1 << 20)) == 0 {
+                cr4_val |= 1 << 20;
+                asm!("mov cr4, {}", in(reg) cr4_val, options(nomem, nostack, preserves_flags));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Ring3ExecOutcome {
+    pub(crate) user_va: u64,
+    pub(crate) kernel_cr3: u64,
+    pub(crate) user_cr3: u64,
+    pub(crate) observed_cr3: u64,
+    pub(crate) pid: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ring3FaultOutcome {
+    SetupFailed,
+    CpuException {
+        vec: u8,
+        err_code: u64,
+        cr2: u64,
+        frame_cs: u16,
+        user_va: u64,
+        user_cr3: u64,
+        observed_cr3: u64,
+    },
+    MailboxOrTrapMismatch,
+    SyscallDenied(target_enterprise::syscall::Errno),
+}
+
+/// Execute a 32-byte x86-64 Ring-3 (`CPL=3`) machine-code stub inside a dedicated hardware
+/// `CR3`-isolated 4-level user page-table hierarchy (`user_pml4_phys`, zero higher-half kernel
+/// PML4 entries) enforcing strict `W^X` (`PT[0]` User RX, `PT[1]` unmapped guard page,
+/// `PT[2]` User RW+NX stack/mailbox, `PT[3]` Supervisor RX trampoline, `PT[4]` Supervisor RW+NX
+/// GDT/TSS/state/stacks, `PT[5]` Supervisor RO+NX IDT), full IDT `0..31` Ring-3 fault recovery,
+/// and per-task capability-gated syscall dispatch (`dispatch_syscall(task_id, cap_mask, ...)`).
 #[inline(never)]
-pub(crate) fn exec_service_ring3_stub(
+pub(crate) fn exec_service_ring3_stub_isolated(
+    task_id: u64,
+    cap_mask: u64,
     ring3_code: &[u8; 32],
     mailbox_req_word: u64,
     expected_arg0: u64,
     corrupt_canary: bool,
-) -> bool {
+) -> Result<Ring3ExecOutcome, Ring3FaultOutcome> {
     use target_enterprise::gdt::{
         Gdt, Tss64, KERNEL_CODE_SEL, KERNEL_DATA_SEL, TSS64_LEN, TSS_SEL, USER_CODE_SEL,
         USER_DATA_SEL,
     };
     use target_enterprise::interrupts::{
-        vectors, Idt, IDT_LEN, TYPE_INTERRUPT_GATE_DPL3, TYPE_TRAP_GATE_DPL0,
+        vectors, Idt, IDT_LEN, TYPE_INTERRUPT_GATE_DPL0, TYPE_INTERRUPT_GATE_DPL3,
+        TYPE_TRAP_GATE_DPL0,
     };
-    use target_enterprise::syscall::{dispatch_with_cap, SYS_GETPID};
+    use target_enterprise::kpti::x86_pml4::{
+        serialize_isolated_user_4level, IsolatedUserSandboxSpec, PML4_BYTES,
+    };
+    use target_enterprise::syscall::{dispatch_syscall, set_task_cap_mask};
 
     let dma = dma_phys_base();
     if dma == 0 || phys_map_offset() == 0 {
-        return false;
+        return Err(Ring3FaultOutcome::SetupFailed);
     }
 
-    // Dedicated physical frames in `dma + 0x2_4000 .. dma + 0x2_B000`:
-    //   +0x2_4000: PDPT for temporary lower-half user mapping
-    //   +0x2_5000: PD
-    //   +0x2_6000: PT (`PT[0]` = Ring-3 code/stack/mailbox page, `PT[1]` = Ring-0 ISR trampoline page)
-    //   +0x2_7000: Ring-3 user code + stack + IPC mailbox frame (`+0xFD0` request/canary, `+0xFD8` response)
-    //   +0x2_8000: Ring-0 ISR trampoline + state frame
-    //   +0x2_9000: Live 256-entry IDT (4096 bytes)
-    //   +0x2_A000: Live GDT (`+0x000`), descriptor pointers (`+0x040..+0x080`),
-    //              64-bit TSS (`+0x100`), `RSP0` stack (`+0x200..+0x800`), `IST1` stack (`+0x800..+0x1000`)
-    let pdpt_phys = dma + 0x2_4000;
-    let pd_phys = dma + 0x2_5000;
-    let pt_phys = dma + 0x2_6000;
-    let user_phys = dma + 0x2_7000;
-    let tramp_phys = dma + 0x2_8000;
-    let idt_phys = dma + 0x2_9000;
-    let gdt_phys = dma + 0x2_A000;
-
-    // Zero all 7 scratch frames (`7 * 4096 = 0x7000` bytes).
-    // SAFETY: `pdpt_phys .. pdpt_phys + 0x7000` lies within the reserved 192 KiB DMA window mapped via `pa_to_va`.
+    // SAFETY: Running at CPL=0 in 64-bit Long Mode.
     unsafe {
-        let base_ptr = pa_to_va(pdpt_phys);
+        enable_cpu_memory_protections();
+    }
+
+    // 9 dedicated 4 KiB physical frames in `dma + 0x2_4000 .. dma + 0x2_D000`:
+    //   +0x2_4000: `user_pml4_phys` — Dedicated isolated user `CR3` PML4 (higher-half slots 256..512 all 0!)
+    //   +0x2_5000: `pdpt_phys`
+    //   +0x2_6000: `pd_phys`
+    //   +0x2_7000: `pt_phys`
+    //   +0x2_8000: `user_code_phys` (`PT[0]`: User RX only)
+    //   +0x2_9000: `user_data_phys` (`PT[2]`: User RW+NX stack + IPC mailbox; `PT[1]` = unmapped guard page)
+    //   +0x2_A000: `tramp_phys`     (`PT[3]`: Supervisor RX entry/exit/fault trampolines)
+    //   +0x2_B000: `idt_phys`       (`PT[5]`: Supervisor RO+NX 256-entry IDT)
+    //   +0x2_C000: `gdt_phys`       (`PT[4]`: Supervisor RW+NX GDT/TSS/state/`RSP0`/`IST1`)
+    let user_pml4_phys = dma + 0x2_4000;
+    let pdpt_phys = dma + 0x2_5000;
+    let pd_phys = dma + 0x2_6000;
+    let pt_phys = dma + 0x2_7000;
+    let user_code_phys = dma + 0x2_8000;
+    let user_data_phys = dma + 0x2_9000;
+    let tramp_phys = dma + 0x2_A000;
+    let idt_phys = dma + 0x2_B000;
+    let gdt_phys = dma + 0x2_C000;
+
+    // Zero all 9 frames (`9 * 4096 = 0x9000` bytes).
+    // SAFETY: `user_pml4_phys .. user_pml4_phys + 0x9000` is reserved exclusively in the 256 KiB DMA window.
+    unsafe {
+        let base_ptr = pa_to_va(user_pml4_phys);
         let mut i = 0usize;
-        while i < 0x7000 {
+        while i < 0x9000 {
             core::ptr::write_volatile(base_ptr.add(i), 0);
             i += 1;
         }
     }
 
-    // Find an unused lower-half PML4 slot (`64..256`).
-    // SAFETY: Running at CPL=0; `read_cr3()` returns the active 4-level PML4 physical address.
-    let pml4_phys = unsafe { read_cr3() } & PTE_ADDR_MASK;
-    let pml4_va = pa_to_va(pml4_phys) as *mut u64;
+    // Find an unused lower-half PML4 slot (`64..256`) in the active kernel PML4 so `PT[3..5]`
+    // share identical supervisor virtual addresses across `kernel_cr3` and `user_pml4_phys`
+    // during the `mov cr3` transition, while higher-half `256..512` remain 100% absent from `user_pml4_phys`.
+    // SAFETY: Running at CPL=0; `read_cr3()` returns the active 4-level kernel PML4 physical address.
+    let kernel_cr3 = unsafe { read_cr3() } & PTE_ADDR_MASK;
+    let kernel_pml4_va = pa_to_va(kernel_cr3) as *mut u64;
     let mut pml4_idx: Option<usize> = None;
     let mut idx = 64usize;
     while idx < 256 {
-        // SAFETY: `pml4_va` points to the 512-entry active PML4 table mapped via `pa_to_va`.
-        let entry = unsafe { core::ptr::read_volatile(pml4_va.add(idx)) };
+        // SAFETY: `kernel_pml4_va` points to the 512-entry active kernel PML4 mapped via `pa_to_va`.
+        let entry = unsafe { core::ptr::read_volatile(kernel_pml4_va.add(idx)) };
         if entry == 0 {
             pml4_idx = Some(idx);
             break;
@@ -198,85 +329,168 @@ pub(crate) fn exec_service_ring3_stub(
         idx += 1;
     }
     let Some(pml4_slot) = pml4_idx else {
-        return false;
+        return Err(Ring3FaultOutcome::SetupFailed);
     };
 
     let user_va: u64 = (pml4_slot as u64) << 39;
-    let kernel_trampoline_va: u64 = user_va + 0x1000;
-    let tramp_state_va: u64 = kernel_trampoline_va + 0x200;
-    let user_rsp: u64 = user_va + 0xFF0;
+    let user_rsp: u64 = user_va + 0x2FF0; // Top of PT[2] (above unmapped PT[1] guard page!)
+    let kernel_trampoline_va: u64 = user_va + 0x3000; // PT[3] Supervisor RX
+    let shared_sup_rw_va: u64 = user_va + 0x4000; // PT[4] Supervisor RW+NX
+    let shared_idt_va: u64 = user_va + 0x5000; // PT[5] Supervisor RO+NX
 
-    // Install 4-level mapping (`PTE_P | PTE_W | PTE_USER` on `PT[0]`, `PTE_P | PTE_W` on `PT[1]`).
-    const PTE_U: u64 = 1 << 2;
-    // SAFETY: `pdpt_phys`, `pd_phys`, and `pt_phys` are freshly zeroed 4 KiB frames in the reserved DMA pool, and `pml4_slot` was verified empty.
-    unsafe {
-        let pdpt_va = pa_to_va(pdpt_phys) as *mut u64;
-        let pd_va = pa_to_va(pd_phys) as *mut u64;
-        let pt_va = pa_to_va(pt_phys) as *mut u64;
-        core::ptr::write_volatile(pt_va.add(0), user_phys | PTE_P | PTE_W | PTE_U);
-        core::ptr::write_volatile(pt_va.add(1), tramp_phys | PTE_P | PTE_W);
-        core::ptr::write_volatile(pd_va.add(0), pt_phys | PTE_P | PTE_W | PTE_U);
-        core::ptr::write_volatile(pdpt_va.add(0), pd_phys | PTE_P | PTE_W | PTE_U);
-        core::ptr::write_volatile(pml4_va.add(pml4_slot), pdpt_phys | PTE_P | PTE_W | PTE_U);
-        asm!(
-            "invlpg [{}]",
-            "invlpg [{}]",
-            in(reg) user_va,
-            in(reg) kernel_trampoline_va,
-            options(nostack, preserves_flags)
-        );
+    let spec = IsolatedUserSandboxSpec {
+        user_va,
+        pdpt_phys,
+        pd_phys,
+        pt_phys,
+        user_code_phys,
+        user_data_phys,
+        tramp_phys,
+        gdt_phys,
+        idt_phys,
+    };
+
+    // Materialize and `W^X`-validate the 4-level isolated user CR3 tables directly in the physical frames.
+    // SAFETY: Each of the 4 physical frames is a distinct 4 KiB page in the reserved DMA window.
+    let ser_res = unsafe {
+        let pml4_buf = &mut *(pa_to_va(user_pml4_phys) as *mut [u8; PML4_BYTES]);
+        let pdpt_buf = &mut *(pa_to_va(pdpt_phys) as *mut [u8; PML4_BYTES]);
+        let pd_buf = &mut *(pa_to_va(pd_phys) as *mut [u8; PML4_BYTES]);
+        let pt_buf = &mut *(pa_to_va(pt_phys) as *mut [u8; PML4_BYTES]);
+        serialize_isolated_user_4level(&spec, None, pml4_buf, pdpt_buf, pd_buf, pt_buf)
+    };
+    if ser_res != Ok(pml4_slot) {
+        return Err(Ring3FaultOutcome::SetupFailed);
     }
 
-    // Write Ring-3 payload into `user_phys` and populate the user-mapped IPC mailbox request + canary
-    // word at `user_phys + 0xFD0` (`[rsp - 0x20]`).
+    // Temporarily alias `PML4[pml4_slot] -> pdpt_phys` into `kernel_cr3` so `PT[3..5]` are
+    // reachable at identical virtual addresses across `mov cr3, user_pml4_phys` and back.
+    const PTE_U: u64 = 1 << 2;
+    // SAFETY: `pml4_slot` in `kernel_pml4_va` was verified empty and `pdpt_phys` is initialized.
+    unsafe {
+        core::ptr::write_volatile(
+            kernel_pml4_va.add(pml4_slot),
+            pdpt_phys | PTE_P | PTE_W | PTE_U,
+        );
+        let mut p = 0u64;
+        while p < 6 {
+            let flush_va = user_va + p * 0x1000;
+            asm!("invlpg [{}]", in(reg) flush_va, options(nostack, preserves_flags));
+            p += 1;
+        }
+    }
+
+    // Populate `user_code_phys` (`PT[0]`) with the 32-byte Ring-3 stub, and `user_data_phys + 0xFD0`
+    // (`PT[2]`, `[user_rsp - 0x20]`) with the IPC mailbox request + canary word.
     let planted_req = if corrupt_canary {
         mailbox_req_word ^ 0xDEAD_BEEF_0000_0000
     } else {
         mailbox_req_word
     };
-    // SAFETY: `user_phys` is a dedicated 4 KiB frame in the reserved DMA window mapped via `pa_to_va`.
+    // SAFETY: `user_code_phys` and `user_data_phys` are dedicated 4 KiB frames mapped RW in `PHYS_MAP_OFFSET`.
     unsafe {
-        let dst = pa_to_va(user_phys);
+        let code_dst = pa_to_va(user_code_phys);
         let mut i = 0usize;
         while i < ring3_code.len() {
-            core::ptr::write_volatile(dst.add(i), ring3_code[i]);
+            core::ptr::write_volatile(code_dst.add(i), ring3_code[i]);
             i += 1;
         }
+        let data_dst = pa_to_va(user_data_phys);
         let req_bytes = planted_req.to_le_bytes();
         let mut k = 0usize;
         while k < 8 {
-            core::ptr::write_volatile(dst.add(0xFD0 + k), req_bytes[k]);
+            core::ptr::write_volatile(data_dst.add(0xFD0 + k), req_bytes[k]);
             k += 1;
         }
     }
 
-    // Write Ring-0 ISR trampolines into `tramp_phys`:
-    // 1) `isr_breakpoint_ist1` at `+0x000` (Vector 3 `#BP`, `IST = 1`)
+    // Populate Ring-0 Supervisor RX trampolines in `tramp_phys` (`user_va + 0x3000`; `state_va = user_va + 0x4200`):
+    // 1) `+0x000`: `isr_breakpoint_ist1` (Vector 3 `#BP`, `DPL=0`, `IST=1`)
     let isr_bp_code: [u8; 18] = [
         0x50,                                     // push rax
-        0x48, 0x8D, 0x05, 0xF8, 0x01, 0x00, 0x00, // lea rax, [rip + 0x1F8] -> +0x200
+        0x48, 0x8D, 0x05, 0xF8, 0x11, 0x00, 0x00, // lea rax, [rip + 0x11F8] -> user_va + 0x4200
         0x48, 0xFF, 0x00,                         // inc qword ptr [rax]
         0x48, 0x89, 0x60, 0x08,                   // mov [rax + 0x08], rsp
         0x58,                                     // pop rax
         0x48, 0xCF,                               // iretq
     ];
-    // 2) `isr_syscall_int80` at `+0x080` (Vector 0x80 `SYSCALL_INT`, `DPL = 3`, `IST = 0`)
-    let isr_int80_code: [u8; 53] = [
-        0x48, 0x8D, 0x05, 0x79, 0x01, 0x00, 0x00, // lea rax, [rip + 0x179] -> +0x200
-        0x48, 0x89, 0x70, 0x20,                   // mov [rax + 0x20], rsi
-        0x48, 0x8B, 0x4C, 0x24, 0x08,             // mov rcx, [rsp + 0x08]
+    // 2) `+0x040`: `entry_to_ring3` (saves `saved_kernel_rsp` & `kernel_cr3`, pivots `RSP` to `rsp0_top`,
+    //    switches hardware `CR3` to `user_pml4_phys`, scrubs GPRs, and `iretq`s to `CPL=3`)
+    let entry_to_ring3_code: [u8; 52] = [
+        0x48, 0x8D, 0x05, 0xB9, 0x11, 0x00, 0x00, // lea rax, [rip + 0x11B9] -> user_va + 0x4200
+        0x48, 0x89, 0x60, 0x10,                   // mov [rax + 0x10], rsp (saved_kernel_rsp)
+        0x0F, 0x20, 0xD9,                         // mov rcx, cr3
+        0x48, 0x89, 0x48, 0x18,                   // mov [rax + 0x18], rcx (kernel_cr3)
+        0x48, 0x8D, 0xA0, 0x00, 0x06, 0x00, 0x00, // lea rsp, [rax + 0x600] (rsp0_top = user_va + 0x4800)
+        0x48, 0x8B, 0x48, 0x50,                   // mov rcx, [rax + 0x50] (user_cr3)
+        0x0F, 0x22, 0xD9,                         // mov cr3, rcx (SWITCH TO ISOLATED USER CR3!)
+        0x6A, USER_DATA_SEL as u8,                // push USER_DATA_SEL (0x1B)
+        0x56,                                     // push rsi (user_rsp)
+        0x6A, 0x02,                               // push 0x02 (RFLAGS IF=0)
+        0x6A, USER_CODE_SEL as u8,                // push USER_CODE_SEL (0x23)
+        0x57,                                     // push rdi (user_va)
+        0x31, 0xC0,                               // xor eax, eax
+        0x31, 0xC9,                               // xor ecx, ecx
+        0x31, 0xD2,                               // xor edx, edx
+        0x31, 0xF6,                               // xor esi, esi
+        0x31, 0xFF,                               // xor edi, edi
+        0x48, 0xCF,                               // iretq -> CPL=3!
+    ];
+    // 3) `+0x080`: `isr_syscall_int80` (Vector `0x80`, `DPL=3`, `IST=0`: records Ring-3 state + active `CR3`,
+    //    switches hardware `CR3` back to `kernel_cr3`, restores `SS` + `saved_kernel_rsp`, `ret`)
+    let isr_int80_code: [u8; 67] = [
+        0x48, 0x8D, 0x05, 0x79, 0x11, 0x00, 0x00, // lea rax, [rip + 0x1179] -> user_va + 0x4200
+        0x48, 0x89, 0x70, 0x20,                   // mov [rax + 0x20], rsi (r3_cs)
+        0x48, 0x8B, 0x4C, 0x24, 0x08,             // mov rcx, [rsp + 0x08] (frame_cs)
         0x48, 0x89, 0x48, 0x28,                   // mov [rax + 0x28], rcx
-        0x48, 0x8B, 0x4C, 0x24, 0x20,             // mov rcx, [rsp + 0x20]
+        0x48, 0x8B, 0x4C, 0x24, 0x20,             // mov rcx, [rsp + 0x20] (frame_ss)
         0x48, 0x89, 0x48, 0x30,                   // mov [rax + 0x30], rcx
-        0x48, 0x89, 0x78, 0x38,                   // mov [rax + 0x38], rdi
-        0x48, 0x89, 0x50, 0x40,                   // mov [rax + 0x40], rdx
-        0x48, 0x89, 0x60, 0x48,                   // mov [rax + 0x48], rsp
+        0x48, 0x89, 0x78, 0x38,                   // mov [rax + 0x38], rdi (sys_nr)
+        0x48, 0x89, 0x50, 0x40,                   // mov [rax + 0x40], rdx (sys_arg0)
+        0x48, 0x89, 0x60, 0x48,                   // mov [rax + 0x48], rsp (trap_rsp)
+        0x0F, 0x20, 0xD9,                         // mov rcx, cr3
+        0x48, 0x89, 0x48, 0x58,                   // mov [rax + 0x58], rcx (observed_active_cr3)
+        0x48, 0x8B, 0x48, 0x18,                   // mov rcx, [rax + 0x18] (kernel_cr3)
+        0x0F, 0x22, 0xD9,                         // mov cr3, rcx (RESTORE KERNEL CR3!)
         0xB9, 0x10, 0x00, 0x00, 0x00,             // mov ecx, 0x10
         0x8E, 0xD1,                               // mov ss, cx
-        0x48, 0x8B, 0x60, 0x10,                   // mov rsp, [rax + 0x10]
+        0x48, 0x8B, 0x60, 0x10,                   // mov rsp, [rax + 0x10] (saved_kernel_rsp)
         0xC3,                                     // ret
     ];
-    // SAFETY: `tramp_phys` is a dedicated 4 KiB frame in the reserved DMA window mapped via `pa_to_va`.
+    // 4) `+0x300`: `common_fault_handler` for CPU exceptions `0..31` triggered in Ring-3
+    let common_fault_code: [u8; 74] = [
+        0x48, 0x8D, 0x05, 0xF9, 0x0E, 0x00, 0x00,             // lea rax, [rip + 0x0EF9] -> user_va + 0x4200
+        0x48, 0xC7, 0x40, 0x60, 0x01, 0x00, 0x00, 0x00,       // mov qword ptr [rax + 0x60], 1 (fault_flag)
+        0x48, 0x8B, 0x0C, 0x24,                               // mov rcx, [rsp] (vec)
+        0x48, 0x89, 0x48, 0x68,                               // mov [rax + 0x68], rcx (fault_vec)
+        0x48, 0x8B, 0x4C, 0x24, 0x08,                         // mov rcx, [rsp + 0x08] (err_code)
+        0x48, 0x89, 0x48, 0x78,                               // mov [rax + 0x78], rcx (fault_err_code)
+        0x0F, 0x20, 0xD1,                                     // mov rcx, cr2
+        0x48, 0x89, 0x48, 0x70,                               // mov [rax + 0x70], rcx (fault_cr2)
+        0x48, 0x8B, 0x4C, 0x24, 0x18,                         // mov rcx, [rsp + 0x18] (frame_cs)
+        0x48, 0x89, 0x48, 0x28,                               // mov [rax + 0x28], rcx
+        0x0F, 0x20, 0xD9,                                     // mov rcx, cr3
+        0x48, 0x89, 0x48, 0x58,                               // mov [rax + 0x58], rcx (observed_active_cr3)
+        0x48, 0x8B, 0x48, 0x18,                               // mov rcx, [rax + 0x18] (kernel_cr3)
+        0x0F, 0x22, 0xD9,                                     // mov cr3, rcx (RESTORE KERNEL CR3!)
+        0xB9, 0x10, 0x00, 0x00, 0x00,                         // mov ecx, 0x10
+        0x8E, 0xD1,                                           // mov ss, cx
+        0x48, 0x8B, 0x60, 0x10,                               // mov rsp, [rax + 0x10] (saved_kernel_rsp)
+        0xC3,                                                 // ret
+    ];
+
+    const HAS_ERR_CODE_MASK: u32 = (1 << 8)
+        | (1 << 10)
+        | (1 << 11)
+        | (1 << 12)
+        | (1 << 13)
+        | (1 << 14)
+        | (1 << 17)
+        | (1 << 21)
+        | (1 << 29)
+        | (1 << 30);
+
+    // SAFETY: `tramp_phys` is a dedicated 4 KiB frame mapped RW in `PHYS_MAP_OFFSET`.
     unsafe {
         let dst = pa_to_va(tramp_phys);
         let mut i = 0usize;
@@ -284,24 +498,56 @@ pub(crate) fn exec_service_ring3_stub(
             core::ptr::write_volatile(dst.add(i), isr_bp_code[i]);
             i += 1;
         }
+        let mut e = 0usize;
+        while e < entry_to_ring3_code.len() {
+            core::ptr::write_volatile(dst.add(0x40 + e), entry_to_ring3_code[e]);
+            e += 1;
+        }
         let mut j = 0usize;
         while j < isr_int80_code.len() {
             core::ptr::write_volatile(dst.add(0x80 + j), isr_int80_code[j]);
             j += 1;
         }
+        let mut c = 0usize;
+        while c < common_fault_code.len() {
+            core::ptr::write_volatile(dst.add(0x300 + c), common_fault_code[c]);
+            c += 1;
+        }
+        let mut v = 0usize;
+        while v < 32 {
+            if v != (vectors::BREAKPOINT as usize) {
+                let stub_off = 0x100 + v * 16;
+                let mut pos = stub_off;
+                if (HAS_ERR_CODE_MASK & (1u32 << v)) == 0 {
+                    core::ptr::write_volatile(dst.add(pos), 0x6A); // push 0
+                    core::ptr::write_volatile(dst.add(pos + 1), 0x00);
+                    pos += 2;
+                }
+                core::ptr::write_volatile(dst.add(pos), 0x6A); // push vec
+                core::ptr::write_volatile(dst.add(pos + 1), v as u8);
+                pos += 2;
+                let rel32 = (0x300i32 - ((pos + 5) as i32)).to_le_bytes();
+                core::ptr::write_volatile(dst.add(pos), 0xE9); // jmp common_fault_handler
+                core::ptr::write_volatile(dst.add(pos + 1), rel32[0]);
+                core::ptr::write_volatile(dst.add(pos + 2), rel32[1]);
+                core::ptr::write_volatile(dst.add(pos + 3), rel32[2]);
+                core::ptr::write_volatile(dst.add(pos + 4), rel32[3]);
+            }
+            v += 1;
+        }
     }
 
-    // Build GDT, 64-bit TSS, and 256-entry IDT in `gdt_phys` and `idt_phys`.
-    let gdt_frame_va = pa_to_va(gdt_phys) as u64;
-    let gdt_va = gdt_frame_va;
-    let gdtr_new_va = gdt_frame_va + 0x040;
-    let idtr_new_va = gdt_frame_va + 0x050;
-    let gdtr_orig_va = gdt_frame_va + 0x060;
-    let idtr_orig_va = gdt_frame_va + 0x070;
-    let tss_va = gdt_frame_va + 0x100;
-    let rsp0_top = gdt_frame_va + 0x800;
-    let ist1_top = gdt_frame_va + 0x1000;
-    let idt_va = pa_to_va(idt_phys) as u64;
+    // Build GDT, 64-bit TSS, state block, and 256-entry IDT using the shared lower-half supervisor VAs
+    // (`shared_sup_rw_va = user_va + 0x4000`, `shared_idt_va = user_va + 0x5000`) so `GDTR`, `TSS`,
+    // `RSP0`, `IST1`, and `IDTR` remain valid while `user_pml4_phys` is loaded in `CR3`!
+    let gdt_va = shared_sup_rw_va;
+    let gdtr_new_va = shared_sup_rw_va + 0x040;
+    let idtr_new_va = shared_sup_rw_va + 0x050;
+    let gdtr_orig_va = shared_sup_rw_va + 0x060;
+    let idtr_orig_va = shared_sup_rw_va + 0x070;
+    let tss_va = shared_sup_rw_va + 0x100;
+    let rsp0_top = shared_sup_rw_va + 0x800;
+    let ist1_top = shared_sup_rw_va + 0x1000;
 
     let tss = Tss64::with_stacks(rsp0_top, ist1_top);
     let tss_bytes = tss.to_bytes();
@@ -309,12 +555,21 @@ pub(crate) fn exec_service_ring3_stub(
     let gdt_bytes = gdt.to_table_bytes();
 
     let mut idt = Idt::new_empty();
-    idt.set_handler_with_attr(
-        vectors::BREAKPOINT,
-        kernel_trampoline_va,
-        TYPE_TRAP_GATE_DPL0,
-        1,
-    );
+    let mut exc_v = 0u8;
+    while exc_v < 32 {
+        if exc_v == vectors::BREAKPOINT {
+            idt.set_handler_with_attr(exc_v, kernel_trampoline_va, TYPE_TRAP_GATE_DPL0, 1);
+        } else {
+            let ist = if exc_v == 8 { 1 } else { 0 };
+            idt.set_handler_with_attr(
+                exc_v,
+                kernel_trampoline_va + 0x100 + ((exc_v as u64) * 16),
+                TYPE_INTERRUPT_GATE_DPL0,
+                ist,
+            );
+        }
+        exc_v += 1;
+    }
     idt.set_handler_with_attr(
         vectors::SYSCALL_INT,
         kernel_trampoline_va + 0x80,
@@ -322,36 +577,41 @@ pub(crate) fn exec_service_ring3_stub(
         0,
     );
 
-    // SAFETY: `gdt_frame_va` and `idt_va` point into dedicated 4 KiB frames in the reserved DMA window.
+    // SAFETY: `gdt_phys` and `idt_phys` are dedicated 4 KiB frames mapped RW in `PHYS_MAP_OFFSET`.
     unsafe {
-        let gdt_ptr = gdt_va as *mut u8;
+        let gdt_phys_ptr = pa_to_va(gdt_phys);
         let mut i = 0usize;
         while i < gdt_bytes.len() {
-            core::ptr::write_volatile(gdt_ptr.add(i), gdt_bytes[i]);
+            core::ptr::write_volatile(gdt_phys_ptr.add(i), gdt_bytes[i]);
             i += 1;
         }
-        let tss_ptr = tss_va as *mut u8;
+        let tss_ptr = gdt_phys_ptr.add(0x100);
         let mut j = 0usize;
         while j < tss_bytes.len() {
             core::ptr::write_volatile(tss_ptr.add(j), tss_bytes[j]);
             j += 1;
         }
-        let idt_ptr = idt_va as *mut u8;
+        // Seed `state[10]` (`+0x250`) with `user_pml4_phys` for `entry_to_ring3`.
+        core::ptr::write_volatile(
+            gdt_phys_ptr.add(0x250).cast::<u64>(),
+            user_pml4_phys,
+        );
+
+        let idt_phys_ptr = pa_to_va(idt_phys);
         let mut v = 0usize;
         while v < IDT_LEN {
             let entry_bytes = idt.raw_bytes(v as u8);
             let mut k = 0usize;
             while k < 16 {
-                core::ptr::write_volatile(idt_ptr.add(v * 16 + k), entry_bytes[k]);
+                core::ptr::write_volatile(idt_phys_ptr.add(v * 16 + k), entry_bytes[k]);
                 k += 1;
             }
             v += 1;
         }
 
-        // Write 10-byte `[limit: u16, base: u64]` descriptors for `lgdt` and `lidt`.
         let gdt_limit: u16 = (Gdt::byte_size() - 1) as u16;
         let idt_limit: u16 = (Idt::byte_size() - 1) as u16;
-        let gdtr_ptr = gdtr_new_va as *mut u8;
+        let gdtr_ptr = gdt_phys_ptr.add(0x040);
         let gdt_lim_b = gdt_limit.to_le_bytes();
         let gdt_base_b = gdt_va.to_le_bytes();
         core::ptr::write_volatile(gdtr_ptr.add(0), gdt_lim_b[0]);
@@ -362,9 +622,9 @@ pub(crate) fn exec_service_ring3_stub(
             b += 1;
         }
 
-        let idtr_ptr = idtr_new_va as *mut u8;
+        let idtr_ptr = gdt_phys_ptr.add(0x050);
         let idt_lim_b = idt_limit.to_le_bytes();
-        let idt_base_b = idt_va.to_le_bytes();
+        let idt_base_b = shared_idt_va.to_le_bytes();
         core::ptr::write_volatile(idtr_ptr.add(0), idt_lim_b[0]);
         core::ptr::write_volatile(idtr_ptr.add(1), idt_lim_b[1]);
         let mut b2 = 0usize;
@@ -374,10 +634,11 @@ pub(crate) fn exec_service_ring3_stub(
         }
     }
 
-    // Execute live GDT/TSS/IDT load, `int3` on `IST1`, and Ring-0 -> Ring-3 (`iretq`) -> Ring-0 (`int 0x80`) round-trip.
-    // SAFETY: Running at CPL=0 with interrupts masked (`cli`); `gdtr_new_va`, `idtr_new_va`, `tss_va`,
-    // `user_va`, and `kernel_trampoline_va` are mapped and initialized, and original `GDTR`/`IDTR`/`CS`/`SS`/`RFLAGS`
-    // are saved and restored before returning.
+    let entry_stub_va = kernel_trampoline_va + 0x040;
+
+    // Execute live GDT/TSS/IDT load, `int3` on `IST1`, and hardware `CR3`-isolated Ring-3 round-trip.
+    // SAFETY: Interrupts are masked (`cli`); `entry_stub_va` switches `CR3` to `user_pml4_phys` and
+    // `isr_syscall_int80` / `common_fault_handler` restores `kernel_cr3` before returning here.
     unsafe {
         asm!(
             "pushfq",
@@ -387,7 +648,6 @@ pub(crate) fn exec_service_ring3_stub(
             "sidt [r10]",
             "mov r13d, cs",
             "mov r14d, ss",
-            // Load Cuttle GDT, reload CS=0x08 and SS/DS/ES=0x10, load TR=0x28, load IDT.
             "lgdt [r11]",
             "push {k_cs}",
             "lea rax, [rip + 2f]",
@@ -401,21 +661,8 @@ pub(crate) fn exec_service_ring3_stub(
             "mov eax, {tss_sel}",
             "ltr ax",
             "lidt [r12]",
-            // 1. Trigger #BP (vector 3) to verify live IDT + TSS IST1 stack switch.
             "int3",
-            // 2. Drop to Ring-3 (`CPL=3`) via `iretq` and return via `int 0x80` on `RSP0`.
-            "call 3f",
-            "jmp 4f",
-            "3:",
-            "mov [r8 + 0x10], rsp",
-            "push {u_ss}",
-            "push rsi",
-            "push 0x2",
-            "push {u_cs}",
-            "push rdi",
-            "iretq",
-            "4:",
-            // Restore bootloader GDTR, CS, SS, IDTR, and RFLAGS.
+            "call r8",
             "lgdt [r9]",
             "push r13",
             "lea rax, [rip + 5f]",
@@ -423,10 +670,13 @@ pub(crate) fn exec_service_ring3_stub(
             "retfq",
             "5:",
             "mov ss, r14w",
+            "xor eax, eax",
+            "mov ds, ax",
+            "mov es, ax",
             "lidt [r10]",
             "push r15",
             "popfq",
-            in("r8") tramp_state_va,
+            in("r8") entry_stub_va,
             in("r9") gdtr_orig_va,
             in("r10") idtr_orig_va,
             in("r11") gdtr_new_va,
@@ -442,18 +692,30 @@ pub(crate) fn exec_service_ring3_stub(
             k_cs = const (KERNEL_CODE_SEL as u64),
             k_ds = const (KERNEL_DATA_SEL as u32),
             tss_sel = const (TSS_SEL as u32),
-            u_ss = const (USER_DATA_SEL as u64),
-            u_cs = const (USER_CODE_SEL as u64),
             clobber_abi("C"),
         );
     }
 
-    // Read back the hardware state captured by `isr_breakpoint_ist1` and `isr_syscall_int80`,
-    // plus the signed IPC response word written by `CPL=3` into `user_phys + 0xFD8` (`[rsp - 0x18]`).
-    // SAFETY: `tramp_state_va` points to the 64-bit state slots at `tramp_phys + 0x200`, `user_phys` is mapped via `pa_to_va`, and `pml4_va` points to the active PML4.
-    let (bp_count, bp_rsp, r3_cs, frame_cs, frame_ss, sys_nr, sys_arg0, trap_rsp, mb_resp) = unsafe {
-        let st = pa_to_va(tramp_phys + 0x200) as *const u64;
-        let user_ptr = pa_to_va(user_phys);
+    // Read back captured hardware state and tear down the temporary `kernel_pml4_va[pml4_slot]` alias.
+    // SAFETY: `gdt_phys` and `user_data_phys` are mapped via `pa_to_va`, and `kernel_cr3` is active.
+    let (
+        bp_count,
+        bp_rsp,
+        r3_cs,
+        frame_cs,
+        frame_ss,
+        sys_nr,
+        sys_arg0,
+        trap_rsp,
+        observed_cr3,
+        fault_flag,
+        fault_vec,
+        fault_cr2,
+        fault_err,
+        mb_resp,
+    ) = unsafe {
+        let st = pa_to_va(gdt_phys + 0x200) as *const u64;
+        let user_ptr = pa_to_va(user_data_phys);
         let mut mb_bytes = [0u8; 8];
         let mut m = 0usize;
         while m < 8 {
@@ -469,58 +731,119 @@ pub(crate) fn exec_service_ring3_stub(
             core::ptr::read_volatile(st.add(7)),
             core::ptr::read_volatile(st.add(8)),
             core::ptr::read_volatile(st.add(9)),
+            core::ptr::read_volatile(st.add(11)) & PTE_ADDR_MASK,
+            core::ptr::read_volatile(st.add(12)),
+            core::ptr::read_volatile(st.add(13)),
+            core::ptr::read_volatile(st.add(14)),
+            core::ptr::read_volatile(st.add(15)),
             u64::from_le_bytes(mb_bytes),
         );
-        // Tear down temporary PML4 entry and flush TLB.
-        core::ptr::write_volatile(pml4_va.add(pml4_slot), 0);
-        asm!(
-            "invlpg [{}]",
-            "invlpg [{}]",
-            in(reg) user_va,
-            in(reg) kernel_trampoline_va,
-            options(nostack, preserves_flags)
-        );
+        core::ptr::write_volatile(kernel_pml4_va.add(pml4_slot), 0);
+        let mut p = 0u64;
+        while p < 6 {
+            let flush_va = user_va + p * 0x1000;
+            asm!("invlpg [{}]", in(reg) flush_va, options(nostack, preserves_flags));
+            p += 1;
+        }
         vals
     };
 
     if bp_count != 1 || bp_rsp != ist1_top - 48 {
-        return false;
+        return Err(Ring3FaultOutcome::SetupFailed);
+    }
+    if fault_flag != 0 {
+        return Err(Ring3FaultOutcome::CpuException {
+            vec: fault_vec as u8,
+            err_code: fault_err,
+            cr2: fault_cr2,
+            frame_cs: frame_cs as u16,
+            user_va,
+            user_cr3: user_pml4_phys,
+            observed_cr3,
+        });
+    }
+    if observed_cr3 != user_pml4_phys || observed_cr3 == kernel_cr3 {
+        return Err(Ring3FaultOutcome::MailboxOrTrapMismatch);
     }
     if (r3_cs as u16) != USER_CODE_SEL
         || (frame_cs as u16) != USER_CODE_SEL
         || (frame_ss as u16) != USER_DATA_SEL
+        || trap_rsp != rsp0_top - 40
     {
-        return false;
-    }
-    if trap_rsp != rsp0_top - 40 {
-        return false;
+        return Err(Ring3FaultOutcome::MailboxOrTrapMismatch);
     }
     let expected_resp = mailbox_req_word ^ expected_arg0;
-    if sys_nr != SYS_GETPID || sys_arg0 != expected_resp || mb_resp != expected_resp {
-        return false;
+    if sys_arg0 != expected_resp || mb_resp != expected_resp {
+        return Err(Ring3FaultOutcome::MailboxOrTrapMismatch);
     }
 
-    let pid = match dispatch_with_cap(sys_nr, u64::MAX, sys_arg0, 0, 0, 0, 0, 0) {
+    if set_task_cap_mask(task_id, cap_mask).is_err() {
+        return Err(Ring3FaultOutcome::SyscallDenied(
+            target_enterprise::syscall::Errno::EPERM,
+        ));
+    }
+    let pid = match dispatch_syscall(task_id, cap_mask, sys_nr, sys_arg0, 0, 0, 0, 0, 0) {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(errno) => return Err(Ring3FaultOutcome::SyscallDenied(errno)),
     };
-    pid == 1 && pid.wrapping_add(sys_arg0) == 1u64.wrapping_add(expected_resp)
+    if pid != 1 || pid.wrapping_add(sys_arg0) != 1u64.wrapping_add(expected_resp) {
+        return Err(Ring3FaultOutcome::MailboxOrTrapMismatch);
+    }
+    Ok(Ring3ExecOutcome {
+        user_va,
+        kernel_cr3,
+        user_cr3: user_pml4_phys,
+        observed_cr3,
+        pid,
+    })
 }
 
-/// Hardware `CPL=3` (`CS=0x23`/`SS=0x1B`, `PTE_U` user page) execution callback registered on
-/// [`target_enterprise::svc_runtime::ServiceSupervisor`] so every live mediated request executes
-/// the service's diversified x86-64 stub at hardware `CPL=3` via `iretq` -> `int 0x80`.
-pub(crate) fn exec_service_ring3_stub_live(
+#[inline(never)]
+pub(crate) fn exec_service_ring3_stub(
     ring3_code: &[u8; 32],
     mailbox_req_word: u64,
     expected_arg0: u64,
+    corrupt_canary: bool,
 ) -> bool {
-    exec_service_ring3_stub(ring3_code, mailbox_req_word, expected_arg0, false)
+    exec_service_ring3_stub_isolated(
+        1,
+        0,
+        ring3_code,
+        mailbox_req_word,
+        expected_arg0,
+        corrupt_canary,
+    )
+    .is_ok()
+}
+
+/// Capability-aware hardware `CPL=3` execution callback registered on
+/// [`target_enterprise::svc_runtime::ServiceSupervisor`] so every live mediated request executes
+/// the target service's diversified x86-64 stub under an isolated `CR3` PML4 and bounded `cap_mask`.
+pub(crate) fn exec_service_ring3_cap_live(
+    svc: target_enterprise::svc_runtime::ServiceId,
+    ring3_code: &[u8; 32],
+    mailbox_req_word: u64,
+    expected_arg0: u64,
+    cap_mask: u64,
+) -> bool {
+    exec_service_ring3_stub_isolated(
+        svc.pid() as u64,
+        cap_mask,
+        ring3_code,
+        mailbox_req_word,
+        expected_arg0,
+        false,
+    )
+    .is_ok()
 }
 
 #[cfg(not(cuttle_prod))]
 #[inline(never)]
 pub(crate) fn banner_ring3_transition() {
+    use target_enterprise::gdt::USER_CODE_SEL;
+    use target_enterprise::svc_runtime::ServiceId;
+    use target_enterprise::syscall::Errno;
+
     let ring3_code: [u8; 32] = [
         0x8C, 0xC8, // mov eax, cs
         0x48, 0x89, 0xC6, // mov rsi, rax
@@ -531,13 +854,110 @@ pub(crate) fn banner_ring3_transition() {
         0xBF, 0x02, 0x00, 0x00, 0x00, // mov edi, 2 (SYS_GETPID)
         0xCD, 0x80, // int 0x80
     ];
-    if !exec_service_ring3_stub(&ring3_code, 0, 42, false) {
-        panic!("RING3: hardware CPL=3 transition verification failed");
+    let ok = match exec_service_ring3_stub_isolated(1, 0, &ring3_code, 0, 42, false) {
+        Ok(o) => o,
+        Err(_) => panic!("RING3: isolated CR3 hardware CPL=3 transition failed"),
+    };
+    if ok.observed_cr3 != ok.user_cr3 || ok.observed_cr3 == ok.kernel_cr3 || ok.pid != 1 {
+        panic!("RING3: hardware CR3 switch to isolated user PML4 did not occur");
     }
-    // Red Team negative verification: corrupted user-space mailbox canary must be rejected.
+
+    // Red Team Check 1: Corrupted user-space mailbox canary must be rejected.
     if exec_service_ring3_stub(&ring3_code, 0xA55A_3C3C_0000_0001, 42, true) {
         panic!("RING3: corrupted user-space mailbox canary was not rejected");
     }
+
+    // Red Team Check 2: Illegal instruction (`ud2`) in Ring-3 traps to IDT vector 6 (`#UD`)
+    // under isolated `user_cr3` and recovers cleanly without crashing the kernel.
+    let mut ud2_code = [0x90u8; 32];
+    ud2_code[0] = 0x0F;
+    ud2_code[1] = 0x0B; // ud2
+    match exec_service_ring3_stub_isolated(1, 0, &ud2_code, 0, 0, false) {
+        Err(Ring3FaultOutcome::CpuException {
+            vec: 6,
+            frame_cs,
+            user_cr3,
+            observed_cr3,
+            ..
+        }) if frame_cs == USER_CODE_SEL && observed_cr3 == user_cr3 => {}
+        other => panic!("RING3: #UD fault recovery drift: {:?}", other),
+    }
+
+    // Red Team Check 3: Stack underflow/overflow into unmapped guard page `PT[1]` (`[rsp - 0x1000]`)
+    // triggers a non-present user `#PF` (`vec = 14`, `err_code & 0x05 == 0x04`) and recovers cleanly.
+    let mut guard_pf_code = [0x90u8; 32];
+    let guard_probe: [u8; 10] = [
+        0x48, 0x8B, 0x84, 0x24, 0x00, 0xF0, 0xFF, 0xFF, // mov rax, [rsp - 0x1000]
+        0xCD, 0x80,
+    ];
+    guard_pf_code[..guard_probe.len()].copy_from_slice(&guard_probe);
+    match exec_service_ring3_stub_isolated(1, 0, &guard_pf_code, 0, 0, false) {
+        Err(Ring3FaultOutcome::CpuException {
+            vec: 14,
+            err_code,
+            cr2,
+            user_va,
+            ..
+        }) if cr2 == user_va + 0x1FF0 && (err_code & 0x05) == 0x04 => {}
+        other => panic!("RING3: guard page #PF recovery drift: {:?}", other),
+    }
+
+    // Red Team Check 4: Reading higher-half kernel `PHYS_MAP_OFFSET` memory from Ring-3 triggers a
+    // non-present `#PF` (`P = 0`), proving hardware KPTI `user_cr3` unmaps kernel memory!
+    let kernel_probe_va = pa_to_va(dma_phys_base()) as u64;
+    let kb = kernel_probe_va.to_le_bytes();
+    let mut kpti_pf_code = [0x90u8; 32];
+    let kpti_probe: [u8; 15] = [
+        0x48, 0xB8, kb[0], kb[1], kb[2], kb[3], kb[4], kb[5], kb[6], kb[7], // movabs rax, kernel_probe_va
+        0x48, 0x8B, 0x00, // mov rax, [rax]
+        0xCD, 0x80,
+    ];
+    kpti_pf_code[..kpti_probe.len()].copy_from_slice(&kpti_probe);
+    match exec_service_ring3_stub_isolated(1, 0, &kpti_pf_code, 0, 0, false) {
+        Err(Ring3FaultOutcome::CpuException {
+            vec: 14,
+            err_code,
+            cr2,
+            ..
+        }) if cr2 == kernel_probe_va && (err_code & 0x05) == 0x04 => {}
+        other => panic!("RING3: KPTI higher-half kernel read was not #PF(P=0): {:?}", other),
+    }
+
+    // Red Team Check 5: Writing to `PT[0]` user code page from Ring-3 triggers a `W^X` protection
+    // `#PF` (`P=1, W=1, U=1` -> `0x07`) and recovers cleanly.
+    let mut wx_pf_code = [0x90u8; 32];
+    let wx_probe: [u8; 9] = [
+        0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x90, // mov byte ptr [rip + 0], 0x90
+        0xCD, 0x80,
+    ];
+    wx_pf_code[..wx_probe.len()].copy_from_slice(&wx_probe);
+    match exec_service_ring3_stub_isolated(1, 0, &wx_pf_code, 0, 0, false) {
+        Err(Ring3FaultOutcome::CpuException {
+            vec: 14,
+            err_code,
+            cr2,
+            user_va,
+            ..
+        }) if cr2 == user_va + 7 && (err_code & 0x07) == 0x07 => {}
+        other => panic!("RING3: W^X user code write was not #PF(P|W|U): {:?}", other),
+    }
+
+    // Red Team Check 6: `svc-http` Ring-3 stub attempting `SYS_OPEN` (`edi = 5`, requires `FS_BYPASS`)
+    // under its bounded capability mask is denied with `Errno::EPERM`.
+    let mut unpriv_open_code = ring3_code;
+    unpriv_open_code[25..30].copy_from_slice(&[0xBF, 0x05, 0x00, 0x00, 0x00]); // mov edi, 5 (SYS_OPEN)
+    match exec_service_ring3_stub_isolated(
+        ServiceId::Http.pid() as u64,
+        ServiceId::Http.policy().cap_mask,
+        &unpriv_open_code,
+        0,
+        42,
+        false,
+    ) {
+        Err(Ring3FaultOutcome::SyscallDenied(Errno::EPERM)) => {}
+        other => panic!("RING3: unprivileged SYS_OPEN was not denied with EPERM: {:?}", other),
+    }
+
     serial_write_str("RING3 transition OK cpl=3->0 vec=0x80 ist1=ok rsp0=ok syscall=43\n");
 }
 

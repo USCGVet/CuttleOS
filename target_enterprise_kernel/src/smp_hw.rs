@@ -11,7 +11,7 @@
 //!   `kthreadd-wal`, and `cuttle-sh`/`worker`.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::{
     alloc_pt_frame, dec_u64, ensure_mmio_page, inb, mmio_read32, mmio_write32, outb, pa_to_va,
@@ -27,6 +27,8 @@ const STACK_WORDS: usize = 2048;
 
 /// Local APIC MMIO physical base address.
 const LAPIC_PHYS_BASE: u64 = 0xFEE0_0000;
+/// Local APIC ID Register offset.
+const LAPIC_ID: u64 = 0x0020;
 /// Local APIC Task Priority Register offset.
 const LAPIC_TPR: u64 = 0x0080;
 /// Local APIC End-Of-Interrupt Register offset.
@@ -63,9 +65,9 @@ const RUNTIME_GDT_PHYS: u64 = 0x8240;
 const RUNTIME_GDTR_PHYS: u64 = 0x8280;
 /// Physical address of the 10-byte Runtime `IDTR` descriptor.
 const RUNTIME_IDTR_PHYS: u64 = 0x8290;
-/// Physical address of `ISR_LAPIC_EOI` (25 bytes, handles Local APIC Timer vector `0x40`).
+/// Physical address of `ISR_LAPIC_EOI` (28 bytes, handles Local APIC Timer vector `0x40`).
 const ISR_LAPIC_EOI_PHYS: u64 = 0x8300;
-/// Physical address of `ISR_PIC_EOI` (11 bytes, handles legacy vectors `0x20..0x2F`).
+/// Physical address of `ISR_PIC_EOI` (10 bytes, handles legacy vectors `0x20..0x2F`).
 const ISR_PIC_EOI_PHYS: u64 = 0x8320;
 /// Physical address of `ISR_SPURIOUS` (2 bytes, `iretq`).
 const ISR_SPURIOUS_PHYS: u64 = 0x8340;
@@ -73,12 +75,14 @@ const ISR_SPURIOUS_PHYS: u64 = 0x8340;
 const LOAD_GDT_IDT_PHYS: u64 = 0x8350;
 /// Physical address of `SLEEP_HLT_CODE` (4 bytes: `sti; hlt; cli; ret`).
 const SLEEP_HLT_PHYS: u64 = 0x8370;
-/// Physical address of the 64-bit atomic Local APIC Timer (`vector 0x40`) wakeup counter.
-const IRQ_WAKEUPS_PHYS: u64 = 0x8380;
+/// Physical address storing `&HW_IRQ_WAKEUP_COUNTER` (`.bss` `RW+NX` atomic pointer).
+const IRQ_WAKEUPS_PTR_PHYS: u64 = 0x8380;
 /// Physical address storing `pa_to_va(LAPIC_PHYS_BASE + LAPIC_EOI) as u64`.
 const LAPIC_EOI_PTR_PHYS: u64 = 0x8388;
 /// Physical address of `ISR_LAPIC_DOORBELL` (17 bytes, handles Doorbell IPI `0x41` and non-timer LAPIC vectors without touching `0x8380`).
 const ISR_LAPIC_DOORBELL_PHYS: u64 = 0x8390;
+/// Physical address of `ISR_CPU_FAULT_DIAG` (23 bytes, diagnostic `COM1` + halt for unexpected Ring-0 CPU faults).
+const ISR_CPU_FAULT_DIAG_PHYS: u64 = 0x83B0;
 /// Physical page holding the 256-entry Runtime 64-bit IDT (`4096` bytes).
 const RUNTIME_IDT_PHYS: u64 = 0x9000;
 
@@ -128,6 +132,14 @@ static AP_BOOT_READY: [AtomicBool; MAX_SMP_CPUS] = [
     AtomicBool::new(false),
 ];
 
+/// Hardware Local APIC IDs observed on each core (`CPU 0..4`) via `0xFEE0_0020`.
+static HW_APIC_IDS: [AtomicU32; MAX_SMP_CPUS] = [
+    AtomicU32::new(0),
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+];
+
 /// Count of online hardware CPUs (`1` = BSP only, `4` = BSP + 3 APs).
 pub(crate) static HW_ONLINE_CPUS: AtomicUsize = AtomicUsize::new(1);
 
@@ -173,6 +185,10 @@ static CPU_WORK_SEED: [AtomicU64; MAX_SMP_CPUS] = [
 static SMP_WORK_HEAD: AtomicUsize = AtomicUsize::new(0);
 /// Total Doorbell IPIs (`vector 0x41`) transmitted via Local APIC `ICR_LO`.
 pub(crate) static HW_IPI_DOORBELLS: AtomicU64 = AtomicU64::new(0);
+/// Hardware Local APIC Timer (`vector 0x40`) wakeup counter in `.bss` (`RW+NX`, strict `W^X`).
+static HW_IRQ_WAKEUP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Dedicated 4 KiB Supervisor `RX`-only higher-half virtual address mapping physical page `0x8000`.
+static SMP_RX_TRAMPOLINE_VA: AtomicU64 = AtomicU64::new(0);
 
 /// Saved scheduler `%rsp` when switching from the BSP into a worker thread stack.
 static BSP_SCHED_RSP: AtomicU64 = AtomicU64::new(0);
@@ -204,6 +220,29 @@ static NEXT_KTHREAD_CURSOR: AtomicUsize = AtomicUsize::new(0);
 /// True once `smp_hw_init` has mapped `0x8000` and initialized the thread stacks.
 static SMP_HW_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+/// Translate a physical address inside `0x8000..0x9000` into its dedicated
+/// Supervisor Read+Execute (`W^X`, `PTE_W = 0`, `PTE_NX = 0`) higher-half virtual address.
+#[inline(always)]
+fn smp_rx_va(phys: u64) -> u64 {
+    let base = SMP_RX_TRAMPOLINE_VA.load(Ordering::Acquire);
+    if base == 0 {
+        panic!("SMP_HW: RX trampoline VA not initialized");
+    }
+    base + (phys - TRAMPOLINE_PAGE_PHYS)
+}
+
+/// Poll the Local APIC `ICR_LO` Delivery Status bit (`bit 12`) until Idle (`0`) or bounded timeout.
+#[inline]
+// SAFETY: Caller must execute at CPL=0 after `ensure_mmio_page(LAPIC_PHYS_BASE)` mapped `0xFEE0_0000`.
+unsafe fn wait_lapic_icr_idle() {
+    let icr_lo_va = pa_to_va(LAPIC_PHYS_BASE + LAPIC_ICR_LO).cast::<u32>();
+    let mut spins = 0u32;
+    while (unsafe { core::ptr::read_volatile(icr_lo_va) } & (1 << 12)) != 0 && spins < 50_000 {
+        core::hint::spin_loop();
+        spins += 1;
+    }
+}
+
 /// Send a broadcast Doorbell IPI (`vector 0x41`, All-Excluding-Self `0x000C_4041`)
 /// via the BSP Local APIC `ICR_LO` (`0xFEE0_0300`) to wake sleeping AP cores from `HLT`.
 #[inline]
@@ -214,22 +253,21 @@ pub(crate) fn ring_smp_doorbell() {
     }
     HW_IPI_DOORBELLS.fetch_add(1, Ordering::Relaxed);
     // SAFETY: `LAPIC_PHYS_BASE` (`0xFEE0_0000`) is mapped by `smp_hw_init` and writing `0x000C_4041`
-    // to `ICR_LO` (`0xFEE0_0300`) sends a Fixed broadcast-excluding-self IPI on vector `0x41`.
+    // to `ICR_LO` (`0xFEE0_0300`) after `wait_lapic_icr_idle` sends a Fixed broadcast-excluding-self IPI.
     unsafe {
+        wait_lapic_icr_idle();
         let icr_lo_va = pa_to_va(LAPIC_PHYS_BASE + LAPIC_ICR_LO).cast::<u32>();
         core::ptr::write_volatile(icr_lo_va, 0x000C_4000 | SMP_DOORBELL_VECTOR);
     }
 }
 
-/// Read the total hardware IRQ/IPI wakeup count recorded by `ISR_LAPIC_EOI` at `pa_to_va(0x8380)`.
+/// Read the total hardware Local APIC Timer (`vector 0x40`) wakeup count recorded in `.bss` (`HW_IRQ_WAKEUP_COUNTER`).
 #[inline]
 pub(crate) fn read_hw_irq_wakeups() -> u64 {
     if !SMP_HW_INITIALIZED.load(Ordering::Acquire) {
         return 0;
     }
-    let ptr = pa_to_va(IRQ_WAKEUPS_PHYS).cast::<u64>();
-    // SAFETY: `pa_to_va(0x8380)` is an 8-byte-aligned slot in mapped physical memory initialized by `smp_hw_init`.
-    unsafe { core::ptr::read_volatile(ptr) }
+    HW_IRQ_WAKEUP_COUNTER.load(Ordering::Acquire)
 }
 
 /// Push a parallel work seed onto a secondary AP core's queue and ring the Doorbell IPI (`0x41`).
@@ -265,33 +303,33 @@ fn execute_parallel_work_unit(seed: u64, cpu_id: u64) -> u64 {
     acc ^ (acc >> 31)
 }
 
-/// Invoke the 30-byte `load_runtime_gdt_idt` stub at `pa_to_va(0x8350)`.
+/// Invoke the 30-byte `load_runtime_gdt_idt` stub via its Supervisor `RX` alias (`smp_rx_va(0x8350)`).
 #[inline(never)]
-// SAFETY: Caller must execute at CPL=0 after `init_runtime_idt_and_isrs` has populated `0x8240..0x836E` and `0x9000`.
+// SAFETY: Caller must execute at CPL=0 after `init_runtime_idt_and_isrs` has populated `0x8240..0x83C7` and `0x9000`.
 unsafe fn invoke_load_runtime_gdt_idt() {
-    let code_va = pa_to_va(LOAD_GDT_IDT_PHYS) as usize;
+    let code_va = smp_rx_va(LOAD_GDT_IDT_PHYS) as usize;
     let gdtr_va = pa_to_va(RUNTIME_GDTR_PHYS) as u64;
     let idtr_va = pa_to_va(RUNTIME_IDTR_PHYS) as u64;
     let fn_ptr: unsafe extern "C" fn(u64, u64) =
-        // SAFETY: `pa_to_va(0x8350)` is mapped executable and contains `LOAD_GDT_IDT_CODE`.
+        // SAFETY: `smp_rx_va(0x8350)` is mapped Supervisor Read+Execute (`W^X`) and contains `LOAD_GDT_IDT_CODE`.
         unsafe { core::mem::transmute(code_va) };
     // SAFETY: `gdtr_va` and `idtr_va` point to valid 10-byte descriptors for `RUNTIME_GDT` and `RUNTIME_IDT`.
     unsafe { fn_ptr(gdtr_va, idtr_va) };
 }
 
-/// Invoke the 4-byte `sti; hlt; cli; ret` hardware sleep stub at `pa_to_va(0x8370)`.
+/// Invoke the 4-byte `sti; hlt; cli; ret` hardware sleep stub via `smp_rx_va(0x8370)`.
 ///
 /// Atomically unmasks interrupts and halts the CPU core (`C1` state, 0% host CPU)
 /// until the next hardware interrupt (Local APIC Timer `0x40` on BSP or Doorbell IPI
-/// `0x41` on APs) wakes the core and runs `ISR_LAPIC_EOI`.
+/// `0x41` on APs) wakes the core.
 #[inline(never)]
 // SAFETY: Caller must execute at CPL=0 after `invoke_load_runtime_gdt_idt` and Local APIC initialization.
 unsafe fn invoke_cpu_sleep_hlt() {
-    let code_va = pa_to_va(SLEEP_HLT_PHYS) as usize;
+    let code_va = smp_rx_va(SLEEP_HLT_PHYS) as usize;
     let fn_ptr: unsafe extern "C" fn() =
-        // SAFETY: `pa_to_va(0x8370)` is mapped executable and contains `[0xFB, 0xF4, 0xFA, 0xC3]`.
+        // SAFETY: `smp_rx_va(0x8370)` is mapped Supervisor Read+Execute (`W^X`) and contains `[0xFB, 0xF4, 0xFA, 0xC3]`.
         unsafe { core::mem::transmute(code_va) };
-    // SAFETY: Wakes via `ISR_LAPIC_EOI` (`iretq`) and returns with interrupts masked (`cli`).
+    // SAFETY: Wakes via `ISR_LAPIC_EOI` / `ISR_LAPIC_DOORBELL` (`iretq`) and returns with interrupts masked (`cli`).
     unsafe { fn_ptr() };
 }
 
@@ -303,10 +341,13 @@ pub extern "C" fn cuttle_ap_entry(cpu_id: u64) -> ! {
     let idx = (cpu_id as usize) & (MAX_SMP_CPUS - 1);
 
     // 1. Load the shared higher-half 64-bit Runtime GDT (`CS=0x08, SS=0x10`) and 256-entry Runtime IDT,
-    //    and enable this AP core's Local APIC (`SVR = 0x1FF`, `TPR = 0`, `ESR = 0`).
+    //    record this core's hardware Local APIC ID (`0xFEE0_0020`), and enable its Local APIC (`SVR = 0x1FF`).
     // SAFETY: Running at CPL=0 in 64-bit Long Mode after `init_runtime_idt_and_isrs` mapped `0x8000`, `0x9000`, and `0xFEE0_0000`.
     unsafe {
         invoke_load_runtime_gdt_idt();
+        let id_ptr = pa_to_va(LAPIC_PHYS_BASE + LAPIC_ID).cast::<u32>();
+        let hw_apic_id = core::ptr::read_volatile(id_ptr) >> 24;
+        HW_APIC_IDS[idx].store(hw_apic_id, Ordering::Release);
         let svr_ptr = pa_to_va(LAPIC_PHYS_BASE + LAPIC_SVR).cast::<u32>();
         let tpr_ptr = pa_to_va(LAPIC_PHYS_BASE + LAPIC_TPR).cast::<u32>();
         let esr_ptr = pa_to_va(LAPIC_PHYS_BASE + LAPIC_ESR).cast::<u32>();
@@ -341,19 +382,19 @@ pub extern "C" fn cuttle_ap_entry(cpu_id: u64) -> ! {
     }
 }
 
-/// Invoke the 27-byte hardware stack context switcher installed at `pa_to_va(0x8200)`.
+/// Invoke the 27-byte hardware stack context switcher via `smp_rx_va(0x8200)` (`W^X`).
 ///
 /// Saves `rbp, rbx, r12, r13, r14, r15` and `%rsp` into `*old_rsp_ptr`, loads
 /// `%rsp` from `*new_rsp_ptr`, pops `r15..rbp`, and `ret`s onto the new stack.
 #[inline(never)]
-// SAFETY: Caller must ensure `pa_to_va(0x8200)` contains the initialized `cuttle_switch_context`
-// machine code with `PTE_NX` cleared and that `old_rsp_ptr` and `new_rsp_ptr` point to valid
-// 8-byte stack-pointer slots whose target stacks follow `[r15, r14, r13, r12, rbx, rbp, rip]`.
+// SAFETY: Caller must ensure `smp_rx_va(0x8200)` is mapped Supervisor `RX` and populated with
+// `cuttle_switch_context`, and that `old_rsp_ptr` and `new_rsp_ptr` point to valid 8-byte
+// stack-pointer slots whose target stacks follow `[r15, r14, r13, r12, rbx, rbp, rip]`.
 unsafe fn invoke_switch_context(old_rsp_ptr: *mut u64, new_rsp_ptr: *const u64) {
-    let code_va = pa_to_va(SWITCH_CONTEXT_VA) as usize;
+    let code_va = smp_rx_va(SWITCH_CONTEXT_VA) as usize;
     let fn_ptr: unsafe extern "C" fn(*mut u64, *const u64) =
-        // SAFETY: `pa_to_va(0x8200)` is mapped executable by `make_va_executable` and populated
-        // with the 27-byte System V AMD64 `cuttle_switch_context` routine before any call.
+        // SAFETY: `smp_rx_va(0x8200)` is mapped Supervisor Read+Execute (`PTE_W = 0`, `PTE_NX = 0`)
+        // and populated with the 27-byte System V AMD64 `cuttle_switch_context` routine before any call.
         unsafe { core::mem::transmute(code_va) };
     // SAFETY: Caller guarantees both stack pointer slots and target hardware stacks are valid.
     unsafe { fn_ptr(old_rsp_ptr, new_rsp_ptr) };
@@ -389,49 +430,57 @@ pub extern "C" fn kthread_worker_entry() -> ! {
     }
 }
 
-/// Clear `PTE_NX` (`bit 63`) along all active page-table levels covering `va`
-/// so code placed at `va` (`pa_to_va(0x8200)`) can be executed at CPL=0.
-// SAFETY: Caller must pass a mapped canonical kernel virtual address at CPL=0.
-unsafe fn make_va_executable(va: u64) {
-    let indices = [
-        ((va >> 39) & 0x1FF) as usize,
-        ((va >> 30) & 0x1FF) as usize,
-        ((va >> 21) & 0x1FF) as usize,
-        ((va >> 12) & 0x1FF) as usize,
-    ];
-    let pte_nx: u64 = 1u64 << 63;
-    // SAFETY: Running at CPL=0; `read_cr3()` returns the active 4-level PML4 physical address.
-    let mut table = unsafe { read_cr3() } & PTE_ADDR_MASK;
-    let mut level = 0usize;
-    while level < 4 {
-        // SAFETY: `table` is a valid page-table physical frame mapped via `pa_to_va` and `indices[level] < 512`.
-        let ent_ptr = unsafe { pa_to_va(table).cast::<u64>().add(indices[level]) };
-        // SAFETY: `ent_ptr` is an 8-byte-aligned page-table entry in mapped physical RAM.
-        let ent = unsafe { core::ptr::read_volatile(ent_ptr) };
+/// Map physical page `0x8000` into an unused higher-half PML4 slot (`256..512`) as a
+/// dedicated 4 KiB Supervisor Read+Execute (`PTE_P` only: `PTE_W = 0`, `PTE_U = 0`, `PTE_NX = 0`)
+/// page so `PHYS_MAP_OFFSET` stays strictly `RW+NX` (zero `RWX` pages anywhere in kernel space).
+// SAFETY: Caller must execute at CPL=0 after `set_phys_offset` initialized `PHYS_MAP_OFFSET` and `PT_ALLOC_NEXT`.
+unsafe fn map_smp_rx_trampoline_page() -> u64 {
+    let existing = SMP_RX_TRAMPOLINE_VA.load(Ordering::Acquire);
+    if existing != 0 {
+        return existing;
+    }
+    // SAFETY: Running at CPL=0; `read_cr3()` returns the active 4-level kernel PML4 physical address.
+    let pml4_phys = unsafe { read_cr3() } & PTE_ADDR_MASK;
+    let pml4_ptr = pa_to_va(pml4_phys).cast::<u64>();
+    let mut chosen_slot: Option<usize> = None;
+    let mut s = 256usize;
+    while s < 512 {
+        // SAFETY: `s < 512` inside the mapped 4 KiB kernel PML4 frame.
+        let ent = unsafe { core::ptr::read_volatile(pml4_ptr.add(s)) };
         if ent & PTE_P == 0 {
-            return;
-        }
-        if (ent & pte_nx) != 0 || (ent & PTE_W) == 0 {
-            // SAFETY: `ent_ptr` is a valid PTE in mapped physical RAM.
-            unsafe {
-                core::ptr::write_volatile(ent_ptr, (ent & !pte_nx) | PTE_P | PTE_W);
-            }
-        }
-        if ent & PTE_PS != 0 || level == 3 {
+            chosen_slot = Some(s);
             break;
         }
-        table = ent & PTE_ADDR_MASK;
-        level += 1;
+        s += 1;
     }
-    // SAFETY: `invlpg` is privileged-safe at CPL=0 for any canonical address `va`.
+    let slot = match chosen_slot {
+        Some(idx) => idx,
+        None => panic!("SMP_HW: no free higher-half PML4 slot for RX trampoline"),
+    };
+    // SAFETY: Running at CPL=0 with initialized page-table frame pool.
+    let pdpt_phys = unsafe { alloc_pt_frame() };
+    // SAFETY: Running at CPL=0 with initialized page-table frame pool.
+    let pd_phys = unsafe { alloc_pt_frame() };
+    // SAFETY: Running at CPL=0 with initialized page-table frame pool.
+    let pt_phys = unsafe { alloc_pt_frame() };
+
+    let va = 0xFFFF_0000_0000_0000u64 | ((slot as u64) << 39);
+    // Strict `W^X`: `PTE_P` only (`PTE_W = 0`, `PTE_U = 0`, `PTE_NX = 0`) at all 4 levels.
+    // SAFETY: `pdpt_phys`, `pd_phys`, `pt_phys`, and `pml4_ptr.add(slot)` are valid 8-byte-aligned PTEs in mapped RAM.
     unsafe {
+        core::ptr::write_volatile(pa_to_va(pt_phys).cast::<u64>(), TRAMPOLINE_PAGE_PHYS | PTE_P);
+        core::ptr::write_volatile(pa_to_va(pd_phys).cast::<u64>(), pt_phys | PTE_P);
+        core::ptr::write_volatile(pa_to_va(pdpt_phys).cast::<u64>(), pd_phys | PTE_P);
+        core::ptr::write_volatile(pml4_ptr.add(slot), pdpt_phys | PTE_P);
         asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
     }
+    SMP_RX_TRAMPOLINE_VA.store(va, Ordering::Release);
+    va
 }
 
 /// Temporarily identity-map virtual page `0x8000` -> physical page `0x8000`
-/// (`PTE_P | PTE_W`, `PTE_NX = 0`) for AP startup, returning `(pte_ptr, orig_pte)`
-/// so the caller can restore any prior mapping at `0x8000` once APs are in 64-bit mode.
+/// as Supervisor Read+Execute (`PTE_P`, `PTE_W = 0`, `PTE_U = 0`, `PTE_NX = 0`) for AP startup,
+/// returning `(pte_ptr, orig_pte)` so the caller restores any prior mapping once APs enter Long Mode.
 // SAFETY: Caller must execute at CPL=0 after `set_phys_offset` has initialized `PHYS_MAP_OFFSET` and `DMA_PHYS_BASE`.
 unsafe fn map_temp_identity_trampoline(phys_page: u64) -> (*mut u64, u64) {
     let va = phys_page & !0xFFFu64;
@@ -460,10 +509,10 @@ unsafe fn map_temp_identity_trampoline(phys_page: u64) -> (*mut u64, u64) {
             table = new_t;
         } else if ent & PTE_PS != 0 {
             // Temporarily replace the huge-page mapping at `va = 0` with an identity-mapped
-            // executable huge page (`phys = 0`) and return `(ent_ptr, ent)` for restoration.
+            // Supervisor Read+Execute (`PTE_P | PTE_PS`, `PTE_W = 0`) huge page and return `(ent_ptr, ent)`.
             // SAFETY: `ent_ptr` is a valid huge-page PTE in mapped physical memory.
             unsafe {
-                core::ptr::write_volatile(ent_ptr, PTE_P | PTE_W | PTE_PS);
+                core::ptr::write_volatile(ent_ptr, PTE_P | PTE_PS);
                 asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
             }
             return (ent_ptr, ent);
@@ -471,7 +520,7 @@ unsafe fn map_temp_identity_trampoline(phys_page: u64) -> (*mut u64, u64) {
             if (ent & pte_nx) != 0 {
                 // SAFETY: `ent_ptr` is a valid intermediate PTE in mapped physical memory.
                 unsafe {
-                    core::ptr::write_volatile(ent_ptr, (ent & !pte_nx) | PTE_P | PTE_W);
+                    core::ptr::write_volatile(ent_ptr, (ent & !pte_nx) | PTE_P);
                 }
             }
             table = ent & PTE_ADDR_MASK;
@@ -482,7 +531,8 @@ unsafe fn map_temp_identity_trampoline(phys_page: u64) -> (*mut u64, u64) {
     let leaf = unsafe { pa_to_va(table).cast::<u64>().add(indices[3]) };
     // SAFETY: `leaf` is a valid L1 PTE in mapped physical memory.
     let orig_pte = unsafe { core::ptr::read_volatile(leaf) };
-    let pte = va | PTE_P | PTE_W;
+    // Strict `W^X`: Supervisor Read+Execute (`PTE_P` only, `PTE_W = 0`, `PTE_U = 0`, `PTE_NX = 0`).
+    let pte = va | PTE_P;
     // SAFETY: `leaf` is a valid L1 PTE in mapped physical memory and `invlpg` is privileged-safe at CPL=0.
     unsafe {
         core::ptr::write_volatile(leaf, pte);
@@ -546,35 +596,40 @@ unsafe fn write_idt_gate(idt_base: *mut u8, vec_idx: usize, handler_va: u64) {
 }
 
 /// Initialize the shared 64-bit Runtime GDT (`0x8240`), 256-entry Runtime IDT (`0x9000`),
-/// hardware ISR stubs (`0x8300..0x8374`), legacy 8259 PIC remap/mask, and load `GDTR`/`IDTR` on `CPU 0`.
-// SAFETY: Caller must execute at CPL=0 after `make_va_executable(pa_to_va(0x8000))` has cleared `PTE_NX`.
+/// hardware ISR stubs (`0x8300..0x83C7`), legacy 8259 PIC remap/mask, and load `GDTR`/`IDTR` on `CPU 0`.
+// SAFETY: Caller must execute at CPL=0 after `map_smp_rx_trampoline_page()` mapped `SMP_RX_TRAMPOLINE_VA`.
 unsafe fn init_runtime_idt_and_isrs() {
     // 1. Map the Local APIC MMIO page (`0xFEE0_0000`) into the shared higher-half page tables
     //    so both the BSP and all secondary APs can access `LAPIC_EOI` (`0xFEE0_00B0`) directly.
     // SAFETY: `LAPIC_PHYS_BASE` is the architectural x86-64 Local APIC MMIO frame.
     let lapic_page_va = unsafe { ensure_mmio_page(LAPIC_PHYS_BASE) as u64 };
     let lapic_eoi_va = lapic_page_va + LAPIC_EOI;
+    let wakeup_counter_va = HW_IRQ_WAKEUP_COUNTER.as_ptr() as usize as u64;
 
-    // 2. Initialize the atomic IRQ wakeup counter (`0x8380`) and `LAPIC_EOI` pointer (`0x8388`).
-    // SAFETY: `0x8380` and `0x8388` are 8-byte-aligned slots inside the mapped `0x8000` frame.
+    // 2. Store `&HW_IRQ_WAKEUP_COUNTER` (`.bss` `RW+NX`) at `0x8380` and `LAPIC_EOI` pointer at `0x8388`.
+    // SAFETY: `0x8380` and `0x8388` are 8-byte-aligned slots inside the mapped `0x8000` frame (`PHYS_MAP_OFFSET`, `RW+NX`).
     unsafe {
-        core::ptr::write_volatile(pa_to_va(IRQ_WAKEUPS_PHYS).cast::<u64>(), 0);
+        HW_IRQ_WAKEUP_COUNTER.store(0, Ordering::Release);
+        core::ptr::write_volatile(
+            pa_to_va(IRQ_WAKEUPS_PTR_PHYS).cast::<u64>(),
+            wakeup_counter_va,
+        );
         core::ptr::write_volatile(pa_to_va(LAPIC_EOI_PTR_PHYS).cast::<u64>(), lapic_eoi_va);
     }
 
-    // 3. Install `ISR_LAPIC_EOI` at `0x8300` (handles Local APIC Timer `0x40` and Doorbell IPI `0x41`):
+    // 3. Install `ISR_LAPIC_EOI` at `0x8300` (handles Local APIC Timer `0x40` under strict `W^X`):
     //      push rax
-    //      lea  rax, [rip + 0x78]       -> 0x8380 (IRQ_WAKEUPS_PHYS)
-    //      lock inc qword ptr [rax]
-    //      mov  rax, [rax + 8]          -> 0x8388 (LAPIC_EOI_PTR_PHYS)
-    //      mov  dword ptr [rax], 0      -> write 0 to LAPIC_EOI
+    //      mov  rax, [rip + 0x78]       -> reads &HW_IRQ_WAKEUP_COUNTER from 0x8380
+    //      lock inc qword ptr [rax]     -> increments .bss RW+NX counter (zero writes to RX page!)
+    //      mov  rax, [rip + 0x75]       -> reads lapic_eoi_va from 0x8388
+    //      mov  dword ptr [rax], 0      -> writes 0 to LAPIC_EOI MMIO
     //      pop  rax
     //      iretq
-    const ISR_LAPIC_EOI: [u8; 25] = [
+    const ISR_LAPIC_EOI: [u8; 28] = [
         0x50,
-        0x48, 0x8D, 0x05, 0x78, 0x00, 0x00, 0x00,
+        0x48, 0x8B, 0x05, 0x78, 0x00, 0x00, 0x00,
         0xF0, 0x48, 0xFF, 0x00,
-        0x48, 0x8B, 0x40, 0x08,
+        0x48, 0x8B, 0x05, 0x75, 0x00, 0x00, 0x00,
         0xC7, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x58,
         0x48, 0xCF,
@@ -595,7 +650,7 @@ unsafe fn init_runtime_idt_and_isrs() {
         0x0F, 0x01, 0x17,                         // lgdt [rdi]
         0x0F, 0x01, 0x1E,                         // lidt [rsi]
         0x6A, 0x08,                               // push 0x08
-        0x48, 0x8D, 0x05, 0x03, 0x00, 0x00, 0x00, // lea rax, [rip + 3] -> 0x8362
+        0x48, 0x8D, 0x05, 0x03, 0x00, 0x00, 0x00, // lea rax, [rip + 3] -> +0x362
         0x50,                                     // push rax
         0x48, 0xCB,                               // retfq
         0xB8, 0x10, 0x00, 0x00, 0x00,             // mov eax, 0x10
@@ -607,13 +662,7 @@ unsafe fn init_runtime_idt_and_isrs() {
     // 7. Install `SLEEP_HLT_CODE` at `0x8370` (`sti; hlt; cli; ret`):
     const SLEEP_HLT_CODE: [u8; 4] = [0xFB, 0xF4, 0xFA, 0xC3];
     // 7b. Install `ISR_LAPIC_DOORBELL` at `0x8390` (handles Doorbell IPI `0x41` and non-timer
-    //     LAPIC vectors `0x30..0xFE` except `0x40`, writing 0 to `LAPIC_EOI` without incrementing
-    //     the timer-only counter at `0x8380`):
-    //      push rax
-    //      mov  rax, [rip - 16]         -> 0x8388 (LAPIC_EOI_PTR_PHYS)
-    //      mov  dword ptr [rax], 0      -> write 0 to LAPIC_EOI
-    //      pop  rax
-    //      iretq
+    //     LAPIC vectors `0x30..0xFE` except `0x40`, writing 0 to `LAPIC_EOI` without touching `0x8380`):
     const ISR_LAPIC_DOORBELL: [u8; 17] = [
         0x50,
         0x48, 0x8B, 0x05, 0xF0, 0xFF, 0xFF, 0xFF,
@@ -621,8 +670,21 @@ unsafe fn init_runtime_idt_and_isrs() {
         0x58,
         0x48, 0xCF,
     ];
+    // 7c. Install `ISR_CPU_FAULT_DIAG` at `0x83B0` (emits `!EXC\n` on `COM1` `0x3F8` and halts
+    //     so unexpected Ring-0 CPU faults never silently `iretq` with an unpopped error code):
+    const ISR_CPU_FAULT_DIAG: [u8; 23] = [
+        0xFA,                   // cli
+        0x66, 0xBA, 0xF8, 0x03, // mov dx, 0x03F8
+        0xB0, b'!', 0xEE,       // out dx, '!'
+        0xB0, b'E', 0xEE,       // out dx, 'E'
+        0xB0, b'X', 0xEE,       // out dx, 'X'
+        0xB0, b'C', 0xEE,       // out dx, 'C'
+        0xB0, b'\n', 0xEE,      // out dx, '\n'
+        0xF4,                   // hlt
+        0xEB, 0xFD,             // jmp -3
+    ];
 
-    // SAFETY: All destination offsets (`0x8300..0x83A1`) lie within the mapped `0x8000` page.
+    // SAFETY: All destination offsets (`0x8300..0x83C7`) lie within the mapped `0x8000` page (`PHYS_MAP_OFFSET`, `RW+NX`).
     unsafe {
         let mut i = 0usize;
         while i < ISR_LAPIC_EOI.len() {
@@ -636,6 +698,14 @@ unsafe fn init_runtime_idt_and_isrs() {
                 ISR_LAPIC_DOORBELL[d],
             );
             d += 1;
+        }
+        let mut f = 0usize;
+        while f < ISR_CPU_FAULT_DIAG.len() {
+            core::ptr::write_volatile(
+                pa_to_va(ISR_CPU_FAULT_DIAG_PHYS).add(f),
+                ISR_CPU_FAULT_DIAG[f],
+            );
+            f += 1;
         }
         let mut j = 0usize;
         while j < ISR_PIC_EOI.len() {
@@ -656,20 +726,22 @@ unsafe fn init_runtime_idt_and_isrs() {
         }
     }
 
-    // 8. Build the 5-entry 64-bit Runtime GDT at `pa_to_va(0x8240)` and 256-entry Runtime IDT at `pa_to_va(0x9000)`.
+    // 8. Build the 5-entry 64-bit Runtime GDT at `pa_to_va(0x8240)` (`RW+NX`) and 256-entry Runtime IDT at `pa_to_va(0x9000)` (`RW+NX`),
+    //    pointing every IDT gate to the dedicated Supervisor `RX` alias (`smp_rx_va(...)`).
     const RUNTIME_GDT_ENTRIES: [u64; 5] = [
         0x0000_0000_0000_0000, // 0x00: Null
-        0x00AF_9A00_0000_FFFF, // 0x08: 64-bit Code (DPL=0, L=1)
-        0x00CF_9200_0000_FFFF, // 0x10: 64-bit Data (DPL=0, W=1)
-        0x00AF_9A00_0000_FFFF, // 0x18: 64-bit Code alias
-        0x00CF_9200_0000_FFFF, // 0x20: 64-bit Data alias
+        0x00AF_9B00_0000_FFFF, // 0x08: 64-bit Code (DPL=0, L=1, Accessed=1)
+        0x00CF_9300_0000_FFFF, // 0x10: 64-bit Data (DPL=0, W=1, Accessed=1)
+        0x00AF_9B00_0000_FFFF, // 0x18: 64-bit Code alias
+        0x00CF_9300_0000_FFFF, // 0x20: 64-bit Data alias
     ];
     let gdt_va = pa_to_va(RUNTIME_GDT_PHYS) as u64;
     let idt_va = pa_to_va(RUNTIME_IDT_PHYS) as u64;
-    let isr_lapic_va = pa_to_va(ISR_LAPIC_EOI_PHYS) as u64;
-    let isr_doorbell_va = pa_to_va(ISR_LAPIC_DOORBELL_PHYS) as u64;
-    let isr_pic_va = pa_to_va(ISR_PIC_EOI_PHYS) as u64;
-    let isr_spurious_va = pa_to_va(ISR_SPURIOUS_PHYS) as u64;
+    let isr_lapic_va = smp_rx_va(ISR_LAPIC_EOI_PHYS);
+    let isr_doorbell_va = smp_rx_va(ISR_LAPIC_DOORBELL_PHYS);
+    let isr_pic_va = smp_rx_va(ISR_PIC_EOI_PHYS);
+    let isr_spurious_va = smp_rx_va(ISR_SPURIOUS_PHYS);
+    let isr_fault_diag_va = smp_rx_va(ISR_CPU_FAULT_DIAG_PHYS);
 
     // SAFETY: `RUNTIME_GDT_PHYS` (`0x8240`) and `RUNTIME_IDT_PHYS` (`0x9000`) are mapped physical RAM frames.
     unsafe {
@@ -683,7 +755,13 @@ unsafe fn init_runtime_idt_and_isrs() {
         let idt_ptr = pa_to_va(RUNTIME_IDT_PHYS);
         let mut v = 0usize;
         while v < 256 {
-            let handler = if v < 0x20 || v == 0xFF {
+            let handler = if v < 0x20 {
+                if v == 2 || v == 3 {
+                    isr_spurious_va
+                } else {
+                    isr_fault_diag_va
+                }
+            } else if v == 0xFF {
                 isr_spurious_va
             } else if v < 0x30 {
                 isr_pic_va
@@ -738,8 +816,8 @@ unsafe fn init_runtime_idt_and_isrs() {
 }
 
 /// Initialize the 4 hardware kernel thread stacks (`KTHREAD_STACKS[0..4]`) and
-/// install the 27-byte `cuttle_switch_context` routine at `pa_to_va(0x8200)`.
-// SAFETY: Caller must execute at CPL=0 after `make_va_executable(pa_to_va(0x8200))` has cleared `PTE_NX`.
+/// install the 27-byte `cuttle_switch_context` routine at `pa_to_va(0x8200)` (`executed via smp_rx_va(0x8200)`).
+// SAFETY: Caller must execute at CPL=0 after `set_phys_offset` mapped `PHYS_MAP_OFFSET`.
 unsafe fn init_kthread_stacks() {
     // 27-byte System V AMD64 context switcher at 0x8200:
     //   push rbp; push rbx; push r12; push r13; push r14; push r15
@@ -754,7 +832,7 @@ unsafe fn init_kthread_stacks() {
     let dst = pa_to_va(SWITCH_CONTEXT_VA);
     let mut i = 0usize;
     while i < SWITCH_CODE.len() {
-        // SAFETY: `dst` points to `pa_to_va(0x8200)` inside the mapped physical memory window.
+        // SAFETY: `dst` points to `pa_to_va(0x8200)` inside the mapped physical memory window (`RW+NX`).
         unsafe {
             core::ptr::write_volatile(dst.add(i), SWITCH_CODE[i]);
         }
@@ -884,25 +962,29 @@ pub(crate) fn smp_hw_idle_wait() {
     HW_CPU_TICKS[0].fetch_add(1, Ordering::Relaxed);
 }
 
-/// Install the x86-64 AP startup trampoline at `0x8000`, wake secondary
-/// hardware cores (`AP 1..=3`) via Local APIC `INIT` + `SIPI`, and initialize
+/// Install the x86-64 AP startup trampoline at `0x8000` (mapped `RX` via `SMP_RX_TRAMPOLINE_VA`
+/// without clearing `PTE_NX` on `PHYS_MAP_OFFSET`), enforce `WP + NXE + SMEP` across BSP + APs,
+/// wake secondary hardware cores (`AP 1..=3`) via Local APIC `INIT` + `SIPI`, and initialize
 /// the 4 hardware kernel thread stacks and Runtime IDT/ISRs.
 pub(crate) fn smp_hw_init() -> usize {
     if SMP_HW_INITIALIZED.load(Ordering::Acquire) {
         return HW_ONLINE_CPUS.load(Ordering::Acquire);
     }
 
-    // 1. Make `pa_to_va(0x8200)` executable (`PTE_NX = 0`), initialize Runtime GDT/IDT/ISRs,
-    //    and initialize the 4 hardware kernel thread stacks.
+    // 1. Enable hardware `NXE + WP + SMEP` on the BSP (so APs inherit identical protections via
+    //    `read_bsp_control_regs()`), map the dedicated 4 KiB Supervisor `RX` trampoline alias,
+    //    initialize Runtime GDT/IDT/ISRs, and initialize the 4 hardware kernel thread stacks.
     // SAFETY: Running at CPL=0 after `set_phys_offset` initialized the physical memory map.
     unsafe {
-        make_va_executable(pa_to_va(SWITCH_CONTEXT_VA) as u64);
+        crate::banners_arch_platform::enable_cpu_memory_protections();
+        let _ = map_smp_rx_trampoline_page();
         init_runtime_idt_and_isrs();
         init_kthread_stacks();
     }
 
     // 2. Write the 16-bit Real Mode -> 32-bit Protected Mode -> 64-bit Long Mode
-    //    trampoline and GDT to `0x8000..0x80B8`.
+    //    trampoline and GDT (with Accessed bits pre-set so `RX` mapping at `0x8000` never faults
+    //    under `CR0.WP = 1`) to `0x8000..0x80B8`.
     const AP_TRAMPOLINE: [u8; 184] = [
         // 0x00: 16-bit Real Mode (CS=0x0800, IP=0x0000 -> linear 0x8000)
         0xFA, // cli
@@ -948,18 +1030,18 @@ pub(crate) fn smp_hw_init() -> usize {
         // 0x80: GDTR (limit=0x0027, base=0x00008090) + padding to 0x90
         0x27, 0x00, 0x90, 0x80, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        // 0x90: GDT (0x00 null, 0x08 code32, 0x10 data32, 0x18 code64, 0x20 data64)
+        // 0x90: GDT (0x00 null, 0x08 code32, 0x10 data32, 0x18 code64, 0x20 data64; Accessed=1)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00,
-        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00,
-        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xAF, 0x00,
-        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00,
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9B, 0xCF, 0x00,
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x93, 0xCF, 0x00,
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9B, 0xAF, 0x00,
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x93, 0xCF, 0x00,
     ];
 
     let tramp_va = pa_to_va(TRAMPOLINE_PAGE_PHYS);
     let mut i = 0usize;
     while i < AP_TRAMPOLINE.len() {
-        // SAFETY: `tramp_va` points to physical page `0x8000` mapped via `pa_to_va`.
+        // SAFETY: `tramp_va` points to physical page `0x8000` mapped via `pa_to_va` (`RW+NX`).
         unsafe {
             core::ptr::write_volatile(tramp_va.add(i), AP_TRAMPOLINE[i]);
         }
@@ -979,13 +1061,15 @@ pub(crate) fn smp_hw_init() -> usize {
         core::ptr::write_volatile(tramp_va.add(0x12C).cast::<u32>(), cr0);
     }
 
-    // 4. Temporarily identity-map virtual `0x8000` -> physical `0x8000`, enable the BSP Local APIC,
-    //    and wake APs `1..=3` via `INIT` + `SIPI`.
+    // 4. Temporarily identity-map virtual `0x8000` -> physical `0x8000` (`Supervisor RX`), enable the
+    //    BSP Local APIC, and wake APs `1..=3` via `INIT` + `SIPI`.
     // SAFETY: Running at CPL=0 with initialized page-table pool.
     let (saved_pte_ptr, orig_pte) = unsafe { map_temp_identity_trampoline(TRAMPOLINE_PAGE_PHYS) };
 
     // SAFETY: `LAPIC_PHYS_BASE` (`0xFEE0_0000`) is the architectural x86-64 Local APIC MMIO page.
     unsafe {
+        let bsp_apic_id = mmio_read32(LAPIC_PHYS_BASE + LAPIC_ID) >> 24;
+        HW_APIC_IDS[0].store(bsp_apic_id, Ordering::Release);
         let svr = mmio_read32(LAPIC_PHYS_BASE + LAPIC_SVR);
         mmio_write32(LAPIC_PHYS_BASE + LAPIC_SVR, svr | 0x1FF);
         mmio_write32(LAPIC_PHYS_BASE + LAPIC_TPR, 0);
@@ -1003,10 +1087,12 @@ pub(crate) fn smp_hw_init() -> usize {
         core::sync::atomic::fence(Ordering::SeqCst);
 
         // Send INIT IPI (`0x0000_4500`) to `apic_id = cpu_id`.
-        // SAFETY: Writing `ICR_HI` (`0xFEE0_0310`) followed by `ICR_LO` (`0xFEE0_0300`) dispatches an IPI to `cpu_id`.
+        // SAFETY: Polling `ICR_LO` idle then writing `ICR_HI` + `ICR_LO` dispatches an IPI to `cpu_id`.
         unsafe {
+            wait_lapic_icr_idle();
             mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_HI, (cpu_id as u32) << 24);
             mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_LO, 0x0000_4500);
+            wait_lapic_icr_idle();
         }
         let mut d = 0u32;
         while d < 10_000 {
@@ -1015,10 +1101,12 @@ pub(crate) fn smp_hw_init() -> usize {
         }
 
         // Send SIPI IPI (`0x0000_4608`, vector `0x08` -> physical `0x8000`).
-        // SAFETY: Writing `ICR_HI` and `ICR_LO` sends a Startup IPI with vector `0x08` (`0x8000`) to `cpu_id`.
+        // SAFETY: Polling `ICR_LO` idle then writing `ICR_HI` + `ICR_LO` sends a Startup IPI to `cpu_id`.
         unsafe {
+            wait_lapic_icr_idle();
             mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_HI, (cpu_id as u32) << 24);
             mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_LO, 0x0000_4608);
+            wait_lapic_icr_idle();
         }
 
         let mut spins = 0u32;
@@ -1027,8 +1115,10 @@ pub(crate) fn smp_hw_init() -> usize {
                 // Second SIPI per Intel MP specification if first did not latch yet.
                 // SAFETY: Re-sending Startup IPI with vector `0x08` to `cpu_id` before AP ready flag is set.
                 unsafe {
+                    wait_lapic_icr_idle();
                     mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_HI, (cpu_id as u32) << 24);
                     mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_LO, 0x0000_4608);
+                    wait_lapic_icr_idle();
                 }
             }
             core::hint::spin_loop();
@@ -1053,6 +1143,44 @@ pub(crate) fn smp_hw_init() -> usize {
 
     SMP_HW_INITIALIZED.store(true, Ordering::Release);
     HW_ONLINE_CPUS.load(Ordering::Acquire)
+}
+
+/// Walk the active 4-level kernel page table for `va` and return `(present, eff_writable, eff_executable)`.
+// SAFETY: Caller must execute at CPL=0 with active 4-level paging and initialized `PHYS_MAP_OFFSET`.
+unsafe fn walk_va_effective_wx(va: u64) -> (bool, bool, bool) {
+    let indices = [
+        ((va >> 39) & 0x1FF) as usize,
+        ((va >> 30) & 0x1FF) as usize,
+        ((va >> 21) & 0x1FF) as usize,
+        ((va >> 12) & 0x1FF) as usize,
+    ];
+    let pte_nx: u64 = 1u64 << 63;
+    // SAFETY: Running at CPL=0; `read_cr3()` returns the active PML4 physical address.
+    let mut table = unsafe { read_cr3() } & PTE_ADDR_MASK;
+    let mut all_writable = true;
+    let mut any_nx = false;
+    let mut level = 0usize;
+    while level < 4 {
+        // SAFETY: `table` is a valid page-table frame mapped via `pa_to_va` and `indices[level] < 512`.
+        let ent_ptr = unsafe { pa_to_va(table).cast::<u64>().add(indices[level]) };
+        // SAFETY: `ent_ptr` is an 8-byte-aligned PTE slot in mapped physical memory.
+        let ent = unsafe { core::ptr::read_volatile(ent_ptr) };
+        if ent & PTE_P == 0 {
+            return (false, false, false);
+        }
+        if ent & PTE_W == 0 {
+            all_writable = false;
+        }
+        if (ent & pte_nx) != 0 {
+            any_nx = true;
+        }
+        if ent & PTE_PS != 0 || level == 3 {
+            return (true, all_writable, !any_nx);
+        }
+        table = ent & PTE_ADDR_MASK;
+        level += 1;
+    }
+    (false, false, false)
 }
 
 /// Synchronize live hardware SMP and multi-stack thread telemetry into `OsShell`,
@@ -1119,17 +1247,41 @@ pub(crate) fn smp_hw_tick_and_sync(sh: &mut target_enterprise::OsShell) {
     let _ = sh.tick_cron_jobs(1);
 }
 
-/// Boot self-proof banner for hardware SMP AP bringup, Doorbell IPI (`0x41`) wakeup
-/// from `HLT`, and multi-stack kernel thread context switching.
+/// Boot self-proof banner for hardware SMP AP bringup, strict `W^X` RX trampoline,
+/// Doorbell IPI (`0x41`) wakeup from `HLT`, and multi-stack kernel thread context switching.
 ///
-/// Boots all available secondary hardware cores, switches across all 4 dedicated
-/// 16 KiB kernel thread stacks (`KTHREAD_STACKS`), verifies each thread executed
-/// with `%rsp` inside its own stack allocation, wakes sleeping AP cores from `HLT`
+/// Boots all available secondary hardware cores, verifies `SMP_RX_TRAMPOLINE_VA` is
+/// Supervisor `RX` (`!writable && executable`) and `PHYS_MAP_OFFSET` (`pa_to_va(0x8200)`)
+/// is never simultaneously writable and executable, switches across all 4 dedicated
+/// 16 KiB kernel thread stacks (`KTHREAD_STACKS`), wakes sleeping AP cores from `HLT`
 /// via Doorbell IPI (`vector 0x41`), and emits:
 /// `SMP_HW init OK cpus=<N> threads=4 ctx_sw=4`
 #[inline(never)]
 pub(crate) fn banner_smp_hw() {
     let online = smp_hw_init();
+
+    // Verify strict `W^X` across both the Supervisor RX trampoline alias and `PHYS_MAP_OFFSET`.
+    // SAFETY: Running at CPL=0 after `smp_hw_init` mapped `SMP_RX_TRAMPOLINE_VA`.
+    unsafe {
+        let (rx_p, rx_w, rx_x) = walk_va_effective_wx(smp_rx_va(SWITCH_CONTEXT_VA));
+        if !rx_p || rx_w || !rx_x {
+            panic!("SMP_HW: RX trampoline violated W^X (expected RX, non-writable)");
+        }
+        let (dm_p, dm_w, dm_x) = walk_va_effective_wx(pa_to_va(SWITCH_CONTEXT_VA) as u64);
+        if !dm_p || (dm_w && dm_x) {
+            panic!("SMP_HW: PHYS_MAP_OFFSET violated W^X (unexpected RWX mapping)");
+        }
+    }
+
+    // Verify online APs observed distinct hardware Local APIC IDs (`0xFEE0_0020`).
+    let mut ap_idx = 1usize;
+    while ap_idx < online {
+        let obs_apic = HW_APIC_IDS[ap_idx].load(Ordering::Acquire);
+        if obs_apic != ap_idx as u32 {
+            panic!("SMP_HW: AP hardware Local APIC ID mismatch");
+        }
+        ap_idx += 1;
+    }
 
     // Execute one full round of hardware stack context switches across all 4 threads.
     let mut i = 0usize;
@@ -1188,7 +1340,7 @@ pub(crate) fn banner_smp_hw() {
         smp_hw_tick_and_sync(&mut sh);
     }
     // Verify Doorbell IPIs (`vector 0x41`) fired during AP wakeup and kthread scheduling
-    // did NOT increment the Local APIC Timer (`vector 0x40`) counter at `0x8380`.
+    // did NOT increment the Local APIC Timer (`vector 0x40`) counter in `.bss`.
     if read_hw_irq_wakeups() != 0 {
         panic!("SMP_HW: Doorbell IPI 0x41 incremented timer IRQ counter");
     }

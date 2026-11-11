@@ -126,8 +126,8 @@ pub(crate) fn set_phys_offset(boot: &BootInfo) {
     }
     PHYS_MAP_OFFSET.store(map_off, core::sync::atomic::Ordering::Relaxed);
     DMA_PHYS_BASE.store(dma, core::sync::atomic::Ordering::Relaxed);
-    // Page-table frame pool (`0x1_C000 .. 0x2_4000` and `0x2_C000 .. 0x4_0000`);
-    // `0x2_4000 .. 0x2_C000` is reserved for the Ring-3 GDT/TSS/IDT/page-table transition frames.
+    // Page-table frame pool (`0x1_C000 .. 0x2_4000` and `0x2_D000 .. 0x4_0000`);
+    // `0x2_4000 .. 0x2_D000` (9 frames) is reserved for the isolated CR3 KPTI Ring-3 sandbox.
     let pt_next = if dma != 0 { dma + 0x1_C000 } else { 0 };
     PT_ALLOC_NEXT.store(pt_next, core::sync::atomic::Ordering::Relaxed);
 }
@@ -162,8 +162,8 @@ pub(crate) unsafe fn read_cr3() -> u64 {
 pub(crate) unsafe fn alloc_pt_frame() -> u64 {
     let base = dma_phys_base();
     let mut next = PT_ALLOC_NEXT.load(core::sync::atomic::Ordering::Relaxed);
-    if base != 0 && next == base + 0x2_4000 {
-        next = base + 0x2_C000;
+    if base != 0 && next >= base + 0x2_4000 && next < base + 0x2_D000 {
+        next = base + 0x2_D000;
     }
     if base == 0 || next == 0 || next + 0x1000 > base + 0x4_0000 {
         panic!("AHCI_HW: PT frame pool exhausted");
@@ -830,6 +830,8 @@ pub(crate) fn live_os_console_loop() -> ! {
         };
         enable_https(svc, vn.mac);
     }
+    // Scrub the root 32-byte device master key from `.bss` before serving live untrusted traffic.
+    scrub_cached_master_key();
     let mut net_rx: u64 = 0;
     let mut net_tx: u64 = 0;
     let mut last_sql_tx: u64 = sh.db.tx_seq;

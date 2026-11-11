@@ -6,6 +6,8 @@
 //! lock, which is safe across SMP cores. Interrupt handlers never allocate, so the
 //! lock cannot be re-entered from an interrupt.
 
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 use linked_list_allocator::LockedHeap;
 
 /// 8 MiB. One TLS 1.3 connection needs tens of KiB, so this covers all 16 TCP
@@ -15,18 +17,51 @@ pub const HEAP_SIZE: usize = 8 * 1024 * 1024;
 #[repr(C, align(4096))]
 struct HeapRegion([u8; HEAP_SIZE]);
 
-static mut HEAP: HeapRegion = HeapRegion([0; HEAP_SIZE]);
+struct SyncHeapRegion(UnsafeCell<HeapRegion>);
+
+// SAFETY: Access to the backing `.bss` region is handed once to `ALLOCATOR` (a spinlock-Synchronized
+// `LockedHeap`) inside `init()` gated by `HEAP_INITIALIZED`.
+unsafe impl Sync for SyncHeapRegion {}
+
+static HEAP: SyncHeapRegion = SyncHeapRegion(UnsafeCell::new(HeapRegion([0; HEAP_SIZE])));
+static HEAP_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
+/// Snapshot of kernel heap utilization (`used`, `free`, `total` bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct HeapStats {
+    pub used: usize,
+    pub free: usize,
+    pub total: usize,
+}
+
 /// Hand the heap region to the allocator. Must run once, on the BSP, before
 /// anything allocates and before the application processors start.
 pub fn init() {
-    // SAFETY: called exactly once at the top of `kernel_main`, before any other
-    // core runs; `HEAP` is referenced nowhere else, so this is its only borrow.
+    if HEAP_INITIALIZED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    // SAFETY: `compare_exchange` guarantees this runs at most once on the BSP before any APs start;
+    // `HEAP.0.get()` points to a 4 KiB-aligned `HEAP_SIZE` `.bss` block owned solely by `ALLOCATOR`.
     unsafe {
-        let start = core::ptr::addr_of_mut!(HEAP) as *mut u8;
+        let start = HEAP.0.get().cast::<u8>();
         ALLOCATOR.lock().init(start, HEAP_SIZE);
+    }
+}
+
+/// Read current kernel heap utilization under the allocator spinlock.
+#[allow(dead_code)]
+pub fn stats() -> HeapStats {
+    let guard = ALLOCATOR.lock();
+    HeapStats {
+        used: guard.used(),
+        free: guard.free(),
+        total: HEAP_SIZE,
     }
 }

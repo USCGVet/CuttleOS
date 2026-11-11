@@ -688,6 +688,10 @@ pub fn derive_service_base_seed(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> u64 {
 /// `fn(ring3_code, mailbox_req_word, expected_arg0) -> bool`.
 pub type Ring3HwHook = fn(&[u8; SVC_RING3_STUB_LEN], u64, u64) -> bool;
 
+/// Capability-aware hardware Ring-3 (`CPL=3`) execution callback:
+/// `fn(service_id, ring3_code, mailbox_req_word, expected_arg0, service_cap_mask) -> bool`.
+pub type Ring3CapHwHook = fn(ServiceId, &[u8; SVC_RING3_STUB_LEN], u64, u64, u64) -> bool;
+
 /// Ring-3 Service Init / Supervisor, KPTI Loader, IPC Bus, and Policy Enforcer.
 #[derive(Copy, Clone, Debug)]
 pub struct ServiceSupervisor {
@@ -709,6 +713,8 @@ pub struct ServiceSupervisor {
     pub ipc_total: u64,
     /// Optional bare-metal hardware Ring-3 (`CPL=3`) execution callback invoked on every mediated endpoint.
     pub ring3_hw_hook: Option<Ring3HwHook>,
+    /// Optional capability-aware hardware Ring-3 (`CPL=3`) execution callback receiving `(ServiceId, code, req, exp, cap_mask)`.
+    pub ring3_cap_hw_hook: Option<Ring3CapHwHook>,
 }
 
 impl ServiceSupervisor {
@@ -728,6 +734,7 @@ impl ServiceSupervisor {
             ipc_head: 0,
             ipc_total: 0,
             ring3_hw_hook: None,
+            ring3_cap_hw_hook: None,
         }
     }
 
@@ -736,6 +743,12 @@ impl ServiceSupervisor {
     /// stub at hardware `CPL=3` via `iretq` -> `int 0x80` on `TSS.RSP0`.
     pub fn set_ring3_hw_hook(&mut self, hook: Ring3HwHook) {
         self.ring3_hw_hook = Some(hook);
+    }
+
+    /// Register a capability-aware hardware Ring-3 (`CPL=3`) execution callback receiving
+    /// `(service_id, ring3_code, mailbox_req_word, expected_arg0, service_cap_mask)`.
+    pub fn set_ring3_cap_hw_hook(&mut self, hook: Ring3CapHwHook) {
+        self.ring3_cap_hw_hook = Some(hook);
     }
 
     /// Derive a per-service variant seed from the node's `base_seed` and `svc`.
@@ -1122,13 +1135,20 @@ impl ServiceSupervisor {
         //    and, when a bare-metal hardware Ring-3 (`CPL=3`) hook is registered, execute the target
         //    service's diversified x86-64 machine-code stub at hardware `CPL=3` (`iretq` -> `int 0x80`).
         let ret = self.execute_service_elf(target, op as u64)?;
-        if let Some(hook) = self.ring3_hw_hook {
+        if self.ring3_cap_hw_hook.is_some() || self.ring3_hw_hook.is_some() {
             let code = self.services[target_idx].ring3_code;
             let expected_arg0 = self.services[target_idx].ring3_expected_arg0;
+            let cap_mask = self.services[target_idx].policy.cap_mask;
             let next_seq = self.services[target_idx].mailbox.req_seq.wrapping_add(1);
             let mb_req = ((self.services[target_idx].mailbox.canary as u64) << 32)
                 | (next_seq & 0xFFFF_FFFF);
-            if !hook(&code, mb_req, expected_arg0) {
+            let hw_ok = match (self.ring3_cap_hw_hook, self.ring3_hw_hook) {
+                (Some(cap_hook), _) => cap_hook(target, &code, mb_req, expected_arg0, cap_mask),
+                (None, Some(hook)) => hook(&code, mb_req, expected_arg0),
+                (None, None) => true,
+            };
+            if !hw_ok {
+                self.services[target_idx].state = ServiceState::Faulted;
                 self.services[target_idx].policy_denials =
                     self.services[target_idx].policy_denials.wrapping_add(1);
                 record_svc_audit(audit, 44, AuditVerdict::Denied, b"svc:cpl3:trap");
@@ -1220,8 +1240,11 @@ impl ServiceSupervisor {
     ) -> Result<Ring3ParseSummary, ServiceError> {
         let svc = op.target_service();
         let idx = svc.index();
-        if !self.role.allows(svc) || self.services[idx].state != ServiceState::Running {
+        if !self.role.allows(svc) || self.services[idx].state == ServiceState::Unloaded {
             return Err(ServiceError::RoleDisabled);
+        }
+        if self.services[idx].state == ServiceState::Faulted {
+            self.ensure_running(svc, audit)?;
         }
         if !self.services[idx].kpti_isolated
             || !verify_service_kpti_isolation(&self.services[idx].user_l4, svc)
@@ -2871,5 +2894,82 @@ mod tests {
         );
         assert!(sup.services[ServiceId::Sql.index()].mailbox.ring3_parser_rejects >= 10);
         assert!(sup.services[ServiceId::Shell.index()].mailbox.ring3_parser_rejects >= 13);
+    }
+
+    #[test]
+    fn ring3_cap_hook_passes_service_cap_mask_and_fault_auto_restarts_on_mailbox_dispatch() {
+        use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        static FORCE_TRAP: AtomicBool = AtomicBool::new(false);
+        static OBSERVED_CAP_MASK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+        fn cap_checking_hook(
+            svc: ServiceId,
+            code: &[u8; SVC_RING3_STUB_LEN],
+            req: u64,
+            exp: u64,
+            cap_mask: u64,
+        ) -> bool {
+            OBSERVED_CAP_MASK.store(cap_mask, Ordering::SeqCst);
+            if FORCE_TRAP.load(Ordering::SeqCst) {
+                return false;
+            }
+            cap_mask == svc.policy().cap_mask
+                && cap_mask != u64::MAX
+                && code.windows(2).any(|w| w == [0xCD, 0x80])
+                && (req >> 32) != 0
+                && exp != 0
+        }
+
+        let mut sh = crate::shell::OsShell::new();
+        sh.svc.set_ring3_cap_hw_hook(cap_checking_hook);
+
+        // 1. Force a hardware Ring-3 fault during SqlQuery mailbox dispatch:
+        FORCE_TRAP.store(true, Ordering::SeqCst);
+        let mut resp = [0u8; 512];
+        assert_eq!(
+            sh.dispatch_mailbox_op(
+                IpcOp::SqlQuery,
+                true,
+                false,
+                1,
+                b"/sql",
+                b"SELECT k FROM kv",
+                &mut resp
+            ),
+            Err(ServiceError::SandboxTrap)
+        );
+        // Hook must have received svc-sql's bounded capability mask (NOT u64::MAX),
+        // and the faulted service must enter ServiceState::Faulted:
+        assert_eq!(
+            OBSERVED_CAP_MASK.load(Ordering::SeqCst),
+            ServiceId::Sql.policy().cap_mask
+        );
+        assert_eq!(
+            sh.svc.services[ServiceId::Sql.index()].state,
+            ServiceState::Faulted,
+            "hardware Ring-3 trap must mark target service Faulted"
+        );
+
+        // 2. Subsequent mailbox dispatch after clearing the transient fault must automatically
+        //    restart svc-sql via ensure_running instead of returning RoleDisabled:
+        FORCE_TRAP.store(false, Ordering::SeqCst);
+        let (status, len) = sh
+            .dispatch_mailbox_op(
+                IpcOp::SqlQuery,
+                true,
+                false,
+                1,
+                b"/sql",
+                b"SELECT k FROM kv",
+                &mut resp,
+            )
+            .expect("Faulted service must auto-restart on next dispatch_mailbox_op");
+        assert_eq!(status, 200);
+        assert!(len > 0);
+        assert_eq!(
+            sh.svc.services[ServiceId::Sql.index()].state,
+            ServiceState::Running
+        );
+        assert_eq!(sh.svc.services[ServiceId::Sql.index()].restarts, 1);
     }
 }

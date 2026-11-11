@@ -338,6 +338,14 @@ impl hmac::Hmac for HmacSha256 {
 
 struct HmacSha256Key(HmacSha256Impl);
 
+impl Drop for HmacSha256Key {
+    fn drop(&mut self) {
+        self.0 = <HmacSha256Impl as ::hmac::Mac>::new_from_slice(&[0u8; 32])
+            .expect("HMAC accepts zero key");
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
 impl hmac::Key for HmacSha256Key {
     fn sign_concat(&self, first: &[u8], middle: &[&[u8]], last: &[u8]) -> hmac::Tag {
         use ::hmac::Mac;
@@ -365,6 +373,20 @@ const AEAD_TAG_LEN: usize = 16;
 enum AeadCipher {
     Aes128Gcm(Box<Aes128Gcm>),
     ChaCha20Poly1305(Box<ChaCha20Poly1305>),
+}
+
+impl Drop for AeadCipher {
+    fn drop(&mut self) {
+        match self {
+            Self::Aes128Gcm(c) => {
+                **c = Aes128Gcm::new_from_slice(&[0u8; 16]).expect("16-byte zero key");
+            }
+            Self::ChaCha20Poly1305(c) => {
+                **c = ChaCha20Poly1305::new_from_slice(&[0u8; 32]).expect("32-byte zero key");
+            }
+        }
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
 }
 
 impl AeadCipher {
@@ -444,6 +466,13 @@ struct Tls13Encrypter {
     iv: Iv,
 }
 
+impl Drop for Tls13Encrypter {
+    fn drop(&mut self) {
+        self.iv = Iv::default();
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
 impl MessageEncrypter for Tls13Encrypter {
     fn encrypt(
         &mut self,
@@ -470,6 +499,13 @@ impl MessageEncrypter for Tls13Encrypter {
 struct Tls13Decrypter {
     cipher: AeadCipher,
     iv: Iv,
+}
+
+impl Drop for Tls13Decrypter {
+    fn drop(&mut self) {
+        self.iv = Iv::default();
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
 }
 
 impl MessageDecrypter for Tls13Decrypter {
