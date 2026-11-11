@@ -1097,34 +1097,58 @@ impl BTreePager {
 
         let parent_id = self.page_parent(leaf_id);
         if new_count == 0 && leaf_id != self.root_page && parent_id != BTREE_NO_PAGE {
-            let p_kind = self.verify_page_seal(parent_id)?;
-            if p_kind != BTreePageKind::Internal {
-                return Err(BTreeError::PageTampered { page_id: parent_id });
-            }
-            let p_count = self.page_count(parent_id);
-            if p_count >= 1 {
-                // 1. Unlink `leaf_id` from any predecessor leaf whose `next_leaf == leaf_id`:
-                let succ_leaf = self.page_next_leaf(leaf_id);
-                let mut pid = 0u16;
-                while pid < self.allocated_pages {
-                    if pid != leaf_id
-                        && !self.is_page_free(pid)
-                        && self.pages[pid as usize][10] == (BTreePageKind::Leaf as u8)
-                        && self.page_next_leaf(pid) == leaf_id
-                    {
-                        self.verify_page_seal(pid)?;
-                        self.set_page_next_leaf(pid, succ_leaf);
-                        self.seal_page(pid)?;
-                    }
-                    pid += 1;
-                }
+            self.reclaim_empty_leaf_and_ancestors(leaf_id, parent_id)?;
+            return Ok(true);
+        }
 
-                // 2. Remove `leaf_id` from `parent_id`:
+        self.seal_page(leaf_id)?;
+        Ok(true)
+    }
+
+    #[inline(never)]
+    fn reclaim_empty_leaf_and_ancestors(
+        &mut self,
+        leaf_id: u16,
+        parent_id: u16,
+    ) -> Result<(), BTreeError> {
+        // 1. Unlink `leaf_id` from any predecessor leaf whose `next_leaf == leaf_id`:
+        let succ_leaf = self.page_next_leaf(leaf_id);
+        let mut pid = 0u16;
+        while pid < self.allocated_pages {
+            if pid != leaf_id
+                && !self.is_page_free(pid)
+                && self.pages[pid as usize][10] == (BTreePageKind::Leaf as u8)
+                && self.page_next_leaf(pid) == leaf_id
+            {
+                self.verify_page_seal(pid)?;
+                self.set_page_next_leaf(pid, succ_leaf);
+                self.seal_page(pid)?;
+            }
+            pid += 1;
+        }
+
+        // 2. Reclaim `leaf_id` and walk upward reclaiming any internal ancestors that
+        //    lose their sole remaining child (`p_count == 0`). Verify `cur_parent`'s seal
+        //    BEFORE marking `cur_child` free so `verify_page_seal` sees valid child links.
+        let mut cur_child = leaf_id;
+        let mut cur_parent = parent_id;
+        let mut depth = 0usize;
+        while cur_parent != BTREE_NO_PAGE && depth < 8 {
+            let p_kind = self.verify_page_seal(cur_parent)?;
+            if p_kind != BTreePageKind::Internal {
+                return Err(BTreeError::PageTampered {
+                    page_id: cur_parent,
+                });
+            }
+            let p_count = self.page_count(cur_parent);
+            self.mark_page_free(cur_child);
+
+            if p_count >= 1 {
                 let mut child_idx = None;
                 let mut ci = 0usize;
                 while ci < p_count {
-                    let (_, lc) = self.read_internal_entry(parent_id, ci);
-                    if lc == leaf_id {
+                    let (_, lc) = self.read_internal_entry(cur_parent, ci);
+                    if lc == cur_child {
                         child_idx = Some(ci);
                         break;
                     }
@@ -1133,36 +1157,65 @@ impl BTreePager {
                 if let Some(c_at) = child_idx {
                     let mut s = c_at;
                     while s + 1 < p_count {
-                        let (nk, nc) = self.read_internal_entry(parent_id, s + 1);
-                        self.write_internal_entry(parent_id, s, nk, nc);
+                        let (nk, nc) = self.read_internal_entry(cur_parent, s + 1);
+                        self.write_internal_entry(cur_parent, s, nk, nc);
                         s += 1;
                     }
-                    self.write_internal_entry(parent_id, p_count - 1, 0, 0);
-                } else if self.page_rightmost_child(parent_id) == leaf_id {
-                    let (_, prev_lc) = self.read_internal_entry(parent_id, p_count - 1);
-                    self.set_page_rightmost_child(parent_id, prev_lc);
-                    self.write_internal_entry(parent_id, p_count - 1, 0, 0);
+                    self.write_internal_entry(cur_parent, p_count - 1, 0, 0);
+                } else if self.page_rightmost_child(cur_parent) == cur_child {
+                    let (_, prev_lc) = self.read_internal_entry(cur_parent, p_count - 1);
+                    self.set_page_rightmost_child(cur_parent, prev_lc);
+                    self.write_internal_entry(cur_parent, p_count - 1, 0, 0);
+                } else {
+                    return Err(BTreeError::PageTampered {
+                        page_id: cur_parent,
+                    });
                 }
 
                 let new_p_count = p_count - 1;
-                self.mark_page_free(leaf_id);
-                if new_p_count == 0 && parent_id == self.root_page {
-                    let sole_child = self.page_rightmost_child(parent_id);
+                if new_p_count == 0 && cur_parent == self.root_page {
+                    let sole_child = self.page_rightmost_child(cur_parent);
                     self.verify_page_seal(sole_child)?;
                     self.root_page = sole_child;
                     self.set_page_parent(sole_child, BTREE_NO_PAGE);
-                    self.mark_page_free(parent_id);
+                    self.mark_page_free(cur_parent);
                     self.seal_page(sole_child)?;
                 } else {
-                    self.set_page_count(parent_id, new_p_count);
-                    self.seal_page(parent_id)?;
+                    self.set_page_count(cur_parent, new_p_count);
+                    self.seal_page(cur_parent)?;
                 }
-                return Ok(true);
+                return Ok(());
             }
+
+            // `p_count == 0`: `cur_child` was `cur_parent`'s sole remaining `rightmost_child`.
+            if self.page_rightmost_child(cur_parent) != cur_child {
+                return Err(BTreeError::PageTampered {
+                    page_id: cur_parent,
+                });
+            }
+            let grand_parent = self.page_parent(cur_parent);
+            if cur_parent == self.root_page || grand_parent == BTREE_NO_PAGE {
+                self.init_page_header(
+                    cur_parent,
+                    BTreePageKind::Leaf,
+                    0,
+                    BTREE_NO_PAGE,
+                    BTREE_NO_PAGE,
+                    BTREE_NO_PAGE,
+                );
+                self.root_page = cur_parent;
+                self.seal_page(cur_parent)?;
+                return Ok(());
+            }
+
+            cur_child = cur_parent;
+            cur_parent = grand_parent;
+            depth += 1;
         }
 
-        self.seal_page(leaf_id)?;
-        Ok(true)
+        Err(BTreeError::PageTampered {
+            page_id: self.root_page,
+        })
     }
 
     /// Ordered range scan over `[min_key ..= max_key]`, routing to the starting 4 KiB leaf page
@@ -1567,5 +1620,27 @@ mod tests {
             let expected = alloc::format!("v{probe:05}");
             assert_eq!(rec.val_bytes(), expected.as_bytes());
         }
+    }
+
+    #[test]
+    fn height3_insert_delete_cycles_reclaim_all_pages_without_leak() {
+        let mut pager = BTreePager::new(TEST_BTREE_KEY).unwrap();
+        for cycle in 0i64..4 {
+            let base = cycle * 2_000;
+            for k in 0i64..1_100 {
+                pager
+                    .insert(base + k, b"lbl", b"val-payload", (base + k + 1) as i64)
+                    .unwrap_or_else(|e| panic!("cycle {cycle} insert({k}) failed: {e:?}"));
+            }
+            for k in 0i64..1_100 {
+                assert!(pager.delete(base + k).unwrap());
+            }
+            assert_eq!(pager.total_records, 0);
+        }
+        let active = pager.verify_all_page_seals().expect("seals valid after delete");
+        assert_eq!(
+            active, 1,
+            "all non-root internal and leaf pages must be reclaimed when height-3 tree empties"
+        );
     }
 }

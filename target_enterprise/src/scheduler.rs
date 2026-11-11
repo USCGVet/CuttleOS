@@ -321,6 +321,9 @@ impl<const N: usize> RoundRobin<N> {
             Some(s) => s,
             None => return false,
         };
+        if self.tasks[slot].state == TaskState::Exited {
+            return false;
+        }
         self.tasks[slot].state = TaskState::Blocked;
         // Remove the slot from the ready queue if it is present. We
         // walk the queue manually since direct indexing into a ring
@@ -545,5 +548,21 @@ mod tests {
         s.pick_next();
         // Only task running; yield finds nothing on the ready queue.
         assert_eq!(s.yield_now(), None);
+    }
+
+    #[test]
+    fn block_rejects_exited_task_and_prevents_resurrection() {
+        let mut s: RoundRobin<4> = RoundRobin::new();
+        assert!(s.enqueue(7));
+        assert_eq!(s.pick_next(), Some(7));
+        assert!(s.exit(7, 42));
+
+        assert!(
+            !s.block(7),
+            "block() on an Exited task must fail rather than overwriting Exited state"
+        );
+        assert!(!s.unblock(7));
+        assert_eq!(s.pick_next(), None);
+        assert_eq!(s.reap(7), Some(42));
     }
 }

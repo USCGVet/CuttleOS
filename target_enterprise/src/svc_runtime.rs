@@ -903,7 +903,12 @@ impl ServiceSupervisor {
         slot.user_l4 = user_l4;
         slot.kpti_isolated = true;
         slot.mailbox.pml4_entries = slot.user_l4.len();
-        slot.mailbox.canary = ((variant_seed as u32).wrapping_mul(0x9E37_79B9)) ^ 0xA55A_3C3C;
+        let raw_canary = ((variant_seed as u32).wrapping_mul(0x9E37_79B9)) ^ 0xA55A_3C3C;
+        slot.mailbox.canary = if raw_canary == 0 {
+            0xA55A_3C3D
+        } else {
+            raw_canary
+        };
         slot.ring3_code = ring3_code;
         slot.ring3_expected_arg0 = ring3_expected_arg0;
         slot.elf_sha256 = bin_dig;
@@ -2971,5 +2976,25 @@ mod tests {
             ServiceState::Running
         );
         assert_eq!(sh.svc.services[ServiceId::Sql.index()].restarts, 1);
+    }
+
+    #[test]
+    fn canary_derivation_never_produces_zero_on_collision_seed() {
+        let mut sup = ServiceSupervisor::empty();
+        sup.init_role(NodeRole::Full, 1);
+        let mut audit: AuditLogImpl<16> = AuditLogImpl::new();
+        // (0x5356_4C1Cu32.wrapping_mul(0x9E37_79B9)) ^ 0xA55A_3C3C == 0
+        sup.rotate_service(ServiceId::Http, 0x5356_4C1C, &mut audit)
+            .unwrap();
+        assert_ne!(
+            sup.services[ServiceId::Http.index()].mailbox.canary, 0,
+            "mailbox canary must never evaluate to 0 on 32-bit bijective collision seed"
+        );
+        sup.stage_mailbox_request(ServiceId::Http, b"/status", b"")
+            .unwrap();
+        assert!(
+            sup.validate_mailbox_request_prefilter(IpcOp::HttpGetStatus, &mut audit)
+                .is_ok()
+        );
     }
 }

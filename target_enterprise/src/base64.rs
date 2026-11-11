@@ -102,7 +102,10 @@ pub fn decode_impl(input: &[u8], out: &mut [u8]) -> Result<usize, Base64Error> {
         if pad2 && !pad3 {
             return Err(Base64Error::InvalidInput);
         }
-        if pad2 && i + 4 != input.len() {
+        if (pad2 || pad3) && i + 4 != input.len() {
+            return Err(Base64Error::InvalidInput);
+        }
+        if (pad2 && (v1 & 0x0F) != 0) || (pad3 && !pad2 && (v2 & 0x03) != 0) {
             return Err(Base64Error::InvalidInput);
         }
         let n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
@@ -287,5 +290,25 @@ mod tests {
         let mut d = [0u8; 4];
         let m = Base64Impl::decode(b"YWI=", &mut d).unwrap();
         assert_eq!(&d[..m], b"ab");
+    }
+
+    #[test]
+    fn rejects_interior_padding_and_nonzero_trailing_pad_bits() {
+        let mut d = [0u8; 16];
+        // Interior single-`=` padding followed by another quantum must be rejected.
+        assert_eq!(
+            Base64Impl::decode(b"YWI=YWI=", &mut d),
+            Err(Base64Error::InvalidInput)
+        );
+        // Non-zero trailing pad bits before `==` ("YR==" vs canonical "YQ==" for "a"):
+        assert_eq!(
+            Base64Impl::decode(b"YR==", &mut d),
+            Err(Base64Error::InvalidInput)
+        );
+        // Non-zero trailing pad bits before `=` ("YWJ=" vs canonical "YWI=" for "ab"):
+        assert_eq!(
+            Base64Impl::decode(b"YWJ=", &mut d),
+            Err(Base64Error::InvalidInput)
+        );
     }
 }

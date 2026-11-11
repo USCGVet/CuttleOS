@@ -1222,7 +1222,7 @@ impl SqlDb {
         let Some(rparen) = rfind_byte(after_table, b')') else {
             return copy_str(b"error: missing ')' in CREATE TABLE\n", out);
         };
-        if rparen <= lparen {
+        if rparen <= lparen || !trim_sql(&after_table[rparen + 1..]).is_empty() {
             return copy_str(b"error: malformed column list in CREATE TABLE\n", out);
         }
         let mut tname = trim_sql(&after_table[..lparen]);
@@ -1262,17 +1262,21 @@ impl SqlDb {
             return copy_str(b"error: maximum table limit reached\n", out);
         };
 
-        let cols_raw = &after_table[lparen + 1..rparen];
+        let cols_raw = trim_sql(&after_table[lparen + 1..rparen]);
+        if cols_raw.is_empty() {
+            return copy_str(b"error: malformed column list in CREATE TABLE\n", out);
+        }
         let mut parsed_cols = [SqlColumn::empty(); SQL_MAX_COLS];
         let mut col_count = 0u8;
 
         let mut cursor = cols_raw;
         while !cursor.is_empty() {
+            let had_comma = find_byte(cursor, b',').is_some();
             let (col_def, next_cursor) = split_comma(cursor);
             cursor = next_cursor;
             let col_def = trim_sql(col_def);
-            if col_def.is_empty() {
-                continue;
+            if col_def.is_empty() || (had_comma && trim_sql(cursor).is_empty()) {
+                return copy_str(b"error: empty column definition in CREATE TABLE\n", out);
             }
             if col_count as usize >= SQL_MAX_COLS {
                 return copy_str(b"error: too many columns (max 4)\n", out);
@@ -1357,7 +1361,7 @@ impl SqlDb {
         let Some(rparen) = rfind_byte(after_on, b')') else {
             return copy_str(b"error: missing ')' in CREATE INDEX\n", out);
         };
-        if rparen <= lparen {
+        if rparen <= lparen || !trim_sql(&after_on[rparen + 1..]).is_empty() {
             return copy_str(b"error: malformed column in CREATE INDEX\n", out);
         }
         let tname = trim_sql(&after_on[..lparen]);
@@ -1482,7 +1486,7 @@ impl SqlDb {
         let Some(rparen) = rfind_byte(after_values, b')') else {
             return copy_str(b"error: missing ')' after VALUES\n", out);
         };
-        if rparen <= lparen {
+        if rparen <= lparen || !trim_sql(&after_values[rparen + 1..]).is_empty() {
             return copy_str(b"error: malformed VALUES list\n", out);
         }
 
@@ -1490,13 +1494,14 @@ impl SqlDb {
         let mut row = SqlRow::empty();
         row.used = true;
         let mut val_idx = 0usize;
-        let mut cursor = &after_values[lparen + 1..rparen];
+        let mut cursor = trim_sql(&after_values[lparen + 1..rparen]);
         while !cursor.is_empty() {
             let (val_raw, next_cursor) = split_comma_respecting_quotes(cursor);
+            let had_comma = val_raw.len() < cursor.len();
             cursor = next_cursor;
             let val_raw = trim_sql(val_raw);
-            if val_raw.is_empty() {
-                continue;
+            if val_raw.is_empty() || (had_comma && trim_sql(cursor).is_empty()) {
+                return copy_str(b"error: empty literal in VALUES list\n", out);
             }
             if val_idx >= col_count {
                 return copy_str(b"error: too many values for table schema\n", out);
@@ -1788,21 +1793,27 @@ impl SqlDb {
                 proj_count += 1;
             }
         } else {
-            let mut cursor = proj;
+            let proj_trimmed = trim_sql(proj);
+            if proj_trimmed.is_empty() {
+                return copy_str(b"error: empty column in SELECT projection\n", out);
+            }
+            let mut cursor = proj_trimmed;
             while !cursor.is_empty() {
+                let had_comma = find_byte(cursor, b',').is_some();
                 let (cname, next_cursor) = split_comma(cursor);
                 cursor = next_cursor;
                 let cname = trim_sql(cname);
-                if cname.is_empty() {
-                    continue;
+                if cname.is_empty() || (had_comma && trim_sql(cursor).is_empty()) {
+                    return copy_str(b"error: empty column in SELECT projection\n", out);
                 }
                 let Some(c_idx) = self.tables[t_idx].find_col(cname) else {
                     return copy_str(b"error: unknown column in SELECT projection\n", out);
                 };
-                if proj_count < SQL_MAX_COLS {
-                    proj_cols[proj_count] = c_idx;
-                    proj_count += 1;
+                if proj_count >= SQL_MAX_COLS {
+                    return copy_str(b"error: too many projected columns (max 4)\n", out);
                 }
+                proj_cols[proj_count] = c_idx;
+                proj_count += 1;
             }
         }
 
@@ -3680,6 +3691,54 @@ mod tests {
             reloaded.state_hash(),
             db_full.state_hash(),
             "every accepted SQL row must survive save_partition + load_partition without silent truncation"
+        );
+    }
+
+    #[test]
+    fn sql_rejects_excess_projections_empty_commas_and_trailing_tokens() {
+        let mut db = SqlDb::new();
+        let mut out = [0u8; 256];
+
+        let n = db.exec(b"SELECT k, v, rev, k, v FROM kv", &mut out);
+        assert!(
+            out[..n].starts_with(b"error:"),
+            "SELECT with >4 projected columns must reject instead of silently truncating: {:?}",
+            core::str::from_utf8(&out[..n])
+        );
+
+        let n = db.exec(b"SELECT , FROM kv", &mut out);
+        assert!(
+            out[..n].starts_with(b"error:"),
+            "SELECT with empty projection slot must reject: {:?}",
+            core::str::from_utf8(&out[..n])
+        );
+
+        let n = db.exec(b"INSERT INTO kv VALUES ('bad', , 'v', 1)", &mut out);
+        assert!(
+            out[..n].starts_with(b"error:"),
+            "INSERT with empty comma slot must reject: {:?}",
+            core::str::from_utf8(&out[..n])
+        );
+
+        let n = db.exec(b"INSERT INTO kv VALUES ('bad', 'v', 1) WHERE 1 = 0", &mut out);
+        assert!(
+            out[..n].starts_with(b"error:"),
+            "INSERT with trailing tokens after ')' must reject: {:?}",
+            core::str::from_utf8(&out[..n])
+        );
+
+        let n = db.exec(b"CREATE INDEX idx_bad ON kv (k) GARBAGE", &mut out);
+        assert!(
+            out[..n].starts_with(b"error:"),
+            "CREATE INDEX with trailing tokens after ')' must reject: {:?}",
+            core::str::from_utf8(&out[..n])
+        );
+
+        let n = db.exec(b"CREATE TABLE bad_cols (a INT, , b TEXT)", &mut out);
+        assert!(
+            out[..n].starts_with(b"error:"),
+            "CREATE TABLE with empty comma slot must reject: {:?}",
+            core::str::from_utf8(&out[..n])
         );
     }
 }

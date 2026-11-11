@@ -142,13 +142,12 @@ impl<const CAPACITY: usize> WalImpl<CAPACITY> {
     /// `durable_cursor` is clamped to `CAPACITY` defensively; a
     /// caller passing a stale cursor from a larger-buffer build
     /// can't escape the bounds of the new buffer.
-    pub fn from_backing(buf: [u8; CAPACITY], durable_cursor: usize) -> Self {
+    pub fn from_backing(mut buf: [u8; CAPACITY], durable_cursor: usize) -> Self {
         let dc = if durable_cursor > CAPACITY { CAPACITY } else { durable_cursor };
         // Count valid records in the durable prefix to recover the
-        // next LSN. We tolerate a corrupt tail (truncate at the
-        // first invalid frame) just like `replay` does — durable
-        // cursor lies within the valid prefix by construction, but
-        // belt-and-suspenders.
+        // next LSN, and truncate both `write_cursor` and `durable_cursor`
+        // to the end of the verified valid prefix (`off`) so a torn or
+        // corrupt tail frame never blocks replay of post-recovery commits.
         let mut lsn_counter: u64 = 0;
         let mut off = 0usize;
         while off + FRAME_HEADER_BYTES <= dc {
@@ -169,10 +168,15 @@ impl<const CAPACITY: usize> WalImpl<CAPACITY> {
             lsn_counter += 1;
             off = payload_end;
         }
+        let mut z = off;
+        while z < dc {
+            buf[z] = 0;
+            z += 1;
+        }
         Self {
             buf,
-            write_cursor: dc,
-            durable_cursor: dc,
+            write_cursor: off,
+            durable_cursor: off,
             next_lsn: lsn_counter + 1,
         }
     }
@@ -492,5 +496,32 @@ mod tests {
         // third record never makes it to the callback even though
         // its bytes are physically intact.
         assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn from_backing_truncates_cursors_at_corrupt_tail_so_new_appends_replay() {
+        let mut wal: WalImpl<256> = WalImpl::new();
+        wal.append(b"rec-1").unwrap();
+        wal.append(b"rec-2").unwrap();
+        wal.flush(proof()).unwrap();
+        let dc = wal.durable_cursor();
+        let mut snap = *wal.backing();
+        snap[dc - 1] ^= 0xFF; // corrupt second frame tail
+
+        let mut recovered: WalImpl<256> = WalImpl::from_backing(snap, dc);
+        assert_eq!(recovered.next_lsn(), 2);
+        let lsn = recovered.append(b"rec-3").unwrap();
+        assert_eq!(lsn, 2);
+        recovered.flush(proof()).unwrap();
+
+        let mut seen = [[0u8; 8]; 4];
+        let mut count = 0usize;
+        recovered.replay(&mut |_lsn, payload| {
+            seen[count][..payload.len()].copy_from_slice(payload);
+            count += 1;
+        });
+        assert_eq!(count, 2, "post-recovery commit after torn tail must be replayed");
+        assert_eq!(&seen[0][..5], b"rec-1");
+        assert_eq!(&seen[1][..5], b"rec-3");
     }
 }

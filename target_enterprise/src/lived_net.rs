@@ -2318,10 +2318,13 @@ impl LivedNet {
                         )
                         .unwrap_or(0);
                     }
+                    let authed = extract_session_token(view.headers_raw)
+                        .and_then(|tok| sh.validate_session(tok))
+                        .is_some();
                     return match sh.dispatch_mailbox_op(
                         IpcOp::SqlQuery,
                         true,
-                        false,
+                        authed,
                         boots,
                         sql_path,
                         q_slice,
@@ -2334,10 +2337,13 @@ impl LivedNet {
                         Err(e) => build_service_error_response(e, out),
                     };
                 }
+                let authed = extract_session_token(view.headers_raw)
+                    .and_then(|tok| sh.validate_session(tok))
+                    .is_some();
                 return match sh.dispatch_mailbox_op(
                     IpcOp::SqlQuery,
                     true,
-                    false,
+                    authed,
                     boots,
                     view.path,
                     b".tables",
@@ -2352,13 +2358,13 @@ impl LivedNet {
             }
             if view.method == HttpMethod::Post {
                 let is_ro = crate::sql::SqlDb::is_readonly_query(view.body);
-                let (op, authed) = if is_ro {
-                    (IpcOp::SqlQuery, false)
+                let authed = extract_session_token(view.headers_raw)
+                    .and_then(|tok| sh.validate_session(tok))
+                    .is_some();
+                let op = if is_ro {
+                    IpcOp::SqlQuery
                 } else {
-                    let ok = extract_session_token(view.headers_raw)
-                        .and_then(|tok| sh.validate_session(tok))
-                        .is_some();
-                    (IpcOp::SqlMutate, ok)
+                    IpcOp::SqlMutate
                 };
                 let mut body = [0u8; 384];
                 return match sh.dispatch_mailbox_op(
@@ -7352,5 +7358,117 @@ mod tests {
             "rejected read-only TRIAD_PREPARE must not advance triad_min_epoch"
         );
         assert_eq!(sh.triad_min_epoch, 0);
+    }
+
+    #[test]
+    fn stage9_udp_threads_run_refused_unauth_all_roles_and_http_sql_tx_session_visibility() {
+        const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let key = [0x33u8; 32];
+
+        // 1. Unauthenticated UDP `:8080` `CMD threads run 8` and `CMD smp run 8` MUST be refused
+        //    with `error: EACCES` across ALL 4 node roles (`Wfe`, `Sql`, `Shell`, `Full`)!
+        for role in [
+            crate::svc_runtime::NodeRole::Wfe,
+            crate::svc_runtime::NodeRole::Sql,
+            crate::svc_runtime::NodeRole::Shell,
+            crate::svc_runtime::NodeRole::Full,
+        ] {
+            let mut net = LivedNet::with_auth_key(MAC, key);
+            let mut sh = crate::shell::OsShell::new();
+            sh.svc.set_role(role, &mut sh.audit);
+            let before_ipis = sh.smp_ipi_doorbells;
+
+            for raw_cmd in [b"CMD threads run 8".as_slice(), b"CMD smp run 8".as_slice()] {
+                let ulen = (8 + raw_cmd.len()) as u16;
+                let mut udp = alloc::vec![0u8; ulen as usize];
+                udp[0..2].copy_from_slice(&50000u16.to_be_bytes());
+                udp[2..4].copy_from_slice(&UDP_STATUS_PORT.to_be_bytes());
+                udp[4..6].copy_from_slice(&ulen.to_be_bytes());
+                udp[6..8].copy_from_slice(&0u16.to_be_bytes());
+                udp[8..].copy_from_slice(raw_cmd);
+
+                let mut replies = ReplySet::new();
+                net.handle_udp(
+                    &udp,
+                    [0xaa; 6],
+                    [10, 0, 2, 2],
+                    [10, 0, 2, 2],
+                    1,
+                    Some(&mut sh),
+                    &mut replies,
+                );
+                assert_eq!(replies.count, 1);
+                let frame = &replies.frames[0][..replies.lens[0]];
+                let udp_body = &frame[42..];
+                assert!(
+                    udp_body.starts_with(b"error: EACCES"),
+                    "role {role:?} must refuse unauthenticated {:?} on UDP :8080, got {:?}",
+                    core::str::from_utf8(raw_cmd),
+                    core::str::from_utf8(udp_body)
+                );
+                assert_eq!(sh.smp_ipi_doorbells, before_ipis);
+            }
+        }
+
+        // 2. Authenticated HTTP `POST /sql` and `GET /sql?...` inside an active `BEGIN` transaction
+        //    must preserve session ownership so the transaction owner sees its uncommitted writes,
+        //    while unauthenticated readers stay isolated on the committed snapshot!
+        let mut net = LivedNet::with_auth_key(MAC, key);
+        let mut sh = crate::shell::OsShell::new();
+        let sid_bytes = sh.try_create_session(b"alice", b"nonce1").unwrap();
+        let sid_str = core::str::from_utf8(&sid_bytes).unwrap();
+        let mut out = [0u8; 1024];
+
+        let req_begin = alloc::format!("POST /sql HTTP/1.1\r\nCookie: sid={sid_str}\r\n\r\nBEGIN");
+        let nb = net.handle_http_request(req_begin.as_bytes(), 1, Some(&mut sh), &mut out);
+        assert!(core::str::from_utf8(&out[..nb]).unwrap().ends_with("\r\n\r\nBEGIN OK\n"));
+
+        let req_ins = alloc::format!(
+            "POST /sql HTTP/1.1\r\nCookie: sid={sid_str}\r\n\r\nINSERT INTO kv VALUES ('tx.key', 'tx.val', 7)"
+        );
+        let ni = net.handle_http_request(req_ins.as_bytes(), 1, Some(&mut sh), &mut out);
+        assert!(core::str::from_utf8(&out[..ni]).unwrap().ends_with("\r\n\r\nINSERT 1\n"));
+
+        // Unauthenticated reader MUST NOT see uncommitted row:
+        let nu = net.handle_http_request(
+            b"POST /sql HTTP/1.1\r\nHost: x\r\n\r\nSELECT v FROM kv WHERE k = 'tx.key'",
+            1,
+            Some(&mut sh),
+            &mut out,
+        );
+        assert!(
+            core::str::from_utf8(&out[..nu]).unwrap().ends_with("\r\n\r\nv\n"),
+            "unauthenticated reader must not see uncommitted row: {:?}",
+            core::str::from_utf8(&out[..nu])
+        );
+
+        // Authenticated transaction owner MUST see its own uncommitted row on both POST /sql and GET /sql:
+        let req_post_sel = alloc::format!(
+            "POST /sql HTTP/1.1\r\nCookie: sid={sid_str}\r\n\r\nSELECT v FROM kv WHERE k = 'tx.key'"
+        );
+        let nps = net.handle_http_request(req_post_sel.as_bytes(), 1, Some(&mut sh), &mut out);
+        assert!(
+            core::str::from_utf8(&out[..nps])
+                .unwrap()
+                .ends_with("\r\n\r\nv\ntx.val\n"),
+            "authenticated POST /sql owner must read its own uncommitted write: {:?}",
+            core::str::from_utf8(&out[..nps])
+        );
+
+        let req_get_sel = alloc::format!(
+            "GET /sql?SELECT%20v%20FROM%20kv%20WHERE%20k%20=%20%27tx.key%27 HTTP/1.1\r\nCookie: sid={sid_str}\r\n\r\n"
+        );
+        let ngs = net.handle_http_request(req_get_sel.as_bytes(), 1, Some(&mut sh), &mut out);
+        assert!(
+            core::str::from_utf8(&out[..ngs])
+                .unwrap()
+                .ends_with("\r\n\r\nv\ntx.val\n"),
+            "authenticated GET /sql owner must read its own uncommitted write: {:?}",
+            core::str::from_utf8(&out[..ngs])
+        );
+
+        let req_rb = alloc::format!("POST /sql HTTP/1.1\r\nCookie: sid={sid_str}\r\n\r\nROLLBACK");
+        let nrb = net.handle_http_request(req_rb.as_bytes(), 1, Some(&mut sh), &mut out);
+        assert!(core::str::from_utf8(&out[..nrb]).unwrap().ends_with("\r\n\r\nROLLBACK OK\n"));
     }
 }

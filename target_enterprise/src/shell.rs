@@ -1092,7 +1092,6 @@ impl OsShell {
             || bytes_eq(cmd, b"status")
             || bytes_eq(cmd, b"uptime")
             || bytes_eq(cmd, b"ps")
-            || bytes_eq(cmd, b"threads")
             || bytes_eq(cmd, b"caps")
             || bytes_eq(cmd, b"ls")
             || bytes_eq(cmd, b"cat")
@@ -1111,6 +1110,7 @@ impl OsShell {
             || bytes_eq(cmd, b"seccomp")
             || bytes_eq(cmd, b"session")
             || bytes_eq(cmd, b"smp")
+            || bytes_eq(cmd, b"threads")
             || bytes_eq(cmd, b"service")
             || bytes_eq(cmd, b"triad")
             || bytes_eq(cmd, b"vault")
@@ -1407,6 +1407,11 @@ impl OsShell {
             } else if payload.len() == 28 && payload[0] == b'S' {
                 if (payload[1] & 1) != 0 {
                     self.guard_lockdown = true;
+                }
+                let nid = (payload[1] >> 1) & 0x03;
+                if nid <= 2 {
+                    self.triad_node_id = nid;
+                    self.sync_triad_local();
                 }
                 let vn = u16::from_le_bytes([payload[2], payload[3]]);
                 if vn > self.vault_nonce_seq {
@@ -2477,6 +2482,21 @@ impl OsShell {
         let (sub, rest) = split_first_word(trim_ascii(arg));
         let n_cpus = (self.smp_cpus_online as usize).clamp(1, 4);
         if bytes_eq(sub, b"run") || bytes_eq(sub, b"dispatch") {
+            if self
+                .svc
+                .mediate_endpoint(
+                    crate::svc_runtime::IpcOp::ShellExec,
+                    false,
+                    true,
+                    &mut self.audit,
+                )
+                .is_err()
+            {
+                return copy_into(
+                    b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                    out,
+                );
+            }
             let count = parse_u32_ascii(trim_ascii(rest)).unwrap_or(4).clamp(1, 64) as usize;
             let mut k = 0usize;
             while k < count {
@@ -2987,7 +3007,11 @@ impl OsShell {
                 self.record_audit(8, AuditVerdict::Error, b"shell:cathex:bad-len");
                 return copy_into(b"usage: cathex <path> [offset] [len]\n", out);
             };
-            (v as usize).clamp(1, 192)
+            if v == 0 || v > 192 {
+                self.record_audit(8, AuditVerdict::Error, b"shell:cathex:bad-len");
+                return copy_into(b"error: cathex length must be 1..=192 bytes\n", out);
+            }
+            v as usize
         };
         let st = match self.fs.stat(path) {
             Ok(s) => s,
@@ -3137,6 +3161,10 @@ impl OsShell {
                 return copy_into(b"error: cannot open path for write\n", out);
             }
         };
+        if content.len() >= SHELL_LINE_MAX {
+            self.record_audit(9, AuditVerdict::Error, b"shell:write:too-large");
+            return copy_into(b"error: write payload exceeds maximum length\n", out);
+        }
         let h = match self.fs.open(cpath, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC) {
             Ok(h) => h,
             Err(_) => {
@@ -3391,7 +3419,14 @@ impl OsShell {
                 &mut out[pos..],
             );
             pos += copy_into(count_slice, &mut out[pos..]);
-            pos += copy_into(b" key_bound=true\n", &mut out[pos..]);
+            pos += copy_into(
+                if is_seal_key_set(&self.seal_key) {
+                    b" key_bound=true\n"
+                } else {
+                    b" key_bound=false\n"
+                },
+                &mut out[pos..],
+            );
             return pos;
         }
 
@@ -3402,6 +3437,11 @@ impl OsShell {
                 b"SELECT k, v, rev FROM kv WHERE k LIKE 'v:%' ORDER BY k ASC",
                 out,
             );
+        }
+
+        if !is_seal_key_set(&self.seal_key) {
+            self.record_audit(35, AuditVerdict::Denied, b"shell:vault:key-unset");
+            return copy_into(b"error: EPERM (vault seal key not provisioned)\n", out);
         }
 
         if self.guard_lockdown {
@@ -7406,5 +7446,99 @@ mod tests {
         let rn = restored_sh.fs.read(hr, 0, &mut rdata).unwrap();
         restored_sh.fs.close(hr).unwrap();
         assert_eq!(&rdata[..rn], b"LONG-PATH-PAYLOAD");
+    }
+
+    #[test]
+    fn stage9_threads_role_cathex_write_bounds_triad_wal_and_unprovisioned_vault() {
+        // 1. `threads run` / `threads dispatch` must NOT be classified as read-only, and must
+        //    enforce svc-sh role mediation across NodeRole::Wfe and NodeRole::Sql!
+        assert!(OsShell::is_readonly_command(b"threads"));
+        assert!(OsShell::is_readonly_command(b"threads status"));
+        assert!(!OsShell::is_readonly_command(b"threads run 8"));
+        assert!(!OsShell::is_readonly_command(b"threads dispatch 8"));
+
+        let mut out = [0u8; 384];
+        for denied_role in [
+            crate::svc_runtime::NodeRole::Wfe,
+            crate::svc_runtime::NodeRole::Sql,
+        ] {
+            let mut sh_role = OsShell::new();
+            sh_role.svc.set_role(denied_role, &mut sh_role.audit);
+            for cmd in [b"threads run 4".as_slice(), b"smp run 4".as_slice()] {
+                let n = sh_role.exec_line(cmd, 1, 0, 0, &mut out).bytes_written();
+                assert!(
+                    out[..n].starts_with(b"error: EACCES"),
+                    "role {denied_role:?} must refuse {:?}, got {:?}",
+                    core::str::from_utf8(cmd),
+                    core::str::from_utf8(&out[..n])
+                );
+            }
+        }
+
+        // 2. `cathex` must reject len=0 and len>192 instead of silently clamping, and `write`
+        //    must reject oversized payloads instead of silently truncating at SHELL_LINE_MAX!
+        let mut sh = OsShell::new();
+        for bad_cathex in [
+            b"cathex /etc/hostname 0 0".as_slice(),
+            b"cathex /etc/hostname 0 512".as_slice(),
+        ] {
+            let n = sh.exec_line(bad_cathex, 1, 0, 0, &mut out).bytes_written();
+            assert!(
+                out[..n].starts_with(b"error:") || out[..n].starts_with(b"usage:"),
+                "out-of-bounds cathex {:?} must not silently clamp: {:?}",
+                core::str::from_utf8(bad_cathex),
+                core::str::from_utf8(&out[..n])
+            );
+        }
+
+        let mut big_write = [0u8; 320];
+        let pfx = b"write /var/big ";
+        big_write[..pfx.len()].copy_from_slice(pfx);
+        for b in &mut big_write[pfx.len()..] {
+            *b = b'A';
+        }
+        let n_bw = sh.exec_line(&big_write, 1, 0, 0, &mut out).bytes_written();
+        assert!(
+            out[..n_bw].starts_with(b"error:"),
+            "oversized write command must be rejected instead of silently truncating: {:?}",
+            core::str::from_utf8(&out[..n_bw])
+        );
+        assert!(sh.fs.stat(b"/var/big").is_err());
+
+        // 3. `triad_node_id` must survive `pack_disk_image` -> `unpack_disk_image` WAL replay!
+        let _ = sh.exec_line(b"triad node 2", 1, 0, 0, &mut out);
+        assert_eq!(sh.triad_node_id, 2);
+        let mut hdr_sec = [0u8; 512];
+        let mut wal_sec = [0u8; 512];
+        sh.pack_disk_image(5, &mut hdr_sec, &mut wal_sec).unwrap();
+        let mut restored = OsShell::new();
+        restored.unpack_disk_image(&hdr_sec, &wal_sec).unwrap();
+        assert_eq!(
+            restored.triad_node_id, 2,
+            "triad_node_id must survive WAL S-record checkpoint & restore"
+        );
+
+        // 4. Unprovisioned `OsShell::empty()` (`seal_key == [0; 32]`) must report `key_bound=false`
+        //    and refuse `vault put`/`get`/`del` instead of sealing under an all-zero key!
+        let mut unprov = OsShell::empty();
+        unprov.seed_defaults();
+        let n_vs = unprov
+            .exec_line(b"vault status", 1, 0, 0, &mut out)
+            .bytes_written();
+        assert!(
+            core::str::from_utf8(&out[..n_vs])
+                .unwrap()
+                .contains("key_bound=false"),
+            "unprovisioned vault status must report key_bound=false, got {:?}",
+            core::str::from_utf8(&out[..n_vs])
+        );
+        let n_vp = unprov
+            .exec_line(b"vault put sec ZeroKey1", 1, 0, 0, &mut out)
+            .bytes_written();
+        assert!(
+            out[..n_vp].starts_with(b"error:"),
+            "unprovisioned vault put must refuse zero-key sealing: {:?}",
+            core::str::from_utf8(&out[..n_vp])
+        );
     }
 }
