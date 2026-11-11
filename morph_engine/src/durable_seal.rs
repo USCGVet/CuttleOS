@@ -61,6 +61,27 @@ fn constant_time_hex_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+fn compute_envelope_hmac_hex(
+    key: &[u8; 32],
+    label: &str,
+    sha256: &str,
+    len: u64,
+    payload_hmac_hex: &str,
+) -> String {
+    let mut msg = Vec::with_capacity(64 + label.len() + sha256.len() + payload_hmac_hex.len());
+    msg.extend_from_slice(b"cuttle-durable-seal-envelope-v1:");
+    msg.extend_from_slice(&(label.len() as u64).to_le_bytes());
+    msg.extend_from_slice(label.as_bytes());
+    msg.push(b':');
+    msg.extend_from_slice(sha256.as_bytes());
+    msg.push(b':');
+    msg.extend_from_slice(&len.to_le_bytes());
+    msg.push(b':');
+    msg.extend_from_slice(payload_hmac_hex.as_bytes());
+    let mac = hmac_sha256_host(key, &msg);
+    mac.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 /// On-disk / in-memory seal over a durable blob.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DurableSeal {
@@ -72,6 +93,10 @@ pub struct DurableSeal {
     /// Optional lowercase hex `HMAC-SHA256(device_key, payload)` for tamper-proof verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hmac_sha256: Option<String>,
+    /// Optional lowercase hex `HMAC-SHA256(device_key, envelope)` binding `(label, sha256, len, hmac_sha256)`
+    /// so `load_seals_dir` can authenticate seal JSON files when `CUTTLE_DURABLE_SEAL_KEY_FILE` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope_hmac_sha256: Option<String>,
     /// Byte length of the sealed payload.
     pub len: u64,
 }
@@ -88,6 +113,7 @@ impl DurableSeal {
             label: label.to_string(),
             sha256,
             hmac_sha256: None,
+            envelope_hmac_sha256: None,
             len: payload.len() as u64,
         }
     }
@@ -96,7 +122,10 @@ impl DurableSeal {
     pub fn seal_keyed(label: &str, payload: &[u8], key: &[u8; 32]) -> Self {
         let mut s = Self::seal(label, payload);
         let mac = hmac_sha256_host(key, payload);
-        s.hmac_sha256 = Some(mac.iter().map(|b| format!("{:02x}", b)).collect());
+        let mac_hex: String = mac.iter().map(|b| format!("{:02x}", b)).collect();
+        let env_hex = compute_envelope_hmac_hex(key, &s.label, &s.sha256, s.len, &mac_hex);
+        s.hmac_sha256 = Some(mac_hex);
+        s.envelope_hmac_sha256 = Some(env_hex);
         s
     }
 
@@ -175,7 +204,41 @@ impl DurableSeal {
                 bail!("seal hmac_sha256 not 64 hex chars");
             }
         }
+        if let Some(env_mac) = &s.envelope_hmac_sha256 {
+            if env_mac.len() != 64 || !env_mac.chars().all(|c| c.is_ascii_hexdigit()) {
+                bail!("seal envelope_hmac_sha256 not 64 hex chars");
+            }
+        }
         Ok(s)
+    }
+
+    /// Verify the seal's keyed envelope `(label, sha256, len, hmac_sha256)` against `key`
+    /// in constant time. Rejects unkeyed seals or seals whose label/sha256/len were altered.
+    pub fn verify_envelope_keyed(&self, key: &[u8; 32]) -> Result<()> {
+        if self.schema != DURABLE_SEAL_SCHEMA {
+            bail!(
+                "durable seal schema {} unsupported (want {})",
+                self.schema,
+                DURABLE_SEAL_SCHEMA
+            );
+        }
+        let mac_hex = self.hmac_sha256.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("durable seal {:?} is unkeyed (missing hmac_sha256)", self.label)
+        })?;
+        let expected_env = self.envelope_hmac_sha256.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "durable seal {:?} is missing envelope_hmac_sha256 tag",
+                self.label
+            )
+        })?;
+        let computed = compute_envelope_hmac_hex(key, &self.label, &self.sha256, self.len, mac_hex);
+        if !constant_time_hex_eq(expected_env, &computed) {
+            bail!(
+                "durable seal envelope_hmac_sha256 mismatch for label {:?}: tamper or wrong key",
+                self.label
+            );
+        }
+        Ok(())
     }
 }
 
@@ -244,13 +307,27 @@ pub fn validate_seals_map(m: &std::collections::BTreeMap<String, String>) -> Res
 /// (TASK-146). Used when CLI `--durable-seals-dir` is omitted.
 pub const DURABLE_SEALS_DIR_ENV: &str = "CUTTLE_DURABLE_SEALS_DIR";
 
+/// Optional env var pointing to a 32-byte device seal key file; when set,
+/// `load_seals_dir` requires every seal JSON to pass `verify_envelope_keyed`.
+pub const DURABLE_SEAL_KEY_ENV: &str = "CUTTLE_DURABLE_SEAL_KEY_FILE";
+
 /// Load every `*.json` seal under `dir` into a label → sha256 map.
 /// Non-JSON files are skipped. Empty directory → empty map.
-/// Duplicate labels: last file wins (sorted by file name for stability).
+/// Duplicate labels across files in `dir` are rejected as a shadowing hazard.
 pub fn load_seals_dir(dir: &Path) -> Result<std::collections::BTreeMap<String, String>> {
     if !dir.is_dir() {
         bail!("durable seals dir is not a directory: {}", dir.display());
     }
+    let configured_key = match std::env::var_os(DURABLE_SEAL_KEY_ENV) {
+        Some(v) if !v.is_empty() => {
+            let kp = std::path::PathBuf::from(v);
+            Some(
+                crate::secret_file::load_strict(&kp)
+                    .with_context(|| format!("load {} at {}", DURABLE_SEAL_KEY_ENV, kp.display()))?,
+            )
+        }
+        _ => None,
+    };
     let mut paths: Vec<_> = fs::read_dir(dir)
         .with_context(|| format!("read seals dir {}", dir.display()))?
         .filter_map(|e| e.ok())
@@ -263,10 +340,24 @@ pub fn load_seals_dir(dir: &Path) -> Result<std::collections::BTreeMap<String, S
         })
         .collect();
     paths.sort();
+    let mut seen_labels = std::collections::BTreeSet::new();
     let mut seals = Vec::new();
     for p in &paths {
         match DurableSeal::read_file(p) {
-            Ok(s) => seals.push(s),
+            Ok(s) => {
+                if !seen_labels.insert(s.label.clone()) {
+                    bail!(
+                        "duplicate durable seal label {:?} in {}",
+                        s.label,
+                        dir.display()
+                    );
+                }
+                if let Some(ref key) = configured_key {
+                    s.verify_envelope_keyed(key)
+                        .with_context(|| format!("verify keyed seal {}", p.display()))?;
+                }
+                seals.push(s);
+            }
             Err(e) => {
                 bail!(
                     "load seal {}: {:#}",
@@ -427,5 +518,99 @@ mod tests {
                 .unwrap_or(0)
         ));
         assert!(resolve_durable_seals(Some(&missing)).is_err());
+    }
+
+    #[test]
+    fn load_seals_dir_rejects_duplicate_labels() {
+        let dir = std::env::temp_dir().join(format!(
+            "cuttle_seals_dup_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        DurableSeal::seal("wal_head", b"genuine-wal")
+            .write_file(&dir.join("01_wal.json"))
+            .unwrap();
+        DurableSeal::seal("wal_head", b"shadowed-wal")
+            .write_file(&dir.join("02_wal.json"))
+            .unwrap();
+        let res = load_seals_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            res.is_err(),
+            "load_seals_dir must reject duplicate seal labels instead of silently shadowing"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_host_matches_rfc4231_test_vectors() {
+        // RFC 4231 Test Case 1: key = 20 bytes of 0x0b (padded to 32 bytes with 0x00 -> identical
+        // to 20-byte HMAC key because keys <= 64 bytes are right-padded with zeros in RFC 2104!).
+        let mut k1 = [0u8; 32];
+        k1[..20].fill(0x0b);
+        let mac1 = hmac_sha256_host(&k1, b"Hi There");
+        let hex1: String = mac1.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(
+            hex1,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+
+        // RFC 4231 Test Case 2: key = "Jefe", data = "what do ya want for nothing?"
+        let mut k2 = [0u8; 32];
+        k2[..4].copy_from_slice(b"Jefe");
+        let mac2 = hmac_sha256_host(&k2, b"what do ya want for nothing?");
+        let hex2: String = mac2.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(
+            hex2,
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn load_seals_dir_enforces_keyed_envelope_when_seal_key_configured() {
+        let dir = std::env::temp_dir().join(format!(
+            "cuttle_seals_keyed_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("device_seal_key.bin");
+        let key = load_or_generate_device_seal_key(&key_path).unwrap();
+
+        let keyed = DurableSeal::seal_keyed("audit_snapshot", b"authentic-audit", &key);
+        keyed.verify_keyed(b"authentic-audit", &key).unwrap();
+        keyed.verify_envelope_keyed(&key).unwrap();
+        keyed.write_file(&dir.join("audit.json")).unwrap();
+
+        unsafe {
+            std::env::set_var(DURABLE_SEAL_KEY_ENV, &key_path);
+        }
+        let m = load_seals_dir(&dir).expect("keyed seal must load when valid key configured");
+        assert_eq!(m.get("audit_snapshot"), Some(&keyed.sha256));
+
+        // Unkeyed seal added into dir must be rejected when DURABLE_SEAL_KEY_ENV is active.
+        DurableSeal::seal("forged_unkeyed", b"attacker-blob")
+            .write_file(&dir.join("forged.json"))
+            .unwrap();
+        let err_unkeyed = load_seals_dir(&dir);
+
+        // Relabelled keyed seal (tampering label without key) must also fail verify_envelope_keyed.
+        let mut relabelled = keyed.clone();
+        relabelled.label = "wal_head".into();
+        let err_relabel = relabelled.verify_envelope_keyed(&key);
+
+        unsafe {
+            std::env::remove_var(DURABLE_SEAL_KEY_ENV);
+        }
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(err_unkeyed.is_err(), "unkeyed seal must fail when seal key env is set");
+        assert!(err_relabel.is_err(), "relabelled seal must fail keyed envelope verification");
     }
 }

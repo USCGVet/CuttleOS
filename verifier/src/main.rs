@@ -30,7 +30,8 @@ use cuttle_verifier::perf::{
     evaluate_perf_gate, read_baseline_window, unmatched_fields, PerfGateOutcome, PerfMetrics,
 };
 use cuttle_verifier::static_checks::{
-    evaluate_static, parse_manifest_str, StaticCheckInput, StaticCheckOutcome,
+    evaluate_bundle_static, evaluate_static, parse_manifest_str, BundleMemberInput,
+    StaticCheckInput, StaticCheckOutcome,
 };
 
 /// Per-cycle performance log written alongside the attestation log.
@@ -126,6 +127,12 @@ fn run() -> Result<bool> {
     //       Logic lives in `cuttle_verifier::static_checks` so the
     //       poison corpus can unit-test every reject class without
     //       spawning cargo.
+    let anchor_path: PathBuf = parsed
+        .candidate
+        .clone()
+        .or_else(|| parsed.bundle.first().map(|(_, p)| p.clone()))
+        .expect("parse_args validated at least one candidate path is present");
+
     if parsed.bundle.is_empty() {
         let cand_src = &subs[0].1;
         match evaluate_static(&StaticCheckInput {
@@ -140,45 +147,41 @@ fn run() -> Result<bool> {
             }
         }
 
-        // Locked-surface stub (unchanged) — reserved for future per-
-        // module locked-name enforcement.
         let _ = LOCKED_PUBLIC_SYMBOLS_HINT;
+    } else {
+        // Bundle mode: run static surface anti-regression, manifest union,
+        // and non-zero-diversity checks across all bundle members before
+        // invoking cargo in the scratch workspace.
+        let ws_root_opt = locate_workspace_root(&anchor_path).ok();
+        let mut prev_sources: Vec<Option<String>> = Vec::with_capacity(subs.len());
+        for (mod_name, _) in &subs {
+            let prev_mod = ws_root_opt.as_ref().and_then(|ws| {
+                let p = ws
+                    .join(&parsed.target_crate)
+                    .join("src")
+                    .join(format!("{}.rs", mod_name));
+                fs::read_to_string(p).ok()
+            });
+            prev_sources.push(prev_mod);
+        }
+        let bundle_inputs: Vec<BundleMemberInput<'_>> = subs
+            .iter()
+            .zip(prev_sources.iter())
+            .map(|((mod_name, cand_src), prev_opt)| BundleMemberInput {
+                module: mod_name.as_str(),
+                candidate: cand_src.as_str(),
+                previous: prev_opt.as_deref(),
+            })
+            .collect();
+        match evaluate_bundle_static(&bundle_inputs, &required_pub) {
+            StaticCheckOutcome::Accept => {}
+            StaticCheckOutcome::Reject { reason } => {
+                eprintln!("{}", reason.stderr_line());
+                return Ok(false);
+            }
+        }
     }
 
-    // 5b. (Removed in TASK-020.) The cap-check AST property is
-    //     replaced by a compile-time type-state proof carried in
-    //     `cuttle_contracts::CapProof`. A morph candidate that
-    //     attempts to bypass the cap gate fails to *compile* in the
-    //     scratch workspace below, which the existing compile-and-
-    //     test stage already catches. The dedicated trybuild suite
-    //     `verifier/tests/cap_typestate.rs` exercises the negative
-    //     cases (let-_-discard, if-false dead code, fake CapProof,
-    //     etc.) end-to-end against the contracts crate.
-
-    // 6. Compile-and-test stage. The candidate is dropped into a scratch
-    //    workspace alongside copies of `contracts/` and `target_minimal/`,
-    //    its `src/lib.rs` is overwritten with the candidate source, and
-    //    cargo is invoked to (a) build the test target, then (b) run the
-    //    `golden` integration test. Either step's non-zero exit rejects
-    //    the candidate. This is the real semantic-preservation check —
-    //    the trait-level harness from `cuttle_contracts::harness` runs
-    //    inside that test binary, against the candidate, in a real Rust
-    //    runtime.
-    //
-    //    The perf measurement runs after golden, BEFORE writing anything
-    //    to perf.jsonl. The threshold check happens here in `run()` so
-    //    that a perf-regression reject leaves the log untouched.
-    //
-    //    Scratch dir cleanup is best-effort and runs on both paths.
-    // Path used only to anchor the workspace-root walk. Single-module:
-    // the positional candidate; bundle: the first --bundle-module's
-    // candidate path. Both point inside the same workspace so either
-    // resolves the same root.
-    let anchor_path: PathBuf = parsed
-        .candidate
-        .clone()
-        .or_else(|| parsed.bundle.first().map(|(_, p)| p.clone()))
-        .expect("parse_args validated at least one candidate path is present");
     match compile_and_test(&anchor_path, &parsed.target_crate, &subs, &perf_opts) {
         Ok(true) => Ok(true),
         Ok(false) => Ok(false),

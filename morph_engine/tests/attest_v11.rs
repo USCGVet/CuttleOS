@@ -393,3 +393,153 @@ fn attest_entry_includes_sbom_digest() {
         "forged sbom_sha256 must fail v11 signature verification"
     );
 }
+
+#[test]
+fn cosign_on_multi_entry_v11_chain_preserves_subsequent_primary_sigs_and_binds_full_entry() {
+    let (_g, guard) = Guard::new("cosign_multi_v11");
+    let sk_primary = test_key();
+    let sk_a = test_key();
+    let fed = guard.dir.join("factory_keys.toml");
+    fs::write(
+        &fed,
+        format!(
+            "threshold = 2\n\
+             [[signers]]\nid = \"primary\"\npubkey_hex = \"{}\"\n\
+             [[signers]]\nid = \"cosigner-a\"\npubkey_hex = \"{}\"\n",
+            pk_hex(&sk_primary),
+            pk_hex(&sk_a),
+        ),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var(FEDERATION_CONFIG_ENV, &fed);
+    }
+
+    let mut f1 = fields(1, "tls", sk_primary.clone());
+    f1.federation_threshold = Some(2);
+    write_attestation(f1).unwrap();
+
+    let mut f2 = fields(2, "wal", sk_primary.clone());
+    f2.federation_threshold = Some(2);
+    write_attestation(f2).unwrap();
+
+    // Offline co-signer (holding ONLY sk_a, NOT sk_primary) appends cosignatures
+    // to entry 0 and entry 1 over the v11 signable entry digest.
+    let mut entries = load_entries().unwrap();
+    for entry in &mut entries {
+        let signable = attest::compute_signable_sha256(entry).unwrap();
+        entry.cosignatures.push(cuttle_morph_engine::federation::Cosignature {
+            signer_id: "cosigner-a".to_string(),
+            sig_ed25519: sk_a
+                .sign(&signable)
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect(),
+        });
+    }
+    rebuild_chain_after_cosign(&mut entries, 0).unwrap();
+    let mut anchors = attest::load_anchors().unwrap();
+    attest::rebuild_anchors_after_cosign(&entries, &mut anchors, 0).unwrap();
+    write_chain_atomic(&entries, &anchors).unwrap();
+
+    // Plain verify AND threshold verify must both pass on the 2-entry v11 chain.
+    let rep = verify_chain().expect("multi-entry v11 chain must still verify after offline cosign");
+    assert_eq!(rep.entries_ok, 2);
+
+    let thr_opts = attest::VerifyOptions {
+        require_threshold: true,
+        federation_config: Some(fed.clone()),
+        require_merkle_root: true,
+        require_strict_factory: false,
+        factory_expected_path: None,
+        require_ext_tlv: true,
+        require_diversity: false,
+        require_durable_seals: false,
+    };
+    let rep_thr = attest::verify_chain_with_options(&thr_opts)
+        .expect("2-of-2 v11 threshold verify must pass");
+    assert_eq!(rep_thr.entries_ok, 2);
+
+    // Even if sk_primary is compromised and re-signs a relabelled module ("kpti")
+    // while keeping cosigner-a's signature, threshold verify MUST reject because
+    // cosigner-a signed the full v11 signable digest, not bare candidate_sha256!
+    let mut forged = load_entries().unwrap();
+    forged[0].module = "kpti".to_string();
+    forged[0].ext_tlv_b64 = Some(
+        cuttle_morph_engine::build_ext_tlv_b64(
+            forged[0].cycle,
+            &forged[0].module,
+            &forged[0].candidate_sha256,
+        )
+        .unwrap(),
+    );
+    let new_signable0 = attest::compute_signable_sha256(&forged[0]).unwrap();
+    let new_primary_sig: String = sk_primary
+        .sign(&new_signable0)
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    forged[0].sig_ed25519 = new_primary_sig.clone();
+    forged[0].cosignatures[0].sig_ed25519 = new_primary_sig;
+    rebuild_chain_after_cosign(&mut forged, 0).unwrap();
+    let signable1 = attest::compute_signable_sha256(&forged[1]).unwrap();
+    forged[1].sig_ed25519 = sk_primary
+        .sign(&signable1)
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    rebuild_chain_after_cosign(&mut forged, 0).unwrap();
+    write_chain_atomic(&forged, &anchors).unwrap();
+
+    assert!(
+        attest::verify_chain_with_options(&thr_opts).is_err(),
+        "threshold verify must reject module relabelling when co-signer only signed original v11 entry"
+    );
+}
+
+#[test]
+fn schema_downgrade_from_v11_to_v10_fails_verification() {
+    let (_g, guard) = Guard::new("downgrade_v11_v10");
+    let sk = test_key();
+    let fed = write_fed_toml(&guard.dir, &sk);
+    unsafe {
+        std::env::set_var(FEDERATION_CONFIG_ENV, &fed);
+    }
+    write_attestation(fields(1, "tls", sk)).unwrap();
+
+    // Attacker appends an unsigned legacy v10 entry after a signed v11 entry.
+    let mut f_downgrade = fields(2, "kpti", test_key());
+    f_downgrade.signing_key = None;
+    f_downgrade.sig_ed25519 = "00".repeat(64);
+    f_downgrade.cosignatures = Vec::new();
+    f_downgrade.federation_threshold = None;
+    write_attestation(f_downgrade).unwrap();
+
+    assert!(
+        verify_chain().is_err(),
+        "monotonic schema downgrade v11 -> v10 must fail verification"
+    );
+}
+
+#[test]
+fn missing_merkle_anchors_for_ten_entry_chain_fails_verification() {
+    let (_g, guard) = Guard::new("missing_anchors");
+    let sk = test_key();
+    let fed = write_fed_toml(&guard.dir, &sk);
+    unsafe {
+        std::env::set_var(FEDERATION_CONFIG_ENV, &fed);
+    }
+    for i in 1u64..=10 {
+        write_attestation(fields(i, "http", sk.clone())).unwrap();
+    }
+    assert_eq!(attest::load_anchors().unwrap().len(), 1);
+    // Delete merkle_anchors.jsonl and verify_chain must fail closed.
+    fs::remove_file(guard.dir.join(attest::ANCHOR_LOG)).unwrap();
+    assert!(
+        verify_chain().is_err(),
+        "deleting merkle_anchors.jsonl on a >=10-entry chain must fail verification"
+    );
+}

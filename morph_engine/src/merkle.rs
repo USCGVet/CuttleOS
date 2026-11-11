@@ -83,6 +83,14 @@ pub enum MerkleError {
     /// Inclusion proof's sibling count does not match the depth
     /// required by `leaf_count`.
     ProofDepthMismatch { expected: usize, got: usize },
+    /// Inclusion proof's sibling `Side` at `depth` disagrees with the
+    /// path implied by `leaf_index`.
+    ProofSideMismatch {
+        depth: usize,
+        index: u64,
+        expected: Side,
+        got: Side,
+    },
 }
 
 impl core::fmt::Display for MerkleError {
@@ -102,6 +110,16 @@ impl core::fmt::Display for MerkleError {
                     got, expected
                 )
             }
+            MerkleError::ProofSideMismatch {
+                depth,
+                index,
+                expected,
+                got,
+            } => write!(
+                f,
+                "merkle: proof side {:?} at depth {} for leaf_index {} disagrees with expected {:?}",
+                got, depth, index, expected
+            ),
         }
     }
 }
@@ -300,12 +318,23 @@ pub fn verify_inclusion(
             got: proof.siblings.len(),
         });
     }
+    let mut pos = proof.leaf_index;
     let mut acc = *leaf;
-    for (side, sibling) in &proof.siblings {
+    for (d, (side, sibling)) in proof.siblings.iter().enumerate() {
+        let expected_side = if pos % 2 == 1 { Side::Left } else { Side::Right };
+        if *side != expected_side {
+            return Err(MerkleError::ProofSideMismatch {
+                depth: d,
+                index: proof.leaf_index,
+                expected: expected_side,
+                got: *side,
+            });
+        }
         acc = match side {
             Side::Left => hash_pair(sibling, &acc),
             Side::Right => hash_pair(&acc, sibling),
         };
+        pos /= 2;
     }
     Ok(acc == *expected_root)
 }
@@ -572,5 +601,23 @@ mod tests {
         let l2_1 = hash_pair(&l1_2, &l1_2);
         let expected = hash_pair(&l2_0, &l2_1);
         assert_eq!(r, expected);
+    }
+
+    #[test]
+    fn proof_rejects_forged_side_direction_for_leaf_index() {
+        let leaves = synthetic_leaves(2);
+        let root = compute_root(&leaves).unwrap();
+        // Forged proof claims `leaves[1]` is at `leaf_index = 0` by flipping
+        // the sibling side to `Side::Left` with `leaves[0]`.
+        let forged = MerkleProof {
+            leaf_index: 0,
+            leaf_count: 2,
+            siblings: vec![(Side::Left, leaves[0])],
+        };
+        let res = verify_inclusion(&leaves[1], &forged, &root);
+        assert!(
+            res.is_err(),
+            "verify_inclusion must reject a proof whose Side disagrees with leaf_index, got {res:?}"
+        );
     }
 }

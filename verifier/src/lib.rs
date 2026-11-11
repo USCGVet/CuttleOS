@@ -32,8 +32,8 @@ pub use perf::{
 
 // Static (pre-compile) poison-corpus surface.
 pub use static_checks::{
-    collect_pub_idents, evaluate_static, parse_manifest_str, StaticCheckInput, StaticCheckOutcome,
-    StaticRejectReason,
+    collect_pub_idents, evaluate_bundle_static, evaluate_static, parse_manifest_str,
+    BundleMemberInput, StaticCheckInput, StaticCheckOutcome, StaticRejectReason,
 };
 
 /// Argument parser exposed to integration tests so they can assert the

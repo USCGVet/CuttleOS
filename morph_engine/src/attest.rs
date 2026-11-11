@@ -752,10 +752,32 @@ pub fn compute_entry_sha256(entry: &AttestEntry) -> Result<[u8; 32]> {
         _ => bail!("attestation entry did not serialize to a JSON object"),
     };
     obj.remove("entry_sha256");
+    if entry.schema_version >= SIGNED_ENTRY_MIN_SCHEMA {
+        // v11+: detached post-mint federation cosignatures are excluded from
+        // `entry_sha256` so an offline co-signer (who does not hold the primary
+        // factory signing key) can co-sign entry `k` without shifting
+        // `entries[k+1].prev_entry_sha256` and invalidating `entries[k+1]`'s
+        // primary signature. Pre-v11 entries keep `cosignatures` in `entry_sha256`
+        // for backward compatibility.
+        obj.remove("cosignatures");
+    }
     let canonical = canonical_json(&serde_json::Value::Object(obj))?;
     let mut h = Sha256::new();
     h.update(canonical.as_bytes());
     Ok(h.finalize().into())
+}
+
+/// Return the 32-byte digest that federation co-signers sign and verify for `entry`:
+/// - `schema_version >= SIGNED_ENTRY_MIN_SCHEMA` (v11+): [`compute_signable_sha256`],
+///   binding co-signatures to the full entry content (`module`, `accepted`,
+///   `diversity`, `durable_seals`, `factory_binaries`, `prev_entry_sha256`, `cycle`, …).
+/// - Legacy pre-v11 entries: `candidate_sha256` for backward compatibility.
+pub fn cosign_message_for_entry(entry: &AttestEntry) -> Result<[u8; 32]> {
+    if entry.schema_version >= SIGNED_ENTRY_MIN_SCHEMA {
+        compute_signable_sha256(entry)
+    } else {
+        parse_hex32(&entry.candidate_sha256)
+    }
 }
 
 /// Compute the **signable hash** (schema v11+): SHA-256 over the canonical
@@ -1147,7 +1169,13 @@ pub fn write_attestation(fields: AttestEntryFields) -> Result<()> {
         use ed25519_dalek::Signer;
         let signable = compute_signable_sha256(&entry)?;
         let sig = key.sign(&signable);
-        entry.sig_ed25519 = hex(&sig.to_bytes());
+        let sig_hex = hex(&sig.to_bytes());
+        entry.sig_ed25519 = sig_hex.clone();
+        for c in &mut entry.cosignatures {
+            if c.signer_id == "primary" {
+                c.sig_ed25519 = sig_hex.clone();
+            }
+        }
     }
     let hash = compute_entry_sha256(&entry)?;
     entry.entry_sha256 = hex(&hash);
@@ -1392,7 +1420,9 @@ fn verify_entry_signature(
     entry: &AttestEntry,
     vk: &ed25519_dalek::VerifyingKey,
 ) -> Result<()> {
-    use ed25519_dalek::Verifier;
+    if vk.is_weak() {
+        bail!("primary verifying key is a weak/small-order Ed25519 point");
+    }
     if entry.sig_ed25519.len() != 128 {
         bail!(
             "v{} entry has sig_ed25519 of {} chars (expected 128)",
@@ -1407,7 +1437,7 @@ fn verify_entry_signature(
     }
     let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
     let signable = compute_signable_sha256(entry)?;
-    vk.verify(&signable, &sig)
+    vk.verify_strict(&signable, &sig)
         .context("primary signature over entry content does not verify")?;
     Ok(())
 }
@@ -1474,6 +1504,7 @@ pub fn verify_chain_with_options(opts: &VerifyOptions) -> Result<VerifyReport> {
     // Entry-level checks: recompute each entry_sha256 and check the
     // prev_entry_sha256 chain link.
     let mut prev_hash = ZERO_HEX.to_string();
+    let mut max_seen_schema: u64 = 0;
     for (i, e) in entries.iter().enumerate() {
         // Hash check.
         let mut e_copy = e.clone();
@@ -1518,6 +1549,31 @@ pub fn verify_chain_with_options(opts: &VerifyOptions) -> Result<VerifyReport> {
                 READABLE_MIN_SCHEMA,
                 SCHEMA_VERSION
             );
+        }
+        if e.schema_version < max_seen_schema {
+            bail!(
+                "verify-attest: entry {} (cycle={}, module={}) downgrades schema_version \
+                 from {} to {} (monotonic schema floor violated)",
+                i,
+                e.cycle,
+                e.module,
+                max_seen_schema,
+                e.schema_version
+            );
+        }
+        max_seen_schema = e.schema_version;
+        for c in &e.cosignatures {
+            if c.signer_id.is_empty()
+                || c.sig_ed25519.len() != 128
+                || !c.sig_ed25519.chars().all(|ch| ch.is_ascii_hexdigit())
+            {
+                bail!(
+                    "verify-attest: entry {} (cycle={}) contains malformed cosignature for signer {:?}",
+                    i,
+                    e.cycle,
+                    c.signer_id
+                );
+            }
         }
         // v11+: the primary signature commits to the full entry content
         // (module, accepted, diversity, seals, chain position, …). Always
@@ -1634,10 +1690,10 @@ pub fn verify_chain_with_options(opts: &VerifyOptions) -> Result<VerifyReport> {
                     fed.threshold
                 );
             }
-            let cand = parse_hex32(&e.candidate_sha256).with_context(|| {
-                format!("verify-attest: entry {} candidate_sha256 malformed", i)
+            let msg = cosign_message_for_entry(e).with_context(|| {
+                format!("verify-attest: entry {} cosign message computation failed", i)
             })?;
-            federation::verify_cosignatures(&cand, &e.cosignatures, fed)
+            federation::verify_cosignatures(&msg, &e.cosignatures, fed)
                 .with_context(|| format!("verify-attest: entry {} (cycle={})", i, e.cycle))?;
         }
         // Factory-fingerprint enforcement (--strict-factory).
@@ -1656,6 +1712,15 @@ pub fn verify_chain_with_options(opts: &VerifyOptions) -> Result<VerifyReport> {
 
     // Anchor-level checks.
     let anchors = load_anchors()?;
+    let expected_anchors = entries.len() / (ANCHOR_INTERVAL as usize);
+    if anchors.len() != expected_anchors {
+        bail!(
+            "verify-attest: expected {} merkle anchor(s) for {} entries, found {}",
+            expected_anchors,
+            entries.len(),
+            anchors.len()
+        );
+    }
     let mut prev_root = ZERO_HEX.to_string();
     for (i, a) in anchors.iter().enumerate() {
         if a.anchor_index != i as u64 {
@@ -1672,6 +1737,18 @@ pub fn verify_chain_with_options(opts: &VerifyOptions) -> Result<VerifyReport> {
                 i,
                 a.prev_anchor_merkle_root,
                 prev_root
+            );
+        }
+        let expected_start = (i as u64) * ANCHOR_INTERVAL;
+        let expected_last = expected_start + ANCHOR_INTERVAL - 1;
+        if a.first_entry != expected_start || a.last_entry != expected_last {
+            bail!(
+                "verify-attest: anchor {} covers {}..={} (expected {}..={})",
+                i,
+                a.first_entry,
+                a.last_entry,
+                expected_start,
+                expected_last
             );
         }
         let start = a.first_entry as usize;

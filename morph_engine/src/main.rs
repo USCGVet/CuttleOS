@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 
 use cuttle_morph_engine::{
     attest::{
-        load_anchors, load_entries, parse_hex32, rebuild_anchors_after_cosign,
-        rebuild_chain_after_cosign, write_chain_atomic,
+        load_anchors, load_entries, rebuild_anchors_after_cosign, rebuild_chain_after_cosign,
+        write_chain_atomic,
     },
     daemon::{run_daemon, DaemonArgs},
     durable_seal_file, durable_verify_file, factory,
@@ -683,10 +683,9 @@ fn cmd_cosign(args: &[String]) -> Result<()> {
             skipped += 1;
             continue;
         }
-        let cand = parse_hex32(&entries[idx].candidate_sha256).with_context(|| {
-            format!("entry {} candidate_sha256 malformed", idx)
-        })?;
-        let sig = sk.sign(&cand);
+        let msg = cuttle_morph_engine::attest::cosign_message_for_entry(&entries[idx])
+            .with_context(|| format!("entry {} cosign digest computation failed", idx))?;
+        let sig = sk.sign(&msg);
         let sig_hex: String = sig.to_bytes().iter().map(|b| format!("{:02x}", b)).collect();
         entries[idx].cosignatures.push(Cosignature {
             signer_id: signer_id.clone(),
@@ -737,15 +736,27 @@ fn cmd_rollback_bundle(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `morph sign-policy <PATH> [--signer <ID>]` (`R3`).
+/// `morph sign-policy <PATH> [--signer <ID>] [--append] [--key-file <PATH>]` (`R3`).
 fn cmd_sign_policy(args: &[String]) -> Result<()> {
     let mut path: Option<PathBuf> = None;
     let mut signer_id = String::from("primary");
+    let mut append = false;
+    let mut key_file: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--signer" => {
                 signer_id = args.get(i + 1).context("--signer needs value")?.clone();
+                i += 2;
+            }
+            "--append" => {
+                append = true;
+                i += 1;
+            }
+            "--key-file" | "--seed-file" => {
+                key_file = Some(PathBuf::from(
+                    args.get(i + 1).context("--key-file needs value")?,
+                ));
                 i += 2;
             }
             s if !s.starts_with('-') && path.is_none() => {
@@ -757,14 +768,29 @@ fn cmd_sign_policy(args: &[String]) -> Result<()> {
     }
     let path = path.context("morph sign-policy requires <PATH>")?;
     let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let stripped: Vec<&str> = raw
-        .lines()
-        .filter(|l| !l.trim().starts_with(factory::POLICY_SIG_PREFIX))
-        .collect();
-    let base = stripped.join("\n") + "\n";
-    let sk = cuttle_morph_engine::load_signing_key()?;
-    let signed = factory::sign_policy_toml_str(&base, &signer_id, &sk);
+    let sk = match key_file {
+        Some(ref kp) => {
+            let seed = cuttle_morph_engine::secret_file::load_strict(kp)?;
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+        }
+        None => cuttle_morph_engine::load_signing_key()?,
+    };
+    let signed = if append {
+        factory::append_policy_signature_str(&raw, &signer_id, &sk)
+    } else {
+        let stripped: Vec<&str> = raw
+            .lines()
+            .filter(|l| !l.trim().starts_with(factory::POLICY_SIG_PREFIX))
+            .collect();
+        let base = stripped.join("\n") + "\n";
+        factory::sign_policy_toml_str(&base, &signer_id, &sk)
+    };
     fs::write(&path, signed).with_context(|| format!("write {}", path.display()))?;
-    println!("sign-policy: signed {} with signer={}", path.display(), signer_id);
+    println!(
+        "sign-policy: signed {} with signer={} append={}",
+        path.display(),
+        signer_id,
+        append
+    );
     Ok(())
 }

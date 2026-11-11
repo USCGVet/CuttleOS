@@ -323,8 +323,31 @@ pub fn sign_policy_toml_str(
     out
 }
 
-/// Verify that `raw_toml` carries at least one valid `# cuttle-policy-sig-v1:`
-/// signature from a non-revoked signer in `fed`.
+/// Append or replace a `# cuttle-policy-sig-v1:` signature for `signer_id`
+/// while preserving existing signatures from other federation co-signers.
+pub fn append_policy_signature_str(
+    raw_toml: &str,
+    signer_id: &str,
+    sk: &ed25519_dalek::SigningKey,
+) -> String {
+    let signer_tok = format!("signer={signer_id}");
+    let kept: Vec<&str> = raw_toml
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix(POLICY_SIG_PREFIX) {
+                !rest.split_whitespace().any(|t| t == signer_tok)
+            } else {
+                true
+            }
+        })
+        .collect();
+    let base = kept.join("\n") + "\n";
+    sign_policy_toml_str(&base, signer_id, sk)
+}
+
+/// Verify that `raw_toml` carries valid `# cuttle-policy-sig-v1:`
+/// signature(s) meeting `fed.threshold` from non-revoked signers in `fed`.
 pub fn verify_policy_toml_str(
     raw_toml: &str,
     fed: &crate::federation::FederationConfig,
@@ -361,12 +384,7 @@ pub fn verify_policy_toml_str(
     let canon = canonical_policy_bytes(raw_toml);
     let dig: [u8; 32] = Sha256::digest(&canon).into();
     let mut policy_fed = fed.clone();
-    if cosigs.len() < (policy_fed.threshold as usize) {
-        // Policy files signed by primary or threshold signers verify against
-        // their present cosignatures if threshold=1, or require fed.threshold.
-    } else {
-        policy_fed.threshold = fed.threshold.max(1);
-    }
+    policy_fed.threshold = fed.threshold.max(1);
     crate::federation::verify_cosignatures(&dig, &cosigs, &policy_fed)
         .with_context(|| format!("verify signed policy TOML {policy_name}"))
 }
@@ -460,12 +478,26 @@ pub fn generate_cyclonedx_sbom(kernel_crate_dir: &Path) -> Result<(String, Strin
 
 pub fn load_factory_expected(path: &Path) -> Result<FactoryExpected> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    if raw.contains(POLICY_SIG_PREFIX) {
+    let sibling_fed = path
+        .parent()
+        .map(|p| p.join(crate::federation::FEDERATION_CONFIG_PATH))
+        .filter(|p| p.exists());
+    if let Some(fed_path) = sibling_fed {
+        // Whenever `factory_keys.toml` sits alongside `factory_expected.toml`,
+        // policy signature verification is MANDATORY (stripping `# cuttle-policy-sig-v1:`
+        // fails closed).
+        let fed = crate::federation::load_federation(&fed_path)?;
+        verify_policy_toml_str(&raw, &fed, &path.display().to_string())?;
+    } else if raw.contains(POLICY_SIG_PREFIX) {
         let fed_path = crate::federation::resolve_federation_path();
-        if fed_path.exists() {
-            let fed = crate::federation::load_federation(&fed_path)?;
-            verify_policy_toml_str(&raw, &fed, &path.display().to_string())?;
-        }
+        let fed = crate::federation::load_federation(&fed_path).with_context(|| {
+            format!(
+                "signed policy {} requires federation config {}",
+                path.display(),
+                fed_path.display()
+            )
+        })?;
+        verify_policy_toml_str(&raw, &fed, &path.display().to_string())?;
     }
     let cfg: FactoryExpected =
         toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
@@ -808,5 +840,66 @@ mod tests {
             .expect("workspace factory_expected.toml must carry valid primary signature");
         verify_signed_locked_modules(&lock_path, &fed)
             .expect("workspace locked_modules.toml must carry valid primary signature");
+    }
+
+    #[test]
+    fn load_factory_expected_rejects_stripped_signature_when_factory_keys_present() {
+        use ed25519_dalek::SigningKey;
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let pk_hex = hex_lower(&sk.verifying_key().to_bytes());
+        let dir = std::env::temp_dir().join(format!(
+            "cuttle_stripped_policy_sig_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(
+            dir.join("factory_keys.toml"),
+            format!("threshold = 1\n[[signers]]\nid = \"primary\"\npubkey_hex = \"{pk_hex}\"\n"),
+        )
+        .unwrap();
+
+        // Attacker strips `# cuttle-policy-sig-v1:` from factory_expected.toml.
+        let unsigned_raw = toml::to_string(&good_expected()).unwrap();
+        let exp_path = dir.join("factory_expected.toml");
+        fs::write(&exp_path, &unsigned_raw).unwrap();
+
+        let res = load_factory_expected(&exp_path);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            res.is_err(),
+            "load_factory_expected must fail closed when signature is stripped alongside factory_keys.toml"
+        );
+    }
+
+    #[test]
+    fn append_policy_signature_str_supports_multi_signer_threshold() {
+        use ed25519_dalek::SigningKey;
+        let sk_p = SigningKey::generate(&mut rand::rngs::OsRng);
+        let sk_a = SigningKey::generate(&mut rand::rngs::OsRng);
+        let fed = crate::federation::FederationConfig {
+            threshold: 2,
+            signers: vec![
+                crate::federation::Signer {
+                    id: "primary".into(),
+                    pubkey_hex: hex_lower(&sk_p.verifying_key().to_bytes()),
+                },
+                crate::federation::Signer {
+                    id: "cosigner-a".into(),
+                    pubkey_hex: hex_lower(&sk_a.verifying_key().to_bytes()),
+                },
+            ],
+            revoked: Vec::new(),
+        };
+        let raw = toml::to_string(&good_expected()).unwrap();
+        let one_sig = sign_policy_toml_str(&raw, "primary", &sk_p);
+        assert!(
+            verify_policy_toml_str(&one_sig, &fed, "factory_expected.toml").is_err(),
+            "single signature must be rejected when fed.threshold == 2"
+        );
+        let two_sigs = append_policy_signature_str(&one_sig, "cosigner-a", &sk_a);
+        verify_policy_toml_str(&two_sigs, &fed, "factory_expected.toml")
+            .expect("2-of-2 appended policy signatures must verify");
     }
 }

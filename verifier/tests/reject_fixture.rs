@@ -181,3 +181,29 @@ fn accept_writes_perf_jsonl_line() {
         );
     }
 }
+
+#[test]
+fn bundle_mode_rejects_canonical_duplicate_and_removed_pub_symbol_at_static_stage() {
+    let root = workspace_root();
+    // Passing the existing target_minimal/src/lib.rs as its own bundle candidate
+    // must be rejected immediately at the static canonical-dedup stage (exit code 1)
+    // WITHOUT invoking cargo build!
+    let existing_lib = root.join("target_minimal").join("src").join("lib.rs");
+    let out = Command::new(verify_binary())
+        .arg("--target-crate")
+        .arg("target_minimal")
+        .arg("--bundle-module")
+        .arg(format!("lib={}", existing_lib.display()))
+        .output()
+        .expect("spawn verify in bundle mode");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "all-identical bundle must reject at static stage with exit code 1, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("canonical-equivalent"),
+        "expected static canonical-dedup reject in bundle mode, got stderr:\n{stderr}"
+    );
+}

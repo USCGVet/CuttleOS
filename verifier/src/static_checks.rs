@@ -193,6 +193,102 @@ pub fn evaluate_static(input: &StaticCheckInput<'_>) -> StaticCheckOutcome {
     StaticCheckOutcome::Accept
 }
 
+/// Per-member input for bundle-mode static verification.
+#[derive(Debug, Clone)]
+pub struct BundleMemberInput<'a> {
+    pub module: &'a str,
+    pub candidate: &'a str,
+    pub previous: Option<&'a str>,
+}
+
+/// Run static checks across an atomic multi-module bundle:
+/// 1. Every member must parse cleanly.
+/// 2. If `required_pub` is non-empty, every required symbol must appear as a
+///    top-level `pub` item in at least one bundle member.
+/// 3. For each member with `previous: Some(prev_src)`, no `pub` item present in
+///    `prev_src` may be dropped from `candidate` (`RemovedPreviousSymbol`).
+/// 4. If at least one member has `previous: Some(prev_src)`, at least ONE member
+///    in the bundle must actually change its canonical AST (`CanonicalDuplicate`
+///    if the entire bundle is AST-identical to the previous cycle).
+pub fn evaluate_bundle_static(
+    members: &[BundleMemberInput<'_>],
+    required_pub: &BTreeSet<String>,
+) -> StaticCheckOutcome {
+    let mut union_pub = BTreeSet::new();
+    let mut saw_any_previous = false;
+    let mut any_member_diversified = false;
+
+    for m in members {
+        let cand: File = match syn::parse_str(m.candidate) {
+            Ok(f) => f,
+            Err(e) => {
+                return StaticCheckOutcome::Reject {
+                    reason: StaticRejectReason::ParseFailed {
+                        message: format!("module {}: {}", m.module, e),
+                    },
+                };
+            }
+        };
+        let cand_pub = collect_pub_idents(&cand);
+        union_pub.extend(cand_pub.iter().cloned());
+
+        if let Some(prev_src) = m.previous {
+            saw_any_previous = true;
+            let prev: File = match syn::parse_str(prev_src) {
+                Ok(f) => f,
+                Err(e) => {
+                    return StaticCheckOutcome::Reject {
+                        reason: StaticRejectReason::ParseFailed {
+                            message: format!("previous source ({}): {}", m.module, e),
+                        },
+                    };
+                }
+            };
+            let prev_pub = collect_pub_idents(&prev);
+            for s in &prev_pub {
+                if !cand_pub.contains(s) {
+                    return StaticCheckOutcome::Reject {
+                        reason: StaticRejectReason::RemovedPreviousSymbol {
+                            name: format!("{}::{}", m.module, s),
+                        },
+                    };
+                }
+            }
+            match (
+                cuttle_diversifier::canonical_hash(m.candidate),
+                cuttle_diversifier::canonical_hash(prev_src),
+            ) {
+                (Ok(cand_h), Ok(prev_h)) if cand_h != prev_h => {
+                    any_member_diversified = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !required_pub.is_empty() {
+        let mut missing: Vec<String> = required_pub
+            .iter()
+            .filter(|name| !union_pub.contains(*name))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            missing.sort();
+            return StaticCheckOutcome::Reject {
+                reason: StaticRejectReason::MissingManifestSymbols { missing },
+            };
+        }
+    }
+
+    if saw_any_previous && !any_member_diversified {
+        return StaticCheckOutcome::Reject {
+            reason: StaticRejectReason::CanonicalDuplicate,
+        };
+    }
+
+    StaticCheckOutcome::Accept
+}
+
 /// Collect top-level public item names from a parsed file.
 ///
 /// Matches the historical verifier surface: `pub fn` / `struct` /
@@ -338,5 +434,32 @@ mod tests {
             required_pub: &empty_req(),
         });
         assert!(out.is_accept(), "{:?}", out);
+    }
+
+    #[test]
+    fn evaluate_bundle_static_rejects_removed_symbol_and_accepts_partial_diversification() {
+        let dropped = [BundleMemberInput {
+            module: "tls",
+            candidate: "pub fn handshake() {}",
+            previous: Some("pub fn handshake() {} pub fn record_open() {}"),
+        }];
+        let out_drop = evaluate_bundle_static(&dropped, &empty_req());
+        assert_eq!(out_drop.reject_tag(), Some("removed_previous_symbol"));
+
+        // One small unchanged module + one diversified module -> bundle accepts.
+        let partial = [
+            BundleMemberInput {
+                module: "tiny",
+                candidate: "pub const VERSION: u32 = 1;",
+                previous: Some("pub const VERSION: u32 = 1;"),
+            },
+            BundleMemberInput {
+                module: "wal",
+                candidate: "pub fn append() -> u32 { let y = 2; y }",
+                previous: Some("pub fn append() -> u32 { let x = 1; x }"),
+            },
+        ];
+        let out_ok = evaluate_bundle_static(&partial, &empty_req());
+        assert!(out_ok.is_accept(), "{out_ok:?}");
     }
 }

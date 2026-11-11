@@ -319,20 +319,52 @@ fn prepare_candidate(args: &CycleArgs) -> Result<PreparedCandidate> {
     })
 }
 
+fn infer_target_crate_name(target_dir: &Path) -> Option<String> {
+    let dir_name = target_dir.file_name()?.to_str()?;
+    let crate_dir = if dir_name == "src" {
+        target_dir.parent()?
+    } else {
+        target_dir
+    };
+    if crate_dir.join("Cargo.toml").exists() {
+        crate_dir.file_name()?.to_str().map(|s| s.to_string())
+    } else {
+        None
+    }
+}
+
+fn build_single_module_verifier_args(
+    args: &CycleArgs,
+    source_path: &Path,
+    cand_path: &Path,
+) -> Vec<std::ffi::OsString> {
+    let mut out: Vec<std::ffi::OsString> = Vec::new();
+    out.push("--module".into());
+    out.push(args.module.clone().into());
+    if let Some(crate_name) = infer_target_crate_name(&args.target_dir) {
+        out.push("--target-crate".into());
+        out.push(crate_name.into());
+    }
+    out.push("--previous".into());
+    out.push(source_path.as_os_str().to_os_string());
+    if let Some(m) = &args.manifest {
+        out.push("--manifest".into());
+        out.push(m.as_os_str().to_os_string());
+    }
+    if args.no_perf_check {
+        out.push("--no-perf-check".into());
+    }
+    out.push(cand_path.as_os_str().to_os_string());
+    out
+}
+
 /// Run the verify binary against a staged candidate. Returns `true` on
 /// verifier ACCEPT (exit 0).
 fn run_verifier(args: &CycleArgs, source_path: &Path, cand_path: &Path) -> Result<bool> {
     eprintln!("morph: stage 3 verify");
     let verify_exe = locate_sibling_bin("verify")?;
     let mut cmd = Command::new(&verify_exe);
-    cmd.arg("--previous").arg(source_path);
-    if let Some(m) = &args.manifest {
-        cmd.arg("--manifest").arg(m);
-    }
-    if args.no_perf_check {
-        cmd.arg("--no-perf-check");
-    }
-    cmd.arg(cand_path);
+    cmd.args(build_single_module_verifier_args(args, source_path, cand_path));
     let status = cmd
         .status()
         .with_context(|| format!("run {}", verify_exe.display()))?;
@@ -1033,14 +1065,24 @@ fn ensure_not_locked(source_path: &Path) -> Result<()> {
     let lock = cuttle_diversifier::load_locked_modules(source_path)
         .map_err(|e| anyhow::anyhow!("locked-modules policy: {}", e))?;
     let lock_path = lock.workspace_root.join("locked_modules.toml");
-    if let Ok(raw) = fs::read_to_string(&lock_path) {
-        if raw.contains(crate::factory::POLICY_SIG_PREFIX) {
-            let fed_path = lock.workspace_root.join(crate::federation::FEDERATION_CONFIG_PATH);
-            if fed_path.exists() {
-                let fed = crate::federation::load_federation(&fed_path)?;
-                crate::factory::verify_policy_toml_str(&raw, &fed, &lock_path.display().to_string())?;
-            }
-        }
+    let raw = fs::read_to_string(&lock_path)
+        .with_context(|| format!("read {}", lock_path.display()))?;
+    let fed_path = lock.workspace_root.join(crate::federation::FEDERATION_CONFIG_PATH);
+    if fed_path.exists() {
+        // Mandatory policy signature check whenever `factory_keys.toml` sits in the
+        // workspace root — stripping `# cuttle-policy-sig-v1:` fails closed.
+        let fed = crate::federation::load_federation(&fed_path)?;
+        crate::factory::verify_policy_toml_str(&raw, &fed, &lock_path.display().to_string())?;
+    } else if raw.contains(crate::factory::POLICY_SIG_PREFIX) {
+        let resolved = crate::federation::resolve_federation_path();
+        let fed = crate::federation::load_federation(&resolved).with_context(|| {
+            format!(
+                "signed locked_modules.toml {} requires federation config {}",
+                lock_path.display(),
+                resolved.display()
+            )
+        })?;
+        crate::factory::verify_policy_toml_str(&raw, &fed, &lock_path.display().to_string())?;
     }
     if lock.is_locked(source_path) {
         bail!(
@@ -2022,5 +2064,38 @@ mod tests {
             "--cycle", "1", "--module", "lib", "--target", "D:/x", "--frobnicate",
         ]));
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn build_single_module_verifier_args_passes_module_and_target_crate() {
+        let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let target_dir = ws.join("target_enterprise").join("src");
+        let src_path = target_dir.join("audit.rs");
+        let cand_path = target_dir.join("audit.candidate.rs");
+        let args = CycleArgs {
+            cycle: 9,
+            module: "audit".into(),
+            target_dir,
+            manifest: None,
+            synthesizer: SynthesizerKind::PassThrough,
+            emit_image: false,
+            no_perf_check: true,
+            durable_seals_dir: None,
+        };
+        let vargs: Vec<String> = build_single_module_verifier_args(&args, &src_path, &cand_path)
+            .into_iter()
+            .map(|o| o.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            vargs.windows(2).any(|w| w == ["--module", "audit"]),
+            "missing --module audit in {vargs:?}"
+        );
+        assert!(
+            vargs.windows(2).any(|w| w == ["--target-crate", "target_enterprise"]),
+            "missing --target-crate target_enterprise in {vargs:?}"
+        );
     }
 }

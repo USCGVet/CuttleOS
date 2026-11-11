@@ -30,7 +30,7 @@
 //! verifier dedupes by `signer_id`: a duplicate cosignature counts once.
 
 use anyhow::{bail, Context, Result};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -367,10 +367,16 @@ pub fn verify_cosignatures(
             .ok_or_else(|| anyhow::anyhow!("unknown signer '{}'", c.signer_id))?;
         let pk = parse_pubkey(&signer.pubkey_hex)
             .with_context(|| format!("signer '{}' has malformed pubkey_hex", signer.id))?;
+        if pk.is_weak() {
+            bail!(
+                "signer '{}' uses a weak/small-order Ed25519 public key",
+                signer.id
+            );
+        }
         reject_revoked_verifying_key(&pk, fed, &signer.id)?;
         let sig = parse_sig(&c.sig_ed25519)
             .with_context(|| format!("signer '{}' cosignature has malformed sig hex", signer.id))?;
-        pk.verify(message, &sig)
+        pk.verify_strict(message, &sig)
             .map_err(|_| anyhow::anyhow!("invalid signature for signer '{}'", signer.id))?;
         // Each distinct verified 32-byte public key counts once.
         counted.insert(pk.to_bytes());
@@ -783,5 +789,31 @@ mod tests {
             reason: "compromised".into(),
         });
         assert!(verify_production_keyset(&cfg_thr2_revoked).is_err());
+    }
+
+    #[test]
+    fn verify_cosignatures_rejects_small_order_torsion_key_and_sig() {
+        // Ed25519 identity point (0, 1) compresses to 0x01 followed by 31 zero bytes.
+        // Under non-strict cofactored verification, A=I, R=I, S=0 verifies ANY message!
+        let identity_pt = format!("01{}", "00".repeat(31));
+        let zero_scalar = "00".repeat(32);
+        let forged_sig = format!("{identity_pt}{zero_scalar}");
+        let cfg = FederationConfig {
+            threshold: 1,
+            signers: vec![Signer {
+                id: "torsion".into(),
+                pubkey_hex: identity_pt,
+            }],
+            revoked: Vec::new(),
+        };
+        let msg = [0xA5u8; 32];
+        let cosigs = vec![Cosignature {
+            signer_id: "torsion".into(),
+            sig_ed25519: forged_sig,
+        }];
+        assert!(
+            verify_cosignatures(&msg, &cosigs, &cfg).is_err(),
+            "verify_cosignatures must reject small-order torsion public keys and signatures"
+        );
     }
 }
