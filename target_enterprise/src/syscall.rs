@@ -307,8 +307,9 @@ pub fn check_task_cap(
     cap_mask: u64,
 ) -> Result<cuttle_contracts::CapProof, Errno> {
     use cuttle_contracts::{CapError, SyscallCapTable};
+    let nr32 = u32::try_from(nr).map_err(|_| Errno::ENOSYS)?;
     let table = CapTableImpl;
-    match table.check(task_id, cap_mask, nr as u32) {
+    match table.check(task_id, cap_mask, nr32) {
         Ok(proof) => Ok(proof),
         Err(CapError::ENOSYS) => Err(Errno::ENOSYS),
         Err(CapError::EPERM) => Err(Errno::EPERM),
@@ -581,6 +582,9 @@ fn sys_dma_map<const D: usize, const V: usize, const E: usize>(
     proof.consume();
 
     let domain = task.iommu_domain.ok_or(Errno::EPERM)?;
+    if host_phys == 0 {
+        return Err(Errno::EINVAL);
+    }
     // perms is encoded as a low byte: bit 0 = READ, bit 1 = WRITE.
     // Mirror `cuttle_contracts::PagePerms`. Reject anything outside
     // the 2-bit range — preserves the locked perms encoding.
@@ -1262,6 +1266,33 @@ mod tests {
         assert_eq!(
             dispatch_dma(&mut iommu, &task29, u64::MAX, SYS_DMA_MAP, 0x4000, 0xC000_0000, 0b11),
             Ok(0)
+        );
+    }
+
+    #[test]
+    fn syscall_rejects_high_32bit_nr_truncation_and_zero_host_phys_dma() {
+        // 1. High 32-bit syscall numbers (e.g. `(1u64 << 32) | SYS_GETPID`) must NOT truncate to `nr as u32`
+        //    in `check_task_cap` / `check_cap` — they must fail closed with `ENOSYS`!
+        let forged_nr = (1u64 << 32) | SYS_GETPID;
+        assert_eq!(check_task_cap(0, forged_nr, u64::MAX).err(), Some(Errno::ENOSYS));
+        assert_eq!(
+            dispatch_syscall(0, u64::MAX, forged_nr, 0, 0, 0, 0, 0, 0),
+            Err(Errno::ENOSYS)
+        );
+
+        // 2. `SYS_DMA_MAP` with `host_phys == 0` (IVT / null physical frame) must be rejected with `EINVAL`!
+        let (mut iommu, task, _device) = dma_test_setup();
+        assert_eq!(
+            dispatch_dma(
+                &mut iommu,
+                &task,
+                cuttle_contracts::caps::NET_RAW,
+                SYS_DMA_MAP,
+                0x4000,
+                0, // host_phys = 0!
+                0b11,
+            ),
+            Err(Errno::EINVAL)
         );
     }
 }

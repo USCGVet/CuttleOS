@@ -99,32 +99,57 @@ pub fn load_phdrs_impl(
     hdr: &ElfHeader,
     out: &mut [ElfPhdr; ELF_MAX_PHDRS],
 ) -> Result<usize, ElfError> {
+    let phoff = usize::try_from(hdr.phoff).map_err(|_| ElfError::Truncated)?;
     let mut count = 0usize;
     let mut i = 0u16;
     while i < hdr.phnum {
-        let off = (hdr.phoff as usize)
-            .checked_add((i as usize) * ELF_PHDR_LEN)
+        let step = (i as usize)
+            .checked_mul(ELF_PHDR_LEN)
             .ok_or(ElfError::Truncated)?;
-        if off + ELF_PHDR_LEN > image.len() {
+        let off = phoff.checked_add(step).ok_or(ElfError::Truncated)?;
+        let end = off.checked_add(ELF_PHDR_LEN).ok_or(ElfError::Truncated)?;
+        if end > image.len() {
             return Err(ElfError::Truncated);
         }
-        let raw = &image[off..off + ELF_PHDR_LEN];
+        let raw = &image[off..end];
         let ptype = le32(raw, 0);
         if ptype == ELF_PT_LOAD {
             if count >= ELF_MAX_PHDRS {
                 return Err(ElfError::TooManyLoads);
             }
+            let flags = le32(raw, 4);
+            let seg_off = le64(raw, 8);
+            let vaddr = le64(raw, 16);
+            let filesz = le64(raw, 32);
+            let memsz = le64(raw, 40);
+            let align = le64(raw, 48);
+            // Enforce W^X (`PF_X = 1`, `PF_W = 2`), `filesz <= memsz`, and non-wrapping ranges.
+            if (flags & 0x3) == 0x3
+                || filesz > memsz
+                || seg_off.checked_add(filesz).is_none()
+                || vaddr.checked_add(memsz).is_none()
+            {
+                return Err(ElfError::BadPhdrs);
+            }
+            let new_end = vaddr + memsz;
+            let mut prev = 0usize;
+            while prev < count {
+                let p_start = out[prev].vaddr;
+                let p_end = p_start + out[prev].memsz;
+                if memsz > 0 && out[prev].memsz > 0 && vaddr < p_end && p_start < new_end {
+                    return Err(ElfError::BadPhdrs);
+                }
+                prev += 1;
+            }
             out[count] = ElfPhdr {
                 ptype,
-                flags: le32(raw, 4),
-                offset: le64(raw, 8),
-                vaddr: le64(raw, 16),
-                filesz: le64(raw, 32),
-                memsz: le64(raw, 40),
-                align: le64(raw, 48),
+                flags,
+                offset: seg_off,
+                vaddr,
+                filesz,
+                memsz,
+                align,
             };
-            // p_filesz is at 32, p_memsz at 40 in ELF64 Phdr:
-            // type@0 flags@4 offset@8 vaddr@16 paddr@24 filesz@32 memsz@40 align@48
             count += 1;
         }
         i += 1;
@@ -503,4 +528,52 @@ mod tests {
         assert_eq!(ELF_MAGIC[0], 0x7F);
         assert_eq!(ELF_MAGIC[1], b'E');
     }
+
+    #[test]
+    fn load_phdrs_rejects_wx_segments_filesz_gt_memsz_phoff_overflow_and_vaddr_overlap() {
+        let empty = ElfPhdr {
+            ptype: 0,
+            flags: 0,
+            offset: 0,
+            vaddr: 0,
+            filesz: 0,
+            memsz: 0,
+            align: 0,
+        };
+
+        // 1. `phoff` near `usize::MAX` must return `Err(ElfError::Truncated)` without overflowing `off + ELF_PHDR_LEN`.
+        let mut ovf = fixture();
+        put64(&mut ovf, 32, u64::MAX - 16);
+        let h_ovf = Elf64Impl::parse_header(&ovf).unwrap();
+        let mut out = [empty; ELF_MAX_PHDRS];
+        assert_eq!(Elf64Impl::load_phdrs(&ovf, &h_ovf, &mut out), Err(ElfError::Truncated));
+
+        // 2. W+X `PT_LOAD` (`PF_R | PF_W | PF_X = 7`) must be rejected with `Err(ElfError::BadPhdrs)`!
+        let mut wx = fixture();
+        put32(&mut wx[ELF_EHDR_LEN..], 4, 7);
+        let h_wx = Elf64Impl::parse_header(&wx).unwrap();
+        assert_eq!(Elf64Impl::load_phdrs(&wx, &h_wx, &mut out), Err(ElfError::BadPhdrs));
+
+        // 3. `filesz > memsz` must be rejected with `Err(ElfError::BadPhdrs)`!
+        let mut bad_sz = fixture();
+        put64(&mut bad_sz[ELF_EHDR_LEN..], 32, 0x200); // filesz
+        put64(&mut bad_sz[ELF_EHDR_LEN..], 40, 0x100); // memsz < filesz
+        let h_sz = Elf64Impl::parse_header(&bad_sz).unwrap();
+        assert_eq!(Elf64Impl::load_phdrs(&bad_sz, &h_sz, &mut out), Err(ElfError::BadPhdrs));
+
+        // 4. Two overlapping `PT_LOAD` virtual ranges must be rejected with `Err(ElfError::BadPhdrs)`!
+        let mut overlap = [0u8; ELF_EHDR_LEN + 2 * ELF_PHDR_LEN];
+        overlap[..ELF_FIXTURE_LEN].copy_from_slice(&fixture());
+        put16(&mut overlap, 56, 2); // phnum = 2
+        let p2_off = ELF_EHDR_LEN + ELF_PHDR_LEN;
+        let p1_copy = overlap[ELF_EHDR_LEN..p2_off].to_vec();
+        overlap[p2_off..p2_off + ELF_PHDR_LEN].copy_from_slice(&p1_copy);
+        put32(&mut overlap[p2_off..], 4, 6); // PF_R | PF_W
+        put64(&mut overlap[p2_off..], 16, ELF_BANNER_ENTRY + 0x80); // overlaps [0x401000, 0x401100)!
+        let h_ovl = Elf64Impl::parse_header(&overlap).unwrap();
+        assert_eq!(Elf64Impl::load_phdrs(&overlap, &h_ovl, &mut out), Err(ElfError::BadPhdrs));
+    }
 }
+
+#[cfg(test)]
+extern crate alloc;

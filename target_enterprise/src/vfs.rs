@@ -624,11 +624,18 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
         if self.read_only && (wants_write || create || trunc) {
             return Err(FsError::ReadOnly);
         }
+        if trunc && !wants_write {
+            return Err(FsError::ReadOnly);
+        }
 
         // Refuse to open the literal root as a regular file.
         if norm_slice == b"/" {
             return Err(FsError::IsADir);
         }
+
+        // Reserve the open-file table slot BEFORE mutating or allocating any inode
+        // so `TooManyHandles` never truncates an existing file or leaks a new inode.
+        let slot = self.allocate_open_slot().ok_or(FsError::TooManyHandles)?;
 
         let existing = self.find_inode(norm_slice);
         let inode_idx = match (existing, create) {
@@ -667,28 +674,27 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
                 let init_cap = 256u64.min(remaining) as u32;
                 let off = self.pool_used;
                 self.pool_used += init_cap;
-                let slot = &mut self.inodes[idx];
-                slot.used = true;
-                slot.path_len = n as u16;
+                let inode_slot = &mut self.inodes[idx];
+                inode_slot.used = true;
+                inode_slot.path_len = n as u16;
                 let mut p = 0usize;
                 while p < FS_PATH_MAX {
-                    slot.path[p] = 0;
+                    inode_slot.path[p] = 0;
                     p += 1;
                 }
                 let mut p = 0usize;
                 while p < n {
-                    slot.path[p] = norm[p];
+                    inode_slot.path[p] = norm[p];
                     p += 1;
                 }
-                slot.data_off = off;
-                slot.data_len = 0;
-                slot.capacity = init_cap;
-                slot.mtime = 0;
+                inode_slot.data_off = off;
+                inode_slot.data_len = 0;
+                inode_slot.capacity = init_cap;
+                inode_slot.mtime = 0;
                 idx
             }
         };
 
-        let slot = self.allocate_open_slot().ok_or(FsError::TooManyHandles)?;
         self.open[slot] = RamOpenFile {
             used: true,
             inode_idx: inode_idx as u32,
@@ -977,14 +983,26 @@ impl<const N: usize> Vfs for VfsImpl<N> {
             i += 1;
         }
         let idx = free_idx.ok_or(FsError::NoSpace)?;
-        let mount_id = {
-            let id = self.next_mount_id;
-            self.next_mount_id = self.next_mount_id.wrapping_add(1);
-            if self.next_mount_id == 0 || self.next_mount_id > VFS_MAX_MOUNT_ID {
-                self.next_mount_id = 1;
+        let mut chosen_id: Option<u8> = None;
+        let mut step = 0u32;
+        while step < VFS_MAX_MOUNT_ID {
+            let mut cand = self.next_mount_id.wrapping_add(step);
+            if cand == 0 || cand > VFS_MAX_MOUNT_ID {
+                cand = ((cand.saturating_sub(1)) % VFS_MAX_MOUNT_ID) + 1;
             }
-            id as u8
-        };
+            let cand_u8 = cand as u8;
+            if self.mount_index_for_id(cand_u8).is_none() {
+                chosen_id = Some(cand_u8);
+                let mut next = (cand_u8 as u32) + 1;
+                if next == 0 || next > VFS_MAX_MOUNT_ID {
+                    next = 1;
+                }
+                self.next_mount_id = next;
+                break;
+            }
+            step += 1;
+        }
+        let mount_id = chosen_id.ok_or(FsError::NoSpace)?;
         let slot = &mut self.mounts[idx];
         slot.used = true;
         let mut p = 0usize;
@@ -1676,5 +1694,59 @@ mod tests {
         let np = fs.read(hp, 0, &mut check).unwrap();
         assert_eq!(&check[..np], b"ANCHOR-TAIL");
         fs.close(hp).unwrap();
+    }
+
+    #[test]
+    fn ramfs_rejects_rdonly_trunc_preserves_state_on_handle_exhaustion_and_avoids_mount_id_collision() {
+        // 1. `FS_O_RDONLY | FS_O_TRUNC` must be rejected with `ReadOnly` without truncating existing file data!
+        let mut fs: MemRamFs<2, 512> = MemRamFs::new();
+        fs.seed_file(b"/keep", b"IMPORTANT", 32, 0).unwrap();
+        assert_eq!(
+            fs.open(b"/keep", FS_O_RDONLY | FS_O_TRUNC),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(fs.stat(b"/keep").unwrap().size, 9);
+
+        // 2. When all open-handle slots (I = 2) are full, `open(..., FS_O_TRUNC)` and `open(..., FS_O_CREATE)`
+        //    must fail with `TooManyHandles` BEFORE truncating `/keep` or leaking `/ghost` into `inodes`/`pool_used`!
+        let h1 = fs.open(b"/keep", FS_O_RDONLY).unwrap();
+        let h2 = fs.open(b"/keep", FS_O_RDONLY).unwrap();
+        let used_before = fs.pool_used;
+        let inodes_before = fs.inode_count();
+        assert_eq!(
+            fs.open(b"/keep", FS_O_RDWR | FS_O_TRUNC),
+            Err(FsError::TooManyHandles)
+        );
+        assert_eq!(
+            fs.open(b"/ghost", FS_O_RDWR | FS_O_CREATE),
+            Err(FsError::TooManyHandles)
+        );
+        fs.close(h1).unwrap();
+        fs.close(h2).unwrap();
+        assert_eq!(fs.stat(b"/keep").unwrap().size, 9, "failed open(O_TRUNC) must not destroy file data");
+        assert_eq!(fs.stat(b"/ghost"), Err(FsError::NotFound), "failed open(O_CREATE) must not leak an inode");
+        assert_eq!(fs.inode_count(), inodes_before);
+        assert_eq!(fs.pool_used, used_before);
+
+        // 3. Mounting `/` (`mount_id = 1`), cycling 255 mounts on `/tmp` so `next_mount_id` wraps around to `1`,
+        //    and then mounting `/boot` must NOT assign a colliding `mount_id = 1`!
+        let mut vfs = VfsImpl::<4>::new();
+        let root_fs = make_static_ramfs();
+        root_fs.seed_file(b"/f", b"ROOT", 16, 0).unwrap();
+        vfs.mount(b"/", root_fs as &mut dyn Filesystem).unwrap();
+        for _ in 0..254 {
+            let tmp_fs = make_static_ramfs();
+            vfs.mount(b"/tmp", tmp_fs as &mut dyn Filesystem).unwrap();
+            vfs.unmount(b"/tmp").unwrap();
+        }
+        let boot_fs = make_static_ramfs();
+        boot_fs.seed_file(b"/f", b"BOOT", 16, 0).unwrap();
+        vfs.mount(b"/boot", boot_fs as &mut dyn Filesystem).unwrap();
+
+        let hb = vfs.open(b"/boot/f", FS_O_RDONLY).unwrap();
+        let mut rbuf = [0u8; 8];
+        let nb = vfs.read(hb, 0, &mut rbuf).unwrap();
+        assert_eq!(&rbuf[..nb], b"BOOT", "wrapped mount_id must not alias active root mount");
+        vfs.close(hb).unwrap();
     }
 }

@@ -377,13 +377,36 @@ pub(crate) fn vnet_notify(n: &VnetModern, queue: u16) {
     }
 }
 
-/// TX one Ethernet frame (2-desc chain, no wait — completion is
-/// reaped lazily). Returns false if the ring bookkeeping misbehaves.
+/// TX one Ethernet frame (2-desc chain, waiting for any prior in-flight TX
+/// to complete before reusing `tx_buf_phys`). Returns false if `frame` is
+/// empty/oversized or if the ring bookkeeping misbehaves.
 pub(crate) fn vnet_tx(n: &mut VnetModern, frame: &[u8]) -> bool {
     use core::sync::atomic::{fence, Ordering};
+    if frame.is_empty() || VN_HDR.saturating_add(frame.len()) > 2048 {
+        return false;
+    }
+    // Wait for any previous in-flight TX descriptor chain to complete before mutating `tx_buf_phys`.
+    if n.tx_used_seen != n.tx_avail_next {
+        let mut spins = 0u32;
+        loop {
+            // SAFETY: `n.tx_q_virt + VN_USED_OFF + 2` is 2-byte aligned inside the mapped TX virtqueue page.
+            let used = unsafe {
+                core::ptr::read_volatile((n.tx_q_virt + VN_USED_OFF + 2) as *const u16)
+            };
+            if used == n.tx_avail_next {
+                n.tx_used_seen = used;
+                break;
+            }
+            spins = spins.wrapping_add(1);
+            if spins > 100_000 {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+    }
     let tx_buf_phys = n.tx_q_phys + 0x8000; // tx scratch: dma+0xA000
     let tx_buf_virt = pa_to_va(tx_buf_phys) as u64;
-    // SAFETY: `tx_buf_virt` and `n.tx_q_virt` lie within the reserved 48 KiB DMA window (`VN_HDR + frame.len() <= 2048`), and single-threaded access prevents ring races.
+    // SAFETY: `tx_buf_virt` and `n.tx_q_virt` lie within the reserved 48 KiB VirtIO DMA window (`VN_HDR + frame.len() <= 2048`), and completion polling above prevents ring races.
     unsafe {
         // hdr (12 zero bytes) + frame
         let mut i = 0usize;
@@ -438,13 +461,25 @@ pub(crate) fn vnet_rx(n: &mut VnetModern, out: &mut [u8]) -> Option<(usize, u16)
         core::ptr::read_volatile((n.rx_q_virt + VN_USED_OFF + 4 + slot * 8 + 4) as *const u32)
     } as usize;
     n.rx_used_seen = n.rx_used_seen.wrapping_add(1);
-    // head desc id → buffer index = id/2. Used len = virtio hdr (12)
-    // + payload bytes; the frame lives at buf + 0x40 (hdr region is
-    // the first 0x40 bytes of the buffer, payload follows).
+    let flen = match target_enterprise::memory::dma_layout::validate_modern_vnet_rx_used(
+        id,
+        len,
+        VN_RX_BUFFERS,
+        VN_HDR,
+        VN_RX_BUF - 0x40,
+        out.len(),
+    ) {
+        Some(flen) => flen,
+        None => {
+            if (id as usize) < 2 * VN_RX_BUFFERS && (id & 1) == 0 {
+                vnet_rx_recycle(n, id);
+            }
+            return None;
+        }
+    };
     let bi = (id / 2) as u64;
     let data_virt = pa_to_va(n.rx_q_phys + 0x2000 + bi * (VN_RX_BUF as u64) + 0x40);
-    let flen = len.saturating_sub(VN_HDR).min(out.len());
-    // SAFETY: `data_virt` points to the mapped RX payload buffer in DMA RAM and `flen <= out.len()`.
+    // SAFETY: `bi < VN_RX_BUFFERS` and `flen <= VN_RX_BUF - 0x40` and `flen <= out.len()`, validated by `validate_modern_vnet_rx_used`.
     unsafe {
         core::ptr::copy_nonoverlapping(data_virt as *const u8, out.as_mut_ptr(), flen);
     }
@@ -1240,6 +1275,12 @@ pub(crate) fn service_udp_status_legacy() {
             u16::from_le_bytes([b0, b1])
         };
         rx_used_last = rx_used_last.wrapping_add(1);
+        if !target_enterprise::memory::dma_layout::validate_legacy_vnet_rx_desc(
+            desc_id,
+            N_RX_BUFS as usize,
+        ) {
+            continue;
+        }
 
         // Read the frame.
         let buf_pa = rx_bufs_pa + (desc_id as u64) * (RX_BUF_LEN as u64);

@@ -447,14 +447,14 @@ impl VirtioBlk {
             polls -= 1;
         }
 
-        // 5. Validate the used-ring entry's chain-head reference.
+        // 5. Consume the used-ring slot first so a corrupt `used_head_idx` never wedges `used_seen`.
         let used_slot = (target.wrapping_sub(1) as usize) & (QUEUE_SIZE_USIZE - 1);
         let (used_head_idx, _used_len) =
             Self::read_used_ring_entry(bus, PHYS_REQ_USED, used_slot as u16);
+        self.used_seen = target;
         if used_head_idx != 0 {
             return Err(VirtBlkError::DescriptorIndexOutOfRange);
         }
-        self.used_seen = target;
 
         // 6. Read the device-written status byte.
         let mut status_buf = [0u8; 1];
@@ -1688,6 +1688,77 @@ mod tests {
         assert!(drv.read_block(&mut bus, 0, &mut buf).is_err());
         // Second read: clean.
         drv.read_block(&mut bus, 0, &mut buf).expect("recover");
+    }
+
+    #[test]
+    fn corrupt_used_head_idx_advances_used_seen_so_subsequent_io_recovers() {
+        struct CorruptOnceBlkBus {
+            inner: MemVirtioBlkBus,
+            corrupt_next_notify: bool,
+        }
+        impl MmioBus for CorruptOnceBlkBus {
+            fn read_common_u8(&self, off: usize) -> u8 {
+                self.inner.read_common_u8(off)
+            }
+            fn write_common_u8(&mut self, off: usize, val: u8) {
+                self.inner.write_common_u8(off, val);
+            }
+            fn read_common_u16(&self, off: usize) -> u16 {
+                self.inner.read_common_u16(off)
+            }
+            fn write_common_u16(&mut self, off: usize, val: u16) {
+                self.inner.write_common_u16(off, val);
+            }
+            fn read_common_u32(&self, off: usize) -> u32 {
+                self.inner.read_common_u32(off)
+            }
+            fn write_common_u32(&mut self, off: usize, val: u32) {
+                self.inner.write_common_u32(off, val);
+            }
+            fn write_common_u64(&mut self, off: usize, val: u64) {
+                self.inner.write_common_u64(off, val);
+            }
+            fn read_device_u8(&self, off: usize) -> u8 {
+                self.inner.read_device_u8(off)
+            }
+            fn read_device_u16(&self, off: usize) -> u16 {
+                self.inner.read_device_u16(off)
+            }
+            fn dma_read(&self, phys: u64, out: &mut [u8]) {
+                self.inner.dma_read(phys, out);
+            }
+            fn dma_write(&mut self, phys: u64, data: &[u8]) {
+                self.inner.dma_write(phys, data);
+            }
+            fn notify_queue(&mut self, queue_index: u16) {
+                self.inner.notify_queue(queue_index);
+                if self.corrupt_next_notify {
+                    self.corrupt_next_notify = false;
+                    // Overwrite used.ring[0].id with invalid head index 7!
+                    self.inner.dma_write(PHYS_REQ_USED + 4, &7u32.to_le_bytes());
+                }
+            }
+        }
+
+        let (mut drv, inner) = fresh();
+        let mut bus = CorruptOnceBlkBus {
+            inner,
+            corrupt_next_notify: false,
+        };
+        drv.init(&mut bus).expect("init");
+        let sector_data = [0x3Cu8; VIRTIO_BLK_SECTOR_SIZE];
+        assert!(bus.inner.plant_sector(1, &sector_data));
+
+        bus.corrupt_next_notify = true;
+        let mut buf = [0u8; VIRTIO_BLK_SECTOR_SIZE];
+        assert_eq!(
+            drv.read_block(&mut bus, 1, &mut buf),
+            Err(VirtBlkError::DescriptorIndexOutOfRange)
+        );
+        // Subsequent read must NOT hang/timeout or re-consume slot 0!
+        drv.read_block(&mut bus, 1, &mut buf)
+            .expect("VirtioBlk must advance used_seen and recover on next request");
+        assert_eq!(buf, sector_data);
     }
 }
 

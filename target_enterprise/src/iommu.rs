@@ -435,7 +435,7 @@ impl<const D: usize, const V: usize, const E: usize> Iommu for IommuImpl<D, V, E
         // the absence of a mapping. Reject so callers don't get
         // surprised by a `translate` that returns `PermissionDenied`
         // where they expected `Unmapped`.
-        if perms.0 == 0 {
+        if perms.0 == 0 || (perms.0 & !(PagePerms::READ.0 | PagePerms::WRITE.0)) != 0 {
             return Err(IommuError::BadAddress);
         }
         let slot = self
@@ -1139,6 +1139,20 @@ mod tests {
         assert_eq!(dev.bus(), 0x56);
         assert_eq!(dev.device(), 0x1F);
         assert_eq!(dev.function(), 0x07);
+    }
+
+    #[test]
+    fn iommu_map_rejects_undefined_page_perms_bits() {
+        let mut iommu: IommuImpl<2, 2, 8> = IommuImpl::new();
+        let dom = iommu.create_domain().unwrap();
+        assert_eq!(
+            iommu.map(dom, 0x1000, 0x2000, PagePerms(0x04)),
+            Err(IommuError::BadAddress)
+        );
+        assert_eq!(
+            iommu.map(dom, 0x1000, 0x2000, PagePerms(0x83)),
+            Err(IommuError::BadAddress)
+        );
     }
 }
 

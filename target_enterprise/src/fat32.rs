@@ -80,6 +80,9 @@ pub fn parse_bpb(image: &[u8]) -> Result<FatBpb, FatError> {
         return Err(FatError::BadBpb);
     }
     let reserved_sectors = le16(image, FAT_BPB_RESERVED);
+    if reserved_sectors == 0 {
+        return Err(FatError::BadBpb);
+    }
     let num_fats = image[FAT_BPB_NUM_FATS];
     if num_fats == 0 {
         return Err(FatError::BadBpb);
@@ -99,8 +102,13 @@ pub fn parse_bpb(image: &[u8]) -> Result<FatBpb, FatError> {
         }
     }
     let fat_start = reserved_sectors as u32;
-    let first_data_sector =
-        fat_start + (num_fats as u32) * fat_size_sectors;
+    let total_fat_sectors = (num_fats as u64)
+        .checked_mul(fat_size_sectors as u64)
+        .ok_or(FatError::BadBpb)?;
+    let first_data_u64 = (fat_start as u64)
+        .checked_add(total_fat_sectors)
+        .ok_or(FatError::BadBpb)?;
+    let first_data_sector = u32::try_from(first_data_u64).map_err(|_| FatError::BadBpb)?;
     Ok(FatBpb {
         bytes_per_sector,
         sectors_per_cluster,
@@ -113,22 +121,47 @@ pub fn parse_bpb(image: &[u8]) -> Result<FatBpb, FatError> {
     })
 }
 
+#[cfg(test)]
 fn cluster_to_lba(bpb: &FatBpb, cluster: u32) -> u32 {
-    bpb.first_data_sector + (cluster - 2) * (bpb.sectors_per_cluster as u32)
+    cluster_to_lba_checked(bpb, cluster).unwrap_or(u32::MAX)
+}
+
+fn cluster_to_lba_checked(bpb: &FatBpb, cluster: u32) -> Result<u32, FatError> {
+    if cluster < 2 {
+        return Err(FatError::BadChain);
+    }
+    let off_sectors = ((cluster - 2) as u64)
+        .checked_mul(bpb.sectors_per_cluster as u64)
+        .ok_or(FatError::Truncated)?;
+    let lba = (bpb.first_data_sector as u64)
+        .checked_add(off_sectors)
+        .ok_or(FatError::Truncated)?;
+    u32::try_from(lba).map_err(|_| FatError::Truncated)
 }
 
 fn sector_slice(image: &[u8], lba: u32) -> Result<&[u8], FatError> {
-    let off = (lba as usize) * FAT_SECTOR_SIZE;
-    if off + FAT_SECTOR_SIZE > image.len() {
+    let off = (lba as usize)
+        .checked_mul(FAT_SECTOR_SIZE)
+        .ok_or(FatError::Truncated)?;
+    let end = off
+        .checked_add(FAT_SECTOR_SIZE)
+        .ok_or(FatError::Truncated)?;
+    if end > image.len() {
         return Err(FatError::Truncated);
     }
-    Ok(&image[off..off + FAT_SECTOR_SIZE])
+    Ok(&image[off..end])
 }
 
 fn fat_next(bpb: &FatBpb, image: &[u8], cluster: u32) -> Result<Option<u32>, FatError> {
-    let fat_offset = (cluster as usize) * 4;
-    let sec = bpb.fat_start + (fat_offset as u32) / (bpb.bytes_per_sector as u32);
-    let in_sec = fat_offset % (bpb.bytes_per_sector as usize);
+    let fat_offset = (cluster as u64)
+        .checked_mul(4)
+        .ok_or(FatError::Truncated)?;
+    let sec_delta = fat_offset / (bpb.bytes_per_sector as u64);
+    let sec_u64 = (bpb.fat_start as u64)
+        .checked_add(sec_delta)
+        .ok_or(FatError::Truncated)?;
+    let sec = u32::try_from(sec_u64).map_err(|_| FatError::Truncated)?;
+    let in_sec = (fat_offset % (bpb.bytes_per_sector as u64)) as usize;
     let s = sector_slice(image, sec)?;
     let entry = le32(s, in_sec) & FAT_CLUS_MASK;
     if entry >= FAT_EOC {
@@ -192,17 +225,34 @@ fn name_eq_ci(a: &[u8; 11], b: &[u8; 11]) -> bool {
     true
 }
 
+fn max_data_clusters(bpb: &FatBpb, image: &[u8]) -> usize {
+    let total_sectors = image.len() / FAT_SECTOR_SIZE;
+    let data_sectors = total_sectors.saturating_sub(bpb.first_data_sector as usize);
+    data_sectors / (bpb.sectors_per_cluster as usize).max(1)
+}
+
 pub fn lookup_root_impl(
     bpb: &FatBpb,
     image: &[u8],
     name_83: &[u8; 11],
 ) -> Result<FatDirent, FatError> {
     let mut cluster = bpb.root_cluster;
+    let mut hare = fat_next(bpb, image, cluster)?;
+    if hare == Some(cluster) {
+        return Err(FatError::BadChain);
+    }
+    let max_hops = max_data_clusters(bpb, image);
+    let mut hops = 0usize;
     loop {
-        let lba = cluster_to_lba(bpb, cluster);
+        hops += 1;
+        if hops > max_hops {
+            return Err(FatError::BadChain);
+        }
+        let lba = cluster_to_lba_checked(bpb, cluster)?;
         let mut s = 0u8;
         while s < bpb.sectors_per_cluster {
-            let sec = sector_slice(image, lba + s as u32)?;
+            let sec_lba = lba.checked_add(s as u32).ok_or(FatError::Truncated)?;
+            let sec = sector_slice(image, sec_lba)?;
             let mut off = 0usize;
             while off + FAT_DIR_ENTRY_LEN <= FAT_SECTOR_SIZE {
                 if sec[off] == 0x00 {
@@ -221,7 +271,22 @@ pub fn lookup_root_impl(
             s += 1;
         }
         match fat_next(bpb, image, cluster)? {
-            Some(n) => cluster = n,
+            Some(n) => {
+                if n == cluster {
+                    return Err(FatError::BadChain);
+                }
+                cluster = n;
+                hare = match hare {
+                    Some(h1) => match fat_next(bpb, image, h1)? {
+                        Some(h2) => fat_next(bpb, image, h2)?,
+                        None => None,
+                    },
+                    None => None,
+                };
+                if hare == Some(cluster) {
+                    return Err(FatError::BadChain);
+                }
+            }
             None => return Err(FatError::NotFound),
         }
     }
@@ -243,13 +308,24 @@ pub fn read_file_impl(
     if cluster < 2 {
         return Err(FatError::BadChain);
     }
+    let mut hare = fat_next(bpb, image, cluster)?;
+    if hare == Some(cluster) {
+        return Err(FatError::BadChain);
+    }
     let mut written = 0usize;
     let need = ent.size as usize;
+    let max_hops = max_data_clusters(bpb, image);
+    let mut hops = 0usize;
     while written < need {
-        let lba = cluster_to_lba(bpb, cluster);
+        hops += 1;
+        if hops > max_hops {
+            return Err(FatError::BadChain);
+        }
+        let lba = cluster_to_lba_checked(bpb, cluster)?;
         let mut s = 0u8;
         while s < bpb.sectors_per_cluster && written < need {
-            let sec = sector_slice(image, lba + s as u32)?;
+            let sec_lba = lba.checked_add(s as u32).ok_or(FatError::Truncated)?;
+            let sec = sector_slice(image, sec_lba)?;
             let take = core::cmp::min(FAT_SECTOR_SIZE, need - written);
             out[written..written + take].copy_from_slice(&sec[..take]);
             written += take;
@@ -259,7 +335,22 @@ pub fn read_file_impl(
             break;
         }
         match fat_next(bpb, image, cluster)? {
-            Some(n) => cluster = n,
+            Some(n) => {
+                if n == cluster {
+                    return Err(FatError::BadChain);
+                }
+                cluster = n;
+                hare = match hare {
+                    Some(h1) => match fat_next(bpb, image, h1)? {
+                        Some(h2) => fat_next(bpb, image, h2)?,
+                        None => None,
+                    },
+                    None => None,
+                };
+                if hare == Some(cluster) {
+                    return Err(FatError::BadChain);
+                }
+            }
             None => return Err(FatError::BadChain),
         }
     }
@@ -637,5 +728,54 @@ mod tests {
     #[test]
     fn eoc_threshold() {
         assert!(FAT_EOC > 0x0FFF_FFF7);
+    }
+
+    #[test]
+    fn fat32_rejects_cyclic_cluster_chains_and_overflowing_bpb_geometry() {
+        extern crate std;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // 1. reserved_sectors == 0 or overflowing `num_fats * fat_size_sectors` must fail `mount` with `BadBpb`.
+        let mut zero_res = fixture();
+        zero_res[FAT_BPB_RESERVED] = 0;
+        zero_res[FAT_BPB_RESERVED + 1] = 0;
+        assert_eq!(Fat32Impl::mount(&zero_res).err(), Some(FatError::BadBpb));
+
+        let mut ovf_bpb = fixture();
+        ovf_bpb[FAT_BPB_NUM_FATS] = 4;
+        put_le32(&mut ovf_bpb, FAT_BPB_FAT_SIZE_32, 0x5000_0000);
+        assert_eq!(Fat32Impl::mount(&ovf_bpb).err(), Some(FatError::BadBpb));
+
+        // 2. Cyclic root directory cluster chain (cluster 2 -> 3 -> 2, with non-zero dir bytes so 0x00 EOD never triggers)
+        //    and cyclic file cluster chain must terminate immediately with `Err(FatError::BadChain)`!
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut img = [0u8; 6 * FAT_SECTOR_SIZE];
+            let _ = build_banner_fixture(&mut img[..FAT_FIXTURE_BYTES]);
+            // FAT #0 at LBA 1: cluster 2 -> 3, cluster 3 -> 2 (2-cycle!)
+            put_le32(&mut img, FAT_SECTOR_SIZE + 2 * 4, 3);
+            put_le32(&mut img, FAT_SECTOR_SIZE + 3 * 4, 2);
+            // Fill cluster 2 (LBA 3) and cluster 3 (LBA 4) with deleted `0xE5` entries so `sec[off] == 0x00` never terminates!
+            for b in &mut img[3 * FAT_SECTOR_SIZE..5 * FAT_SECTOR_SIZE] {
+                *b = 0xE5;
+            }
+            let fs = Fat32Impl::mount(&img).unwrap();
+            let r_lookup = fs.lookup_root(&img, b"MISSING TXT");
+            let dirent = FatDirent {
+                name_83: *b"LOOP    BIN",
+                attr: 0x20,
+                cluster: 2,
+                size: (4 * FAT_SECTOR_SIZE) as u32,
+            };
+            let mut out = [0u8; 4 * FAT_SECTOR_SIZE];
+            let r_read = fs.read_file(&img, &dirent, &mut out);
+            let _ = tx.send((r_lookup, r_read));
+        });
+        let (r_lookup, r_read) = rx
+            .recv_timeout(Duration::from_millis(150))
+            .expect("FAT32 cyclic cluster chain hung instead of returning BadChain");
+        assert_eq!(r_lookup, Err(FatError::BadChain));
+        assert_eq!(r_read, Err(FatError::BadChain));
     }
 }

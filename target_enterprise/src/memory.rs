@@ -211,3 +211,117 @@ pub const fn frame_idx_to_pa(idx: usize) -> u64 {
 pub const fn pa_to_frame_idx(pa: u64) -> usize {
     (pa / FRAME_SIZE) as usize
 }
+
+/// Bare-metal kernel physical DMA window layout and VirtIO ring-entry validators.
+pub mod dma_layout {
+    /// Total reserved DMA + page-table window size in bytes (`384 KiB`).
+    pub const DMA_WINDOW_BYTES: u64 = 0x6_0000;
+    /// VirtIO-Net / VirtIO-Blk legacy & modern virtqueue/buffer region `[0x0_0000 .. 0x0_C000)`.
+    pub const VIRTIO_REGION: (u64, u64) = (0x0_0000, 0x0_C000);
+    /// AHCI CLB/FB/CTBA/sector DMA region `[0x1_0000 .. 0x1_C000)`.
+    pub const AHCI_REGION: (u64, u64) = (0x1_0000, 0x1_C000);
+    /// Intel e1000 TX/RX descriptor rings and frame buffers `[0x2_0000 .. 0x2_3000)`.
+    pub const E1000_REGION: (u64, u64) = (0x2_0000, 0x2_3000);
+    /// Dedicated 9-frame isolated `CR3` KPTI Ring-3 sandbox `[0x2_4000 .. 0x2_D000)`.
+    pub const RING3_KPTI_REGION: (u64, u64) = (0x2_4000, 0x2_D000);
+    /// NVMe Admin/I/O SQ+CQ + Identify/sector DMA buffers `[0x3_0000 .. 0x3_7000)`.
+    pub const NVME_REGION: (u64, u64) = (0x3_0000, 0x3_7000);
+    /// Dynamic 4 KiB page-table frame pool `[PT_POOL_START_OFF .. PT_POOL_END_OFF)` (`40` dedicated frames).
+    pub const PT_POOL_START_OFF: u64 = 0x3_8000;
+    /// Exclusive upper bound of the dynamic 4 KiB page-table frame pool.
+    pub const PT_POOL_END_OFF: u64 = 0x6_0000;
+
+    /// Validate that every region in `regions` is 4 KiB-aligned, non-empty, within `window_bytes`,
+    /// and pairwise non-overlapping. Returns `Err((idx_a, idx_b))` on overlap or bounds violation.
+    pub const fn validate_regions(
+        window_bytes: u64,
+        regions: &[(u64, u64)],
+    ) -> Result<(), (usize, usize)> {
+        let mut i = 0usize;
+        while i < regions.len() {
+            let (s_i, e_i) = regions[i];
+            if s_i >= e_i || (s_i & 0xFFF) != 0 || (e_i & 0xFFF) != 0 || e_i > window_bytes {
+                return Err((i, i));
+            }
+            let mut j = i + 1;
+            while j < regions.len() {
+                let (s_j, e_j) = regions[j];
+                if s_i < e_j && s_j < e_i {
+                    return Err((i, j));
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// Validate the active kernel DMA + page-table pool layout for pairwise disjointness.
+    pub const fn validate_default_layout() -> Result<(), (usize, usize)> {
+        let regions = [
+            VIRTIO_REGION,
+            AHCI_REGION,
+            E1000_REGION,
+            RING3_KPTI_REGION,
+            NVME_REGION,
+            (PT_POOL_START_OFF, PT_POOL_END_OFF),
+        ];
+        validate_regions(DMA_WINDOW_BYTES, &regions)
+    }
+
+    const _: () = {
+        assert!(validate_default_layout().is_ok());
+    };
+
+    /// Validate a modern VirtIO-Net RX used-ring completion `(id, used_len)` before indexing DMA buffers.
+    pub const fn validate_modern_vnet_rx_used(
+        id: u16,
+        used_len: usize,
+        rx_buffers: usize,
+        hdr_len: usize,
+        max_payload: usize,
+        out_len: usize,
+    ) -> Option<usize> {
+        if (id as usize) >= 2 * rx_buffers || (id & 1) != 0 {
+            return None;
+        }
+        if used_len < hdr_len {
+            return None;
+        }
+        let flen = used_len - hdr_len;
+        if flen > max_payload || flen > out_len {
+            return None;
+        }
+        Some(flen)
+    }
+
+    /// Validate a legacy VirtIO-Net RX used-ring descriptor index before indexing `rx_bufs_pa`.
+    pub const fn validate_legacy_vnet_rx_desc(desc_id: u16, rx_buffers: usize) -> bool {
+        (desc_id as usize) < rx_buffers
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dma_layout::*;
+
+    #[test]
+    fn kernel_dma_regions_are_disjoint_and_virtio_ring_bounds_reject_corrupt_used_entries() {
+        assert_eq!(
+            validate_default_layout(),
+            Ok(()),
+            "kernel PT_POOL must never overlap VirtIO, AHCI, e1000, Ring-3 KPTI, or NVMe DMA rings"
+        );
+        // Odd head descriptor, out-of-range id (>= 16), short (< 12B hdr), or oversize (> 1984B) must fail!
+        assert_eq!(validate_modern_vnet_rx_used(1, 64, 8, 12, 1984, 2048), None);
+        assert_eq!(validate_modern_vnet_rx_used(16, 64, 8, 12, 1984, 2048), None);
+        assert_eq!(validate_modern_vnet_rx_used(0, 11, 8, 12, 1984, 2048), None);
+        assert_eq!(validate_modern_vnet_rx_used(0, 12 + 1985, 8, 12, 1984, 2048), None);
+        assert_eq!(validate_modern_vnet_rx_used(0, 12 + 1500, 8, 12, 1984, 1024), None);
+        assert_eq!(validate_modern_vnet_rx_used(14, 12 + 60, 8, 12, 1984, 2048), Some(60));
+
+        assert!(!validate_legacy_vnet_rx_desc(8, 8));
+        assert!(!validate_legacy_vnet_rx_desc(u16::MAX, 8));
+        assert!(validate_legacy_vnet_rx_desc(7, 8));
+    }
+}

@@ -94,12 +94,23 @@ fn validate(program: &[BpfInstr]) -> Result<usize, BpfError> {
         return Err(BpfError::ProgramTooLong);
     }
 
+    let mut is_ld_imm64_cont = [false; BPF_MAX_INSTRUCTIONS];
+    let mut jump_targets = [usize::MAX; BPF_MAX_INSTRUCTIONS];
+    let mut jump_count = 0usize;
+
     let mut i = 0usize;
     while i < count {
         let insn = program[i];
+        if insn.dst() > BPF_REG_FP || insn.src() > BPF_REG_FP {
+            return Err(BpfError::BadRegister);
+        }
         let class = insn.opcode & bpf_op::BPF_CLASS_MASK;
         match class {
             bpf_op::BPF_CLASS_ALU | bpf_op::BPF_CLASS_ALU64 => {
+                // Frame pointer `r10` is strictly read-only per contract.
+                if insn.dst() == BPF_REG_FP {
+                    return Err(BpfError::BadRegister);
+                }
                 // Sub-ops ADD..ARSH all map; nothing is rejected at
                 // validate time — division-by-zero is a run-time
                 // signal, not a validator one.
@@ -116,6 +127,8 @@ fn validate(program: &[BpfInstr]) -> Result<usize, BpfError> {
                         if target < 0 || (target as usize) >= count {
                             return Err(BpfError::IllegalJump);
                         }
+                        jump_targets[jump_count] = target as usize;
+                        jump_count += 1;
                     }
                 }
             }
@@ -123,17 +136,29 @@ fn validate(program: &[BpfInstr]) -> Result<usize, BpfError> {
                 if insn.opcode != bpf_op::BPF_LD_IMM64 {
                     return Err(BpfError::BadOpcode);
                 }
+                if insn.dst() == BPF_REG_FP {
+                    return Err(BpfError::BadRegister);
+                }
                 if i + 1 >= count {
                     return Err(BpfError::TruncatedLdImm64);
                 }
+                let cont = program[i + 1];
+                if cont.dst() > BPF_REG_FP || cont.src() > BPF_REG_FP {
+                    return Err(BpfError::BadRegister);
+                }
+                is_ld_imm64_cont[i + 1] = true;
                 // Skip the continuation slot; the dispatcher reads
                 // it directly when it processes `program[pc]`.
                 i += 1;
             }
-            bpf_op::BPF_CLASS_LDX | bpf_op::BPF_CLASS_ST | bpf_op::BPF_CLASS_STX => {
-                // Size code is bit-field constrained; reject any
-                // size code outside the 4 known values to surface
-                // wire drift early.
+            bpf_op::BPF_CLASS_LDX => {
+                if insn.dst() == BPF_REG_FP {
+                    return Err(BpfError::BadRegister);
+                }
+                validate_mem_size(insn.opcode)?;
+            }
+            bpf_op::BPF_CLASS_ST | bpf_op::BPF_CLASS_STX => {
+                // `dst` is the base pointer (commonly `r10`), which is only read here.
                 validate_mem_size(insn.opcode)?;
             }
             _ => return Err(BpfError::BadOpcode),
@@ -141,20 +166,18 @@ fn validate(program: &[BpfInstr]) -> Result<usize, BpfError> {
         i += 1;
     }
 
-    // Final dispatchable instruction must be EXIT. We re-walk from
-    // the end skipping over a possible continuation slot of an
-    // `LD_IMM64` (which would have its `opcode` bytes still set to
-    // whatever the caller put there — we look at the slot before it
-    // as the actual terminator candidate).
-    //
-    // In practice the simplest correct rule is: the last slot's
-    // opcode must equal `BPF_OP_EXIT`. The `LD_IMM64` payload slot
-    // would not pass this check; the validator above already
-    // ensures `LD_IMM64` is followed by exactly one more slot, so
-    // ending on the payload is impossible if the program ends with
-    // `LD_IMM64; <payload>` — that would not be a valid program
-    // anyway since the payload is not executable.
-    if program[count - 1].opcode != bpf_op::BPF_OP_EXIT {
+    let mut j = 0usize;
+    while j < jump_count {
+        let tgt = jump_targets[j];
+        if is_ld_imm64_cont[tgt] {
+            return Err(BpfError::IllegalJump);
+        }
+        j += 1;
+    }
+
+    // Final dispatchable instruction must be an actual executable `BPF_OP_EXIT`
+    // (never the continuation payload slot of a trailing `BPF_LD_IMM64`).
+    if is_ld_imm64_cont[count - 1] || program[count - 1].opcode != bpf_op::BPF_OP_EXIT {
         return Err(BpfError::MissingExit);
     }
 
@@ -1245,6 +1268,92 @@ mod tests {
         let prog = [bad, exit()];
         let err = EBpfImpl::run(&prog, &mut ctx).unwrap_err();
         assert_eq!(err, BpfError::BadRegister);
+    }
+
+    #[test]
+    fn verifier_rejects_jump_into_ld_imm64_r10_writes_and_trailing_ld_imm64() {
+        let mut ctx = BpfContext::new();
+
+        // 1. Jumping into the continuation slot (pc=2) of a 2-slot `BPF_LD_IMM64` (pc=1..2)
+        //    must be rejected at verification time with `IllegalJump` (cannot execute raw imm payload!).
+        let jmp_into_ld_imm64 = [
+            BpfInstr::new(bpf_op::BPF_CLASS_JMP | bpf_op::BPF_JMP_JA, 0, 0, 1, 0), // pc=0 -> target=2 (continuation slot!)
+            BpfInstr::new(bpf_op::BPF_LD_IMM64, 0, 0, 0, 0x1122_3344),
+            BpfInstr::new(bpf_op::BPF_OP_EXIT, 0, 0, 0, 0), // forged EXIT opcode inside LD_IMM64 hi-slot!
+            exit(),
+        ];
+        assert_eq!(
+            EBpfImpl::run(&jmp_into_ld_imm64, &mut ctx),
+            Err(BpfError::IllegalJump)
+        );
+
+        // 2. A program whose final slot `count - 1` is the continuation slot of `BPF_LD_IMM64`
+        //    at `count - 2` has NO trailing executable `EXIT` and must return `MissingExit`!
+        let trailing_ld_imm64 = [
+            BpfInstr::new(bpf_op::BPF_LD_IMM64, 0, 0, 0, 1),
+            BpfInstr::new(bpf_op::BPF_OP_EXIT, 0, 0, 0, 0),
+        ];
+        assert_eq!(
+            EBpfImpl::run(&trailing_ld_imm64, &mut ctx),
+            Err(BpfError::MissingExit)
+        );
+
+        // 3. Writes to read-only frame pointer `r10` (`BPF_REG_FP`) in ALU64, ALU32, LD, and LDX
+        //    must be rejected with `BadRegister`!
+        let write_r10_alu64 = [mov64_imm(10, 0), exit()];
+        assert_eq!(
+            EBpfImpl::run(&write_r10_alu64, &mut ctx),
+            Err(BpfError::BadRegister)
+        );
+        let write_r10_alu32 = [
+            BpfInstr::new(bpf_op::BPF_CLASS_ALU | bpf_op::BPF_OP_MOV, 10, 0, 0, 0),
+            exit(),
+        ];
+        assert_eq!(
+            EBpfImpl::run(&write_r10_alu32, &mut ctx),
+            Err(BpfError::BadRegister)
+        );
+        let write_r10_ld64 = [
+            BpfInstr::new(bpf_op::BPF_LD_IMM64, 10, 0, 0, 0),
+            BpfInstr::new(0, 0, 0, 0, 0),
+            exit(),
+        ];
+        assert_eq!(
+            EBpfImpl::run(&write_r10_ld64, &mut ctx),
+            Err(BpfError::BadRegister)
+        );
+        let write_r10_ldx = [
+            BpfInstr::new(bpf_op::BPF_CLASS_LDX | bpf_op::BPF_SIZE_DW, 10, 10, -8, 0),
+            exit(),
+        ];
+        assert_eq!(
+            EBpfImpl::run(&write_r10_ldx, &mut ctx),
+            Err(BpfError::BadRegister)
+        );
+
+        // 4. Unreachable dead-branch `BadRegister` (`dst = 15`) must still be rejected at validate time!
+        let dead_bad_reg = [
+            BpfInstr::new(bpf_op::BPF_CLASS_JMP | bpf_op::BPF_JMP_JA, 0, 0, 1, 0),
+            BpfInstr {
+                opcode: 0xb7,
+                regs: 0x0f,
+                offset: 0,
+                imm: 0,
+            },
+            exit(),
+        ];
+        assert_eq!(
+            EBpfImpl::run(&dead_bad_reg, &mut ctx),
+            Err(BpfError::BadRegister)
+        );
+
+        // 5. Legitimate frame-pointer-relative stack stores (`ST`, `STX`) and `JMP` reads on `r10` still work!
+        let valid_fp_stack = [
+            BpfInstr::new(bpf_op::BPF_CLASS_ST | bpf_op::BPF_SIZE_DW, 10, 0, -8, 99),
+            BpfInstr::new(bpf_op::BPF_CLASS_LDX | bpf_op::BPF_SIZE_DW, 0, 10, -8, 0),
+            exit(),
+        ];
+        assert_eq!(EBpfImpl::run(&valid_fp_stack, &mut ctx), Ok(99));
     }
 }
 

@@ -156,7 +156,7 @@ pub fn is_seal_key_set(key: &[u8; DURABLE_DIGEST_LEN]) -> bool {
 
 /// Constant-time compare of two digests (avoid short-circuit on first
 /// mismatch for use with keyed MACs; cheap for 32 bytes).
-fn constant_time_eq(a: &[u8; DURABLE_DIGEST_LEN], b: &[u8; DURABLE_DIGEST_LEN]) -> bool {
+pub fn constant_time_eq(a: &[u8; DURABLE_DIGEST_LEN], b: &[u8; DURABLE_DIGEST_LEN]) -> bool {
     let mut diff = 0u8;
     let mut i = 0usize;
     while i < DURABLE_DIGEST_LEN {

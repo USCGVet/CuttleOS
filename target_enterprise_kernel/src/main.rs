@@ -118,17 +118,25 @@ pub(crate) fn set_phys_offset(boot: &BootInfo) {
             continue;
         }
         let aligned = (start + 0xFFF) & !0xFFF;
-        // 256 KiB: virtio queues + AHCI CLB/FB/CTBA + PT scratch + Ring-3 trampoline frames + SMP PT frames.
-        if aligned >= 0x10_0000 && end.saturating_sub(aligned) >= 0x4_0000 {
+        // 384 KiB (`DMA_WINDOW_BYTES = 0x6_0000`): disjoint device DMA apertures (`0x0_0000..0x3_7000`)
+        // + dedicated 40-frame Page-Table pool (`0x3_8000..0x6_0000`).
+        if aligned >= 0x10_0000
+            && end.saturating_sub(aligned)
+                >= target_enterprise::memory::dma_layout::DMA_WINDOW_BYTES
+        {
             dma = aligned;
             break;
         }
     }
     PHYS_MAP_OFFSET.store(map_off, core::sync::atomic::Ordering::Relaxed);
     DMA_PHYS_BASE.store(dma, core::sync::atomic::Ordering::Relaxed);
-    // Page-table frame pool (`0x1_C000 .. 0x2_4000` and `0x2_D000 .. 0x4_0000`);
-    // `0x2_4000 .. 0x2_D000` (9 frames) is reserved for the isolated CR3 KPTI Ring-3 sandbox.
-    let pt_next = if dma != 0 { dma + 0x1_C000 } else { 0 };
+    // Dedicated Page-Table frame pool (`0x3_8000 .. 0x6_0000`, 40 frames = 160 KiB),
+    // strictly disjoint from VirtIO, AHCI, e1000, KPTI CR3, and NVMe DMA rings.
+    let pt_next = if dma != 0 {
+        dma + target_enterprise::memory::dma_layout::PT_POOL_START_OFF
+    } else {
+        0
+    };
     PT_ALLOC_NEXT.store(pt_next, core::sync::atomic::Ordering::Relaxed);
 }
 
@@ -161,11 +169,11 @@ pub(crate) unsafe fn read_cr3() -> u64 {
 // SAFETY: Caller must ensure DMA_PHYS_BASE and PHYS_MAP_OFFSET are initialized from BootInfo.
 pub(crate) unsafe fn alloc_pt_frame() -> u64 {
     let base = dma_phys_base();
-    let mut next = PT_ALLOC_NEXT.load(core::sync::atomic::Ordering::Relaxed);
-    if base != 0 && next >= base + 0x2_4000 && next < base + 0x2_D000 {
-        next = base + 0x2_D000;
-    }
-    if base == 0 || next == 0 || next + 0x1000 > base + 0x4_0000 {
+    let next = PT_ALLOC_NEXT.load(core::sync::atomic::Ordering::Relaxed);
+    if base == 0
+        || next < base + target_enterprise::memory::dma_layout::PT_POOL_START_OFF
+        || next + 0x1000 > base + target_enterprise::memory::dma_layout::PT_POOL_END_OFF
+    {
         panic!("AHCI_HW: PT frame pool exhausted");
     }
     let frame = next;

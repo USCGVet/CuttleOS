@@ -1435,6 +1435,19 @@ pub(crate) fn banner_nvme_hw() {
         serial_write_bytes(&line[..pos]);
     }
 
+    // Quench NVMe controller (`CC.EN = 0` + wait `!CSTS.RDY`) before leaving `banner_nvme_hw`
+    // so admin/IO DMA queues do not stay live across subsequent boot stages.
+    // SAFETY: `bar0` is the uncached-mapped NVMe MMIO register page (`REG_CC`, `REG_CSTS`).
+    unsafe {
+        let cc = mmio_read32(bar0 + REG_CC as u64);
+        mmio_write32(bar0 + REG_CC as u64, cc & !CC_EN);
+        let mut spins = 0u32;
+        while (mmio_read32(bar0 + REG_CSTS as u64) & CSTS_RDY) != 0 && spins < 5_000_000 {
+            spins = spins.wrapping_add(1);
+            core::hint::spin_loop();
+        }
+    }
+
     let _ = found_addr;
     let _ = bar0;
     let _ = next_cid;

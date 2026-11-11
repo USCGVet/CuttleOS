@@ -910,5 +910,12 @@ pub(crate) fn banner_e1000_hw() {
         pos += 1;
         serial_write_bytes(&line[..pos]);
     }
+    // Quench e1000 RX/TX DMA engines before leaving `banner_e1000_hw` so stray network broadcast
+    // frames cannot asynchronously DMA-clobber RAM after bring-up completes.
+    // SAFETY: `rx_bar0` and `bar0` are uncached-mapped MMIO pages of the probed e1000 NIC(s).
+    unsafe {
+        mmio_write32(rx_bar0 + E1000_REG_RCTL as u64, 0);
+        mmio_write32(bar0 + E1000_REG_TCTL as u64, 0);
+    }
     let _ = rx_slot;
 }

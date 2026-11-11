@@ -336,11 +336,30 @@ impl JournalFs for JfsImpl {
             return Err(JfsError::Truncated);
         }
         let sb = parse_superblock(&image[..JFS_SB_LEN])?;
-        // Inode table must fit.
-        let table_bytes = (sb.inode_count as usize) * JFS_INODE_LEN;
-        let table_sectors =
-            (table_bytes + JFS_SECTOR_SIZE - 1) / JFS_SECTOR_SIZE;
-        let table_end = lba_offset(sb.inode_table_lba) + table_sectors * JFS_SECTOR_SIZE;
+        if sb.inode_table_lba == 0 {
+            return Err(JfsError::BadSuperblock);
+        }
+        // Inode table must fit and must not overlap superblock (LBA 0) or data region.
+        let table_bytes = (sb.inode_count as usize)
+            .checked_mul(JFS_INODE_LEN)
+            .ok_or(JfsError::BadSuperblock)?;
+        let table_sectors = table_bytes
+            .checked_add(JFS_SECTOR_SIZE - 1)
+            .ok_or(JfsError::BadSuperblock)?
+            / JFS_SECTOR_SIZE;
+        let min_data_lba = (sb.inode_table_lba as u64)
+            .checked_add(table_sectors as u64)
+            .ok_or(JfsError::BadSuperblock)?;
+        if (sb.data_start_lba as u64) < min_data_lba {
+            return Err(JfsError::BadSuperblock);
+        }
+        let table_start = (sb.inode_table_lba as usize)
+            .checked_mul(JFS_SECTOR_SIZE)
+            .ok_or(JfsError::Truncated)?;
+        let table_end = table_sectors
+            .checked_mul(JFS_SECTOR_SIZE)
+            .and_then(|sz| table_start.checked_add(sz))
+            .ok_or(JfsError::Truncated)?;
         if table_end > image.len() {
             return Err(JfsError::Truncated);
         }
@@ -435,6 +454,9 @@ impl JfsImpl {
             let lba = inode.extents[ei];
             if lba == 0 {
                 break;
+            }
+            if lba < self.sb.data_start_lba {
+                return Err(JfsError::BadInode);
             }
             let sec = sector_slice(image, lba)?;
             let take = core::cmp::min(JFS_SECTOR_SIZE, size - written);
@@ -1083,5 +1105,67 @@ mod tests {
         let fs = JfsImpl::mount(&img).unwrap();
         let mut out = [0u8; 16];
         assert_eq!(fs.read_file(&img, 2, &mut out).unwrap(), 0);
+    }
+
+    #[test]
+    fn jfs_rejects_superblock_overlap_and_extents_pointing_into_metadata_sectors() {
+        // 1. `inode_table_lba == 0` (overlapping superblock) or `data_start_lba < inode_table_end`
+        //    must fail `mount` with `BadSuperblock`.
+        let mut bad_tbl0 = fixture();
+        encode_superblock(
+            &JfsSuperblock {
+                version: JFS_VERSION,
+                block_size: 512,
+                root_inode: 1,
+                inode_count: 3,
+                inode_table_lba: 0,
+                data_start_lba: 2,
+                free_bitmap_lba: 0,
+            },
+            &mut bad_tbl0,
+            durable_fs_proof_init(),
+        )
+        .unwrap();
+        assert_eq!(JfsImpl::mount(&bad_tbl0).err(), Some(JfsError::BadSuperblock));
+
+        let mut bad_data_overlap = fixture();
+        encode_superblock(
+            &JfsSuperblock {
+                version: JFS_VERSION,
+                block_size: 512,
+                root_inode: 1,
+                inode_count: 3,
+                inode_table_lba: 1,
+                data_start_lba: 1, // overlaps inode table at LBA 1!
+                free_bitmap_lba: 0,
+            },
+            &mut bad_data_overlap,
+            durable_fs_proof_init(),
+        )
+        .unwrap();
+        assert_eq!(
+            JfsImpl::mount(&bad_data_overlap).err(),
+            Some(JfsError::BadSuperblock)
+        );
+
+        // 2. An inode whose extent points to LBA 1 (`< data_start_lba = 2`, inside metadata!)
+        //    must be rejected with `BadInode` instead of leaking raw superblock/inode bytes!
+        let mut meta_leak = fixture();
+        let forged_file = JfsInode {
+            ino: 2,
+            size_bytes: 16,
+            mtime_unix: 0,
+            extents: [1, 0, 0], // LBA 1 = inode table!
+            kind: JFS_KIND_FILE,
+        };
+        encode_inode(
+            &forged_file,
+            &mut meta_leak[lba_offset(1) + 2 * JFS_INODE_LEN..lba_offset(1) + 3 * JFS_INODE_LEN],
+            durable_fs_proof_init(),
+        )
+        .unwrap();
+        let fs = JfsImpl::mount(&meta_leak).unwrap();
+        let mut out = [0u8; 32];
+        assert_eq!(fs.read_file(&meta_leak, 2, &mut out), Err(JfsError::BadInode));
     }
 }

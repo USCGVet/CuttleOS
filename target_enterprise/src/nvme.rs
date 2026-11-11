@@ -409,6 +409,9 @@ impl<R: NvmeRegs> NvmeImpl<R> {
     /// Submit the SQE on the admin SQ, advance the tail, poll the CQ
     /// for completion of THIS cid. Returns the CQE on success.
     fn admin_command(&mut self, sqe: &SubmissionQueueEntry) -> Result<CompletionQueueEntry, NvmeError> {
+        if !self.enabled {
+            return Err(NvmeError::Unsupported);
+        }
         let cid = sqe.cid();
         self.regs.submit_entry(0, sqe);
         self.admin_sq_tail = (self.admin_sq_tail + 1) % ADMIN_QUEUE_ENTRIES;
@@ -721,28 +724,41 @@ impl MemNvmeController {
                 0x02 => {
                     // Read.
                     let lba = (sqe.cdw10 as u64) | ((sqe.cdw11 as u64) << 32);
-                    let off = (lba as usize) * NVME_BLOCK_SIZE;
-                    if off + NVME_BLOCK_SIZE > self.disk.len() {
-                        cqe.status_and_cid |= 0x80 << 17; // LBA out of range
-                    } else {
-                        let mut buf = [0u8; IDENTIFY_BUF_SIZE];
-                        buf[..NVME_BLOCK_SIZE]
-                            .copy_from_slice(&self.disk[off..off + NVME_BLOCK_SIZE]);
-                        self.shadow_phys_addr = sqe.prp1;
-                        self.shadow_phys_buf = buf;
+                    let range = usize::try_from(lba)
+                        .ok()
+                        .and_then(|l| l.checked_mul(NVME_BLOCK_SIZE))
+                        .and_then(|off| off.checked_add(NVME_BLOCK_SIZE).map(|end| (off, end)));
+                    match range {
+                        Some((off, end)) if end <= self.disk.len() => {
+                            let mut buf = [0u8; IDENTIFY_BUF_SIZE];
+                            buf[..NVME_BLOCK_SIZE].copy_from_slice(&self.disk[off..end]);
+                            self.shadow_phys_addr = sqe.prp1;
+                            self.shadow_phys_buf = buf;
+                        }
+                        _ => {
+                            cqe.status_and_cid |= 0x80 << 17; // LBA out of range
+                        }
                     }
                 }
                 0x01 => {
                     // Write.
                     let lba = (sqe.cdw10 as u64) | ((sqe.cdw11 as u64) << 32);
-                    let off = (lba as usize) * NVME_BLOCK_SIZE;
-                    if off + NVME_BLOCK_SIZE > self.disk.len() {
-                        cqe.status_and_cid |= 0x80 << 17;
-                    } else if self.shadow_phys_addr == sqe.prp1 {
-                        self.disk[off..off + NVME_BLOCK_SIZE]
-                            .copy_from_slice(&self.shadow_phys_buf[..NVME_BLOCK_SIZE]);
-                    } else {
-                        cqe.status_and_cid |= 0x02 << 17; // Invalid Field
+                    let range = usize::try_from(lba)
+                        .ok()
+                        .and_then(|l| l.checked_mul(NVME_BLOCK_SIZE))
+                        .and_then(|off| off.checked_add(NVME_BLOCK_SIZE).map(|end| (off, end)));
+                    match range {
+                        Some((off, end)) if end <= self.disk.len() => {
+                            if self.shadow_phys_addr == sqe.prp1 {
+                                self.disk[off..end]
+                                    .copy_from_slice(&self.shadow_phys_buf[..NVME_BLOCK_SIZE]);
+                            } else {
+                                cqe.status_and_cid |= 0x02 << 17; // Invalid Field
+                            }
+                        }
+                        _ => {
+                            cqe.status_and_cid |= 0x80 << 17; // LBA out of range
+                        }
                     }
                 }
                 0x00 => {
@@ -1069,5 +1085,29 @@ mod tests {
             drv.try_read_block(i as u64, &mut got, 0x6000).unwrap();
             assert_eq!(got, blocks[i], "block {} mismatch", i);
         }
+    }
+
+    #[test]
+    fn nvme_rejects_admin_cmd_before_bring_up_and_overflowing_emulator_lba() {
+        // 1. Admin commands issued before `bring_up()` (`enabled == false`) must fail with `Unsupported`.
+        let mut uninit = NvmeImpl::new(MemNvmeController::new());
+        let mut id_buf = [0u8; IDENTIFY_BUF_SIZE];
+        assert_eq!(
+            uninit.identify_controller(0x4000, &mut id_buf),
+            Err(NvmeError::Unsupported)
+        );
+
+        // 2. `MemNvmeController::process_io_sq` must not panic or wrap `(lba as usize) * 512` on `u64::MAX`!
+        let mut emu = MemNvmeController::new();
+        let mut sqe = SubmissionQueueEntry::EMPTY;
+        sqe.cdw0 = SubmissionQueueEntry::cdw0(0x02, 7); // Read
+        sqe.nsid = 1;
+        sqe.prp1 = 0x6000;
+        sqe.cdw10 = u32::MAX;
+        sqe.cdw11 = u32::MAX; // lba = u64::MAX
+        emu.submit_entry(1, &sqe);
+        emu.ring_sq_doorbell(1, 1);
+        let cqe = emu.fetch_completion(1).expect("completion");
+        assert_eq!(cqe.status(), 0x80, "overflowing LBA must return NVMe LBA Out of Range (0x80)");
     }
 }

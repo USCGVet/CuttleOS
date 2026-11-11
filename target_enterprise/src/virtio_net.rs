@@ -608,20 +608,31 @@ impl NetDevice for VirtioNet {
         let (head_idx, total_written) =
             Self::read_used_ring_entry(bus, PHYS_RX_USED, slot as u16);
 
-        // Validate descriptor index.
-        if head_idx as usize >= 2 * RX_BUFFERS {
+        // Always advance rx_used_seen so a corrupt or oversize used entry never wedges the ring.
+        self.rx_used_seen = self.rx_used_seen.wrapping_add(1);
+
+        // Validate descriptor index before touching descriptor buffers or recycling.
+        if head_idx as usize >= 2 * RX_BUFFERS || (head_idx & 1) != 0 {
             return Err(NetDeviceError::DescriptorIndexOutOfRange);
         }
-        if head_idx & 1 != 0 {
-            // Chains always start on even indices.
-            return Err(NetDeviceError::DescriptorIndexOutOfRange);
-        }
+
+        let mut recycle_rx_head = |bus: &mut dyn MmioBus| {
+            let recycle_slot = (self.rx_avail_idx as usize) & (QUEUE_SIZE_USIZE - 1);
+            let head_le = head_idx.to_le_bytes();
+            bus.dma_write(PHYS_RX_AVAIL + 4 + (recycle_slot as u64) * 2, &head_le);
+            let new_idx = self.rx_avail_idx.wrapping_add(1);
+            let new_idx_le = new_idx.to_le_bytes();
+            bus.dma_write(PHYS_RX_AVAIL + 2, &new_idx_le);
+            self.rx_avail_idx = new_idx;
+            bus.notify_queue(VIRTIO_NET_QUEUE_RX);
+        };
 
         // The frame total is `total_written`. The first 12 bytes are
         // the VirtIO-net header (read from the head descriptor's
         // buffer); the remainder is the Ethernet payload (read from
         // the tail descriptor's buffer at offset 64).
         if (total_written as usize) < VIRTIO_NET_HDR_LEN {
+            recycle_rx_head(bus);
             return Err(NetDeviceError::RxFrameTruncated);
         }
         let buffer_index = (head_idx / 2) as usize;
@@ -630,29 +641,17 @@ impl NetDevice for VirtioNet {
         bus.dma_read(buf_phys, &mut hdr_bytes);
         let hdr = decode_net_hdr(&hdr_bytes);
         if hdr.num_buffers != 1 {
+            recycle_rx_head(bus);
             return Err(NetDeviceError::UnsupportedRxBuffersMerged);
         }
 
         let payload_len = (total_written as usize) - VIRTIO_NET_HDR_LEN;
-        let payload_len = core::cmp::min(payload_len, RX_BUF_SIZE - 64);
-        let payload_len = core::cmp::min(payload_len, out.len());
+        if payload_len > MAX_FRAME_LEN || payload_len > RX_BUF_SIZE - 64 {
+            recycle_rx_head(bus);
+            return Err(NetDeviceError::FrameTooLarge);
+        }
         bus.dma_read(buf_phys + 64, &mut out[..payload_len]);
-
-        // Advance rx_used_seen.
-        self.rx_used_seen = self.rx_used_seen.wrapping_add(1);
-
-        // Recycle the descriptor pair back into the avail ring.
-        let recycle_slot = (self.rx_avail_idx as usize) & (QUEUE_SIZE_USIZE - 1);
-        let head_le = head_idx.to_le_bytes();
-        bus.dma_write(
-            PHYS_RX_AVAIL + 4 + (recycle_slot as u64) * 2,
-            &head_le,
-        );
-        let new_idx = self.rx_avail_idx.wrapping_add(1);
-        let new_idx_le = new_idx.to_le_bytes();
-        bus.dma_write(PHYS_RX_AVAIL + 2, &new_idx_le);
-        self.rx_avail_idx = new_idx;
-        bus.notify_queue(VIRTIO_NET_QUEUE_RX);
+        recycle_rx_head(bus);
 
         Ok(payload_len)
     }
@@ -1771,5 +1770,53 @@ mod tests {
         let mut out = [0xAAu8; 4];
         bus.dma_read(big_phys, &mut out);
         assert_eq!(out, [0u8; 4]);
+    }
+
+    #[test]
+    fn receive_rejects_oversize_frame_and_recovers_after_corrupt_used_entries() {
+        let mut bus = MemVirtioBus::new();
+        let mut drv = VirtioNet::new();
+        drv.init(&mut bus).expect("init");
+        let mut out = [0u8; MAX_FRAME_LEN];
+
+        // 1. Inject an oversize RX used entry (`head_idx = 0`, `total_written = 12 + MAX_FRAME_LEN + 10`).
+        //    `receive` must reject with `FrameTooLarge` (never silently clamp!) AND advance `rx_used_seen` + recycle!
+        let mut hdr1 = [0u8; VIRTIO_NET_HDR_LEN];
+        hdr1[10] = 1; // num_buffers = 1
+        bus.dma_write(PHYS_RX_BUFFERS, &hdr1);
+        bus.dma_write(PHYS_RX_USED + 4, &0u32.to_le_bytes());
+        bus.dma_write(
+            PHYS_RX_USED + 8,
+            &((VIRTIO_NET_HDR_LEN + MAX_FRAME_LEN + 10) as u32).to_le_bytes(),
+        );
+        bus.dma_write(PHYS_RX_USED + 2, &1u16.to_le_bytes());
+        assert_eq!(
+            drv.receive(&mut bus, &mut out),
+            Err(NetDeviceError::FrameTooLarge)
+        );
+
+        // 2. Inject a truncated RX used entry (`head_idx = 2`, `total_written = 4`).
+        //    Must return `RxFrameTruncated` AND advance `rx_used_seen` so the ring does not wedge!
+        bus.dma_write(PHYS_RX_USED + 4 + 8, &2u32.to_le_bytes());
+        bus.dma_write(PHYS_RX_USED + 8 + 8, &4u32.to_le_bytes());
+        bus.dma_write(PHYS_RX_USED + 2, &2u16.to_le_bytes());
+        assert_eq!(
+            drv.receive(&mut bus, &mut out),
+            Err(NetDeviceError::RxFrameTruncated)
+        );
+
+        // 3. Subsequent clean frame at slot 2 (`head_idx = 4`, 64B payload) must succeed without wedging!
+        let valid_payload = [0x5Au8; 64];
+        bus.dma_write(PHYS_RX_BUFFERS + 2 * (RX_BUF_SIZE as u64), &hdr1);
+        bus.dma_write(PHYS_RX_BUFFERS + 2 * (RX_BUF_SIZE as u64) + 64, &valid_payload);
+        bus.dma_write(PHYS_RX_USED + 4 + 16, &4u32.to_le_bytes());
+        bus.dma_write(
+            PHYS_RX_USED + 8 + 16,
+            &((VIRTIO_NET_HDR_LEN + 64) as u32).to_le_bytes(),
+        );
+        bus.dma_write(PHYS_RX_USED + 2, &3u16.to_le_bytes());
+        let n = drv.receive(&mut bus, &mut out).expect("recover after malformed RX entries");
+        assert_eq!(n, 64);
+        assert_eq!(&out[..64], &valid_payload[..]);
     }
 }

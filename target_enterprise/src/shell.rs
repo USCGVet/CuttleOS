@@ -28,10 +28,13 @@ use cuttle_contracts::{
     TPM_ALG_SHA256,
 };
 
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+
 use crate::audit::AuditLogImpl;
 use crate::durable_seal::{
-    is_seal_key_set, seal_bytes, seal_bytes_keyed, seal_matches, seal_matches_keyed,
-    zeroize_secret_bytes, DURABLE_DIGEST_LEN,
+    constant_time_eq, is_seal_key_set, seal_bytes, seal_bytes_keyed, seal_matches,
+    seal_matches_keyed, zeroize_secret_bytes, DURABLE_DIGEST_LEN,
 };
 #[cfg(test)]
 use crate::durable_seal::{
@@ -524,13 +527,18 @@ impl OsShell {
 
     /// Register or update a trusted SHA-256 digest for `path` in the IMA table.
     pub fn enroll_ima_digest(&mut self, path: &[u8], digest: &[u8; DURABLE_DIGEST_LEN]) -> bool {
-        if path.is_empty() || path.len() > 32 {
+        let mut norm = [0u8; cuttle_contracts::FS_PATH_MAX];
+        let Ok(nlen) = crate::vfs::normalise_path(path, &mut norm) else {
+            return false;
+        };
+        let cpath = &norm[..nlen];
+        if cpath.is_empty() || cpath.len() > 32 {
             return false;
         }
         let mut i = 0usize;
         while i < self.ima_count {
             let plen = self.ima_path_lens[i] as usize;
-            if bytes_eq(&self.ima_paths[i][..plen], path) {
+            if bytes_eq(&self.ima_paths[i][..plen], cpath) {
                 self.ima_digests[i] = *digest;
                 return true;
             }
@@ -542,11 +550,11 @@ impl OsShell {
         let idx = self.ima_count;
         self.ima_paths[idx] = [0u8; 32];
         let mut k = 0usize;
-        while k < path.len() {
-            self.ima_paths[idx][k] = path[k];
+        while k < cpath.len() {
+            self.ima_paths[idx][k] = cpath[k];
             k += 1;
         }
-        self.ima_path_lens[idx] = path.len() as u8;
+        self.ima_path_lens[idx] = cpath.len() as u8;
         self.ima_digests[idx] = *digest;
         self.ima_count += 1;
         true
@@ -560,10 +568,15 @@ impl OsShell {
         data: &[u8],
         out_dig: &mut [u8; DURABLE_DIGEST_LEN],
     ) -> bool {
+        let mut norm = [0u8; cuttle_contracts::FS_PATH_MAX];
+        let Ok(nlen) = crate::vfs::normalise_path(path, &mut norm) else {
+            return false;
+        };
+        let cpath = &norm[..nlen];
         let mut i = 0usize;
         while i < self.ima_count {
             let plen = self.ima_path_lens[i] as usize;
-            if bytes_eq(&self.ima_paths[i][..plen], path) {
+            if bytes_eq(&self.ima_paths[i][..plen], cpath) {
                 if seal_matches(data, &self.ima_digests[i]) {
                     *out_dig = self.ima_digests[i];
                     return true;
@@ -1508,9 +1521,9 @@ impl OsShell {
             self.record_audit(21, AuditVerdict::Denied, b"shell:wal:key-unset");
             return Err(WalError::PayloadTooLarge);
         }
-        let mut scratch = [0u8; 1024];
-        let len = serialize_wal_for_seal(wal, &mut scratch);
-        if !seal_matches_keyed(&self.seal_key, &scratch[..len], expected_seal) {
+        let mut actual_seal = [0u8; DURABLE_DIGEST_LEN];
+        compute_wal_seal(&self.seal_key, wal, &mut actual_seal);
+        if !constant_time_eq(&actual_seal, expected_seal) {
             self.record_audit(21, AuditVerdict::Denied, b"shell:wal:seal-mismatch");
             return Err(WalError::PayloadTooLarge);
         }
@@ -1618,10 +1631,16 @@ impl OsShell {
         if is_legacy {
             let mut scratch = [0u8; 1024];
             let len = serialize_wal_for_seal(&wal, &mut scratch);
+            let mut stream_primary = [0u8; DURABLE_DIGEST_LEN];
+            let mut stream_legacy = [0u8; DURABLE_DIGEST_LEN];
+            compute_wal_seal(&self.seal_key, &wal, &mut stream_primary);
+            compute_wal_seal(&self.legacy_seal_key, &wal, &mut stream_legacy);
             let ok = (is_seal_key_set(&self.seal_key)
-                && seal_matches_keyed(&self.seal_key, &scratch[..len], &expected_seal))
+                && (constant_time_eq(&stream_primary, &expected_seal)
+                    || seal_matches_keyed(&self.seal_key, &scratch[..len], &expected_seal)))
                 || (is_seal_key_set(&self.legacy_seal_key)
-                    && seal_matches_keyed(&self.legacy_seal_key, &scratch[..len], &expected_seal));
+                    && (constant_time_eq(&stream_legacy, &expected_seal)
+                        || seal_matches_keyed(&self.legacy_seal_key, &scratch[..len], &expected_seal)));
             if !ok {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:wal:seal-mismatch");
                 return Err(WalError::PayloadTooLarge);
@@ -1683,7 +1702,7 @@ impl OsShell {
         while i < SHELL_FS_INODES {
             if let Some((path, data)) = self.fs.inode_data(i) {
                 if !is_default_system_file(path) {
-                    if path.is_empty() || path.len() > 46 {
+                    if path.is_empty() || path.len() > SHELL_MAX_WRITABLE_PATH {
                         return Err(WalError::PayloadTooLarge);
                     }
                     if data_cursor.saturating_add(data.len()) > SHELL_FS_POOL {
@@ -1703,10 +1722,21 @@ impl OsShell {
                     sectors[dir_sec][dir_off + 5] = dlen_b[1];
                     sectors[dir_sec][dir_off + 6] = dlen_b[2];
                     sectors[dir_sec][dir_off + 7] = dlen_b[3];
+                    let inline_len = path.len().min(46);
                     let mut p = 0usize;
-                    while p < path.len() {
+                    while p < inline_len {
                         sectors[dir_sec][dir_off + 8 + p] = path[p];
                         p += 1;
+                    }
+                    if path.len() > 46 {
+                        let ext_base = file_count * 160;
+                        let mut k = 0usize;
+                        let tail = &path[46..];
+                        while k < tail.len() {
+                            let abs_ext = ext_base + k;
+                            sectors[11 + (abs_ext / 512)][abs_ext % 512] = tail[k];
+                            k += 1;
+                        }
                     }
                     let mut m = 0usize;
                     while m < 8 {
@@ -1850,11 +1880,35 @@ impl OsShell {
                 sectors[dir_sec][dir_off + 62],
                 sectors[dir_sec][dir_off + 63],
             ]);
-            if plen == 0 || plen > 46 || doff.saturating_add(dlen) > data_bytes {
+            if plen == 0 || plen > SHELL_MAX_WRITABLE_PATH || doff.saturating_add(dlen) > data_bytes {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:fs:dirent-corrupt");
                 return Err(WalError::PayloadTooLarge);
             }
-            let path = &sectors[dir_sec][dir_off + 8..dir_off + 8 + plen];
+            let mut raw_path_buf = [0u8; SHELL_MAX_WRITABLE_PATH];
+            let inline_len = plen.min(46);
+            raw_path_buf[..inline_len]
+                .copy_from_slice(&sectors[dir_sec][dir_off + 8..dir_off + 8 + inline_len]);
+            if plen > 46 {
+                let ext_base = idx * 160;
+                let tail_len = plen - 46;
+                let mut k = 0usize;
+                while k < tail_len {
+                    let abs_ext = ext_base + k;
+                    raw_path_buf[46 + k] = sectors[11 + (abs_ext / 512)][abs_ext % 512];
+                    k += 1;
+                }
+            }
+            let mut norm_path_buf = [0u8; cuttle_contracts::FS_PATH_MAX];
+            let Ok(nlen) = crate::vfs::normalise_path(&raw_path_buf[..plen], &mut norm_path_buf)
+            else {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:fs:dirent-corrupt");
+                return Err(WalError::PayloadTooLarge);
+            };
+            let path = &norm_path_buf[..nlen];
+            if is_default_system_file(path) {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:fs:dirent-corrupt");
+                return Err(WalError::PayloadTooLarge);
+            }
             let mut chunk = [0u8; 256];
             if dlen <= 256 {
                 let mut b = 0usize;
@@ -1898,24 +1952,25 @@ impl OsShell {
     /// IMA table, anti-replay watermark, and audit watermark).
     #[inline(never)]
     pub fn compute_state_seal(&self, out: &mut [u8; DURABLE_DIGEST_LEN]) {
-        let mut buf = [0u8; 1024];
-        let mut pos = 0usize;
+        let mut hasher = Sha256::new();
+        hasher.update(b"cuttle-state-seal-v2\0");
+
         let mut i = 0usize;
         while i < SHELL_FS_INODES {
             if let Some((path, data)) = self.fs.inode_data(i) {
-                pos += copy_into(path, &mut buf[pos..]);
-                pos += copy_into(b":", &mut buf[pos..]);
-                pos += copy_into(data, &mut buf[pos..]);
-                pos += copy_into(b";", &mut buf[pos..]);
+                hasher.update(&(path.len() as u32).to_be_bytes());
+                hasher.update(path);
+                hasher.update(&(data.len() as u32).to_be_bytes());
+                hasher.update(data);
             }
             i += 1;
         }
+        hasher.update(&[0xFFu8]);
+
         let mut s = 0usize;
         while s < SHELL_MAX_TASKS {
             if let Some(t) = self.sched.slot(s) {
                 if t.state != TaskState::Empty && t.state != TaskState::Exited {
-                    pos += dec_u64(t.id as u64, &mut buf[pos..]);
-                    pos += copy_into(b"=", &mut buf[pos..]);
                     let cap = if (t.id as usize) < SHELL_MAX_TASKS {
                         self.task_caps[t.id as usize]
                     } else {
@@ -1926,28 +1981,56 @@ impl OsShell {
                     } else {
                         0
                     };
-                    pos += dec_u64(cap, &mut buf[pos..]);
-                    if sc != 0 {
-                        pos += copy_into(b"/", &mut buf[pos..]);
-                        pos += dec_u64(sc as u64, &mut buf[pos..]);
-                    }
-                    pos += copy_into(b";", &mut buf[pos..]);
+                    hasher.update(&t.id.to_be_bytes());
+                    hasher.update(&cap.to_be_bytes());
+                    hasher.update(&[sc]);
                 }
             }
             s += 1;
         }
-        pos += dec_u64(self.fw.as_slice().len() as u64, &mut buf[pos..]);
-        pos += copy_into(b":", &mut buf[pos..]);
-        pos += dec_u64(self.ima_count as u64, &mut buf[pos..]);
-        pos += copy_into(b":", &mut buf[pos..]);
-        pos += dec_u64(self.auth_seq, &mut buf[pos..]);
-        pos += copy_into(b":", &mut buf[pos..]);
-        pos += dec_u64(self.audit.high_watermark(), &mut buf[pos..]);
-        pos += copy_into(b":", &mut buf[pos..]);
-        pos += copy_into(self.svc.role.as_bytes(), &mut buf[pos..]);
-        pos += copy_into(b":", &mut buf[pos..]);
-        pos += copy_into(&self.svc.svc_pcr10, &mut buf[pos..]);
-        seal_bytes(&buf[..pos], out);
+        hasher.update(&[0xFEu8]);
+
+        let rules = self.fw.as_slice();
+        hasher.update(&(rules.len() as u32).to_be_bytes());
+        let mut r_idx = 0usize;
+        while r_idx < rules.len() {
+            let r = &rules[r_idx];
+            let act_byte = match r.action {
+                FilterAction::Accept => 0u8,
+                FilterAction::Drop => 1u8,
+                FilterAction::Reject => 2u8,
+            };
+            hasher.update(&r.src_ip);
+            hasher.update(&[r.src_mask]);
+            hasher.update(&r.dst_ip);
+            hasher.update(&[r.dst_mask, r.proto]);
+            hasher.update(&r.src_port_start.to_be_bytes());
+            hasher.update(&r.src_port_end.to_be_bytes());
+            hasher.update(&r.dst_port_start.to_be_bytes());
+            hasher.update(&r.dst_port_end.to_be_bytes());
+            hasher.update(&[act_byte]);
+            r_idx += 1;
+        }
+        hasher.update(&[0xFDu8]);
+
+        hasher.update(&(self.ima_count as u32).to_be_bytes());
+        let mut m = 0usize;
+        while m < self.ima_count {
+            let plen = self.ima_path_lens[m] as usize;
+            hasher.update(&(plen as u32).to_be_bytes());
+            hasher.update(&self.ima_paths[m][..plen]);
+            hasher.update(&self.ima_digests[m]);
+            m += 1;
+        }
+        hasher.update(&[0xFCu8]);
+
+        hasher.update(&self.auth_seq.to_be_bytes());
+        hasher.update(&self.audit.high_watermark().to_be_bytes());
+        let role_bytes = self.svc.role.as_bytes();
+        hasher.update(&(role_bytes.len() as u32).to_be_bytes());
+        hasher.update(role_bytes);
+        hasher.update(&self.svc.svc_pcr10);
+        out.copy_from_slice(&hasher.finalize());
     }
 
     /// Feed a single raw console byte (from COM1 16550 or PS/2 keyboard).
@@ -4373,6 +4456,17 @@ impl OsShell {
             }
         }
 
+        let st = match self.fs.stat(path) {
+            Ok(s) => s,
+            Err(_) => {
+                self.record_audit(22, AuditVerdict::Error, b"shell:exec:not-found");
+                return copy_into(b"error: executable not found\n", out);
+            }
+        };
+        if st.size > 512 {
+            self.record_audit(22, AuditVerdict::Denied, b"shell:exec:too-large");
+            return copy_into(b"error: executable exceeds 512B sandbox limit\n", out);
+        }
         let h = match self.fs.open(path, FS_O_RDONLY) {
             Ok(h) => h,
             Err(_) => {
@@ -4410,15 +4504,32 @@ impl OsShell {
             align: 0,
         }; ELF_MAX_PHDRS];
         let ph_count = match Elf64Impl::load_phdrs(&img[..n], &hdr, &mut phdrs) {
-            Ok(c) if c >= 1 && phdrs[0].ptype == ELF_PT_LOAD => c,
+            Ok(c)
+                if c >= 1
+                    && phdrs[0].ptype == ELF_PT_LOAD
+                    && (phdrs[0].flags & 0x1) != 0
+                    && (phdrs[0].flags & 0x2) == 0 =>
+            {
+                c
+            }
             _ => {
                 self.record_audit(22, AuditVerdict::Denied, b"shell:exec:bad-phdr");
                 return copy_into(b"error: invalid elf64 phdrs\n", out);
             }
         };
         let _ = ph_count;
-        let code_off = phdrs[0].offset as usize;
-        let code_len = phdrs[0].filesz as usize;
+        let seg_vaddr = phdrs[0].vaddr;
+        let seg_filesz = phdrs[0].filesz;
+        if hdr.entry < seg_vaddr
+            || hdr.entry >= seg_vaddr.saturating_add(seg_filesz)
+            || ((hdr.entry - seg_vaddr) % 8) != 0
+        {
+            self.record_audit(22, AuditVerdict::Denied, b"shell:exec:bad-entry");
+            return copy_into(b"error: invalid elf64 entry point\n", out);
+        }
+        let entry_rel = (hdr.entry - seg_vaddr) as usize;
+        let code_off = (phdrs[0].offset as usize).saturating_add(entry_rel);
+        let code_len = (seg_filesz as usize).saturating_sub(entry_rel);
         if code_len == 0
             || (code_len % 8) != 0
             || code_off.saturating_add(code_len) > n
@@ -4606,11 +4717,17 @@ impl OsShell {
                     out,
                 );
             }
-            let path = trim_ascii(rest);
-            if path.is_empty() {
+            let raw_path = trim_ascii(rest);
+            if raw_path.is_empty() {
                 self.record_audit(24, AuditVerdict::Error, b"shell:ima:no-path");
                 return copy_into(b"usage: ima enroll <path>\n", out);
             }
+            let mut norm_buf = [0u8; cuttle_contracts::FS_PATH_MAX];
+            let Ok(nlen) = crate::vfs::normalise_path(raw_path, &mut norm_buf) else {
+                self.record_audit(24, AuditVerdict::Error, b"shell:ima:bad-path");
+                return copy_into(b"error: invalid path\n", out);
+            };
+            let path = &norm_buf[..nlen];
             let h = match self.fs.open(path, FS_O_RDONLY) {
                 Ok(h) => h,
                 Err(_) => {
@@ -4618,11 +4735,20 @@ impl OsShell {
                     return copy_into(b"error: file not found\n", out);
                 }
             };
-            let mut img = [0u8; 512];
-            let n = self.fs.read(h, 0, &mut img).unwrap_or(0);
+            let mut hasher = Sha256::new();
+            let mut chunk = [0u8; 256];
+            let mut off = 0u64;
+            loop {
+                let n = self.fs.read(h, off, &mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&chunk[..n]);
+                off = off.saturating_add(n as u64);
+            }
             let _ = self.fs.close(h);
             let mut dig = [0u8; DURABLE_DIGEST_LEN];
-            seal_bytes(&img[..n], &mut dig);
+            dig.copy_from_slice(&hasher.finalize());
             if !self.enroll_ima_digest(path, &dig) {
                 self.record_audit(24, AuditVerdict::Error, b"shell:ima:full");
                 return copy_into(b"error: ima table full or path too long\n", out);
@@ -4886,9 +5012,17 @@ fn compute_wal_seal<const C: usize>(
     wal: &WalImpl<C>,
     seal_out: &mut [u8; DURABLE_DIGEST_LEN],
 ) {
-    let mut scratch = [0u8; 1024];
-    let len = serialize_wal_for_seal(wal, &mut scratch);
-    seal_bytes_keyed(key, &scratch[..len], seal_out);
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts 32-byte key");
+    mac.update(b"cuttle-wal-seal-v2\0");
+    let mut rec_count = 0u64;
+    wal.replay(&mut |lsn: u64, payload: &[u8]| {
+        mac.update(&lsn.to_be_bytes());
+        mac.update(&(payload.len() as u32).to_be_bytes());
+        mac.update(payload);
+        rec_count = rec_count.wrapping_add(1);
+    });
+    mac.update(&rec_count.to_be_bytes());
+    seal_out.copy_from_slice(&mac.finalize().into_bytes());
 }
 
 fn compute_fs_partition_seal(
@@ -5477,24 +5611,25 @@ fn evaluate_seccomp_ebpf(seccomp_mask: u8, syscall_nr: u64) -> bool {
         return true;
     }
 
-    let st_dw = bpf_op::BPF_CLASS_ST | bpf_op::BPF_SIZE_DW;
+    let st_w = bpf_op::BPF_CLASS_ST | bpf_op::BPF_SIZE_W;
     let ldx_dw = bpf_op::BPF_CLASS_LDX | bpf_op::BPF_SIZE_DW;
     let mov64_imm = bpf_op::BPF_CLASS_ALU64 | bpf_op::BPF_OP_MOV;
     let jeq_imm = bpf_op::BPF_CLASS_JMP | bpf_op::BPF_JMP_JEQ;
 
-    let mut prog = [BpfInstr::new(0, 0, 0, 0, 0); 12];
-    prog[0] = BpfInstr::new(st_dw, 1, 0, 0, syscall_nr as i32);
-    prog[1] = BpfInstr::new(ldx_dw, 2, 1, 0, 0);
-    prog[2] = BpfInstr::new(mov64_imm, 0, 0, 0, 0);
+    let mut prog = [BpfInstr::new(0, 0, 0, 0, 0); 14];
+    prog[0] = BpfInstr::new(st_w, 1, 0, 0, syscall_nr as i32);
+    prog[1] = BpfInstr::new(st_w, 1, 0, 4, (syscall_nr >> 32) as i32);
+    prog[2] = BpfInstr::new(ldx_dw, 2, 1, 0, 0);
+    prog[3] = BpfInstr::new(mov64_imm, 0, 0, 0, 0);
     let mut j = 0usize;
     while j < denied_count {
         let jump_to_exit = (denied_count - j) as i16;
-        prog[3 + j] = BpfInstr::new(jeq_imm, 2, 0, jump_to_exit, denied_nrs[j] as i32);
+        prog[4 + j] = BpfInstr::new(jeq_imm, 2, 0, jump_to_exit, denied_nrs[j] as i32);
         j += 1;
     }
-    prog[3 + denied_count] = BpfInstr::new(mov64_imm, 0, 0, 0, 1);
-    prog[3 + denied_count + 1] = BpfInstr::new(bpf_op::BPF_OP_EXIT, 0, 0, 0, 0);
-    let total_insns = 3 + denied_count + 2;
+    prog[4 + denied_count] = BpfInstr::new(mov64_imm, 0, 0, 0, 1);
+    prog[4 + denied_count + 1] = BpfInstr::new(bpf_op::BPF_OP_EXIT, 0, 0, 0, 0);
+    let total_insns = 4 + denied_count + 2;
 
     let mut ctx = BpfContext::new();
     matches!(EBpfImpl::run(&prog[..total_insns], &mut ctx), Ok(1))
@@ -7100,5 +7235,176 @@ mod tests {
         assert!(resumed.vault_nonce_seq >= 311);
         assert!(resumed.guard_lockdown);
         assert!(resumed.cron_jobs.iter().any(|j| j.active && j.interval_ticks == 15));
+    }
+
+    #[test]
+    fn shell_seals_over_1kib_without_truncation_harden_ima_exec_seccomp64_and_long_fs_paths() {
+        // 1. Keyed WAL seal over >1200 bytes must authenticate every trailing record (zero 1024B truncation!).
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 512];
+        for idx in 0..6usize {
+            let mut path = [0u8; 12];
+            let p_len = copy_into(b"/tmp/f", &mut path);
+            path[p_len] = b'0' + (idx as u8);
+            let fh = sh
+                .fs
+                .open(&path[..p_len + 1], FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC)
+                .unwrap();
+            sh.fs
+                .write(fh, 0, &[b'A' + (idx as u8); 240])
+                .unwrap();
+            sh.fs.close(fh).unwrap();
+        }
+        let mut wal: WalImpl<4096> = WalImpl::new();
+        let mut seal = [0u8; DURABLE_DIGEST_LEN];
+        let count = sh.checkpoint_sealed(&mut wal, &mut seal).unwrap();
+        assert!(count >= 6);
+        assert!(wal.durable_cursor() > 1300);
+
+        // Tamper with the LAST file's payload near the end of the WAL (>1200B offset) and recompute
+        // its unkeyed WAL CRC32 so `wal.replay` yields the tampered record — `restore_sealed` MUST reject!
+        let mut forged_backing = *wal.backing();
+        let cursor = wal.durable_cursor();
+        // Flip the final payload byte at `cursor - 1` and recompute that record's CRC32:
+        let mut scan = 0usize;
+        let mut last_hdr = 0usize;
+        let mut last_len = 0usize;
+        while scan + 8 <= cursor {
+            let rlen = u32::from_le_bytes([
+                forged_backing[scan],
+                forged_backing[scan + 1],
+                forged_backing[scan + 2],
+                forged_backing[scan + 3],
+            ]) as usize;
+            if scan + 8 + rlen > cursor {
+                break;
+            }
+            last_hdr = scan;
+            last_len = rlen;
+            scan += 8 + rlen;
+        }
+        assert!(last_hdr > 1100);
+        forged_backing[last_hdr + 8 + last_len - 1] ^= 0xFF;
+        let new_crc = crate::wal::crc32_ieee(
+            &forged_backing[last_hdr + 8..last_hdr + 8 + last_len],
+        );
+        forged_backing[last_hdr + 4..last_hdr + 8].copy_from_slice(&new_crc.to_le_bytes());
+        let forged_wal = WalImpl::<4096>::from_backing(forged_backing, cursor);
+        let mut victim = OsShell::new();
+        assert!(
+            victim.restore_sealed(&forged_wal, &seal).is_err(),
+            "restore_sealed must authenticate WAL records past 1024 bytes"
+        );
+
+        // 2. `compute_state_seal` must reflect file mutations past 1024 bytes AND firewall rule content changes!
+        let mut seal_a = [0u8; DURABLE_DIGEST_LEN];
+        sh.compute_state_seal(&mut seal_a);
+        let fh5 = sh.fs.open(b"/tmp/f5", FS_O_RDWR).unwrap();
+        sh.fs.write(fh5, 239, b"Z").unwrap();
+        sh.fs.close(fh5).unwrap();
+        let mut seal_b = [0u8; DURABLE_DIGEST_LEN];
+        sh.compute_state_seal(&mut seal_b);
+        assert_ne!(
+            seal_a, seal_b,
+            "compute_state_seal must not truncate VFS state at 1024 bytes"
+        );
+
+        let _ = sh.exec_line(b"fw block 10.9.0.1/32", 1, 0, 0, &mut out);
+        let mut seal_fw1 = [0u8; DURABLE_DIGEST_LEN];
+        sh.compute_state_seal(&mut seal_fw1);
+        sh.fw.clear();
+        let _ = sh.exec_line(b"fw allow 10.9.0.2/32", 1, 0, 0, &mut out);
+        let mut seal_fw2 = [0u8; DURABLE_DIGEST_LEN];
+        sh.compute_state_seal(&mut seal_fw2);
+        assert_ne!(
+            seal_fw1, seal_fw2,
+            "compute_state_seal must commit actual firewall rule fields, not just rule count"
+        );
+
+        // 3. `ima enroll` normalizes paths (`//tmp/bigbin` == `/tmp/bigbin`), hashes >512B files without
+        //    truncation, and `cmd_exec` rejects >512B binaries and out-of-segment `hdr.entry`!
+        let mut ima_sh = OsShell::new();
+        let h_big = ima_sh
+            .fs
+            .open(b"/tmp/bigbin", FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC)
+            .unwrap();
+        ima_sh.fs.write(h_big, 0, &[0x41u8; 640]).unwrap();
+        ima_sh.fs.close(h_big).unwrap();
+        let n_enr1 = ima_sh
+            .exec_line(b"ima enroll //tmp/bigbin", 1, 0, 0, &mut out)
+            .bytes_written();
+        let enr1_reply = out[..n_enr1].to_vec();
+        assert!(enr1_reply.starts_with(b"ima enrolled path=/tmp/bigbin sha256="));
+
+        let h_big2 = ima_sh.fs.open(b"/tmp/bigbin", FS_O_RDWR).unwrap();
+        ima_sh.fs.write(h_big2, 600, b"DIFF").unwrap();
+        ima_sh.fs.close(h_big2).unwrap();
+        let n_enr2 = ima_sh
+            .exec_line(b"ima enroll /tmp/bigbin", 1, 0, 0, &mut out)
+            .bytes_written();
+        assert_ne!(
+            &enr1_reply[..],
+            &out[..n_enr2],
+            "ima enroll must hash bytes beyond offset 512"
+        );
+        let n_exec_big = ima_sh
+            .exec_line(b"exec /tmp/bigbin", 1, 0, 0, &mut out)
+            .bytes_written();
+        assert!(
+            out[..n_exec_big].starts_with(b"error:"),
+            "cmd_exec must reject executables larger than its 512B image buffer"
+        );
+
+        let mut bad_entry_elf = [0u8; 256];
+        let elf_len = build_sum_elf(&mut bad_entry_elf);
+        // Corrupt `e_entry` (`[24..32]`) to point outside `[vaddr, vaddr + filesz)` (`0x401000 + 0x800`):
+        bad_entry_elf[24..32].copy_from_slice(&(0x401800u64).to_le_bytes());
+        let h_bad = ima_sh
+            .fs
+            .open(b"/tmp/badentry", FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC)
+            .unwrap();
+        ima_sh.fs.write(h_bad, 0, &bad_entry_elf[..elf_len]).unwrap();
+        ima_sh.fs.close(h_bad).unwrap();
+        let _ = ima_sh.exec_line(b"ima enroll /tmp/badentry", 1, 0, 0, &mut out);
+        let n_bad_exec = ima_sh
+            .exec_line(b"exec /tmp/badentry", 1, 0, 0, &mut out)
+            .bytes_written();
+        assert!(
+            out[..n_bad_exec].starts_with(b"error:"),
+            "cmd_exec must reject ELF header entry outside PT_LOAD code segment"
+        );
+
+        // 4. `evaluate_seccomp_ebpf` must compare the full 64-bit syscall_nr without 32-bit truncation!
+        assert!(!evaluate_seccomp_ebpf(SECCOMP_DENY_YIELD, SYS_YIELD));
+        assert!(
+            evaluate_seccomp_ebpf(SECCOMP_DENY_YIELD, (1u64 << 32) | SYS_YIELD),
+            "64-bit syscall number (1<<32)|SYS_YIELD must not truncate to 32-bit SYS_YIELD in seccomp filter"
+        );
+
+        // 5. `pack_fs_partition` + `unpack_fs_partition` must support mutable paths up to `SHELL_MAX_WRITABLE_PATH` (e.g. 120B)!
+        let mut p_sh = OsShell::new();
+        let mut long_path = [b'x'; 120];
+        long_path[0] = b'/';
+        long_path[60] = b'/';
+        let hp = p_sh
+            .fs
+            .open(&long_path, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC)
+            .unwrap();
+        p_sh.fs.write(hp, 0, b"LONG-PATH-PAYLOAD").unwrap();
+        p_sh.fs.close(hp).unwrap();
+        let mut fs_secs = [[0u8; 512]; SHELL_FS_PART_SECTORS];
+        let (fc, db) = p_sh
+            .pack_fs_partition(3, &mut fs_secs)
+            .expect("pack_fs_partition must support paths > 46 bytes up to SHELL_MAX_WRITABLE_PATH");
+        assert_eq!(fc, 1);
+        assert_eq!(db, 17);
+        let mut restored_sh = OsShell::new();
+        let (r_gen, r_fc, r_db) = restored_sh.unpack_fs_partition(&fs_secs).unwrap();
+        assert_eq!((r_gen, r_fc, r_db), (3, 1, 17));
+        let hr = restored_sh.fs.open(&long_path, FS_O_RDONLY).unwrap();
+        let mut rdata = [0u8; 32];
+        let rn = restored_sh.fs.read(hr, 0, &mut rdata).unwrap();
+        restored_sh.fs.close(hr).unwrap();
+        assert_eq!(&rdata[..rn], b"LONG-PATH-PAYLOAD");
     }
 }
