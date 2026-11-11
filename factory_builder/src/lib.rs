@@ -418,17 +418,81 @@ pub fn compose_reproducible_kernel_rustflags(
     let mut flags = compose_kernel_rustflags(inherited, layout_seed, prod);
     if let Some(ws) = workspace_root {
         let ws_s = ws.to_string_lossy();
-        if !ws_s.contains(' ') {
-            flags.push_str(&format!(" --remap-path-prefix={ws_s}=/cuttle_ws"));
-        }
+        flags.push_str(&format!(" --remap-path-prefix={ws_s}=/cuttle_ws"));
     }
     if let Some(ch) = cargo_home {
         let ch_s = ch.to_string_lossy();
-        if !ch_s.contains(' ') {
-            flags.push_str(&format!(" --remap-path-prefix={ch_s}=/cargo_home"));
-        }
+        flags.push_str(&format!(" --remap-path-prefix={ch_s}=/cargo_home"));
     }
     flags.trim().to_string()
+}
+
+fn push_remap_prefix_args(args: &mut Vec<String>, host_dir: &Path, virtual_prefix: &str) {
+    let raw = host_dir.to_string_lossy();
+    if raw.is_empty() {
+        return;
+    }
+    args.push(format!("--remap-path-prefix={raw}={virtual_prefix}"));
+    if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+        if !stripped.is_empty() {
+            args.push(format!("--remap-path-prefix={stripped}={virtual_prefix}"));
+        }
+    }
+}
+
+fn default_home_subdir(env_var: &str, subdir: &str) -> Option<PathBuf> {
+    if let Ok(v) = std::env::var(env_var) {
+        if !v.trim().is_empty() {
+            return Some(PathBuf::from(v));
+        }
+    }
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })?;
+    Some(PathBuf::from(home).join(subdir))
+}
+
+/// Configure reproducible kernel Cargo environment using `CARGO_ENCODED_RUSTFLAGS`
+/// (`\x1f`-delimited) so `--remap-path-prefix` works reliably even when host
+/// workspace, `CARGO_HOME`, or `RUSTUP_HOME` paths contain spaces (`R5`).
+pub fn configure_kernel_cargo_env_reproducible(
+    cmd: &mut Command,
+    inherited_rustflags: &str,
+    layout_seed: Option<u64>,
+    prod: bool,
+    workspace_root: Option<&Path>,
+    cargo_home: Option<&Path>,
+    rustup_home: Option<&Path>,
+) -> String {
+    let base_flags = compose_kernel_rustflags(inherited_rustflags, layout_seed, prod);
+    let mut args: Vec<String> = base_flags
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    if let Some(ws) = workspace_root {
+        push_remap_prefix_args(&mut args, ws, "/cuttle_ws");
+    }
+    if let Some(ch) = cargo_home {
+        push_remap_prefix_args(&mut args, ch, "/cargo_home");
+    }
+    if let Some(rh) = rustup_home {
+        push_remap_prefix_args(&mut args, rh, "/rustup_home");
+    }
+    let encoded = args.join("\x1f");
+    if let Some(seed) = layout_seed {
+        cmd.env("CUTTLE_VARIANT_SEED", seed.to_string());
+    } else {
+        cmd.env_remove("CUTTLE_VARIANT_SEED");
+    }
+    cmd.env("SOURCE_DATE_EPOCH", REPRO_SOURCE_DATE_EPOCH);
+    cmd.env_remove("RUSTFLAGS");
+    cmd.env("CARGO_ENCODED_RUSTFLAGS", &encoded);
+    encoded
 }
 
 /// Generate a deterministic CycloneDX 1.5 JSON SBOM for `kernel_crate_dir`
@@ -495,6 +559,7 @@ pub fn generate_cyclonedx_sbom(kernel_crate_dir: &Path) -> Result<(String, Strin
     Ok((sbom, hex(&dig)))
 }
 
+#[cfg(test)]
 fn configure_kernel_cargo_env(
     cmd: &mut Command,
     inherited_rustflags: &str,
@@ -545,7 +610,7 @@ pub fn build_kernel_with_layout_seed_and_prod(
         );
     }
     if let Some(ws_root) = kernel_crate_dir.parent() {
-        let _ = ensure_device_secret_key(&ws_root.join(DEVICE_SECRET_KEY_FILENAME));
+        ensure_device_secret_key(&ws_root.join(DEVICE_SECRET_KEY_FILENAME))?;
     }
     eprintln!(
         "factory_builder: building kernel crate at {}",
@@ -568,12 +633,21 @@ pub fn build_kernel_with_layout_seed_and_prod(
         .arg("--release")
         .arg("--manifest-path")
         .arg(&manifest);
-    // Compose RUSTFLAGS once from the inherited base + KERNEL_BASE_RUSTFLAGS:
-    // diversity levers for a layout seed, then the prod cfg. Building the
-    // string in one place avoids clobbering the soft-float crypto cfgs in
-    // `target_enterprise_kernel/.cargo/config.toml`.
+    // Compose reproducible CARGO_ENCODED_RUSTFLAGS from the inherited base +
+    // KERNEL_BASE_RUSTFLAGS + `--remap-path-prefix` for workspace, cargo_home,
+    // and rustup_home so host build paths never leak into the ELF.
     let inherited_rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
-    let _rustflags = configure_kernel_cargo_env(&mut cmd, &inherited_rustflags, layout_seed, prod);
+    let cargo_home = default_home_subdir("CARGO_HOME", ".cargo");
+    let rustup_home = default_home_subdir("RUSTUP_HOME", ".rustup");
+    let _encoded_rustflags = configure_kernel_cargo_env_reproducible(
+        &mut cmd,
+        &inherited_rustflags,
+        layout_seed,
+        prod,
+        kernel_crate_dir.parent(),
+        cargo_home.as_deref(),
+        rustup_home.as_deref(),
+    );
     if let Some(seed) = layout_seed {
         let llvm_flags = kernel_llvm_codegen_rustflags(seed);
         eprintln!(
@@ -1041,5 +1115,41 @@ mod tests {
         assert_eq!(dig1.len(), 64);
         assert!(sbom1.contains("\"bomFormat\":\"CycloneDX\""));
         assert!(sbom1.contains("pkg:cargo/"));
+    }
+
+    #[test]
+    fn configure_kernel_cargo_env_sets_encoded_remap_path_prefixes_including_spaces() {
+        let mut cmd = Command::new("cargo");
+        let ws_with_space = Path::new("C:/Users/Alice Smith/Cuttle Workspace");
+        let cargo_with_space = Path::new("C:/Users/Alice Smith/.cargo");
+        configure_kernel_cargo_env_reproducible(
+            &mut cmd,
+            "",
+            Some(101),
+            true,
+            Some(ws_with_space),
+            Some(cargo_with_space),
+            None,
+        );
+        let envs: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
+            .collect();
+        let encoded = envs
+            .get("CARGO_ENCODED_RUSTFLAGS")
+            .expect("CARGO_ENCODED_RUSTFLAGS must be set for space-safe reproducible builds");
+        let parts: Vec<&str> = encoded.split('\x1f').collect();
+        assert!(
+            parts.iter().any(|p| *p == "--remap-path-prefix=C:/Users/Alice Smith/Cuttle Workspace=/cuttle_ws"),
+            "missing space-preserving workspace --remap-path-prefix in CARGO_ENCODED_RUSTFLAGS: {parts:?}"
+        );
+        assert!(
+            parts.iter().any(|p| *p == "--remap-path-prefix=C:/Users/Alice Smith/.cargo=/cargo_home"),
+            "missing space-preserving cargo_home --remap-path-prefix in CARGO_ENCODED_RUSTFLAGS: {parts:?}"
+        );
+        assert!(
+            parts.contains(&"cuttle_prod"),
+            "missing --cfg cuttle_prod in CARGO_ENCODED_RUSTFLAGS: {parts:?}"
+        );
     }
 }

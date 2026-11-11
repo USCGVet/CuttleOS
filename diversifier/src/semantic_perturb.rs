@@ -222,6 +222,19 @@ impl VisitMut for SemanticVisitor {
             }
         }
 
+        // Collapse nested `((expr))` parentheses produced across alternating
+        // strength-reduction cycles (`x * 8` -> `(x << 3)` -> `(x * 8)` -> `(x << 3)`)
+        // so source size remains strictly bounded across arbitrary cycle counts.
+        if let Expr::Paren(outer) = e {
+            if outer.attrs.is_empty() {
+                if let Expr::Paren(inner) = &*outer.expr {
+                    if inner.attrs.is_empty() {
+                        *e = (*outer.expr).clone();
+                    }
+                }
+            }
+        }
+
         if self.flips.polarity {
             if let Expr::If(ei) = e {
                 if invert_branch_polarity(ei) {
@@ -267,10 +280,25 @@ fn unsuffixed_int(e: &Expr) -> Option<u64> {
     None
 }
 
+fn is_tight_for_mul(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Path(_)
+            | Expr::Lit(_)
+            | Expr::Paren(_)
+            | Expr::Call(_)
+            | Expr::MethodCall(_)
+            | Expr::Field(_)
+            | Expr::Index(_)
+            | Expr::Array(_)
+            | Expr::Tuple(_)
+    )
+}
+
 fn strength_reduce(b: &ExprBinary) -> Option<Expr> {
     let left = &b.left;
     match b.op {
-        // x * C  ->  x << log2(C), for C in {2,4,8,16}
+        // x * C  ->  (x << log2(C)), for C in {2,4,8,16}
         BinOp::Mul(_) => {
             let c = unsuffixed_int(&b.right)?;
             let k = match c {
@@ -281,16 +309,20 @@ fn strength_reduce(b: &ExprBinary) -> Option<Expr> {
                 _ => return None,
             };
             let lit = syn::LitInt::new(&k.to_string(), Span::call_site());
-            Some(syn::parse_quote!(#left << #lit))
+            Some(syn::parse_quote!((#left << #lit)))
         }
-        // x << k  ->  x * (1 << k), for k in {1,2,3,4}
+        // x << k  ->  x * (1 << k) (or (x) * (1 << k) when `x` has lower precedence than `*`)
         BinOp::Shl(_) => {
             let k = unsuffixed_int(&b.right)?;
             if !(1..=4).contains(&k) {
                 return None;
             }
             let lit = syn::LitInt::new(&(1u64 << k).to_string(), Span::call_site());
-            Some(syn::parse_quote!(#left * #lit))
+            if is_tight_for_mul(left) {
+                Some(syn::parse_quote!(#left * #lit))
+            } else {
+                Some(syn::parse_quote!((#left) * #lit))
+            }
         }
         _ => None,
     }
@@ -300,16 +332,31 @@ fn strength_reduce(b: &ExprBinary) -> Option<Expr> {
 // (b) branch polarity inversion
 // ---------------------------------------------------------------------------
 
-/// Swap a comparison operator for its inverse. Returns None for
-/// non-comparison operators.
-fn invert_binop(op: &BinOp) -> Option<BinOp> {
-    Some(match op {
+/// True when `e` is syntactically an integer, byte, or char literal (optionally
+/// parenthesized or negated), proving in Rust (which has no implicit int-to-float
+/// coercion) that a comparison with `e` cannot involve `f32`/`f64` `NaN`.
+fn is_non_float_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Lit(el) => matches!(el.lit, Lit::Int(_) | Lit::Byte(_) | Lit::Char(_)),
+        Expr::Paren(p) => is_non_float_literal(&p.expr),
+        Expr::Group(g) => is_non_float_literal(&g.expr),
+        Expr::Unary(u) if matches!(u.op, UnOp::Neg(_)) => is_non_float_literal(&u.expr),
+        _ => false,
+    }
+}
+
+/// Swap a comparison operator for its inverse when total-order / IEEE-754 safe.
+/// Returns `None` for non-comparison operators and for ordered `<, <=, >, >=`
+/// comparisons whose operands might be floating-point (`!(NaN < x) != (NaN >= x)`).
+fn invert_binop(b: &ExprBinary) -> Option<BinOp> {
+    let ordered_safe = is_non_float_literal(&b.left) || is_non_float_literal(&b.right);
+    Some(match b.op {
         BinOp::Eq(_) => BinOp::Ne(Default::default()),
         BinOp::Ne(_) => BinOp::Eq(Default::default()),
-        BinOp::Lt(_) => BinOp::Ge(Default::default()),
-        BinOp::Le(_) => BinOp::Gt(Default::default()),
-        BinOp::Gt(_) => BinOp::Le(Default::default()),
-        BinOp::Ge(_) => BinOp::Lt(Default::default()),
+        BinOp::Lt(_) if ordered_safe => BinOp::Ge(Default::default()),
+        BinOp::Le(_) if ordered_safe => BinOp::Gt(Default::default()),
+        BinOp::Gt(_) if ordered_safe => BinOp::Le(Default::default()),
+        BinOp::Ge(_) if ordered_safe => BinOp::Lt(Default::default()),
         _ => return None,
     })
 }
@@ -333,7 +380,7 @@ fn simple_ident(e: &Expr) -> Option<syn::Ident> {
 fn negate_condition(cond: &Expr) -> Option<Expr> {
     match cond {
         Expr::Binary(b) => {
-            let new_op = invert_binop(&b.op)?;
+            let new_op = invert_binop(b)?;
             let l = &b.left;
             let r = &b.right;
             let mut out: Expr = syn::parse_quote!(#l #new_op #r);
@@ -419,6 +466,69 @@ fn block_contains_break_or_continue(b: &Block) -> bool {
     f.found
 }
 
+fn expr_mentions_ident(e: &Expr, target: &str) -> bool {
+    quote::quote!(#e).to_string().split(|c: char| !c.is_alphanumeric() && c != '_').any(|tok| tok == target)
+}
+
+/// True if `target` is shadowed/rebound in a pattern, assigned/compound-assigned,
+/// `&mut`-borrowed, or referenced inside an opaque macro anywhere in `stmts`.
+fn ident_is_mutated_or_rebound_in_stmts(stmts: &[Stmt], target: &str) -> bool {
+    struct HazardFinder<'a> {
+        target: &'a str,
+        found: bool,
+    }
+    impl<'ast, 'a> syn::visit::Visit<'ast> for HazardFinder<'a> {
+        fn visit_pat_ident(&mut self, pi: &'ast syn::PatIdent) {
+            if pi.ident == self.target {
+                self.found = true;
+            }
+            syn::visit::visit_pat_ident(self, pi);
+        }
+        fn visit_expr_assign(&mut self, ea: &'ast syn::ExprAssign) {
+            if expr_mentions_ident(&ea.left, self.target) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_assign(self, ea);
+        }
+        fn visit_expr_binary(&mut self, b: &'ast ExprBinary) {
+            if crate::is_assign_op(&b.op) && expr_mentions_ident(&b.left, self.target) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_binary(self, b);
+        }
+        fn visit_expr_reference(&mut self, r: &'ast syn::ExprReference) {
+            if r.mutability.is_some() && expr_mentions_ident(&r.expr, self.target) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_reference(self, r);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            let s = m.tokens.to_string();
+            if s.split(|c: char| !c.is_alphanumeric() && c != '_').any(|tok| tok == self.target) {
+                self.found = true;
+            }
+        }
+    }
+    let mut f = HazardFinder {
+        target,
+        found: false,
+    };
+    for s in stmts {
+        syn::visit::Visit::visit_stmt(&mut f, s);
+    }
+    f.found
+}
+
+fn is_pure_invariant_loop_bound(end: &Expr, body_stmts: &[Stmt]) -> bool {
+    match end {
+        Expr::Lit(el) => matches!(el.lit, Lit::Int(_)),
+        _ => match simple_ident(end) {
+            Some(id) => !ident_is_mutated_or_rebound_in_stmts(body_stmts, &id.to_string()),
+            None => false,
+        },
+    }
+}
+
 /// `for i in 0..n { body }` -> `{ let mut i = 0; while i < n { body; i += 1; } }`.
 fn for_to_while(fl: &syn::ExprForLoop) -> Option<Expr> {
     if fl.label.is_some() {
@@ -447,6 +557,12 @@ fn for_to_while(fl: &syn::ExprForLoop) -> Option<Expr> {
         return None;
     }
     if block_contains_break_or_continue(&fl.body) {
+        return None;
+    }
+    if !is_pure_invariant_loop_bound(end, &fl.body.stmts) {
+        return None;
+    }
+    if ident_is_mutated_or_rebound_in_stmts(&fl.body.stmts, &var.to_string()) {
         return None;
     }
     let stmts: Vec<Stmt> = fl.body.stmts.clone();
@@ -544,6 +660,12 @@ fn while_to_for_in_stmts(stmts: &mut Vec<Stmt>) -> bool {
                 return None;
             }
             if block_contains_break_or_continue(&w.body) {
+                return None;
+            }
+            if !is_pure_invariant_loop_bound(&end, body_prefix) {
+                return None;
+            }
+            if ident_is_mutated_or_rebound_in_stmts(body_prefix, &var.to_string()) {
                 return None;
             }
             // The induction variable must not be read after the loop —
@@ -993,5 +1115,98 @@ mod tests {
         let body_pos = out.find("acc = acc . wrapping_add (i * 2)").unwrap();
         let incr_pos = out.find("i += 1").unwrap();
         assert!(body_pos < incr_pos);
+    }
+
+    #[test]
+    fn strength_reduce_preserves_precedence_in_additive_and_bitwise_exprs() {
+        // 1) `a + b * 8` means `a + (b * 8)`. Without parens around the shift result,
+        //    emitting `a + b << 3` parses in Rust as `(a + b) << 3`!
+        // 2) `b * 8 * 3` means `(b * 8) * 3`. Without parens around the shift result,
+        //    emitting `b << 3 * 3` parses in Rust as `b << 9`!
+        // 3) `a + c << 2` means `(a + c) << 2`. Without parens around `#left`,
+        //    emitting `a + c * 4` parses in Rust as `a + (c * 4)`!
+        let src = r#"
+            fn calc(a: u64, b: u64, c: u64) -> u64 {
+                let x = a + b * 8;
+                let z = b * 8 * 3;
+                let y = a + c << 2;
+                x ^ y ^ z
+            }
+        "#;
+        let mut file = make_file(src);
+        let log = apply(&mut file, &Seed::derive(1, "semantic-test"), 100);
+        assert_eq!(log[0].1, LABEL_STRENGTH);
+        let out = emitted(&file);
+        assert!(
+            out.contains("a + (b << 3)"),
+            "expected parenthesized `a + (b << 3)`, got: {out}"
+        );
+        assert!(
+            out.contains("(b << 3) * 3"),
+            "expected parenthesized `(b << 3) * 3`, got: {out}"
+        );
+        assert!(
+            out.contains("(a + c) * 4"),
+            "expected parenthesized `(a + c) * 4`, got: {out}"
+        );
+        let _: File = syn::parse_str(&out).expect("output must reparse");
+    }
+
+    #[test]
+    fn for_to_while_refuses_shadowed_induction_var_and_mutated_or_impure_bound() {
+        let src = r#"
+            fn shadowed(n: usize) -> usize {
+                let mut acc = 0usize;
+                for i in 0..n {
+                    let mut i = 10usize;
+                    i += 1;
+                    acc += i;
+                }
+                acc
+            }
+            fn mutated_end(mut n: usize) -> usize {
+                let mut acc = 0usize;
+                for i in 0..n {
+                    n = n.saturating_sub(1);
+                    acc += i;
+                }
+                acc
+            }
+            fn impure_end(v: &[u8]) -> usize {
+                let mut acc = 0usize;
+                for i in 0..v.len() {
+                    acc += i;
+                }
+                acc
+            }
+        "#;
+        let mut file = make_file(src);
+        let seed = Seed::derive(1, "semantic-test");
+        apply(&mut file, &seed, 100);
+        let out = emitted(&file);
+        assert!(
+            !out.contains("while i <"),
+            "unsafe for->while rewrite fired on shadowed/mutated/impure loop: {out}"
+        );
+    }
+
+    #[test]
+    fn branch_polarity_refuses_ordered_comparison_on_potential_floats() {
+        let src = r#"
+            fn fcmp_vars(a: f64, b: f64) -> u64 {
+                if a < b { 1 } else { 2 }
+            }
+            fn fcmp_lit(a: f64) -> u64 {
+                if a < 0.0 { 1 } else { 2 }
+            }
+        "#;
+        let mut file = make_file(src);
+        let seed = Seed::derive(1, "semantic-test");
+        apply(&mut file, &seed, 100);
+        let out = emitted(&file);
+        assert!(
+            !out.contains(">="),
+            "NaN-unsafe `<` -> `>=` inversion fired on potential float comparison: {out}"
+        );
     }
 }

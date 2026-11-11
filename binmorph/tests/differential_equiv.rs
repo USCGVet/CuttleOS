@@ -1107,9 +1107,13 @@ fn execute_function_with_ro(
                     if bits == 64 {
                         state.regs[0] = prod as u64;
                         state.regs[2] = (prod >> 64) as u64;
+                        state.cf = prod != ((state.regs[0] as i64) as i128);
+                        state.of = state.cf;
                     } else if bits == 32 {
                         state.regs[0] = (prod as u64) & 0xFFFF_FFFF;
                         state.regs[2] = ((prod >> 32) as u64) & 0xFFFF_FFFF;
+                        state.cf = prod != (((state.regs[0] as u32) as i32) as i128);
+                        state.of = state.cf;
                     } else {
                         return Err(VmFault::UnsupportedInstruction(
                             insn.code(),

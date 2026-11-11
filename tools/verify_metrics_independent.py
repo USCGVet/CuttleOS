@@ -563,18 +563,38 @@ def build_synthetic_elf64_specimen() -> bytes:
     return bytes(elf)
 
 
+def _latest_binmorph_source_mtime(repo_root: Path) -> float:
+    bm_dir = repo_root / "binmorph"
+    mtimes: List[float] = []
+    manifest = bm_dir / "Cargo.toml"
+    if manifest.exists():
+        mtimes.append(manifest.stat().st_mtime)
+    src_dir = bm_dir / "src"
+    if src_dir.is_dir():
+        for rs in src_dir.rglob("*.rs"):
+            mtimes.append(rs.stat().st_mtime)
+    return max(mtimes) if mtimes else 0.0
+
+
 def find_binmorph_cmd(repo_root: Path) -> List[str]:
     env_bin = os.environ.get("CARGO_BIN_EXE_binmorph")
     if env_bin and Path(env_bin).exists():
         return [env_bin]
+    latest_src_mtime = _latest_binmorph_source_mtime(repo_root)
     exe_suffix = ".exe" if os.name == "nt" else ""
+    fresh_candidates: List[Tuple[float, Path]] = []
     for rel in [
         Path("target") / "debug" / f"binmorph{exe_suffix}",
         Path("target") / "release" / f"binmorph{exe_suffix}",
     ]:
         cand = repo_root / rel
         if cand.exists():
-            return [str(cand)]
+            cand_mtime = cand.stat().st_mtime
+            if cand_mtime >= latest_src_mtime:
+                fresh_candidates.append((cand_mtime, cand))
+    if fresh_candidates:
+        fresh_candidates.sort(key=lambda pair: pair[0], reverse=True)
+        return [str(fresh_candidates[0][1])]
     return ["cargo", "run", "--quiet", "-p", "cuttle-binmorph", "--"]
 
 
@@ -591,6 +611,29 @@ def run_self_test(repo_root: Path, allow_missing_kernel: bool = False) -> int:
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
+            # Regression check: stale `target/debug/binmorph(.exe)` older than `binmorph/src/lib.rs`
+            # must be skipped in favor of `cargo run` (or a fresher binary).
+            fake_repo = tmp_dir / "fake_repo"
+            (fake_repo / "binmorph" / "src").mkdir(parents=True)
+            (fake_repo / "target" / "debug").mkdir(parents=True)
+            exe_suffix = ".exe" if os.name == "nt" else ""
+            stale_bin = fake_repo / "target" / "debug" / f"binmorph{exe_suffix}"
+            fresh_src = fake_repo / "binmorph" / "src" / "lib.rs"
+            stale_bin.write_bytes(b"stale")
+            fresh_src.write_text("// newer source\n", encoding="utf-8")
+            os.utime(stale_bin, (1000.0, 1000.0))
+            os.utime(fresh_src, (2000.0, 2000.0))
+            saved_env = os.environ.pop("CARGO_BIN_EXE_binmorph", None)
+            try:
+                stale_res = find_binmorph_cmd(fake_repo)
+                _require(
+                    stale_res[0] == "cargo",
+                    f"expected stale binmorph binary to fall back to cargo run, got {stale_res}",
+                )
+            finally:
+                if saved_env is not None:
+                    os.environ["CARGO_BIN_EXE_binmorph"] = saved_env
+
             base_path = tmp_dir / "base_specimen.elf"
             base_bytes = build_synthetic_elf64_specimen()
             base_path.write_bytes(base_bytes)

@@ -293,6 +293,7 @@ pub fn diversify_with_log_and_options(
     if !filtered_rename_map.is_empty() {
         RenamePrivateFns {
             map: &filtered_rename_map,
+            mod_depth: 0,
         }
         .visit_file_mut(&mut file);
     }
@@ -469,17 +470,82 @@ fn strip_prior_cycle_inline_attrs(file: &mut File) {
     }
 }
 
+fn collect_shadow_or_use_idents_in_file(file: &File) -> HashSet<String> {
+    struct ShadowCollector {
+        blocked: HashSet<String>,
+        item_depth: usize,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for ShadowCollector {
+        fn visit_use_name(&mut self, u: &'ast syn::UseName) {
+            self.blocked.insert(u.ident.to_string());
+        }
+        fn visit_use_rename(&mut self, u: &'ast syn::UseRename) {
+            self.blocked.insert(u.ident.to_string());
+            self.blocked.insert(u.rename.to_string());
+        }
+        fn visit_pat_ident(&mut self, pi: &'ast syn::PatIdent) {
+            self.blocked.insert(pi.ident.to_string());
+            syn::visit::visit_pat_ident(self, pi);
+        }
+        fn visit_item(&mut self, it: &'ast Item) {
+            if self.item_depth > 0 {
+                match it {
+                    Item::Fn(f) => {
+                        self.blocked.insert(f.sig.ident.to_string());
+                    }
+                    Item::Const(c) => {
+                        self.blocked.insert(c.ident.to_string());
+                    }
+                    Item::Static(s) => {
+                        self.blocked.insert(s.ident.to_string());
+                    }
+                    _ => {}
+                }
+            } else {
+                match it {
+                    Item::Const(c) => {
+                        self.blocked.insert(c.ident.to_string());
+                    }
+                    Item::Static(s) => {
+                        self.blocked.insert(s.ident.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            self.item_depth += 1;
+            syn::visit::visit_item(self, it);
+            self.item_depth -= 1;
+        }
+    }
+    let mut sc = ShadowCollector {
+        blocked: HashSet::new(),
+        item_depth: 0,
+    };
+    syn::visit::Visit::visit_file(&mut sc, file);
+    sc.blocked
+}
+
+fn fn_has_symbol_pinning_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| {
+        let s = quote::quote!(#a).to_string();
+        s.contains("no_mangle") || s.contains("export_name") || s.contains("link_name")
+    })
+}
+
 fn build_private_fn_rename_map(file: &File, rng: &mut ChaCha20Rng) -> BTreeMap<String, String> {
     let suffix = derive_suffix(rng, "m");
+    let blocked = collect_shadow_or_use_idents_in_file(file);
 
     let mut map = BTreeMap::new();
     for it in &file.items {
         if let Item::Fn(f) = it {
-            if matches!(f.vis, Visibility::Inherited) {
+            if matches!(f.vis, Visibility::Inherited)
+                && f.sig.abi.is_none()
+                && !fn_has_symbol_pinning_attr(&f.attrs)
+            {
                 let original = f.sig.ident.to_string();
-                // Skip `main` — even in a no_std lib it's a magic name,
-                // and renaming it would break any test/main binary.
-                if original == "main" {
+                // Skip `main` and any identifier shadowed by a local/param/`use`/const/static.
+                if original == "main" || blocked.contains(&original) {
                     continue;
                 }
                 let base = strip_cuttle_fn_suffix(&original);
@@ -493,21 +559,68 @@ fn build_private_fn_rename_map(file: &File, rng: &mut ChaCha20Rng) -> BTreeMap<S
 
 struct RenamePrivateFns<'a> {
     map: &'a BTreeMap<String, String>,
+    mod_depth: usize,
 }
 
 impl<'a> VisitMut for RenamePrivateFns<'a> {
-    fn visit_ident_mut(&mut self, id: &mut Ident) {
-        if let Some(new) = self.map.get(&id.to_string()) {
-            *id = Ident::new(new, Span::call_site());
+    fn visit_file_mut(&mut self, f: &mut File) {
+        // 1. Rename declarations ONLY on top-level `Item::Fn` definitions
+        //    (never struct fields, impl methods, trait items, or `use` trees).
+        for it in &mut f.items {
+            if let Item::Fn(func) = it {
+                if let Some(new) = self.map.get(&func.sig.ident.to_string()) {
+                    func.sig.ident = Ident::new(new, Span::call_site());
+                }
+            }
+        }
+        syn::visit_mut::visit_file_mut(self, f);
+    }
+
+    fn visit_item_mod_mut(&mut self, m: &mut syn::ItemMod) {
+        self.mod_depth += 1;
+        syn::visit_mut::visit_item_mod_mut(self, m);
+        self.mod_depth -= 1;
+    }
+
+    fn visit_field_value_mut(&mut self, fv: &mut syn::FieldValue) {
+        // Expand struct shorthand `S { foo }` -> `S { foo: foo_m... }` if `foo`
+        // is a renamed private function value so the struct field name `foo` is preserved.
+        if fv.colon_token.is_none() {
+            if let Expr::Path(ep) = &fv.expr {
+                if ep.qself.is_none() && ep.path.leading_colon.is_none() && ep.path.segments.len() == 1 {
+                    if self.map.contains_key(&ep.path.segments[0].ident.to_string()) {
+                        fv.colon_token = Some(Default::default());
+                    }
+                }
+            }
+        }
+        syn::visit_mut::visit_field_value_mut(self, fv);
+    }
+
+    fn visit_expr_path_mut(&mut self, ep: &mut syn::ExprPath) {
+        syn::visit_mut::visit_expr_path_mut(self, ep);
+        if ep.qself.is_some() || ep.path.leading_colon.is_some() {
+            return;
+        }
+        let segs = &mut ep.path.segments;
+        if segs.len() == 1 {
+            if let Some(new) = self.map.get(&segs[0].ident.to_string()) {
+                segs[0].ident = Ident::new(new, Span::call_site());
+            }
+        } else if segs.len() == 2 && self.mod_depth == 0 && segs[0].ident == "self" {
+            if let Some(new) = self.map.get(&segs[1].ident.to_string()) {
+                segs[1].ident = Ident::new(new, Span::call_site());
+            }
+        } else if segs.len() == 2 && self.mod_depth == 1 && segs[0].ident == "super" {
+            if let Some(new) = self.map.get(&segs[1].ident.to_string()) {
+                segs[1].ident = Ident::new(new, Span::call_site());
+            }
         }
     }
 
     fn visit_macro_mut(&mut self, _m: &mut Macro) {
         // Macro tokens are not yet Rust; we cannot safely rename inside
         // them without understanding the macro's grammar. Skip entirely.
-        // (Side effect: a private fn referenced ONLY from inside a macro
-        // body would be missed. Today's target_minimal does not do that;
-        // production manifests would flag any module that does.)
     }
 }
 
@@ -1662,6 +1775,19 @@ fn walk_expr_names(e: &Expr, n: &mut NameSets, in_lhs: bool) {
                 } else {
                     n.reads.insert(name);
                 }
+            } else {
+                // Multi-segment or qualified path (e.g. `self::GLOBAL_A`, `crate::STATE`, `<T>::ASSOC`).
+                if ep.qself.is_some() || in_lhs {
+                    n.has_side_effect = true;
+                }
+                if let Some(last) = ep.path.segments.last() {
+                    let key = last.ident.to_string();
+                    if in_lhs {
+                        n.writes.insert(key);
+                    } else {
+                        n.reads.insert(key);
+                    }
+                }
             }
         }
         Expr::Assign(ea) => {
@@ -1684,10 +1810,27 @@ fn walk_expr_names(e: &Expr, n: &mut NameSets, in_lhs: bool) {
                 walk_expr_names(&b.right, n, false);
             }
         }
-        Expr::Unary(u) => walk_expr_names(&u.expr, n, false),
+        Expr::Unary(u) => {
+            if matches!(u.op, syn::UnOp::Deref(_)) {
+                // Pointer or reference dereference (`*ptr`, `*r`) can alias
+                // arbitrary locals, statics, or MMIO registers; never reorder across it.
+                n.has_side_effect = true;
+            }
+            walk_expr_names(&u.expr, n, in_lhs);
+        }
         Expr::Paren(p) => walk_expr_names(&p.expr, n, in_lhs),
         Expr::Group(g) => walk_expr_names(&g.expr, n, in_lhs),
-        Expr::Reference(r) => walk_expr_names(&r.expr, n, in_lhs),
+        Expr::Reference(r) => {
+            if r.mutability.is_some() {
+                // Creating `&mut expr` establishes an exclusive mutable borrow
+                // whose lifetime and alias target must not be reordered across siblings.
+                n.has_side_effect = true;
+                walk_expr_names(&r.expr, n, true);
+                walk_expr_names(&r.expr, n, false);
+            } else {
+                walk_expr_names(&r.expr, n, in_lhs);
+            }
+        }
         Expr::Cast(c) => walk_expr_names(&c.expr, n, false),
         Expr::Tuple(t) => t.elems.iter().for_each(|e| walk_expr_names(e, n, in_lhs)),
         Expr::Array(a) => a.elems.iter().for_each(|e| walk_expr_names(e, n, false)),
@@ -3484,5 +3627,83 @@ mod tests {
         for bad in ["", "fn (", "pub struct { 123 }", "unsafe fn x() { let a = ; }"] {
             let _ = diversify_with_log(bad, &Seed::derive(1, "bad"));
         }
+    }
+
+    #[test]
+    fn reorder_stmts_never_reorders_pointer_deref_writes_mut_borrows_or_path_statics() {
+        let s_ptr_w: Stmt = syn::parse_quote!(*ptr = 1;);
+        let s_ptr_r: Stmt = syn::parse_quote!(let v = *ptr;);
+        assert!(
+            !are_independent(&s_ptr_w, &s_ptr_r),
+            "pointer deref write `*ptr = 1` must NOT be independent of `let v = *ptr`"
+        );
+
+        let s_borrow: Stmt = syn::parse_quote!(let r = &mut x;);
+        let s_read_x: Stmt = syn::parse_quote!(let y = x;);
+        assert!(
+            !are_independent(&s_borrow, &s_read_x),
+            "`let r = &mut x;` must NOT be reordered across `let y = x;`"
+        );
+
+        let s_deref_r: Stmt = syn::parse_quote!(*r = 10;);
+        assert!(
+            !are_independent(&s_deref_r, &s_read_x),
+            "`*r = 10;` must NOT be reordered across `let y = x;` due to potential `&mut` alias"
+        );
+
+        let s_path_a: Stmt = syn::parse_quote!(let a = self::GLOBAL_A;);
+        let s_path_b: Stmt = syn::parse_quote!(self::GLOBAL_A = 2;);
+        assert!(
+            !are_independent(&s_path_a, &s_path_b),
+            "multi-segment path write `self::GLOBAL_A = 2` must NOT be reordered across read"
+        );
+    }
+
+    #[test]
+    fn rename_private_fns_preserves_struct_fields_method_calls_impl_fns_and_imports() {
+        let src = r#"
+            use core::cmp::min;
+
+            pub struct PacketHdr {
+                pub state: u64,
+                pub len: usize,
+            }
+
+            impl PacketHdr {
+                pub fn state(&self) -> u64 {
+                    self.state
+                }
+                pub fn len(&self) -> usize {
+                    min(self.len, 64)
+                }
+            }
+
+            fn state(v: u64) -> u64 {
+                v + 1
+            }
+
+            fn len(h: &PacketHdr) -> usize {
+                let s = state(h.state);
+                h.len() + (s as usize)
+            }
+
+            pub fn entry(h: &PacketHdr) -> usize {
+                len(h) + h.state() as usize
+            }
+        "#;
+        let (out, _log) = diversify_with_log(src, &Seed::derive(42, "rename_scope")).unwrap();
+        let norm = out.replace(' ', "");
+        assert!(norm.contains("pubstate:u64"), "struct field `state` was corrupted: {out}");
+        assert!(norm.contains("publen:usize"), "struct field `len` was corrupted: {out}");
+        assert!(norm.contains("pubfnstate("), "impl method `pub fn state` was corrupted: {out}");
+        assert!(norm.contains("pubfnlen("), "impl method `pub fn len` was corrupted: {out}");
+        assert!(norm.contains(".state"), "field/method access `.state` was corrupted: {out}");
+        assert!(norm.contains(".len()"), "method call `.len()` was corrupted: {out}");
+        assert!(norm.contains("usecore::cmp::min;"), "use import was corrupted: {out}");
+        // Meanwhile private free functions `state` and `len` SHOULD be renamed!
+        assert!(
+            out.contains("state_m") && out.contains("len_m"),
+            "private free functions must still be renamed and called by their new names: {out}"
+        );
     }
 }

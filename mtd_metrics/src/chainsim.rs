@@ -168,16 +168,15 @@ fn evaluate_chain_with_kinds(
         if variant.by_offset.get(off) == Some(gadget_text) {
             out.positional_hits += 1;
         }
-        // Byte-exact step: the gadget's byte span is unchanged.
+        // Byte-exact step: the gadget's exact decoded byte span (up to and including
+        // its terminating `ret` / indirect `call` / indirect `jmp`) is unchanged.
         let start = *off as usize;
-        // Gadget byte length: re-derive from the base image by decoding
-        // is overkill; use the span to the next known base gadget offset
-        // or a fixed 15-byte max-instruction window clipped to .text.
-        let end = (start + 15).min(base_text.len());
         if start < base_text.len() && start < variant_text.len() {
-            let b = &base_text[start..end.min(base_text.len())];
+            let span_len = exact_gadget_byte_len(&base_text[start..], DEFAULT_MAX_INSTRS);
+            let end = (start + span_len).min(base_text.len());
+            let b = &base_text[start..end];
             let v_end = (start + b.len()).min(variant_text.len());
-            if v_end == start + b.len() && &variant_text[start..v_end] == b {
+            if !b.is_empty() && v_end == start + b.len() && &variant_text[start..v_end] == b {
                 out.byte_hits += 1;
             }
         }
@@ -191,6 +190,28 @@ fn evaluate_chain_with_kinds(
         }
     }
     out
+}
+
+fn exact_gadget_byte_len(slice: &[u8], max_instrs: usize) -> usize {
+    use iced_x86::{Code, Decoder, DecoderOptions, FlowControl};
+    let cap = slice.len().min((max_instrs + 1) * 15);
+    let mut dec = Decoder::with_ip(64, &slice[..cap], 0, DecoderOptions::NONE);
+    for _ in 0..=max_instrs {
+        if !dec.can_decode() {
+            break;
+        }
+        let ins = dec.decode();
+        if ins.code() == Code::INVALID {
+            break;
+        }
+        if matches!(
+            ins.flow_control(),
+            FlowControl::Return | FlowControl::IndirectBranch | FlowControl::IndirectCall
+        ) {
+            return dec.position();
+        }
+    }
+    slice.len().min(15)
 }
 
 /// Aggregate result of firing `chains` synthesized chains at one variant.
@@ -697,6 +718,25 @@ mod dataflow_tests {
         assert_eq!(morph_rep.static_dataflow_viable, 0);
         assert!(morph_rep.mean_step_dataflow_survival < 0.5);
         assert!(!morph_rep.relocated_pool_satisfiable);
+    }
+
+    #[test]
+    fn byte_hits_measures_exact_gadget_span_not_following_function_bytes() {
+        // Offset 0..2 is `pop rdi; ret` (`5F C3`), identical in both base and variant.
+        // Offset 2..6 is a separate subsequent instruction (`48 89 D8 C3` vs `48 8D 03 C3`).
+        let base_bytes = [0x5F, 0xC3, 0x48, 0x89, 0xD8, 0xC3];
+        let variant_bytes = [0x5F, 0xC3, 0x48, 0x8D, 0x03, 0xC3];
+        let base_gs = extract_gadgets(&base_bytes, 0x1000, DEFAULT_MAX_INSTRS);
+        let variant_gs = extract_gadgets(&variant_bytes, 0x1000, DEFAULT_MAX_INSTRS);
+        let chain = Chain {
+            gadget_offsets: vec![0],
+        };
+        let out = evaluate_chain(&chain, &base_gs, &variant_gs, &base_bytes, &variant_bytes);
+        assert_eq!(out.positional_hits, 1);
+        assert_eq!(
+            out.byte_hits, 1,
+            "`pop rdi; ret` at offset 0..2 is byte-identical (`5F C3`); bytes past `ret` must not poison `byte_hits`"
+        );
     }
 }
 

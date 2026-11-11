@@ -1246,6 +1246,13 @@ fn verify_family_push_pop_discipline(
     true
 }
 
+#[inline]
+fn is_near_sysv_ret(ins: &Instruction) -> bool {
+    ins.flow_control() == iced_x86::FlowControl::Return
+        && ins.mnemonic() == Mnemonic::Ret
+        && ins.op_count() == 0
+}
+
 /// Sound whole-function callee-saved register family swap (`fam_a <-> fam_b`,
 /// covering `64/32/16/8`-bit sub-registers) with strict control-flow and
 /// prologue/epilogue verification.
@@ -1275,7 +1282,8 @@ pub fn try_swap_callee_saved_family(
             return false;
         }
         match instr.flow_control() {
-            FlowControl::Next | FlowControl::Return | FlowControl::Call | FlowControl::IndirectCall => {}
+            FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {}
+            FlowControl::Return if is_near_sysv_ret(&instr) => {}
             FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
                 match instr.op0_kind() {
                     OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
@@ -1520,7 +1528,8 @@ fn pass_leaf_scratch_reg_swap(code: &mut [u8], base_ip: u64, prng: &mut Prng, st
             return;
         }
         match instr.flow_control() {
-            FlowControl::Next | FlowControl::Return => {}
+            FlowControl::Next => {}
+            FlowControl::Return if is_near_sysv_ret(&instr) => {}
             FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
                 match instr.op0_kind() {
                     OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
@@ -1544,7 +1553,7 @@ fn pass_leaf_scratch_reg_swap(code: &mut [u8], base_ip: u64, prng: &mut Prng, st
     let Some(last) = instrs.last() else {
         return;
     };
-    if last.flow_control() != FlowControl::Return {
+    if !is_near_sysv_ret(last) {
         return;
     }
 
@@ -1686,7 +1695,8 @@ fn pass_return_block_scratch_swap(code: &mut [u8], base_ip: u64, prng: &mut Prng
             return;
         }
         match instr.flow_control() {
-            FlowControl::Next | FlowControl::Return | FlowControl::Call | FlowControl::IndirectCall => {}
+            FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {}
+            FlowControl::Return if is_near_sysv_ret(&instr) => {}
             FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
                 match instr.op0_kind() {
                     OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
@@ -1869,7 +1879,8 @@ fn pass_prologue_epilogue_perm(code: &mut [u8], base_ip: u64, prng: &mut Prng, s
             return;
         }
         match instr.flow_control() {
-            FlowControl::Next | FlowControl::Return | FlowControl::Call | FlowControl::IndirectCall => {}
+            FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {}
+            FlowControl::Return if is_near_sysv_ret(&instr) => {}
             FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
                 match instr.op0_kind() {
                     OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
@@ -2237,7 +2248,8 @@ fn pass_schedule_commute(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: 
             return;
         }
         match instr.flow_control() {
-            FlowControl::Next | FlowControl::Return | FlowControl::Call | FlowControl::IndirectCall => {}
+            FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {}
+            FlowControl::Return if is_near_sysv_ret(&instr) => {}
             FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
                 match instr.op0_kind() {
                     OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
@@ -2354,10 +2366,12 @@ fn try_encode_same_len(alt: &Instruction, instr: &Instruction) -> Option<Vec<u8>
 #[inline]
 fn is_flag_killer_instr(ins: &Instruction, branch_targets: &[u64]) -> bool {
     use iced_x86::FlowControl;
-    if matches!(
-        ins.flow_control(),
-        FlowControl::Return | FlowControl::Call | FlowControl::IndirectCall
-    ) || ins.mnemonic() == Mnemonic::Ud2
+    if is_near_sysv_ret(ins)
+        || matches!(
+            ins.flow_control(),
+            FlowControl::Call | FlowControl::IndirectCall
+        )
+        || ins.mnemonic() == Mnemonic::Ud2
         || (ins.flow_control() == FlowControl::UnconditionalBranch
             && matches!(
                 ins.op0_kind(),
@@ -2669,7 +2683,43 @@ fn multi_instr_imm_load_alts(instr: &Instruction, dead_flags: bool) -> Vec<Vec<u
     use iced_x86::Register;
 
     let mut out = Vec::new();
-    if !dead_flags || instr.op0_kind() != OpKind::Register {
+    if instr.op0_kind() != OpKind::Register {
+        return out;
+    }
+
+    // Flag-preserving `7`-byte `mov r64, imm32` (`imm >= 0`) -> `mov r32, imm.swap_bytes(); bswap r32`
+    // (`5 + 2 = 7` bytes) for `{RAX (0F C8), RCX (0F C9), RBP (0F CD), RSI (0F CE)}`
+    // (strictly excluding `EDX/EBX/EDI` whose `0F CA/CB/CF` opcodes contain `retf`/`iret` bytes!).
+    if instr.code() == Code::Mov_rm64_imm32 && instr.len() == 7 {
+        let r64 = instr.op0_register();
+        let imm_u32 = instr.immediate32();
+        if (imm_u32 & 0x8000_0000) == 0 && imm_u32 != 0 {
+            let bswap_reg_idx = match r64 {
+                Register::RAX => Some(0u8),
+                Register::RCX => Some(1u8),
+                Register::RBP => Some(5u8),
+                Register::RSI => Some(6u8),
+                _ => None,
+            };
+            if let Some(reg_idx) = bswap_reg_idx {
+                let swapped_le = imm_u32.swap_bytes().to_le_bytes();
+                let cand = vec![
+                    0xB8 | reg_idx,
+                    swapped_le[0],
+                    swapped_le[1],
+                    swapped_le[2],
+                    swapped_le[3],
+                    0x0F,
+                    0xC8 | reg_idx,
+                ];
+                if !has_ret_opcode_byte(&cand) {
+                    out.push(cand);
+                }
+            }
+        }
+    }
+
+    if !dead_flags {
         return out;
     }
 
@@ -2749,9 +2799,16 @@ fn multi_instr_imm_load_alts(instr: &Instruction, dead_flags: bool) -> Vec<Vec<u
         let r32 = instr.op0_register();
         if let Some(fam) = upper_reg_family(r32) {
             if r32 == fam.r32 {
-                let imm = instr.immediate32() as i32;
+                let imm_u32 = instr.immediate32();
+                let imm = imm_u32 as i32;
                 let reg_low = (gp_reg_index(r32).unwrap_or(8) & 7) as u8;
                 let modrm_self = 0xC0 | (reg_low << 3) | reg_low;
+                if (1..=255).contains(&imm_u32) {
+                    let b = imm_u32 as u8;
+                    // `xor/sub rXd, rXd` (3B) + `mov rXb, imm8` (`41 B0+r imm8`, 3B) = 6B!
+                    out.push(vec![0x45, 0x31, modrm_self, 0x41, 0xB0 | reg_low, b]);
+                    out.push(vec![0x45, 0x29, modrm_self, 0x41, 0xB0 | reg_low, b]);
+                }
                 if imm == 1 && reg_low != 2 && reg_low != 3 {
                     out.push(vec![0x45, 0x31, modrm_self, 0x41, 0xFF, 0xC0 | reg_low]);
                     out.push(vec![0x45, 0x29, modrm_self, 0x41, 0xFF, 0xC0 | reg_low]);
@@ -2766,7 +2823,19 @@ fn multi_instr_imm_load_alts(instr: &Instruction, dead_flags: bool) -> Vec<Vec<u
         if r64 == Register::RSP || gp_reg_index(r64).is_none() {
             return out;
         }
-        let imm = instr.immediate32() as i32;
+        let imm_u32 = instr.immediate32();
+        let imm = imm_u32 as i32;
+        if r64 == Register::RAX && imm >= 0 && imm != 0 {
+            // `mov eax, imm32 ^ k; xor al, k` (`5 + 2 = 7` bytes) — blinds immediate constants
+            // in RAX and scrubs embedded `0xC3/0xCF/0xCB/0xCA` bytes in the low immediate byte!
+            for k in [0x5Au8, 0xA5, 0x3C, 0x69] {
+                let blinded = (imm_u32 ^ (k as u32)).to_le_bytes();
+                let cand = vec![0xB8, blinded[0], blinded[1], blinded[2], blinded[3], 0x34, k];
+                if !has_ret_opcode_byte(&cand) {
+                    out.push(cand);
+                }
+            }
+        }
         if !(-127..=127).contains(&imm) || imm == 0 {
             return out;
         }
@@ -3201,9 +3270,9 @@ fn pass_cross_width_pair_morph(
         }
         match instr.flow_control() {
             FlowControl::Next
-            | FlowControl::Return
             | FlowControl::Call
             | FlowControl::IndirectCall => {}
+            FlowControl::Return if is_near_sysv_ret(&instr) => {}
             FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
                 match instr.op0_kind() {
                     OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
@@ -3307,7 +3376,7 @@ fn pass_cross_width_pair_morph(
             let pos_i = positions[i];
             let total_len = new_window.len();
             let orig_window = &original[pos_i..pos_i + total_len];
-            if has_ret_opcode_byte(orig_window) || prng.coin() {
+            if has_ret_opcode_byte(orig_window) || ((prng.next_u64() & 0b111) != 0) {
                 code[pos_i..pos_i + total_len].copy_from_slice(&new_window);
                 stats.candidates += 1;
                 stats.swapped += 1;
@@ -3513,21 +3582,28 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
     let mut instrs: Vec<Instruction> = Vec::new();
     let mut positions: Vec<usize> = Vec::new();
     let mut branch_targets: Vec<u64> = Vec::new();
+    let mut backward_loops: Vec<(u64, u64)> = Vec::new();
     let mut allow_liveness = true;
 
     while decoder.can_decode() {
         let pos = decoder.position();
         let instr = decoder.decode();
         if instr.code() == Code::INVALID {
-            break;
+            return;
         }
         match instr.flow_control() {
+            FlowControl::Return if !is_near_sysv_ret(&instr) => {
+                allow_liveness = false;
+            }
             FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
                 match instr.op0_kind() {
                     OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
                         let t = instr.near_branch_target();
                         if t >= base_ip && t < end_ip {
                             branch_targets.push(t);
+                            if t <= instr.ip() {
+                                backward_loops.push((t, instr.ip()));
+                            }
                         } else if instr.flow_control() != FlowControl::UnconditionalBranch {
                             allow_liveness = false;
                         }
@@ -3535,7 +3611,7 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
                     _ => allow_liveness = false,
                 }
             }
-            FlowControl::IndirectBranch => allow_liveness = false,
+            FlowControl::IndirectBranch | FlowControl::Interrupt => allow_liveness = false,
             _ => {}
         }
         positions.push(pos);
@@ -3546,11 +3622,16 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
         let pos = positions[idx];
         stats.instrs += 1;
         let ilen = instr.len();
+        let in_backward_loop = backward_loops
+            .iter()
+            .any(|&(lo, hi)| instr.ip() >= lo && instr.ip() <= hi);
         let dead_flags = allow_liveness && flags_are_dead(&instrs, &branch_targets, idx);
         let cf_af_dead =
             allow_liveness && (dead_flags || cf_af_are_dead(&instrs, &branch_targets, idx));
         let upper32_zero = allow_liveness && prev_instr_zeroed_upper32(&instrs, &branch_targets, idx);
-        let src_reg_dead = allow_liveness && src_reg_is_dead_after(&instrs, &branch_targets, idx);
+        let src_reg_dead = allow_liveness
+            && !in_backward_loop
+            && src_reg_is_dead_after(&instrs, &branch_targets, idx);
 
         let orig_bytes = &original[pos..pos + ilen];
         let mut alts: Vec<(Vec<u8>, bool)> = Vec::new();
@@ -3588,7 +3669,7 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
         // Unintended `0xC3/0xC2/0xCB/0xCA/0xCF` (`ret`/`iret`) and `0xFF /2../5`
         // (`call/jmp r/m64`) bytes are free ROP/JOP gadgets: always scrub them
         // (100% probability); otherwise flip on the seeded coin.
-        if !orig_has_ret && (draw & 1 == 0) {
+        if !orig_has_ret && ((draw & 0b111) == 0) {
             continue;
         }
 
@@ -4554,6 +4635,102 @@ mod tests {
             assert!(count_c3_cf_bytes(&code) <= orig_c3);
             assert!(count_ret_family_bytes(&code) <= orig_ret);
         }
+    }
+
+    #[test]
+    fn retfq_and_iretq_are_not_treated_as_sysv_function_returns() {
+        // 1) `add eax, 1; retfq` (`83 C0 01 48 CB`):
+        //    `retfq` does NOT kill CPU arithmetic flags (it reloads CS:RIP inside a Ring-0 routine!),
+        //    so `is_flag_killer_instr` must NOT treat `retfq` as killing flags and must NOT rewrite
+        //    `add eax, 1` (`83 C0 01`) into flag-preserving `lea eax, [rax + 1]` (`8D 40 01`)!
+        let add_before_retfq: [u8; 5] = [
+            0x83, 0xC0, 0x01, // add eax, 1 (sets ZF/CF/OF/SF/PF/AF!)
+            0x48, 0xCB,       // retfq (does NOT pop RFLAGS; target may branch on flags!)
+        ];
+        for seed in 0..128u64 {
+            let mut buf = add_before_retfq.to_vec();
+            let mut prng = Prng::new(seed);
+            let mut stats = Stats::default();
+            pass_reg_reg_morph(&mut buf, 0x1000, &mut prng, &mut stats);
+            assert_ne!(
+                &buf[0..3],
+                &[0x8D, 0x40, 0x01],
+                "seed {seed}: `add eax, 1` before `retfq` was unsoundly turned into `lea eax, [rax+1]`, dropping flag writes!"
+            );
+        }
+
+        // 2) `mov r8d, 1; add r8d, 2; retfq` (`41 B8 01 00 00 00 41 83 C0 02 48 CB`):
+        //    `pass_leaf_scratch_reg_swap` must NOT treat `retfq` as a SysV leaf return, because
+        //    `r9`/`r10`/`r11` can hold live inline-asm inputs across `retfq` (`banners_arch_platform.rs:395`)!
+        let r8_before_retfq: [u8; 12] = [
+            0x41, 0xB8, 0x01, 0x00, 0x00, 0x00, // mov r8d, 1
+            0x41, 0x83, 0xC0, 0x02,             // add r8d, 2
+            0x48, 0xCB,                         // retfq
+        ];
+        for seed in 0..64u64 {
+            let mut buf = r8_before_retfq.to_vec();
+            let mut prng = Prng::new(seed);
+            let mut stats = Stats::default();
+            pass_leaf_scratch_reg_swap(&mut buf, 0x1000, &mut prng, &mut stats);
+            assert_eq!(
+                buf, r8_before_retfq,
+                "seed {seed}: pass_leaf_scratch_reg_swap renamed r8 into a live r9..r11 register across `retfq`!"
+            );
+        }
+    }
+
+    #[test]
+    fn pass_reg_reg_morph_aborts_on_invalid_instruction_bytes() {
+        // `add eax, 1` (`83 C0 01`) followed by invalid 64-bit opcode `0x06` (`push es` = INVALID in x86-64)
+        // and a backward jump that was hidden behind the invalid byte: Pass 7 must bail out
+        // rather than running dead-flag/liveness transforms on a truncated CFG.
+        let orig: [u8; 6] = [
+            0x83, 0xC0, 0x01, // add eax, 1
+            0xC3,             // ret (would look like flags are dead if 0x06 only stopped later, so put 0x06 right after add!)
+            0x06,             // INVALID in 64-bit mode
+            0xC3,
+        ];
+        // Specifically: `[add eax, 1; mov ecx, edx; 0x06 (INVALID)]` — with `0x06` present,
+        // `pass_reg_reg_morph` must refuse to mutate the undecodable function.
+        let invalid_fn: [u8; 6] = [
+            0x89, 0xD1, // mov ecx, edx
+            0x31, 0xC0, // xor eax, eax
+            0x06,       // INVALID in 64-bit mode
+            0xC3,
+        ];
+        for seed in 0..64u64 {
+            let mut buf = invalid_fn.to_vec();
+            let mut prng = Prng::new(seed);
+            let mut stats = Stats::default();
+            pass_reg_reg_morph(&mut buf, 0x2000, &mut prng, &mut stats);
+            assert_eq!(
+                buf, invalid_fn,
+                "seed {seed}: pass_reg_reg_morph mutated function containing Code::INVALID! orig={orig:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn six_byte_upper_reg_small_imm_loads_morph_across_seeds() {
+        // `mov r8d, 42; ret` (`41 B8 2A 00 00 00 C3`) — flags are dead at `ret`,
+        // so `pass_reg_reg_morph` itself must diversify `6`-byte `mov r8d, imm32` (`imm in 1..=255`)
+        // into `xor/sub r8d, r8d; mov r8b, 42` (`45 31 C0 41 B0 2A`).
+        let orig: [u8; 7] = [0x41, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
+        let mut morphed_any = false;
+        for seed in 0..64u64 {
+            let mut buf = orig.to_vec();
+            let mut prng = Prng::new(seed);
+            let mut stats = Stats::default();
+            pass_reg_reg_morph(&mut buf, 0x3000, &mut prng, &mut stats);
+            if buf != orig {
+                morphed_any = true;
+                break;
+            }
+        }
+        assert!(
+            morphed_any,
+            "expected `pass_reg_reg_morph` on `mov r8d, 42; ret` to diversify across seeds"
+        );
     }
 }
 
