@@ -841,23 +841,38 @@ fn migrate_chain() -> Result<()> {
         return Ok(());
     }
     let content = fs::read_to_string(&log).with_context(|| format!("read {}", log.display()))?;
-    let last = match content.lines().rev().find(|l| !l.trim().is_empty()) {
-        Some(s) => s,
-        None => return Ok(()),
-    };
-    let v: serde_json::Value = match serde_json::from_str(last) {
-        Ok(x) => x,
-        // Malformed last line: treat as v1, migrate aside.
-        Err(_) => {
-            move_aside(&log, &attest_log_v1_bak_path())?;
-            let anchor = anchor_log_path();
-            if anchor.exists() {
-                move_aside(&anchor, &anchor_log_v1_bak_path())?;
-            }
-            return Ok(());
+    let mut parsed_versions: Vec<(usize, Option<u64>)> = Vec::new();
+    for (idx, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
         }
+        let v: serde_json::Value = serde_json::from_str(line).with_context(|| {
+            format!(
+                "{}: malformed JSON at line {} — refusing to migrate corrupted attestation chain aside",
+                log.display(),
+                idx + 1
+            )
+        })?;
+        let ver = v.get("schema_version").and_then(|x| x.as_u64());
+        parsed_versions.push((idx + 1, ver));
+    }
+    let Some(&(_, existing_ver)) = parsed_versions.last() else {
+        return Ok(());
     };
-    let existing_ver = v.get("schema_version").and_then(|x| x.as_u64());
+    let has_modern = parsed_versions
+        .iter()
+        .any(|&(_, ver)| ver.is_some_and(|v| v >= READABLE_MIN_SCHEMA));
+    let has_pre_modern = parsed_versions
+        .iter()
+        .any(|&(_, ver)| ver.is_none_or(|v| v < READABLE_MIN_SCHEMA));
+    if has_modern && has_pre_modern {
+        bail!(
+            "{}: mixed pre-v{} and v{}+ entries in attestation log — refusing to migrate chain aside",
+            log.display(),
+            READABLE_MIN_SCHEMA,
+            READABLE_MIN_SCHEMA
+        );
+    }
     if existing_ver == Some(SCHEMA_VERSION) {
         // Already at the current schema.
         return Ok(());
@@ -1376,6 +1391,7 @@ fn resolve_primary_verifying_key(
         .federation_config
         .clone()
         .unwrap_or_else(federation::resolve_federation_path);
+    let mut loaded_fed: Option<FederationConfig> = None;
     if fed_path.exists() {
         let cfg = federation::load_federation(&fed_path).with_context(|| {
             format!(
@@ -1396,7 +1412,9 @@ fn resolve_primary_verifying_key(
             return Ok(Some(vk));
         }
         // Config exists but has no "primary" signer — fall through to the
-        // key file so single-signer hosts still authenticate.
+        // key file so single-signer hosts still authenticate, while preserving
+        // `cfg` so revoked keys in `factory_keys.toml` are still rejected!
+        loaded_fed = Some(cfg);
     }
     for candidate in [
         crate::signing::resolve_signing_key_path(),
@@ -1407,7 +1425,11 @@ fn resolve_primary_verifying_key(
             let key = crate::signing::load_signing_key_from(&candidate)
                 .with_context(|| format!("load primary key from {}", candidate.display()))?;
             let vk = key.verifying_key();
-            federation::reject_fixture_verifying_key(&vk, &candidate.display().to_string())?;
+            let desc = candidate.display().to_string();
+            federation::reject_fixture_verifying_key(&vk, &desc)?;
+            if let Some(ref cfg) = loaded_fed {
+                federation::reject_revoked_verifying_key(&vk, cfg, &desc)?;
+            }
             return Ok(Some(vk));
         }
     }
@@ -1671,30 +1693,36 @@ pub fn verify_chain_with_options(opts: &VerifyOptions) -> Result<VerifyReport> {
             None => {}
         }
         // Federation threshold enforcement (--require-threshold).
+        // Applies to accepted entries (which deploy a candidate and carry M-of-N
+        // cosignatures); rejected entries never deploy code and legitimately omit
+        // `federation_threshold` / `cosignatures`, unless non-empty cosignatures
+        // were attached (which must still verify cleanly).
         if let Some(fed) = &fed {
-            let entry_thr = e.federation_threshold.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "verify-attest: entry {} (cycle={}) missing federation_threshold field; \
-                     refusing under --require-threshold",
-                    i,
-                    e.cycle
-                )
-            })?;
-            if entry_thr != fed.threshold {
-                bail!(
-                    "verify-attest: entry {} (cycle={}) declares federation_threshold={} \
-                     but federation config has threshold={}",
-                    i,
-                    e.cycle,
-                    entry_thr,
-                    fed.threshold
-                );
+            if e.accepted || !e.cosignatures.is_empty() || e.federation_threshold.is_some() {
+                let entry_thr = e.federation_threshold.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "verify-attest: entry {} (cycle={}) missing federation_threshold field; \
+                         refusing under --require-threshold",
+                        i,
+                        e.cycle
+                    )
+                })?;
+                if entry_thr != fed.threshold {
+                    bail!(
+                        "verify-attest: entry {} (cycle={}) declares federation_threshold={} \
+                         but federation config has threshold={}",
+                        i,
+                        e.cycle,
+                        entry_thr,
+                        fed.threshold
+                    );
+                }
+                let msg = cosign_message_for_entry(e).with_context(|| {
+                    format!("verify-attest: entry {} cosign message computation failed", i)
+                })?;
+                federation::verify_cosignatures(&msg, &e.cosignatures, fed)
+                    .with_context(|| format!("verify-attest: entry {} (cycle={})", i, e.cycle))?;
             }
-            let msg = cosign_message_for_entry(e).with_context(|| {
-                format!("verify-attest: entry {} cosign message computation failed", i)
-            })?;
-            federation::verify_cosignatures(&msg, &e.cosignatures, fed)
-                .with_context(|| format!("verify-attest: entry {} (cycle={})", i, e.cycle))?;
         }
         // Factory-fingerprint enforcement (--strict-factory).
         if let Some(expected) = &factory_expected {

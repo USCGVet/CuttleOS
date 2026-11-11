@@ -71,7 +71,10 @@ fn ineligibility_sig(sig: &syn::Signature, attrs: &[syn::Attribute]) -> Option<&
     if sig.ident == "main" {
         return Some("main-fn");
     }
-    if sig.abi.is_some() {
+    if sig.constness.is_some() {
+        return Some("const-fn");
+    }
+    if sig.abi.is_some() || attrs.iter().any(is_abi_or_naked_attr) {
         return Some("extern-fn");
     }
     if attrs
@@ -81,6 +84,24 @@ fn ineligibility_sig(sig: &syn::Signature, attrs: &[syn::Attribute]) -> Option<&
         return Some("test-fn");
     }
     None
+}
+
+fn is_abi_or_naked_attr(a: &syn::Attribute) -> bool {
+    if a.path().is_ident("no_mangle")
+        || a.path().is_ident("export_name")
+        || a.path().is_ident("link_name")
+        || a.path().is_ident("naked")
+    {
+        return true;
+    }
+    if a.path().is_ident("unsafe") {
+        let s = quote::quote!(#a).to_string();
+        return s.contains("no_mangle")
+            || s.contains("export_name")
+            || s.contains("link_name")
+            || s.contains("naked");
+    }
+    false
 }
 
 fn attr_mentions_test(a: &syn::Attribute) -> bool {
@@ -183,10 +204,9 @@ struct SemanticVisitor {
 impl VisitMut for SemanticVisitor {
     fn visit_expr_mut(&mut self, e: &mut Expr) {
         // Position-level eligibility: never rewrite inside an
-        // `unsafe { }` block. Recurse (nested safe code inside an
-        // unsafe block is still conservatively skipped) with all
+        // `unsafe { }` or `const { }` block. Recurse with all
         // coins suppressed, then restore.
-        if matches!(e, Expr::Unsafe(_)) {
+        if matches!(e, Expr::Unsafe(_) | Expr::Const(_)) {
             let saved = self.flips;
             self.flips = Flips::default();
             syn::visit_mut::visit_expr_mut(self, e);
@@ -1207,6 +1227,56 @@ mod tests {
         assert!(
             !out.contains(">="),
             "NaN-unsafe `<` -> `>=` inversion fired on potential float comparison: {out}"
+        );
+    }
+
+    #[test]
+    fn skips_const_fn_abi_export_attrs_and_const_blocks() {
+        let src = r#"
+            pub const fn compile_time_calc(x: u64) -> u64 {
+                if x == 0 { 1 } else { x * 8 }
+            }
+            #[no_mangle]
+            pub fn exported_entry(x: u64) -> u64 {
+                if x == 0 { 1 } else { x * 8 }
+            }
+            #[export_name = "_cuttle_abi_sym"]
+            pub fn custom_export(x: u64) -> u64 {
+                if x == 0 { 1 } else { x * 8 }
+            }
+            #[unsafe(no_mangle)]
+            pub fn edition2024_export(x: u64) -> u64 {
+                if x == 0 { 1 } else { x * 8 }
+            }
+            pub fn has_const_block(y: u64) -> u64 {
+                let k = const { if 1 == 0 { 2 } else { 3 * 8 } };
+                k + y
+            }
+        "#;
+        let mut file = make_file(src);
+        let seed = Seed::derive(1, "semantic-const-abi-test");
+        let log = apply(&mut file, &seed, 100);
+        let map: std::collections::HashMap<_, _> = log.into_iter().collect();
+        assert_eq!(
+            map.get("compile_time_calc").map(String::as_str),
+            Some("ineligible:const-fn")
+        );
+        assert_eq!(
+            map.get("exported_entry").map(String::as_str),
+            Some("ineligible:extern-fn")
+        );
+        assert_eq!(
+            map.get("custom_export").map(String::as_str),
+            Some("ineligible:extern-fn")
+        );
+        assert_eq!(
+            map.get("edition2024_export").map(String::as_str),
+            Some("ineligible:extern-fn")
+        );
+        let out = emitted(&file);
+        assert!(
+            !out.contains("<<"),
+            "const fn, ABI-exported fn, or const {{ }} block was rewritten: {out}"
         );
     }
 }

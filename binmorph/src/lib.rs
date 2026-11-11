@@ -2364,6 +2364,15 @@ fn try_encode_same_len(alt: &Instruction, instr: &Instruction) -> Option<Vec<u8>
 }
 
 #[inline]
+fn is_external_rip_tail_jmp(ins: &Instruction) -> bool {
+    ins.flow_control() == iced_x86::FlowControl::IndirectBranch
+        && ins.mnemonic() == Mnemonic::Jmp
+        && ins.op_count() == 1
+        && ins.op0_kind() == OpKind::Memory
+        && ins.is_ip_rel_memory_operand()
+}
+
+#[inline]
 fn is_flag_killer_instr(ins: &Instruction, branch_targets: &[u64]) -> bool {
     use iced_x86::FlowControl;
     if is_near_sysv_ret(ins)
@@ -2378,6 +2387,8 @@ fn is_flag_killer_instr(ins: &Instruction, branch_targets: &[u64]) -> bool {
                 OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
             )
             && !branch_targets.contains(&ins.near_branch_target()))
+        || (is_external_rip_tail_jmp(ins)
+            && !branch_targets.contains(&ins.ip_rel_memory_address()))
     {
         return true;
     }
@@ -3504,6 +3515,31 @@ fn gadget_counts_not_increased(before: &[u8], after: &[u8]) -> bool {
 }
 
 #[inline]
+fn slice_window_gadget_total(bytes: &[u8]) -> usize {
+    count_ret_family_bytes(bytes) + count_indirect_call_jmp_bytes(bytes)
+}
+
+#[inline]
+fn slice_window_gadgets_at(code: &[u8], pos: usize, len: usize, replacement: Option<&[u8]>) -> usize {
+    let win_start = pos.saturating_sub(1);
+    let win_end = (pos + len + 1).min(code.len());
+    match replacement {
+        None => slice_window_gadget_total(&code[win_start..win_end]),
+        Some(rep) => {
+            let mut after = Vec::with_capacity(win_end - win_start);
+            if pos > win_start {
+                after.push(code[win_start]);
+            }
+            after.extend_from_slice(rep);
+            if pos + len < win_end {
+                after.push(code[pos + len]);
+            }
+            slice_window_gadget_total(&after)
+        }
+    }
+}
+
+#[inline]
 fn slice_replacement_preserves_gadget_counts(
     code: &[u8],
     pos: usize,
@@ -3611,7 +3647,15 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
                     _ => allow_liveness = false,
                 }
             }
-            FlowControl::IndirectBranch | FlowControl::Interrupt => allow_liveness = false,
+            FlowControl::IndirectBranch => {
+                if !is_external_rip_tail_jmp(&instr)
+                    || (instr.ip_rel_memory_address() >= base_ip
+                        && instr.ip_rel_memory_address() < end_ip)
+                {
+                    allow_liveness = false;
+                }
+            }
+            FlowControl::Interrupt => allow_liveness = false,
             _ => {}
         }
         positions.push(pos);
@@ -3663,27 +3707,27 @@ fn pass_reg_reg_morph(code: &mut [u8], base_ip: u64, prng: &mut Prng, stats: &mu
             continue;
         }
         stats.candidates += 1;
-        let orig_has_ret = has_ret_opcode_byte(orig_bytes);
+        let win_before = slice_window_gadgets_at(code, pos, ilen, None);
+        let orig_has_ret = has_ret_opcode_byte(orig_bytes) || win_before > 0;
         let draw = prng.next_u64();
 
-        // Unintended `0xC3/0xC2/0xCB/0xCA/0xCF` (`ret`/`iret`) and `0xFF /2../5`
-        // (`call/jmp r/m64`) bytes are free ROP/JOP gadgets: always scrub them
-        // (100% probability); otherwise flip on the seeded coin.
         if !orig_has_ret && ((draw & 0b111) == 0) {
             continue;
         }
 
-        // Prefer encodings that:
-        // 1. Do NOT contain any embedded return or indirect call/jmp byte, AND
-        // 2. Change the disassembled mnemonic or operand order (`mov`↔`lea`↔`xchg`,
-        //    `xor`↔`sub`, `test`↔`or`↔`and`, `add`↔`shl`, `add`↔`sub`↔`lea`,
-        //    `mov imm32`↔`xor/sub+lea/add/sub/or/xor`, `r32`↔`r64`, SIB swap)
-        //    rather than merely flipping the direction bit (`89`↔`8B`).
-        // Never allow any instruction rewrite to increase `ret`-family (`0xC3/0xC2/0xCB/0xCA/0xCF`),
-        // `0xC3/0xCF`, or indirect `call/jmp` (`0xFF /2..=5`) gadget byte counts.
         alts.retain(|(b, _)| slice_replacement_preserves_gadget_counts(code, pos, ilen, b));
         if alts.is_empty() {
             continue;
+        }
+        if win_before > 0 {
+            let min_win = alts
+                .iter()
+                .map(|(b, _)| slice_window_gadgets_at(code, pos, ilen, Some(b)))
+                .min()
+                .unwrap_or(win_before);
+            if min_win < win_before {
+                alts.retain(|(b, _)| slice_window_gadgets_at(code, pos, ilen, Some(b)) == min_win);
+            }
         }
         let sem_clean_count = alts
             .iter()
@@ -4731,6 +4775,59 @@ mod tests {
             morphed_any,
             "expected `pass_reg_reg_morph` on `mov r8d, 42; ret` to diversify across seeds"
         );
+    }
+
+    #[test]
+    fn got_tail_jump_kills_flags_and_ff_slash5_gadget_is_deterministically_scrubbed() {
+        // 1. `add rdi, 8; jmp qword ptr [rip + 0x2000]` (`48 83 C7 08 FF 25 00 20 00 00`):
+        //    External RIP-relative GOT/PLT tail-jump kills caller RFLAGS just like a near external
+        //    tail-jump or `ret`, allowing `add rdi, 8` (`48 83 C7 08`) to morph to `sub rdi, -8`
+        //    (`48 83 EF F8`) or `lea rdi, [rdi + 8]` (`48 8D 7F 08`).
+        let got_tail: [u8; 10] = [
+            0x48, 0x83, 0xC7, 0x08, // add rdi, 8
+            0xFF, 0x25, 0x00, 0x20, 0x00, 0x00, // jmp qword ptr [rip + 0x2000]
+        ];
+        let mut morphed_tail = false;
+        for seed in 0..64u64 {
+            let mut buf = got_tail.to_vec();
+            let mut prng = Prng::new(seed);
+            let mut stats = Stats::default();
+            pass_reg_reg_morph(&mut buf, 0x4000, &mut prng, &mut stats);
+            if buf != got_tail {
+                // Ensure the RIP-relative jump bytes themselves were preserved.
+                assert_eq!(&buf[4..], &got_tail[4..]);
+                morphed_tail = true;
+                break;
+            }
+        }
+        assert!(
+            morphed_tail,
+            "expected `add rdi, 8` before external GOT tail-jump `jmp [rip+disp32]` to diversify across seeds"
+        );
+
+        // 2. Cross-instruction `FF 29` (`jmp fword ptr [rcx]`, `0xFF /5` indirect far jump gadget)
+        //    formed by `mov ecx, -1; sub eax, eax; ret` (`B9 FF FF FF FF 29 C0 C3`):
+        //    must be deterministically scrubbed to 0 indirect call/jmp gadgets across ALL seeds!
+        let ff5_gadget: [u8; 8] = [
+            0xB9, 0xFF, 0xFF, 0xFF, 0xFF, // mov ecx, -1
+            0x29, 0xC0, // sub eax, eax  (boundary `FF 29` = `0xFF /5` indirect far jmp!)
+            0xC3,
+        ];
+        assert!(
+            count_indirect_call_jmp_bytes(&ff5_gadget) >= 1,
+            "precondition: `FF 29` must be counted as an indirect jmp gadget"
+        );
+        for seed in 0..64u64 {
+            let mut buf = ff5_gadget.to_vec();
+            let mut prng = Prng::new(seed);
+            let mut stats = Stats::default();
+            pass_reg_reg_morph(&mut buf, 0x5000, &mut prng, &mut stats);
+            assert_eq!(
+                count_indirect_call_jmp_bytes(&buf),
+                0,
+                "seed {seed}: `FF 29` (`0xFF /5`) gadget survived `pass_reg_reg_morph`: {buf:02x?}"
+            );
+        }
     }
 }
 

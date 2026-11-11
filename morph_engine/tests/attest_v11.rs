@@ -543,3 +543,151 @@ fn missing_merkle_anchors_for_ten_entry_chain_fails_verification() {
         "deleting merkle_anchors.jsonl on a >=10-entry chain must fail verification"
     );
 }
+
+#[test]
+fn torn_trailing_line_refuses_migration_instead_of_wiping_v11_chain() {
+    let (_g, guard) = Guard::new("torn_trailing_line");
+    let sk = test_key();
+    let fed = write_fed_toml(&guard.dir, &sk);
+    unsafe {
+        std::env::set_var(FEDERATION_CONFIG_ENV, &fed);
+    }
+    write_attestation(fields(1, "http", sk.clone())).unwrap();
+    let log_path = attest::attest_log_path();
+    let before = fs::read_to_string(&log_path).unwrap();
+    // Simulate a torn/corrupted trailing line (e.g. crash mid-append or attacker append).
+    fs::write(&log_path, format!("{before}{{\"schema_version\":11,\"cycle\":2")).unwrap();
+
+    let err = write_attestation(fields(3, "http", sk));
+    assert!(
+        err.is_err(),
+        "torn trailing line in v11 attest.log.jsonl must fail closed instead of migrating chain aside"
+    );
+    assert!(
+        !guard.dir.join(attest::ATTEST_LOG_V1_BAK).exists(),
+        "corrupted v11 chain must NOT be moved aside to .v1.jsonl.bak"
+    );
+    assert!(
+        fs::read_to_string(&log_path).unwrap().starts_with(&before),
+        "existing v11 entry must remain intact on disk"
+    );
+}
+
+#[test]
+fn primary_key_file_fallback_rejects_revoked_key_when_primary_absent_from_roster() {
+    let (_g, guard) = Guard::new("fallback_revoked_reject");
+    let sk_revoked = test_key();
+    let sk_other = test_key();
+    let key_file = guard.dir.join(cuttle_morph_engine::SIGNING_KEY_FILE);
+    fs::write(&key_file, sk_revoked.to_bytes()).unwrap();
+
+    let pk_revoked: String = sk_revoked
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    let pk_other: String = sk_other
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    // Roster has no "primary" signer (forcing fallback to factory_signing_key.bin),
+    // and explicitly revokes sk_revoked's public key!
+    let fed_path = guard.dir.join("factory_keys.toml");
+    fs::write(
+        &fed_path,
+        format!(
+            "threshold = 1\n\
+             [[signers]]\nid = \"cosigner-a\"\npubkey_hex = \"{pk_other}\"\n\
+             [[revoked]]\npubkey_hex = \"{pk_revoked}\"\nsince_unix = 1700000000\nreason = \"compromised host key\"\n"
+        ),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var(FEDERATION_CONFIG_ENV, &fed_path);
+        std::env::set_var(cuttle_morph_engine::SIGNING_KEY_ENV, &key_file);
+    }
+
+    write_attestation(fields(1, "http", sk_revoked)).unwrap();
+    let err = verify_chain().expect_err("revoked fallback signing key must be rejected");
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains("revoked"),
+        "expected revoked key rejection error, got: {msg}"
+    );
+}
+
+#[test]
+fn threshold_verify_allows_signed_v11_rejected_entry_alongside_cosigned_accepted_entry() {
+    let (_g, guard) = Guard::new("thr_with_rejected_v11");
+    let sk_primary = test_key();
+    let sk_cosigner = test_key();
+    let pk_primary: String = sk_primary
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    let pk_cosigner: String = sk_cosigner
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    let fed_path = guard.dir.join("factory_keys.toml");
+    fs::write(
+        &fed_path,
+        format!(
+            "threshold = 2\n\
+             [[signers]]\nid = \"primary\"\npubkey_hex = \"{pk_primary}\"\n\
+             [[signers]]\nid = \"cosigner-a\"\npubkey_hex = \"{pk_cosigner}\"\n"
+        ),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var(FEDERATION_CONFIG_ENV, &fed_path);
+    }
+
+    // Entry 0: accepted v11 entry, co-signed by cosigner-a (2-of-2).
+    let mut f_acc = fields(1, "http", sk_primary.clone());
+    f_acc.federation_threshold = Some(2);
+    write_attestation(f_acc).unwrap();
+    let mut entries = load_entries().unwrap();
+    let signable0 = attest::compute_signable_sha256(&entries[0]).unwrap();
+    entries[0]
+        .cosignatures
+        .push(cuttle_morph_engine::federation::Cosignature {
+            signer_id: "cosigner-a".into(),
+            sig_ed25519: sk_cosigner
+                .sign(&signable0)
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect(),
+        });
+    rebuild_chain_after_cosign(&mut entries, 0).unwrap();
+    let anchors = attest::load_anchors().unwrap();
+    write_chain_atomic(&entries, &anchors).unwrap();
+
+    // Entry 1: rejected v11 entry (accepted=false, no candidate cosignatures, signed entry envelope).
+    let mut f_rej = fields(2, "http", sk_primary);
+    f_rej.accepted = false;
+    f_rej.cosignatures = Vec::new();
+    f_rej.federation_threshold = None;
+    write_attestation(f_rej).unwrap();
+
+    let report = attest::verify_chain_with_options(&attest::VerifyOptions {
+        require_threshold: true,
+        federation_config: Some(fed_path),
+        require_merkle_root: false,
+        require_strict_factory: false,
+        factory_expected_path: None,
+        require_ext_tlv: true,
+        require_diversity: false,
+        require_durable_seals: false,
+    })
+    .expect("threshold verify must succeed when chain contains a signed v11 rejected entry");
+    assert_eq!(report.entries_ok, 2);
+}

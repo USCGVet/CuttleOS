@@ -47,6 +47,12 @@ pub enum Reason {
     MainFn,
     /// Already carries `#[inline]`, `#[inline(always)]`, or `#[inline(never)]`.
     AlreadyInline,
+    /// `const fn`.
+    ConstFn,
+    /// Explicit ABI (`extern "..."`) or fixed-symbol/naked attribute (`#[no_mangle]`, `#[export_name]`, `#[link_name]`, `#[naked]`).
+    ExternOrAbiFn,
+    /// Unit test function (`#[test]` or `#[cfg(test)]`).
+    TestFn,
 }
 
 /// Decide what to do with one function. Pure: no I/O, no rng, no
@@ -58,6 +64,12 @@ pub fn decide(seed: &Seed, fn_name: &str, existing_attrs: &[syn::Attribute]) -> 
     }
     if has_inline_attr(existing_attrs) {
         return PerturbDecision::Ineligible(Reason::AlreadyInline);
+    }
+    if existing_attrs.iter().any(has_abi_or_naked_attr) {
+        return PerturbDecision::Ineligible(Reason::ExternOrAbiFn);
+    }
+    if existing_attrs.iter().any(is_test_attr) {
+        return PerturbDecision::Ineligible(Reason::TestFn);
     }
     let mut h = Sha256::new();
     h.update(HASH_TAG);
@@ -83,7 +95,13 @@ pub fn apply(file: &mut File, seed: &Seed) -> Vec<(String, PerturbDecision)> {
     for item in file.items.iter_mut() {
         let Item::Fn(f) = item else { continue };
         let name = f.sig.ident.to_string();
-        let d = decide(seed, &name, &f.attrs);
+        let d = if f.sig.constness.is_some() {
+            PerturbDecision::Ineligible(Reason::ConstFn)
+        } else if f.sig.abi.is_some() {
+            PerturbDecision::Ineligible(Reason::ExternOrAbiFn)
+        } else {
+            decide(seed, &name, &f.attrs)
+        };
         match d {
             PerturbDecision::InlineAlways => {
                 let attr: syn::Attribute = syn::parse_quote!(#[inline(always)]);
@@ -102,6 +120,29 @@ pub fn apply(file: &mut File, seed: &Seed) -> Vec<(String, PerturbDecision)> {
 
 fn has_inline_attr(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| a.path().is_ident("inline"))
+}
+
+fn has_abi_or_naked_attr(a: &syn::Attribute) -> bool {
+    if a.path().is_ident("no_mangle")
+        || a.path().is_ident("export_name")
+        || a.path().is_ident("link_name")
+        || a.path().is_ident("naked")
+    {
+        return true;
+    }
+    if a.path().is_ident("unsafe") {
+        let s = quote::quote!(#a).to_string();
+        return s.contains("no_mangle")
+            || s.contains("export_name")
+            || s.contains("link_name")
+            || s.contains("naked");
+    }
+    false
+}
+
+fn is_test_attr(a: &syn::Attribute) -> bool {
+    a.path().is_ident("test")
+        || (a.path().is_ident("cfg") && quote::quote!(#a).to_string().contains("test"))
 }
 
 // ---------------------------------------------------------------------------
@@ -455,5 +496,39 @@ mod tests {
         let log = apply(&mut file, &seed);
         let names: Vec<_> = log.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn skips_const_extern_naked_abi_exported_and_test_functions() {
+        let src = r#"
+            pub const fn cfn(x: u32) -> u32 { x + 1 }
+            pub extern "C" fn efn(x: u32) -> u32 { x + 1 }
+            #[naked]
+            pub unsafe extern "sysv64" fn nfn() {}
+            #[no_mangle]
+            pub fn nm_fn(x: u32) -> u32 { x + 1 }
+            #[export_name = "custom_sym"]
+            pub fn exp_fn(x: u32) -> u32 { x + 1 }
+            #[unsafe(no_mangle)]
+            pub fn ed2024_nm(x: u32) -> u32 { x + 1 }
+            #[test]
+            fn unit_t() {}
+        "#;
+        for cycle in 0..32u64 {
+            let seed = Seed::derive(cycle, "codegen-guard");
+            let mut file = make_file(src);
+            let log = apply(&mut file, &seed);
+            for (name, dec) in &log {
+                assert!(
+                    matches!(dec, PerturbDecision::Ineligible(_)),
+                    "cycle {cycle}: {name} must be Ineligible for #[inline(...)], got {dec:?}"
+                );
+                let f = find_fn(&file, name);
+                assert!(
+                    !f.attrs.iter().any(|a| a.path().is_ident("inline")),
+                    "cycle {cycle}: {name} must never receive #[inline(...)]"
+                );
+            }
+        }
     }
 }

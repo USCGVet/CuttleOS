@@ -138,14 +138,23 @@ fn find_workspace_root(start_dir: &Path) -> Option<PathBuf> {
 /// Load and parse `locked_modules.toml` by walking up from `start_path`.
 /// `start_path` may be a file (its parent dir is the walk seed) or a dir.
 pub fn load_locked_modules(start_path: &Path) -> Result<LockedModules, DiversifyError> {
-    let seed_dir: PathBuf = if start_path.is_file() {
-        start_path
+    let abs_start: PathBuf = if start_path.is_relative() {
+        match std::env::current_dir() {
+            Ok(cwd) => lexical_normalize(&cwd.join(start_path)),
+            Err(_) => lexical_normalize(start_path),
+        }
+    } else {
+        lexical_normalize(start_path)
+    };
+    let raw_seed_dir: PathBuf = if abs_start.is_file() {
+        abs_start
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."))
     } else {
-        start_path.to_path_buf()
+        abs_start
     };
+    let seed_dir = canonicalize_loose(&raw_seed_dir);
     let root = find_workspace_root(&seed_dir).ok_or_else(|| {
         DiversifyError::MissingLockedModulesFile {
             searched_from: seed_dir.clone(),
@@ -225,7 +234,14 @@ pub fn parse_locked_modules_str(
 /// `is_locked` walks both sides through this, so consistent-shape
 /// outputs are what we need.
 fn canonicalize_loose(p: &Path) -> PathBuf {
-    fs::canonicalize(p).unwrap_or_else(|_| lexical_normalize(p))
+    fs::canonicalize(p).unwrap_or_else(|_| {
+        if p.is_relative() {
+            if let Ok(cwd) = std::env::current_dir() {
+                return lexical_normalize(&cwd.join(p));
+            }
+        }
+        lexical_normalize(p)
+    })
 }
 
 /// Lexical-only path normalisation: collapse `.` and `..` components,
@@ -484,5 +500,51 @@ mod tests {
         }
         // If we couldn't find one, we're running outside the workspace
         // (e.g. in a sub-tree). Nothing to check.
+    }
+
+    #[test]
+    fn load_locked_modules_resolves_relative_seed_from_subdirectory_to_outermost_root() {
+        // Regression test: when `start_path` is a relative path (such as `"src/kpti.rs"` or `"."`)
+        // while CWD is a subdirectory inside a workspace — even if an attacker planted a rogue
+        // inner `locked_modules.toml` in that subdirectory — `load_locked_modules` must canonicalize
+        // / absolutize `start_path` before walking ancestors so `PathBuf::pop()` reaches the
+        // outermost workspace `locked_modules.toml` instead of stopping at `""`!
+        let tmp = std::env::temp_dir().join(format!(
+            "cuttle_locked_rel_walk_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sub_src = tmp.join("subcrate").join("src");
+        fs::create_dir_all(&sub_src).unwrap();
+        // Outermost workspace policy locks `subcrate/src/kpti.rs`.
+        fs::write(
+            tmp.join("locked_modules.toml"),
+            "schema_version = 1\nlocked = [\"subcrate/src/kpti.rs\"]\n",
+        )
+        .unwrap();
+        // Rogue inner policy in `subcrate/` claims nothing is locked!
+        fs::write(
+            tmp.join("subcrate").join("locked_modules.toml"),
+            "schema_version = 1\nlocked = []\n",
+        )
+        .unwrap();
+        let target_file = sub_src.join("kpti.rs");
+        fs::write(&target_file, "pub fn init() {}\n").unwrap();
+
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.join("subcrate")).unwrap();
+        let loaded_res = load_locked_modules(Path::new("src/kpti.rs"));
+        std::env::set_current_dir(&prev_cwd).unwrap();
+
+        let locked = loaded_res.expect("load_locked_modules on relative path must succeed");
+        let is_locked = locked.is_locked(&target_file);
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(
+            is_locked,
+            "relative start_path from subdirectory must resolve to outermost workspace locked_modules.toml"
+        );
     }
 }

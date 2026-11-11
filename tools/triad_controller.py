@@ -1615,9 +1615,15 @@ class TriadController:
                         and bytes(cells[0][1]).startswith(b"v:")
                     ):
                         vkey = bytes(cells[0][1])[2:].decode("utf-8", errors="replace")
-                        if vkey in vault_records:
-                            cp_stmts.append(vault_records[vkey])
-                            seen_vault_keys.add(vkey)
+                        if vkey not in vault_records:
+                            self.log_event(
+                                "ALERT",
+                                f"WAL checkpoint aborted: live Vault row 'v:{vkey}' has no matching WAL Vault record!",
+                                code="WAL_CORRUPT",
+                            )
+                            return False
+                        cp_stmts.append(vault_records[vkey])
+                        seen_vault_keys.add(vkey)
                         continue
                     formatted: list[str] = []
                     for ctype, val in cells:
@@ -1635,9 +1641,10 @@ class TriadController:
                     verb = "INSERT OR REPLACE INTO" if table == "kv" else "INSERT INTO"
                     cp_stmts.append(f"{verb} {table} VALUES({','.join(formatted)})")
 
-            for vkey, vstmt in vault_records.items():
-                if vkey not in seen_vault_keys:
-                    cp_stmts.append(vstmt)
+            if "kv" not in table_dumps:
+                for vkey, vstmt in vault_records.items():
+                    if vkey not in seen_vault_keys:
+                        cp_stmts.append(vstmt)
 
             cp_seq = self.triad_tx_seq
             self.wal_checkpoint = {
@@ -4635,7 +4642,15 @@ function authHeaders() {
 
 async function refresh() {
   try {
-    const r = await fetch('/api/triad');
+    const r = await fetch('/api/triad', {cache: 'no-store', headers: authHeaders()});
+    if (!r.ok) {
+      const pill = document.getElementById('quorumPill');
+      if (r.status === 401) {
+        pill.textContent = 'AUTHENTICATION REQUIRED — PASTE SESSION TOKEN';
+        pill.className = 'quorum-pill warn';
+      }
+      return;
+    }
     const d = await r.json();
     const pill = document.getElementById('quorumPill');
     pill.textContent = d.quorum_status;
@@ -4825,27 +4840,129 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                     return True
         return False
 
+    def _has_supplied_credentials(self) -> bool:
+        for hdr in ("X-Cuttle-Session", "X-Session-Token"):
+            if (self.headers.get(hdr) or "").strip():
+                return True
+        auth = (self.headers.get("Authorization") or "").strip()
+        if auth.lower().startswith("bearer ") and auth[7:].strip():
+            return True
+        cookie = self.headers.get("Cookie") or ""
+        for part in cookie.split(";"):
+            kv = part.strip()
+            if kv.startswith("triad_sid=") and kv[len("triad_sid="):].strip():
+                return True
+        return False
+
+    def _auth_rate_limited(self) -> bool:
+        if type(self) is not TriadHttpHandler:
+            return False
+        ctrl = getattr(self, "ctrl", None)
+        if ctrl is None:
+            return False
+        limit = int(getattr(ctrl, "auth_fail_limit", 40))
+        if limit <= 0:
+            return False
+        lock = getattr(ctrl, "_auth_rate_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            ctrl._auth_rate_lock = lock
+            ctrl._auth_fail_by_ip = {}
+        client_ip = (self.client_address[0] if getattr(self, "client_address", None) else "127.0.0.1") or "127.0.0.1"
+        now = time.monotonic()
+        with lock:
+            hist = [t for t in ctrl._auth_fail_by_ip.get(client_ip, []) if now - t < 60.0]
+            ctrl._auth_fail_by_ip[client_ip] = hist
+            return len(hist) >= limit
+
+    def _record_failed_auth_guess(self) -> None:
+        if type(self) is not TriadHttpHandler or not self._has_supplied_credentials():
+            return
+        ctrl = getattr(self, "ctrl", None)
+        if ctrl is None:
+            return
+        lock = getattr(ctrl, "_auth_rate_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            ctrl._auth_rate_lock = lock
+            ctrl._auth_fail_by_ip = {}
+        client_ip = (self.client_address[0] if getattr(self, "client_address", None) else "127.0.0.1") or "127.0.0.1"
+        now = time.monotonic()
+        with lock:
+            hist = [t for t in ctrl._auth_fail_by_ip.get(client_ip, []) if now - t < 60.0]
+            hist.append(now)
+            ctrl._auth_fail_by_ip[client_ip] = hist
+
+    def _check_auth_or_reject_json(self, drain_len: int = 0) -> bool:
+        if self._auth_rate_limited():
+            if drain_len > 0:
+                self._drain_unread_body_nonblocking(drain_len)
+            self._send_json(
+                429,
+                {"ok": False, "error": "too many failed authentication attempts; retry in 60s"},
+                extra_headers={"Retry-After": "60"},
+            )
+            return False
+        if self._is_authenticated():
+            return True
+        self._record_failed_auth_guess()
+        if drain_len > 0:
+            self._drain_unread_body_nonblocking(drain_len)
+        self._send_json(
+            401,
+            {"ok": False, "error": "unauthorized: provide valid X-Cuttle-Session or Authorization: Bearer token"},
+        )
+        return False
+
+    def _check_auth_or_reject_text(self) -> bool:
+        if self._auth_rate_limited():
+            self._send_text(
+                429,
+                "text/plain; charset=utf-8",
+                "error: too many failed authentication attempts; retry in 60s\n",
+                extra_headers={"Retry-After": "60"},
+            )
+            return False
+        if self._is_authenticated():
+            return True
+        self._record_failed_auth_guess()
+        self._send_text(
+            401,
+            "text/plain; charset=utf-8",
+            "error: unauthorized (provide valid X-Cuttle-Session or Authorization: Bearer token)\n",
+        )
+        return False
+
     def _send_security_headers(self):
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
         )
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
 
-    def _send_json(self, code: int, obj: dict):
+    def _send_json(self, code: int, obj: dict, extra_headers: dict[str, str] | None = None):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self._send_security_headers()
+        if extra_headers:
+            for hk, hv in extra_headers.items():
+                self.send_header(hk, hv)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_text(self, code: int, ctype: str, text: str):
+    def _send_text(self, code: int, ctype: str, text: str, extra_headers: dict[str, str] | None = None):
         body = text.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self._send_security_headers()
+        if extra_headers:
+            for hk, hv in extra_headers.items():
+                self.send_header(hk, hv)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -4937,12 +5054,8 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
             return self._send_text(200, "text/html; charset=utf-8", page)
 
         if base_path == "/metrics":
-            if not self._is_authenticated():
-                return self._send_text(
-                    401,
-                    "text/plain; charset=utf-8",
-                    "error: unauthorized (provide valid X-Cuttle-Session or Authorization: Bearer token)\n",
-                )
+            if not self._check_auth_or_reject_text():
+                return
             return self._send_text(
                 200,
                 "text/plain; version=0.0.4; charset=utf-8",
@@ -4950,6 +5063,8 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
             )
 
         if base_path == "/api/triad":
+            if not self._check_auth_or_reject_json():
+                return
             c = self.ctrl
             data = {
                 "quorum_status": c.quorum_status,
@@ -4989,12 +5104,8 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
             return self._send_json(200, data)
 
         if self.path.startswith("/sql"):
-            if not self._is_authenticated():
-                return self._send_text(
-                    401,
-                    "text/plain; charset=utf-8",
-                    "error: unauthorized (provide valid X-Cuttle-Session or Authorization: Bearer token)\n",
-                )
+            if not self._check_auth_or_reject_text():
+                return
             q = "SELECT * FROM kv"
             if "?" in self.path:
                 q = urllib.parse.unquote_plus(self.path.split("?", 1)[1]).strip()
@@ -5035,12 +5146,8 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
             return
         if not self._check_browser_origin(cl):
             return
-        if not self._is_authenticated():
-            self._drain_unread_body_nonblocking(cl)
-            return self._send_json(
-                401,
-                {"ok": False, "error": "unauthorized: provide valid X-Cuttle-Session or Authorization: Bearer token"},
-            )
+        if not self._check_auth_or_reject_json(drain_len=cl):
+            return
 
         body = self._read_bounded_body(cl)
         if body is None:
@@ -7422,9 +7529,138 @@ def run_unit_self_tests():
             assert sched_calls["hb"] == 1 and sched_calls["parity"] == 1, (
                 f"_scheduler_step must poll heartbeats and verify RAID parity on online Triad, saw: {sched_calls}"
             )
+            run_stage8_security_and_wal_unit_tests(tmp_dir, sc_harness)
         finally:
             sc_harness.close()
     run_fault_injection_unit_tests()
+
+
+def run_stage8_security_and_wal_unit_tests(tmp_dir: Path, sc_harness: RealOsShellHarness) -> None:
+    """Stage 8 unit tests: /api/triad auth across all roles, security headers, 429 rate limit, and Vault WAL checkpoint safety."""
+    # 1. GET /api/triad without credentials MUST return 401 across ALL 4 node roles (wfe, sql, shell, full),
+    #    and return 200 with nosniff / no-referrer / no-store headers when authenticated.
+    for role_name in ("wfe", "sql", "shell", "full"):
+        r_dir = tmp_dir / f"stage8_http_{role_name}"
+        r_ctrl = TriadController(
+            show_gui=False,
+            spec=TriadSpec(name=f"s8-{role_name}", role=role_name, state_dir=r_dir, write_operator_token=False),
+            unit_test=True,
+        )
+        r_ctrl.shutdown()
+        r_ctrl.auth_fail_limit = 4
+        prev_ctrl = getattr(TriadHttpHandler, "ctrl", None)
+        TriadHttpHandler.ctrl = r_ctrl
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), TriadHttpHandler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            # Unauthenticated GET /api/triad (no credentials) must be refused with 401 in every role,
+            # and empty-credential probes must NOT trip the brute-force 429 lockout.
+            for _ in range(6):
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/api/triad", timeout=5.0)
+                    raise AssertionError(f"role={role_name}: unauthenticated GET /api/triad must return 401!")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 401, f"role={role_name}: expected 401 on empty creds, got {e.code}"
+
+            # Authenticated GET /api/triad must succeed with 200 and hardened HTTP security headers.
+            auth_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/triad",
+                headers={"X-Cuttle-Session": r_ctrl.coordinator_token},
+            )
+            with urllib.request.urlopen(auth_req, timeout=5.0) as resp:
+                assert resp.status == 200
+                assert (resp.headers.get("X-Content-Type-Options") or "").lower() == "nosniff", (
+                    f"missing X-Content-Type-Options: nosniff on /api/triad: {dict(resp.headers)}"
+                )
+                assert (resp.headers.get("Referrer-Policy") or "").lower() == "no-referrer", (
+                    f"missing Referrer-Policy: no-referrer on /api/triad: {dict(resp.headers)}"
+                )
+                assert "no-store" in (resp.headers.get("Cache-Control") or "").lower(), (
+                    f"missing Cache-Control: no-store on /api/triad: {dict(resp.headers)}"
+                )
+
+            if role_name == "full":
+                # Repeated wrong non-empty credential guesses must trip HTTP 429 Too Many Requests.
+                for idx in range(4):
+                    bad_req = urllib.request.Request(
+                        f"http://127.0.0.1:{port}/api/triad",
+                        headers={"X-Cuttle-Session": f"wrong-guess-{idx}"},
+                    )
+                    try:
+                        urllib.request.urlopen(bad_req, timeout=5.0)
+                        raise AssertionError("invalid token must not succeed")
+                    except urllib.error.HTTPError as e:
+                        assert e.code == 401, f"expected 401 before limit on guess {idx}, got {e.code}"
+
+                locked_get = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/triad",
+                    headers={"X-Cuttle-Session": "wrong-guess-over-limit"},
+                )
+                try:
+                    urllib.request.urlopen(locked_get, timeout=5.0)
+                    raise AssertionError("expected 429 rate limit after exceeding auth_fail_limit")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 429, f"expected 429 on GET /api/triad brute-force, got {e.code}"
+                    assert e.headers.get("Retry-After"), "429 response must include Retry-After header"
+
+                locked_post = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/whoami",
+                    data=b"{}",
+                    headers={"X-Cuttle-Session": "wrong-guess-post"},
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(locked_post, timeout=5.0)
+                    raise AssertionError("expected 429 rate limit on POST /api/whoami")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 429, f"expected 429 on POST /api/whoami brute-force, got {e.code}"
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            TriadHttpHandler.ctrl = prev_ctrl
+
+    # 2. Vault WAL checkpoint integrity: must NOT resurrect deleted `v:<key>` rows from stale
+    #    `vault_records`, and MUST fail closed (False + WAL_CORRUPT) if `kv` has an unrecorded `v:<key>` row!
+    v_dir = tmp_dir / "stage8_vault_cp"
+    v_ctrl = TriadController(
+        show_gui=False,
+        spec=TriadSpec(name="s8-vault-cp", state_dir=v_dir, write_operator_token=False),
+        unit_test=True,
+    )
+    v_ctrl.shutdown()
+    v_ctrl.send_shell_cmd = sc_harness.exec
+    for n in v_ctrl.nodes:
+        n.state = "ONLINE"
+        v_ctrl._reset_sql_vote_tables(n)
+
+    assert v_ctrl.execute_triad_app("vault put keep_sec AlphaSec1")["ok"]
+    assert v_ctrl.execute_triad_app("vault put stale_sec StaleDel2")["ok"]
+    # Delete `v:stale_sec` via SQL (`DELETE FROM kv WHERE k = 'v:stale_sec'`) so `vault_records`
+    # still holds `ENC_WAL_V1` for `stale_sec`, while live `kv` ground truth no longer has it!
+    assert v_ctrl.execute_triad_sql("DELETE FROM kv WHERE k = 'v:stale_sec'")["ok"]
+    assert v_ctrl.checkpoint_wal(), "checkpoint_wal must succeed when live Vault keys match WAL records"
+    decrypted_cp = [
+        v_ctrl._decrypt_wal_vault_cmd(s) if s.startswith("ENC_WAL_V1:") else s
+        for s in v_ctrl.wal_checkpoint["stmts"]
+    ]
+    assert any("vault put keep_sec AlphaSec1" in s for s in decrypted_cp), decrypted_cp
+    assert not any("stale_sec" in s for s in decrypted_cp), (
+        f"checkpoint_wal resurrected deleted Vault secret 'stale_sec' from stale WAL records: {decrypted_cp}"
+    )
+
+    # Plant an unrecorded `v:orphan_sec` row directly on all 3 nodes, advance `triad_tx_seq` past the
+    # previous checkpoint, and verify `checkpoint_wal` fails closed with `WAL_CORRUPT`!
+    for n in v_ctrl.nodes:
+        sc_harness.exec(n, "vault put orphan_sec OrphanSec1")
+    assert v_ctrl.execute_triad_sql("INSERT OR REPLACE INTO kv VALUES ('bump.seq', '1', 1)")["ok"]
+    assert v_ctrl.checkpoint_wal() is False, (
+        "checkpoint_wal must fail closed (False) when live `kv` contains an unrecorded `v:<key>` Vault row!"
+    )
+    assert any(e.get("code") == "WAL_CORRUPT" for e in v_ctrl.events), (
+        f"Expected WAL_CORRUPT alert on unrecorded Vault row during checkpoint_wal: {v_ctrl.events}"
+    )
 
 
 def main():
@@ -7537,6 +7773,7 @@ def main():
             try:
                 # #17 & #22: Every authenticated endpoint refuses {no token, wrong token, non-ASCII token} with 401
                 auth_endpoints = [
+                    ("GET", "/api/triad", None),
                     ("GET", "/sql?SELECT+*+FROM+kv", None),
                     ("POST", "/sql", b"SELECT * FROM kv"),
                     ("POST", "/api/sql", b"SELECT * FROM kv"),

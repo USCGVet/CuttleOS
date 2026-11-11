@@ -858,10 +858,10 @@ function lockOut(message) {
 async function poll() {
   let delay = 1000;
   try {
-    if (FLEET && !S.unlocked) return;
+    if (!S.unlocked) return;
     if (VIEW !== 'triad') { delay = 2000; await pollFleet(); return; }
     const r = await fetch(API_BASE + '/api/triad', { cache: 'no-store', headers: authHeaders() });
-    if (FLEET && r.status === 401) { lockOut('Your token is no longer valid. The provider may have restarted.'); return; }
+    if (r.status === 401) { lockOut(FLEET ? 'Your token is no longer valid. The provider may have restarted.' : 'Paste the operator session token to connect.'); return; }
     if (FLEET && r.status === 403) { location.replace(fleetUrl(S.scopeClient)); return; }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();

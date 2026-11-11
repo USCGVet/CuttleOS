@@ -30,6 +30,7 @@ SCENARIOS = (
     "hung_node",
     "delayed_quorum",
     "crash_pending_wal",
+    "vault_checkpoint_heal",
 )
 
 
@@ -75,9 +76,11 @@ def verify_chaos_invariants(
             f"[{scenario_name}] per-node tx_seq {seqs} != controller triad_tx_seq {ctrl.triad_tx_seq}"
         )
 
-    # Invariant 1: Every acknowledged write marker is present in all 3 nodes' SQL state.
+    # Invariant 1: Every acknowledged write marker is present in all 3 nodes' SQL state
+    # (using paginated `.dump kv` so >31-row tables are never truncated by interactive SELECT display caps).
     for n in ctrl.nodes:
-        out = ctrl.send_shell_cmd(n, "sql SELECT * FROM kv")
+        tdump = ctrl._dump_node_sql_table(n, "kv")
+        out = tdump["select_text"] if tdump is not None else ctrl.send_shell_cmd(n, "sql SELECT * FROM kv")
         for marker in acknowledged_markers:
             if marker not in out:
                 raise AssertionError(
@@ -344,15 +347,73 @@ def scenario_crash_pending_wal(work: Path, harness: tc.RealOsShellHarness, rng: 
         ctrl2.shutdown()
 
 
+def scenario_vault_checkpoint_heal(work: Path, harness: tc.RealOsShellHarness, rng: random.Random) -> dict:
+    """Put & delete Vault secrets + >35 SQL rows, checkpoint WAL, wipe a node, and heal from checkpoint."""
+    sdir = work / "vault_checkpoint_heal"
+    ctrl = _new_controller("chaos-vch", sdir, harness, reset_tables=True)
+    acked: list[str] = []
+    try:
+        assert ctrl.execute_triad_app("vault put live_secret KeepSec42")["ok"]
+        assert ctrl.execute_triad_app("vault put doomed_secret DeleteMe99")["ok"]
+        assert ctrl.execute_triad_app("vault del doomed_secret")["ok"]
+        acked.append("v:live_secret")
+
+        for idx in range(36):
+            marker = f"vch-{idx:02d}-{rng.randint(1000, 9999)}"
+            res = ctrl.execute_triad_sql(
+                f"INSERT OR REPLACE INTO kv VALUES ('chaos.vch.{idx:02d}', '{marker}', {idx + 1})"
+            )
+            assert res["ok"], res
+            acked.append(marker)
+
+        assert ctrl.checkpoint_wal(), "WAL checkpoint must succeed across 3/3 nodes"
+        victim = ctrl.nodes[rng.choice((0, 1, 2))]
+        prev_morph = victim.morph_count
+        ctrl._reset_sql_vote_tables(victim)
+        ctrl.compute_and_verify_raid_parity()
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if (
+                victim.state == "ONLINE"
+                and victim.morph_count > prev_morph
+                and ctrl._state_probe(victim) == ctrl._state_probe(ctrl.nodes[victim.node_id % 3])
+            ):
+                break
+            time.sleep(0.02)
+
+        # Ensure healed victim decrypted `live_secret` under its own hardware seal key AND did not resurrect `doomed_secret`!
+        vget = ctrl.execute_triad_app("vault get live_secret")
+        assert vget["ok"] and "KeepSec42" in vget["output"], vget
+        vlist = ctrl.execute_triad_app("vault list")
+        assert vlist["ok"] and "doomed_secret" not in vlist["output"], vlist
+
+        verify_chaos_invariants(ctrl, acked, "vault_checkpoint_heal")
+        return {
+            "scenario": "vault_checkpoint_heal",
+            "healed_node": victim.node_id,
+            "tx_seq": ctrl.triad_tx_seq,
+        }
+    finally:
+        ctrl.shutdown()
+
+
 def verify_oracle_catches_planted_divergence(work: Path, harness: tc.RealOsShellHarness) -> None:
-    """Negative test: ensure verify_chaos_invariants catches a planted missing write."""
+    """Negative + >35-row pagination test: ensure verify_chaos_invariants checks all rows via .dump and catches missing writes."""
     sdir = work / "oracle_negative"
     ctrl = _new_controller("chaos-neg", sdir, harness, reset_tables=True)
     try:
-        ctrl.execute_triad_sql("INSERT OR REPLACE INTO kv VALUES ('chaos.neg', 'present', 1)")
+        cap_markers: list[str] = []
+        for idx in range(40):
+            m = f"present-row-{idx:02d}"
+            r = ctrl.execute_triad_sql(f"INSERT OR REPLACE INTO kv VALUES ('chaos.neg.{idx:02d}', '{m}', {idx + 1})")
+            assert r["ok"], r
+            cap_markers.append(m)
         ctrl.log_event("ALERT", "Synthetic alert for oracle test", code="SPLIT_BRAIN")
+        # Must verify all 40 markers across all 3 nodes without hitting the 31-row SELECT display limit!
+        verify_chaos_invariants(ctrl, cap_markers, "oracle_40_rows")
         try:
-            verify_chaos_invariants(ctrl, ["present", "planted-missing-write"], "oracle_negative")
+            verify_chaos_invariants(ctrl, cap_markers + ["planted-missing-write"], "oracle_negative")
             raise AssertionError("Chaos oracle must fail when an acknowledged write is missing")
         except AssertionError as e:
             assert "planted-missing-write" in str(e), e
@@ -371,6 +432,7 @@ def run_chaos(selected: str, seed: int) -> int:
         "hung_node": scenario_hung_node,
         "delayed_quorum": scenario_delayed_quorum,
         "crash_pending_wal": scenario_crash_pending_wal,
+        "vault_checkpoint_heal": scenario_vault_checkpoint_heal,
     }
     to_run = list(SCENARIOS) if selected == "all" else [selected]
     results = []

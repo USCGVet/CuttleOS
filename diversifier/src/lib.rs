@@ -148,6 +148,9 @@ pub fn perturb_decision_label(d: &codegen_perturb::PerturbDecision) -> &'static 
         PerturbDecision::InlineNever => "inline-never",
         PerturbDecision::Ineligible(Reason::MainFn) => "ineligible:main-fn",
         PerturbDecision::Ineligible(Reason::AlreadyInline) => "ineligible:already-inline",
+        PerturbDecision::Ineligible(Reason::ConstFn) => "ineligible:const-fn",
+        PerturbDecision::Ineligible(Reason::ExternOrAbiFn) => "ineligible:extern-fn",
+        PerturbDecision::Ineligible(Reason::TestFn) => "ineligible:test-fn",
     }
 }
 

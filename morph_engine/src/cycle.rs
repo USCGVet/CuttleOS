@@ -387,9 +387,16 @@ pub fn run_cycle(args: &CycleArgs) -> Result<()> {
     let attest_div_log = prep.attest_div_log.clone();
 
     // === Stage 3: verify ===
-    let status_ok = run_verifier(args, &source_path, &cand_path)?;
+    let status_ok = match run_verifier(args, &source_path, &cand_path) {
+        Ok(ok) => ok,
+        Err(e) => {
+            let _ = fs::remove_file(&cand_path);
+            return Err(e);
+        }
+    };
     if !status_ok {
         eprintln!("morph: candidate REJECTED by verifier — rolling back");
+        let _ = fs::remove_file(&cand_path);
         let rej_diversity = build_cycle_diversity(
             Some(&attest_div_log),
             None,
@@ -410,7 +417,9 @@ pub fn run_cycle(args: &CycleArgs) -> Result<()> {
             None, // rejected before any image build → no layout seed
             rej_diversity,
             args.durable_seals_dir.as_deref(),
-            None, // rejected entries stay legacy-schema (zero sig, unsigned)
+            // Sign rejected entries at v11 when a factory signing key is available so
+            // chains with prior v11 entries never violate the monotonic schema floor!
+            load_signing_key().ok(),
         )?;
         bail!("verifier rejected candidate for module {}", args.module);
     }
@@ -1378,6 +1387,11 @@ pub fn run_bundle(args: &BundleCycleArgs) -> Result<()> {
                 .perturb_decisions
                 .insert(format!("{}::{}", module, fname), label);
         }
+        for (fname, label) in member_div_log.semantic_decisions {
+            bundle_div_log
+                .semantic_decisions
+                .insert(format!("{}::{}", module, fname), label);
+        }
         // `canonical_hash` returns a 32-byte SHA-256; we use the bytes
         // directly to compute the bundle hash and emit the hex form
         // only when writing the attestation entry.
@@ -1424,9 +1438,18 @@ pub fn run_bundle(args: &BundleCycleArgs) -> Result<()> {
         cmd.arg("--bundle-module")
             .arg(format!("{}={}", s.name, s.candidate_path.display()));
     }
-    let status = cmd
+    let status = match cmd
         .status()
-        .with_context(|| format!("run {}", verify_exe.display()))?;
+        .with_context(|| format!("run {}", verify_exe.display()))
+    {
+        Ok(st) => st,
+        Err(e) => {
+            for s in &staged {
+                let _ = fs::remove_file(&s.candidate_path);
+            }
+            return Err(e);
+        }
+    };
     if !status.success() {
         eprintln!(
             "morph: bundle {} REJECTED by verifier — wiping staged candidates",
@@ -1449,7 +1472,7 @@ pub fn run_bundle(args: &BundleCycleArgs) -> Result<()> {
             Some(bundle_div_log.clone()),
             None,
             rej_div,
-            None, // rejected entries stay legacy-schema (zero sig, unsigned)
+            load_signing_key().ok(),
         )?;
         bail!(
             "verifier rejected bundle {} (cycle {})",
@@ -1768,8 +1791,15 @@ pub const PROPOSAL_SCHEMA_VERSION: u64 = 1;
 /// rejections).
 pub fn propose_cycle(args: &CycleArgs, out_path: &Path) -> Result<()> {
     let prep = prepare_candidate(args)?;
-    let ok = run_verifier(args, &prep.source_path, &prep.cand_path)?;
+    let ok = match run_verifier(args, &prep.source_path, &prep.cand_path) {
+        Ok(ok) => ok,
+        Err(e) => {
+            let _ = fs::remove_file(&prep.cand_path);
+            return Err(e);
+        }
+    };
     if !ok {
+        let _ = fs::remove_file(&prep.cand_path);
         bail!(
             "proposer: verifier rejected candidate for module {} — no proposal written",
             args.module
@@ -1842,8 +1872,15 @@ pub fn attest_proposal(args: &CycleArgs, proposal_path: &Path) -> Result<()> {
     // proposer's `proposer_verified_ok` flag is treated as a claim,
     // never as evidence.
     let source_path = args.target_dir.join(format!("{}.rs", args.module));
-    let ok = run_verifier(args, &source_path, &cand_path)?;
+    let ok = match run_verifier(args, &source_path, &cand_path) {
+        Ok(ok) => ok,
+        Err(e) => {
+            let _ = fs::remove_file(&cand_path);
+            return Err(e);
+        }
+    };
     if !ok {
+        let _ = fs::remove_file(&cand_path);
         bail!(
             "independent re-verification REJECTED the proposal candidate (module {})",
             args.module
@@ -1885,11 +1922,7 @@ pub fn attest_proposal(args: &CycleArgs, proposal_path: &Path) -> Result<()> {
         true,
         // Proposer's recorded label is informational; the attested bytes
         // are what the verifier re-derived. Preserve known labels.
-        match proposal.synthesizer.as_str() {
-            "prompt-only" => "prompt-only",
-            "anthropic" => "anthropic",
-            _ => "passthrough",
-        },
+        normalize_proposal_synthesizer(&proposal.synthesizer),
         None,
         None,
         Some(proposal.diversifier_log),
@@ -1905,6 +1938,15 @@ pub fn attest_proposal(args: &CycleArgs, proposal_path: &Path) -> Result<()> {
         hex(&cand_hash)
     );
     Ok(())
+}
+
+fn normalize_proposal_synthesizer(s: &str) -> &'static str {
+    match s {
+        "prompt-only" => "prompt-only",
+        "anthropic" => "anthropic",
+        "fireworks" => "fireworks",
+        _ => "passthrough",
+    }
 }
 
 /// Tiny hex helper used by the bundle code paths. Mirrors
@@ -2097,5 +2139,14 @@ mod tests {
             vargs.windows(2).any(|w| w == ["--target-crate", "target_enterprise"]),
             "missing --target-crate target_enterprise in {vargs:?}"
         );
+    }
+
+    #[test]
+    fn proposal_synthesizer_preserves_fireworks_and_known_labels() {
+        assert_eq!(normalize_proposal_synthesizer("fireworks"), "fireworks");
+        assert_eq!(normalize_proposal_synthesizer("anthropic"), "anthropic");
+        assert_eq!(normalize_proposal_synthesizer("prompt-only"), "prompt-only");
+        assert_eq!(normalize_proposal_synthesizer("passthrough"), "passthrough");
+        assert_eq!(normalize_proposal_synthesizer("unknown"), "passthrough");
     }
 }

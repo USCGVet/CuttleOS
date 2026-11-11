@@ -405,10 +405,10 @@ fn compile_and_test(
             return Ok(false);
         }
 
-        // Run the golden integration test — only for target_minimal,
-        // which is where the golden suite lives. Other target crates
-        // have their own test surfaces; for bundle mode against
-        // target_enterprise the build step itself is the verification.
+        // Run the crate's semantic verification suite:
+        // - `target_minimal`: runs the `golden` integration test.
+        // - `target_enterprise`: runs `--lib` unit tests (~1,777 in-tree unit tests;
+        //   no `[dev-dependencies]` are required for `--lib`).
         if is_target_minimal {
             let mut test = Command::new(&cargo);
             test.arg("test")
@@ -429,6 +429,30 @@ fn compile_and_test(
             if !test_status.success() {
                 eprintln!(
                     "verify: candidate failed the golden test in scratch dir {}",
+                    scratch.display()
+                );
+                return Ok(false);
+            }
+        } else if package_name == "target_enterprise" {
+            let mut lib_test = Command::new(&cargo);
+            lib_test
+                .arg("test")
+                .arg("--release")
+                .arg("--lib")
+                .arg("-p")
+                .arg(&package_name)
+                .arg("--target-dir")
+                .arg(&target_dir);
+            if scratch.join("Cargo.lock").exists() {
+                lib_test.arg("--offline");
+            }
+            lib_test.current_dir(&scratch);
+            let lib_status = lib_test.status().with_context(|| {
+                format!("invoke cargo test --lib in {}", scratch.display())
+            })?;
+            if !lib_status.success() {
+                eprintln!(
+                    "verify: candidate failed target_enterprise --lib unit tests in scratch dir {}",
                     scratch.display()
                 );
                 return Ok(false);
@@ -1030,3 +1054,38 @@ fn append_perf_record(perf_log_path: &Path, metrics: &PerfMetrics) -> Result<()>
 // `read_baseline_window`, and the new `evaluate_perf_gate` all live in
 // `cuttle_verifier::perf` (in `lib.rs`). Static reject stages live in
 // `cuttle_verifier::static_checks`. The binary just calls them.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_enterprise_candidate_that_compiles_but_breaks_unit_test_is_rejected() {
+        let ws_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .to_path_buf();
+        let watchdog_path = ws_root
+            .join("target_enterprise")
+            .join("src")
+            .join("watchdog.rs");
+        let orig = fs::read_to_string(&watchdog_path).expect("read watchdog.rs");
+        // Inject a unit test failure that still compiles cleanly under `cargo build --release`!
+        let broken = format!(
+            "{orig}\n#[cfg(test)]\nmod stage8_verifier_gate_probe {{\n    #[test]\n    fn must_run_in_verifier() {{ panic!(\"semantic regression caught by unit test\"); }}\n}}\n"
+        );
+        let subs = vec![("watchdog".to_string(), broken)];
+        let perf_opts = PerfOptions {
+            threshold_pct: 20,
+            window: 5,
+            baseline_override: None,
+            skip_check: true,
+        };
+        let accepted = compile_and_test(&watchdog_path, "target_enterprise", &subs, &perf_opts)
+            .expect("compile_and_test infra ok");
+        assert!(
+            !accepted,
+            "target_enterprise candidate that compiles cleanly but fails a --lib unit test MUST be rejected by verifier!"
+        );
+    }
+}
