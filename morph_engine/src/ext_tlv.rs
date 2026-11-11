@@ -26,7 +26,7 @@ pub const EXT_TLV_TAG_COUNT: usize = 3;
 
 /// Build the default three-tag extension blob for a cycle accept/reject.
 pub fn build_ext_tlv_b64(cycle: u64, module: &str, candidate_sha256_hex: &str) -> Result<String> {
-    let mut raw = [0u8; 256];
+    let mut raw = [0u8; 512];
     let mut pos = 0usize;
 
     let cycle_le = cycle.to_le_bytes();
@@ -41,7 +41,7 @@ pub fn build_ext_tlv_b64(cycle: u64, module: &str, candidate_sha256_hex: &str) -
     pos += AttestTlvImpl::encode(ATTEST_TLV_TAG_SEED, &seed8, &mut raw[pos..])
         .map_err(|e| anyhow::anyhow!("encode seed TLV: {:?}", e))?;
 
-    let mut b64 = [0u8; 512];
+    let mut b64 = [0u8; 768];
     let n = Base64Impl::encode(&raw[..pos], &mut b64)
         .map_err(|e| anyhow::anyhow!("base64 encode ext tlv: {:?}", e))?;
     Ok(std::str::from_utf8(&b64[..n])
@@ -60,6 +60,13 @@ pub fn verify_ext_tlv_b64(
     let n = Base64Impl::decode(b64.as_bytes(), &mut raw)
         .map_err(|e| anyhow::anyhow!("ext_tlv_b64: base64 decode failed: {:?}", e))?;
     let buf = &raw[..n];
+
+    let mut canon = [0u8; 768];
+    let canon_n = Base64Impl::encode(buf, &mut canon)
+        .map_err(|e| anyhow::anyhow!("ext_tlv_b64: canonical base64 encode failed: {:?}", e))?;
+    if &canon[..canon_n] != b64.as_bytes() {
+        bail!("ext_tlv_b64: non-canonical Base64 encoding");
+    }
 
     let count = AttestTlvImpl::count_sequence(buf)
         .map_err(|e| anyhow::anyhow!("ext_tlv_b64: TLV sequence parse: {:?}", e))?;
@@ -110,11 +117,18 @@ pub fn verify_ext_tlv_b64(
         if rec.tag != ATTEST_TLV_TAG_SEED {
             bail!("ext_tlv_b64: third tag want SEED got {}", rec.tag);
         }
+        if rec.value_len != 8 {
+            bail!("ext_tlv_b64: seed value len {}", rec.value_len);
+        }
         let expect = first8_from_hex(candidate_sha256_hex)?;
         let v = &buf[off + rec.value_off..off + rec.value_off + rec.value_len];
         if v != expect {
             bail!("ext_tlv_b64: seed prefix mismatch candidate_sha256");
         }
+        off += 4 + rec.value_len;
+    }
+    if off != buf.len() {
+        bail!("ext_tlv_b64: trailing bytes after third TLV");
     }
 
     Ok(())
@@ -122,9 +136,9 @@ pub fn verify_ext_tlv_b64(
 
 fn first8_from_hex(hex: &str) -> Result<[u8; 8]> {
     let h = hex.trim();
-    if h.len() < 16 {
+    if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!(
-            "candidate_sha256 too short for 8-byte seed prefix (len={})",
+            "candidate_sha256 must be exactly 64 ASCII hex chars (len={})",
             h.len()
         );
     }
@@ -201,5 +215,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn stage11_ext_tlv_utf8_hex_256b_module_and_canonical_b64() {
+        // 1. Multibyte UTF-8 in `candidate_sha256` must return Err cleanly (never UTF-8 slice panic),
+        //    and non-64-hex suffixes must be rejected.
+        assert!(build_ext_tlv_b64(1, "kernel", "éééééééééééééééé").is_err());
+        assert!(build_ext_tlv_b64(
+            1,
+            "kernel",
+            "39b94ac83ca00c15ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+        )
+        .is_err());
+
+        // 2. Up to 256-byte module names must fit in `build_ext_tlv_b64` and round-trip cleanly.
+        let long_mod = "m".repeat(250);
+        let sha = "39b94ac83ca00c15a2f4c292e41717f9e390b3c3157bb6428a519c9b42b0a7d8";
+        let b64 = build_ext_tlv_b64(9, &long_mod, sha)
+            .expect("250-byte module name must encode cleanly in ext_tlv_b64");
+        verify_ext_tlv_b64(&b64, 9, &long_mod, sha)
+            .expect("250-byte module name must verify cleanly");
+
+        // 3. Non-canonical whitespace-wrapped Base64 must be rejected by `verify_ext_tlv_b64`.
+        assert!(
+            verify_ext_tlv_b64(&format!("  {b64}\n"), 9, &long_mod, sha).is_err(),
+            "verify_ext_tlv_b64 must enforce canonical Base64 without leading/trailing whitespace"
+        );
     }
 }

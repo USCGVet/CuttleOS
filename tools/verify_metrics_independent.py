@@ -93,6 +93,17 @@ def parse_elf64_independent(raw: bytes) -> IndependentElfView:
         raise ValueError(f"expected EM_X86_64 (62), got {e_machine}")
     if e_shoff == 0 or e_shnum == 0:
         raise ValueError("ELF image has no section headers")
+    if e_shentsize < 64:
+        raise ValueError(f"ELF64 e_shentsize {e_shentsize} < 64")
+    if e_shoff + e_shnum * e_shentsize > len(raw):
+        raise ValueError("ELF64 section header table extends past end of file")
+    if not (0 <= e_shstrndx < e_shnum):
+        raise ValueError(f"ELF64 e_shstrndx {e_shstrndx} out of range for {e_shnum} sections")
+
+    def _slice_checked(blob: bytes, off: int, size: int, desc: str) -> bytes:
+        if off < 0 or size < 0 or off + size > len(blob):
+            raise ValueError(f"ELF64 {desc} [{off}..{off + size}) exceeds image length {len(blob)}")
+        return blob[off : off + size]
 
     shdrs = []
     for idx in range(e_shnum):
@@ -101,7 +112,7 @@ def parse_elf64_independent(raw: bytes) -> IndependentElfView:
 
     shstr_shdr = shdrs[e_shstrndx]
     shstr_off, shstr_size = shstr_shdr[4], shstr_shdr[5]
-    shstrtab = raw[shstr_off : shstr_off + shstr_size]
+    shstrtab = _slice_checked(raw, shstr_off, shstr_size, ".shstrtab")
 
     def read_cstr(blob: bytes, offset: int) -> str:
         if offset < 0 or offset >= len(blob):
@@ -126,17 +137,22 @@ def parse_elf64_independent(raw: bytes) -> IndependentElfView:
         elif sh_type == SHT_SYMTAB:
             symtab_shdr = sh
 
-    if text_vaddr is None or text_offset is None or text_size is None:
-        raise ValueError("no .text section found in ELF64")
+    if text_vaddr is None or text_offset is None or text_size is None or text_size == 0:
+        raise ValueError("no non-empty .text section found in ELF64")
 
-    text_bytes = raw[text_offset : text_offset + text_size]
+    text_bytes = _slice_checked(raw, text_offset, text_size, ".text")
     functions: List[ElfFunctionSymbol] = []
 
     if symtab_shdr is not None:
         _n, _t, _f, _a, sym_off, sym_sz, str_link, _info, _al, sym_entsz = symtab_shdr
         entsz = sym_entsz or 24
+        if entsz < 24:
+            raise ValueError(f"ELF64 symtab entry size {entsz} < 24")
+        if not (0 <= str_link < len(shdrs)):
+            raise ValueError(f"ELF64 symtab sh_link {str_link} out of range")
+        _slice_checked(raw, sym_off, sym_sz, ".symtab")
         str_shdr = shdrs[str_link]
-        strtab = raw[str_shdr[4] : str_shdr[4] + str_shdr[5]]
+        strtab = _slice_checked(raw, str_shdr[4], str_shdr[5], ".strtab")
         count = sym_sz // entsz
         seen_ranges: Set[Tuple[int, int]] = set()
         for i in range(count):
@@ -639,6 +655,32 @@ def run_self_test(repo_root: Path, allow_missing_kernel: bool = False) -> int:
             base_path.write_bytes(base_bytes)
             base_view = parse_elf64_independent(base_bytes)
 
+            # Stage 11: Reject out-of-bounds `.text` / `.shstrtab` / `e_shstrndx` / `e_shentsize`
+            # with `ValueError` instead of silent Python slice truncation or `IndexError`.
+            trunc_elf = bytearray(base_bytes)
+            # Inflate `.text` sh_size (shdr #1 in synthetic specimen, or find `.text` shdr) past EOF:
+            e_shoff_t = struct.unpack_from("<Q", trunc_elf, 40)[0]
+            e_shentsz_t, e_shnum_t, e_shstr_t = struct.unpack_from("<HHH", trunc_elf, 58)
+            for s_idx in range(e_shnum_t):
+                s_base = e_shoff_t + s_idx * e_shentsz_t
+                s_type = struct.unpack_from("<I", trunc_elf, s_base + 4)[0]
+                if s_type == SHT_PROGBITS:
+                    struct.pack_into("<Q", trunc_elf, s_base + 32, len(trunc_elf) + 4096)
+                    break
+            try:
+                parse_elf64_independent(bytes(trunc_elf))
+                raise RuntimeError("parse_elf64_independent must reject truncated .text section")
+            except ValueError:
+                pass
+
+            bad_shstr_elf = bytearray(base_bytes)
+            struct.pack_into("<H", bad_shstr_elf, 62, e_shnum_t + 5)
+            try:
+                parse_elf64_independent(bytes(bad_shstr_elf))
+                raise RuntimeError("parse_elf64_independent must reject out-of-range e_shstrndx with ValueError")
+            except ValueError:
+                pass
+
             _require(
                 len(base_view.functions) == 3,
                 f"expected 3 functions, got {len(base_view.functions)}",
@@ -798,6 +840,9 @@ def main() -> int:
     if args.self_test:
         return run_self_test(repo_root, allow_missing_kernel=args.allow_missing_kernel)
 
+    if bool(args.base) != bool(args.variant):
+        print("ERROR: --base and --variant must be provided together", file=sys.stderr)
+        return 2
     if args.base and args.variant:
         b_view = parse_elf64_independent(args.base.read_bytes())
         v_view = parse_elf64_independent(args.variant.read_bytes())

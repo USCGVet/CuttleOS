@@ -85,8 +85,23 @@ def _complete(resp: bytes) -> bool:
     head, _, body = resp.partition(b"\r\n\r\n")
     for line in head.split(b"\r\n"):
         if line.lower().startswith(b"content-length:"):
-            return len(body) >= int(line.split(b":", 1)[1])
+            raw_cl = line.split(b":", 1)[1].strip()
+            if not raw_cl.isdigit() or not raw_cl.isascii():
+                return False
+            return len(body) >= int(raw_cl, 10)
     return False
+
+
+def validate_cli_target(port: int, path: str, expect_sha256: str | None) -> None:
+    if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
+        raise ValueError(f"--port {port!r} must be an integer in 1..65535")
+    if not isinstance(path, str) or not path.startswith("/") or any(
+        ch in path for ch in ("\r", "\n", " ", "\t", "\x00")
+    ):
+        raise ValueError(f"--path {path!r} must start with '/' and contain no whitespace or control bytes")
+    if expect_sha256 is not None:
+        if len(expect_sha256) != 64 or any(c not in "0123456789abcdefABCDEF" for c in expect_sha256):
+            raise ValueError("--expect-sha256 must be a 64-character hexadecimal SHA-256 digest")
 
 
 def s_client(openssl: str, host: str, port: int, cafile: str, path: str, extra: list[str]) -> subprocess.CompletedProcess:
@@ -158,6 +173,27 @@ def run_self_test() -> int:
         ["openssl"], 1, "", "sslv3 alert handshake failure"
     )
     assert is_tls_handshake_refusal(hs_fail_res), "TLS handshake failure alert must be accepted"
+
+    # Stage 11: `_complete` must reject negative or non-digit `Content-Length` without crashing
+    # or treating negative lengths as satisfied (`len(body) >= -5`), and CLI target validation
+    # must reject out-of-range ports, CRLF/non-slash `--path`, and malformed `--expect-sha256`.
+    assert not _complete(b"HTTP/1.1 200 OK\r\nContent-Length: -5\r\n\r\n")
+    assert not _complete(b"HTTP/1.1 200 OK\r\nContent-Length: not-a-number\r\n\r\nhi")
+    assert _complete(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+    assert not _complete(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhi")
+    for bad_args in (
+        (0, "/healthz", None),
+        (70000, "/healthz", None),
+        (443, "healthz", None),
+        (443, "/healthz\r\nX-Injected: 1", None),
+        (443, "/healthz", "not-64-hex"),
+    ):
+        try:
+            validate_cli_target(*bad_args)
+            raise AssertionError(f"validate_cli_target must reject {bad_args!r}")
+        except ValueError:
+            pass
+    validate_cli_target(443, "/healthz", "a" * 64)
     print("https_check self-test OK")
     return 0
 
@@ -178,6 +214,10 @@ def main() -> int:
     if not args.port:
         ap.error("--port is required unless --self-test is passed")
     host, port, path = args.host, args.port, args.path
+    try:
+        validate_cli_target(port, path, args.expect_sha256)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     # 1. Certificate, trust on first use.
     try:

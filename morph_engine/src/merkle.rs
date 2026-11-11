@@ -91,6 +91,12 @@ pub enum MerkleError {
         expected: Side,
         got: Side,
     },
+    /// Inclusion proof sits at the odd-layer tail (`pos == layer - 1`),
+    /// where duplicate-last padding requires `sibling == acc`.
+    ProofOddTailMismatch {
+        depth: usize,
+        index: u64,
+    },
 }
 
 impl core::fmt::Display for MerkleError {
@@ -119,6 +125,11 @@ impl core::fmt::Display for MerkleError {
                 f,
                 "merkle: proof side {:?} at depth {} for leaf_index {} disagrees with expected {:?}",
                 got, depth, index, expected
+            ),
+            MerkleError::ProofOddTailMismatch { depth, index } => write!(
+                f,
+                "merkle: odd-tail node at depth {} for leaf_index {} must duplicate itself",
+                depth, index
             ),
         }
     }
@@ -319,6 +330,7 @@ pub fn verify_inclusion(
         });
     }
     let mut pos = proof.leaf_index;
+    let mut layer = proof.leaf_count;
     let mut acc = *leaf;
     for (d, (side, sibling)) in proof.siblings.iter().enumerate() {
         let expected_side = if pos % 2 == 1 { Side::Left } else { Side::Right };
@@ -330,11 +342,18 @@ pub fn verify_inclusion(
                 got: *side,
             });
         }
+        if layer % 2 == 1 && pos == layer - 1 && *sibling != acc {
+            return Err(MerkleError::ProofOddTailMismatch {
+                depth: d,
+                index: proof.leaf_index,
+            });
+        }
         acc = match side {
             Side::Left => hash_pair(sibling, &acc),
             Side::Right => hash_pair(&acc, sibling),
         };
         pos /= 2;
+        layer = layer.div_ceil(2);
     }
     Ok(acc == *expected_root)
 }
@@ -351,10 +370,7 @@ pub fn depth_for_count(count: u64) -> usize {
     let mut layer = count;
     let mut d = 0usize;
     while layer > 1 {
-        if layer % 2 == 1 {
-            layer += 1;
-        }
-        layer /= 2;
+        layer = layer.div_ceil(2);
         d += 1;
     }
     d
@@ -618,6 +634,29 @@ mod tests {
         assert!(
             res.is_err(),
             "verify_inclusion must reject a proof whose Side disagrees with leaf_index, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn stage11_depth_for_u64_max_and_odd_tail_self_duplicate_enforced() {
+        // 1. `depth_for_count(u64::MAX)` must return 64 without `layer += 1` overflow.
+        assert_eq!(depth_for_count(u64::MAX), 64);
+
+        // 2. Odd-tail inclusion proof must enforce `sibling == acc` at every odd layer tail:
+        //    a 4-leaf tree `[L0, L1, L2, L3]` (`L2 != L3`) must NOT verify `L2` under a
+        //    `leaf_count = 3, leaf_index = 2` proof that sneaks `L3` in as `Right` sibling!
+        let leaves = synthetic_leaves(4);
+        let root4 = compute_root(&leaves).unwrap();
+        let h01 = hash_pair(&leaves[0], &leaves[1]);
+        let forged_odd_tail = MerkleProof {
+            leaf_index: 2,
+            leaf_count: 3,
+            siblings: vec![(Side::Right, leaves[3]), (Side::Left, h01)],
+        };
+        let res = verify_inclusion(&leaves[2], &forged_odd_tail, &root4);
+        assert!(
+            res.is_err(),
+            "verify_inclusion must reject odd-tail proof whose sibling != self-duplicate, got {res:?}"
         );
     }
 }

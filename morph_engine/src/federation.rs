@@ -196,6 +196,13 @@ pub fn reject_fixture_signers(fed: &FederationConfig) -> Result<()> {
         }
         let pk = parse_pubkey(&s.pubkey_hex)
             .with_context(|| format!("signer '{}' has malformed pubkey_hex", s.id))?;
+        if pk.is_weak() {
+            bail!(
+                "federation config: signer '{}' uses weak/small-order Ed25519 public key {}",
+                s.id,
+                s.pubkey_hex
+            );
+        }
         reject_fixture_verifying_key(&pk, &s.id)?;
         if !seen_keys.insert(pk.to_bytes()) {
             bail!(
@@ -233,6 +240,18 @@ pub fn load_federation(path: &Path) -> Result<FederationConfig> {
     }
     let mut seen = HashSet::new();
     for s in &cfg.signers {
+        if s.id.is_empty()
+            || s.id.len() > 64
+            || !s
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+        {
+            bail!(
+                "federation config: invalid signer id {:?} (must be 1..=64 ASCII [A-Za-z0-9_.-] chars)",
+                s.id
+            );
+        }
         if !seen.insert(s.id.clone()) {
             bail!("federation config: duplicate signer id '{}'", s.id);
         }
@@ -815,5 +834,53 @@ mod tests {
             verify_cosignatures(&msg, &cosigs, &cfg).is_err(),
             "verify_cosignatures must reject small-order torsion public keys and signatures"
         );
+    }
+
+    #[test]
+    fn stage11_load_federation_rejects_weak_torsion_key_and_invalid_signer_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "cuttle_stage11_fed_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // 1. Small-order Ed25519 torsion key must be rejected at `load_federation` & `verify_production_keyset`
+        //    (not only later during `verify_cosignatures`).
+        let identity_pt = format!("01{}", "00".repeat(31));
+        let sk_valid = random_sk();
+        let weak_fed_path = dir.join("weak_fed.toml");
+        fs::write(
+            &weak_fed_path,
+            format!(
+                "threshold = 2\n[[signers]]\nid = \"torsion\"\npubkey_hex = \"{identity_pt}\"\n[[signers]]\nid = \"valid\"\npubkey_hex = \"{}\"\n",
+                pk_hex(&sk_valid)
+            ),
+        )
+        .unwrap();
+        assert!(
+            load_federation(&weak_fed_path).is_err(),
+            "load_federation must reject small-order torsion public keys"
+        );
+
+        // 2. Empty, whitespace, or '=' signer IDs must be rejected by `load_federation`.
+        for bad_id in ["", "bad id", "sig=inject"] {
+            let p = dir.join("bad_id.toml");
+            fs::write(
+                &p,
+                format!(
+                    "threshold = 1\n[[signers]]\nid = {:?}\npubkey_hex = \"{}\"\n",
+                    bad_id,
+                    pk_hex(&sk_valid)
+                ),
+            )
+            .unwrap();
+            assert!(
+                load_federation(&p).is_err(),
+                "load_federation must reject invalid signer id {bad_id:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

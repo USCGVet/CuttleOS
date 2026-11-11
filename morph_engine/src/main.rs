@@ -643,21 +643,7 @@ fn cmd_cosign(args: &[String]) -> Result<()> {
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&seed_bytes);
     let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-    let derived_pk: String = sk
-        .verifying_key()
-        .to_bytes()
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
-    if derived_pk != signer.pubkey_hex {
-        bail!(
-            "seed file {} produces pubkey {} but federation config has {} for signer '{}'",
-            seed_file.display(),
-            derived_pk,
-            signer.pubkey_hex,
-            signer_id
-        );
-    }
+    validate_cosigner_key(&sk, &fed, &signer_id, &signer.pubkey_hex, &seed_file)?;
 
     let mut entries = load_entries()?;
     if entries.is_empty() {
@@ -775,6 +761,7 @@ fn cmd_sign_policy(args: &[String]) -> Result<()> {
         }
         None => cuttle_morph_engine::load_signing_key()?,
     };
+    federation::reject_fixture_verifying_key(&sk.verifying_key(), &signer_id)?;
     let signed = if append {
         factory::append_policy_signature_str(&raw, &signer_id, &sk)
     } else {
@@ -793,4 +780,70 @@ fn cmd_sign_policy(args: &[String]) -> Result<()> {
         append
     );
     Ok(())
+}
+
+fn validate_cosigner_key(
+    sk: &ed25519_dalek::SigningKey,
+    fed: &federation::FederationConfig,
+    signer_id: &str,
+    expected_pubkey_hex: &str,
+    seed_file: &Path,
+) -> Result<()> {
+    let vk = sk.verifying_key();
+    if vk.is_weak() {
+        bail!(
+            "seed file {} for signer '{}' derives a weak/small-order Ed25519 public key",
+            seed_file.display(),
+            signer_id
+        );
+    }
+    federation::reject_fixture_verifying_key(&vk, signer_id)?;
+    federation::reject_revoked_verifying_key(&vk, fed, signer_id)?;
+    let derived_pk: String = vk
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    if derived_pk != expected_pubkey_hex {
+        bail!(
+            "seed file {} produces pubkey {} but federation config has {} for signer '{}'",
+            seed_file.display(),
+            derived_pk,
+            expected_pubkey_hex,
+            signer_id
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage11_cosign_rejects_revoked_and_fixture_keys() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x93u8; 32]);
+        let pk_hex: String = sk
+            .verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let fed = federation::FederationConfig {
+            threshold: 1,
+            signers: vec![federation::Signer {
+                id: "revoked_op".into(),
+                pubkey_hex: pk_hex.clone(),
+            }],
+            revoked: vec![federation::RevokedSigner {
+                pubkey_hex: pk_hex.clone(),
+                since_unix: 1700000000,
+                reason: "compromised".into(),
+            }],
+        };
+        assert!(
+            validate_cosigner_key(&sk, &fed, "revoked_op", &pk_hex, Path::new("op.seed")).is_err(),
+            "cmd_cosign must refuse signing with a key listed in fed.revoked"
+        );
+    }
 }

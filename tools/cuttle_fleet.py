@@ -51,6 +51,7 @@ FLEET_DIR = tc.IMAGES_DIR / "fleet"
 FARM_SECRET_ENV = "CUTTLE_FARM_SECRET"
 FLEET_DIR_ENV = "CUTTLE_FLEET_DIR"
 CLIENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,30}$")
+JOB_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 VALID_ROLES = ("wfe", "sql", "shell", "full")
 # Service whose request counter is a job's headline KPI.
 PRIMARY_SERVICE = {"wfe": "svc-http", "sql": "svc-sql", "shell": "svc-sh", "full": "svc-sh"}
@@ -64,17 +65,27 @@ HISTORY_LEN = 60
 def load_fleet_config(path: Path = FLEET_CONFIG) -> dict:
     cfg = tomllib.loads(path.read_text(encoding="utf-8"))
     jobs, plans, clients = cfg.get("jobs", {}), cfg.get("plans", {}), cfg.get("clients", [])
+    if not clients:
+        raise ValueError("fleet config must declare at least 1 client")
     for job_id, job in jobs.items():
+        if not JOB_ID_RE.match(job_id):
+            raise ValueError(f"job id {job_id!r} must match {JOB_ID_RE.pattern}")
         if job.get("role") not in VALID_ROLES:
             raise ValueError(f"job '{job_id}': role must be one of {VALID_ROLES}")
     for plan_id, plan in plans.items():
-        for job_id in plan.get("jobs", []):
+        plan_jobs = plan.get("jobs", [])
+        for job_id in plan_jobs:
             if job_id not in jobs:
                 raise ValueError(f"plan '{plan_id}' uses unknown job '{job_id}'")
-        if not 1 <= len(plan.get("jobs", [])) <= 5:
+        if len(set(plan_jobs)) != len(plan_jobs):
+            raise ValueError(f"plan '{plan_id}' has duplicate jobs in {plan_jobs!r}")
+        if not 1 <= len(plan_jobs) <= 5:
             raise ValueError(
                 f"plan '{plan_id}' must have 1-5 jobs (port block is 100 per client with +50 HTTPS offset)"
             )
+        vcpus = plan.get("vcpus", 2)
+        if not isinstance(vcpus, int) or isinstance(vcpus, bool) or not (1 <= vcpus <= 64):
+            raise ValueError(f"plan '{plan_id}': vcpus {vcpus!r} must be an integer in 1..64")
     for where, value in [("provider", cfg.get("provider", {}).get("accelerator"))] + [
         (f"plan '{p}'", v.get("accelerator")) for p, v in plans.items()
     ]:
@@ -90,7 +101,22 @@ def load_fleet_config(path: Path = FLEET_CONFIG) -> dict:
             raise ValueError(f"client '{c['id']}' uses unknown plan '{c.get('plan')}'")
         seen.add(c["id"])
 
-    prov = cfg.get("provider", {})
+    prov = cfg.setdefault("provider", {})
+    prov.setdefault("port", 18888)
+    prov.setdefault("farm_port_base", 18900)
+    prov.setdefault("vm_port_base", 20000)
+    prov.setdefault("auth_fail_limit", 40)
+    boot_stagger = prov.get("boot_stagger_s", 8)
+    if (
+        not isinstance(boot_stagger, (int, float))
+        or isinstance(boot_stagger, bool)
+        or boot_stagger < 0
+    ):
+        raise ValueError(f"provider.boot_stagger_s {boot_stagger!r} must be a number >= 0")
+    auth_fail_limit = prov["auth_fail_limit"]
+    if not isinstance(auth_fail_limit, int) or isinstance(auth_fail_limit, bool) or auth_fail_limit < 0:
+        raise ValueError(f"provider.auth_fail_limit {auth_fail_limit!r} must be an integer >= 0")
+
     port_owners: dict[int, str] = {}
 
     def claim_port(p: int, label: str):
@@ -100,10 +126,9 @@ def load_fleet_config(path: Path = FLEET_CONFIG) -> dict:
             raise ValueError(f"port collision on {p}: {label} collides with {port_owners[p]}")
         port_owners[p] = label
 
-    if "port" in prov:
-        claim_port(prov["port"], "provider.port")
-    farm_base = prov.get("farm_port_base", 18900)
-    vm_base = prov.get("vm_port_base", 20000)
+    claim_port(prov["port"], "provider.port")
+    farm_base = prov["farm_port_base"]
+    vm_base = prov["vm_port_base"]
     for slot, c in enumerate(clients):
         cid = c["id"]
         claim_port(farm_base + slot, f"client '{cid}' farm port")
@@ -223,6 +248,9 @@ class Farm:
         for spec in triad_specs(cfg, client):
             self.triads[spec.job] = tc.TriadController(show_gui=False, spec=spec)
         self.load_enabled = bool(cfg["provider"].get("synthetic_load", True))
+        self.auth_fail_limit = int(cfg["provider"].get("auth_fail_limit", 40))
+        self._auth_rate_lock = threading.Lock()
+        self._auth_fail_by_ip: dict[str, list[float]] = {}
         self.booted = False
         self.boot_error = None
         self.started_at = time.time()
@@ -394,6 +422,41 @@ class Farm:
         }
 
 
+def _fleet_auth_rate_limited(handler: tc.TriadHttpHandler, owner) -> bool:
+    if owner is None:
+        return False
+    limit = int(getattr(owner, "auth_fail_limit", 40))
+    if limit <= 0:
+        return False
+    lock = getattr(owner, "_auth_rate_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        owner._auth_rate_lock = lock
+        owner._auth_fail_by_ip = {}
+    client_ip = (handler.client_address[0] if getattr(handler, "client_address", None) else "127.0.0.1") or "127.0.0.1"
+    now = time.monotonic()
+    with lock:
+        hist = [t for t in owner._auth_fail_by_ip.get(client_ip, []) if now - t < 60.0]
+        owner._auth_fail_by_ip[client_ip] = hist
+        return len(hist) >= limit
+
+
+def _fleet_record_auth_failure(handler: tc.TriadHttpHandler, owner) -> None:
+    if owner is None:
+        return
+    lock = getattr(owner, "_auth_rate_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        owner._auth_rate_lock = lock
+        owner._auth_fail_by_ip = {}
+    client_ip = (handler.client_address[0] if getattr(handler, "client_address", None) else "127.0.0.1") or "127.0.0.1"
+    now = time.monotonic()
+    with lock:
+        hist = [t for t in owner._auth_fail_by_ip.get(client_ip, []) if now - t < 60.0]
+        hist.append(now)
+        owner._auth_fail_by_ip[client_ip] = hist
+
+
 class FarmHandler(tc.TriadHttpHandler):
     """Farm API. Every request needs the provider's per-run farm secret.
 
@@ -405,6 +468,9 @@ class FarmHandler(tc.TriadHttpHandler):
 
     farm: Farm = None
     secret: str = ""
+
+    def _has_farm_credentials(self) -> bool:
+        return bool((self.headers.get("X-Cuttle-Farm-Secret") or "").strip()) or self._has_supplied_credentials()
 
     def _is_authenticated(self) -> bool:
         val = (self.headers.get("X-Cuttle-Farm-Secret") or "").strip()
@@ -420,7 +486,16 @@ class FarmHandler(tc.TriadHttpHandler):
         return True
 
     def do_GET(self):
+        has_cred = self._has_farm_credentials()
+        if has_cred and _fleet_auth_rate_limited(self, self.farm):
+            return self._send_json(
+                429,
+                {"ok": False, "error": "too many failed authentication attempts; retry in 60s"},
+                extra_headers={"Retry-After": "60"},
+            )
         if not self._is_authenticated():
+            if has_cred:
+                _fleet_record_auth_failure(self, self.farm)
             return self._send_json(401, {"ok": False, "error": "unauthorized"})
         if self.path.split("?", 1)[0] == "/api/farm":
             return self._send_json(200, self.farm.summary())
@@ -434,7 +509,17 @@ class FarmHandler(tc.TriadHttpHandler):
             return None
         if not self._check_browser_origin(cl):
             return None
+        has_cred = self._has_farm_credentials()
+        if has_cred and _fleet_auth_rate_limited(self, self.farm):
+            self._drain_unread_body_nonblocking(cl)
+            return self._send_json(
+                429,
+                {"ok": False, "error": "too many failed authentication attempts; retry in 60s"},
+                extra_headers={"Retry-After": "60"},
+            )
         if not self._is_authenticated():
+            if has_cred:
+                _fleet_record_auth_failure(self, self.farm)
             self._drain_unread_body_nonblocking(cl)
             return self._send_json(401, {"ok": False, "error": "unauthorized"})
         if self.path in ("/api/load", "/api/shutdown"):
@@ -448,6 +533,7 @@ class FarmHandler(tc.TriadHttpHandler):
             threading.Thread(target=_farm_exit, args=(self.farm,), daemon=True).start()
             return None
         if not self._route_triad():
+            self._drain_unread_body_nonblocking(cl)
             return self._send_json(404, {"error": "unknown endpoint"})
         return tc.TriadHttpHandler.do_POST(self)
 
@@ -463,7 +549,9 @@ def run_farm(client_id: str):
     if len(secret) < 32:
         sys.exit(f"farm: {FARM_SECRET_ENV} must be set by the provider")
     cfg = load_fleet_config(Path(os.environ.get("CUTTLE_FLEET_CONFIG", FLEET_CONFIG)))
-    client = next(c for c in cfg["clients"] if c["id"] == client_id)
+    client = next((c for c in cfg["clients"] if c["id"] == client_id), None)
+    if client is None:
+        sys.exit(f"farm: unknown client {client_id!r}")
     farm = Farm(cfg, client)
     FarmHandler.farm = farm
     FarmHandler.secret = secret
@@ -522,6 +610,9 @@ class Provider:
         self.farm_jobs: dict = {}
         self.cache: dict = {cid: None for cid in self.clients}
         self.lock = threading.Lock()
+        self.auth_fail_limit = int(cfg["provider"].get("auth_fail_limit", 40))
+        self._auth_rate_lock = threading.Lock()
+        self._auth_fail_by_ip: dict[str, list[float]] = {}
         self.running = True
 
     # ---- auth ----
@@ -722,8 +813,18 @@ class ProviderHandler(tc.TriadHttpHandler):
             return
         if not self._check_browser_origin(length):
             return
-        scope, own = self._scope()
+        tok = self._token()
+        if tok and _fleet_auth_rate_limited(self, self.provider):
+            self._drain_unread_body_nonblocking(length)
+            return self._send_json(
+                429,
+                {"ok": False, "error": "too many failed authentication attempts; retry in 60s"},
+                extra_headers={"Retry-After": "60"},
+            )
+        scope, own = self.provider.scope_for(tok)
         if scope is None:
+            if tok:
+                _fleet_record_auth_failure(self, self.provider)
             self._drain_unread_body_nonblocking(length)
             return self._send_json(
                 401,
@@ -733,9 +834,23 @@ class ProviderHandler(tc.TriadHttpHandler):
         return self._dispatch("POST", body, pre_auth=(scope, own))
 
     def _dispatch(self, method: str, body: bytes, pre_auth=None):
-        scope, own = pre_auth if pre_auth is not None else self._scope()
-        if scope is None:
-            return self._send_json(401, {"ok": False, "error": "unauthorized: provide a provider or client token"})
+        if pre_auth is not None:
+            scope, own = pre_auth
+        else:
+            tok = self._token()
+            if tok and _fleet_auth_rate_limited(self, self.provider):
+                return self._send_json(
+                    429,
+                    {"ok": False, "error": "too many failed authentication attempts; retry in 60s"},
+                    extra_headers={"Retry-After": "60"},
+                )
+            scope, own = self.provider.scope_for(tok)
+            if scope is None:
+                if tok:
+                    _fleet_record_auth_failure(self, self.provider)
+                return self._send_json(
+                    401, {"ok": False, "error": "unauthorized: provide a provider or client token"}
+                )
         base = self.path.split("?", 1)[0]
         if method == "POST" and base == "/api/whoami":
             c = self.provider.clients.get(own) if own else None
@@ -826,6 +941,7 @@ farm_port_base = 18950
 vm_port_base = 21000
 boot_stagger_s = 0
 synthetic_load = false
+auth_fail_limit = 500
 
 [jobs.web]
 label = "Web front end"
@@ -1057,8 +1173,124 @@ def run_fleet_unit_tests(work: Path):
             )
             with urllib.request.urlopen(ok_req, timeout=5.0) as resp:
                 assert resp.status == 200
+
+            # Stage 11a: Strict RFC 9110 Content-Length (`^\d+$`, no duplicates, no Transfer-Encoding)
+            # and per-IP failed non-empty credential 429 rate-limiting on ProviderHandler & FarmHandler!
+            import socket as _sock
+
+            with _sock.create_connection(("127.0.0.1", p_port), timeout=5.0) as s:
+                s.sendall(
+                    f"POST /api/whoami HTTP/1.1\r\nHost: 127.0.0.1:{p_port}\r\nContent-Length: +5\r\n\r\nhello".encode(
+                        "ascii"
+                    )
+                )
+                first_line = s.makefile("rb").readline().decode("latin1")
+                assert " 400 " in first_line, f"Content-Length: +5 must be rejected with 400, got {first_line!r}"
+
+            with _sock.create_connection(("127.0.0.1", p_port), timeout=5.0) as s:
+                s.sendall(
+                    f"POST /api/whoami HTTP/1.1\r\nHost: 127.0.0.1:{p_port}\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".encode(
+                        "ascii"
+                    )
+                )
+                first_line = s.makefile("rb").readline().decode("latin1")
+                assert " 400 " in first_line, f"Transfer-Encoding must be rejected with 400, got {first_line!r}"
+
+            poll_prov.auth_fail_limit = 3
+            for _ in range(3):
+                bad_req = urllib.request.Request(
+                    f"http://127.0.0.1:{p_port}/api/fleet",
+                    headers={"X-Cuttle-Session": "wrong-token-guess"},
+                )
+                try:
+                    urllib.request.urlopen(bad_req, timeout=5.0)
+                    raise AssertionError("wrong token must fail")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 401, e.code
+            rl_req = urllib.request.Request(
+                f"http://127.0.0.1:{p_port}/api/fleet",
+                headers={"X-Cuttle-Session": "wrong-token-guess"},
+            )
+            try:
+                urllib.request.urlopen(rl_req, timeout=5.0)
+                raise AssertionError("4th wrong token guess must be rate-limited with 429")
+            except urllib.error.HTTPError as e:
+                assert e.code == 429, f"Expected 429 after auth_fail_limit, got {e.code}"
+                assert e.headers.get("Retry-After") == "60"
         finally:
             p_srv.shutdown()
+
+        # Stage 11b: `load_fleet_config` must reject path-traversal job IDs, duplicate jobs in a plan,
+        # zero/bool vcpus, negative boot_stagger_s, empty clients, and must normalize omitted provider ports.
+        for label, snippet in (
+            ("bad_job_id", '\n[jobs."../escape"]\nrole = "wfe"\n'),
+            ("dup_plan_job", '\n[plans.dup]\njobs = ["web", "web"]\nvcpus = 2\n'),
+            ("bool_vcpus", '\n[plans.bv]\njobs = ["web"]\nvcpus = true\n'),
+            ("zero_vcpus", '\n[plans.zv]\njobs = ["web"]\nvcpus = 0\n'),
+        ):
+            bad_p = work / f"s11_{label}.toml"
+            bad_p.write_text(SELFTEST_CONFIG + snippet, encoding="utf-8")
+            try:
+                load_fleet_config(bad_p)
+                raise AssertionError(f"load_fleet_config must reject {label}")
+            except ValueError:
+                pass
+
+        omitted_ports_p = work / "s11_omitted_ports.toml"
+        omitted_ports_p.write_text(
+            '[jobs.web]\nrole = "wfe"\n[plans.basic]\njobs = ["web"]\n[[clients]]\nid = "alpha"\nplan = "basic"\n',
+            encoding="utf-8",
+        )
+        norm_cfg = load_fleet_config(omitted_ports_p)
+        assert norm_cfg["provider"]["port"] == 18888
+        assert len(triad_specs(norm_cfg, norm_cfg["clients"][0])) == 1
+
+        # Stage 11c: FarmHandler rate-limits wrong non-empty secrets with 429 and drains POST body on 404.
+        dummy_farm_http = object.__new__(Farm)
+        dummy_farm_http.triads = {}
+        dummy_farm_http.load_enabled = False
+        dummy_farm_http.auth_fail_limit = 2
+        FarmHandler.farm = dummy_farm_http
+        FarmHandler.secret = "s" * 48
+        f_srv = ThreadingHTTPServer(("127.0.0.1", 0), FarmHandler)
+        f_port = f_srv.server_address[1]
+        threading.Thread(target=f_srv.serve_forever, daemon=True).start()
+        try:
+            unk_req = urllib.request.Request(
+                f"http://127.0.0.1:{f_port}/api/unknown",
+                data=b"payload-to-drain",
+                headers={"X-Cuttle-Farm-Secret": FarmHandler.secret},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(unk_req, timeout=5.0)
+                raise AssertionError("unknown Farm POST route must return 404")
+            except urllib.error.HTTPError as e:
+                assert e.code == 404, e.code
+            for _ in range(2):
+                try:
+                    urllib.request.urlopen(
+                        urllib.request.Request(
+                            f"http://127.0.0.1:{f_port}/api/farm",
+                            headers={"X-Cuttle-Farm-Secret": "x" * 48},
+                        ),
+                        timeout=5.0,
+                    )
+                except urllib.error.HTTPError as e:
+                    assert e.code == 401, e.code
+            try:
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"http://127.0.0.1:{f_port}/api/farm",
+                        headers={"X-Cuttle-Farm-Secret": "x" * 48},
+                    ),
+                    timeout=5.0,
+                )
+                raise AssertionError("3rd wrong Farm secret must return 429")
+            except urllib.error.HTTPError as e:
+                assert e.code == 429, f"Expected 429 on FarmHandler, got {e.code}"
+        finally:
+            f_srv.shutdown()
     finally:
         if old_fleet_env2 is None:
             os.environ.pop(FLEET_DIR_ENV, None)

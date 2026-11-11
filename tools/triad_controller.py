@@ -4803,15 +4803,23 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         pass
 
     def _validate_content_length(self) -> int | None:
-        raw_len = self.headers.get("Content-Length", "0")
-        try:
-            length = int(raw_len)
-        except ValueError:
+        if self.headers.get("Transfer-Encoding") is not None:
+            self._send_json(
+                400,
+                {"ok": False, "error": "Transfer-Encoding is not supported; use Content-Length"},
+            )
+            return None
+        cl_headers = self.headers.get_all("Content-Length") or []
+        if len(cl_headers) > 1:
+            self._send_json(400, {"ok": False, "error": "duplicate Content-Length headers"})
+            return None
+        if not cl_headers:
+            return 0
+        raw_len = cl_headers[0].strip()
+        if not re.fullmatch(r"[0-9]+", raw_len):
             self._send_json(400, {"ok": False, "error": "invalid Content-Length"})
             return None
-        if length < 0:
-            self._send_json(400, {"ok": False, "error": "negative Content-Length"})
-            return None
+        length = int(raw_len, 10)
         if length > MAX_HTTP_BODY_BYTES:
             self._send_json(
                 413,

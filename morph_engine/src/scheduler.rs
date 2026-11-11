@@ -168,11 +168,62 @@ pub enum NextWork {
     Bundle(NextBundleChoice),
 }
 
+fn validate_safe_ident(kind: &str, name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        anyhow::bail!(
+            "scheduler config: invalid {} identifier {:?} (must be 1..=64 ASCII [A-Za-z0-9_-] chars)",
+            kind,
+            name
+        );
+    }
+    Ok(())
+}
+
+fn validate_module_ident(name: &str) -> Result<()> {
+    let first_ok = name
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_');
+    if !first_ok
+        || name.len() > 64
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        anyhow::bail!(
+            "scheduler config: invalid module identifier {:?} (must be a safe Rust module name without path separators)",
+            name
+        );
+    }
+    Ok(())
+}
+
 pub fn load_config(path: &Path) -> Result<SchedulerConfig> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("read scheduler config {}", path.display()))?;
     let cfg: SchedulerConfig = toml::from_str(&text)
         .with_context(|| format!("parse scheduler config {}", path.display()))?;
+    for (name, mcfg) in &cfg.modules {
+        validate_module_ident(name)?;
+        if mcfg.priority == 0 {
+            anyhow::bail!("scheduler config: module '{}' priority must be >= 1", name);
+        }
+    }
+    for (bname, bcfg) in &cfg.bundles {
+        validate_safe_ident("bundle", bname)?;
+        if bcfg.priority == 0 {
+            anyhow::bail!("scheduler config: bundle '{}' priority must be >= 1", bname);
+        }
+        if bcfg.modules.is_empty() {
+            anyhow::bail!("scheduler config: bundle '{}' must declare at least 1 module", bname);
+        }
+        for m in &bcfg.modules {
+            validate_module_ident(m)?;
+        }
+    }
     Ok(cfg)
 }
 
@@ -193,9 +244,32 @@ pub fn load_state(path: &Path) -> Result<SchedulerState> {
 }
 
 pub fn save_state(path: &Path, state: &SchedulerState) -> Result<()> {
+    use std::io::Write;
     let text = serde_json::to_string_pretty(state).context("serialize scheduler state")?;
-    fs::write(path, text)
-        .with_context(|| format!("write scheduler state {}", path.display()))?;
+    let tmp_name = format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("scheduler_state.json")
+    );
+    let tmp = path.with_file_name(tmp_name);
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .with_context(|| format!("open {}", tmp.display()))?;
+        f.write_all(text.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("sync {}", tmp.display()))?;
+    }
+    if cfg!(windows) && path.exists() {
+        let _ = fs::remove_file(path);
+    }
+    fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
 
@@ -247,10 +321,11 @@ pub fn pick_next_at(
             }
         };
     }
+    let next_cycle = state.global_cycle.checked_add(1)?;
     best.map(|(_, _, name, mcfg)| NextChoice {
         module: name.to_string(),
         config: mcfg.clone(),
-        next_cycle: state.global_cycle + 1,
+        next_cycle,
     })
 }
 
@@ -338,16 +413,17 @@ pub fn pick_next_work_at(
         }
     }
 
+    let next_cycle = state.global_cycle.checked_add(1)?;
     best.map(|(_, pool)| match pool {
         Pool::Module(name, cfg) => NextWork::Module(NextChoice {
             module: name.to_string(),
             config: cfg.clone(),
-            next_cycle: state.global_cycle + 1,
+            next_cycle,
         }),
         Pool::Bundle(name, cfg) => NextWork::Bundle(NextBundleChoice {
             bundle: name.to_string(),
             config: cfg.clone(),
-            next_cycle: state.global_cycle + 1,
+            next_cycle,
         }),
     })
 }
@@ -404,6 +480,7 @@ pub fn record_success_bundle_at(
 /// each restore to `<module>.rs.rollback.tmp`, `sync_all()`s it, and
 /// renames over `<module>.rs`. Returns the number of restored modules.
 pub fn rollback_bundle(cfg: &SchedulerConfig, bundle_name: &str) -> Result<usize> {
+    validate_safe_ident("bundle", bundle_name)?;
     let bcfg = cfg
         .bundles
         .get(bundle_name)
@@ -414,6 +491,7 @@ pub fn rollback_bundle(cfg: &SchedulerConfig, bundle_name: &str) -> Result<usize
     let src_dir = bcfg.workspace.join("src");
     let mut staged_reads: Vec<(String, PathBuf, Vec<u8>)> = Vec::with_capacity(bcfg.modules.len());
     for module in &bcfg.modules {
+        validate_module_ident(module)?;
         let last_good = src_dir.join(format!("{}.last_good.rs", module));
         if !last_good.exists() {
             anyhow::bail!(
@@ -508,6 +586,81 @@ mod tests {
             "// current alpha\n",
             "failed rollback must not partially overwrite earlier bundle members"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage11_scheduler_rejects_zero_priority_path_traversal_and_cycle_overflow() {
+        let dir = std::env::temp_dir().join(format!(
+            "cuttle_stage11_sched_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+
+        // 1. `load_config` must reject priority == 0, empty bundle modules, and path-traversal module names.
+        let zero_prio = dir.join("zero_prio.toml");
+        fs::write(
+            &zero_prio,
+            "[modules.alpha]\npriority = 0\nmax_age_secs = 60\ntarget_dir = \"target_minimal\"\n",
+        )
+        .unwrap();
+        assert!(
+            load_config(&zero_prio).is_err(),
+            "load_config must reject priority = 0"
+        );
+
+        let traversal_cfg = dir.join("traversal.toml");
+        fs::write(
+            &traversal_cfg,
+            "[bundle.k]\npriority = 5\nmax_age_secs = 60\nworkspace = \"target_minimal\"\nmodules = [\"../escape\"]\n",
+        )
+        .unwrap();
+        assert!(
+            load_config(&traversal_cfg).is_err(),
+            "load_config must reject path-traversal module names"
+        );
+
+        // 2. Direct `rollback_bundle` call with a crafted `BundleConfig` containing `../` must also fail closed.
+        let outside = dir.join("outside.last_good.rs");
+        fs::write(&outside, b"// outside\n").unwrap();
+        let mut bad_bundle_cfg = SchedulerConfig::default();
+        bad_bundle_cfg.bundles.insert(
+            "evil".into(),
+            BundleConfig {
+                priority: 1,
+                max_age_secs: 10,
+                workspace: dir.clone(),
+                modules: vec!["../outside".into()],
+                manifest: None,
+            },
+        );
+        assert!(rollback_bundle(&bad_bundle_cfg, "evil").is_err());
+
+        // 3. `pick_next_at` and `pick_next_work_at` must not overflow when `global_cycle == u64::MAX`.
+        let mut ok_cfg = SchedulerConfig::default();
+        ok_cfg.modules.insert(
+            "alpha".into(),
+            ModuleConfig {
+                priority: 1,
+                max_age_secs: 1,
+                target_dir: dir.clone(),
+                manifest: None,
+            },
+        );
+        let mut max_state = SchedulerState::default();
+        max_state.global_cycle = u64::MAX;
+        assert!(pick_next_at(&ok_cfg, &max_state, 100).is_none());
+        assert!(pick_next_work_at(&ok_cfg, &max_state, 100).is_none());
+
+        // 4. `save_state` must persist valid JSON without leaving `.tmp` files behind.
+        let st_path = dir.join("sched_state.json");
+        let mut st = SchedulerState::default();
+        record_success_at(&mut st, "alpha", 7, 12345);
+        save_state(&st_path, &st).expect("save_state");
+        assert!(!dir.join("sched_state.json.tmp").exists());
+        assert_eq!(load_state(&st_path).unwrap().global_cycle, 7);
 
         let _ = fs::remove_dir_all(&dir);
     }
