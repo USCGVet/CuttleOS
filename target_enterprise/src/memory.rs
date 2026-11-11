@@ -301,9 +301,197 @@ pub mod dma_layout {
     }
 }
 
+/// Pure host-testable bounds, protocol, and hardware-framing guards shared by
+/// `target_enterprise_kernel` (`fb_console`, `smp_hw`, `net_service`, `main`).
+pub mod kernel_guards {
+    /// Compute the byte offset of pixel `(x, y)` inside a linear framebuffer.
+    pub const fn fb_checked_pixel_offset(
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        stride: usize,
+        bpp: usize,
+        len: usize,
+    ) -> Option<usize> {
+        if bpp < 3 || x >= w || y >= h || stride < w {
+            return None;
+        }
+        let row_px = match y.checked_mul(stride) {
+            Some(v) => v,
+            None => return None,
+        };
+        let px_idx = match row_px.checked_add(x) {
+            Some(v) => v,
+            None => return None,
+        };
+        let off = match px_idx.checked_mul(bpp) {
+            Some(v) => v,
+            None => return None,
+        };
+        match off.checked_add(2) {
+            Some(last_byte) if last_byte < len => Some(off),
+            _ => None,
+        }
+    }
+
+    /// Pack `(r, g, b)` into hardware byte order (`is_bgr = true` for BGR, `false` for RGB).
+    pub const fn fb_pack_rgb(rgb: (u8, u8, u8), is_bgr: bool) -> [u8; 3] {
+        if is_bgr {
+            [rgb.2, rgb.1, rgb.0]
+        } else {
+            [rgb.0, rgb.1, rgb.2]
+        }
+    }
+
+    /// Translate physical address `phys` in `[0x8000, 0x9000)` into the SMP RX trampoline VA.
+    pub const fn smp_checked_rx_va(base_va: u64, phys: u64) -> Option<u64> {
+        if base_va == 0 || phys < 0x8000 || phys >= 0x9000 {
+            return None;
+        }
+        base_va.checked_add(phys - 0x8000)
+    }
+
+    /// Map AP slot `cpu_slot` (`1..max_cpus`) to a target Local APIC ID without self-targeting `bsp_apic_id`.
+    pub const fn smp_apic_for_ap_slot(cpu_slot: usize, bsp_apic_id: u32) -> Option<u32> {
+        if cpu_slot == 0 {
+            None
+        } else {
+            let cand = (cpu_slot - 1) as u32;
+            if cand < bsp_apic_id {
+                Some(cand)
+            } else {
+                Some(cpu_slot as u32)
+            }
+        }
+    }
+
+    /// Validate a PCI capability list offset (`0x40..=0xFC`, 4-byte aligned, with room for `min_bytes`).
+    pub const fn vnet_valid_pci_cap_ptr(cap_ptr: u8, min_bytes: u8) -> bool {
+        if cap_ptr < 0x40 || (cap_ptr & 3) != 0 || min_bytes < 4 {
+            return false;
+        }
+        (cap_ptr as u16) + (min_bytes as u16) <= 0x100
+    }
+
+    /// Compute the physical MMIO address of a VirtIO modern queue notify doorbell.
+    pub const fn vnet_notify_mmio_pa(
+        notify_bar: u64,
+        notify_off: u64,
+        queue_notify_off: u16,
+        notify_mult: u32,
+    ) -> Option<u64> {
+        let base = match notify_bar.checked_add(notify_off) {
+            Some(b) => b,
+            None => return None,
+        };
+        let qoff = match (queue_notify_off as u64).checked_mul(notify_mult as u64) {
+            Some(q) => q,
+            None => return None,
+        };
+        match base.checked_add(qoff) {
+            Some(pa) if (pa & 1) == 0 => Some(pa),
+            _ => None,
+        }
+    }
+
+    /// Validate an outbound Ethernet frame length against the VirtIO header and DMA buffer size.
+    pub const fn vnet_valid_tx_frame_len(
+        frame_len: usize,
+        hdr_len: usize,
+        dma_buf_len: usize,
+    ) -> bool {
+        if frame_len == 0 {
+            return false;
+        }
+        match hdr_len.checked_add(frame_len) {
+            Some(total) => total <= dma_buf_len,
+            None => false,
+        }
+    }
+
+    /// Extract `(sport, dport)` from an Ethernet + IPv4 + TCP/UDP frame of valid length `flen`.
+    pub fn ipv4_l4_ports_in_frame(frame: &[u8], flen: usize) -> Option<(u16, u16)> {
+        if flen < 36 || flen > frame.len() {
+            return None;
+        }
+        if u16::from_be_bytes([frame[12], frame[13]]) != 0x0800 {
+            return None;
+        }
+        if (frame[14] >> 4) != 4 {
+            return None;
+        }
+        let ihl = ((frame[14] & 0x0F) as usize) * 4;
+        if ihl < 20 {
+            return None;
+        }
+        let proto = frame[23];
+        if proto != 6 && proto != 17 {
+            return None;
+        }
+        let l4_end = 14usize.checked_add(ihl)?.checked_add(4)?;
+        if l4_end > flen {
+            return None;
+        }
+        let sport = u16::from_be_bytes([frame[14 + ihl], frame[14 + ihl + 1]]);
+        let dport = u16::from_be_bytes([frame[14 + ihl + 2], frame[14 + ihl + 3]]);
+        Some((sport, dport))
+    }
+
+    /// Return `true` iff an i8042 status byte (`port 0x64`) indicates a clean PS/2 keyboard scancode
+    /// (bit 0 OBF set, bit 5 AUXB mouse cleared, bits 6..7 timeout/parity error cleared).
+    pub const fn ps2_kbd_byte_ready(status: u8) -> bool {
+        (status & 0x01) != 0 && (status & 0xE0) == 0
+    }
+
+    /// Format up to `n` bytes of `bytes` as lowercase hex into `out`, bounded by `out.len() / 2`.
+    pub fn hex_encode_bounded(bytes: &[u8], n: usize, out: &mut [u8]) -> usize {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let max_in = out.len() / 2;
+        let take_req = if n > bytes.len() { bytes.len() } else { n };
+        let take = if take_req > max_in { max_in } else { take_req };
+        let mut i = 0usize;
+        while i < take {
+            let b = bytes[i];
+            out[i * 2] = HEX[(b >> 4) as usize];
+            out[i * 2 + 1] = HEX[(b & 0x0F) as usize];
+            i += 1;
+        }
+        take * 2
+    }
+
+    /// Format `val` as decimal ASCII into `out`, returning `0` if `out` cannot hold the digits.
+    pub fn dec_u64_bounded(mut val: u64, out: &mut [u8]) -> usize {
+        if val == 0 {
+            if out.is_empty() {
+                return 0;
+            }
+            out[0] = b'0';
+            return 1;
+        }
+        let mut tmp = [0u8; 20];
+        let mut k = 0usize;
+        while val > 0 {
+            tmp[k] = b'0' + ((val % 10) as u8);
+            val /= 10;
+            k += 1;
+        }
+        if k > out.len() {
+            return 0;
+        }
+        let mut i = 0usize;
+        while i < k {
+            out[i] = tmp[k - 1 - i];
+            i += 1;
+        }
+        k
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::dma_layout::*;
+    use super::kernel_guards::*;
 
     #[test]
     fn kernel_dma_regions_are_disjoint_and_virtio_ring_bounds_reject_corrupt_used_entries() {
@@ -323,5 +511,85 @@ mod tests {
         assert!(!validate_legacy_vnet_rx_desc(8, 8));
         assert!(!validate_legacy_vnet_rx_desc(u16::MAX, 8));
         assert!(validate_legacy_vnet_rx_desc(7, 8));
+    }
+
+    #[test]
+    fn stage10_kernel_fb_smp_vnet_ps2_and_fmt_guards() {
+        // 1. Framebuffer bounds + RGB/BGR channel order.
+        assert_eq!(
+            fb_checked_pixel_offset(105, 10, 100, 80, 128, 4, 128 * 80 * 4),
+            None,
+            "pixel x >= viewport width must be clipped even when stride > width"
+        );
+        assert_eq!(
+            fb_checked_pixel_offset(10, 80, 100, 80, 128, 4, 128 * 80 * 4),
+            None,
+            "pixel y >= viewport height must be clipped"
+        );
+        assert_eq!(
+            fb_checked_pixel_offset(0, usize::MAX / 2, usize::MAX, usize::MAX, 4, 4, 4096),
+            None,
+            "usize multiplication wraparound must not pass bounds check"
+        );
+        assert_eq!(fb_pack_rgb((0x11, 0x22, 0x33), true), [0x33, 0x22, 0x11]);
+        assert_eq!(fb_pack_rgb((0x11, 0x22, 0x33), false), [0x11, 0x22, 0x33]);
+
+        // 2. SMP RX trampoline VA bounds & non-zero BSP APIC ID avoidance.
+        assert_eq!(smp_checked_rx_va(0xFFFF_8000_0008_0000, 0x7FFF), None);
+        assert_eq!(smp_checked_rx_va(0xFFFF_8000_0008_0000, 0x9000), None);
+        assert_eq!(
+            smp_checked_rx_va(0xFFFF_8000_0008_0000, 0x8120),
+            Some(0xFFFF_8000_0008_0120)
+        );
+        assert_eq!(smp_apic_for_ap_slot(1, 0), Some(1));
+        assert_eq!(smp_apic_for_ap_slot(2, 0), Some(2));
+        assert_eq!(smp_apic_for_ap_slot(3, 0), Some(3));
+        for slot in 1..=3 {
+            assert_ne!(
+                smp_apic_for_ap_slot(slot, 1),
+                Some(1),
+                "AP wake target must never send INIT/SIPI to BSP APIC ID"
+            );
+            assert_ne!(smp_apic_for_ap_slot(slot, 2), Some(2));
+        }
+
+        // 3. VirtIO PCI cap pointer alignment/wraparound, TX DMA frame bounds, and RX IPv4 IHL bounds.
+        assert!(!vnet_valid_pci_cap_ptr(0x00, 4));
+        assert!(!vnet_valid_pci_cap_ptr(0x3C, 4));
+        assert!(!vnet_valid_pci_cap_ptr(0x42, 4));
+        assert!(!vnet_valid_pci_cap_ptr(0xF4, 20), "0xF4 + 16 would wrap u8 PCI config offset");
+        assert!(vnet_valid_pci_cap_ptr(0x40, 20));
+        assert!(!vnet_valid_tx_frame_len(0, 12, 2048));
+        assert!(!vnet_valid_tx_frame_len(2040, 12, 2048));
+        assert!(vnet_valid_tx_frame_len(1514, 12, 2048));
+
+        let mut frame = [0xAAu8; 128];
+        frame[12] = 0x08;
+        frame[13] = 0x00;
+        frame[14] = 0x4F; // IHL = 60 bytes, while flen = 38 -> out of received frame bounds!
+        frame[23] = 17; // UDP
+        assert_eq!(
+            ipv4_l4_ports_in_frame(&frame, 38),
+            None,
+            "oversized IPv4 IHL must not read stale L4 bytes past flen"
+        );
+        frame[14] = 0x45; // IHL = 20 bytes
+        frame[23] = 1; // ICMP (not TCP/UDP)
+        assert_eq!(ipv4_l4_ports_in_frame(&frame, 42), None);
+        frame[23] = 6; // TCP
+        frame[34..38].copy_from_slice(&[0x1F, 0x90, 0x00, 0x50]); // 8080 -> 80
+        assert_eq!(ipv4_l4_ports_in_frame(&frame, 38), Some((8080, 80)));
+
+        // 4. PS/2 i8042 status AUXB/error filtering and bounded formatters.
+        assert!(ps2_kbd_byte_ready(0x01));
+        assert!(!ps2_kbd_byte_ready(0x21), "AUXB mouse byte must not feed root shell");
+        assert!(!ps2_kbd_byte_ready(0x81), "parity error byte must be dropped");
+        assert!(!ps2_kbd_byte_ready(0x41), "timeout error byte must be dropped");
+
+        let mut tiny = [0u8; 3];
+        assert_eq!(hex_encode_bounded(&[0xAB, 0xCD], 2, &mut tiny), 2);
+        assert_eq!(&tiny[..2], b"ab");
+        assert_eq!(dec_u64_bounded(12345, &mut tiny), 0);
+        assert_eq!(dec_u64_bounded(0, &mut []), 0);
     }
 }

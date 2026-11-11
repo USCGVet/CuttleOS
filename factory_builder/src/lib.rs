@@ -42,8 +42,9 @@ pub const STDOUT_UEFI_PREFIX: &str = "uefi ";
 /// directory up to `<workspace>/factory_builder_pkg/`.
 pub const PKG_SIBLING_DIR: &str = "factory_builder_pkg";
 
-/// Validate that `path` exists, is readable, and starts with the ELF
-/// magic. Returns the path canonicalized to absolute form on success.
+/// Validate that `path` exists, is readable, starts with the ELF magic over a
+/// complete 64-byte `Elf64_Ehdr`, and has in-bounds program/section header tables
+/// whenever `e_phnum > 0` or `e_shnum > 0`. Returns the canonicalized path.
 pub fn validate_elf(path: &Path) -> Result<PathBuf> {
     if !path.exists() {
         bail!("factory_builder: kernel ELF not found at {}", path.display());
@@ -55,6 +56,73 @@ pub fn validate_elf(path: &Path) -> Result<PathBuf> {
             "factory_builder: {} is not an ELF file (magic mismatch)",
             path.display()
         );
+    }
+    if bytes.len() < 64 {
+        bail!(
+            "factory_builder: {} is truncated ({} bytes < 64-byte Elf64_Ehdr)",
+            path.display(),
+            bytes.len()
+        );
+    }
+    let e_phoff = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+    let e_shoff = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+    let e_phentsize = u16::from_le_bytes(bytes[54..56].try_into().unwrap()) as u64;
+    let e_phnum = u16::from_le_bytes(bytes[56..58].try_into().unwrap()) as u64;
+    let e_shentsize = u16::from_le_bytes(bytes[58..60].try_into().unwrap()) as u64;
+    let e_shnum = u16::from_le_bytes(bytes[60..62].try_into().unwrap()) as u64;
+    if e_phnum > 0 {
+        if e_phentsize < 56 {
+            bail!(
+                "factory_builder: {} has invalid ELF64 e_phentsize={} (< 56)",
+                path.display(),
+                e_phentsize
+            );
+        }
+        let ph_end = e_phnum
+            .checked_mul(e_phentsize)
+            .and_then(|sz| e_phoff.checked_add(sz))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "factory_builder: {} program header table overflows u64",
+                    path.display()
+                )
+            })?;
+        if ph_end > bytes.len() as u64 {
+            bail!(
+                "factory_builder: {} program header table [{}..{}) exceeds file size {}",
+                path.display(),
+                e_phoff,
+                ph_end,
+                bytes.len()
+            );
+        }
+    }
+    if e_shnum > 0 {
+        if e_shentsize < 64 {
+            bail!(
+                "factory_builder: {} has invalid ELF64 e_shentsize={} (< 64)",
+                path.display(),
+                e_shentsize
+            );
+        }
+        let sh_end = e_shnum
+            .checked_mul(e_shentsize)
+            .and_then(|sz| e_shoff.checked_add(sz))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "factory_builder: {} section header table overflows u64",
+                    path.display()
+                )
+            })?;
+        if sh_end > bytes.len() as u64 {
+            bail!(
+                "factory_builder: {} section header table [{}..{}) exceeds file size {}",
+                path.display(),
+                e_shoff,
+                sh_end,
+                bytes.len()
+            );
+        }
     }
     let abs = fs::canonicalize(path)
         .with_context(|| format!("factory_builder: canonicalize {}", path.display()))?;
@@ -115,7 +183,14 @@ pub fn parse_image_line(line: &str) -> Result<(ImageKind, PathBuf, String)> {
     let space = trimmed.rfind(' ').ok_or_else(|| {
         anyhow::anyhow!("factory_builder: stdout line missing sha256 token: {:?}", line)
     })?;
-    let path = PathBuf::from(&trimmed[..space]);
+    let raw_path = trimmed[..space].trim();
+    if raw_path.is_empty() {
+        bail!(
+            "factory_builder: stdout line has empty image path: {:?}",
+            line
+        );
+    }
+    let path = PathBuf::from(raw_path);
     let sha = trimmed[space + 1..].to_string();
     if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!(
@@ -262,7 +337,14 @@ pub fn parse_pkg_output_line(line: &str) -> Result<(ImageKind, PathBuf)> {
     } else {
         bail!("factory_builder: pkg output line missing prefix: {:?}", line);
     };
-    Ok((kind, PathBuf::from(rest.trim())))
+    let raw_path = rest.trim();
+    if raw_path.is_empty() {
+        bail!(
+            "factory_builder: pkg output line has empty image path: {:?}",
+            line
+        );
+    }
+    Ok((kind, PathBuf::from(raw_path)))
 }
 
 /// Individual soft-float crypto `--cfg` names required for bare-metal
@@ -495,6 +577,22 @@ pub fn configure_kernel_cargo_env_reproducible(
     encoded
 }
 
+fn json_escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Generate a deterministic CycloneDX 1.5 JSON SBOM for `kernel_crate_dir`
 /// (parsing `Cargo.lock` packages in sorted `(name, version)` order) and
 /// return `(cyclonedx_json, sha256_hex)` (`R5`).
@@ -509,29 +607,51 @@ pub fn generate_cyclonedx_sbom(kernel_crate_dir: &Path) -> Result<(String, Strin
     let text = fs::read_to_string(&lock_path)
         .with_context(|| format!("factory_builder: read Cargo.lock at {}", lock_path.display()))?;
     let mut pkgs: Vec<(String, String, String)> = Vec::new();
+    let mut in_pkg = false;
     let mut cur_name = String::new();
     let mut cur_ver = String::new();
     let mut cur_chk = String::new();
     for raw_line in text.lines() {
         let line = raw_line.trim();
         if line == "[[package]]" {
-            if !cur_name.is_empty() {
+            if in_pkg {
+                if cur_name.is_empty() || cur_ver.is_empty() {
+                    bail!(
+                        "factory_builder: malformed [[package]] entry missing name or version in {}",
+                        lock_path.display()
+                    );
+                }
                 pkgs.push((
                     std::mem::take(&mut cur_name),
                     std::mem::take(&mut cur_ver),
                     std::mem::take(&mut cur_chk),
                 ));
             }
-        } else if let Some(v) = line.strip_prefix("name = ") {
-            cur_name = v.trim_matches('"').to_string();
-        } else if let Some(v) = line.strip_prefix("version = ") {
-            cur_ver = v.trim_matches('"').to_string();
-        } else if let Some(v) = line.strip_prefix("checksum = ") {
-            cur_chk = v.trim_matches('"').to_string();
+            in_pkg = true;
+        } else if in_pkg {
+            if let Some(v) = line.strip_prefix("name = ") {
+                cur_name = v.trim_matches('"').to_string();
+            } else if let Some(v) = line.strip_prefix("version = ") {
+                cur_ver = v.trim_matches('"').to_string();
+            } else if let Some(v) = line.strip_prefix("checksum = ") {
+                cur_chk = v.trim_matches('"').to_string();
+            }
         }
     }
-    if !cur_name.is_empty() {
+    if in_pkg {
+        if cur_name.is_empty() || cur_ver.is_empty() {
+            bail!(
+                "factory_builder: malformed [[package]] entry missing name or version in {}",
+                lock_path.display()
+            );
+        }
         pkgs.push((cur_name, cur_ver, cur_chk));
+    }
+    if pkgs.is_empty() {
+        bail!(
+            "factory_builder: Cargo.lock at {} contains zero [[package]] entries",
+            lock_path.display()
+        );
     }
     pkgs.sort();
     pkgs.dedup();
@@ -541,14 +661,17 @@ pub fn generate_cyclonedx_sbom(kernel_crate_dir: &Path) -> Result<(String, Strin
         if idx > 0 {
             components_json.push(',');
         }
-        let purl = format!("pkg:cargo/{name}@{ver}");
+        let ename = json_escape_str(name);
+        let ever = json_escape_str(ver);
+        let epurl = json_escape_str(&format!("pkg:cargo/{name}@{ver}"));
         if chk.is_empty() {
             components_json.push_str(&format!(
-                "{{\"type\":\"library\",\"name\":\"{name}\",\"version\":\"{ver}\",\"purl\":\"{purl}\"}}"
+                "{{\"type\":\"library\",\"name\":\"{ename}\",\"version\":\"{ever}\",\"purl\":\"{epurl}\"}}"
             ));
         } else {
+            let echk = json_escape_str(chk);
             components_json.push_str(&format!(
-                "{{\"type\":\"library\",\"name\":\"{name}\",\"version\":\"{ver}\",\"purl\":\"{purl}\",\"hashes\":[{{\"alg\":\"SHA-256\",\"content\":\"{chk}\"}}]}}"
+                "{{\"type\":\"library\",\"name\":\"{ename}\",\"version\":\"{ever}\",\"purl\":\"{epurl}\",\"hashes\":[{{\"alg\":\"SHA-256\",\"content\":\"{echk}\"}}]}}"
             ));
         }
     }
@@ -1151,5 +1274,83 @@ mod tests {
             parts.contains(&"cuttle_prod"),
             "missing --cfg cuttle_prod in CARGO_ENCODED_RUSTFLAGS: {parts:?}"
         );
+    }
+
+    #[test]
+    fn stage10_validate_elf_headers_image_lines_and_sbom_bounds() {
+        let dir = tmpdir();
+
+        // 1a. Truncated (< 64B Elf64_Ehdr) file with `\x7fELF` prefix must be rejected.
+        let short_elf = dir.join("short.elf");
+        fs::write(&short_elf, b"\x7fELF\x02\x01\x01\x00truncated").unwrap();
+        assert!(
+            validate_elf(&short_elf).is_err(),
+            "validate_elf must reject files shorter than 64-byte Elf64_Ehdr"
+        );
+
+        // 1b. Out-of-bounds `e_phoff + e_phnum * e_phentsize` must be rejected.
+        let bad_ph = dir.join("bad_ph.elf");
+        let mut ph_bytes = vec![0u8; 68];
+        ph_bytes[..4].copy_from_slice(&ELF_MAGIC);
+        ph_bytes[32..40].copy_from_slice(&4096u64.to_le_bytes()); // e_phoff = 4096 > 68
+        ph_bytes[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize = 56
+        ph_bytes[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum = 2
+        fs::write(&bad_ph, &ph_bytes).unwrap();
+        assert!(
+            validate_elf(&bad_ph).is_err(),
+            "validate_elf must reject out-of-bounds program header table"
+        );
+
+        // 1c. Overflowing `e_shoff + e_shnum * e_shentsize` must be rejected.
+        let bad_sh = dir.join("bad_sh.elf");
+        let mut sh_bytes = vec![0u8; 68];
+        sh_bytes[..4].copy_from_slice(&ELF_MAGIC);
+        sh_bytes[40..48].copy_from_slice(&(u64::MAX - 8).to_le_bytes()); // e_shoff overflows
+        sh_bytes[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize = 64
+        sh_bytes[60..62].copy_from_slice(&3u16.to_le_bytes()); // e_shnum = 3
+        fs::write(&bad_sh, &sh_bytes).unwrap();
+        assert!(
+            validate_elf(&bad_sh).is_err(),
+            "validate_elf must reject overflowing section header table"
+        );
+
+        // 2. Empty/whitespace-only path in `parse_image_line` and `parse_pkg_output_line` must fail.
+        let sha = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        assert!(
+            parse_image_line(&format!("bios    {sha}")).is_err(),
+            "parse_image_line must reject whitespace-only path"
+        );
+        assert!(
+            parse_pkg_output_line("bios    ").is_err(),
+            "parse_pkg_output_line must reject whitespace-only path"
+        );
+        assert!(
+            parse_pkg_output_line("uefi ").is_err(),
+            "parse_pkg_output_line must reject empty path"
+        );
+
+        // 3. `generate_cyclonedx_sbom` must reject empty Cargo.lock or package missing version,
+        //    and JSON-escape string fields so output is always valid JSON.
+        let empty_lock_dir = dir.join("empty_lock");
+        fs::create_dir_all(&empty_lock_dir).unwrap();
+        fs::write(empty_lock_dir.join("Cargo.lock"), "version = 3\n").unwrap();
+        assert!(
+            generate_cyclonedx_sbom(&empty_lock_dir).is_err(),
+            "generate_cyclonedx_sbom must reject Cargo.lock with zero packages"
+        );
+
+        let no_ver_dir = dir.join("no_ver_lock");
+        fs::create_dir_all(&no_ver_dir).unwrap();
+        fs::write(
+            no_ver_dir.join("Cargo.lock"),
+            "version = 3\n\n[[package]]\nname = \"cuttle-test\"\n",
+        )
+        .unwrap();
+        assert!(
+            generate_cyclonedx_sbom(&no_ver_dir).is_err(),
+            "generate_cyclonedx_sbom must reject [[package]] entry missing version"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

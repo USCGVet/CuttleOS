@@ -284,6 +284,9 @@ fn run_specimen_pipeline(
     label: &str,
     options: &cuttle_diversifier::DiversifyOptions,
 ) -> Result<f64> {
+    if variants < 2 {
+        bail!("--variants must be >= 2 (need a base plus at least one morph to compare)");
+    }
     let work = std::env::temp_dir().join(format!(
         "cuttle_mtd_{}_{}",
         std::process::id(),
@@ -348,27 +351,12 @@ fn run_specimen_pipeline(
         "\n=== [{}] gadget churn vs. base cycle (variant 0), max_instrs={} ===\n",
         label, max_instrs
     );
-    let base = &sets[0];
-    let mut pos_rates = Vec::new();
-    let mut sem_rates = Vec::new();
-    let mut reports: Vec<ChurnReport> = Vec::new();
-    for i in 1..sets.len() {
-        let r = churn(base, &sets[i]);
-        pos_rates.push(r.positional_survival());
-        sem_rates.push(r.semantic_survival());
-        println!("variant {} vs 0:", i);
-        println!("{}\n", indent(&r.to_string()));
-        reports.push(r);
-    }
-
-    let mean_pos = mean(&pos_rates);
-    let mean_sem = mean(&sem_rates);
-    let worst_pos = pos_rates.iter().cloned().fold(0.0_f64, f64::max);
+    let (mean_pos, worst_pos, mean_sem, reports) = summarize_specimen_sets(&sets, true)?;
 
     println!("=== summary ({} morph pairs) ===", reports.len());
     println!("mean positional survival : {:.1}%   (lower = better; this is the headline thesis number)", mean_pos * 100.0);
     println!("worst positional survival: {:.1}%   (the most exploit-friendly single morph observed)", worst_pos * 100.0);
-    println!("mean semantic   survival : {:.1}%   (expected high under offset-only diversity)", mean_sem * 100.0);
+    println!("mean semantic   survival : {:.1}%   (address-masked; expected high under offset-only diversity)", mean_sem * 100.0);
     println!();
     println!("interpretation:");
     println!("  positional survival is the fraction of a ROP chain hardcoded against the base");
@@ -535,4 +523,63 @@ fn mean(xs: &[f64]) -> f64 {
 
 fn indent(s: &str) -> String {
     s.lines().map(|l| format!("  {}", l)).collect::<Vec<_>>().join("\n")
+}
+
+fn summarize_specimen_sets(
+    sets: &[cuttle_mtd_metrics::GadgetSet],
+    print_reports: bool,
+) -> Result<(f64, f64, f64, Vec<ChurnReport>)> {
+    if sets.len() < 2 {
+        bail!(
+            "specimen summary requires at least 2 gadget sets (got {})",
+            sets.len()
+        );
+    }
+    let base = &sets[0];
+    let mut pos_rates = Vec::new();
+    let mut sem_rates = Vec::new();
+    let mut reports: Vec<ChurnReport> = Vec::new();
+    for i in 1..sets.len() {
+        let r = churn(base, &sets[i]);
+        pos_rates.push(r.positional_survival());
+        sem_rates.push(r.semantic_survival_normalized());
+        if print_reports {
+            println!("variant {} vs 0:", i);
+            println!("{}\n", indent(&r.to_string()));
+        }
+        reports.push(r);
+    }
+    let mean_pos = mean(&pos_rates);
+    let mean_sem = mean(&sem_rates);
+    let worst_pos = pos_rates.iter().cloned().fold(0.0_f64, f64::max);
+    Ok((mean_pos, worst_pos, mean_sem, reports))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage10_specimen_summary_uses_normalized_survival_and_rejects_under_two_sets() {
+        // `add rsp, 8; ret` vs `add rsp, 0x10; ret`: raw `semantic_survival()` is 1/3,
+        // whereas `semantic_survival_normalized()` (what `--semantic` promises) is 1.0!
+        let g0 = extract_gadgets(&[0x48, 0x83, 0xC4, 0x08, 0xC3], 0, DEFAULT_MAX_INSTRS);
+        let g1 = extract_gadgets(&[0x48, 0x83, 0xC4, 0x10, 0xC3], 0, DEFAULT_MAX_INSTRS);
+        let (_mean_pos, _worst_pos, mean_sem_norm, reports) =
+            summarize_specimen_sets(&[g0.clone(), g1], false).expect("2 sets must succeed");
+        assert_eq!(reports.len(), 1);
+        assert!(
+            (mean_sem_norm - 1.0).abs() < 1e-9,
+            "run_specimen_pipeline must return mean semantic_survival_normalized (1.0), got {}",
+            mean_sem_norm
+        );
+        assert!(
+            summarize_specimen_sets(&[], false).is_err(),
+            "0 sets must fail cleanly instead of panicking"
+        );
+        assert!(
+            summarize_specimen_sets(&[g0], false).is_err(),
+            "1 set must fail cleanly instead of dividing over 0 morph pairs"
+        );
+    }
 }

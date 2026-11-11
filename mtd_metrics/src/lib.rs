@@ -177,7 +177,7 @@ pub fn extract_gadgets(text: &[u8], base_ip: u64, max_instrs: usize) -> GadgetSe
         let mut decoder = Decoder::with_ip(
             64,
             &text[start..],
-            base_ip + start as u64,
+            base_ip.wrapping_add(start as u64),
             DecoderOptions::NONE,
         );
         let mut seq: Vec<String> = Vec::with_capacity(max_instrs);
@@ -392,14 +392,28 @@ pub fn survivor_offset_buckets(
     nbuckets: usize,
 ) -> Vec<OffsetBucket> {
     let nbuckets = nbuckets.max(1);
-    let span = base.by_offset.keys().last().copied().unwrap_or(0) + 1;
-    let width = span.div_ceil(nbuckets as u64).max(1);
+    let span = match base.by_offset.keys().last().copied() {
+        Some(max_off) => max_off.saturating_add(1),
+        None => 0,
+    };
+    let width = if span == 0 {
+        1
+    } else {
+        span.div_ceil(nbuckets as u64).max(1)
+    };
     let mut buckets: Vec<OffsetBucket> = (0..nbuckets)
-        .map(|i| OffsetBucket {
-            lo: i as u64 * width,
-            hi: ((i as u64 + 1) * width).min(span),
-            total: 0,
-            survived: 0,
+        .map(|i| {
+            let lo = (i as u64).saturating_mul(width).min(span);
+            let hi = ((i as u64).saturating_add(1))
+                .saturating_mul(width)
+                .min(span)
+                .max(lo);
+            OffsetBucket {
+                lo,
+                hi,
+                total: 0,
+                survived: 0,
+            }
         })
         .collect();
     for (off, g) in &base.by_offset {
@@ -433,11 +447,25 @@ pub fn read_text_section(path: &std::path::Path) -> Result<(Vec<u8>, u64)> {
         if sec.kind() != SectionKind::Text {
             continue;
         }
-        if let Ok(bytes) = sec.data() {
-            if !bytes.is_empty() {
-                let name = sec.name().unwrap_or("").to_string();
-                texts.push((sec.address(), name, bytes.to_vec()));
-            }
+        let name = sec.name().unwrap_or("").to_string();
+        let bytes = sec.data().with_context(|| {
+            format!(
+                "read executable section {:?} in {}",
+                name,
+                path.display()
+            )
+        })?;
+        sec.address()
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "executable section {:?} address+size overflows u64 in {}",
+                    name,
+                    path.display()
+                )
+            })?;
+        if !bytes.is_empty() {
+            texts.push((sec.address(), name, bytes.to_vec()));
         }
     }
     if texts.is_empty() {
@@ -698,6 +726,102 @@ mod tests {
             (ab.mean_pairwise_positional_survival - ba.mean_pairwise_positional_survival).abs()
                 < 1e-12,
             "pairwise positional survival must be symmetric with respect to variant ordering"
+        );
+    }
+
+    #[test]
+    fn stage10_extract_gadgets_max_ip_buckets_monotonic_and_corrupt_text_rejected() {
+        // 1. `base_ip = u64::MAX` must wrap cleanly rather than panicking on `base_ip + start`.
+        let g_max = extract_gadgets(&[0x58, 0xC3], u64::MAX, DEFAULT_MAX_INSTRS);
+        assert_eq!(g_max.by_offset.get(&0).map(String::as_str), Some("pop rax; ret"));
+        assert_eq!(g_max.by_offset.get(&1).map(String::as_str), Some("ret"));
+
+        // 2. `survivor_offset_buckets` must never produce inverted `lo > hi` buckets when
+        //    `nbuckets > span` (empty or 1-offset GadgetSet) or overflow on `u64::MAX` offsets.
+        let empty = GadgetSet {
+            by_offset: BTreeMap::new(),
+        };
+        for b in survivor_offset_buckets(&empty, &empty, 8) {
+            assert!(
+                b.lo <= b.hi,
+                "empty GadgetSet produced inverted bucket [{}..{})",
+                b.lo,
+                b.hi
+            );
+        }
+        let mut one_zero = BTreeMap::new();
+        one_zero.insert(0u64, "ret".to_string());
+        let gs_one = GadgetSet { by_offset: one_zero };
+        for b in survivor_offset_buckets(&gs_one, &gs_one, 8) {
+            assert!(
+                b.lo <= b.hi,
+                "1-offset GadgetSet produced inverted bucket [{}..{})",
+                b.lo,
+                b.hi
+            );
+        }
+        let mut max_off_map = BTreeMap::new();
+        max_off_map.insert(u64::MAX, "ret".to_string());
+        let gs_max = GadgetSet {
+            by_offset: max_off_map,
+        };
+        let b_max = survivor_offset_buckets(&gs_max, &gs_max, 4);
+        assert_eq!(b_max.iter().map(|b| b.total).sum::<usize>(), 1);
+        for b in &b_max {
+            assert!(b.lo <= b.hi);
+        }
+
+        // 3. `read_text_section` must fail closed if ANY executable section in an ELF64
+        //    has truncated/out-of-bounds `sh_offset + sh_size`, even when another valid
+        //    `.text` section is also present.
+        let shstr = b"\0.shstrtab\0.text.ok\0.text.bad\0";
+        let code_ok = [0x58u8, 0xC3];
+        let ehdr_len = 64usize;
+        let code_off = ehdr_len;
+        let shstr_off = code_off + code_ok.len();
+        let shoff = (shstr_off + shstr.len() + 7) & !7;
+        let shnum = 4usize;
+        let mut elf = vec![0u8; shoff + shnum * 64];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[58..60].copy_from_slice(&64u16.to_le_bytes());
+        elf[60..62].copy_from_slice(&(shnum as u16).to_le_bytes());
+        elf[62..64].copy_from_slice(&1u16.to_le_bytes()); // e_shstrndx = 1
+        elf[code_off..code_off + code_ok.len()].copy_from_slice(&code_ok);
+        elf[shstr_off..shstr_off + shstr.len()].copy_from_slice(shstr);
+
+        let write_shdr = |buf: &mut [u8], idx: usize, name: u32, ty: u32, flags: u64, addr: u64, off: u64, size: u64| {
+            let base = shoff + idx * 64;
+            buf[base..base + 4].copy_from_slice(&name.to_le_bytes());
+            buf[base + 4..base + 8].copy_from_slice(&ty.to_le_bytes());
+            buf[base + 8..base + 16].copy_from_slice(&flags.to_le_bytes());
+            buf[base + 16..base + 24].copy_from_slice(&addr.to_le_bytes());
+            buf[base + 24..base + 32].copy_from_slice(&off.to_le_bytes());
+            buf[base + 32..base + 40].copy_from_slice(&size.to_le_bytes());
+            buf[base + 48..base + 56].copy_from_slice(&1u64.to_le_bytes());
+        };
+        // shdr[1]: .shstrtab (name=1, SHT_STRTAB=3)
+        write_shdr(&mut elf, 1, 1, 3, 0, 0, shstr_off as u64, shstr.len() as u64);
+        // shdr[2]: .text.ok (name=11, SHT_PROGBITS=1, SHF_ALLOC|SHF_EXECINSTR=6)
+        write_shdr(&mut elf, 2, 11, 1, 0x6, 0x1000, code_off as u64, code_ok.len() as u64);
+        // shdr[3]: .text.bad (name=20, SHT_PROGBITS=1, SHF_ALLOC|SHF_EXECINSTR=6, truncated size=0x10000!)
+        write_shdr(&mut elf, 3, 20, 1, 0x6, 0x2000, code_off as u64, 0x10000);
+
+        let tmp = std::env::temp_dir().join(format!("cuttle_stage10_corrupt_text_{}.elf", std::process::id()));
+        std::fs::write(&tmp, &elf).unwrap();
+        let res = read_text_section(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            res.is_err(),
+            "read_text_section must reject ELF with truncated executable section instead of silently skipping it: {:?}",
+            res
         );
     }
 

@@ -477,18 +477,10 @@ pub(crate) fn serial_write_bytes(buf: &[u8]) {
 
 pub(crate) const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
-/// Write the first `n` bytes of `bytes` as lowercase hex into `out`.
-/// Caller-supplied `out` must be at least `n * 2` bytes long.
+/// Write the first `n` bytes of `bytes` as lowercase hex into `out`,
+/// bounded by `out.len() / 2` so short buffers never panic.
 pub(crate) fn hex_encode(bytes: &[u8], n: usize, out: &mut [u8]) -> usize {
-    let take = if n > bytes.len() { bytes.len() } else { n };
-    let mut i = 0usize;
-    while i < take {
-        let b = bytes[i];
-        out[i * 2] = HEX_DIGITS[(b >> 4) as usize];
-        out[i * 2 + 1] = HEX_DIGITS[(b & 0x0F) as usize];
-        i += 1;
-    }
-    take * 2
+    target_enterprise::memory::kernel_guards::hex_encode_bounded(bytes, n, out)
 }
 
 /// Format `val` as zero-padded 8-character lowercase hex (the low 32
@@ -504,26 +496,9 @@ pub(crate) fn hex_u32(val: u32, out: &mut [u8; 8]) {
 }
 
 /// Format `val` as decimal into `out`, returning the number of bytes
-/// written. `out` must be at least 20 bytes long (max u64 decimal).
-pub(crate) fn dec_u64(mut val: u64, out: &mut [u8]) -> usize {
-    if val == 0 {
-        out[0] = b'0';
-        return 1;
-    }
-    let mut tmp = [0u8; 20];
-    let mut k = 0usize;
-    while val > 0 {
-        tmp[k] = b'0' + ((val % 10) as u8);
-        val /= 10;
-        k += 1;
-    }
-    // tmp is little-endian decimal; reverse into out.
-    let mut i = 0usize;
-    while i < k {
-        out[i] = tmp[k - 1 - i];
-        i += 1;
-    }
-    k
+/// written (`0` if `out` cannot hold the digits).
+pub(crate) fn dec_u64(val: u64, out: &mut [u8]) -> usize {
+    target_enterprise::memory::kernel_guards::dec_u64_bounded(val, out)
 }
 
 // ============================================================
@@ -936,20 +911,22 @@ pub(crate) fn live_os_console_loop() -> ! {
             // SAFETY: COM1 LSR bit 0 confirmed a received byte is ready in RBR (0x3F8).
             maybe_byte = Some(unsafe { inb(COM1) });
         } else {
-            // 2. Poll PS/2 8042 status port (bit 0 = output buffer full).
+            // 2. Poll PS/2 8042 status port (bit 0 = output buffer full; bit 5 = AUXB mouse; bits 6..7 = error).
             // SAFETY: Running at CPL=0; port 0x64 is the read-only i8042 PS/2 controller status register and reading it has no memory side effects.
-            let kbd_ready = unsafe { inb(0x64) & 0x01 != 0 };
-            if kbd_ready {
-                // SAFETY: 8042 status bit 0 confirmed a scancode byte is ready at port 0x60.
+            let status = unsafe { inb(0x64) };
+            if (status & 0x01) != 0 {
+                // SAFETY: 8042 status bit 0 confirmed an output byte is waiting at port 0x60 (drain even if AUXB/error).
                 let sc = unsafe { inb(0x60) };
-                if let Some(ev) = kbd.feed(sc) {
-                    if ev.pressed {
-                        if ev.ascii != 0 {
-                            maybe_byte = Some(ev.ascii);
-                        } else if ev.code == KeyCode::Enter {
-                            maybe_byte = Some(b'\n');
-                        } else if ev.code == KeyCode::Backspace {
-                            maybe_byte = Some(0x08);
+                if target_enterprise::memory::kernel_guards::ps2_kbd_byte_ready(status) {
+                    if let Some(ev) = kbd.feed(sc) {
+                        if ev.pressed {
+                            if ev.ascii != 0 {
+                                maybe_byte = Some(ev.ascii);
+                            } else if ev.code == KeyCode::Enter {
+                                maybe_byte = Some(b'\n');
+                            } else if ev.code == KeyCode::Backspace {
+                                maybe_byte = Some(0x08);
+                            }
                         }
                     }
                 }

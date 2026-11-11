@@ -146,6 +146,7 @@ pub fn evaluate_chain(
         &variant_reg_kinds,
         base_text,
         variant_text,
+        DEFAULT_MAX_INSTRS,
     )
 }
 
@@ -157,6 +158,7 @@ fn evaluate_chain_with_kinds(
     variant_reg_kinds: &std::collections::HashSet<String>,
     base_text: &[u8],
     variant_text: &[u8],
+    max_instrs: usize,
 ) -> ChainOutcome {
     let mut out = ChainOutcome::default();
     for off in &chain.gadget_offsets {
@@ -172,11 +174,11 @@ fn evaluate_chain_with_kinds(
         // its terminating `ret` / indirect `call` / indirect `jmp`) is unchanged.
         let start = *off as usize;
         if start < base_text.len() && start < variant_text.len() {
-            let span_len = exact_gadget_byte_len(&base_text[start..], DEFAULT_MAX_INSTRS);
-            let end = (start + span_len).min(base_text.len());
+            let span_len = exact_gadget_byte_len(&base_text[start..], max_instrs);
+            let end = start.saturating_add(span_len).min(base_text.len());
             let b = &base_text[start..end];
-            let v_end = (start + b.len()).min(variant_text.len());
-            if !b.is_empty() && v_end == start + b.len() && &variant_text[start..v_end] == b {
+            let v_end = start.saturating_add(b.len()).min(variant_text.len());
+            if !b.is_empty() && v_end == start.saturating_add(b.len()) && &variant_text[start..v_end] == b {
                 out.byte_hits += 1;
             }
         }
@@ -194,9 +196,12 @@ fn evaluate_chain_with_kinds(
 
 fn exact_gadget_byte_len(slice: &[u8], max_instrs: usize) -> usize {
     use iced_x86::{Code, Decoder, DecoderOptions, FlowControl};
-    let cap = slice.len().min((max_instrs + 1) * 15);
+    if slice.is_empty() || max_instrs == 0 {
+        return 0;
+    }
+    let cap = slice.len().min(max_instrs.saturating_mul(15));
     let mut dec = Decoder::with_ip(64, &slice[..cap], 0, DecoderOptions::NONE);
-    for _ in 0..=max_instrs {
+    for _ in 0..max_instrs {
         if !dec.can_decode() {
             break;
         }
@@ -211,7 +216,7 @@ fn exact_gadget_byte_len(slice: &[u8], max_instrs: usize) -> usize {
             return dec.position();
         }
     }
-    slice.len().min(15)
+    dec.position().max(1).min(slice.len())
 }
 
 /// Aggregate result of firing `chains` synthesized chains at one variant.
@@ -253,6 +258,8 @@ pub fn run_experiment(
     seed: u64,
     max_instrs: usize,
 ) -> Result<ChainReport> {
+    anyhow::ensure!(n_chains > 0, "n_chains must be >= 1");
+    anyhow::ensure!(chain_len > 0, "chain_len must be >= 1");
     let base = extract_gadgets(base_text, base_ip, max_instrs);
     let variant = extract_gadgets(variant_text, variant_ip, max_instrs);
     if base.len() < chain_len {
@@ -290,6 +297,7 @@ pub fn run_experiment(
             &variant_reg_kinds,
             base_text,
             variant_text,
+            max_instrs,
         );
         if oc.viable_static(chain_len) {
             rep.static_viable += 1;
@@ -567,6 +575,14 @@ pub fn synthesize_dataflow_chain(
     goal_regs: &[u8],
     rng: &mut Prng,
 ) -> Result<DataflowChain> {
+    anyhow::ensure!(!goal_regs.is_empty(), "goal_regs must not be empty");
+    for &goal_reg in goal_regs {
+        anyhow::ensure!(
+            goal_reg < 16,
+            "goal_reg {} out of architectural range 0..16",
+            goal_reg
+        );
+    }
     let analyzed: Vec<(u64, u16, bool)> = base
         .by_offset
         .iter()
@@ -625,6 +641,15 @@ pub fn evaluate_dataflow_chains(
     n_chains: usize,
     seed: u64,
 ) -> Result<DataflowChainReport> {
+    anyhow::ensure!(n_chains > 0, "n_chains must be >= 1");
+    anyhow::ensure!(!goal_regs.is_empty(), "goal_regs must not be empty");
+    for &goal_reg in goal_regs {
+        anyhow::ensure!(
+            goal_reg < 16,
+            "goal_reg {} out of architectural range 0..16",
+            goal_reg
+        );
+    }
     let mut rng = Prng::new(seed);
     let mut static_viable = 0usize;
     let mut total_step_hits = 0usize;
@@ -737,6 +762,39 @@ mod dataflow_tests {
             out.byte_hits, 1,
             "`pop rdi; ret` at offset 0..2 is byte-identical (`5F C3`); bytes past `ret` must not poison `byte_hits`"
         );
+    }
+
+    #[test]
+    fn stage10_chainsim_rejects_zero_counts_bad_goal_regs_and_caps_exact_span() {
+        let code = [0x5F, 0xC3, 0x5E, 0xC3];
+        // 1. Zero `n_chains` or zero `chain_len` must return Err instead of dividing 0/0 -> NaN.
+        assert!(
+            run_experiment("zero_chains", &code, 0x1000, &code, 0x1000, 0, 1, 1, 5).is_err(),
+            "run_experiment must reject n_chains == 0"
+        );
+        assert!(
+            run_experiment("zero_len", &code, 0x1000, &code, 0x1000, 4, 0, 1, 5).is_err(),
+            "run_experiment must reject chain_len == 0"
+        );
+
+        // 2. `exact_gadget_byte_len` must decode at most `max_instrs` instructions (matching
+        //    `extract_gadgets`) and must not overflow on `usize::MAX`.
+        assert_eq!(
+            exact_gadget_byte_len(&[0x5F, 0xC3], 1),
+            1,
+            "with max_instrs=1, `pop rdi; ret` cannot reach `ret` on a 2nd instruction"
+        );
+        assert_eq!(exact_gadget_byte_len(&[0x5F, 0xC3], usize::MAX), 2);
+
+        // 3. Dataflow chain synthesis/evaluation must reject empty or out-of-range `goal_regs` (>= 16)
+        //    and `n_chains == 0` cleanly without panicking on `1u16 << goal_reg`.
+        let base_gs = extract_gadgets(&code, 0x1000, DEFAULT_MAX_INSTRS);
+        let mut rng = Prng::new(7);
+        assert!(synthesize_dataflow_chain(&base_gs, &[], &mut rng).is_err());
+        assert!(synthesize_dataflow_chain(&base_gs, &[16], &mut rng).is_err());
+        assert!(evaluate_dataflow_chains(&base_gs, &base_gs, &[7], 0, 7).is_err());
+        assert!(evaluate_dataflow_chains(&base_gs, &base_gs, &[], 4, 7).is_err());
+        assert!(evaluate_dataflow_chains(&base_gs, &base_gs, &[255], 4, 7).is_err());
     }
 }
 

@@ -167,11 +167,11 @@ pub(crate) fn vnet_modern_init(dma: u64) -> Option<VnetModern> {
     let mut notify_mult: u32 = 0;
     let mut device_cfg: Option<(u64, u64)> = None;
     let mut guard = 0;
-    while cap_ptr != 0 && guard < 48 {
+    while target_enterprise::memory::kernel_guards::vnet_valid_pci_cap_ptr(cap_ptr, 4) && guard < 48 {
         let dw0 = PciConfigBus::read_dword(&mut bus, addr, cap_ptr);
         let cap_id = (dw0 & 0xFF) as u8;
         let next = ((dw0 >> 8) & 0xFF) as u8;
-        if cap_id == 0x09 {
+        if cap_id == 0x09 && target_enterprise::memory::kernel_guards::vnet_valid_pci_cap_ptr(cap_ptr, 16) {
             let dw1 = PciConfigBus::read_dword(&mut bus, addr, cap_ptr + 4);
             let cfg_type = ((dw0 >> 24) & 0xFF) as u8;
             let bar_idx = (dw1 & 0xFF) as u8;
@@ -184,7 +184,7 @@ pub(crate) fn vnet_modern_init(dma: u64) -> Option<VnetModern> {
             if cap_bar != 0 {
                 match cfg_type {
                     1 => common = Some((cap_bar, off)),
-                    2 => {
+                    2 if target_enterprise::memory::kernel_guards::vnet_valid_pci_cap_ptr(cap_ptr, 20) => {
                         notify = Some((cap_bar, off));
                         notify_mult =
                             PciConfigBus::read_dword(&mut bus, addr, cap_ptr + 16);
@@ -294,6 +294,23 @@ pub(crate) fn vnet_modern_init(dma: u64) -> Option<VnetModern> {
     vn_wr64(common_virt, VN_CC_QUEUE_DRIVER, tx_q_phys + VN_AVAIL_OFF);
     vn_wr64(common_virt, VN_CC_QUEUE_DEVICE, tx_q_phys + VN_USED_OFF);
     let tx_notify_off = vn_rd16(common_virt, VN_CC_QUEUE_NOTIFY_OFF);
+    let rx_notify_pa = target_enterprise::memory::kernel_guards::vnet_notify_mmio_pa(
+        notify_bar,
+        notify_off,
+        rx_notify_off,
+        notify_mult,
+    )?;
+    let tx_notify_pa = target_enterprise::memory::kernel_guards::vnet_notify_mmio_pa(
+        notify_bar,
+        notify_off,
+        tx_notify_off,
+        notify_mult,
+    )?;
+    // SAFETY: Running at CPL=0 with initialized page-table pool; both RX and TX queue doorbell MMIO pages are mapped uncached before enabling/notifying queues.
+    unsafe {
+        ensure_mmio_page(rx_notify_pa);
+        ensure_mmio_page(tx_notify_pa);
+    }
     vn_wr16(common_virt, VN_CC_QUEUE_ENABLE, 1);
 
     // DRIVER_OK.
@@ -815,14 +832,13 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
                 line[pos..pos + 4].copy_from_slice(&hx);
                 pos += 4;
             }
-            if flen >= 36 && u16::from_be_bytes([frame[12], frame[13]]) == 0x0800 {
-                let ihl2 = ((frame[14] & 0x0F) as usize) * 4;
-                let dport = u16::from_be_bytes([frame[14 + ihl2 + 2], frame[14 + ihl2 + 3]]);
+            if let Some((sport, dport)) =
+                target_enterprise::memory::kernel_guards::ipv4_l4_ports_in_frame(&frame, flen)
+            {
                 let mid2 = b" dport=";
                 line[pos..pos + mid2.len()].copy_from_slice(mid2);
                 pos += mid2.len();
                 pos += dec_u64_to_buf(dport as u64, &mut line[pos..]);
-                let sport = u16::from_be_bytes([frame[14 + ihl2], frame[14 + ihl2 + 1]]);
                 let mid3 = b" sport=";
                 line[pos..pos + mid3.len()].copy_from_slice(mid3);
                 pos += mid3.len();
@@ -1397,6 +1413,13 @@ pub(crate) fn udp_svc_tx(
     frame: &[u8],
 ) {
     use core::sync::atomic::{fence, Ordering};
+    if !target_enterprise::memory::kernel_guards::vnet_valid_tx_frame_len(
+        frame.len(),
+        UDP_SVC_VIRTIO_HDR,
+        2048,
+    ) {
+        return;
+    }
     let total = (UDP_SVC_VIRTIO_HDR + frame.len()) as u32;
     // SAFETY: `tx_buf_pa` is a 2048-byte buffer inside the reserved DMA window mapped via `pa_to_va`, and `12 + frame.len() <= 1526 < 2048` guarantees all writes are in bounds.
     unsafe {
@@ -1454,22 +1477,6 @@ pub(crate) const Q_TX_KICK: u16 = 1;
 
 /// Decimal u64 into buf, returns bytes written (service-local variant
 /// of dec_u64 for the payload builder).
-pub(crate) fn dec_u64_to_buf(mut v: u64, out: &mut [u8]) -> usize {
-    if v == 0 {
-        out[0] = b'0';
-        return 1;
-    }
-    let mut tmp = [0u8; 20];
-    let mut n = 0usize;
-    while v > 0 {
-        tmp[n] = b'0' + (v % 10) as u8;
-        v /= 10;
-        n += 1;
-    }
-    let mut i = 0usize;
-    while i < n {
-        out[i] = tmp[n - 1 - i];
-        i += 1;
-    }
-    n
+pub(crate) fn dec_u64_to_buf(v: u64, out: &mut [u8]) -> usize {
+    target_enterprise::memory::kernel_guards::dec_u64_bounded(v, out)
 }

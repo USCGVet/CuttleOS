@@ -225,10 +225,10 @@ static SMP_HW_INITIALIZED: AtomicBool = AtomicBool::new(false);
 #[inline(always)]
 fn smp_rx_va(phys: u64) -> u64 {
     let base = SMP_RX_TRAMPOLINE_VA.load(Ordering::Acquire);
-    if base == 0 {
-        panic!("SMP_HW: RX trampoline VA not initialized");
+    match target_enterprise::memory::kernel_guards::smp_checked_rx_va(base, phys) {
+        Some(va) => va,
+        None => panic!("SMP_HW: invalid or uninitialized RX trampoline phys/VA"),
     }
-    base + (phys - TRAMPOLINE_PAGE_PHYS)
 }
 
 /// Poll the Local APIC `ICR_LO` Delivery Status bit (`bit 12`) until Idle (`0`) or bounded timeout.
@@ -1067,17 +1067,23 @@ pub(crate) fn smp_hw_init() -> usize {
     let (saved_pte_ptr, orig_pte) = unsafe { map_temp_identity_trampoline(TRAMPOLINE_PAGE_PHYS) };
 
     // SAFETY: `LAPIC_PHYS_BASE` (`0xFEE0_0000`) is the architectural x86-64 Local APIC MMIO page.
-    unsafe {
-        let bsp_apic_id = mmio_read32(LAPIC_PHYS_BASE + LAPIC_ID) >> 24;
-        HW_APIC_IDS[0].store(bsp_apic_id, Ordering::Release);
+    let bsp_apic_id = unsafe {
+        let id = mmio_read32(LAPIC_PHYS_BASE + LAPIC_ID) >> 24;
+        HW_APIC_IDS[0].store(id, Ordering::Release);
         let svr = mmio_read32(LAPIC_PHYS_BASE + LAPIC_SVR);
         mmio_write32(LAPIC_PHYS_BASE + LAPIC_SVR, svr | 0x1FF);
         mmio_write32(LAPIC_PHYS_BASE + LAPIC_TPR, 0);
         mmio_write32(LAPIC_PHYS_BASE + LAPIC_ESR, 0);
-    }
+        id
+    };
 
     let mut cpu_id = 1usize;
     while cpu_id < MAX_SMP_CPUS {
+        let Some(target_apic_id) =
+            target_enterprise::memory::kernel_guards::smp_apic_for_ap_slot(cpu_id, bsp_apic_id)
+        else {
+            break;
+        };
         let stack_top = AP_STACKS[cpu_id].top_va() - 16;
         // SAFETY: Offsets `0x110` and `0x118` are 8-byte-aligned mailbox slots inside `0x8000..0x9000`.
         unsafe {
@@ -1086,11 +1092,11 @@ pub(crate) fn smp_hw_init() -> usize {
         }
         core::sync::atomic::fence(Ordering::SeqCst);
 
-        // Send INIT IPI (`0x0000_4500`) to `apic_id = cpu_id`.
-        // SAFETY: Polling `ICR_LO` idle then writing `ICR_HI` + `ICR_LO` dispatches an IPI to `cpu_id`.
+        // Send INIT IPI (`0x0000_4500`) to `target_apic_id` (never self-targeting `bsp_apic_id`).
+        // SAFETY: Polling `ICR_LO` idle then writing `ICR_HI` + `ICR_LO` dispatches an IPI to `target_apic_id`.
         unsafe {
             wait_lapic_icr_idle();
-            mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_HI, (cpu_id as u32) << 24);
+            mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_HI, target_apic_id << 24);
             mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_LO, 0x0000_4500);
             wait_lapic_icr_idle();
         }
@@ -1101,10 +1107,10 @@ pub(crate) fn smp_hw_init() -> usize {
         }
 
         // Send SIPI IPI (`0x0000_4608`, vector `0x08` -> physical `0x8000`).
-        // SAFETY: Polling `ICR_LO` idle then writing `ICR_HI` + `ICR_LO` sends a Startup IPI to `cpu_id`.
+        // SAFETY: Polling `ICR_LO` idle then writing `ICR_HI` + `ICR_LO` sends a Startup IPI to `target_apic_id`.
         unsafe {
             wait_lapic_icr_idle();
-            mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_HI, (cpu_id as u32) << 24);
+            mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_HI, target_apic_id << 24);
             mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_LO, 0x0000_4608);
             wait_lapic_icr_idle();
         }
@@ -1113,10 +1119,10 @@ pub(crate) fn smp_hw_init() -> usize {
         while !AP_BOOT_READY[cpu_id].load(Ordering::Acquire) && spins < 400_000 {
             if spins == 80_000 {
                 // Second SIPI per Intel MP specification if first did not latch yet.
-                // SAFETY: Re-sending Startup IPI with vector `0x08` to `cpu_id` before AP ready flag is set.
+                // SAFETY: Re-sending Startup IPI with vector `0x08` to `target_apic_id` before AP ready flag is set.
                 unsafe {
                     wait_lapic_icr_idle();
-                    mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_HI, (cpu_id as u32) << 24);
+                    mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_HI, target_apic_id << 24);
                     mmio_write32(LAPIC_PHYS_BASE + LAPIC_ICR_LO, 0x0000_4608);
                     wait_lapic_icr_idle();
                 }

@@ -18,6 +18,7 @@ static FB_WIDTH: AtomicUsize = AtomicUsize::new(0);
 static FB_HEIGHT: AtomicUsize = AtomicUsize::new(0);
 static FB_STRIDE: AtomicUsize = AtomicUsize::new(0);
 static FB_BPP: AtomicUsize = AtomicUsize::new(0);
+static FB_IS_BGR: AtomicBool = AtomicBool::new(true);
 static FB_ACTIVE: AtomicBool = AtomicBool::new(false);
 static FB_COL: AtomicUsize = AtomicUsize::new(1);
 static FB_ROW: AtomicUsize = AtomicUsize::new(4);
@@ -27,12 +28,14 @@ pub(crate) fn fb_register(boot: &mut bootloader_api::BootInfo) {
     if let Some(fb) = boot.framebuffer.as_mut() {
         let info = fb.info();
         let buf = fb.buffer_mut();
+        let is_bgr = !matches!(info.pixel_format, bootloader_api::info::PixelFormat::Rgb);
         FB_PTR.store(buf.as_mut_ptr() as u64, Ordering::Relaxed);
         FB_LEN.store(buf.len(), Ordering::Relaxed);
         FB_WIDTH.store(info.width, Ordering::Relaxed);
         FB_HEIGHT.store(info.height, Ordering::Relaxed);
         FB_STRIDE.store(info.stride, Ordering::Relaxed);
         FB_BPP.store(info.bytes_per_pixel, Ordering::Relaxed);
+        FB_IS_BGR.store(is_bgr, Ordering::Relaxed);
     }
 }
 
@@ -138,28 +141,30 @@ pub(crate) fn fb_write_byte(b: u8) {
 }
 
 fn fill_rect(x0: usize, y0: usize, rw: usize, rh: usize, rgb: (u8, u8, u8)) {
+    use target_enterprise::memory::kernel_guards::{fb_checked_pixel_offset, fb_pack_rgb};
     let ptr = FB_PTR.load(Ordering::Relaxed) as *mut u8;
     let len = FB_LEN.load(Ordering::Relaxed);
     let w = FB_WIDTH.load(Ordering::Relaxed);
     let h = FB_HEIGHT.load(Ordering::Relaxed);
     let stride = FB_STRIDE.load(Ordering::Relaxed);
     let bpp = FB_BPP.load(Ordering::Relaxed);
+    let is_bgr = FB_IS_BGR.load(Ordering::Relaxed);
     if ptr.is_null() || bpp < 3 {
         return;
     }
-    let y_end = (y0 + rh).min(h);
-    let x_end = (x0 + rw).min(w);
+    let px_bytes = fb_pack_rgb(rgb, is_bgr);
+    let y_end = y0.saturating_add(rh).min(h);
+    let x_end = x0.saturating_add(rw).min(w);
     let mut y = y0;
     while y < y_end {
         let mut x = x0;
         while x < x_end {
-            let off = (y * stride + x) * bpp;
-            if off + 2 < len {
-                // SAFETY: `off + 2 < len` guarantees the pixel offset lies within the bootloader-mapped framebuffer slice.
+            if let Some(off) = fb_checked_pixel_offset(x, y, w, h, stride, bpp, len) {
+                // SAFETY: `fb_checked_pixel_offset` verified `off + 2 < len` without overflow inside the bootloader-mapped framebuffer slice.
                 unsafe {
-                    core::ptr::write_volatile(ptr.add(off), rgb.2);
-                    core::ptr::write_volatile(ptr.add(off + 1), rgb.1);
-                    core::ptr::write_volatile(ptr.add(off + 2), rgb.0);
+                    core::ptr::write_volatile(ptr.add(off), px_bytes[0]);
+                    core::ptr::write_volatile(ptr.add(off + 1), px_bytes[1]);
+                    core::ptr::write_volatile(ptr.add(off + 2), px_bytes[2]);
                 }
             }
             x += 1;
@@ -172,7 +177,7 @@ fn draw_str_at(x0: usize, y0: usize, s: &[u8], fg: (u8, u8, u8), bg: (u8, u8, u8
     let mut x = x0;
     for &b in s {
         draw_glyph_at(x, y0, b, fg, bg);
-        x += CHAR_W;
+        x = x.saturating_add(CHAR_W);
     }
 }
 
@@ -180,35 +185,40 @@ fn draw_str_at(x0: usize, y0: usize, s: &[u8], fg: (u8, u8, u8), bg: (u8, u8, u8
 /// with 3px vertical line spacing = 14x19 cell) so horizontal and vertical
 /// strokes have uniform 2px thickness and natural monospace proportions.
 fn draw_glyph_at(x0: usize, y0: usize, ch: u8, fg: (u8, u8, u8), bg: (u8, u8, u8)) {
+    use target_enterprise::memory::kernel_guards::{fb_checked_pixel_offset, fb_pack_rgb};
     let ptr = FB_PTR.load(Ordering::Relaxed) as *mut u8;
     let len = FB_LEN.load(Ordering::Relaxed);
+    let w = FB_WIDTH.load(Ordering::Relaxed);
+    let h = FB_HEIGHT.load(Ordering::Relaxed);
     let stride = FB_STRIDE.load(Ordering::Relaxed);
     let bpp = FB_BPP.load(Ordering::Relaxed);
+    let is_bgr = FB_IS_BGR.load(Ordering::Relaxed);
     if ptr.is_null() || bpp < 3 {
         return;
     }
+    let fg_px = fb_pack_rgb(fg, is_bgr);
+    let bg_px = fb_pack_rgb(bg, is_bgr);
     let glyph = glyph_8x8(ch);
     let mut gy = 0usize;
     while gy < 8 {
         let row_bits = glyph[gy];
         let mut sy = 0usize;
         while sy < 2 {
-            let py = y0 + gy * 2 + sy;
+            let py = y0.saturating_add(gy * 2 + sy);
             let mut gx = 0usize;
             // Render the 7 active columns (bits 7..=1) at 2x horizontal width = 14px.
             while gx < 7 {
                 let on = (row_bits & (0x80 >> gx)) != 0;
-                let c = if on { fg } else { bg };
+                let px_bytes = if on { fg_px } else { bg_px };
                 let mut sx = 0usize;
                 while sx < 2 {
-                    let px = x0 + gx * 2 + sx;
-                    let off = (py * stride + px) * bpp;
-                    if off + 2 < len {
-                        // SAFETY: `off + 2 < len` guarantees the pixel offset lies within the mapped hardware framebuffer slice.
+                    let px = x0.saturating_add(gx * 2 + sx);
+                    if let Some(off) = fb_checked_pixel_offset(px, py, w, h, stride, bpp, len) {
+                        // SAFETY: `fb_checked_pixel_offset` verified `off + 2 < len` without overflow inside the mapped hardware framebuffer slice.
                         unsafe {
-                            core::ptr::write_volatile(ptr.add(off), c.2);
-                            core::ptr::write_volatile(ptr.add(off + 1), c.1);
-                            core::ptr::write_volatile(ptr.add(off + 2), c.0);
+                            core::ptr::write_volatile(ptr.add(off), px_bytes[0]);
+                            core::ptr::write_volatile(ptr.add(off + 1), px_bytes[1]);
+                            core::ptr::write_volatile(ptr.add(off + 2), px_bytes[2]);
                         }
                     }
                     sx += 1;
