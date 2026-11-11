@@ -287,6 +287,33 @@ impl SqlTable {
         }
     }
 
+    /// Reset a table slot in-place without materializing a multi-kilobyte [`SqlTable`] temporary on the stack.
+    pub fn reset_in_place(&mut self) {
+        self.used = false;
+        self.name = [0u8; SQL_IDENT_LEN];
+        self.name_len = 0;
+        self.col_count = 0;
+        let mut c = 0usize;
+        while c < SQL_MAX_COLS {
+            self.cols[c] = SqlColumn::empty();
+            c += 1;
+        }
+        let mut r = 0usize;
+        while r < SQL_MAX_ROWS {
+            self.rows[r].used = false;
+            let mut k = 0usize;
+            while k < SQL_MAX_COLS {
+                self.rows[r].cells[k] = SqlVal::zero_int();
+                k += 1;
+            }
+            self.index_hashes[r] = 0;
+            r += 1;
+        }
+        self.indexed_col = SQL_NO_INDEX;
+        self.index_name = [0u8; SQL_IDENT_LEN];
+        self.index_name_len = 0;
+    }
+
     /// Table name slice.
     pub fn name_bytes(&self) -> &[u8] {
         &self.name[..self.name_len as usize]
@@ -564,57 +591,164 @@ impl SqlDb {
     }
 
     /// Compute a deterministic 64-bit FNV-1a cryptographic state fingerprint across all
-    /// active tables, columns, secondary indexes, and live rows for 2-of-3 Triad TMR voting.
+    /// active tables, columns, secondary indexes, and canonically sorted live rows for 2-of-3 Triad TMR voting.
     pub fn state_hash(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         let mix_byte = |acc: u64, b: u8| -> u64 { (acc ^ (b as u64)).wrapping_mul(0x0100_0000_01b3) };
-        let mut t_idx = 0usize;
-        while t_idx < SQL_MAX_TABLES {
-            let tbl = &self.tables[t_idx];
-            if tbl.used {
-                h = mix_byte(h, 0xA5);
-                let mut i = 0usize;
-                while i < (tbl.name_len as usize) {
-                    h = mix_byte(h, tbl.name[i]);
-                    i += 1;
+
+        // Canonically sort active table indices by ASCII-lowercased table name.
+        let mut tbl_order = [0usize; SQL_MAX_TABLES];
+        let mut tcount = 0usize;
+        let mut ti = 0usize;
+        while ti < SQL_MAX_TABLES {
+            if self.tables[ti].used {
+                tbl_order[tcount] = ti;
+                tcount += 1;
+            }
+            ti += 1;
+        }
+        let mut a = 0usize;
+        while a < tcount {
+            let mut b = a + 1;
+            while b < tcount {
+                let na = self.tables[tbl_order[a]].name_bytes();
+                let nb = self.tables[tbl_order[b]].name_bytes();
+                if cmp_ascii_case_insensitive(na, nb) > 0 {
+                    tbl_order.swap(a, b);
                 }
-                h = mix_byte(h, tbl.col_count);
-                let mut r_idx = 0usize;
-                while r_idx < SQL_MAX_ROWS {
-                    let row = self.committed_row(t_idx, r_idx);
-                    if row.used {
-                        h = mix_byte(h, 0x5A);
-                        let mut c_idx = 0usize;
-                        while c_idx < (tbl.col_count as usize) {
-                            match &row.cells[c_idx] {
-                                SqlVal::Int(iv) => {
-                                    h = mix_byte(h, 1);
-                                    let bytes = iv.to_le_bytes();
-                                    let mut bi = 0usize;
-                                    while bi < 8 {
-                                        h = mix_byte(h, bytes[bi]);
-                                        bi += 1;
-                                    }
-                                }
-                                SqlVal::Text(tb, tl) => {
-                                    h = mix_byte(h, 2);
-                                    h = mix_byte(h, *tl);
-                                    let mut ti = 0usize;
-                                    while ti < (*tl as usize) {
-                                        h = mix_byte(h, tb[ti]);
-                                        ti += 1;
-                                    }
-                                }
+                b += 1;
+            }
+            a += 1;
+        }
+
+        let mut ord_i = 0usize;
+        while ord_i < tcount {
+            let t_idx = tbl_order[ord_i];
+            let tbl = &self.tables[t_idx];
+            let col_count = tbl.col_count as usize;
+            let is_kv = eq_ignore_ascii_case(tbl.name_bytes(), b"kv");
+            h = mix_byte(h, 0xA5);
+            let mut i = 0usize;
+            while i < (tbl.name_len as usize) {
+                h = mix_byte(h, tbl.name[i].to_ascii_lowercase());
+                i += 1;
+            }
+            h = mix_byte(h, tbl.col_count);
+            let mut col_i = 0usize;
+            while col_i < col_count {
+                let cname = tbl.cols[col_i].name_bytes();
+                h = mix_byte(h, cname.len() as u8);
+                let mut ci = 0usize;
+                while ci < cname.len() {
+                    h = mix_byte(h, cname[ci].to_ascii_lowercase());
+                    ci += 1;
+                }
+                h = mix_byte(h, tbl.cols[col_i].col_type as u8);
+                col_i += 1;
+            }
+
+            // Collect and canonically sort occupied rows so `state_hash()` is invariant to row-slot order.
+            let mut row_order = [0usize; SQL_MAX_ROWS];
+            let mut rcount = 0usize;
+            let mut r_idx = 0usize;
+            while r_idx < SQL_MAX_ROWS {
+                if self.committed_row(t_idx, r_idx).used {
+                    row_order[rcount] = r_idx;
+                    rcount += 1;
+                }
+                r_idx += 1;
+            }
+            let mut ri = 0usize;
+            while ri < rcount {
+                let mut rj = ri + 1;
+                while rj < rcount {
+                    let ra = self.committed_row(t_idx, row_order[ri]);
+                    let rb = self.committed_row(t_idx, row_order[rj]);
+                    if cmp_rows_canonical(ra, rb, col_count, is_kv) > 0 {
+                        row_order.swap(ri, rj);
+                    }
+                    rj += 1;
+                }
+                ri += 1;
+            }
+
+            let mut rk = 0usize;
+            while rk < rcount {
+                let row = self.committed_row(t_idx, row_order[rk]);
+                h = mix_byte(h, 0x5A);
+                let mut c_idx = 0usize;
+                while c_idx < col_count {
+                    match &row.cells[c_idx] {
+                        SqlVal::Int(iv) => {
+                            h = mix_byte(h, 1);
+                            let bytes = iv.to_le_bytes();
+                            let mut bi = 0usize;
+                            while bi < 8 {
+                                h = mix_byte(h, bytes[bi]);
+                                bi += 1;
                             }
-                            c_idx += 1;
+                        }
+                        SqlVal::Text(tb, tl) => {
+                            h = mix_byte(h, 2);
+                            h = mix_byte(h, *tl);
+                            let mut ti2 = 0usize;
+                            while ti2 < (*tl as usize) {
+                                h = mix_byte(h, tb[ti2]);
+                                ti2 += 1;
+                            }
                         }
                     }
-                    r_idx += 1;
+                    c_idx += 1;
                 }
+                rk += 1;
             }
-            t_idx += 1;
+            ord_i += 1;
         }
         h
+    }
+
+    /// Return the exact byte offset reached when serializing all live tables and rows
+    /// into the 4 KiB `CTTLSQL1` partition layout (must remain `<= SQL_PART_SECTORS * 512 - 8`).
+    pub fn serialized_partition_bytes(&self) -> usize {
+        let mut pos = 52usize;
+        let mut t = 0usize;
+        while t < SQL_MAX_TABLES {
+            let tbl = &self.tables[t];
+            if !tbl.used {
+                pos += 1;
+                t += 1;
+                continue;
+            }
+            let col_count = (tbl.col_count as usize).min(SQL_MAX_COLS);
+            let has_idx = tbl.index_name_len > 0 && (tbl.indexed_col as usize) < col_count;
+            pos += 4 + SQL_IDENT_LEN + col_count * (2 + SQL_IDENT_LEN);
+            if has_idx {
+                pos += 2 + (tbl.index_name_len as usize).min(SQL_IDENT_LEN);
+            }
+            let mut r = 0usize;
+            while r < SQL_MAX_ROWS {
+                let row = &tbl.rows[r];
+                if row.used {
+                    let mut c = 0usize;
+                    while c < col_count {
+                        pos += match row.cells[c] {
+                            SqlVal::Int(v) => {
+                                if v >= (i16::MIN as i64) && v <= (i16::MAX as i64) {
+                                    3
+                                } else {
+                                    9
+                                }
+                            }
+                            SqlVal::Text(_, len) => 2 + (len as usize).min(SQL_TEXT_LEN),
+                        };
+                        c += 1;
+                    }
+                }
+                r += 1;
+            }
+            t += 1;
+        }
+        pos
     }
 
     fn visible_row(&self, t_idx: usize, r_idx: usize, use_committed: bool) -> &SqlRow {
@@ -1129,10 +1263,8 @@ impl SqlDb {
         };
 
         let cols_raw = &after_table[lparen + 1..rparen];
-        let mut table = SqlTable::empty();
-        table.used = true;
-        table.name[..tname.len()].copy_from_slice(tname);
-        table.name_len = tname.len() as u8;
+        let mut parsed_cols = [SqlColumn::empty(); SQL_MAX_COLS];
+        let mut col_count = 0u8;
 
         let mut cursor = cols_raw;
         while !cursor.is_empty() {
@@ -1142,13 +1274,28 @@ impl SqlDb {
             if col_def.is_empty() {
                 continue;
             }
-            if table.col_count as usize >= SQL_MAX_COLS {
+            if col_count as usize >= SQL_MAX_COLS {
                 return copy_str(b"error: too many columns (max 4)\n", out);
             }
             let (cname, ctype_raw) = next_token(col_def);
-            let (ctype_tok, _) = next_token(ctype_raw);
+            let (ctype_tok, after_ctype) = next_token(ctype_raw);
+            if !trim_sql(after_ctype).is_empty() {
+                return copy_str(b"error: unexpected tokens in column definition\n", out);
+            }
             if !is_valid_ident(cname) {
                 return copy_str(b"error: invalid column name\n", out);
+            }
+            let mut dup = false;
+            let mut j = 0usize;
+            while j < col_count as usize {
+                if eq_ignore_ascii_case(parsed_cols[j].name_bytes(), cname) {
+                    dup = true;
+                    break;
+                }
+                j += 1;
+            }
+            if dup {
+                return copy_str(b"error: duplicate column name in CREATE TABLE\n", out);
             }
             let ctype = if eq_ignore_ascii_case(ctype_tok, b"INT")
                 || eq_ignore_ascii_case(ctype_tok, b"INTEGER")
@@ -1161,16 +1308,31 @@ impl SqlDb {
             } else {
                 return copy_str(b"error: column type must be INT or TEXT\n", out);
             };
-            let idx = table.col_count as usize;
-            table.cols[idx].name[..cname.len()].copy_from_slice(cname);
-            table.cols[idx].name_len = cname.len() as u8;
-            table.cols[idx].col_type = ctype;
-            table.col_count += 1;
+            let idx = col_count as usize;
+            parsed_cols[idx].name[..cname.len()].copy_from_slice(cname);
+            parsed_cols[idx].name_len = cname.len() as u8;
+            parsed_cols[idx].col_type = ctype;
+            col_count += 1;
         }
-        if table.col_count == 0 {
+        if !trim_sql(&after_table[rparen + 1..]).is_empty() {
+            return copy_str(b"error: unexpected trailing tokens after CREATE TABLE\n", out);
+        }
+        if col_count == 0 {
             return copy_str(b"error: CREATE TABLE requires at least 1 column\n", out);
         }
-        self.tables[t_idx] = table;
+        self.tables[t_idx].reset_in_place();
+        self.tables[t_idx].used = true;
+        self.tables[t_idx].name[..tname.len()].copy_from_slice(tname);
+        self.tables[t_idx].name_len = tname.len() as u8;
+        self.tables[t_idx].col_count = col_count;
+        self.tables[t_idx].cols = parsed_cols;
+        if self.serialized_partition_bytes() > SQL_PART_SECTORS * 512 - 8 {
+            self.tables[t_idx].reset_in_place();
+            return copy_str(
+                b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)\n",
+                out,
+            );
+        }
         self.tx_seq = self.tx_seq.wrapping_add(1);
         let mut pos = 0usize;
         pos += append_bytes(out, pos, b"CREATE TABLE ");
@@ -1267,7 +1429,7 @@ impl SqlDb {
             }
             return copy_str(b"error: table not found\n", out);
         };
-        self.tables[t_idx] = SqlTable::empty();
+        self.tables[t_idx].reset_in_place();
         self.tx_seq = self.tx_seq.wrapping_add(1);
         let mut pos = 0usize;
         pos += append_bytes(out, pos, b"DROP TABLE ");
@@ -1362,6 +1524,16 @@ impl SqlDb {
                             out,
                         );
                     }
+                    let prev_row = self.tables[t_idx].rows[r];
+                    self.tables[t_idx].rows[r] = row;
+                    if self.serialized_partition_bytes() > SQL_PART_SECTORS * 512 - 8 {
+                        self.tables[t_idx].rows[r] = prev_row;
+                        return copy_str(
+                            b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)\n",
+                            out,
+                        );
+                    }
+                    self.tables[t_idx].rows[r] = prev_row;
                     self.record_row_undo(t_idx, r);
                     let idx_col = self.tables[t_idx].indexed_col as usize;
                     if idx_col < col_count {
@@ -1393,6 +1565,15 @@ impl SqlDb {
                 out,
             );
         }
+        self.tables[t_idx].rows[r_idx] = row;
+        if self.serialized_partition_bytes() > SQL_PART_SECTORS * 512 - 8 {
+            self.tables[t_idx].rows[r_idx] = SqlRow::empty();
+            return copy_str(
+                b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)\n",
+                out,
+            );
+        }
+        self.tables[t_idx].rows[r_idx] = SqlRow::empty();
         self.record_row_undo(t_idx, r_idx);
         let idx_col = self.tables[t_idx].indexed_col as usize;
         if idx_col < col_count {
@@ -1422,12 +1603,17 @@ impl SqlDb {
         let mut limit = SQL_MAX_ROWS;
         if let Some((before_lim, lim_str)) = split_keyword_ignore_case(clauses, b"LIMIT") {
             clauses = before_lim;
-            let (lim_tok, _) = next_token(lim_str);
-            if let Some(n) = parse_i64(lim_tok) {
-                if n >= 0 {
-                    limit = (n as usize).min(SQL_MAX_ROWS);
-                }
+            let (lim_tok, lim_tail) = next_token(lim_str);
+            if !trim_sql(lim_tail).is_empty() {
+                return copy_str(b"error: unexpected tokens after LIMIT\n", out);
             }
+            let Some(n) = parse_i64(lim_tok) else {
+                return copy_str(b"error: invalid LIMIT value\n", out);
+            };
+            if n < 0 {
+                return copy_str(b"error: LIMIT must be non-negative\n", out);
+            }
+            limit = (n as usize).min(SQL_MAX_ROWS);
         }
 
         // Parse optional ORDER BY <col> [ASC|DESC].
@@ -1435,15 +1621,25 @@ impl SqlDb {
         if let Some((before_ord, ord_str)) = split_keyword_ignore_case(clauses, b"ORDER") {
             clauses = before_ord;
             let (kw_by, after_by) = next_token(ord_str);
-            if eq_ignore_ascii_case(kw_by, b"BY") {
-                let (ocol, dir_raw) = next_token(after_by);
-                let (dir_tok, _) = next_token(dir_raw);
-                let Some(c_idx) = self.tables[t_idx].find_col(ocol) else {
-                    return copy_str(b"error: unknown column in ORDER BY\n", out);
-                };
-                let desc = eq_ignore_ascii_case(dir_tok, b"DESC");
-                order_col = Some((c_idx, desc));
+            if !eq_ignore_ascii_case(kw_by, b"BY") {
+                return copy_str(b"error: expected ORDER BY <col> [ASC|DESC]\n", out);
             }
+            let (ocol, dir_raw) = next_token(after_by);
+            let (dir_tok, dir_tail) = next_token(dir_raw);
+            if !trim_sql(dir_tail).is_empty() {
+                return copy_str(b"error: unexpected tokens after ORDER BY\n", out);
+            }
+            let Some(c_idx) = self.tables[t_idx].find_col(ocol) else {
+                return copy_str(b"error: unknown column in ORDER BY\n", out);
+            };
+            let desc = if dir_tok.is_empty() || eq_ignore_ascii_case(dir_tok, b"ASC") {
+                false
+            } else if eq_ignore_ascii_case(dir_tok, b"DESC") {
+                true
+            } else {
+                return copy_str(b"error: invalid ORDER BY direction\n", out);
+            };
+            order_col = Some((c_idx, desc));
         }
 
         // Parse optional WHERE <col> <op> <val> [AND|OR <col2> <op2> <val2>].
@@ -1719,6 +1915,46 @@ impl SqlDb {
                 b"error: transaction undo log full (max 8 rows); COMMIT or ROLLBACK first\n",
                 out,
             );
+        }
+
+        // Pre-verify 4 KiB `CTTLSQL1` partition budget before mutating rows or undo log:
+        if mcount > 0 {
+            let mut delta: isize = 0;
+            let new_cell_bytes: isize = match new_val {
+                SqlVal::Int(v) => {
+                    if v >= (i16::MIN as i64) && v <= (i16::MAX as i64) {
+                        3
+                    } else {
+                        9
+                    }
+                }
+                SqlVal::Text(_, len) => (2 + (len as usize).min(SQL_TEXT_LEN)) as isize,
+            };
+            let mut mi = 0usize;
+            while mi < mcount {
+                let old_cell = &self.tables[t_idx].rows[matched[mi]].cells[set_col_idx];
+                let old_bytes: isize = match old_cell {
+                    SqlVal::Int(v) => {
+                        if *v >= (i16::MIN as i64) && *v <= (i16::MAX as i64) {
+                            3
+                        } else {
+                            9
+                        }
+                    }
+                    SqlVal::Text(_, len) => (2 + (*len as usize).min(SQL_TEXT_LEN)) as isize,
+                };
+                delta += new_cell_bytes - old_bytes;
+                mi += 1;
+            }
+            if delta > 0
+                && self.serialized_partition_bytes().saturating_add(delta as usize)
+                    > SQL_PART_SECTORS * 512 - 8
+            {
+                return copy_str(
+                    b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)\n",
+                    out,
+                );
+            }
         }
 
         let mut updated = 0u64;
@@ -2028,23 +2264,94 @@ impl SqlDb {
             return false;
         }
 
-        let mut pos = 52usize;
-        let mut parsed_tables = [SqlTable::empty(); SQL_MAX_TABLES];
-        let mut t = 0usize;
-        while t < SQL_MAX_TABLES {
-            if pos >= total_pos {
+        // Pass 1: validate the entire serialized payload structure without allocating
+        // multi-kilobyte `SqlTable` temporaries on the bare-metal kernel stack.
+        let mut scan = 52usize;
+        let mut st = 0usize;
+        while st < SQL_MAX_TABLES {
+            if scan >= total_pos {
                 return false;
             }
+            let marker = flat[scan];
+            if marker == 0 {
+                scan += 1;
+                st += 1;
+                continue;
+            }
+            if scan + 4 + SQL_IDENT_LEN > total_pos {
+                return false;
+            }
+            let col_count = (flat[scan + 2].min(SQL_MAX_COLS as u8)) as usize;
+            let used_rows = (flat[scan + 3] as usize).min(SQL_MAX_ROWS);
+            scan += 4 + SQL_IDENT_LEN;
+
+            if scan + col_count * (2 + SQL_IDENT_LEN) > total_pos {
+                return false;
+            }
+            scan += col_count * (2 + SQL_IDENT_LEN);
+
+            if marker == 2 {
+                if scan + 2 > total_pos {
+                    return false;
+                }
+                let idx_col = flat[scan];
+                let ilen = (flat[scan + 1] as usize).min(SQL_IDENT_LEN);
+                if scan + 2 + ilen > total_pos || (idx_col as usize) >= col_count {
+                    return false;
+                }
+                scan += 2 + ilen;
+            }
+
+            let mut sr = 0usize;
+            while sr < used_rows {
+                let mut sc = 0usize;
+                while sc < col_count {
+                    if scan >= total_pos {
+                        return false;
+                    }
+                    let tag_b = flat[scan];
+                    if tag_b == SqlType::Text as u8 {
+                        if scan + 2 > total_pos {
+                            return false;
+                        }
+                        let len = (flat[scan + 1] as usize).min(SQL_TEXT_LEN);
+                        if scan + 2 + len > total_pos {
+                            return false;
+                        }
+                        scan += 2 + len;
+                    } else if tag_b == 3 {
+                        if scan + 3 > total_pos {
+                            return false;
+                        }
+                        scan += 3;
+                    } else {
+                        if scan + 9 > total_pos {
+                            return false;
+                        }
+                        scan += 9;
+                    }
+                    sc += 1;
+                }
+                sr += 1;
+            }
+            st += 1;
+        }
+        if scan != total_pos {
+            return false;
+        }
+
+        // Pass 2: payload is verified valid; decode directly into `self.tables` in-place.
+        let mut pos = 52usize;
+        let mut t = 0usize;
+        while t < SQL_MAX_TABLES {
+            self.tables[t].reset_in_place();
             let marker = flat[pos];
             if marker == 0 {
                 pos += 1;
                 t += 1;
                 continue;
             }
-            if pos + 4 + SQL_IDENT_LEN > total_pos {
-                return false;
-            }
-            let mut tbl = SqlTable::empty();
+            let tbl = &mut self.tables[t];
             tbl.used = true;
             tbl.name_len = flat[pos + 1].min(SQL_IDENT_LEN as u8);
             tbl.col_count = flat[pos + 2].min(SQL_MAX_COLS as u8);
@@ -2056,9 +2363,6 @@ impl SqlDb {
             let col_count = tbl.col_count as usize;
             let mut c = 0usize;
             while c < col_count {
-                if pos + 2 + SQL_IDENT_LEN > total_pos {
-                    return false;
-                }
                 tbl.cols[c].name_len = flat[pos].min(SQL_IDENT_LEN as u8);
                 tbl.cols[c].col_type = if flat[pos + 1] == SqlType::Text as u8 {
                     SqlType::Text
@@ -2072,14 +2376,8 @@ impl SqlDb {
             }
 
             if marker == 2 {
-                if pos + 2 > total_pos {
-                    return false;
-                }
                 let idx_col = flat[pos];
                 let ilen = (flat[pos + 1] as usize).min(SQL_IDENT_LEN);
-                if pos + 2 + ilen > total_pos || (idx_col as usize) >= col_count {
-                    return false;
-                }
                 tbl.indexed_col = idx_col;
                 tbl.index_name_len = ilen as u8;
                 tbl.index_name[..ilen].copy_from_slice(&flat[pos + 2..pos + 2 + ilen]);
@@ -2091,33 +2389,18 @@ impl SqlDb {
                 tbl.rows[r].used = true;
                 let mut rc = 0usize;
                 while rc < col_count {
-                    if pos >= total_pos {
-                        return false;
-                    }
                     let tag_b = flat[pos];
                     if tag_b == SqlType::Text as u8 {
-                        if pos + 2 > total_pos {
-                            return false;
-                        }
                         let len = (flat[pos + 1] as usize).min(SQL_TEXT_LEN);
-                        if pos + 2 + len > total_pos {
-                            return false;
-                        }
                         let mut buf = [0u8; SQL_TEXT_LEN];
                         buf[..len].copy_from_slice(&flat[pos + 2..pos + 2 + len]);
                         tbl.rows[r].cells[rc] = SqlVal::Text(buf, len as u8);
                         pos += 2 + len;
                     } else if tag_b == 3 {
-                        if pos + 3 > total_pos {
-                            return false;
-                        }
                         let v16 = i16::from_le_bytes([flat[pos + 1], flat[pos + 2]]);
                         tbl.rows[r].cells[rc] = SqlVal::Int(v16 as i64);
                         pos += 3;
                     } else {
-                        if pos + 9 > total_pos {
-                            return false;
-                        }
                         let mut vb = [0u8; 8];
                         vb.copy_from_slice(&flat[pos + 1..pos + 9]);
                         tbl.rows[r].cells[rc] = SqlVal::Int(i64::from_le_bytes(vb));
@@ -2128,17 +2411,16 @@ impl SqlDb {
                 r += 1;
             }
             tbl.rebuild_index();
-            parsed_tables[t] = tbl;
             t += 1;
-        }
-        if pos != total_pos {
-            return false;
         }
 
         let mut tx_bytes = [0u8; 8];
         tx_bytes.copy_from_slice(&flat[8..16]);
         self.tx_seq = u64::from_le_bytes(tx_bytes);
-        self.tables = parsed_tables;
+        self.tx_active = false;
+        self.tx_owner = 0;
+        self.tx_age_ticks = 0;
+        self.tx_undo_len = 0;
         true
     }
 }
@@ -2279,6 +2561,29 @@ fn split_comma_respecting_quotes(s: &[u8]) -> (&[u8], &[u8]) {
         i += 1;
     }
     (s, &[])
+}
+
+fn cmp_ascii_case_insensitive(a: &[u8], b: &[u8]) -> i8 {
+    let min_len = a.len().min(b.len());
+    let mut i = 0usize;
+    while i < min_len {
+        let ca = a[i].to_ascii_lowercase();
+        let cb = b[i].to_ascii_lowercase();
+        if ca < cb {
+            return -1;
+        }
+        if ca > cb {
+            return 1;
+        }
+        i += 1;
+    }
+    if a.len() < b.len() {
+        -1
+    } else if a.len() > b.len() {
+        1
+    } else {
+        0
+    }
 }
 
 fn split_keyword_ignore_case<'a>(s: &'a [u8], kw: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
@@ -3280,5 +3585,101 @@ mod tests {
             &mut out,
         );
         assert_eq!(&out[..n_con], b"v\n1\n");
+    }
+
+    #[test]
+    fn state_hash_is_slot_order_independent_and_parser_rejects_overflow_and_malformed_clauses() {
+        let mut out = [0u8; 512];
+
+        // 1. Two databases reaching identical logical rows via different DELETE/INSERT slot orderings
+        //    must produce the exact same `state_hash()`.
+        let mut db_a = SqlDb::new();
+        let mut db_b = SqlDb::new();
+        let n = db_a.exec(b"INSERT INTO kv VALUES ('alpha', '1', 10)", &mut out);
+        assert_eq!(&out[..n], b"INSERT 1\n");
+        let n = db_a.exec(b"INSERT INTO kv VALUES ('beta', '2', 20)", &mut out);
+        assert_eq!(&out[..n], b"INSERT 1\n");
+
+        // `db_b` inserts a dummy first, then `beta`, then deletes dummy, then inserts `alpha` into slot 0
+        // so `beta` sits in a higher physical `rows[]` index than in `db_a` (or vice versa):
+        let n = db_b.exec(b"INSERT INTO kv VALUES ('tmp', '0', 0)", &mut out);
+        assert_eq!(&out[..n], b"INSERT 1\n");
+        let n = db_b.exec(b"INSERT INTO kv VALUES ('beta', '2', 20)", &mut out);
+        assert_eq!(&out[..n], b"INSERT 1\n");
+        let n = db_b.exec(b"DELETE FROM kv WHERE k = 'tmp'", &mut out);
+        assert_eq!(&out[..n], b"DELETE 1\n");
+        let n = db_b.exec(b"INSERT INTO kv VALUES ('alpha', '1', 10)", &mut out);
+        assert_eq!(&out[..n], b"INSERT 1\n");
+        // Flip order in `db_b`: put `beta` in slot 0 and `alpha` in slot 1!
+        let mut db_c = SqlDb::new();
+        let _ = db_c.exec(b"INSERT INTO kv VALUES ('beta', '2', 20)", &mut out);
+        let _ = db_c.exec(b"INSERT INTO kv VALUES ('alpha', '1', 10)", &mut out);
+        assert_eq!(
+            db_a.state_hash(),
+            db_c.state_hash(),
+            "state_hash() must be invariant to physical row-slot ordering across Triad nodes"
+        );
+
+        // 2. Duplicate column names in CREATE TABLE and malformed LIMIT / ORDER BY must be rejected.
+        let n_dup = db_a.exec(b"CREATE TABLE bad_dup (id INT, id TEXT)", &mut out);
+        assert!(
+            out[..n_dup].starts_with(b"error:"),
+            "duplicate column names must fail: {:?}",
+            core::str::from_utf8(&out[..n_dup])
+        );
+        let n_lim = db_a.exec(b"SELECT * FROM kv LIMIT abc", &mut out);
+        assert!(
+            out[..n_lim].starts_with(b"error:"),
+            "non-numeric LIMIT must fail: {:?}",
+            core::str::from_utf8(&out[..n_lim])
+        );
+        let n_ord = db_a.exec(b"SELECT * FROM kv ORDER k", &mut out);
+        assert!(
+            out[..n_ord].starts_with(b"error:"),
+            "ORDER without BY must fail: {:?}",
+            core::str::from_utf8(&out[..n_ord])
+        );
+        let n_dir = db_a.exec(b"SELECT * FROM kv ORDER BY k SIDEWAYS", &mut out);
+        assert!(
+            out[..n_dir].starts_with(b"error:"),
+            "invalid ORDER BY direction must fail: {:?}",
+            core::str::from_utf8(&out[..n_dir])
+        );
+
+        // 3. Partition capacity enforcement: `SqlDb` must reject mutations that would exceed the
+        //    4 KiB `CTTLSQL1` partition budget instead of silently dropping rows on `save_partition`.
+        let mut db_full = SqlDb::new();
+        for t in 0..2usize {
+            let create = alloc::format!("CREATE TABLE wide{t} (a TEXT, b TEXT, c TEXT, d TEXT)");
+            let n = db_full.exec(create.as_bytes(), &mut out);
+            assert!(!out[..n].starts_with(b"error:"));
+        }
+        let mut rejected_overflow = false;
+        for t in 0..2usize {
+            for r in 0..40usize {
+                let ins = alloc::format!(
+                    "INSERT INTO wide{t} VALUES ('k{t}_{r:02}_xxxxxxxxxxxxxxxx', 'v1_{r:02}_xxxxxxxxxxxxxxxxxx', 'v2_{r:02}_xxxxxxxxxxxxxxxxxx', 'v3_{r:02}_xxxxxxxxxxxxxxxxxx')"
+                );
+                let ni = db_full.exec(ins.as_bytes(), &mut out);
+                if out[..ni].starts_with(b"error:") {
+                    rejected_overflow = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            rejected_overflow,
+            "SqlDb must explicitly reject INSERT once 4 KiB CTTLSQL1 partition capacity is reached"
+        );
+        let key = [0x5Au8; 32];
+        let mut secs = [[0u8; 512]; SQL_PART_SECTORS];
+        db_full.save_partition(&key, &mut secs);
+        let mut reloaded = SqlDb::empty();
+        assert!(reloaded.load_partition(&key, &secs));
+        assert_eq!(
+            reloaded.state_hash(),
+            db_full.state_hash(),
+            "every accepted SQL row must survive save_partition + load_partition without silent truncation"
+        );
     }
 }

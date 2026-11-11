@@ -89,7 +89,14 @@ fn boots_under_qemu_and_emits_banner() {
     let kernel_crate = root.join("target_enterprise_kernel");
     let pkg_crate = root.join("factory_builder_pkg");
 
+    let require_qemu = std::env::var("CUTTLE_REQUIRE_QEMU").as_deref() == Ok("1");
     if !kernel_crate.join("Cargo.toml").exists() {
+        if require_qemu {
+            panic!(
+                "CUTTLE_REQUIRE_QEMU=1: target_enterprise_kernel/ not present at {}",
+                kernel_crate.display()
+            );
+        }
         eprintln!(
             "SKIP: target_enterprise_kernel/ not present at {} — out-of-workspace kernel crate missing",
             kernel_crate.display()
@@ -97,6 +104,12 @@ fn boots_under_qemu_and_emits_banner() {
         return;
     }
     if !pkg_crate.join("Cargo.toml").exists() {
+        if require_qemu {
+            panic!(
+                "CUTTLE_REQUIRE_QEMU=1: factory_builder_pkg/ not present at {}",
+                pkg_crate.display()
+            );
+        }
         eprintln!(
             "SKIP: factory_builder_pkg/ not present at {} — out-of-workspace packager missing",
             pkg_crate.display()
@@ -106,7 +119,7 @@ fn boots_under_qemu_and_emits_banner() {
     let qemu = match find_qemu() {
         Some(p) => p,
         None => {
-            if std::env::var("CUTTLE_REQUIRE_QEMU").as_deref() == Ok("1") {
+            if require_qemu {
                 panic!(
                     "CUTTLE_REQUIRE_QEMU=1: qemu-system-x86_64 not found on PATH or standard install locations"
                 );
@@ -129,6 +142,12 @@ fn boots_under_qemu_and_emits_banner() {
         .output()
         .expect("spawn factory_builder build-kernel");
     if !bk.status.success() {
+        if require_qemu {
+            panic!(
+                "CUTTLE_REQUIRE_QEMU=1: kernel build failed. exit={:?}",
+                bk.status.code()
+            );
+        }
         eprintln!(
             "SKIP: kernel build failed (likely missing nightly + rust-src). exit={:?}",
             bk.status.code()
@@ -157,6 +176,12 @@ fn boots_under_qemu_and_emits_banner() {
         .output()
         .expect("spawn factory_builder package");
     if !pkg_out.status.success() {
+        if require_qemu {
+            panic!(
+                "CUTTLE_REQUIRE_QEMU=1: factory_builder_pkg packaging failed.\nstderr:\n{}",
+                String::from_utf8_lossy(&pkg_out.stderr)
+            );
+        }
         eprintln!(
             "SKIP: factory_builder_pkg packaging failed (likely missing nightly toolchain).\n\
              stderr:\n{}",
@@ -534,6 +559,132 @@ impl SmokeVm<'_> {
         let _ = qproc.wait();
         (std::fs::read_to_string(serial_log).unwrap_or_default(), reached)
     }
+
+    /// Boot with piped `-serial stdio`, wait until `interactive shell ready.` appears,
+    /// feed `commands` line-by-line (pausing briefly between lines), wait until `done(log)`
+    /// holds or 45s pass, then kill QEMU and return `(log, reached)`.
+    fn boot_interactive(
+        &self,
+        commands: &[&str],
+        done: impl Fn(&str) -> bool,
+    ) -> (String, bool) {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+
+        let mut qproc = Command::new(self.qemu)
+            .args(smoke_accel_args())
+            .arg("-cpu")
+            .arg(PINNED_QEMU_CPU_MODEL)
+            .arg("-smp")
+            .arg("4")
+            .arg("-fw_cfg")
+            .arg(format!(
+                "name={},file={}",
+                factory_builder::FW_CFG_DEVICE_KEY_NAME,
+                self.device_key.display()
+            ))
+            .arg("-drive")
+            .arg(format!("format=raw,file={},if=ide", self.bios.display()))
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=vd0,format=raw,file={}",
+                self.virtio_disk.display()
+            ))
+            .arg("-device")
+            .arg("virtio-blk-pci,drive=vd0,disable-legacy=off,disable-modern=on")
+            .arg("-netdev")
+            .arg("hubport,id=n0,hubid=1")
+            .arg("-device")
+            .arg("virtio-net-pci,netdev=n0,disable-legacy=off,disable-modern=on")
+            .arg("-netdev")
+            .arg("hubport,id=n1,hubid=1")
+            .arg("-device")
+            .arg("virtio-net-pci,netdev=n1,disable-legacy=off,disable-modern=on")
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=ahd0,format=raw,file={}",
+                self.ahci_disk.display()
+            ))
+            .arg("-device")
+            .arg("ahci,id=ahci0")
+            .arg("-device")
+            .arg("ide-hd,drive=ahd0,bus=ahci0.0")
+            .arg("-netdev")
+            .arg("hubport,id=e0,hubid=2")
+            .arg("-device")
+            .arg("e1000,netdev=e0")
+            .arg("-netdev")
+            .arg("hubport,id=e1,hubid=2")
+            .arg("-device")
+            .arg("e1000,netdev=e1")
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=nvme0,format=raw,file={}",
+                self.nvme_disk.display()
+            ))
+            .arg("-device")
+            .arg("nvme,drive=nvme0,serial=CUTTLE-NVME-HW")
+            .arg("-serial")
+            .arg("stdio")
+            .arg("-display")
+            .arg("none")
+            .arg("-no-reboot")
+            .arg("-m")
+            .arg("256M")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn interactive qemu");
+
+        let mut stdout = qproc.stdout.take().expect("qemu stdout");
+        let mut stdin = qproc.stdin.take().expect("qemu stdin");
+        let buf = Arc::new(Mutex::new(String::new()));
+        let buf_reader = Arc::clone(&buf);
+        let reader_handle = std::thread::spawn(move || {
+            let mut chunk = [0u8; 512];
+            while let Ok(n) = stdout.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                let text = String::from_utf8_lossy(&chunk[..n]);
+                if let Ok(mut g) = buf_reader.lock() {
+                    g.push_str(&text);
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut commands_sent = false;
+        let mut reached = false;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(120));
+            let snapshot = buf.lock().map(|g| g.clone()).unwrap_or_default();
+            if !commands_sent && snapshot.contains("Cuttle Enterprise OS interactive shell ready.") {
+                std::thread::sleep(Duration::from_millis(120));
+                for cmd in commands {
+                    let payload = format!("{cmd}\n");
+                    for chunk in payload.as_bytes().chunks(6) {
+                        let _ = stdin.write_all(chunk);
+                        let _ = stdin.flush();
+                        std::thread::sleep(Duration::from_millis(30));
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                commands_sent = true;
+            }
+            if commands_sent && done(&snapshot) {
+                reached = true;
+                break;
+            }
+        }
+        drop(stdin);
+        let _ = qproc.kill();
+        let _ = qproc.wait();
+        let _ = reader_handle.join();
+        let final_log = buf.lock().map(|g| g.clone()).unwrap_or_default();
+        (final_log, reached)
+    }
 }
 
 fn halted(log: &str) -> bool {
@@ -825,15 +976,77 @@ fn morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu() {
             assert_eq!(Some(fs_slice), boot_1_fs_magic.as_deref());
             assert_eq!(Some(sql_slice), boot_1_sql_magic.as_deref());
         }
-        let _ = std::fs::remove_file(&bios_path);
         let _ = std::fs::remove_file(images_dir.join(format!("qemu_multiseed_{seed}.elf")));
     }
 
+    // 4. Interactive cross-morph operator state continuity (Boot #4 seed=202 -> Boot #5 seed=303):
+    //    Write a custom VFS file, CIDR firewall rule, and scheduled cron job on seed=202, sync to AHCI,
+    //    then boot morphed seed=303 and prove all three survived across the binary variant swap!
+    let bios_202 = images_dir.join("qemu_multiseed_bios_202.img");
+    let bios_303 = images_dir.join("qemu_multiseed_bios_303.img");
+    let vm_202 = SmokeVm {
+        qemu: &qemu,
+        bios: &bios_202,
+        virtio_disk: &virtio_disk,
+        ahci_disk: &ahci_disk,
+        nvme_disk: &nvme_disk,
+        device_key: &device_key_path,
+    };
+    let (log_202_rw, synced_202) = vm_202.boot_interactive(
+        &[
+            "write /var/morph.cfg persisted-across-morph",
+            "fw block 198.51.100.0/24",
+            "cron add 40 status",
+            "sync",
+            "halt",
+        ],
+        |s| s.contains("system halting..."),
+    );
+    assert!(
+        synced_202 && log_202_rw.contains("sync: ok "),
+        "interactive seed=202 failed to complete sync!\nSerial log:\n{log_202_rw}"
+    );
+
+    let vm_303 = SmokeVm {
+        qemu: &qemu,
+        bios: &bios_303,
+        virtio_disk: &virtio_disk,
+        ahci_disk: &ahci_disk,
+        nvme_disk: &nvme_disk,
+        device_key: &device_key_path,
+    };
+    let (log_303_ro, verified_303) = vm_303.boot_interactive(
+        &["cat /var/morph.cfg", "fw", "cron list", "uname", "halt"],
+        |s| s.contains("system halting..."),
+    );
+    for seed_bios in [
+        images_dir.join("qemu_multiseed_bios_101.img"),
+        bios_202,
+        bios_303,
+    ] {
+        let _ = std::fs::remove_file(seed_bios);
+    }
     for disk in scratch_disks {
         let _ = std::fs::remove_file(disk);
     }
+    assert!(
+        verified_303,
+        "interactive seed=303 did not respond to verification commands!\nSerial log:\n{log_303_ro}"
+    );
+    assert!(
+        log_303_ro.contains("persisted-across-morph"),
+        "custom VFS file /var/morph.cfg was wiped on morphed kernel reboot (seed 202 -> 303)!\nSerial log:\n{log_303_ro}"
+    );
+    assert!(
+        log_303_ro.contains("198.51.100.0/24"),
+        "custom CIDR firewall rule was wiped on morphed kernel reboot (seed 202 -> 303)!\nSerial log:\n{log_303_ro}"
+    );
+    assert!(
+        log_303_ro.contains("every=40") && log_303_ro.contains("cmd=\"status\""),
+        "scheduled cron job was wiped on morphed kernel reboot (seed 202 -> 303)!\nSerial log:\n{log_303_ro}"
+    );
     eprintln!(
-        "smoke[multiseed]: 10 morphed seeds verified distinct & 3 consecutive cross-seed QEMU boots (seeds 101 -> 202 -> 303) preserved sealed state; MULTI-SEED QEMU TEST PASSED"
+        "smoke[multiseed]: 10 morphed seeds verified distinct & cross-seed QEMU boots preserved VFS, firewall, cron, and SQL state; MULTI-SEED QEMU TEST PASSED"
     );
 }
 

@@ -84,11 +84,61 @@ impl Http for HttpImpl {
             find_blank_line(rest_after_rl).ok_or(HttpError::HeaderBlockTooLarge)?;
         let headers_raw = &rest_after_rl[..headers_end];
         let body_start = after_request_line + body_off;
-        let body = if body_start <= bytes.len() {
+        let mut body = if body_start <= bytes.len() {
             &bytes[body_start..]
         } else {
             &[]
         };
+
+        // Validate every header line against RFC 9110 / RFC 9112 smuggling vectors:
+        // - Reject obsolete line folding (`obs-fold`: leading SP/HTAB).
+        // - Reject missing `:` or invalid/whitespace-padded header field names.
+        // - Reject `Transfer-Encoding` (`UnsupportedVersion`).
+        // - Reject duplicate or non-numeric `Content-Length`, and enforce exact framing
+        //   when `Content-Length` is present (`Truncated` if short, sliced to `cl` if longer).
+        let mut content_length: Option<usize> = None;
+        if !headers_raw.is_empty() {
+            let mut cursor = 0usize;
+            while cursor < headers_raw.len() {
+                let rest = &headers_raw[cursor..];
+                let (line, advance) = match find_crlf(rest) {
+                    Some(eol) => (&rest[..eol], eol + 2),
+                    None => (rest, rest.len()),
+                };
+                cursor += advance;
+                if line.is_empty() {
+                    continue;
+                }
+                if line[0] == b' ' || line[0] == b'\t' {
+                    return Err(HttpError::MalformedRequestLine);
+                }
+                let colon = find_byte(line, b':').ok_or(HttpError::MalformedRequestLine)?;
+                let hname = &line[..colon];
+                if !is_valid_header_name(hname) {
+                    return Err(HttpError::MalformedRequestLine);
+                }
+                let raw_val = &line[colon + 1..];
+                let hval = trim_http_ows(raw_val);
+                if ascii_eq_ignore_case(hname, b"Transfer-Encoding") {
+                    return Err(HttpError::UnsupportedVersion);
+                }
+                if ascii_eq_ignore_case(hname, b"Content-Length") {
+                    if content_length.is_some() {
+                        return Err(HttpError::MalformedRequestLine);
+                    }
+                    let parsed =
+                        parse_strict_decimal_usize(hval).ok_or(HttpError::MalformedRequestLine)?;
+                    content_length = Some(parsed);
+                }
+            }
+        }
+
+        if let Some(cl) = content_length {
+            if body.len() < cl {
+                return Err(HttpError::Truncated);
+            }
+            body = &body[..cl];
+        }
 
         Ok(HttpRequestView {
             method,
@@ -213,6 +263,76 @@ fn parse_method(bytes: &[u8]) -> Result<HttpMethod, HttpError> {
         b"PATCH" => Ok(HttpMethod::Patch),
         _ => Err(HttpError::UnknownMethod),
     }
+}
+
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_valid_header_name(name: &[u8]) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < name.len() {
+        if !is_tchar(name[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn trim_http_ows(mut s: &[u8]) -> &[u8] {
+    while let Some((&first, rest)) = s.split_first() {
+        if first == b' ' || first == b'\t' {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((&last, rest)) = s.split_last() {
+        if last == b' ' || last == b'\t' {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+fn parse_strict_decimal_usize(s: &[u8]) -> Option<usize> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut acc = 0usize;
+    let mut i = 0usize;
+    while i < s.len() {
+        let b = s[i];
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+        i += 1;
+    }
+    Some(acc)
 }
 
 fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
@@ -570,6 +690,45 @@ mod tests {
         assert_eq!(view.method, HttpMethod::Post);
         assert_eq!(view.path, b"/echo");
         assert_eq!(view.body, response_bytes);
+    }
+
+    #[test]
+    fn parse_request_rejects_smuggling_headers_and_short_or_trailing_content_length() {
+        // 1. Whitespace before ':' in header name (RFC 9112 §5.1 smuggling vector) must be rejected.
+        assert_eq!(
+            HttpImpl::parse_request(b"POST /x HTTP/1.1\r\nContent-Length : 5\r\n\r\nhello"),
+            Err(HttpError::MalformedRequestLine)
+        );
+        // 2. Obsolete line folding (`obs-fold`) must be rejected.
+        assert_eq!(
+            HttpImpl::parse_request(b"GET /x HTTP/1.1\r\nHost: a\r\n b\r\n\r\n"),
+            Err(HttpError::MalformedRequestLine)
+        );
+        // 3. Duplicate Content-Length headers must be rejected.
+        assert_eq!(
+            HttpImpl::parse_request(
+                b"POST /x HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello"
+            ),
+            Err(HttpError::MalformedRequestLine)
+        );
+        // 4. Transfer-Encoding must be rejected at parser level.
+        assert!(
+            HttpImpl::parse_request(
+                b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+            )
+            .is_err()
+        );
+        // 5. Body shorter than Content-Length must return Err(HttpError::Truncated).
+        assert_eq!(
+            HttpImpl::parse_request(b"POST /x HTTP/1.1\r\nContent-Length: 10\r\n\r\nhello"),
+            Err(HttpError::Truncated)
+        );
+        // 6. Trailing pipelined bytes past Content-Length must NOT leak into `view.body`.
+        let view = HttpImpl::parse_request(
+            b"POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /smuggled HTTP/1.1\r\n\r\n",
+        )
+        .expect("exact Content-Length slice");
+        assert_eq!(view.body, b"hello");
     }
 
     // Tiny `contains_subseq` extension for the assertion above.

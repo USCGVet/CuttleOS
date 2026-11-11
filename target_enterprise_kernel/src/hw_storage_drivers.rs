@@ -447,8 +447,14 @@ impl AhciHwPort {
         }
     }
 
-    /// Issue one H2D command in slot 0 against the running port.
-    pub(crate) fn issue(&self, fis_params: &cuttle_contracts::H2dFisParams, write: bool, tag: &[u8]) {
+    /// Issue one H2D command in slot 0 against the running port with `prdtl` PRDT entries (`0` or `1`).
+    pub(crate) fn issue_with_prdtl(
+        &self,
+        fis_params: &cuttle_contracts::H2dFisParams,
+        write: bool,
+        prdtl: u16,
+        tag: &[u8],
+    ) {
         use cuttle_contracts::{
             AhciCmd, AhciCmdHeader, AhciFis, AhciPrdt, AHCI_CFL_H2D, AHCI_CMD_HDR_LEN,
             AHCI_FIS_H2D_LEN, AHCI_PRDT_LEN,
@@ -468,21 +474,24 @@ impl AhciHwPort {
             cfl: AHCI_CFL_H2D,
             write,
             pmp: 0,
-            prdtl: 1,
+            prdtl,
             prdbc: 0,
             ctba: self.ctba_pa,
         };
-        let prdt = AhciPrdt {
-            dba: self.data_pa,
-            byte_count: 512,
-            ioc: true,
-        };
         let mut hbuf = [0u8; AHCI_CMD_HDR_LEN];
+        if AhciCmdImpl::encode_header(&hdr, &mut hbuf).is_err() {
+            panic!("AHCI_HW: header encode");
+        }
         let mut pbuf = [0u8; AHCI_PRDT_LEN];
-        if AhciCmdImpl::encode_header(&hdr, &mut hbuf).is_err()
-            || AhciCmdImpl::encode_prdt(&prdt, &mut pbuf).is_err()
-        {
-            panic!("AHCI_HW: header/PRDT encode");
+        if prdtl > 0 {
+            let prdt = AhciPrdt {
+                dba: self.data_pa,
+                byte_count: 512,
+                ioc: true,
+            };
+            if AhciCmdImpl::encode_prdt(&prdt, &mut pbuf).is_err() {
+                panic!("AHCI_HW: PRDT encode");
+            }
         }
         // SAFETY: `ctba_pa` and `clb_pa` are disjoint, aligned subregions of the reserved DMA window mapped via `pa_to_va`, and slot 0 is idle (`PxCI & 1 == 0`) while we populate descriptors.
         unsafe {
@@ -497,10 +506,12 @@ impl AhciHwPort {
                 core::ptr::write_volatile(ct.add(i), fis[i]);
                 i += 1;
             }
-            i = 0;
-            while i < AHCI_PRDT_LEN {
-                core::ptr::write_volatile(ct.add(0x80 + i), pbuf[i]);
-                i += 1;
+            if prdtl > 0 {
+                i = 0;
+                while i < AHCI_PRDT_LEN {
+                    core::ptr::write_volatile(ct.add(0x80 + i), pbuf[i]);
+                    i += 1;
+                }
             }
             let cl = pa_to_va(self.clb_pa);
             i = 0;
@@ -540,6 +551,27 @@ impl AhciHwPort {
                 panic!("AHCI_HW: command TFD ERR");
             }
         }
+    }
+
+    /// Issue one 1-PRDT H2D DMA command in slot 0 against the running port.
+    pub(crate) fn issue(&self, fis_params: &cuttle_contracts::H2dFisParams, write: bool, tag: &[u8]) {
+        self.issue_with_prdtl(fis_params, write, 1, tag);
+    }
+
+    /// Issue non-data ATA `FLUSH CACHE` (`0xE7`, `PRDTL = 0`) as a write-order durability barrier.
+    pub(crate) fn flush_cache(&self) {
+        use cuttle_contracts::{H2dFisParams, ATA_DEV_LBA};
+        const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
+        let fl = H2dFisParams {
+            command: ATA_CMD_FLUSH_CACHE,
+            features: 0,
+            lba: 0,
+            count: 0,
+            device: ATA_DEV_LBA,
+            pm_port: 0,
+            is_command: true,
+        };
+        self.issue_with_prdtl(&fl, false, 0, b"flush");
     }
 
     /// Read the DMA data buffer back into a 512-byte array.

@@ -173,14 +173,21 @@ pub struct LivedNet {
     /// Whether an out-of-band device secret was provisioned; when `false`, all
     /// `AUTH` commands are refused unconditionally.
     pub auth_enabled: bool,
-    /// Highest accepted monotonic sequence number for anti-replay protection.
+    /// Highest accepted monotonic sequence number for anti-replay protection on UDP `AUTH`.
     pub last_auth_seq: u64,
+    /// Highest accepted monotonic sequence number for anti-replay protection on HTTP `/session/login`.
+    pub last_http_login_seq: u64,
     /// Minimum accepted Triad coordinator fencing epoch (`R6`) on `TRIAD_PREPARE`.
     pub triad_min_epoch: u64,
     /// TLS connections started on port 443 since boot.
     pub tls_sessions_started: u64,
     /// Total TCP retransmission / half-open reclamation events triggered by RTO timers.
     pub rto_retransmits: u64,
+    active_http_peer_ip: [u8; 4],
+    login_rl_ips: [[u8; 4]; 8],
+    login_rl_streaks: [u8; 8],
+    login_rl_cooldowns: [u16; 8],
+    login_rl_backoffs: [u8; 8],
     tcbs: [Tcb; TCP_MAX_SLOTS],
     slot_last_tick: [u32; TCP_MAX_SLOTS],
     slot_rto_ticks: [u32; TCP_MAX_SLOTS],
@@ -206,9 +213,15 @@ impl LivedNet {
             auth_key: [0u8; 32],
             auth_enabled: false,
             last_auth_seq: 0,
+            last_http_login_seq: 0,
             triad_min_epoch: 0,
             tls_sessions_started: 0,
             rto_retransmits: 0,
+            active_http_peer_ip: [0u8; 4],
+            login_rl_ips: [[0u8; 4]; 8],
+            login_rl_streaks: [0u8; 8],
+            login_rl_cooldowns: [0u16; 8],
+            login_rl_backoffs: [0u8; 8],
             tcbs: [Tcb::EMPTY; TCP_MAX_SLOTS],
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
@@ -240,9 +253,15 @@ impl LivedNet {
             auth_key,
             auth_enabled: true,
             last_auth_seq: 0,
+            last_http_login_seq: 0,
             triad_min_epoch: 0,
             tls_sessions_started: 0,
             rto_retransmits: 0,
+            active_http_peer_ip: [0u8; 4],
+            login_rl_ips: [[0u8; 4]; 8],
+            login_rl_streaks: [0u8; 8],
+            login_rl_cooldowns: [0u16; 8],
+            login_rl_backoffs: [0u8; 8],
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
@@ -269,9 +288,15 @@ impl LivedNet {
             auth_key: [0u8; 32],
             auth_enabled: false,
             last_auth_seq: 0,
+            last_http_login_seq: 0,
             triad_min_epoch: 0,
             tls_sessions_started: 0,
             rto_retransmits: 0,
+            active_http_peer_ip: [0u8; 4],
+            login_rl_ips: [[0u8; 4]; 8],
+            login_rl_streaks: [0u8; 8],
+            login_rl_cooldowns: [0u16; 8],
+            login_rl_backoffs: [0u8; 8],
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
@@ -286,6 +311,63 @@ impl LivedNet {
             peak_tls_pending_tx: 0,
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
+        }
+    }
+
+    fn is_peer_login_rate_limited(&self, peer_ip: [u8; 4]) -> bool {
+        let mut i = 0usize;
+        while i < 8 {
+            if self.login_rl_ips[i] == peer_ip && self.login_rl_cooldowns[i] > 0 {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn record_peer_login_failure(&mut self, peer_ip: [u8; 4]) {
+        let mut slot: Option<usize> = None;
+        let mut free_slot: Option<usize> = None;
+        let mut quiet_slot: Option<usize> = None;
+        let mut i = 0usize;
+        while i < 8 {
+            if self.login_rl_ips[i] == peer_ip {
+                slot = Some(i);
+                break;
+            }
+            if free_slot.is_none() && self.login_rl_ips[i] == [0, 0, 0, 0] {
+                free_slot = Some(i);
+            }
+            if quiet_slot.is_none() && self.login_rl_cooldowns[i] == 0 {
+                quiet_slot = Some(i);
+            }
+            i += 1;
+        }
+        let idx = slot.or(free_slot).or(quiet_slot).unwrap_or(0);
+        if self.login_rl_ips[idx] != peer_ip {
+            self.login_rl_ips[idx] = peer_ip;
+            self.login_rl_streaks[idx] = 0;
+            self.login_rl_cooldowns[idx] = 0;
+            self.login_rl_backoffs[idx] = 0;
+        }
+        self.login_rl_streaks[idx] = self.login_rl_streaks[idx].saturating_add(1);
+        if self.login_rl_streaks[idx] >= 5 {
+            self.login_rl_streaks[idx] = 0;
+            let shift = self.login_rl_backoffs[idx].min(4);
+            self.login_rl_cooldowns[idx] = 8u16 << shift;
+            self.login_rl_backoffs[idx] = self.login_rl_backoffs[idx].saturating_add(1).min(4);
+        }
+    }
+
+    fn reset_peer_login_streak(&mut self, peer_ip: [u8; 4]) {
+        let mut i = 0usize;
+        while i < 8 {
+            if self.login_rl_ips[i] == peer_ip {
+                self.login_rl_streaks[i] = 0;
+                self.login_rl_backoffs[i] = 0;
+                break;
+            }
+            i += 1;
         }
     }
 
@@ -418,6 +500,13 @@ impl LivedNet {
         let rto_ticks = self.rto_retransmit_ticks();
         let reclaim_ticks = self.half_open_reclaim_ticks();
         let idle_ticks = self.idle_timeout_ticks();
+        let mut rli = 0usize;
+        while rli < 8 {
+            if self.login_rl_cooldowns[rli] > 0 {
+                self.login_rl_cooldowns[rli] -= 1;
+            }
+            rli += 1;
+        }
         let mut actions = 0usize;
         let mut i = 0usize;
         while i < TCP_MAX_SLOTS {
@@ -440,10 +529,6 @@ impl LivedNet {
                     }
                 }
             } else if (st == TcpState::Established || st == TcpState::CloseWait)
-                && (self.tcbs[i].local_port == HTTPS_PORT
-                    || self.tls[i].is_some()
-                    || !self.http_bufs[i].is_empty()
-                    || !self.http_tx[i].is_empty())
                 && self.ticks.wrapping_sub(self.slot_last_tick[i]) >= idle_ticks
             {
                 let tcb = self.tcbs[i];
@@ -513,6 +598,23 @@ impl LivedNet {
         let c_len = cmd.len().min(msg.len() - pos);
         msg[pos..pos + c_len].copy_from_slice(&cmd[..c_len]);
         pos += c_len;
+        hmac_sha256(key, &msg[..pos], out);
+    }
+
+    /// Compute the domain-separated 32-byte HMAC-SHA256 tag over
+    /// `"cuttle-http-login-v1:<seq_ascii>:<user>"` for `POST /session/login`.
+    pub fn compute_http_login_tag(
+        key: &[u8; 32],
+        seq_ascii: &[u8],
+        user: &[u8],
+        out: &mut [u8; 32],
+    ) {
+        let mut msg = [0u8; 128];
+        let mut pos = 0usize;
+        pos += copy_msg(b"cuttle-http-login-v1:", &mut msg[pos..]);
+        pos += copy_msg(&seq_ascii[..seq_ascii.len().min(32)], &mut msg[pos..]);
+        pos += copy_msg(b":", &mut msg[pos..]);
+        pos += copy_msg(&user[..user.len().min(32)], &mut msg[pos..]);
         hmac_sha256(key, &msg[..pos], out);
     }
 
@@ -1250,7 +1352,19 @@ impl LivedNet {
             }
             j += 1;
         }
-        let idx = free_slot.or(half_open_slot).unwrap_or(lru_slot);
+        let idx = match free_slot.or(half_open_slot) {
+            Some(s) => s,
+            None => {
+                // All 16 slots are `Established`: only evict an `Established` connection if it has
+                // already exceeded `idle_timeout_ticks()`; never let a SYN flood tear down active peers.
+                if self.ticks.wrapping_sub(self.slot_last_tick[lru_slot]) >= self.idle_timeout_ticks()
+                {
+                    lru_slot
+                } else {
+                    return None;
+                }
+            }
+        };
         self.tcbs[idx] = Tcb::listen(self.ip, dst_port, 65535);
         self.slot_rto_ticks[idx] = self.ticks;
         self.slot_remote_mac[idx] = [0u8; 6];
@@ -1367,7 +1481,7 @@ impl LivedNet {
         } else if !self.http_input_closed[idx] {
             let mut responses = 0usize;
             while responses < 8 && self.http_tx[idx].len() < HTTPS_TX_HIGH_WATER {
-                let mut single = [0u8; TCP_SEGMENT_PAYLOAD];
+                let mut single = [0u8; 4096];
                 let close_after;
                 let n = match frame_next_http_request(&mut self.http_bufs[idx]) {
                     HttpFrameOutcome::Incomplete => {
@@ -1392,7 +1506,11 @@ impl LivedNet {
                     }
                     HttpFrameOutcome::Complete(req) => {
                         close_after = http_wants_close(&req);
-                        self.handle_http_request(&req, boots, shell.as_deref_mut(), &mut single)
+                        self.active_http_peer_ip = self.tcbs[idx].remote_ip;
+                        let written =
+                            self.handle_http_request(&req, boots, shell.as_deref_mut(), &mut single);
+                        self.active_http_peer_ip = [0u8; 4];
+                        written
                     }
                 };
                 if n > 0 {
@@ -1653,12 +1771,14 @@ impl LivedNet {
                     }
                     HttpFrameOutcome::Complete(mut request) => {
                         close_after = http_wants_close(&request);
+                        self.active_http_peer_ip = self.tcbs[idx].remote_ip;
                         let written = self.handle_http_request(
                             &request,
                             boots,
                             shell.as_deref_mut(),
                             &mut response,
                         );
+                        self.active_http_peer_ip = [0u8; 4];
                         crate::https::scrub_vec_all_bytes(&mut request);
                         written
                     }
@@ -1928,7 +2048,13 @@ impl LivedNet {
                 )
                 .unwrap_or(0);
             }
-            if sh.is_login_rate_limited() {
+            let peer_ip = self.active_http_peer_ip;
+            let rate_limited = if peer_ip != [0, 0, 0, 0] {
+                self.is_peer_login_rate_limited(peer_ip)
+            } else {
+                sh.is_login_rate_limited()
+            };
+            if rate_limited {
                 sh.record_net_audit(AuditVerdict::Denied, b"net:http:login-ratelimit");
                 return HttpImpl::build_response(
                     429,
@@ -1951,17 +2077,22 @@ impl LivedNet {
                 )
                 .unwrap_or(0);
             };
-            if user.is_empty() || hmac_tok.len() != 64 {
+            let valid_user = !user.is_empty()
+                && user.len() <= 16
+                && user
+                    .iter()
+                    .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-');
+            if !valid_user || hmac_tok.len() != 64 {
                 sh.record_net_audit(AuditVerdict::Error, b"net:http:login-syntax");
                 return HttpImpl::build_response(
                     400,
                     b"text/plain",
-                    b"usage: <seq> <hmac_hex64> <user>\n",
+                    b"usage: <seq> <hmac_hex64> <user[1..=16:[A-Za-z0-9_.-]]>\n",
                     out,
                 )
                 .unwrap_or(0);
             }
-            let watermark = self.last_auth_seq.max(sh.auth_seq);
+            let watermark = self.last_http_login_seq.max(sh.http_login_seq);
             if seq <= watermark {
                 sh.record_net_audit(AuditVerdict::Denied, b"net:http:login-replay");
                 return HttpImpl::build_response(
@@ -1974,7 +2105,11 @@ impl LivedNet {
             }
             let mut provided_mac = [0u8; 32];
             if !decode_hex_32(hmac_tok, &mut provided_mac) {
-                sh.record_login_failure();
+                if peer_ip != [0, 0, 0, 0] {
+                    self.record_peer_login_failure(peer_ip);
+                } else {
+                    sh.record_login_failure();
+                }
                 sh.record_net_audit(AuditVerdict::Denied, b"net:http:login-hex");
                 return HttpImpl::build_response(
                     401,
@@ -1985,7 +2120,7 @@ impl LivedNet {
                 .unwrap_or(0);
             }
             let mut expected_mac = [0u8; 32];
-            Self::compute_auth_tag(&self.auth_key, seq_tok, user, &mut expected_mac);
+            Self::compute_http_login_tag(&self.auth_key, seq_tok, user, &mut expected_mac);
             let mut diff = 0u8;
             let mut i = 0usize;
             while i < 32 {
@@ -1993,7 +2128,11 @@ impl LivedNet {
                 i += 1;
             }
             if diff != 0 {
-                sh.record_login_failure();
+                if peer_ip != [0, 0, 0, 0] {
+                    self.record_peer_login_failure(peer_ip);
+                } else {
+                    sh.record_login_failure();
+                }
                 sh.record_net_audit(AuditVerdict::Denied, b"net:http:login-hmac");
                 return HttpImpl::build_response(
                     401,
@@ -2003,8 +2142,11 @@ impl LivedNet {
                 )
                 .unwrap_or(0);
             }
-            self.last_auth_seq = seq;
-            sh.auth_seq = seq;
+            if peer_ip != [0, 0, 0, 0] {
+                self.reset_peer_login_streak(peer_ip);
+            }
+            self.last_http_login_seq = seq;
+            sh.http_login_seq = seq;
             let Some(sid) = sh.try_create_session(user, seq_tok) else {
                 return HttpImpl::build_response(
                     503,
@@ -2017,7 +2159,7 @@ impl LivedNet {
             let mut body = [0u8; 128];
             let mut bpos = 0usize;
             bpos += copy_msg(b"session: ok user=", &mut body[bpos..]);
-            bpos += copy_msg(&user[..user.len().min(16)], &mut body[bpos..]);
+            bpos += copy_msg(user, &mut body[bpos..]);
             bpos += copy_msg(b" sid=", &mut body[bpos..]);
             bpos += copy_msg(&sid, &mut body[bpos..]);
             bpos += copy_msg(b"\n", &mut body[bpos..]);
@@ -2856,10 +2998,6 @@ impl TriadIngressVoter {
                 && win.status_code < 300
                 && !win.body.starts_with(b"error:")
                 && !win.body.starts_with(b"usage:");
-            if commit_ok && self.prev_quorum_hash != 0 && win.state_hash == self.prev_quorum_hash {
-                self.split_brain_refusals = self.split_brain_refusals.wrapping_add(1);
-                return (TriadVoteOutcome::SplitBrainOrQuorumLost, 0);
-            }
             winning_body_out[..win.body.len()].copy_from_slice(win.body);
             if commit_ok {
                 if self.node_hash[0] != 0 && self.node_hash[0] != win.state_hash {
@@ -2903,10 +3041,6 @@ impl TriadIngressVoter {
                 && win.status_code < 300
                 && !win.body.starts_with(b"error:")
                 && !win.body.starts_with(b"usage:");
-            if commit_ok && self.prev_quorum_hash != 0 && win.state_hash == self.prev_quorum_hash {
-                self.split_brain_refusals = self.split_brain_refusals.wrapping_add(1);
-                return (TriadVoteOutcome::SplitBrainOrQuorumLost, 0);
-            }
             winning_body_out[..win.body.len()].copy_from_slice(win.body);
             if commit_ok {
                 if self.node_hash[a] != 0 && self.node_hash[a] != win.state_hash {
@@ -3244,40 +3378,37 @@ fn frame_next_http_request(buf: &mut alloc::vec::Vec<u8>) -> HttpFrameOutcome {
         buf.clear();
         return HttpFrameOutcome::PayloadTooLarge;
     }
-    let total = match HttpImpl::parse_request(&buf[..body_start]) {
+    if buf.len() < crate::http::MIN_REQUEST_LEN {
+        buf.clear();
+        return HttpFrameOutcome::BadRequest;
+    }
+    match HttpImpl::parse_request(&buf[..]) {
         Ok(view) => {
-            let mut content_length: Option<u64> = None;
-            let mut cl_count = 0usize;
-            for line in view.headers_raw.split(|&b| b == b'\n') {
-                let line = line.strip_suffix(b"\r").unwrap_or(line);
-                if line.is_empty() {
-                    continue;
-                }
-                let Some(colon) = line.iter().position(|&b| b == b':') else {
+            if HttpImpl::find_header(view.headers_raw, b"Content-Length").is_some() {
+                let total = body_start + view.body.len();
+                if total > MAX_HTTP_REQUEST_BYTES {
                     buf.clear();
-                    return HttpFrameOutcome::BadRequest;
-                };
-                let name = trim_ws(&line[..colon]);
-                let val = trim_ws(&line[colon + 1..]);
-                if name.eq_ignore_ascii_case(b"Transfer-Encoding") {
-                    buf.clear();
-                    return HttpFrameOutcome::NotImplemented;
+                    return HttpFrameOutcome::PayloadTooLarge;
                 }
-                if name.eq_ignore_ascii_case(b"Content-Length") {
-                    cl_count += 1;
-                    let Some(parsed) = parse_u64_dec(val) else {
+                HttpFrameOutcome::Complete(buf.drain(..total).collect())
+            } else if matches!(view.method, HttpMethod::Post | HttpMethod::Put) {
+                buf.clear();
+                HttpFrameOutcome::LengthRequired
+            } else {
+                HttpFrameOutcome::Complete(buf.drain(..body_start).collect())
+            }
+        }
+        Err(cuttle_contracts::HttpError::Truncated) => {
+            // Headers were valid and `Content-Length` exceeded the currently buffered body;
+            // check `body_start + cl` upfront so oversized `Content-Length` fails immediately with 413.
+            let hdr_slice = &buf[..hdr_end];
+            if let Some(rl_end) = hdr_slice.windows(2).position(|w| w == b"\r\n") {
+                let headers_raw = &hdr_slice[rl_end + 2..];
+                if let Some(cl_raw) = HttpImpl::find_header(headers_raw, b"Content-Length") {
+                    let Some(cl) = parse_u64_dec(trim_ws(cl_raw)) else {
                         buf.clear();
                         return HttpFrameOutcome::BadRequest;
                     };
-                    if cl_count > 1 {
-                        buf.clear();
-                        return HttpFrameOutcome::BadRequest;
-                    }
-                    content_length = Some(parsed);
-                }
-            }
-            match (content_length, view.method) {
-                (Some(cl), _) => {
                     let Some(total) = body_start.checked_add(cl as usize) else {
                         buf.clear();
                         return HttpFrameOutcome::PayloadTooLarge;
@@ -3286,27 +3417,34 @@ fn frame_next_http_request(buf: &mut alloc::vec::Vec<u8>) -> HttpFrameOutcome {
                         buf.clear();
                         return HttpFrameOutcome::PayloadTooLarge;
                     }
-                    total
+                    return HttpFrameOutcome::Incomplete;
                 }
-                (None, HttpMethod::Post | HttpMethod::Put) => {
-                    buf.clear();
-                    return HttpFrameOutcome::LengthRequired;
-                }
-                (None, _) => body_start,
+            }
+            buf.clear();
+            HttpFrameOutcome::BadRequest
+        }
+        Err(cuttle_contracts::HttpError::UnsupportedVersion) => {
+            let hdr_slice = &buf[..hdr_end];
+            let has_te = hdr_slice
+                .split(|&b| b == b'\n')
+                .skip(1)
+                .any(|line| {
+                    let line = line.strip_suffix(b"\r").unwrap_or(line);
+                    line.iter()
+                        .position(|&b| b == b':')
+                        .is_some_and(|c| line[..c].eq_ignore_ascii_case(b"Transfer-Encoding"))
+                });
+            buf.clear();
+            if has_te {
+                HttpFrameOutcome::NotImplemented
+            } else {
+                HttpFrameOutcome::BadRequest
             }
         }
         Err(_) => {
             buf.clear();
-            return HttpFrameOutcome::BadRequest;
+            HttpFrameOutcome::BadRequest
         }
-    };
-    if buf.len() >= total {
-        HttpFrameOutcome::Complete(buf.drain(..total).collect())
-    } else if buf.len() > MAX_HTTP_REQUEST_BYTES {
-        buf.clear();
-        HttpFrameOutcome::PayloadTooLarge
-    } else {
-        HttpFrameOutcome::Incomplete
     }
 }
 
@@ -3338,20 +3476,22 @@ fn http_wants_close(req: &[u8]) -> bool {
 fn extract_session_token(headers_raw: &[u8]) -> Option<&[u8]> {
     if let Some(tok) = HttpImpl::find_header(headers_raw, b"X-Session-Token") {
         let tok = trim_ws(tok);
-        if tok.len() == 32 {
+        if tok.len() == 32 && tok.iter().all(|b| b.is_ascii_hexdigit()) {
             return Some(tok);
         }
     }
     if let Some(cookie) = HttpImpl::find_header(headers_raw, b"Cookie") {
-        let mut i = 0usize;
-        while i + 4 <= cookie.len() {
-            if &cookie[i..i + 4] == b"sid=" {
-                let start = i + 4;
-                if start + 32 <= cookie.len() {
-                    return Some(&cookie[start..start + 32]);
+        for pair in cookie.split(|&b| b == b';') {
+            let pair = trim_ws(pair);
+            if let Some(val) = pair.strip_prefix(b"sid=") {
+                let val = val
+                    .strip_prefix(b"\"")
+                    .and_then(|v| v.strip_suffix(b"\""))
+                    .unwrap_or(val);
+                if val.len() == 32 && val.iter().all(|b| b.is_ascii_hexdigit()) {
+                    return Some(val);
                 }
             }
-            i += 1;
         }
     }
     None
@@ -4290,7 +4430,7 @@ mod tests {
 
         // 4. Authenticate and mint a dynamic session via POST /session/login:
         let mut mac = [0u8; 32];
-        LivedNet::compute_auth_tag(&DEFAULT_NET_AUTH_KEY, b"1", b"admin", &mut mac);
+        LivedNet::compute_http_login_tag(&DEFAULT_NET_AUTH_KEY, b"1", b"admin", &mut mac);
         let mut hex_mac = [0u8; 64];
         const HEX: &[u8; 16] = b"0123456789abcdef";
         for (i, &b) in mac.iter().enumerate() {
@@ -4588,7 +4728,7 @@ mod tests {
         }
         assert!(!sh.is_login_rate_limited());
         let mut mac_ok = [0u8; 32];
-        LivedNet::compute_auth_tag(&DEFAULT_NET_AUTH_KEY, b"100", b"admin", &mut mac_ok);
+        LivedNet::compute_http_login_tag(&DEFAULT_NET_AUTH_KEY, b"100", b"admin", &mut mac_ok);
         let mut hex_ok = [0u8; 64];
         const HEX: &[u8; 16] = b"0123456789abcdef";
         for (i, &b) in mac_ok.iter().enumerate() {
@@ -6705,6 +6845,261 @@ mod tests {
                 .peer_buffered_bytes(crate::https::LOOPBACK_PEER_IP)
                 >= partial_record.len(),
             "peer_buffered_bytes must account for unparsed TLS rx bytes"
+        );
+    }
+
+    #[test]
+    fn http_login_enforces_domain_separation_strict_cookie_and_per_ip_lockout() {
+        let mut net = LivedNet::new([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+        let mut sh = crate::shell::OsShell::new();
+        let mut out = [0u8; 1500];
+
+        // 1. Replaying a UDP `AUTH` HMAC tag (`compute_auth_tag`) onto `POST /session/login` MUST fail!
+        let mut udp_mac = [0u8; 32];
+        LivedNet::compute_auth_tag(&DEFAULT_NET_AUTH_KEY, b"1", b"admin", &mut udp_mac);
+        let mut hex_udp = [0u8; 64];
+        hex_encode_bytes(&udp_mac, &mut hex_udp);
+        let mut bad_login = [0u8; 200];
+        let mut p = 0usize;
+        p += copy_msg(b"POST /session/login HTTP/1.1\r\nHost: x\r\n\r\n1 ", &mut bad_login[p..]);
+        p += copy_msg(&hex_udp, &mut bad_login[p..]);
+        p += copy_msg(b" admin", &mut bad_login[p..]);
+        let n_replay = net.handle_http_request(&bad_login[..p], 1, Some(&mut sh), &mut out);
+        assert!(
+            out[..n_replay].starts_with(b"HTTP/1.1 401 "),
+            "UDP AUTH tag must not authenticate POST /session/login: {:?}",
+            core::str::from_utf8(&out[..n_replay])
+        );
+
+        // 2. Domain-separated `compute_http_login_tag` succeeds, while oversized (>16B) or invalid-charset
+        //    usernames are rejected with 400 Bad Request instead of silent truncation!
+        let mut ok_mac = [0u8; 32];
+        LivedNet::compute_http_login_tag(
+            &DEFAULT_NET_AUTH_KEY,
+            b"2",
+            b"admin_long_username_99",
+            &mut ok_mac,
+        );
+        let mut hex_long = [0u8; 64];
+        hex_encode_bytes(&ok_mac, &mut hex_long);
+        let mut long_req = [0u8; 220];
+        let mut lp = 0usize;
+        lp += copy_msg(b"POST /session/login HTTP/1.1\r\nHost: x\r\n\r\n2 ", &mut long_req[lp..]);
+        lp += copy_msg(&hex_long, &mut long_req[lp..]);
+        lp += copy_msg(b" admin_long_username_99", &mut long_req[lp..]);
+        let n_long = net.handle_http_request(&long_req[..lp], 1, Some(&mut sh), &mut out);
+        assert!(
+            out[..n_long].starts_with(b"HTTP/1.1 400 "),
+            "oversized username (>16B) must be rejected with 400, not truncated: {:?}",
+            core::str::from_utf8(&out[..n_long])
+        );
+
+        LivedNet::compute_http_login_tag(&DEFAULT_NET_AUTH_KEY, b"3", b"admin", &mut ok_mac);
+        let mut hex_ok = [0u8; 64];
+        hex_encode_bytes(&ok_mac, &mut hex_ok);
+        let mut ok_req = [0u8; 200];
+        let mut op = 0usize;
+        op += copy_msg(b"POST /session/login HTTP/1.1\r\nHost: x\r\n\r\n3 ", &mut ok_req[op..]);
+        op += copy_msg(&hex_ok, &mut ok_req[op..]);
+        op += copy_msg(b" admin", &mut ok_req[op..]);
+        let n_ok = net.handle_http_request(&ok_req[..op], 1, Some(&mut sh), &mut out);
+        let s_ok = core::str::from_utf8(&out[..n_ok]).unwrap();
+        assert!(s_ok.starts_with("HTTP/1.1 200 OK\r\n"));
+        let sid_pos = s_ok.find("sid=").unwrap() + 4;
+        let mut sid = [0u8; 32];
+        sid.copy_from_slice(&s_ok.as_bytes()[sid_pos..sid_pos + 32]);
+
+        // 3. Strict `;`-delimited Cookie parsing: `Cookie: not_sid=<sid>` MUST NOT authenticate!
+        let mut spoof_cookie = [0u8; 200];
+        let mut cp = 0usize;
+        cp += copy_msg(
+            b"GET /session/whoami HTTP/1.1\r\nCookie: not_sid=",
+            &mut spoof_cookie[cp..],
+        );
+        cp += copy_msg(&sid, &mut spoof_cookie[cp..]);
+        cp += copy_msg(b"\r\n\r\n", &mut spoof_cookie[cp..]);
+        let n_spoof = net.handle_http_request(&spoof_cookie[..cp], 1, Some(&mut sh), &mut out);
+        assert!(
+            out[..n_spoof].starts_with(b"HTTP/1.1 401 "),
+            "not_sid=<hex> must not match Cookie sid=: {:?}",
+            core::str::from_utf8(&out[..n_spoof])
+        );
+
+        // 4. Per-IP login rate-limiting: 5 failed login attempts from `10.0.2.99` lock out ONLY `10.0.2.99` (`429`),
+        //    while legitimate peer `10.0.2.2` still logs in with `200 OK`!
+        let attacker_ip = [10, 0, 2, 99];
+        net.active_http_peer_ip = attacker_ip;
+        for seq in 10..15u64 {
+            let mut bad_req = [0u8; 200];
+            let mut bp = 0usize;
+            bp += copy_msg(b"POST /session/login HTTP/1.1\r\nHost: x\r\n\r\n", &mut bad_req[bp..]);
+            bp += dec_u64(seq, &mut bad_req[bp..]);
+            bp += copy_msg(
+                b" 0000000000000000000000000000000000000000000000000000000000000000 admin",
+                &mut bad_req[bp..],
+            );
+            let nb = net.handle_http_request(&bad_req[..bp], 1, Some(&mut sh), &mut out);
+            assert!(out[..nb].starts_with(b"HTTP/1.1 401 "));
+        }
+        let n_locked = net.handle_http_request(
+            b"POST /session/login HTTP/1.1\r\nHost: x\r\n\r\n16 0000000000000000000000000000000000000000000000000000000000000000 admin",
+            1,
+            Some(&mut sh),
+            &mut out,
+        );
+        assert!(
+            out[..n_locked].starts_with(b"HTTP/1.1 429 "),
+            "attacker IP must be rate-limited after 5 failed logins: {:?}",
+            core::str::from_utf8(&out[..n_locked])
+        );
+
+        // Legitimate peer `10.0.2.2` is NOT locked out:
+        net.active_http_peer_ip = PEER_IP;
+        LivedNet::compute_http_login_tag(&DEFAULT_NET_AUTH_KEY, b"20", b"admin", &mut ok_mac);
+        hex_encode_bytes(&ok_mac, &mut hex_ok);
+        let mut ok_peer_req = [0u8; 200];
+        let mut opp = 0usize;
+        opp += copy_msg(
+            b"POST /session/login HTTP/1.1\r\nHost: x\r\n\r\n20 ",
+            &mut ok_peer_req[opp..],
+        );
+        opp += copy_msg(&hex_ok, &mut ok_peer_req[opp..]);
+        opp += copy_msg(b" admin", &mut ok_peer_req[opp..]);
+        let n_legit = net.handle_http_request(&ok_peer_req[..opp], 1, Some(&mut sh), &mut out);
+        assert!(
+            out[..n_legit].starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "legitimate peer IP must not be locked out by attacker IP's failed logins: {:?}",
+            core::str::from_utf8(&out[..n_legit])
+        );
+        net.active_http_peer_ip = [0, 0, 0, 0];
+    }
+
+    #[test]
+    fn triad_voter_allows_aba_value_transition_and_tcp_preserves_established_slots_on_syn_flood() {
+        // 1. TriadIngressVoter must allow legitimate A -> B -> A state transitions (e.g. toggling a flag
+        //    or INSERT followed by DELETE returning `state_hash` to its original hash `0xAAAA`):
+        let mut voter = TriadIngressVoter::new(
+            crate::svc_runtime::NodeRole::Full,
+            [0x42u8; 32],
+            [101, 202, 303],
+        );
+        let mut out_body = [0u8; 64];
+        let mk_votes = |state_hash: u64, body: &'static [u8]| {
+            [
+                TriadNodeVoteInput {
+                    node_id: 0,
+                    available: true,
+                    status_code: 200,
+                    state_hash,
+                    body,
+                },
+                TriadNodeVoteInput {
+                    node_id: 1,
+                    available: true,
+                    status_code: 200,
+                    state_hash,
+                    body,
+                },
+                TriadNodeVoteInput {
+                    node_id: 2,
+                    available: true,
+                    status_code: 200,
+                    state_hash,
+                    body,
+                },
+            ]
+        };
+        let r_a = mk_votes(0xAAAA_1111_2222_3333, b"INSERT 1\n");
+        let (v1, _) = voter.vote_ingress_request(true, true, &r_a, &mut out_body);
+        assert!(matches!(v1, TriadVoteOutcome::Unanimous3of3 { .. }));
+
+        let r_b = mk_votes(0xBBBB_4444_5555_6666, b"UPDATE 1\n");
+        let (v2, _) = voter.vote_ingress_request(true, true, &r_b, &mut out_body);
+        assert!(matches!(v2, TriadVoteOutcome::Unanimous3of3 { .. }));
+
+        let r_back_to_a = mk_votes(0xAAAA_1111_2222_3333, b"UPDATE 1\n");
+        let (v3, _) = voter.vote_ingress_request(true, true, &r_back_to_a, &mut out_body);
+        assert!(
+            matches!(v3, TriadVoteOutcome::Unanimous3of3 { .. }),
+            "A -> B -> A state hash return must not be falsely rejected as rollback: {v3:?}"
+        );
+
+        // 2. When all 16 TCP slots hold active `Established` connections, a 17th `SYN` flood packet
+        //    must NOT evict an `Established` connection!
+        let mut net = LivedNet::new(MAC);
+        for slot_i in 0..TCP_MAX_SLOTS {
+            let sport = 41000u16 + slot_i as u16;
+            let mut seg_buf = [0u8; 40];
+            let n_syn = TcpImpl::build_segment(
+                sport,
+                HTTP_PORT,
+                1000,
+                0,
+                tcp_flags::SYN,
+                65535,
+                b"",
+                PEER_IP,
+                GUEST_IP,
+                &mut seg_buf,
+            )
+            .unwrap();
+            let (syn_frame, syn_len) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &seg_buf[..n_syn]);
+            let mut replies = ReplySet::new();
+            net.handle_frame(&syn_frame[..syn_len], 1, &mut replies);
+            assert_eq!(replies.len(), 1);
+            let syn_ack_tcp = &replies.get(0).unwrap()[ETH_HEADER_LEN + IPV4_HEADER_LEN..];
+            let srv_isn = u32::from_be_bytes([
+                syn_ack_tcp[4],
+                syn_ack_tcp[5],
+                syn_ack_tcp[6],
+                syn_ack_tcp[7],
+            ]);
+            let n_ack = TcpImpl::build_segment(
+                sport,
+                HTTP_PORT,
+                1001,
+                srv_isn.wrapping_add(1),
+                tcp_flags::ACK,
+                65535,
+                b"",
+                PEER_IP,
+                GUEST_IP,
+                &mut seg_buf,
+            )
+            .unwrap();
+            let (ack_frame, ack_len) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &seg_buf[..n_ack]);
+            let mut ack_replies = ReplySet::new();
+            net.handle_frame(&ack_frame[..ack_len], 1, &mut ack_replies);
+        }
+        assert_eq!(net.active_tcp_slots(), TCP_MAX_SLOTS);
+
+        // Now send a SYN from a 17th port: none of the 16 Established slots may be evicted!
+        let flood_ip = [10, 0, 2, 99];
+        let mut flood_seg = [0u8; 40];
+        let nf = TcpImpl::build_segment(
+            55555,
+            HTTP_PORT,
+            9000,
+            0,
+            tcp_flags::SYN,
+            65535,
+            b"",
+            flood_ip,
+            GUEST_IP,
+            &mut flood_seg,
+        )
+        .unwrap();
+        let (flood_frame, flood_len) = eth_ip(IP_PROTO_TCP, flood_ip, GUEST_IP, &flood_seg[..nf]);
+        let mut flood_replies = ReplySet::new();
+        net.handle_frame(&flood_frame[..flood_len], 1, &mut flood_replies);
+        assert_eq!(
+            flood_replies.len(),
+            0,
+            "17th SYN must be dropped when all 16 slots are active Established connections"
+        );
+        assert!(
+            net.tcbs.iter().all(|t| t.state == TcpState::Established),
+            "SYN flood must never evict an active Established TCB"
         );
     }
 }

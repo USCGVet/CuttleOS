@@ -510,11 +510,38 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
             }
             i += 1;
         }
+        self.reclaim_inode_capacity(idx);
+        self.inodes[idx] = EMPTY_INODE;
+        Ok(())
+    }
+
+    fn truncate_inode(&mut self, idx: usize) {
+        if self.inodes[idx].capacity > 256 {
+            self.reclaim_inode_capacity(idx);
+            let remaining = (P as u64).saturating_sub(self.pool_used as u64);
+            let init_cap = 256u64.min(remaining) as u32;
+            self.inodes[idx].data_off = self.pool_used;
+            self.inodes[idx].capacity = init_cap;
+            self.pool_used += init_cap;
+        } else {
+            let off = self.inodes[idx].data_off as usize;
+            let cap = self.inodes[idx].capacity as usize;
+            let mut z = 0usize;
+            while z < cap && off + z < P {
+                self.pool[off + z] = 0;
+                z += 1;
+            }
+            self.inodes[idx].data_len = 0;
+        }
+    }
+
+    fn reclaim_inode_capacity(&mut self, idx: usize) {
         let removed_off = self.inodes[idx].data_off;
         let removed_cap = self.inodes[idx].capacity;
-        self.inodes[idx] = EMPTY_INODE;
+        self.inodes[idx].data_len = 0;
         if removed_cap > 0
-            && (removed_off as usize).saturating_add(removed_cap as usize) <= self.pool_used as usize
+            && (removed_off as usize).saturating_add(removed_cap as usize)
+                <= self.pool_used as usize
         {
             let src_start = (removed_off + removed_cap) as usize;
             let dst_start = removed_off as usize;
@@ -524,16 +551,26 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
                 self.pool[dst_start + m] = self.pool[src_start + m];
                 m += 1;
             }
+            let new_used = (self.pool_used - removed_cap) as usize;
+            let mut z = new_used;
+            while z < self.pool_used as usize {
+                self.pool[z] = 0;
+                z += 1;
+            }
             let mut k = 0usize;
             while k < I {
-                if self.inodes[k].used && self.inodes[k].data_off > removed_off {
+                if self.inodes[k].used
+                    && k != idx
+                    && self.inodes[k].data_off >= removed_off + removed_cap
+                {
                     self.inodes[k].data_off -= removed_cap;
                 }
                 k += 1;
             }
             self.pool_used -= removed_cap;
         }
-        Ok(())
+        self.inodes[idx].capacity = 0;
+        self.inodes[idx].data_off = self.pool_used;
     }
 
     fn find_inode(&self, norm_path: &[u8]) -> Option<usize> {
@@ -597,7 +634,7 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
         let inode_idx = match (existing, create) {
             (Some(i), false) => {
                 if trunc {
-                    self.inodes[i].data_len = 0;
+                    self.truncate_inode(i);
                 }
                 i
             }
@@ -606,13 +643,13 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
                     return Err(FsError::AlreadyExists);
                 }
                 if trunc {
-                    self.inodes[i].data_len = 0;
+                    self.truncate_inode(i);
                 }
                 i
             }
             (None, false) => return Err(FsError::NotFound),
             (None, true) => {
-                // Allocate a fresh inode + zero-length file.
+                // Allocate a fresh inode + zero-length file (growing pool capacity on demand in `write`).
                 let mut free_idx: Option<usize> = None;
                 let mut k = 0usize;
                 while k < I {
@@ -623,16 +660,13 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
                     k += 1;
                 }
                 let idx = free_idx.ok_or(FsError::NoSpace)?;
-                // Default new-file capacity: 256 bytes, or whatever
-                // remains in the pool if that is less. Empty pool
-                // → NoSpace.
                 let remaining = (P as u64).saturating_sub(self.pool_used as u64);
                 if remaining == 0 {
                     return Err(FsError::NoSpace);
                 }
-                let cap = if remaining < 256 { remaining as u32 } else { 256u32 };
+                let init_cap = 256u64.min(remaining) as u32;
                 let off = self.pool_used;
-                self.pool_used += cap;
+                self.pool_used += init_cap;
                 let slot = &mut self.inodes[idx];
                 slot.used = true;
                 slot.path_len = n as u16;
@@ -648,7 +682,7 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
                 }
                 slot.data_off = off;
                 slot.data_len = 0;
-                slot.capacity = cap;
+                slot.capacity = init_cap;
                 slot.mtime = 0;
                 idx
             }
@@ -1608,5 +1642,39 @@ mod tests {
         assert_eq!(fs.write(hd, 0, &payload_d).unwrap(), 460);
         fs.close(hd).unwrap();
         assert_eq!(fs.pool_used, 32 + 460);
+    }
+
+    #[test]
+    fn open_trunc_reclaims_pool_capacity_across_repeated_overwrites() {
+        let mut fs: MemRamFs<8, 1024> = MemRamFs::new();
+        let h1 = fs.open(b"/log", FS_O_CREATE | FS_O_RDWR).unwrap();
+        assert_eq!(fs.write(h1, 0, &[b'X'; 700]).unwrap(), 700);
+        fs.close(h1).unwrap();
+
+        let h2 = fs.open(b"/peer", FS_O_CREATE | FS_O_RDWR).unwrap();
+        assert_eq!(fs.write(h2, 0, b"ANCHOR-TAIL").unwrap(), 11);
+        fs.close(h2).unwrap();
+        assert_eq!(fs.pool_used, 700 + 256);
+
+        // Truncating `/log` must reclaim its excess capacity above 256 bytes and compact `/peer`
+        // so subsequent files can allocate from the reclaimed 444 bytes without `NoSpace`.
+        let h_trunc = fs.open(b"/log", FS_O_RDWR | FS_O_TRUNC).unwrap();
+        assert_eq!(fs.write(h_trunc, 0, b"tiny").unwrap(), 4);
+        fs.close(h_trunc).unwrap();
+        assert_eq!(
+            fs.pool_used,
+            256 + 256,
+            "FS_O_TRUNC must compact and reclaim excess capacity from pool_used"
+        );
+
+        let h_big = fs.open(b"/fresh", FS_O_CREATE | FS_O_RDWR).unwrap();
+        assert_eq!(fs.write(h_big, 0, &[b'Z'; 500]).unwrap(), 500);
+        fs.close(h_big).unwrap();
+
+        let mut check = [0u8; 32];
+        let hp = fs.open(b"/peer", FS_O_RDONLY).unwrap();
+        let np = fs.read(hp, 0, &mut check).unwrap();
+        assert_eq!(&check[..np], b"ANCHOR-TAIL");
+        fs.close(hp).unwrap();
     }
 }

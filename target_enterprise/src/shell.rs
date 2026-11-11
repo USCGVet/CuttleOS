@@ -226,6 +226,9 @@ pub struct OsShell {
     /// Monotonic anti-replay sequence watermark for authenticated UDP control-plane commands,
     /// persisted across morph reboots via WAL (`Q` record).
     pub auth_seq: u64,
+    /// Monotonic anti-replay sequence watermark for HTTP `POST /session/login` requests,
+    /// domain-separated from `auth_seq` and persisted across reboots via WAL.
+    pub http_login_seq: u64,
     /// 256-bit HMAC-SHA256 device key used to cryptographically seal and verify
     /// WAL/disk persistence checkpoints (`checkpoint_sealed` / `restore_sealed`).
     pub seal_key: [u8; DURABLE_DIGEST_LEN],
@@ -258,6 +261,8 @@ pub struct OsShell {
     pub login_backoff_level: u8,
     /// Monotonic 15-bit per-write nonce counter (`1..=0x7FFF`) mixed into `CuttleVault` keystream and MAC derivation.
     pub vault_nonce_seq: u16,
+    /// Boot-seeded baseline for `vault_nonce_seq` so `checkpoint_wal` emits `S` only when security state advances.
+    vault_nonce_default: u16,
     /// Most recently validated HTTP session slot owner ID (`0` = console/unauthenticated, `1..=SHELL_MAX_SESSIONS` = session slot).
     pub last_session_owner: u64,
     /// Active SQL transaction owner override (`0` = console, `1..=4` = HTTP session, `SQL_OWNER_*` = internal subsystem).
@@ -313,6 +318,7 @@ impl OsShell {
             ima_pcr10: [0u8; DURABLE_DIGEST_LEN],
             ima_measurements: 0,
             auth_seq: 0,
+            http_login_seq: 0,
             seal_key: [0u8; DURABLE_DIGEST_LEN],
             legacy_seal_key: [0u8; DURABLE_DIGEST_LEN],
             attest_key: [0u8; DURABLE_DIGEST_LEN],
@@ -327,6 +333,7 @@ impl OsShell {
             login_cooldown_ticks: 0,
             login_backoff_level: 0,
             vault_nonce_seq: 0,
+            vault_nonce_default: 0,
             last_session_owner: 0,
             sql_owner_override: 0,
             triad_node_id: 0,
@@ -444,7 +451,9 @@ impl OsShell {
         self.failed_login_streak = 0;
         self.login_backoff_level = 0;
         self.login_cooldown_ticks = 0;
+        self.http_login_seq = 0;
         self.vault_nonce_seq = ((boot_gen as u16).wrapping_mul(37)) & 0x7FFF;
+        self.vault_nonce_default = self.vault_nonce_seq;
         self.last_session_owner = 0;
         self.sql_owner_override = 0;
         self.triad_node_id = 0;
@@ -1241,6 +1250,44 @@ impl OsShell {
             count += 1;
         }
 
+        // Persist security watermarks and lockdown posture (`S` record, 28 bytes).
+        if self.guard_lockdown
+            || self.http_login_seq > 0
+            || self.triad_tx_seq > 0
+            || self.triad_min_epoch > 0
+            || self.triad_node_id != 0
+            || (self.vault_nonce_seq != 0 && self.vault_nonce_seq != self.vault_nonce_default)
+        {
+            let mut rec = [0u8; 28];
+            rec[0] = b'S';
+            rec[1] = (if self.guard_lockdown { 1u8 } else { 0u8 })
+                | ((self.triad_node_id & 0x03) << 1);
+            rec[2..4].copy_from_slice(&self.vault_nonce_seq.to_le_bytes());
+            rec[4..12].copy_from_slice(&self.http_login_seq.to_le_bytes());
+            rec[12..20].copy_from_slice(&self.triad_tx_seq.to_le_bytes());
+            rec[20..28].copy_from_slice(&self.triad_min_epoch.to_le_bytes());
+            wal.append(&rec)?;
+            count += 1;
+        }
+
+        // Persist active CuttleChronos scheduled jobs (`C` records, 7 + cmd_len bytes).
+        let mut cj = 0usize;
+        while cj < SHELL_MAX_CRON_JOBS {
+            let job = &self.cron_jobs[cj];
+            let clen = job.cmd_len as usize;
+            if job.active && job.interval_ticks > 0 && clen > 0 && clen <= 48 {
+                let mut rec = [0u8; 7 + 48];
+                rec[0] = b'C';
+                rec[1] = job.id;
+                rec[2..6].copy_from_slice(&(job.interval_ticks as u32).to_le_bytes());
+                rec[6] = clen as u8;
+                rec[7..7 + clen].copy_from_slice(&job.cmd[..clen]);
+                wal.append(&rec[..7 + clen])?;
+                count += 1;
+            }
+            cj += 1;
+        }
+
         wal.flush(proof)?;
         self.record_audit(19, AuditVerdict::Allowed, b"shell:wal:checkpoint");
         Ok(count)
@@ -1344,6 +1391,87 @@ impl OsShell {
                     self.auth_seq = seq;
                 }
                 applied += 1;
+            } else if payload.len() == 28 && payload[0] == b'S' {
+                if (payload[1] & 1) != 0 {
+                    self.guard_lockdown = true;
+                }
+                let vn = u16::from_le_bytes([payload[2], payload[3]]);
+                if vn > self.vault_nonce_seq {
+                    self.vault_nonce_seq = vn;
+                }
+                let hls = u64::from_le_bytes([
+                    payload[4],
+                    payload[5],
+                    payload[6],
+                    payload[7],
+                    payload[8],
+                    payload[9],
+                    payload[10],
+                    payload[11],
+                ]);
+                if hls > self.http_login_seq {
+                    self.http_login_seq = hls;
+                }
+                let tts = u64::from_le_bytes([
+                    payload[12],
+                    payload[13],
+                    payload[14],
+                    payload[15],
+                    payload[16],
+                    payload[17],
+                    payload[18],
+                    payload[19],
+                ]);
+                if tts > self.triad_tx_seq {
+                    self.triad_tx_seq = tts;
+                }
+                let tme = u64::from_le_bytes([
+                    payload[20],
+                    payload[21],
+                    payload[22],
+                    payload[23],
+                    payload[24],
+                    payload[25],
+                    payload[26],
+                    payload[27],
+                ]);
+                if tme > self.triad_min_epoch {
+                    self.triad_min_epoch = tme;
+                }
+                applied += 1;
+            } else if payload.len() >= 7 && payload[0] == b'C' {
+                let id = payload[1];
+                let interval = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+                let clen = payload[6] as usize;
+                if interval > 0
+                    && interval <= u16::MAX as u32
+                    && clen > 0
+                    && clen <= 48
+                    && 7 + clen == payload.len()
+                {
+                    let mut target_slot = None;
+                    let mut s = 0usize;
+                    while s < SHELL_MAX_CRON_JOBS {
+                        if self.cron_jobs[s].active && self.cron_jobs[s].id == id {
+                            target_slot = Some(s);
+                            break;
+                        }
+                        if !self.cron_jobs[s].active && target_slot.is_none() {
+                            target_slot = Some(s);
+                        }
+                        s += 1;
+                    }
+                    if let Some(slot) = target_slot {
+                        let mut job = CronJob::empty();
+                        job.active = true;
+                        job.id = if id == 0 { (slot as u8) + 1 } else { id };
+                        job.interval_ticks = interval as u16;
+                        job.cmd_len = clen as u8;
+                        job.cmd[..clen].copy_from_slice(&payload[7..7 + clen]);
+                        self.cron_jobs[slot] = job;
+                        applied += 1;
+                    }
+                }
             }
         });
         self.record_audit(20, AuditVerdict::Allowed, b"shell:wal:restore");
@@ -1433,6 +1561,14 @@ impl OsShell {
             hdr_sector[20 + s] = seal[s];
             s += 1;
         }
+        // Authenticate the entire CTTLSHL1 header (`magic || saved_boots || cursor || wal_seal`)
+        // under `self.seal_key` at `hdr_sector[52..84]` so `saved_boots` is tamper-evident.
+        let mut hdr_msg = [0u8; 16 + 52];
+        hdr_msg[0..16].copy_from_slice(b"CTTLSHL1-HDR-v1:");
+        hdr_msg[16..68].copy_from_slice(&hdr_sector[0..52]);
+        let mut hdr_seal = [0u8; DURABLE_DIGEST_LEN];
+        seal_bytes_keyed(&self.seal_key, &hdr_msg, &mut hdr_seal);
+        hdr_sector[52..52 + DURABLE_DIGEST_LEN].copy_from_slice(&hdr_seal);
         Ok(count)
     }
 
@@ -1493,6 +1629,19 @@ impl OsShell {
             let applied = self.restore_wal(&wal);
             Ok((saved_boots, applied))
         } else {
+            if !is_seal_key_set(&self.seal_key) {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:wal:key-unset");
+                return Err(WalError::PayloadTooLarge);
+            }
+            let mut hdr_msg = [0u8; 16 + 52];
+            hdr_msg[0..16].copy_from_slice(b"CTTLSHL1-HDR-v1:");
+            hdr_msg[16..68].copy_from_slice(&hdr_sector[0..52]);
+            let mut expected_hdr_seal = [0u8; DURABLE_DIGEST_LEN];
+            expected_hdr_seal.copy_from_slice(&hdr_sector[52..52 + DURABLE_DIGEST_LEN]);
+            if !seal_matches_keyed(&self.seal_key, &hdr_msg, &expected_hdr_seal) {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:wal:hdr-seal-mismatch");
+                return Err(WalError::PayloadTooLarge);
+            }
             let applied = self.restore_sealed(&wal, &expected_seal)?;
             Ok((saved_boots, applied))
         }
@@ -6913,5 +7062,43 @@ mod tests {
             &out[..act_ch200.bytes_written()],
             b"hex len=3 off=0 data=414243\n"
         );
+    }
+
+    #[test]
+    fn disk_image_authenticates_saved_boots_and_persists_security_state_and_cron() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 256];
+        sh.auth_seq = 42;
+        sh.http_login_seq = 19;
+        sh.triad_tx_seq = 77;
+        sh.triad_min_epoch = 5;
+        sh.vault_nonce_seq = 311;
+        sh.guard_lockdown = true;
+        let _ = sh.exec_line(b"cron add 15 status", 7, 0, 0, &mut out);
+
+        let mut hdr_sec = [0u8; 512];
+        let mut wal_sec = [0u8; 512];
+        let _ = sh.pack_disk_image(7, &mut hdr_sec, &mut wal_sec).unwrap();
+
+        // 1. Tampering with `saved_boots` (`hdr_sec[8..16]`) must be rejected!
+        let mut forged_hdr = hdr_sec;
+        forged_hdr[8] ^= 0x01;
+        let mut victim = OsShell::new();
+        assert!(
+            victim.unpack_disk_image(&forged_hdr, &wal_sec).is_err(),
+            "CTTLSHL1 unpack_disk_image must reject tampered saved_boots in header sector"
+        );
+
+        // 2. Untampered image restores security watermarks, guard lockdown, and cron jobs!
+        let mut resumed = OsShell::new();
+        let (saved_boots, _) = resumed.unpack_disk_image(&hdr_sec, &wal_sec).unwrap();
+        assert_eq!(saved_boots, 7);
+        assert_eq!(resumed.auth_seq, 42);
+        assert_eq!(resumed.http_login_seq, 19);
+        assert_eq!(resumed.triad_tx_seq, 77);
+        assert_eq!(resumed.triad_min_epoch, 5);
+        assert!(resumed.vault_nonce_seq >= 311);
+        assert!(resumed.guard_lockdown);
+        assert!(resumed.cron_jobs.iter().any(|j| j.active && j.interval_ticks == 15));
     }
 }

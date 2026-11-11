@@ -362,6 +362,16 @@ pub fn process_segment(
         return Err(TcpProcessError::WrongConnection);
     }
 
+    // Enforce RFC 5961 §3.2 exact-sequence RST validation across all non-LISTEN states:
+    // only `seg.seq == tcb.rcv_nxt` may tear down the connection; off-path blind RSTs fail.
+    if tcb.state != TcpState::Listen && (seg.flags & tcp_flags::RST) != 0 {
+        if seg.seq == tcb.rcv_nxt {
+            tcb.state = TcpState::Closed;
+            return Ok((tcb, Reply::NONE));
+        }
+        return Err(TcpProcessError::OutOfWindow);
+    }
+
     match tcb.state {
         TcpState::Closed => unreachable!(), // handled above
 
@@ -1163,5 +1173,65 @@ mod tests {
         assert_eq!(final_ack.flags, tcp_flags::ACK);
         assert_eq!(final_ack.seq, 122);
         assert_eq!(final_ack.ack, 52);
+    }
+
+    #[test]
+    fn rst_requires_in_window_sequence_number() {
+        let server_ip = ip(10, 0, 2, 15);
+        let client_ip = ip(10, 0, 2, 2);
+        let tcb = Tcb {
+            state: TcpState::Established,
+            local_port: 80,
+            remote_port: 40000,
+            local_ip: server_ip,
+            remote_ip: client_ip,
+            snd_iss: 100,
+            snd_una: 101,
+            snd_nxt: 101,
+            snd_wnd: 65535,
+            rcv_irs: 500,
+            rcv_nxt: 501,
+            rcv_wnd: 65535,
+        };
+        let mut buf = [0u8; 40];
+
+        // 1. Blind off-path RST with wrong sequence number must NOT close the connection.
+        let n_bad = TcpImpl::build_segment(
+            40000,
+            80,
+            99999,
+            101,
+            tcp_flags::RST,
+            0,
+            b"",
+            client_ip,
+            server_ip,
+            &mut buf,
+        )
+        .unwrap();
+        let bad_rst = TcpImpl::parse_segment(&buf[..n_bad], client_ip, server_ip).unwrap();
+        assert_eq!(
+            process_segment(tcb, &bad_rst, 0),
+            Err(TcpProcessError::OutOfWindow)
+        );
+
+        // 2. Exact `seg.seq == tcb.rcv_nxt` RST cleanly transitions the TCB to `Closed`.
+        let n_ok = TcpImpl::build_segment(
+            40000,
+            80,
+            501,
+            101,
+            tcp_flags::RST,
+            0,
+            b"",
+            client_ip,
+            server_ip,
+            &mut buf,
+        )
+        .unwrap();
+        let ok_rst = TcpImpl::parse_segment(&buf[..n_ok], client_ip, server_ip).unwrap();
+        let (closed_tcb, reply) = process_segment(tcb, &ok_rst, 0).unwrap();
+        assert_eq!(closed_tcb.state, TcpState::Closed);
+        assert!(!reply.present);
     }
 }

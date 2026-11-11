@@ -828,13 +828,24 @@ pub(crate) fn live_os_console_loop() -> ! {
             Some(k) => target_enterprise::LivedNet::with_auth_key(vn.mac, k),
             None => target_enterprise::LivedNet::new_unprovisioned(vn.mac),
         };
+        svc.last_auth_seq = sh.auth_seq;
+        svc.last_http_login_seq = sh.http_login_seq;
+        svc.triad_min_epoch = sh.triad_min_epoch;
         enable_https(svc, vn.mac);
     }
     // Scrub the root 32-byte device master key from `.bss` before serving live untrusted traffic.
     scrub_cached_master_key();
     let mut net_rx: u64 = 0;
     let mut net_tx: u64 = 0;
-    let mut last_sql_tx: u64 = sh.db.tx_seq;
+    let mut last_persisted_state = (
+        sh.db.tx_seq,
+        sh.auth_seq,
+        sh.http_login_seq,
+        sh.triad_min_epoch,
+        sh.triad_tx_seq,
+        sh.vault_nonce_seq,
+        sh.guard_lockdown,
+    );
     let mut last_rto_irq: u64 = read_hw_irq_wakeups();
 
     smp_hw_tick_and_sync(sh);
@@ -893,8 +904,17 @@ pub(crate) fn live_os_console_loop() -> ! {
                     }
                 }
                 vnet_rx_recycle(vn, head_id);
-                if sh.db.tx_seq != last_sql_tx {
-                    last_sql_tx = sh.db.tx_seq;
+                let cur_state = (
+                    sh.db.tx_seq,
+                    sh.auth_seq,
+                    sh.http_login_seq,
+                    sh.triad_min_epoch,
+                    sh.triad_tx_seq,
+                    sh.vault_nonce_seq,
+                    sh.guard_lockdown,
+                );
+                if cur_state != last_persisted_state {
+                    last_persisted_state = cur_state;
                     let _ = persist_shell_to_ahci(sh, boots);
                 }
             }
@@ -939,8 +959,17 @@ pub(crate) fn live_os_console_loop() -> ! {
             let rlen = act.bytes_written();
             if rlen > 0 {
                 smp_hw_tick_and_sync(sh);
-                if reply[..rlen].starts_with(b"sync: ok ") || sh.db.tx_seq != last_sql_tx {
-                    last_sql_tx = sh.db.tx_seq;
+                let cur_state = (
+                    sh.db.tx_seq,
+                    sh.auth_seq,
+                    sh.http_login_seq,
+                    sh.triad_min_epoch,
+                    sh.triad_tx_seq,
+                    sh.vault_nonce_seq,
+                    sh.guard_lockdown,
+                );
+                if reply[..rlen].starts_with(b"sync: ok ") || cur_state != last_persisted_state {
+                    last_persisted_state = cur_state;
                     let _ = persist_shell_to_ahci(sh, boots);
                 }
                 serial_write_bytes(&reply[..rlen]);

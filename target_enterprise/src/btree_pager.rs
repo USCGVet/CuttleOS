@@ -34,8 +34,8 @@ static NEXT_BTREE_ID: AtomicU64 = AtomicU64::new(1);
 pub const BTREE_PAGE_SIZE: usize = 4096;
 /// Number of 512-byte disk sectors per 4 KiB B+Tree page.
 pub const BTREE_SECTORS_PER_PAGE: usize = 8;
-/// Maximum number of 4 KiB pages managed by a [`BTreePager`] instance (`32` pages = `128 KiB`).
-pub const BTREE_MAX_PAGES: usize = 32;
+/// Maximum number of 4 KiB pages managed by a [`BTreePager`] instance (`40` pages = `160 KiB`).
+pub const BTREE_MAX_PAGES: usize = 40;
 /// 8-byte magic header on every sealed 4 KiB B+Tree page.
 pub const BTREE_PAGE_MAGIC: &[u8; 8] = b"CTTLBTP1";
 /// 8-byte magic header on every sealed [`BTreeManifest`].
@@ -105,7 +105,7 @@ pub struct BTreeManifest {
     /// High-water number of page slots initialized (`1..=BTREE_MAX_PAGES`).
     pub allocated_pages: u16,
     /// Bitmask of reclaimed free page slots (`bit i == 1` means page `i` is free).
-    pub free_mask: u32,
+    pub free_mask: u64,
     /// Latest committed Log Sequence Number.
     pub lsn: u64,
     /// Total live records stored across all leaf pages.
@@ -212,11 +212,13 @@ pub struct BTreePager {
     /// High-water number of initialized 4 KiB page slots (`1..=BTREE_MAX_PAGES`).
     pub allocated_pages: u16,
     /// Bitmask of reclaimed free page slots (`bit i == 1` means page `i` is free).
-    pub free_mask: u32,
+    pub free_mask: u64,
     /// Monotonic Log Sequence Number incremented on every page seal operation.
     pub lsn: u64,
     /// Total leaf page split operations performed.
     pub leaf_splits: u64,
+    /// Total internal index page split operations performed.
+    pub internal_splits: u64,
     /// Total records currently stored across all leaf pages.
     pub total_records: usize,
     /// Expected committed LSN for each page slot (`0` for free/unallocated pages).
@@ -239,6 +241,7 @@ impl BTreePager {
             free_mask: 0,
             lsn: 0,
             leaf_splits: 0,
+            internal_splits: 0,
             total_records: 0,
             page_lsns: [0u64; BTREE_MAX_PAGES],
             manifest_tag: [0u8; DURABLE_DIGEST_LEN],
@@ -296,18 +299,18 @@ impl BTreePager {
     }
 
     fn compute_manifest_tag(&self) -> [u8; DURABLE_DIGEST_LEN] {
-        let mut buf = [0u8; 8 + 8 + 8 + 2 + 2 + 4 + 8 + 4 + (BTREE_MAX_PAGES * 8)];
+        let mut buf = [0u8; 8 + 8 + 8 + 2 + 2 + 8 + 8 + 4 + (BTREE_MAX_PAGES * 8)];
         buf[0..8].copy_from_slice(BTREE_MANIFEST_MAGIC);
         buf[8..16].copy_from_slice(&self.tree_id.to_le_bytes());
         buf[16..24].copy_from_slice(&self.epoch.to_le_bytes());
         buf[24..26].copy_from_slice(&self.root_page.to_le_bytes());
         buf[26..28].copy_from_slice(&self.allocated_pages.to_le_bytes());
-        buf[28..32].copy_from_slice(&self.free_mask.to_le_bytes());
-        buf[32..40].copy_from_slice(&self.lsn.to_le_bytes());
-        buf[40..44].copy_from_slice(&(self.total_records as u32).to_le_bytes());
+        buf[28..36].copy_from_slice(&self.free_mask.to_le_bytes());
+        buf[36..44].copy_from_slice(&self.lsn.to_le_bytes());
+        buf[44..48].copy_from_slice(&(self.total_records as u32).to_le_bytes());
         let mut i = 0usize;
         while i < BTREE_MAX_PAGES {
-            let off = 44 + i * 8;
+            let off = 48 + i * 8;
             buf[off..off + 8].copy_from_slice(&self.page_lsns[i].to_le_bytes());
             i += 1;
         }
@@ -335,18 +338,18 @@ impl BTreePager {
         {
             return Err(BTreeError::ManifestTampered);
         }
-        let mut buf = [0u8; 8 + 8 + 8 + 2 + 2 + 4 + 8 + 4 + (BTREE_MAX_PAGES * 8)];
+        let mut buf = [0u8; 8 + 8 + 8 + 2 + 2 + 8 + 8 + 4 + (BTREE_MAX_PAGES * 8)];
         buf[0..8].copy_from_slice(BTREE_MANIFEST_MAGIC);
         buf[8..16].copy_from_slice(&self.tree_id.to_le_bytes());
         buf[16..24].copy_from_slice(&self.epoch.to_le_bytes());
         buf[24..26].copy_from_slice(&self.root_page.to_le_bytes());
         buf[26..28].copy_from_slice(&self.allocated_pages.to_le_bytes());
-        buf[28..32].copy_from_slice(&self.free_mask.to_le_bytes());
-        buf[32..40].copy_from_slice(&self.lsn.to_le_bytes());
-        buf[40..44].copy_from_slice(&(self.total_records as u32).to_le_bytes());
+        buf[28..36].copy_from_slice(&self.free_mask.to_le_bytes());
+        buf[36..44].copy_from_slice(&self.lsn.to_le_bytes());
+        buf[44..48].copy_from_slice(&(self.total_records as u32).to_le_bytes());
         let mut i = 0usize;
         while i < BTREE_MAX_PAGES {
-            let off = 44 + i * 8;
+            let off = 48 + i * 8;
             buf[off..off + 8].copy_from_slice(&self.page_lsns[i].to_le_bytes());
             i += 1;
         }
@@ -396,6 +399,7 @@ impl BTreePager {
             free_mask: manifest.free_mask,
             lsn: manifest.lsn,
             leaf_splits: 0,
+            internal_splits: 0,
             total_records: manifest.total_records as usize,
             page_lsns: manifest.page_lsns,
             manifest_tag: manifest.hmac_tag,
@@ -587,7 +591,7 @@ impl BTreePager {
     fn alloc_page_slot(&mut self) -> Result<u16, BTreeError> {
         if self.free_mask != 0 {
             let pid = self.free_mask.trailing_zeros() as u16;
-            self.free_mask &= !(1u32 << pid);
+            self.free_mask &= !(1u64 << pid);
             return Ok(pid);
         }
         if (self.allocated_pages as usize) >= BTREE_MAX_PAGES {
@@ -601,7 +605,7 @@ impl BTreePager {
     fn mark_page_free(&mut self, page_id: u16) {
         self.pages[page_id as usize] = [0u8; BTREE_PAGE_SIZE];
         self.page_lsns[page_id as usize] = 0;
-        self.free_mask |= 1u32 << page_id;
+        self.free_mask |= 1u64 << page_id;
     }
 
     fn page_count(&self, page_id: u16) -> usize {
@@ -796,24 +800,33 @@ impl BTreePager {
             return Ok(leaf_id);
         }
 
-        // Otherwise, split the full 64-entry leaf page across two 4 KiB leaf pages!
+        // Otherwise, split the full 64-entry leaf page across two 4 KiB leaf pages,
+        // pre-checking exact page budget across any cascading internal splits up to the root!
         let parent_id = self.page_parent(leaf_id);
-        let needed_pages = if parent_id == BTREE_NO_PAGE {
-            2usize // new right leaf + new internal root page
-        } else {
-            1usize // new right leaf
-        };
+        let mut needed_pages = 1usize; // new right leaf
+        let mut climb = parent_id;
+        let mut climb_hops = 0usize;
+        loop {
+            if climb == BTREE_NO_PAGE {
+                needed_pages += 1; // new internal root page
+                break;
+            }
+            if climb_hops >= 8 {
+                return Err(BTreeError::PageTampered { page_id: climb });
+            }
+            let p_kind = self.verify_page_seal(climb)?;
+            if p_kind != BTreePageKind::Internal {
+                return Err(BTreeError::PageTampered { page_id: climb });
+            }
+            if self.page_count(climb) < BTREE_INTERNAL_MAX_KEYS {
+                break;
+            }
+            needed_pages += 1; // internal node `climb` will also split
+            climb = self.page_parent(climb);
+            climb_hops += 1;
+        }
         if self.available_page_slots() < needed_pages {
             return Err(BTreeError::PagerFull);
-        }
-        if parent_id != BTREE_NO_PAGE {
-            let p_kind = self.verify_page_seal(parent_id)?;
-            if p_kind != BTreePageKind::Internal {
-                return Err(BTreeError::PageTampered { page_id: parent_id });
-            }
-            if self.page_count(parent_id) >= BTREE_INTERNAL_MAX_KEYS {
-                return Err(BTreeError::PagerFull);
-            }
         }
 
         // Collect all 65 sorted records in stack scratch:
@@ -872,59 +885,155 @@ impl BTreePager {
 
         self.total_records += 1;
         self.leaf_splits += 1;
-
-        if parent_id == BTREE_NO_PAGE {
-            // Allocate new internal root page:
-            let new_root = self.alloc_page_slot()?;
-            self.init_page_header(
-                new_root,
-                BTreePageKind::Internal,
-                1,
-                BTREE_NO_PAGE,
-                BTREE_NO_PAGE,
-                right_id,
-            );
-            self.write_internal_entry(new_root, 0, sep_key, leaf_id);
-            self.set_page_parent(leaf_id, new_root);
-            self.set_page_parent(right_id, new_root);
-            self.root_page = new_root;
-            self.seal_page(leaf_id)?;
-            self.seal_page(right_id)?;
-            self.seal_page(new_root)?;
-        } else {
-            let p_count = self.page_count(parent_id);
-            // Insert `(sep_key, leaf_id)` into `parent_id` and update child pointer after `sep_key` to `right_id`:
-            let mut ins_at = p_count;
-            let mut pi = 0usize;
-            while pi < p_count {
-                let (k_i, _) = self.read_internal_entry(parent_id, pi);
-                if sep_key < k_i {
-                    ins_at = pi;
-                    break;
-                }
-                pi += 1;
-            }
-            if ins_at == p_count {
-                self.write_internal_entry(parent_id, p_count, sep_key, leaf_id);
-                self.set_page_rightmost_child(parent_id, right_id);
-            } else {
-                let mut s = p_count;
-                while s > ins_at {
-                    let (prev_k, prev_c) = self.read_internal_entry(parent_id, s - 1);
-                    self.write_internal_entry(parent_id, s, prev_k, prev_c);
-                    s -= 1;
-                }
-                let (next_k, _) = self.read_internal_entry(parent_id, ins_at + 1);
-                self.write_internal_entry(parent_id, ins_at, sep_key, leaf_id);
-                self.write_internal_entry(parent_id, ins_at + 1, next_k, right_id);
-            }
-            self.set_page_count(parent_id, p_count + 1);
-            self.seal_page(leaf_id)?;
-            self.seal_page(right_id)?;
-            self.seal_page(parent_id)?;
-        }
+        self.insert_into_parent(leaf_id, sep_key, right_id)?;
 
         Ok(if key < sep_key { leaf_id } else { right_id })
+    }
+
+    fn insert_into_parent(
+        &mut self,
+        mut cur_left: u16,
+        mut cur_sep: i64,
+        mut cur_right: u16,
+    ) -> Result<(), BTreeError> {
+        let mut depth = 0usize;
+        while depth < 8 {
+            let parent_id = self.page_parent(cur_left);
+            if parent_id == BTREE_NO_PAGE {
+                let new_root = self.alloc_page_slot()?;
+                self.init_page_header(
+                    new_root,
+                    BTreePageKind::Internal,
+                    1,
+                    BTREE_NO_PAGE,
+                    BTREE_NO_PAGE,
+                    cur_right,
+                );
+                self.write_internal_entry(new_root, 0, cur_sep, cur_left);
+                self.set_page_parent(cur_left, new_root);
+                self.set_page_parent(cur_right, new_root);
+                self.root_page = new_root;
+                self.seal_page(cur_left)?;
+                self.seal_page(cur_right)?;
+                self.seal_page(new_root)?;
+                return Ok(());
+            }
+
+            let p_count = self.page_count(parent_id);
+            let mut keys = [0i64; BTREE_INTERNAL_MAX_KEYS + 1];
+            let mut children = [0u16; BTREE_INTERNAL_MAX_KEYS + 2];
+            let mut found_child = None;
+            let mut i = 0usize;
+            while i < p_count {
+                let (k_i, c_i) = self.read_internal_entry(parent_id, i);
+                if c_i == cur_left {
+                    found_child = Some(i);
+                }
+                keys[i] = k_i;
+                children[i] = c_i;
+                i += 1;
+            }
+            let rm = self.page_rightmost_child(parent_id);
+            children[p_count] = rm;
+            if rm == cur_left {
+                found_child = Some(p_count);
+            }
+            let pos = found_child.ok_or(BTreeError::PageTampered { page_id: parent_id })?;
+
+            // Shift keys `[pos..p_count]` right by 1 and children `[pos + 1..=p_count]` right by 1:
+            let mut s = p_count;
+            while s > pos {
+                keys[s] = keys[s - 1];
+                children[s + 1] = children[s];
+                s -= 1;
+            }
+            keys[pos] = cur_sep;
+            children[pos + 1] = cur_right;
+            let total_keys = p_count + 1;
+
+            if total_keys <= BTREE_INTERNAL_MAX_KEYS {
+                let mut wi = 0usize;
+                while wi < total_keys {
+                    self.write_internal_entry(parent_id, wi, keys[wi], children[wi]);
+                    wi += 1;
+                }
+                self.set_page_rightmost_child(parent_id, children[total_keys]);
+                self.set_page_count(parent_id, total_keys);
+                self.set_page_parent(cur_left, parent_id);
+                self.set_page_parent(cur_right, parent_id);
+                self.seal_page(cur_left)?;
+                self.seal_page(cur_right)?;
+                self.seal_page(parent_id)?;
+                return Ok(());
+            }
+
+            // Internal node overflow (`total_keys == 32`, `33` children): split internal node!
+            // Push `keys[mid]` up to grandparent; left internal gets `0..mid` (`16` keys, `17` children),
+            // right internal gets `(mid + 1)..total_keys` (`15` keys, `16` children).
+            let mid = total_keys / 2;
+            let up_sep = keys[mid];
+            let grandparent_id = self.page_parent(parent_id);
+            let right_int_id = self.alloc_page_slot()?;
+
+            self.init_page_header(
+                parent_id,
+                BTreePageKind::Internal,
+                mid as u16,
+                BTREE_NO_PAGE,
+                grandparent_id,
+                children[mid],
+            );
+            let mut li = 0usize;
+            while li < mid {
+                self.write_internal_entry(parent_id, li, keys[li], children[li]);
+                li += 1;
+            }
+            let mut lc = 0usize;
+            while lc <= mid {
+                let ch = children[lc];
+                if ch == cur_left || ch == cur_right || self.page_parent(ch) != parent_id {
+                    self.set_page_parent(ch, parent_id);
+                    self.seal_page(ch)?;
+                }
+                lc += 1;
+            }
+
+            let right_keys = total_keys - (mid + 1);
+            self.init_page_header(
+                right_int_id,
+                BTreePageKind::Internal,
+                right_keys as u16,
+                BTREE_NO_PAGE,
+                grandparent_id,
+                children[total_keys],
+            );
+            let mut ri = 0usize;
+            while ri < right_keys {
+                self.write_internal_entry(
+                    right_int_id,
+                    ri,
+                    keys[mid + 1 + ri],
+                    children[mid + 1 + ri],
+                );
+                ri += 1;
+            }
+            let mut rc = mid + 1;
+            while rc <= total_keys {
+                let ch = children[rc];
+                self.set_page_parent(ch, right_int_id);
+                self.seal_page(ch)?;
+                rc += 1;
+            }
+
+            self.internal_splits += 1;
+            cur_left = parent_id;
+            cur_sep = up_sep;
+            cur_right = right_int_id;
+            depth += 1;
+        }
+        Err(BTreeError::PageTampered {
+            page_id: self.root_page,
+        })
     }
 
     /// Point lookup for `key` across the B+Tree, verifying the constant-time `HMAC-SHA256`
@@ -1432,5 +1541,31 @@ mod tests {
             Err(BTreeError::InputTooLarge)
         );
         assert_eq!(pager.total_records, 0);
+    }
+
+    #[test]
+    fn btree_pager_splits_internal_nodes_to_height_three_with_intact_seals() {
+        let mut pager = BTreePager::new(TEST_BTREE_KEY).unwrap();
+        // Insert 1,100 sequential records: triggers 33 leaf splits -> overflows a 31-key internal root,
+        // requiring an internal node split (`height == 3`, `internal_splits >= 1`)!
+        for i in 0..1100i64 {
+            let lbl = alloc::format!("k{i:05}");
+            let val = alloc::format!("v{i:05}");
+            pager
+                .insert(i, lbl.as_bytes(), val.as_bytes(), i + 1)
+                .unwrap_or_else(|e| panic!("insert({i}) failed before height-3 split: {e:?}"));
+        }
+        assert_eq!(pager.total_records, 1100);
+        assert!(
+            pager.internal_splits >= 1,
+            "1,100 sequential inserts must split the 31-key internal index page into height 3"
+        );
+        let active = pager.verify_all_page_seals().expect("all height-3 seals valid");
+        assert!(active >= 36, "expected >= 36 active pages, got {active}");
+        for probe in [0i64, 511, 1024, 1057, 1099] {
+            let rec = pager.get(probe).unwrap().expect("record present");
+            let expected = alloc::format!("v{probe:05}");
+            assert_eq!(rec.val_bytes(), expected.as_bytes());
+        }
     }
 }

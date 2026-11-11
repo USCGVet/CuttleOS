@@ -602,23 +602,24 @@ pub(crate) fn persist_shell_to_ahci(sh: &mut target_enterprise::OsShell, boots: 
     let mut sql_secs = SQL_PART_SECTORS_BUF.lock();
     sh.pack_sql_partition(&mut *sql_secs);
     let port = AhciHwPort::probe_start_quiet();
-    // Write SQL partition payload sectors first, then SQL superblock sector last (crash-atomic).
+    // Phase 1: write all payload sectors across SQL, FS, and WAL partitions first.
     let mut sq = 1usize;
     while sq < target_enterprise::SQL_PART_SECTORS {
         port.write_sector(SHELL_SQL_DISK_LBA + (sq as u64), &sql_secs[sq]);
         sq += 1;
     }
-    port.write_sector(SHELL_SQL_DISK_LBA, &sql_secs[0]);
-    // Write directory + data sectors first, then superblock sector last (crash-atomic).
     let mut s = 1usize;
     while s < target_enterprise::shell::SHELL_FS_PART_SECTORS {
         port.write_sector(SHELL_FS_DISK_LBA + (s as u64), &fs_secs[s]);
         s += 1;
     }
-    port.write_sector(SHELL_FS_DISK_LBA, &fs_secs[0]);
-    // Write WAL payload sector first, then header sector last (crash-atomic).
     port.write_sector(SHELL_DISK_LBA + 1, &wal_sec);
+    port.flush_cache();
+    // Phase 2: commit sealed superblock / header sectors after payload barrier, then flush.
+    port.write_sector(SHELL_SQL_DISK_LBA, &sql_secs[0]);
+    port.write_sector(SHELL_FS_DISK_LBA, &fs_secs[0]);
     port.write_sector(SHELL_DISK_LBA, &hdr_sec);
+    port.flush_cache();
     Some(count)
 }
 
@@ -750,15 +751,95 @@ fn quote_hmac(quote: &[u8]) -> Option<[u8; 32]> {
     Some(mac)
 }
 
+fn run_shell_compose_fixtures(
+    sh: &mut target_enterprise::OsShell,
+    boots: u64,
+    out: &mut [u8; 256],
+) {
+    use target_enterprise::ShellAction;
+
+    let a1 = sh.exec_line(b"write /var/boot.ok ready", boots, 0, 0, out);
+    if &out[..a1.bytes_written()] != b"wrote 6 bytes to /var/boot.ok\n" {
+        panic!("SHELL compose: write /var/boot.ok drift");
+    }
+    let a2 = sh.exec_line(b"cat /var/boot.ok", boots, 0, 0, out);
+    if &out[..a2.bytes_written()] != b"ready\n" {
+        panic!("SHELL compose: cat /var/boot.ok drift");
+    }
+    let a3 = sh.exec_line(b"spawn", boots, 0, 0, out);
+    if &out[..a3.bytes_written()] != b"spawned pid=5\n" {
+        panic!("SHELL compose: spawn pid=5 drift");
+    }
+    let a4 = sh.exec_line(b"kill 1", boots, 0, 0, out);
+    if &out[..a4.bytes_written()] != b"error: permission denied (protected system task)\n" {
+        panic!("SHELL compose: protected kill 1 should deny");
+    }
+    let a5 = sh.exec_line(b"status", boots, 0, 0, out);
+    if !matches!(a5, ShellAction::Continue(_)) || sh.fs.inode_count() != 5 || sh.audit.len() != 5 {
+        panic!("SHELL compose: status/audit state drift");
+    }
+
+    // Verify capability-gated syscall enforcement + ELF64/KPTI/eBPF exec:
+    let a6 = sh.exec_line(b"syscall 5 open /var/boot.ok", boots, 0, 0, out);
+    if &out[..a6.bytes_written()] != b"syscall denied: EPERM (missing fs capability)\n" {
+        panic!("SHELL compose: unprivileged syscall open should deny");
+    }
+    let a7 = sh.exec_line(b"grant 5 fs", boots, 0, 0, out);
+    if &out[..a7.bytes_written()] != b"granted fs on pid=5\n" {
+        panic!("SHELL compose: grant 5 fs drift");
+    }
+    let a8 = sh.exec_line(b"syscall 5 open /var/boot.ok", boots, 0, 0, out);
+    if &out[..a8.bytes_written()] != b"syscall ok: ret=0\n" {
+        panic!("SHELL compose: granted syscall open should succeed");
+    }
+    let a_sc_deny = sh.exec_line(b"seccomp deny 5 open", boots, 0, 0, out);
+    if &out[..a_sc_deny.bytes_written()] != b"seccomp: denied open on pid=5 (mask=8)\n" {
+        panic!("SHELL compose: seccomp deny 5 open drift");
+    }
+    let a_sc_blk = sh.exec_line(b"syscall 5 open /var/boot.ok", boots, 0, 0, out);
+    if &out[..a_sc_blk.bytes_written()]
+        != b"syscall denied: EACCES (blocked by eBPF seccomp filter)\n"
+    {
+        panic!("SHELL compose: seccomp filter failed to block open");
+    }
+    let a_sc_ok = sh.exec_line(b"syscall 5 getpid", boots, 0, 0, out);
+    if &out[..a_sc_ok.bytes_written()] != b"syscall ok: ret=1\n" {
+        panic!("SHELL compose: seccomp filter blocked permitted getpid");
+    }
+    let a9 = sh.exec_line(b"exec /bin/fib 10", boots, 0, 0, out);
+    if &out[..a9.bytes_written()]
+        != b"exec: path=/bin/fib entry=4198400 kpti=isolated insns=11 ret=55\n"
+    {
+        panic!("SHELL compose: exec /bin/fib 10 drift");
+    }
+    if sh.ima_measurements != 1 || sh.ima_pcr10 == [0u8; 32] {
+        panic!("SHELL compose: IMA/TPM PCR-10 measurement not extended");
+    }
+    let a10 = sh.exec_line(b"exec /var/boot.ok", boots, 0, 0, out);
+    if &out[..a10.bytes_written()] != b"error: EPERM (IMA signature verification failed)\n" {
+        panic!("SHELL compose: unsigned binary must be rejected by IMA");
+    }
+    let a11 = sh.exec_line(b"fw block 192.168.66.0/24", boots, 0, 0, out);
+    if &out[..a11.bytes_written()] != b"fw: blocked src=192.168.66.0/24\n" || sh.fw.len() != 1 {
+        panic!("SHELL compose: fw block CIDR failed");
+    }
+    let sq_ins = sh
+        .db
+        .exec(b"INSERT INTO kv VALUES ('boot.state', 'ready', 1)", out);
+    if &out[..sq_ins] != b"INSERT 1\n" {
+        panic!("SHELL compose: SQL INSERT INTO kv failed");
+    }
+    sh.auth_seq = 7;
+}
+
 /// Live composition proof for `OsShell`: seeds the BSS shell, writes and
 /// reads back `/var/boot.ok`, spawns PID 5, verifies capability-gated
 /// `SYS_OPEN` (`EPERM` before `grant 5 fs`, `ret=0` after), executes user
 /// ELF64 `/bin/fib 10`, persists the keyed HMAC-SHA256-sealed WAL to physical AHCI
-/// sectors `1040..=1041`, and verifies round-trip restoration from AHCI.
+/// sectors `1040..=1041`, and verifies round-trip restoration from AHCI while
+/// preserving operator VFS, firewall, cron, SQL, and anti-replay state across reboots.
 #[inline(never)]
 pub(crate) fn banner_shell_compose() {
-    use target_enterprise::ShellAction;
-
     let seal_key = derive_runtime_seal_key();
     let legacy_seal_key = derive_runtime_legacy_seal_key();
     let attest_key = derive_runtime_attest_key();
@@ -773,11 +854,11 @@ pub(crate) fn banner_shell_compose() {
 
     let mut out = [0u8; 256];
     let mut seal_rejected = false;
+    let mut resumed_ok = false;
 
-    let mut resumed_db: Option<target_enterprise::sql::SqlDb> = None;
     if boots > 1 {
         if let Some((prev_boots, applied)) = restore_shell_from_ahci(sh) {
-            if prev_boots + 1 != boots || applied < 2 {
+            if prev_boots + 1 != boots || applied < 1 {
                 panic!("SHELL resume: cross-boot AHCI state drift");
             }
             let ar = sh.exec_line(b"cat /var/boot.ok", boots, 0, 0, &mut out);
@@ -792,95 +873,20 @@ pub(crate) fn banner_shell_compose() {
                     panic!("SHELL resume: cross-boot SQL partition drift");
                 }
             }
-            resumed_db = Some(sh.db);
+            resumed_ok = true;
             serial_write_str("SHELL resume OK\n");
-        } else if sh.audit.len() > 0 {
-            seal_rejected = true;
+        } else {
+            if sh.audit.len() > 0 {
+                seal_rejected = true;
+            }
+            *sh = target_enterprise::OsShell::empty();
+            sh.seal_key = seal_key;
+            sh.legacy_seal_key = legacy_seal_key;
+            sh.attest_key = attest_key;
+            sh.seed_defaults_for_boot(boots);
         }
-        *sh = target_enterprise::OsShell::empty();
-        sh.seal_key = seal_key;
-        sh.legacy_seal_key = legacy_seal_key;
-        sh.attest_key = attest_key;
-        sh.seed_defaults_for_boot(boots);
     }
 
-    let a1 = sh.exec_line(b"write /var/boot.ok ready", boots, 0, 0, &mut out);
-    if &out[..a1.bytes_written()] != b"wrote 6 bytes to /var/boot.ok\n" {
-        panic!("SHELL compose: write /var/boot.ok drift");
-    }
-    let a2 = sh.exec_line(b"cat /var/boot.ok", boots, 0, 0, &mut out);
-    if &out[..a2.bytes_written()] != b"ready\n" {
-        panic!("SHELL compose: cat /var/boot.ok drift");
-    }
-    let a3 = sh.exec_line(b"spawn", boots, 0, 0, &mut out);
-    if &out[..a3.bytes_written()] != b"spawned pid=5\n" {
-        panic!("SHELL compose: spawn pid=5 drift");
-    }
-    let a4 = sh.exec_line(b"kill 1", boots, 0, 0, &mut out);
-    if &out[..a4.bytes_written()] != b"error: permission denied (protected system task)\n" {
-        panic!("SHELL compose: protected kill 1 should deny");
-    }
-    let a5 = sh.exec_line(b"status", boots, 0, 0, &mut out);
-    if !matches!(a5, ShellAction::Continue(_)) || sh.fs.inode_count() != 5 || sh.audit.len() != 5 {
-        panic!("SHELL compose: status/audit state drift");
-    }
-
-    // Verify capability-gated syscall enforcement + ELF64/KPTI/eBPF exec:
-    let a6 = sh.exec_line(b"syscall 5 open /var/boot.ok", boots, 0, 0, &mut out);
-    if &out[..a6.bytes_written()] != b"syscall denied: EPERM (missing fs capability)\n" {
-        panic!("SHELL compose: unprivileged syscall open should deny");
-    }
-    let a7 = sh.exec_line(b"grant 5 fs", boots, 0, 0, &mut out);
-    if &out[..a7.bytes_written()] != b"granted fs on pid=5\n" {
-        panic!("SHELL compose: grant 5 fs drift");
-    }
-    let a8 = sh.exec_line(b"syscall 5 open /var/boot.ok", boots, 0, 0, &mut out);
-    if &out[..a8.bytes_written()] != b"syscall ok: ret=0\n" {
-        panic!("SHELL compose: granted syscall open should succeed");
-    }
-    let a_sc_deny = sh.exec_line(b"seccomp deny 5 open", boots, 0, 0, &mut out);
-    if &out[..a_sc_deny.bytes_written()] != b"seccomp: denied open on pid=5 (mask=8)\n" {
-        panic!("SHELL compose: seccomp deny 5 open drift");
-    }
-    let a_sc_blk = sh.exec_line(b"syscall 5 open /var/boot.ok", boots, 0, 0, &mut out);
-    if &out[..a_sc_blk.bytes_written()]
-        != b"syscall denied: EACCES (blocked by eBPF seccomp filter)\n"
-    {
-        panic!("SHELL compose: seccomp filter failed to block open");
-    }
-    let a_sc_ok = sh.exec_line(b"syscall 5 getpid", boots, 0, 0, &mut out);
-    if &out[..a_sc_ok.bytes_written()] != b"syscall ok: ret=1\n" {
-        panic!("SHELL compose: seccomp filter blocked permitted getpid");
-    }
-    let a9 = sh.exec_line(b"exec /bin/fib 10", boots, 0, 0, &mut out);
-    if &out[..a9.bytes_written()]
-        != b"exec: path=/bin/fib entry=4198400 kpti=isolated insns=11 ret=55\n"
-    {
-        panic!("SHELL compose: exec /bin/fib 10 drift");
-    }
-    if sh.ima_measurements != 1 || sh.ima_pcr10 == [0u8; 32] {
-        panic!("SHELL compose: IMA/TPM PCR-10 measurement not extended");
-    }
-    let a10 = sh.exec_line(b"exec /var/boot.ok", boots, 0, 0, &mut out);
-    if &out[..a10.bytes_written()] != b"error: EPERM (IMA signature verification failed)\n" {
-        panic!("SHELL compose: unsigned binary must be rejected by IMA");
-    }
-    let a11 = sh.exec_line(b"fw block 192.168.66.0/24", boots, 0, 0, &mut out);
-    if &out[..a11.bytes_written()] != b"fw: blocked src=192.168.66.0/24\n" || sh.fw.len() != 1 {
-        panic!("SHELL compose: fw block CIDR failed");
-    }
-    let sq_ins = sh
-        .db
-        .exec(b"INSERT INTO kv VALUES ('boot.state', 'ready', 1)", &mut out);
-    if &out[..sq_ins] != b"INSERT 1\n" {
-        panic!("SHELL compose: SQL INSERT INTO kv failed");
-    }
-    sh.auth_seq = 7;
-
-    // Persist sealed WAL (F + T + W + Q = 4 records), 16-sector FS partition, and 8-sector SQL partition to physical AHCI disk:
-    if persist_shell_to_ahci(sh, boots) != Some(4) {
-        panic!("SHELL compose: AHCI persist expected 4 records");
-    }
     static VERIFY_SHELL: spin::Mutex<target_enterprise::OsShell> =
         spin::Mutex::new(target_enterprise::OsShell::empty());
     let mut vsh_guard = VERIFY_SHELL.lock();
@@ -890,8 +896,42 @@ pub(crate) fn banner_shell_compose() {
     vsh.legacy_seal_key = legacy_seal_key;
     vsh.attest_key = attest_key;
     vsh.seed_defaults_for_boot(boots);
-    if restore_shell_from_ahci(vsh) != Some((boots, 4)) {
-        panic!("SHELL compose: AHCI sealed restore failed");
+
+    if resumed_ok {
+        run_shell_compose_fixtures(vsh, boots, &mut out);
+        let mut hdr_sec = [0u8; 512];
+        let mut wal_sec = [0u8; 512];
+        if vsh.pack_disk_image(boots, &mut hdr_sec, &mut wal_sec) != Ok(4) {
+            panic!("SHELL compose: sealed WAL pack expected 4 records");
+        }
+        {
+            let mut fs_secs = FS_PART_SECTORS.lock();
+            if vsh.pack_fs_partition(boots, &mut *fs_secs).is_err() {
+                panic!("SHELL compose: sealed FS pack failed");
+            }
+            let mut sql_secs = SQL_PART_SECTORS_BUF.lock();
+            vsh.pack_sql_partition(&mut *sql_secs);
+            *vsh = target_enterprise::OsShell::empty();
+            vsh.seal_key = seal_key;
+            vsh.legacy_seal_key = legacy_seal_key;
+            vsh.attest_key = attest_key;
+            vsh.seed_defaults_for_boot(boots);
+            if vsh.unpack_disk_image(&hdr_sec, &wal_sec) != Ok((boots, 4))
+                || vsh.unpack_fs_partition(&*fs_secs).map(|r| r.0) != Ok(boots)
+                || !vsh.unpack_sql_partition(&*sql_secs)
+            {
+                panic!("SHELL compose: sealed roundtrip failed");
+            }
+        }
+    } else {
+        run_shell_compose_fixtures(sh, boots, &mut out);
+        // Persist sealed WAL (F + T + W + Q = 4 records), 16-sector FS partition, and 8-sector SQL partition to physical AHCI disk:
+        if persist_shell_to_ahci(sh, boots) != Some(4) {
+            panic!("SHELL compose: AHCI persist expected 4 records");
+        }
+        if restore_shell_from_ahci(vsh) != Some((boots, 4)) {
+            panic!("SHELL compose: AHCI sealed restore failed");
+        }
     }
     if vsh.fw.len() != 1 || vsh.auth_seq != 7 || vsh.seccomp_mask[5] != 8 {
         panic!("SHELL compose: AHCI restored fw/auth_seq/seccomp drift");
@@ -980,12 +1020,15 @@ pub(crate) fn banner_shell_compose() {
     }
     sh.svc
         .set_ring3_cap_hw_hook(crate::banners_arch_platform::exec_service_ring3_cap_live);
-    let _ = sh.exec_line(b"seccomp clear 5", boots, 0, 0, &mut out);
-    let _ = sh.exec_line(b"fw clear", boots, 0, 0, &mut out);
-    sh.auth_seq = 0;
-    if let Some(db) = resumed_db {
-        sh.db = db;
+    if resumed_ok {
         let _ = persist_shell_to_ahci(sh, boots);
+    } else {
+        let _ = sh.exec_line(b"seccomp clear 5", boots, 0, 0, &mut out);
+        let _ = sh.exec_line(b"fw clear", boots, 0, 0, &mut out);
+        sh.auth_seq = 0;
+        if !seal_rejected {
+            let _ = persist_shell_to_ahci(sh, boots);
+        }
     }
 
     serial_write_str("SHELL compose OK tasks=5 files=5 audit=5\n");
