@@ -200,11 +200,16 @@ pub struct LivedNet {
     http_tx: [alloc::vec::Vec<u8>; TCP_MAX_SLOTS],
     slot_tls_buffered: [usize; TCP_MAX_SLOTS],
     peak_tls_pending_tx: usize,
+    heap_headroom_fn: Option<fn(usize) -> bool>,
     tls_config: Option<Arc<ServerConfig>>,
     tls: [Option<Box<TlsSession>>; TCP_MAX_SLOTS],
 }
 
 impl LivedNet {
+    /// Minimum Ring-0 heap headroom (`64 KiB` beyond emergency reserve) required before
+    /// accepting and allocating a new TLS 1.3 handshake state on port 443.
+    pub const TLS_SESSION_MIN_HEAP_HEADROOM: usize = 64 * 1024;
+
     /// Zero-initialized BSS constructor suitable for `static spin::Mutex<LivedNet>`.
     pub const fn empty() -> Self {
         Self {
@@ -234,6 +239,7 @@ impl LivedNet {
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             slot_tls_buffered: [0usize; TCP_MAX_SLOTS],
             peak_tls_pending_tx: 0,
+            heap_headroom_fn: None,
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -274,6 +280,7 @@ impl LivedNet {
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             slot_tls_buffered: [0usize; TCP_MAX_SLOTS],
             peak_tls_pending_tx: 0,
+            heap_headroom_fn: None,
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -309,6 +316,7 @@ impl LivedNet {
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             slot_tls_buffered: [0usize; TCP_MAX_SLOTS],
             peak_tls_pending_tx: 0,
+            heap_headroom_fn: None,
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
         }
@@ -562,6 +570,12 @@ impl LivedNet {
     /// Until this is called, connections to 443 are not accepted.
     pub fn enable_tls(&mut self, config: Arc<ServerConfig>) {
         self.tls_config = Some(config);
+    }
+
+    /// Install a kernel heap headroom callback invoked before allocating new TLS 1.3
+    /// session state so connection floods fail closed instead of panicking Ring-0 on OOM.
+    pub fn set_heap_headroom_guard(&mut self, guard: fn(usize) -> bool) {
+        self.heap_headroom_fn = Some(guard);
     }
 
     /// True once [`enable_tls`](Self::enable_tls) has been called.
@@ -1701,8 +1715,16 @@ impl LivedNet {
     ) {
         let state = self.tcbs[idx].state;
         let open = state == TcpState::Established || state == TcpState::CloseWait;
-        if self.tls[idx].is_none() && open && !inbound.is_empty() {
-            if let Some(config) = self.tls_config.clone() {
+        if self.tls[idx].is_none() && open && !inbound.is_empty() && !self.http_input_closed[idx] {
+            let has_heap = self
+                .heap_headroom_fn
+                .is_none_or(|f| f(Self::TLS_SESSION_MIN_HEAP_HEADROOM));
+            if !has_heap {
+                if let Some(sh) = shell.as_deref_mut() {
+                    sh.record_net_audit(AuditVerdict::Denied, b"net:tls:heap_reserve");
+                }
+                self.http_input_closed[idx] = true;
+            } else if let Some(config) = self.tls_config.clone() {
                 if let Ok(session) = TlsSession::new(config) {
                     self.tls[idx] = Some(Box::new(session));
                     self.tls_sessions_started = self.tls_sessions_started.wrapping_add(1);
@@ -1890,7 +1912,10 @@ impl LivedNet {
             ),
             None => (true, true),
         };
-        if self.tcbs[idx].state == TcpState::CloseWait
+        if (self.tcbs[idx].state == TcpState::CloseWait
+            || (self.tcbs[idx].state == TcpState::Established
+                && self.tls[idx].is_none()
+                && self.http_input_closed[idx]))
             && drained
             && ready_for_fin
             && out.len() < MAX_REPLIES
@@ -7470,5 +7495,87 @@ mod tests {
         let req_rb = alloc::format!("POST /sql HTTP/1.1\r\nCookie: sid={sid_str}\r\n\r\nROLLBACK");
         let nrb = net.handle_http_request(req_rb.as_bytes(), 1, Some(&mut sh), &mut out);
         assert!(core::str::from_utf8(&out[..nrb]).unwrap().ends_with("\r\n\r\nROLLBACK OK\n"));
+    }
+
+    #[test]
+    fn stage12_https_connection_flood_refused_when_heap_reserve_low() {
+        crate::tls_provider::SYSTEM_RNG.reseed([0x5Au8; 32]);
+        let secret = [0x42u8; 32];
+        let identity = crate::https::ServerIdentity::derive(&secret, MAC);
+        let cfg = crate::https::server_config(&identity, crate::tls_provider::system_provider())
+            .expect("TLS 1.3 server_config");
+
+        let mut net = LivedNet::with_auth_key(MAC, secret);
+        net.enable_tls(cfg);
+        // Simulate Ring-0 heap emergency reserve threshold reached (`has_headroom -> false`).
+        net.set_heap_headroom_guard(|_| false);
+        let mut sh = crate::shell::OsShell::new();
+
+        // 1. Complete TCP 3-way SYN -> SYN/ACK -> ClientHello PSH|ACK on port 443 (`HTTPS_PORT`).
+        let client_isn: u32 = 0x7100_0000;
+        let client_port: u16 = 54443;
+        let mut syn = [0u8; 40];
+        let ns = TcpImpl::build_segment(
+            client_port,
+            HTTPS_PORT,
+            client_isn,
+            0,
+            tcp_flags::SYN,
+            65535,
+            b"",
+            PEER_IP,
+            GUEST_IP,
+            &mut syn,
+        )
+        .unwrap();
+        let (f_syn, flen_syn) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn[..ns]);
+        let mut out = ReplySet::new();
+        net.handle_frame_with_shell(&f_syn[..flen_syn], 1, &mut sh, &mut out);
+        assert_eq!(out.len(), 1);
+        let sa = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+
+        let fake_client_hello = [0x16u8, 0x03, 0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00];
+        let mut psh = [0u8; 80];
+        let np = TcpImpl::build_segment(
+            client_port,
+            HTTPS_PORT,
+            client_isn.wrapping_add(1),
+            sa.seq.wrapping_add(1),
+            tcp_flags::ACK | tcp_flags::PSH,
+            65535,
+            &fake_client_hello,
+            PEER_IP,
+            GUEST_IP,
+            &mut psh,
+        )
+        .unwrap();
+        let (f_psh, flen_psh) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &psh[..np]);
+        let mut out2 = ReplySet::new();
+        net.handle_frame_with_shell(&f_psh[..flen_psh], 1, &mut sh, &mut out2);
+
+        // Zero `TlsSession` heap allocations occurred, `FIN` was emitted to close the TCP slot,
+        // and `net:tls:heap_reserve` denial was recorded in the kernel audit ring!
+        assert_eq!(
+            net.tls_sessions_started, 0,
+            "TLS session allocation must be refused when Ring-0 emergency heap reserve is low"
+        );
+        let mut saw_fin = false;
+        for idx in 0..out2.len() {
+            let seg = TcpImpl::parse_segment(&out2.get(idx).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+            if (seg.flags & tcp_flags::FIN) != 0 {
+                saw_fin = true;
+            }
+        }
+        assert!(saw_fin, "refused HTTPS slot must actively emit TCP FIN");
+
+        let mut audit_buf = [0u8; 4096];
+        let crate::shell::ShellAction::Continue(an) = sh.exec_line(b"audit", 1, 0, 0, &mut audit_buf) else {
+            panic!("audit command must return ShellAction::Continue");
+        };
+        let audit_str = core::str::from_utf8(&audit_buf[..an]).unwrap();
+        assert!(
+            audit_str.contains("net:tls:heap_reserve"),
+            "audit log must record net:tls:heap_reserve denial, got: {audit_str}"
+        );
     }
 }

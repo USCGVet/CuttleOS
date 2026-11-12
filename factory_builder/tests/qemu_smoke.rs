@@ -285,6 +285,11 @@ fn boots_under_qemu_and_emits_banner() {
             log_contents
         );
     }
+    assert!(
+        log_contents.contains("tlb_ipi=3 vtd_slpt=ok"),
+        "QEMU smoke: expected OS_ARMOR cross-CPU TLB shootdown ACKs (tlb_ipi=3) + vtd_slpt=ok!\nSerial log:\n{}",
+        log_contents
+    );
     if log_contents.contains("CONTINUITY resume OK") {
         assert!(
             log_contents.contains("SHELL resume OK"),
@@ -443,6 +448,7 @@ const REQUIRED_BANNERS: &[&str] = &[
     "SVC_RUNTIME: OK role=full->wfe->full svcs=3 kpti=isolated seccomp=deny-default rot=1",
     "SHELL compose OK tasks=5 files=5 audit=5",
     "SMP_HW init OK cpus=4 threads=4 ctx_sw=4",
+    "OS_ARMOR OK mmio_nx=1 guarded_stacks=16 tss_ltr=4",
     "CUTTLE-TE HALT",
 ];
 

@@ -213,6 +213,123 @@ pub(crate) struct AhciHwPort {
     pub(crate) slot: u8,
 }
 
+static AHCI_CACHED_PBASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static AHCI_CACHED_CLB_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static AHCI_CACHED_CTBA_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static AHCI_CACHED_DATA_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Non-panicking best-effort emergency 512-byte sector write for `#[panic_handler]`.
+/// Uses the previously initialized AHCI port state (`AHCI_CACHED_*`) with bounded timeouts
+/// so a kernel panic never triggers a recursive panic if storage is absent or wedged.
+pub(crate) fn try_write_ahci_sector_emergency(lba: u64, data: &[u8; 512]) -> bool {
+    use core::sync::atomic::Ordering;
+    use cuttle_contracts::{
+        AhciCmd, AhciCmdHeader, AhciFis, AhciPrdt, H2dFisParams, AHCI_CFL_H2D, AHCI_CMD_HDR_LEN,
+        AHCI_FIS_H2D_LEN, AHCI_PRDT_LEN, ATA_DEV_LBA,
+    };
+    use target_enterprise::ahci_cmd::AhciCmdImpl;
+    use target_enterprise::ahci_fis::AhciFisImpl;
+
+    const PORT_IS: u64 = 0x10;
+    const PORT_TFD: u64 = 0x20;
+    const PORT_CI: u64 = 0x38;
+    const ATA_CMD_WRITE_DMA: u8 = 0xCA;
+
+    let pbase = AHCI_CACHED_PBASE.load(Ordering::Acquire);
+    let clb_pa = AHCI_CACHED_CLB_PA.load(Ordering::Acquire);
+    let ctba_pa = AHCI_CACHED_CTBA_PA.load(Ordering::Acquire);
+    let data_pa = AHCI_CACHED_DATA_PA.load(Ordering::Acquire);
+    if pbase == 0 || clb_pa == 0 || ctba_pa == 0 || data_pa == 0 || phys_map_offset() == 0 {
+        return false;
+    }
+
+    let fis_params = H2dFisParams {
+        command: ATA_CMD_WRITE_DMA,
+        features: 0,
+        lba,
+        count: 1,
+        device: ATA_DEV_LBA,
+        pm_port: 0,
+        is_command: true,
+    };
+    let mut fis = [0u8; AHCI_FIS_H2D_LEN];
+    if AhciFisImpl::encode_h2d(&fis_params, &mut fis).is_err() {
+        return false;
+    }
+    let hdr = AhciCmdHeader {
+        cfl: AHCI_CFL_H2D,
+        write: true,
+        pmp: 0,
+        prdtl: 1,
+        prdbc: 0,
+        ctba: ctba_pa,
+    };
+    let mut hbuf = [0u8; AHCI_CMD_HDR_LEN];
+    if AhciCmdImpl::encode_header(&hdr, &mut hbuf).is_err() {
+        return false;
+    }
+    let prdt = AhciPrdt {
+        dba: data_pa,
+        byte_count: 512,
+        ioc: true,
+    };
+    let mut pbuf = [0u8; AHCI_PRDT_LEN];
+    if AhciCmdImpl::encode_prdt(&prdt, &mut pbuf).is_err() {
+        return false;
+    }
+
+    // SAFETY: `pbase`, `clb_pa`, `ctba_pa`, and `data_pa` were validated and mapped during `AhciHwPort::probe_start_inner`.
+    unsafe {
+        let mut spins = 0u32;
+        while (mmio_read32(pbase + PORT_CI) & 1) != 0 || (mmio_read32(pbase + PORT_TFD) & 0x80) != 0 {
+            spins = spins.wrapping_add(1);
+            if spins > 2_000_000 {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        let d = pa_to_va(data_pa);
+        let mut i = 0usize;
+        while i < 512 {
+            core::ptr::write_volatile(d.add(i), data[i]);
+            i += 1;
+        }
+        let ct = pa_to_va(ctba_pa);
+        i = 0;
+        while i < 0x100 {
+            core::ptr::write_volatile(ct.add(i), 0);
+            i += 1;
+        }
+        i = 0;
+        while i < AHCI_FIS_H2D_LEN {
+            core::ptr::write_volatile(ct.add(i), fis[i]);
+            i += 1;
+        }
+        i = 0;
+        while i < AHCI_PRDT_LEN {
+            core::ptr::write_volatile(ct.add(0x80 + i), pbuf[i]);
+            i += 1;
+        }
+        let cl = pa_to_va(clb_pa);
+        i = 0;
+        while i < AHCI_CMD_HDR_LEN {
+            core::ptr::write_volatile(cl.add(i), hbuf[i]);
+            i += 1;
+        }
+        mmio_write32(pbase + PORT_IS, 0xFFFF_FFFF);
+        mmio_write32(pbase + PORT_CI, 1);
+        spins = 0;
+        while (mmio_read32(pbase + PORT_CI) & 1) != 0 {
+            spins = spins.wrapping_add(1);
+            if spins > 4_000_000 {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        (mmio_read32(pbase + PORT_TFD) & 0x01) == 0
+    }
+}
+
 impl AhciHwPort {
     /// PCI scan for the AHCI HBA, enable MMIO + bus mastering, start the
     /// port command engine on the first port with a device present, and emit
@@ -436,6 +553,11 @@ impl AhciHwPort {
             c |= PX_CMD_ST;
             mmio_write32(pbase + PORT_CMD, c);
         }
+
+        AHCI_CACHED_PBASE.store(pbase, core::sync::atomic::Ordering::Release);
+        AHCI_CACHED_CLB_PA.store(clb_pa, core::sync::atomic::Ordering::Release);
+        AHCI_CACHED_CTBA_PA.store(ctba_pa, core::sync::atomic::Ordering::Release);
+        AHCI_CACHED_DATA_PA.store(data_pa, core::sync::atomic::Ordering::Release);
 
         AhciHwPort {
             abar,

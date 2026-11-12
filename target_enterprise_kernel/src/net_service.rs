@@ -601,6 +601,7 @@ pub(crate) fn enable_https(svc: &mut target_enterprise::LivedNet, mac: [u8; 6]) 
     target_enterprise::durable_seal::zeroize_secret_bytes(&mut secret);
     match server_config(&identity, system_provider()) {
         Ok(config) => {
+            svc.set_heap_headroom_guard(crate::heap::has_headroom);
             svc.enable_tls(config);
             let mut line = [0u8; 160];
             let prefix = b"HTTPS UP port=443 tls13=rustls entropy=";

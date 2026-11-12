@@ -133,10 +133,28 @@ pub(crate) fn banner_dma() {
 /// `iretq` -> `int 0x80` on `TSS.RSP0`, verifying the `IST1` breakpoint stack switch,
 /// `CPL=3` `USER_CODE_SEL`/`USER_DATA_SEL` selectors, user-mapped IPC mailbox request/canary
 /// read (`[rsp - 0x20]`) and signed response write (`[rsp - 0x18]`), `SYS_GETPID` trap, and `expected_arg0`.
-/// Enable hardware `IA32_EFER.NXE` (`bit 11`), `CR0.WP` (`bit 16`), and CPUID-advertised
-/// `CR4.SMEP` (`bit 20`) on the calling logical processor.
-// SAFETY: Caller must execute at CPL=0 in 64-bit Long Mode where all supervisor code pages have `PTE_U = 0`.
-pub(crate) unsafe fn enable_cpu_memory_protections() {
+/// Bitmask of hardware CPU security controls verified active on the BSP (`NXE`, `WP`, `SMEP`, `SMAP`, `FSGSBASE`, `UMIP`).
+pub(crate) static ACTIVE_CPU_SEC_BITS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+pub(crate) const CPU_SEC_NXE: u32 = 1 << 0;
+pub(crate) const CPU_SEC_WP: u32 = 1 << 1;
+pub(crate) const CPU_SEC_SMEP: u32 = 1 << 2;
+pub(crate) const CPU_SEC_SMAP: u32 = 1 << 3;
+pub(crate) const CPU_SEC_FSGSBASE: u32 = 1 << 4;
+pub(crate) const CPU_SEC_UMIP: u32 = 1 << 5;
+
+#[inline]
+pub(crate) fn read_active_cpu_sec_bits() -> u32 {
+    ACTIVE_CPU_SEC_BITS.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Enable hardware `IA32_EFER.NXE` (`bit 11`), `CR0.WP` (`bit 16`), and all CPUID-advertised
+/// Ring-0/Ring-3 architectural protections (`CR4.SMEP` bit 20, `CR4.SMAP` bit 21 + `CLAC`,
+/// `CR4.UMIP` bit 11, and `CR4.FSGSBASE` bit 16) on the calling logical processor, returning
+/// the hardware read-back bitmask (`CPU_SEC_*`).
+// SAFETY: Caller must execute at CPL=0 in 64-bit Long Mode where all supervisor pages have `PTE_U = 0`.
+pub(crate) unsafe fn enable_cpu_memory_protections() -> u32 {
     let max_leaf: u32;
     // SAFETY: CPUID leaf 0 is supported on all x86-64 CPUs; `rbx` is preserved across `cpuid`.
     unsafe {
@@ -151,8 +169,9 @@ pub(crate) unsafe fn enable_cpu_memory_protections() {
             options(nomem, preserves_flags),
         );
     }
-    let has_smep = if max_leaf >= 7 {
+    let (has_fsgsbase, has_smep, has_smap, has_umip) = if max_leaf >= 7 {
         let ebx_7: u32;
+        let ecx_7: u32;
         // SAFETY: `max_leaf >= 7` verified leaf 7 support; `rbx` is saved in `r9` and restored.
         unsafe {
             asm!(
@@ -164,20 +183,27 @@ pub(crate) unsafe fn enable_cpu_memory_protections() {
                 "mov rbx, r9",
                 out_ebx = out(reg) ebx_7,
                 out("eax") _,
-                out("ecx") _,
+                out("ecx") ecx_7,
                 out("edx") _,
                 out("r9") _,
                 options(nomem, preserves_flags),
             );
         }
-        (ebx_7 & (1 << 7)) != 0
+        (
+            (ebx_7 & (1 << 0)) != 0,
+            (ebx_7 & (1 << 7)) != 0,
+            (ebx_7 & (1 << 20)) != 0,
+            (ecx_7 & (1 << 2)) != 0,
+        )
     } else {
-        false
+        (false, false, false, false)
     };
 
-    // SAFETY: Setting IA32_EFER.NXE (1<<11), CR0.WP (1<<16), and CR4.SMEP (1<<20 when supported) at CPL=0.
+    let mut active_mask: u32 = 0;
+
+    // SAFETY: Setting IA32_EFER.NXE, CR0.WP, and CPUID-verified CR4 security controls at CPL=0.
     unsafe {
-        let efer_lo: u32;
+        let mut efer_lo: u32;
         let efer_hi: u32;
         asm!(
             "mov ecx, 0xC0000080",
@@ -197,6 +223,17 @@ pub(crate) unsafe fn enable_cpu_memory_protections() {
                 out("ecx") _,
                 options(nomem, nostack, preserves_flags),
             );
+            asm!(
+                "mov ecx, 0xC0000080",
+                "rdmsr",
+                out("ecx") _,
+                out("eax") efer_lo,
+                out("edx") _,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        if (efer_lo & (1 << 11)) != 0 {
+            active_mask |= CPU_SEC_NXE;
         }
 
         let mut cr0_val: u64;
@@ -204,17 +241,51 @@ pub(crate) unsafe fn enable_cpu_memory_protections() {
         if (cr0_val & (1 << 16)) == 0 {
             cr0_val |= 1 << 16;
             asm!("mov cr0, {}", in(reg) cr0_val, options(nomem, nostack, preserves_flags));
+            asm!("mov {}, cr0", out(reg) cr0_val, options(nomem, nostack, preserves_flags));
+        }
+        if (cr0_val & (1 << 16)) != 0 {
+            active_mask |= CPU_SEC_WP;
         }
 
+        let mut cr4_want: u64 = 0;
+        if has_umip {
+            cr4_want |= 1 << 11;
+        }
+        if has_fsgsbase {
+            cr4_want |= 1 << 16;
+        }
         if has_smep {
-            let mut cr4_val: u64;
+            cr4_want |= 1 << 20;
+        }
+        if has_smap {
+            cr4_want |= 1 << 21;
+            // Clear RFLAGS.AC (`clac` = 0F 01 CA) BEFORE enabling CR4.SMAP so supervisor mode
+            // immediately blocks any accidental user-page (`PTE_U = 1`) dereference!
+            asm!(".byte 0x0f, 0x01, 0xca", options(nomem, nostack));
+        }
+        let mut cr4_val: u64;
+        asm!("mov {}, cr4", out(reg) cr4_val, options(nomem, nostack, preserves_flags));
+        if (cr4_val & cr4_want) != cr4_want {
+            cr4_val |= cr4_want;
+            asm!("mov cr4, {}", in(reg) cr4_val, options(nomem, nostack, preserves_flags));
             asm!("mov {}, cr4", out(reg) cr4_val, options(nomem, nostack, preserves_flags));
-            if (cr4_val & (1 << 20)) == 0 {
-                cr4_val |= 1 << 20;
-                asm!("mov cr4, {}", in(reg) cr4_val, options(nomem, nostack, preserves_flags));
-            }
+        }
+        if (cr4_val & (1 << 20)) != 0 {
+            active_mask |= CPU_SEC_SMEP;
+        }
+        if (cr4_val & (1 << 21)) != 0 {
+            active_mask |= CPU_SEC_SMAP;
+        }
+        if (cr4_val & (1 << 16)) != 0 {
+            active_mask |= CPU_SEC_FSGSBASE;
+        }
+        if (cr4_val & (1 << 11)) != 0 {
+            active_mask |= CPU_SEC_UMIP;
         }
     }
+
+    ACTIVE_CPU_SEC_BITS.fetch_or(active_mask, core::sync::atomic::Ordering::Release);
+    active_mask
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +309,11 @@ pub(crate) enum Ring3FaultOutcome {
         user_cr3: u64,
         observed_cr3: u64,
     },
+    Preempted {
+        rip: u64,
+        frame_cs: u16,
+        observed_cr3: u64,
+    },
     MailboxOrTrapMismatch,
     SyscallDenied(target_enterprise::syscall::Errno),
 }
@@ -257,6 +333,27 @@ pub(crate) fn exec_service_ring3_stub_isolated(
     expected_arg0: u64,
     corrupt_canary: bool,
 ) -> Result<Ring3ExecOutcome, Ring3FaultOutcome> {
+    exec_service_ring3_stub_with_opts(
+        task_id,
+        cap_mask,
+        ring3_code,
+        mailbox_req_word,
+        expected_arg0,
+        corrupt_canary,
+        None,
+    )
+}
+
+#[inline(never)]
+pub(crate) fn exec_service_ring3_stub_with_opts(
+    task_id: u64,
+    cap_mask: u64,
+    ring3_code: &[u8; 32],
+    mailbox_req_word: u64,
+    expected_arg0: u64,
+    corrupt_canary: bool,
+    preempt_timer_ticks: Option<u32>,
+) -> Result<Ring3ExecOutcome, Ring3FaultOutcome> {
     use target_enterprise::gdt::{
         Gdt, Tss64, KERNEL_CODE_SEL, KERNEL_DATA_SEL, TSS64_LEN, TSS_SEL, USER_CODE_SEL,
         USER_DATA_SEL,
@@ -270,6 +367,15 @@ pub(crate) fn exec_service_ring3_stub_isolated(
     };
     use target_enterprise::syscall::{dispatch_syscall, set_task_cap_mask};
 
+    const LAPIC_BASE: u64 = 0xFEE0_0000;
+    const LAPIC_TPR_OFF: u64 = 0x0080;
+    const LAPIC_EOI_OFF: u64 = 0x00B0;
+    const LAPIC_SVR_OFF: u64 = 0x00F0;
+    const LAPIC_LVT_TIMER_OFF: u64 = 0x0320;
+    const LAPIC_TIMER_INIT_OFF: u64 = 0x0380;
+    const LAPIC_TIMER_DIV_OFF: u64 = 0x03E0;
+    const PREEMPT_TIMER_VEC: u8 = 0x40;
+
     let dma = dma_phys_base();
     if dma == 0 || phys_map_offset() == 0 {
         return Err(Ring3FaultOutcome::SetupFailed);
@@ -278,6 +384,9 @@ pub(crate) fn exec_service_ring3_stub_isolated(
     // SAFETY: Running at CPL=0 in 64-bit Long Mode.
     unsafe {
         enable_cpu_memory_protections();
+        if preempt_timer_ticks.is_some() {
+            let _ = crate::ensure_mmio_page(LAPIC_BASE);
+        }
     }
 
     // 9 dedicated 4 KiB physical frames in `dma + 0x2_4000 .. dma + 0x2_D000`:
@@ -415,8 +524,8 @@ pub(crate) fn exec_service_ring3_stub_isolated(
         0x48, 0xCF,                               // iretq
     ];
     // 2) `+0x040`: `entry_to_ring3` (saves `saved_kernel_rsp` & `kernel_cr3`, pivots `RSP` to `rsp0_top`,
-    //    switches hardware `CR3` to `user_pml4_phys`, scrubs GPRs, and `iretq`s to `CPL=3`)
-    let entry_to_ring3_code: [u8; 52] = [
+    //    switches hardware `CR3` to `user_pml4_phys`, pushes `user_rflags` from `[rax + 0x90]`, scrubs GPRs, and `iretq`s)
+    let entry_to_ring3_code: [u8; 56] = [
         0x48, 0x8D, 0x05, 0xB9, 0x11, 0x00, 0x00, // lea rax, [rip + 0x11B9] -> user_va + 0x4200
         0x48, 0x89, 0x60, 0x10,                   // mov [rax + 0x10], rsp (saved_kernel_rsp)
         0x0F, 0x20, 0xD9,                         // mov rcx, cr3
@@ -426,7 +535,7 @@ pub(crate) fn exec_service_ring3_stub_isolated(
         0x0F, 0x22, 0xD9,                         // mov cr3, rcx (SWITCH TO ISOLATED USER CR3!)
         0x6A, USER_DATA_SEL as u8,                // push USER_DATA_SEL (0x1B)
         0x56,                                     // push rsi (user_rsp)
-        0x6A, 0x02,                               // push 0x02 (RFLAGS IF=0)
+        0xFF, 0xB0, 0x90, 0x00, 0x00, 0x00,       // push qword ptr [rax + 0x90] (0x02 or 0x202 IF=1)
         0x6A, USER_CODE_SEL as u8,                // push USER_CODE_SEL (0x23)
         0x57,                                     // push rdi (user_va)
         0x31, 0xC0,                               // xor eax, eax
@@ -479,6 +588,27 @@ pub(crate) fn exec_service_ring3_stub_isolated(
         0xC3,                                                 // ret
     ];
 
+    // 5) `+0x360`: `isr_preempt_timer` (Vector `0x40`, `DPL=0`, `IST=0`: evicts runaway Ring-3 code
+    //    upon Local APIC timer expiry while `user_pml4_phys` is loaded in `CR3`, restores `kernel_cr3` + `RSP`)
+    let isr_preempt_timer: [u8; 64] = [
+        0x48, 0x8D, 0x05, 0x99, 0x0E, 0x00, 0x00,                   // lea rax, [rip + 0x0E99] -> user_va + 0x4200
+        0x48, 0xC7, 0x80, 0x80, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // mov qword ptr [rax + 0x80], 1
+        0x48, 0x8B, 0x0C, 0x24,                                     // mov rcx, [rsp] (interrupted RIP)
+        0x48, 0x89, 0x88, 0x88, 0x00, 0x00, 0x00,                   // mov [rax + 0x88], rcx
+        0x48, 0x8B, 0x4C, 0x24, 0x08,                               // mov rcx, [rsp + 0x08] (frame_cs)
+        0x48, 0x89, 0x48, 0x28,                                     // mov [rax + 0x28], rcx
+        0x0F, 0x20, 0xD9,                                           // mov rcx, cr3
+        0x48, 0x89, 0x48, 0x58,                                     // mov [rax + 0x58], rcx (observed_active_cr3)
+        0x48, 0x8B, 0x48, 0x18,                                     // mov rcx, [rax + 0x18] (kernel_cr3)
+        0x0F, 0x22, 0xD9,                                           // mov cr3, rcx (RESTORE KERNEL CR3!)
+        0xB9, 0x10, 0x00, 0x00, 0x00,                               // mov ecx, 0x10
+        0x8E, 0xD1,                                                 // mov ss, cx
+        0x48, 0x8B, 0x60, 0x10,                                     // mov rsp, [rax + 0x10] (saved_kernel_rsp)
+        0xC3,                                                       // ret
+    ];
+    // 6) `+0x3B0`: benign `iretq` for spurious vector `0xFF`
+    let isr_spurious_code: [u8; 2] = [0x48, 0xCF];
+
     const HAS_ERR_CODE_MASK: u32 = (1 << 8)
         | (1 << 10)
         | (1 << 11)
@@ -513,6 +643,13 @@ pub(crate) fn exec_service_ring3_stub_isolated(
             core::ptr::write_volatile(dst.add(0x300 + c), common_fault_code[c]);
             c += 1;
         }
+        let mut pt = 0usize;
+        while pt < isr_preempt_timer.len() {
+            core::ptr::write_volatile(dst.add(0x360 + pt), isr_preempt_timer[pt]);
+            pt += 1;
+        }
+        core::ptr::write_volatile(dst.add(0x3B0), isr_spurious_code[0]);
+        core::ptr::write_volatile(dst.add(0x3B1), isr_spurious_code[1]);
         let mut v = 0usize;
         while v < 32 {
             if v != (vectors::BREAKPOINT as usize) {
@@ -571,11 +708,29 @@ pub(crate) fn exec_service_ring3_stub_isolated(
         exc_v += 1;
     }
     idt.set_handler_with_attr(
+        PREEMPT_TIMER_VEC,
+        kernel_trampoline_va + 0x360,
+        TYPE_INTERRUPT_GATE_DPL0,
+        0,
+    );
+    idt.set_handler_with_attr(
+        0xFF,
+        kernel_trampoline_va + 0x3B0,
+        TYPE_INTERRUPT_GATE_DPL0,
+        0,
+    );
+    idt.set_handler_with_attr(
         vectors::SYSCALL_INT,
         kernel_trampoline_va + 0x80,
         TYPE_INTERRUPT_GATE_DPL3,
         0,
     );
+
+    let user_rflags: u64 = if preempt_timer_ticks.is_some() {
+        0x202
+    } else {
+        0x02
+    };
 
     // SAFETY: `gdt_phys` and `idt_phys` are dedicated 4 KiB frames mapped RW in `PHYS_MAP_OFFSET`.
     unsafe {
@@ -591,11 +746,12 @@ pub(crate) fn exec_service_ring3_stub_isolated(
             core::ptr::write_volatile(tss_ptr.add(j), tss_bytes[j]);
             j += 1;
         }
-        // Seed `state[10]` (`+0x250`) with `user_pml4_phys` for `entry_to_ring3`.
+        // Seed `state[10]` (`+0x250`) with `user_pml4_phys` and `state[18]` (`+0x290`) with `user_rflags`.
         core::ptr::write_volatile(
             gdt_phys_ptr.add(0x250).cast::<u64>(),
             user_pml4_phys,
         );
+        core::ptr::write_volatile(gdt_phys_ptr.add(0x290).cast::<u64>(), user_rflags);
 
         let idt_phys_ptr = pa_to_va(idt_phys);
         let mut v = 0usize;
@@ -636,9 +792,41 @@ pub(crate) fn exec_service_ring3_stub_isolated(
 
     let entry_stub_va = kernel_trampoline_va + 0x040;
 
+    // Save/arm Local APIC one-shot preemption timer when requested (with legacy 8259 PIC masked).
+    let mut saved_lvt_timer: u32 = 0;
+    let mut saved_timer_init: u32 = 0;
+    // SAFETY: Running at CPL=0; `LAPIC_BASE` was mapped above when `preempt_timer_ticks.is_some()`.
+    unsafe {
+        if let Some(ticks) = preempt_timer_ticks {
+            asm!("cli", options(nomem, nostack, preserves_flags));
+            crate::outb(0x20, 0x11);
+            crate::outb(0xA0, 0x11);
+            crate::outb(0x21, 0x20);
+            crate::outb(0xA1, 0x28);
+            crate::outb(0x21, 0x04);
+            crate::outb(0xA1, 0x02);
+            crate::outb(0x21, 0x01);
+            crate::outb(0xA1, 0x01);
+            crate::outb(0x21, 0xFF);
+            crate::outb(0xA1, 0xFF);
+
+            saved_lvt_timer = crate::mmio_read32(LAPIC_BASE + LAPIC_LVT_TIMER_OFF);
+            saved_timer_init = crate::mmio_read32(LAPIC_BASE + LAPIC_TIMER_INIT_OFF);
+            let svr = crate::mmio_read32(LAPIC_BASE + LAPIC_SVR_OFF);
+            crate::mmio_write32(LAPIC_BASE + LAPIC_SVR_OFF, svr | 0x1FF);
+            crate::mmio_write32(LAPIC_BASE + LAPIC_TPR_OFF, 0);
+            crate::mmio_write32(LAPIC_BASE + LAPIC_TIMER_DIV_OFF, 0x03);
+            crate::mmio_write32(
+                LAPIC_BASE + LAPIC_LVT_TIMER_OFF,
+                PREEMPT_TIMER_VEC as u32,
+            );
+            crate::mmio_write32(LAPIC_BASE + LAPIC_TIMER_INIT_OFF, ticks.max(64));
+        }
+    }
+
     // Execute live GDT/TSS/IDT load, `int3` on `IST1`, and hardware `CR3`-isolated Ring-3 round-trip.
     // SAFETY: Interrupts are masked (`cli`); `entry_stub_va` switches `CR3` to `user_pml4_phys` and
-    // `isr_syscall_int80` / `common_fault_handler` restores `kernel_cr3` before returning here.
+    // `isr_syscall_int80` / `common_fault_handler` / `isr_preempt_timer` restores `kernel_cr3` before returning here.
     unsafe {
         asm!(
             "pushfq",
@@ -696,6 +884,24 @@ pub(crate) fn exec_service_ring3_stub_isolated(
         );
     }
 
+    // Disarm/EOI one-shot preemption timer and restore CPU 0's permanent guarded runtime TSS (`TR`).
+    // SAFETY: Running at CPL=0 with `kernel_cr3` active.
+    unsafe {
+        if preempt_timer_ticks.is_some() {
+            crate::mmio_write32(
+                LAPIC_BASE + LAPIC_LVT_TIMER_OFF,
+                0x0001_0000 | (PREEMPT_TIMER_VEC as u32),
+            );
+            crate::mmio_write32(LAPIC_BASE + LAPIC_TIMER_INIT_OFF, 0);
+            crate::mmio_write32(LAPIC_BASE + LAPIC_EOI_OFF, 0);
+            if (saved_lvt_timer & 0x0002_0000) != 0 && saved_timer_init != 0 {
+                crate::mmio_write32(LAPIC_BASE + LAPIC_LVT_TIMER_OFF, saved_lvt_timer);
+                crate::mmio_write32(LAPIC_BASE + LAPIC_TIMER_INIT_OFF, saved_timer_init);
+            }
+        }
+        crate::smp_hw::restore_cpu0_runtime_tss_if_active();
+    }
+
     // Read back captured hardware state and tear down the temporary `kernel_pml4_va[pml4_slot]` alias.
     // SAFETY: `gdt_phys` and `user_data_phys` are mapped via `pa_to_va`, and `kernel_cr3` is active.
     let (
@@ -712,6 +918,8 @@ pub(crate) fn exec_service_ring3_stub_isolated(
         fault_vec,
         fault_cr2,
         fault_err,
+        preempt_flag,
+        preempt_rip,
         mb_resp,
     ) = unsafe {
         let st = pa_to_va(gdt_phys + 0x200) as *const u64;
@@ -736,6 +944,8 @@ pub(crate) fn exec_service_ring3_stub_isolated(
             core::ptr::read_volatile(st.add(13)),
             core::ptr::read_volatile(st.add(14)),
             core::ptr::read_volatile(st.add(15)),
+            core::ptr::read_volatile(st.add(16)),
+            core::ptr::read_volatile(st.add(17)),
             u64::from_le_bytes(mb_bytes),
         );
         core::ptr::write_volatile(kernel_pml4_va.add(pml4_slot), 0);
@@ -750,6 +960,13 @@ pub(crate) fn exec_service_ring3_stub_isolated(
 
     if bp_count != 1 || bp_rsp != ist1_top - 48 {
         return Err(Ring3FaultOutcome::SetupFailed);
+    }
+    if preempt_flag != 0 {
+        return Err(Ring3FaultOutcome::Preempted {
+            rip: preempt_rip,
+            frame_cs: frame_cs as u16,
+            observed_cr3,
+        });
     }
     if fault_flag != 0 {
         return Err(Ring3FaultOutcome::CpuException {
@@ -956,6 +1173,35 @@ pub(crate) fn banner_ring3_transition() {
     ) {
         Err(Ring3FaultOutcome::SyscallDenied(Errno::EPERM)) => {}
         other => panic!("RING3: unprivileged SYS_OPEN was not denied with EPERM: {:?}", other),
+    }
+
+    // Red Team Check 7: Privileged instruction (`hlt` `0xF4`) in Ring-3 traps to `#GP` (`vec = 13`)
+    // under isolated `user_cr3` and recovers cleanly without halting the CPU.
+    let mut hlt_code = [0x90u8; 32];
+    hlt_code[0] = 0xF4; // hlt (privileged CPL=0 instruction)
+    match exec_service_ring3_stub_isolated(1, 0, &hlt_code, 0, 0, false) {
+        Err(Ring3FaultOutcome::CpuException {
+            vec: 13,
+            frame_cs,
+            user_cr3,
+            observed_cr3,
+            ..
+        }) if frame_cs == USER_CODE_SEL && observed_cr3 == user_cr3 => {}
+        other => panic!("RING3: privileged HLT #GP recovery drift: {:?}", other),
+    }
+
+    // Red Team Check 8: Preemptive Ring-3 eviction — an infinite Ring-3 CPU loop (`jmp $` `[0xEB, 0xFE]`)
+    // is forcibly preempted by the Local APIC one-shot timer (`vector 0x40`) and evicted back to Ring-0!
+    let mut inf_loop_code = [0x90u8; 32];
+    inf_loop_code[0] = 0xEB;
+    inf_loop_code[1] = 0xFE; // jmp $
+    match exec_service_ring3_stub_with_opts(1, 0, &inf_loop_code, 0, 0, false, Some(2048)) {
+        Err(Ring3FaultOutcome::Preempted {
+            rip,
+            frame_cs,
+            observed_cr3,
+        }) if rip == ok.user_va && frame_cs == USER_CODE_SEL && observed_cr3 == ok.user_cr3 => {}
+        other => panic!("RING3: runaway infinite loop preemption failed: {:?}", other),
     }
 
     serial_write_str("RING3 transition OK cpl=3->0 vec=0x80 ist1=ok rsp0=ok syscall=43\n");

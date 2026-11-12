@@ -486,6 +486,194 @@ pub mod kernel_guards {
         }
         k
     }
+
+    /// x86-64 PTE Present (`P`) flag.
+    pub const PTE_P_BIT: u64 = 1;
+    /// x86-64 PTE Writable (`R/W`) flag.
+    pub const PTE_W_BIT: u64 = 1 << 1;
+    /// x86-64 PTE Page-Level Write-Through (`PWT`) flag.
+    pub const PTE_PWT_BIT: u64 = 1 << 3;
+    /// x86-64 PTE Page-Level Cache Disable (`PCD`) flag.
+    pub const PTE_PCD_BIT: u64 = 1 << 4;
+    /// x86-64 PTE Execute-Disable (`NX`) flag.
+    pub const PTE_NX_BIT: u64 = 1u64 << 63;
+    /// x86-64 4 KiB physical frame address mask (`bits 51:12`).
+    pub const PTE_PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+    /// Virtual page stride for one guarded 16 KiB hardware stack (`1` unmapped guard + `4` `RW+NX` pages).
+    pub const STACK16K_STRIDE_PAGES: usize = 5;
+    /// Virtual page stride for one guarded 4 KiB IST stack (`1` unmapped guard + `1` `RW+NX` page).
+    pub const IST4K_STRIDE_PAGES: usize = 2;
+
+    /// Build a strict `W^X`-compliant uncached MMIO leaf PTE (`Present | Writable | PWT | PCD | NX`).
+    pub const fn mmio_leaf_pte(phys_page: u64) -> u64 {
+        (phys_page & PTE_PHYS_MASK)
+            | PTE_P_BIT
+            | PTE_W_BIT
+            | PTE_PWT_BIT
+            | PTE_PCD_BIT
+            | PTE_NX_BIT
+    }
+
+    /// Return `true` iff `pte` maps an uncached MMIO page with `PTE_NX_BIT` enforced (`never executable`).
+    pub const fn is_mmio_pte_compliant(pte: u64) -> bool {
+        let req = PTE_P_BIT | PTE_W_BIT | PTE_PWT_BIT | PTE_PCD_BIT | PTE_NX_BIT;
+        (pte & req) == req
+    }
+
+    /// Compute `(bottom_guard_va, stack_base_va, stack_top_va)` for guarded 16 KiB stack `slot_idx`.
+    ///
+    /// Note that `stack_top_va` coincides with the unmapped 4 KiB guard page immediately above the stack.
+    pub const fn guarded_stack16k_bounds_va(
+        region_base_va: u64,
+        slot_idx: usize,
+    ) -> Option<(u64, u64, u64)> {
+        if region_base_va == 0 || (region_base_va & 0x1F_FFFF) != 0 {
+            return None;
+        }
+        let first_page = match slot_idx.checked_mul(STACK16K_STRIDE_PAGES) {
+            Some(p) if p + STACK16K_STRIDE_PAGES < 512 => p,
+            _ => return None,
+        };
+        let guard_lo = region_base_va + (first_page as u64) * 4096;
+        let base = guard_lo + 4096;
+        let top = base + 16 * 1024;
+        Some((guard_lo, base, top))
+    }
+
+    /// Compute `(bottom_guard_va, ist_base_va, ist_top_va)` for guarded 4 KiB IST stack `ist_idx`
+    /// placed after `num_16k_slots` guarded 16 KiB stacks inside the same 2 MiB L1 page table.
+    pub const fn guarded_ist4k_bounds_va(
+        region_base_va: u64,
+        num_16k_slots: usize,
+        ist_idx: usize,
+    ) -> Option<(u64, u64, u64)> {
+        if region_base_va == 0 || (region_base_va & 0x1F_FFFF) != 0 {
+            return None;
+        }
+        let base_pt = match num_16k_slots.checked_mul(STACK16K_STRIDE_PAGES) {
+            Some(v) => v,
+            None => return None,
+        };
+        let off_pt = match ist_idx.checked_mul(IST4K_STRIDE_PAGES) {
+            Some(v) => v,
+            None => return None,
+        };
+        let first_page = match base_pt.checked_add(off_pt) {
+            Some(p) if p + IST4K_STRIDE_PAGES < 512 => p,
+            _ => return None,
+        };
+        let guard_lo = region_base_va + (first_page as u64) * 4096;
+        let base = guard_lo + 4096;
+        let top = base + 4096;
+        Some((guard_lo, base, top))
+    }
+
+    /// Populate a 512-entry L1 Page Table (`pt_out`) with guarded 16 KiB stacks (`stacks_16k`)
+    /// and guarded 4 KiB IST stacks (`ists_4k`), placing an unmapped (`PTE_P = 0`) 4 KiB guard
+    /// page below and above every stack and enforcing `Supervisor RW + NX` on all interior pages.
+    #[inline(never)]
+    pub fn build_guarded_stacks_pt(
+        stacks_16k: &[[u64; 4]],
+        ists_4k: &[u64],
+        pt_out: &mut [u64; 512],
+    ) -> Result<usize, &'static str> {
+        let s_entries = stacks_16k
+            .len()
+            .checked_mul(STACK16K_STRIDE_PAGES)
+            .ok_or("stack count overflow")?;
+        let i_entries = ists_4k
+            .len()
+            .checked_mul(IST4K_STRIDE_PAGES)
+            .ok_or("ist count overflow")?;
+        let total_entries = s_entries
+            .checked_add(i_entries)
+            .and_then(|v| v.checked_add(1))
+            .ok_or("pt entry count overflow")?;
+        if total_entries > 512 {
+            return Err("guarded stacks exceed single L1 page table");
+        }
+
+        let mut i = 0usize;
+        while i < 512 {
+            pt_out[i] = 0;
+            i += 1;
+        }
+
+        let mut cursor = 0usize;
+        let mut s = 0usize;
+        while s < stacks_16k.len() {
+            pt_out[cursor] = 0; // Unmapped 4 KiB bottom guard page
+            cursor += 1;
+            let mut p = 0usize;
+            while p < 4 {
+                let pa = stacks_16k[s][p];
+                if pa == 0 || (pa & 0xFFF) != 0 || (pa & !PTE_PHYS_MASK) != 0 {
+                    return Err("unaligned or invalid 16k stack physical frame");
+                }
+                pt_out[cursor] = pa | PTE_P_BIT | PTE_W_BIT | PTE_NX_BIT;
+                cursor += 1;
+                p += 1;
+            }
+            s += 1;
+        }
+
+        let mut k = 0usize;
+        while k < ists_4k.len() {
+            pt_out[cursor] = 0; // Unmapped 4 KiB bottom guard page
+            cursor += 1;
+            let pa = ists_4k[k];
+            if pa == 0 || (pa & 0xFFF) != 0 || (pa & !PTE_PHYS_MASK) != 0 {
+                return Err("unaligned or invalid 4k IST physical frame");
+            }
+            pt_out[cursor] = pa | PTE_P_BIT | PTE_W_BIT | PTE_NX_BIT;
+            cursor += 1;
+            k += 1;
+        }
+
+        pt_out[cursor] = 0; // Trailing unmapped 4 KiB top guard page
+
+        // Verify pairwise disjointness of all mapped physical frames and zero RWX.
+        let mut a = 0usize;
+        while a < cursor {
+            let ea = pt_out[a];
+            if (ea & PTE_P_BIT) != 0 {
+                if (ea & PTE_NX_BIT) == 0 {
+                    return Err("executable stack PTE forbidden");
+                }
+                let pa_a = ea & PTE_PHYS_MASK;
+                let mut b = a + 1;
+                while b < cursor {
+                    let eb = pt_out[b];
+                    if (eb & PTE_P_BIT) != 0 && (eb & PTE_PHYS_MASK) == pa_a {
+                        return Err("duplicate physical frame in guarded stack table");
+                    }
+                    b += 1;
+                }
+            }
+            a += 1;
+        }
+
+        Ok(total_entries)
+    }
+
+    /// Return `true` iff allocating `requested` bytes from a heap with `used` of `total` bytes
+    /// preserves at least `min_reserve` bytes of emergency Ring-0 headroom.
+    pub const fn heap_has_headroom(
+        used: usize,
+        total: usize,
+        requested: usize,
+        min_reserve: usize,
+    ) -> bool {
+        if used > total {
+            return false;
+        }
+        let avail = total - used;
+        match requested.checked_add(min_reserve) {
+            Some(need) => avail >= need,
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -591,5 +779,97 @@ mod tests {
         assert_eq!(&tiny[..2], b"ab");
         assert_eq!(dec_u64_bounded(12345, &mut tiny), 0);
         assert_eq!(dec_u64_bounded(0, &mut []), 0);
+    }
+
+    #[test]
+    fn stage12_mmio_nx_guarded_stacks_and_heap_headroom_guards() {
+        use super::kernel_guards::{
+            build_guarded_stacks_pt, guarded_ist4k_bounds_va, guarded_stack16k_bounds_va,
+            heap_has_headroom, is_mmio_pte_compliant, mmio_leaf_pte, IST4K_STRIDE_PAGES,
+            PTE_NX_BIT, PTE_P_BIT, PTE_W_BIT, STACK16K_STRIDE_PAGES,
+        };
+
+        // 1. MMIO leaf PTE MUST always enforce `PTE_NX_BIT` (never executable).
+        let lapic_pte = mmio_leaf_pte(0xFEE0_0000);
+        assert!(is_mmio_pte_compliant(lapic_pte));
+        assert_ne!(lapic_pte & PTE_NX_BIT, 0, "MMIO BAR PTE must enforce NX");
+        assert!(
+            !is_mmio_pte_compliant(lapic_pte & !PTE_NX_BIT),
+            "executable MMIO PTE must be rejected as non-compliant"
+        );
+
+        // 2. Build 16 guarded hardware stacks (8 x 16 KiB + 8 x 4 KiB IST) in a 512-entry L1 PT.
+        let mut stacks_16k = [[0u64; 4]; 8];
+        let mut next_pa = 0x20_0000u64;
+        for slot in &mut stacks_16k {
+            for frame in slot.iter_mut() {
+                *frame = next_pa;
+                next_pa += 4096;
+            }
+        }
+        let mut ists_4k = [0u64; 8];
+        for frame in &mut ists_4k {
+            *frame = next_pa;
+            next_pa += 4096;
+        }
+        let mut pt = [0xFFFF_FFFF_FFFF_FFFFu64; 512];
+        let used = build_guarded_stacks_pt(&stacks_16k, &ists_4k, &mut pt)
+            .expect("valid guarded stack table must succeed");
+        assert_eq!(used, 8 * STACK16K_STRIDE_PAGES + 8 * IST4K_STRIDE_PAGES + 1);
+
+        let region_va = 0xFFFF_8800_0020_0000u64;
+        for s in 0..8 {
+            let (glo, base, top) = guarded_stack16k_bounds_va(region_va, s).unwrap();
+            let glo_idx = ((glo - region_va) / 4096) as usize;
+            let top_idx = ((top - region_va) / 4096) as usize;
+            assert_eq!(pt[glo_idx], 0, "bottom 4 KiB guard page must be unmapped");
+            assert_eq!(pt[top_idx], 0, "top 4 KiB guard page must be unmapped");
+            for p in 0..4 {
+                let idx = ((base - region_va) / 4096) as usize + p;
+                assert_eq!(
+                    pt[idx] & (PTE_P_BIT | PTE_W_BIT | PTE_NX_BIT),
+                    PTE_P_BIT | PTE_W_BIT | PTE_NX_BIT,
+                    "stack interior page must be Supervisor RW + NX"
+                );
+            }
+        }
+        for i in 0..8 {
+            let (glo, base, top) = guarded_ist4k_bounds_va(region_va, 8, i).unwrap();
+            let glo_idx = ((glo - region_va) / 4096) as usize;
+            let in_idx = ((base - region_va) / 4096) as usize;
+            let top_idx = ((top - region_va) / 4096) as usize;
+            assert_eq!(pt[glo_idx], 0, "IST bottom guard page must be unmapped");
+            assert_eq!(pt[top_idx], 0, "IST top guard page must be unmapped");
+            assert_eq!(
+                pt[in_idx] & (PTE_P_BIT | PTE_W_BIT | PTE_NX_BIT),
+                PTE_P_BIT | PTE_W_BIT | PTE_NX_BIT,
+                "IST page must be Supervisor RW + NX"
+            );
+        }
+
+        // Duplicate physical frame, unaligned PA, and zero PA must all fail closed.
+        let mut dup = stacks_16k;
+        dup[3][1] = dup[0][2];
+        assert!(build_guarded_stacks_pt(&dup, &ists_4k, &mut pt).is_err());
+        let mut unaligned = ists_4k;
+        unaligned[2] |= 0x100;
+        assert!(build_guarded_stacks_pt(&stacks_16k, &unaligned, &mut pt).is_err());
+        let mut zero_pa = ists_4k;
+        zero_pa[0] = 0;
+        assert!(build_guarded_stacks_pt(&stacks_16k, &zero_pa, &mut pt).is_err());
+        assert_eq!(guarded_stack16k_bounds_va(0xFFFF_8800_0010_0000, 0), None);
+
+        // 3. Emergency heap reserve guard prevents connection floods from exhausting Ring-0 heap.
+        let total = 2 * 1024 * 1024;
+        let reserve = 512 * 1024;
+        assert!(heap_has_headroom(1024 * 1024, total, 64 * 1024, reserve));
+        assert!(!heap_has_headroom(
+            total - reserve + 1,
+            total,
+            64 * 1024,
+            reserve
+        ));
+        assert!(!heap_has_headroom(0, total, usize::MAX, reserve));
+        assert!(!heap_has_headroom(total + 1, total, 0, reserve));
     }
 }

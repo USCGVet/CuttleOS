@@ -14,6 +14,10 @@ use linked_list_allocator::LockedHeap;
 /// slots with ample headroom inside a 128 MiB VM.
 pub const HEAP_SIZE: usize = 8 * 1024 * 1024;
 
+/// 512 KiB emergency Ring-0 heap reserve withheld from untrusted network/TLS
+/// connection floods so core kernel paths never panic on heap exhaustion.
+pub const KERNEL_HEAP_RESERVE_BYTES: usize = 512 * 1024;
+
 #[repr(C, align(4096))]
 struct HeapRegion([u8; HEAP_SIZE]);
 
@@ -64,4 +68,19 @@ pub fn stats() -> HeapStats {
         free: guard.free(),
         total: HEAP_SIZE,
     }
+}
+
+/// Return `true` iff allocating `requested` bytes preserves at least
+/// [`KERNEL_HEAP_RESERVE_BYTES`] of free Ring-0 emergency heap headroom.
+pub fn has_headroom(requested: usize) -> bool {
+    if !HEAP_INITIALIZED.load(Ordering::Acquire) {
+        return false;
+    }
+    let st = stats();
+    target_enterprise::memory::kernel_guards::heap_has_headroom(
+        st.used,
+        st.total,
+        requested,
+        KERNEL_HEAP_RESERVE_BYTES,
+    )
 }

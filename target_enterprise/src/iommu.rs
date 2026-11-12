@@ -715,6 +715,262 @@ pub mod dmar {
     }
 }
 
+/// Intel VT-d (`DMAR` Spec §9.1–§9.3, §10.4) hardware Root Table, Context Table, and
+/// 4-level Second-Level Page Table (`SLPT`) builders and software-verified walker.
+pub mod vtd_hw {
+    use cuttle_contracts::{AccessKind, IommuError, PagePerms};
+
+    use super::{DeviceId, PAGE_MASK, PAGE_SHIFT, PAGE_SIZE};
+
+    /// VT-d Global Command Register (`GCMD_REG`) MMIO offset.
+    pub const VTD_REG_GCMD: u64 = 0x18;
+    /// VT-d Global Status Register (`GSTS_REG`) MMIO offset.
+    pub const VTD_REG_GSTS: u64 = 0x1C;
+    /// VT-d Root Table Address Register (`RTADDR_REG`) MMIO offset.
+    pub const VTD_REG_RTADDR: u64 = 0x20;
+    /// VT-d Context Command Register (`CCMD_REG`) MMIO offset.
+    pub const VTD_REG_CCMD: u64 = 0x28;
+    /// `GCMD.TE` (`bit 31`): Translation Enable.
+    pub const GCMD_TE: u32 = 1 << 31;
+    /// `GCMD.SRTP` (`bit 30`): Set Root Table Pointer.
+    pub const GCMD_SRTP: u32 = 1 << 30;
+    /// `CCMD.ICC` (`bit 63`) | Global Context Invalidation (`01b << 61`).
+    pub const CCMD_GLOBAL_INVAL: u64 = (1u64 << 63) | (1u64 << 61);
+
+    /// VT-d Second-Level PTE Read permission (`bit 0`).
+    pub const SLPT_READ: u64 = 1 << 0;
+    /// VT-d Second-Level PTE Write permission (`bit 1`).
+    pub const SLPT_WRITE: u64 = 1 << 1;
+    /// VT-d 4 KiB physical address mask (`bits 51:12`).
+    pub const VTD_PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    /// VT-d Context Entry Address Width `010b` = 48-bit AGAW (4-level SLPT).
+    pub const CTX_AW_48BIT_4LVL: u64 = 0b010;
+
+    /// Encode a 128-bit Intel VT-d Root Entry pointing PCI bus `bus` at 4 KiB-aligned `ctx_table_phys`.
+    pub const fn encode_root_entry(ctx_table_phys: u64) -> Result<[u8; 16], IommuError> {
+        if ctx_table_phys == 0
+            || (ctx_table_phys & !PAGE_MASK) != 0
+            || (ctx_table_phys & !VTD_PHYS_MASK) != 0
+        {
+            return Err(IommuError::BadAddress);
+        }
+        let lo = (ctx_table_phys & VTD_PHYS_MASK) | 1u64;
+        let lb = lo.to_le_bytes();
+        let mut out = [0u8; 16];
+        let mut i = 0usize;
+        while i < 8 {
+            out[i] = lb[i];
+            i += 1;
+        }
+        Ok(out)
+    }
+
+    /// Encode a 128-bit Intel VT-d Legacy Context Entry binding `(dev, func)` to `slpt_pml4_phys`
+    /// under 48-bit 4-level translation (`AW = 0b010`) and non-zero `domain_id`.
+    pub const fn encode_context_entry(
+        slpt_pml4_phys: u64,
+        domain_id: u16,
+    ) -> Result<[u8; 16], IommuError> {
+        if domain_id == 0
+            || slpt_pml4_phys == 0
+            || (slpt_pml4_phys & !PAGE_MASK) != 0
+            || (slpt_pml4_phys & !VTD_PHYS_MASK) != 0
+        {
+            return Err(IommuError::BadAddress);
+        }
+        let lo = (slpt_pml4_phys & VTD_PHYS_MASK) | 1u64;
+        let hi = CTX_AW_48BIT_4LVL | ((domain_id as u64) << 8);
+        let lb = lo.to_le_bytes();
+        let hb = hi.to_le_bytes();
+        let mut out = [0u8; 16];
+        let mut i = 0usize;
+        while i < 8 {
+            out[i] = lb[i];
+            out[8 + i] = hb[i];
+            i += 1;
+        }
+        Ok(out)
+    }
+
+    /// Populate a 4-level VT-d Second-Level Page Table (`SLPT`) confining a device strictly
+    /// to `[region_base_phys, region_base_phys + region_len)` within a single 2 MiB L1 window.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_confined_slpt_4level(
+        pml4: &mut [u64; 512],
+        pdpt: &mut [u64; 512],
+        pd: &mut [u64; 512],
+        pt: &mut [u64; 512],
+        pdpt_phys: u64,
+        pd_phys: u64,
+        pt_phys: u64,
+        region_base_phys: u64,
+        region_len: u64,
+        perms: PagePerms,
+    ) -> Result<usize, IommuError> {
+        if region_len == 0
+            || (region_base_phys & !PAGE_MASK) != 0
+            || (region_len & !PAGE_MASK) != 0
+            || (pdpt_phys & !PAGE_MASK) != 0
+            || (pd_phys & !PAGE_MASK) != 0
+            || (pt_phys & !PAGE_MASK) != 0
+            || pdpt_phys == 0
+            || pd_phys == 0
+            || pt_phys == 0
+            || (perms.0 & !(PagePerms::READ.0 | PagePerms::WRITE.0)) != 0
+            || perms.0 == 0
+        {
+            return Err(IommuError::BadAddress);
+        }
+        let end_phys = region_base_phys
+            .checked_add(region_len)
+            .ok_or(IommuError::BadAddress)?;
+        if (region_base_phys >> 21) != ((end_phys - 1) >> 21) {
+            return Err(IommuError::BadAddress);
+        }
+
+        let mut i = 0usize;
+        while i < 512 {
+            pml4[i] = 0;
+            pdpt[i] = 0;
+            pd[i] = 0;
+            pt[i] = 0;
+            i += 1;
+        }
+
+        let l4_idx = ((region_base_phys >> 39) & 0x1FF) as usize;
+        let l3_idx = ((region_base_phys >> 30) & 0x1FF) as usize;
+        let l2_idx = ((region_base_phys >> 21) & 0x1FF) as usize;
+
+        let non_leaf_rw = SLPT_READ | SLPT_WRITE;
+        pml4[l4_idx] = (pdpt_phys & VTD_PHYS_MASK) | non_leaf_rw;
+        pdpt[l3_idx] = (pd_phys & VTD_PHYS_MASK) | non_leaf_rw;
+        pd[l2_idx] = (pt_phys & VTD_PHYS_MASK) | non_leaf_rw;
+
+        let mut leaf_flags = 0u64;
+        if (perms.0 & PagePerms::READ.0) != 0 {
+            leaf_flags |= SLPT_READ;
+        }
+        if (perms.0 & PagePerms::WRITE.0) != 0 {
+            leaf_flags |= SLPT_WRITE;
+        }
+
+        let pages = (region_len >> PAGE_SHIFT) as usize;
+        let mut p = 0usize;
+        while p < pages {
+            let pa = region_base_phys + (p as u64) * PAGE_SIZE;
+            let l1_idx = ((pa >> 12) & 0x1FF) as usize;
+            pt[l1_idx] = (pa & VTD_PHYS_MASK) | leaf_flags;
+            p += 1;
+        }
+        Ok(pages)
+    }
+
+    /// Software-verify an Intel VT-d hardware Root -> Context -> 4-level SLPT translation for `dev`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_vtd_dma_access(
+        root_table_4k: &[u8; 4096],
+        bus0_ctx_table_4k: &[u8; 4096],
+        expected_ctx_phys: u64,
+        expected_pml4_phys: u64,
+        pml4: &[u64; 512],
+        pdpt: &[u64; 512],
+        pd: &[u64; 512],
+        pt: &[u64; 512],
+        expected_pdpt_phys: u64,
+        expected_pd_phys: u64,
+        expected_pt_phys: u64,
+        dev: DeviceId,
+        iova: u64,
+        access: AccessKind,
+    ) -> Result<u64, IommuError> {
+        if dev.segment() != 0 || dev.bus() != 0 {
+            return Err(IommuError::DeviceNotBound);
+        }
+        let root_lo = u64::from_le_bytes([
+            root_table_4k[0],
+            root_table_4k[1],
+            root_table_4k[2],
+            root_table_4k[3],
+            root_table_4k[4],
+            root_table_4k[5],
+            root_table_4k[6],
+            root_table_4k[7],
+        ]);
+        if (root_lo & 1) == 0 || (root_lo & VTD_PHYS_MASK) != expected_ctx_phys {
+            return Err(IommuError::DeviceNotBound);
+        }
+
+        let devfn = (((dev.device() & 0x1F) << 3) | (dev.function() & 0x07)) as usize;
+        let ctx_off = devfn * 16;
+        let ctx_lo = u64::from_le_bytes([
+            bus0_ctx_table_4k[ctx_off],
+            bus0_ctx_table_4k[ctx_off + 1],
+            bus0_ctx_table_4k[ctx_off + 2],
+            bus0_ctx_table_4k[ctx_off + 3],
+            bus0_ctx_table_4k[ctx_off + 4],
+            bus0_ctx_table_4k[ctx_off + 5],
+            bus0_ctx_table_4k[ctx_off + 6],
+            bus0_ctx_table_4k[ctx_off + 7],
+        ]);
+        let ctx_hi = u64::from_le_bytes([
+            bus0_ctx_table_4k[ctx_off + 8],
+            bus0_ctx_table_4k[ctx_off + 9],
+            bus0_ctx_table_4k[ctx_off + 10],
+            bus0_ctx_table_4k[ctx_off + 11],
+            bus0_ctx_table_4k[ctx_off + 12],
+            bus0_ctx_table_4k[ctx_off + 13],
+            bus0_ctx_table_4k[ctx_off + 14],
+            bus0_ctx_table_4k[ctx_off + 15],
+        ]);
+        if (ctx_lo & 1) == 0
+            || (ctx_lo & VTD_PHYS_MASK) != expected_pml4_phys
+            || (ctx_hi & 0x7) != CTX_AW_48BIT_4LVL
+            || ((ctx_hi >> 8) & 0xFFFF) == 0
+        {
+            return Err(IommuError::DeviceNotBound);
+        }
+
+        let req_bit = match access {
+            AccessKind::Read => SLPT_READ,
+            AccessKind::Write => SLPT_WRITE,
+        };
+        let l4 = pml4[((iova >> 39) & 0x1FF) as usize];
+        if (l4 & req_bit) == 0 || (l4 & VTD_PHYS_MASK) != expected_pdpt_phys {
+            return Err(if (l4 & (SLPT_READ | SLPT_WRITE)) == 0 {
+                IommuError::Unmapped
+            } else {
+                IommuError::PermissionDenied
+            });
+        }
+        let l3 = pdpt[((iova >> 30) & 0x1FF) as usize];
+        if (l3 & req_bit) == 0 || (l3 & VTD_PHYS_MASK) != expected_pd_phys {
+            return Err(if (l3 & (SLPT_READ | SLPT_WRITE)) == 0 {
+                IommuError::Unmapped
+            } else {
+                IommuError::PermissionDenied
+            });
+        }
+        let l2 = pd[((iova >> 21) & 0x1FF) as usize];
+        if (l2 & req_bit) == 0 || (l2 & VTD_PHYS_MASK) != expected_pt_phys {
+            return Err(if (l2 & (SLPT_READ | SLPT_WRITE)) == 0 {
+                IommuError::Unmapped
+            } else {
+                IommuError::PermissionDenied
+            });
+        }
+        let l1 = pt[((iova >> 12) & 0x1FF) as usize];
+        if (l1 & (SLPT_READ | SLPT_WRITE)) == 0 {
+            return Err(IommuError::Unmapped);
+        }
+        if (l1 & req_bit) == 0 {
+            return Err(IommuError::PermissionDenied);
+        }
+        Ok((l1 & VTD_PHYS_MASK) | (iova & (PAGE_SIZE - 1)))
+    }
+}
+
 // ============================================================
 // Unit tests. Cover the contract's invariants:
 //   - Default-deny on unbound devices.
@@ -1152,6 +1408,165 @@ mod tests {
         assert_eq!(
             iommu.map(dom, 0x1000, 0x2000, PagePerms(0x83)),
             Err(IommuError::BadAddress)
+        );
+    }
+
+    #[test]
+    fn stage15_vtd_hw_root_context_slpt_confines_pci_bdf_dma() {
+        use super::vtd_hw::{
+            build_confined_slpt_4level, encode_context_entry, encode_root_entry,
+            verify_vtd_dma_access,
+        };
+        use crate::memory::dma_layout::{AHCI_REGION, VIRTIO_REGION};
+
+        assert_eq!(encode_root_entry(0), Err(IommuError::BadAddress));
+        assert_eq!(encode_root_entry(0x1234), Err(IommuError::BadAddress));
+        assert_eq!(encode_context_entry(0x2000, 0), Err(IommuError::BadAddress)); // domain 0 reserved!
+
+        let mut root_4k = [0u8; 4096];
+        let mut ctx_4k = [0u8; 4096];
+        let ctx_pa = 0x50_1000u64;
+        let v_pml4_pa = 0x50_2000u64;
+        let v_pdpt_pa = 0x50_3000u64;
+        let v_pd_pa = 0x50_4000u64;
+        let v_pt_pa = 0x50_5000u64;
+        let a_pml4_pa = 0x50_6000u64;
+        let a_pdpt_pa = 0x50_7000u64;
+        let a_pd_pa = 0x50_8000u64;
+        let a_pt_pa = 0x50_9000u64;
+
+        root_4k[0..16].copy_from_slice(&encode_root_entry(ctx_pa).unwrap());
+        let dev_virtio = DeviceId::from_bdf(0, 0, 1, 0);
+        let dev_ahci = DeviceId::from_bdf(0, 0, 2, 0);
+        let dev_unbound = DeviceId::from_bdf(0, 0, 3, 0);
+        ctx_4k[8 * 16..8 * 16 + 16]
+            .copy_from_slice(&encode_context_entry(v_pml4_pa, 1).unwrap());
+        ctx_4k[16 * 16..16 * 16 + 16]
+            .copy_from_slice(&encode_context_entry(a_pml4_pa, 2).unwrap());
+
+        let dma_base = 0x20_0000u64;
+        let (v_start, v_end) = VIRTIO_REGION;
+        let (a_start, a_end) = AHCI_REGION;
+        let v_len = v_end - v_start;
+        let a_len = a_end - a_start;
+        let virtio_pa = dma_base + v_start;
+        let ahci_pa = dma_base + a_start;
+
+        let mut v_pml4 = [0u64; 512];
+        let mut v_pdpt = [0u64; 512];
+        let mut v_pd = [0u64; 512];
+        let mut v_pt = [0u64; 512];
+        let rw = PagePerms(PagePerms::READ.0 | PagePerms::WRITE.0);
+        let pages = build_confined_slpt_4level(
+            &mut v_pml4,
+            &mut v_pdpt,
+            &mut v_pd,
+            &mut v_pt,
+            v_pdpt_pa,
+            v_pd_pa,
+            v_pt_pa,
+            virtio_pa,
+            v_len,
+            rw,
+        )
+        .unwrap();
+        assert_eq!(pages, (v_len / 4096) as usize);
+
+        let mut a_pml4 = [0u64; 512];
+        let mut a_pdpt = [0u64; 512];
+        let mut a_pd = [0u64; 512];
+        let mut a_pt = [0u64; 512];
+        build_confined_slpt_4level(
+            &mut a_pml4,
+            &mut a_pdpt,
+            &mut a_pd,
+            &mut a_pt,
+            a_pdpt_pa,
+            a_pd_pa,
+            a_pt_pa,
+            ahci_pa,
+            a_len,
+            PagePerms::READ,
+        )
+        .unwrap();
+
+        // VirtIO R/W inside VIRTIO_REGION translates 1:1; cross-device DMA into AHCI_REGION is blocked!
+        assert_eq!(
+            verify_vtd_dma_access(
+                &root_4k,
+                &ctx_4k,
+                ctx_pa,
+                v_pml4_pa,
+                &v_pml4,
+                &v_pdpt,
+                &v_pd,
+                &v_pt,
+                v_pdpt_pa,
+                v_pd_pa,
+                v_pt_pa,
+                dev_virtio,
+                virtio_pa + 0x248,
+                AccessKind::Write,
+            ),
+            Ok(virtio_pa + 0x248)
+        );
+        assert_eq!(
+            verify_vtd_dma_access(
+                &root_4k,
+                &ctx_4k,
+                ctx_pa,
+                v_pml4_pa,
+                &v_pml4,
+                &v_pdpt,
+                &v_pd,
+                &v_pt,
+                v_pdpt_pa,
+                v_pd_pa,
+                v_pt_pa,
+                dev_virtio,
+                ahci_pa,
+                AccessKind::Write,
+            ),
+            Err(IommuError::Unmapped)
+        );
+        // Read-only SLPT blocks DMA writes with PermissionDenied, and unbound BDF fails DeviceNotBound.
+        assert_eq!(
+            verify_vtd_dma_access(
+                &root_4k,
+                &ctx_4k,
+                ctx_pa,
+                a_pml4_pa,
+                &a_pml4,
+                &a_pdpt,
+                &a_pd,
+                &a_pt,
+                a_pdpt_pa,
+                a_pd_pa,
+                a_pt_pa,
+                dev_ahci,
+                ahci_pa + 0x40,
+                AccessKind::Write,
+            ),
+            Err(IommuError::PermissionDenied)
+        );
+        assert_eq!(
+            verify_vtd_dma_access(
+                &root_4k,
+                &ctx_4k,
+                ctx_pa,
+                v_pml4_pa,
+                &v_pml4,
+                &v_pdpt,
+                &v_pd,
+                &v_pt,
+                v_pdpt_pa,
+                v_pd_pa,
+                v_pt_pa,
+                dev_unbound,
+                virtio_pa,
+                AccessKind::Read,
+            ),
+            Err(IommuError::DeviceNotBound)
         );
     }
 }

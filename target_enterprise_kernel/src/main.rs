@@ -88,6 +88,37 @@ pub(crate) static PHYS_MAP_OFFSET: core::sync::atomic::AtomicU64 = core::sync::a
 pub(crate) static DMA_PHYS_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Bump cursor for page-table frames carved from the top of the DMA window.
 pub(crate) static PT_ALLOC_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Firmware RSDP physical address reported by `bootloader_api::BootInfo`, if any.
+pub(crate) static BOOT_RSDP_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// IRQ-safe lock serializing shared kernel page-table frame allocation and PTE updates.
+static PT_MOD_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+/// Execute `f` with local interrupts masked (`cli`) while holding `PT_MOD_LOCK`, restoring
+/// the caller's `RFLAGS.IF` state upon return.
+#[inline]
+pub(crate) fn with_pt_lock<R>(f: impl FnOnce() -> R) -> R {
+    let saved_rflags: u64;
+    // SAFETY: Reading RFLAGS and executing `cli` in Ring-0 is privileged-safe and prevents IRQ re-entrancy.
+    unsafe {
+        asm!(
+            "pushfq",
+            "pop {}",
+            "cli",
+            out(reg) saved_rflags,
+            options(nomem, preserves_flags),
+        );
+    }
+    let guard = PT_MOD_LOCK.lock();
+    let res = f();
+    drop(guard);
+    if (saved_rflags & (1 << 9)) != 0 {
+        // SAFETY: Restoring `IF = 1` only when interrupts were previously enabled before acquiring `PT_MOD_LOCK`.
+        unsafe {
+            asm!("sti", options(nomem, nostack, preserves_flags));
+        }
+    }
+    res
+}
 
 #[inline(always)]
 pub(crate) fn phys_map_offset() -> u64 {
@@ -138,6 +169,9 @@ pub(crate) fn set_phys_offset(boot: &BootInfo) {
         0
     };
     PT_ALLOC_NEXT.store(pt_next, core::sync::atomic::Ordering::Relaxed);
+    if let Some(rsdp) = boot.rsdp_addr.into_option() {
+        BOOT_RSDP_PHYS.store(rsdp, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Virtual address for a guest-physical address in the physical memory map.
@@ -150,8 +184,6 @@ pub(crate) fn pa_to_va(phys: u64) -> *mut u8 {
 
 pub(crate) const PTE_P: u64 = 1;
 pub(crate) const PTE_W: u64 = 2;
-pub(crate) const PTE_PWT: u64 = 1 << 3;
-pub(crate) const PTE_PCD: u64 = 1 << 4;
 pub(crate) const PTE_PS: u64 = 1 << 7;
 pub(crate) const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
@@ -167,9 +199,9 @@ pub(crate) unsafe fn read_cr3() -> u64 {
 }
 
 // SAFETY: Caller must ensure DMA_PHYS_BASE and PHYS_MAP_OFFSET are initialized from BootInfo.
-pub(crate) unsafe fn alloc_pt_frame() -> u64 {
+pub(crate) unsafe fn alloc_pt_frame_locked() -> u64 {
     let base = dma_phys_base();
-    let next = PT_ALLOC_NEXT.load(core::sync::atomic::Ordering::Relaxed);
+    let next = PT_ALLOC_NEXT.load(core::sync::atomic::Ordering::Acquire);
     if base == 0
         || next < base + target_enterprise::memory::dma_layout::PT_POOL_START_OFF
         || next + 0x1000 > base + target_enterprise::memory::dma_layout::PT_POOL_END_OFF
@@ -177,7 +209,7 @@ pub(crate) unsafe fn alloc_pt_frame() -> u64 {
         panic!("AHCI_HW: PT frame pool exhausted");
     }
     let frame = next;
-    PT_ALLOC_NEXT.store(next + 0x1000, core::sync::atomic::Ordering::Relaxed);
+    PT_ALLOC_NEXT.store(next + 0x1000, core::sync::atomic::Ordering::Release);
     // SAFETY: `frame` is a newly allocated 4 KiB page inside the reserved DMA/PT pool mapped via `pa_to_va`.
     unsafe {
         let p = pa_to_va(frame);
@@ -190,60 +222,171 @@ pub(crate) unsafe fn alloc_pt_frame() -> u64 {
     frame
 }
 
-/// Ensure guest-physical `phys` (any offset in page) is reachable via
-/// `PHYS_MAP_OFFSET`. Installs a 4 KiB uncached PTE when the bootloader
-/// did not map the page (typical for PCI MMIO BARs).
-// SAFETY: Caller must pass a valid guest-physical MMIO or RAM address in ring 0 with active 4-level paging.
-pub(crate) unsafe fn ensure_mmio_page(phys: u64) -> *mut u8 {
-    let phys_page = phys & !0xFFFu64;
-    let off = PHYS_MAP_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
-    if off == 0 {
-        panic!("AHCI_HW: no physical_memory_offset for MMIO");
-    }
-    let va = phys_page.wrapping_add(off);
+// SAFETY: Caller must ensure DMA_PHYS_BASE and PHYS_MAP_OFFSET are initialized from BootInfo.
+pub(crate) unsafe fn alloc_pt_frame() -> u64 {
+    with_pt_lock(|| unsafe { alloc_pt_frame_locked() })
+}
+
+/// Walk the active 4-level `CR3` page table to resolve the guest-physical address backing
+/// a mapped kernel virtual address (`4 KiB` page or `2 MiB` huge page).
+// SAFETY: Caller must execute in Ring-0 after `set_phys_offset` initialized `PHYS_MAP_OFFSET`.
+pub(crate) unsafe fn translate_kernel_va_to_pa(va: u64) -> Option<u64> {
     let indices = [
         ((va >> 39) & 0x1FF) as usize,
         ((va >> 30) & 0x1FF) as usize,
         ((va >> 21) & 0x1FF) as usize,
         ((va >> 12) & 0x1FF) as usize,
     ];
-    // SAFETY: Running in ring 0; CR3 holds the active PML4 physical address.
+    // SAFETY: Running at CPL=0; `read_cr3()` returns the active PML4 physical address.
     let mut table = unsafe { read_cr3() } & PTE_ADDR_MASK;
     let mut level = 0usize;
     while level < 3 {
-        // SAFETY: `table` is a physical page-table frame mapped via `pa_to_va`, and `indices[level] < 512`.
-        let ent_ptr = unsafe { pa_to_va(table).cast::<u64>().add(indices[level]) };
-        // SAFETY: `ent_ptr` is 8-byte aligned and points to a valid page-table entry in mapped physical memory.
-        let ent = unsafe { core::ptr::read_volatile(ent_ptr) };
-        if ent & PTE_P == 0 {
-            // SAFETY: Running at CPL=0 with initialized `PT_ALLOC_NEXT`; returns a 4 KiB-aligned physical address within the reserved DMA/PT pool.
-            let new_t = unsafe { alloc_pt_frame() };
-            // SAFETY: `ent_ptr` is an 8-byte-aligned PTE slot in the mapped parent page table and `new_ent` points to a zeroed 4 KiB frame.
-            unsafe {
-                core::ptr::write_volatile(ent_ptr, new_t | PTE_P | PTE_W);
-            }
-            table = new_t;
-        } else if ent & PTE_PS != 0 {
-            // Huge page already present — only valid if it covers this
-            // phys (bootloader RAM maps). MMIO VAs should not hit this.
-            return va as *mut u8;
-        } else {
-            table = ent & PTE_ADDR_MASK;
+        // SAFETY: `table` is a physical page-table frame mapped via `pa_to_va` and `indices[level] < 512`.
+        let ent = unsafe { core::ptr::read_volatile(pa_to_va(table).cast::<u64>().add(indices[level])) };
+        if (ent & PTE_P) == 0 {
+            return None;
         }
+        if (ent & PTE_PS) != 0 {
+            return if level == 2 {
+                Some((ent & 0x000F_FFFF_FFE0_0000) | (va & 0x001F_FFFF))
+            } else if level == 1 {
+                Some((ent & 0x000F_FFFF_C000_0000) | (va & 0x3FFF_FFFF))
+            } else {
+                None
+            };
+        }
+        table = ent & PTE_ADDR_MASK;
         level += 1;
     }
-    // SAFETY: `table` is the L1 page-table frame and `indices[3] < 512`.
-    let leaf = unsafe { pa_to_va(table).cast::<u64>().add(indices[3]) };
-    // SAFETY: `leaf` is a valid L1 PTE pointer in mapped physical memory.
-    let ent = unsafe { core::ptr::read_volatile(leaf) };
-    if ent & PTE_P == 0 || (ent & (PTE_PWT | PTE_PCD)) != (PTE_PWT | PTE_PCD) {
-        // Present | Writable | PWT | PCD (uncached MMIO).
-        let pte = phys_page | PTE_P | PTE_W | PTE_PWT | PTE_PCD;
-        // SAFETY: `leaf` is an 8-byte-aligned L1 PTE pointer in mapped physical memory and `invlpg` is valid at CPL=0 for any canonical virtual address `va`.
-        unsafe {
-            core::ptr::write_volatile(leaf, pte);
-            asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
+    // SAFETY: `table` is the L1 page table mapped via `pa_to_va` and `indices[3] < 512`.
+    let leaf = unsafe { core::ptr::read_volatile(pa_to_va(table).cast::<u64>().add(indices[3])) };
+    if (leaf & PTE_P) == 0 {
+        return None;
+    }
+    Some((leaf & PTE_ADDR_MASK) | (va & 0xFFF))
+}
+
+/// Ensure guest-physical firmware/ROM page `phys` is readable via `PHYS_MAP_OFFSET`
+/// without altering existing RAM cacheability; maps unmapped pages as `Read-Only + NX`.
+// SAFETY: Caller must execute in Ring-0 with active 4-level paging and initialized `PHYS_MAP_OFFSET`.
+pub(crate) unsafe fn ensure_phys_ro_page(phys: u64) -> *const u8 {
+    use target_enterprise::memory::kernel_guards::PTE_NX_BIT;
+    let phys_page = phys & !0xFFFu64;
+    let off = PHYS_MAP_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    if off == 0 {
+        return core::ptr::null();
+    }
+    let va = phys_page.wrapping_add(off);
+    let mut shootdown = false;
+    with_pt_lock(|| {
+        let indices = [
+            ((va >> 39) & 0x1FF) as usize,
+            ((va >> 30) & 0x1FF) as usize,
+            ((va >> 21) & 0x1FF) as usize,
+            ((va >> 12) & 0x1FF) as usize,
+        ];
+        // SAFETY: Running at CPL=0 under `PT_MOD_LOCK`.
+        let mut table = unsafe { read_cr3() } & PTE_ADDR_MASK;
+        let mut level = 0usize;
+        while level < 3 {
+            // SAFETY: `table` is mapped via `pa_to_va` and `indices[level] < 512`.
+            let ent_ptr = unsafe { pa_to_va(table).cast::<u64>().add(indices[level]) };
+            // SAFETY: `ent_ptr` is an 8-byte-aligned PTE slot in mapped RAM.
+            let ent = unsafe { core::ptr::read_volatile(ent_ptr) };
+            if ent & PTE_P == 0 {
+                // SAFETY: Under `PT_MOD_LOCK` with initialized PT frame pool.
+                let new_t = unsafe { alloc_pt_frame_locked() };
+                // SAFETY: Writing intermediate PTE into mapped parent page table.
+                unsafe {
+                    core::ptr::write_volatile(ent_ptr, new_t | PTE_P | PTE_W);
+                }
+                table = new_t;
+            } else if ent & PTE_PS != 0 {
+                return;
+            } else {
+                table = ent & PTE_ADDR_MASK;
+            }
+            level += 1;
         }
+        // SAFETY: `table` is the L1 page table and `indices[3] < 512`.
+        let leaf = unsafe { pa_to_va(table).cast::<u64>().add(indices[3]) };
+        // SAFETY: Reading L1 PTE in mapped RAM.
+        let ent = unsafe { core::ptr::read_volatile(leaf) };
+        if ent & PTE_P == 0 {
+            let pte = phys_page | PTE_P | PTE_NX_BIT;
+            // SAFETY: Installing Read-Only + NX leaf PTE and invalidating local TLB.
+            unsafe {
+                core::ptr::write_volatile(leaf, pte);
+                asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
+            }
+            shootdown = true;
+        }
+    });
+    if shootdown {
+        smp_broadcast_tlb_shootdown();
+    }
+    va as *const u8
+}
+
+/// Ensure guest-physical `phys` (any offset in page) is reachable via
+/// `PHYS_MAP_OFFSET`. Installs a 4 KiB uncached `RW + NX` PTE (`mmio_leaf_pte`)
+/// when the bootloader did not map the page (typical for PCI MMIO BARs).
+// SAFETY: Caller must pass a valid guest-physical MMIO or RAM address in ring 0 with active 4-level paging.
+pub(crate) unsafe fn ensure_mmio_page(phys: u64) -> *mut u8 {
+    use target_enterprise::memory::kernel_guards::{is_mmio_pte_compliant, mmio_leaf_pte};
+    let phys_page = phys & !0xFFFu64;
+    let off = PHYS_MAP_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    if off == 0 {
+        panic!("AHCI_HW: no physical_memory_offset for MMIO");
+    }
+    let va = phys_page.wrapping_add(off);
+    let mut shootdown = false;
+    with_pt_lock(|| {
+        let indices = [
+            ((va >> 39) & 0x1FF) as usize,
+            ((va >> 30) & 0x1FF) as usize,
+            ((va >> 21) & 0x1FF) as usize,
+            ((va >> 12) & 0x1FF) as usize,
+        ];
+        // SAFETY: Running in ring 0 under `PT_MOD_LOCK`; CR3 holds the active PML4 physical address.
+        let mut table = unsafe { read_cr3() } & PTE_ADDR_MASK;
+        let mut level = 0usize;
+        while level < 3 {
+            // SAFETY: `table` is a physical page-table frame mapped via `pa_to_va`, and `indices[level] < 512`.
+            let ent_ptr = unsafe { pa_to_va(table).cast::<u64>().add(indices[level]) };
+            // SAFETY: `ent_ptr` is 8-byte aligned and points to a valid page-table entry in mapped physical memory.
+            let ent = unsafe { core::ptr::read_volatile(ent_ptr) };
+            if ent & PTE_P == 0 {
+                // SAFETY: Running at CPL=0 under `PT_MOD_LOCK` with initialized `PT_ALLOC_NEXT`.
+                let new_t = unsafe { alloc_pt_frame_locked() };
+                // SAFETY: `ent_ptr` is an 8-byte-aligned PTE slot in the mapped parent page table.
+                unsafe {
+                    core::ptr::write_volatile(ent_ptr, new_t | PTE_P | PTE_W);
+                }
+                table = new_t;
+            } else if ent & PTE_PS != 0 {
+                return;
+            } else {
+                table = ent & PTE_ADDR_MASK;
+            }
+            level += 1;
+        }
+        // SAFETY: `table` is the L1 page-table frame and `indices[3] < 512`.
+        let leaf = unsafe { pa_to_va(table).cast::<u64>().add(indices[3]) };
+        // SAFETY: `leaf` is a valid L1 PTE pointer in mapped physical memory.
+        let ent = unsafe { core::ptr::read_volatile(leaf) };
+        if !is_mmio_pte_compliant(ent) {
+            let pte = mmio_leaf_pte(phys_page);
+            // SAFETY: `leaf` is an 8-byte-aligned L1 PTE pointer in mapped physical memory and `invlpg` is valid at CPL=0.
+            unsafe {
+                core::ptr::write_volatile(leaf, pte);
+                asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
+            }
+            shootdown = true;
+        }
+    });
+    if shootdown {
+        smp_broadcast_tlb_shootdown();
     }
     va as *mut u8
 }
@@ -555,6 +698,11 @@ pub(crate) use smp_hw::*;
 pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     heap::init(); // before anything allocates (rustls on port 443)
     set_phys_offset(boot_info);
+    // Enforce hardware NXE + WP + SMEP + SMAP + UMIP + FSGSBASE immediately on the BSP.
+    // SAFETY: Running at CPL=0 in 64-bit Long Mode before any Ring-3 or untrusted code runs.
+    unsafe {
+        enable_cpu_memory_protections();
+    }
     fb_register(boot_info);
     serial_init();
     serial_write_str("CUTTLE-TE OK\n");
@@ -984,11 +1132,122 @@ pub(crate) fn live_os_console_loop() -> ! {
     }
 }
 
+/// Disjoint AHCI LBA partition (`1536..1568`, 16 KiB) reserved for forensic `CTTLPAN1`
+/// crash dumps so emergency dumps never overlap continuity/shell/SQL (`LBA 0..1100`).
+pub(crate) const AHCI_PANIC_DUMP_LBA: u64 = 1536;
+
+struct PanicDumpScratch(core::cell::UnsafeCell<[u8; cuttle_contracts::CRASH_DUMP_BYTES]>);
+// SAFETY: Accessed exclusively inside `#[panic_handler]` after winning the one-shot
+// `!target_enterprise::panic_dump::set_dumped()` atomic latch and halting peer APs.
+unsafe impl Sync for PanicDumpScratch {}
+
+static PANIC_DUMP_SCRATCH: PanicDumpScratch =
+    PanicDumpScratch(core::cell::UnsafeCell::new([0u8; cuttle_contracts::CRASH_DUMP_BYTES]));
+
+struct EmergencyAhciCrashSink;
+
+impl target_enterprise::panic_dump::SectorSink for EmergencyAhciCrashSink {
+    type Error = cuttle_contracts::CrashDumpError;
+
+    fn write_sector(
+        &mut self,
+        lba: u64,
+        data: &[u8; 512],
+    ) -> Result<(), cuttle_contracts::CrashDumpError> {
+        let rel = lba.saturating_sub(DUMP_START_LBA);
+        if rel >= 32 {
+            return Err(cuttle_contracts::CrashDumpError::LayoutOverflow);
+        }
+        if try_write_ahci_sector_emergency(AHCI_PANIC_DUMP_LBA + rel, data) {
+            Ok(())
+        } else {
+            Err(cuttle_contracts::CrashDumpError::LayoutOverflow)
+        }
+    }
+}
+
 #[panic_handler]
 pub(crate) fn panic(info: &PanicInfo) -> ! {
+    // 1. Mask interrupts immediately on the faulting CPU.
+    // SAFETY: `cli` in Ring-0 masks maskable external interrupts during crash containment.
+    unsafe {
+        asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+
+    // 2. One-shot atomic re-entry guard (`set_dumped()` returns `false` on first entry):
+    //    halt peer APs, zeroize runtime secrets, and commit a forensic CRC32-C-sealed
+    //    `CTTLPAN1` dump to AHCI `LBA 1536..1568` using `.bss` scratch (`PANIC_DUMP_SCRATCH`).
+    if !target_enterprise::panic_dump::set_dumped() {
+        smp_broadcast_panic_halt();
+        scrub_all_runtime_keys_emergency();
+
+        let rip_val: u64;
+        let rsp_val: u64;
+        let tsc_lo: u32;
+        let tsc_hi: u32;
+        // SAFETY: Reading RIP/RSP/RDTSC in Ring-0 has no memory side effects.
+        unsafe {
+            asm!(
+                "lea {rip}, [rip + 0]",
+                "mov {rsp}, rsp",
+                "rdtsc",
+                rip = out(reg) rip_val,
+                rsp = out(reg) rsp_val,
+                out("eax") tsc_lo,
+                out("edx") tsc_hi,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        let mut msg_buf = [0u8; 96];
+        let mut msg_len = 0usize;
+        {
+            use core::fmt::Write;
+            struct BufWriter<'a> {
+                buf: &'a mut [u8],
+                pos: &'a mut usize,
+            }
+            impl<'a> Write for BufWriter<'a> {
+                fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                    let bytes = s.as_bytes();
+                    let rem = self.buf.len().saturating_sub(*self.pos);
+                    let n = bytes.len().min(rem);
+                    self.buf[*self.pos..*self.pos + n].copy_from_slice(&bytes[..n]);
+                    *self.pos += n;
+                    Ok(())
+                }
+            }
+            let _ = write!(
+                BufWriter {
+                    buf: &mut msg_buf,
+                    pos: &mut msg_len,
+                },
+                "{}",
+                info.message()
+            );
+        }
+        let loc_str = info.location().map(|l| l.file()).unwrap_or("kernel");
+        let msg_str = core::str::from_utf8(&msg_buf[..msg_len]).unwrap_or("panic");
+        let mut regs = [0u64; cuttle_contracts::CRASH_REG_COUNT];
+        regs[0] = read_current_lapic_id_safe() as u64;
+        regs[7] = rsp_val;
+        regs[16] = rip_val;
+        let bt = [rip_val];
+        let ctx = CrashContext {
+            wall_unix: 0,
+            tsc: ((tsc_hi as u64) << 32) | (tsc_lo as u64),
+            panic_loc: loc_str,
+            message: msg_str,
+            registers: &regs,
+            backtrace: &bt,
+            kmsg: &[],
+        };
+        let mut sink = EmergencyAhciCrashSink;
+        // SAFETY: `set_dumped()` guarantees single-winner exclusive access to `PANIC_DUMP_SCRATCH`.
+        let dump_buf = unsafe { &mut *PANIC_DUMP_SCRATCH.0.get() };
+        let _ = PanicDumpImpl::dump_to_sink(&ctx, dump_buf, &mut sink);
+    }
+
     serial_write_str("CUTTLE-TE PANIC: ");
-    // Prefer the panic payload so hardware-path failures are diagnosable
-    // from the QEMU serial log without a debugger.
     {
         use core::fmt::Write;
         struct Sw;

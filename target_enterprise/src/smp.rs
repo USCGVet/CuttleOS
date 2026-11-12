@@ -221,6 +221,160 @@ pub fn build_madt_fixture(cpu_count: usize, out: &mut [u8]) -> Result<usize, Smp
     }
     Ok(total_v73aa22a7_0)
 }
+
+/// MADT entry type `9` (`Processor Local x2APIC`, 16 bytes, ACPI 6.4 §5.2.12.12).
+pub const MADT_ENTRY_LOCAL_X2APIC: u8 = 9;
+/// Fixed byte length of a MADT Processor Local x2APIC subtable.
+pub const MADT_LOCAL_X2APIC_LEN: usize = 16;
+/// MADT Processor Local APIC `Online Capable` flag (`bit 1`, ACPI 6.3+).
+pub const MADT_FLAG_ONLINE_CAPABLE: u32 = 1 << 1;
+
+/// Resolve up to `N` distinct hardware Local APIC IDs (`out[0] = bsp_apic_id`, `out[1..count]` = APs)
+/// from an optional firmware `MADT` (`"APIC"`) table, supporting sparse/non-contiguous Xeon/EPYC
+/// APIC topologies (both Type-0 xAPIC and Type-9 x2APIC entries) and falling back cleanly to
+/// [`crate::memory::kernel_guards::smp_apic_for_ap_slot`] when `madt_opt` is absent or malformed.
+#[inline(never)]
+pub fn resolve_ap_apic_targets<const N: usize>(
+    madt_opt: Option<&[u8]>,
+    bsp_apic_id: u32,
+) -> ([u32; N], usize) {
+    let mut out = [u32::MAX; N];
+    if N == 0 {
+        return (out, 0);
+    }
+    out[0] = bsp_apic_id;
+    let mut count = 1usize;
+
+    if let Some(madt_bytes) = madt_opt {
+        if madt_bytes.len() >= madt::HEADER_LEN && &madt_bytes[0..4] == madt::SIG_APIC.as_slice() {
+            let tlen = u32::from_le_bytes([
+                madt_bytes[4],
+                madt_bytes[5],
+                madt_bytes[6],
+                madt_bytes[7],
+            ]) as usize;
+            if tlen >= madt::HEADER_LEN && tlen <= madt_bytes.len() {
+                let mut cur = madt::HEADER_LEN;
+                let mut malformed = false;
+                while cur + 2 <= tlen {
+                    let etype = madt_bytes[cur];
+                    let elen = madt_bytes[cur + 1] as usize;
+                    if elen < 2 || cur + elen > tlen {
+                        malformed = true;
+                        break;
+                    }
+                    let mut cand_id: Option<u32> = None;
+                    if etype == madt::ENTRY_LOCAL_APIC && elen == madt::LOCAL_APIC_ENTRY_LEN {
+                        let flags = u32::from_le_bytes([
+                            madt_bytes[cur + 4],
+                            madt_bytes[cur + 5],
+                            madt_bytes[cur + 6],
+                            madt_bytes[cur + 7],
+                        ]);
+                        if (flags & (madt::LOCAL_APIC_FLAG_ENABLED | MADT_FLAG_ONLINE_CAPABLE)) != 0
+                        {
+                            cand_id = Some(madt_bytes[cur + 3] as u32);
+                        }
+                    } else if etype == MADT_ENTRY_LOCAL_X2APIC && elen >= MADT_LOCAL_X2APIC_LEN {
+                        let x2_id = u32::from_le_bytes([
+                            madt_bytes[cur + 4],
+                            madt_bytes[cur + 5],
+                            madt_bytes[cur + 6],
+                            madt_bytes[cur + 7],
+                        ]);
+                        let flags = u32::from_le_bytes([
+                            madt_bytes[cur + 8],
+                            madt_bytes[cur + 9],
+                            madt_bytes[cur + 10],
+                            madt_bytes[cur + 11],
+                        ]);
+                        if (flags & (madt::LOCAL_APIC_FLAG_ENABLED | MADT_FLAG_ONLINE_CAPABLE)) != 0
+                            && x2_id <= 0xFE
+                        {
+                            cand_id = Some(x2_id);
+                        }
+                    }
+                    if let Some(apic_id) = cand_id {
+                        let mut dup = false;
+                        let mut j = 0usize;
+                        while j < count {
+                            if out[j] == apic_id {
+                                dup = true;
+                                break;
+                            }
+                            j += 1;
+                        }
+                        if !dup && count < N {
+                            out[count] = apic_id;
+                            count += 1;
+                        }
+                    }
+                    cur += elen;
+                }
+                if !malformed && count >= 1 {
+                    return (out, count);
+                }
+            }
+        }
+    }
+
+    // Firmware MADT unavailable or malformed: populate deterministic non-BSP fallback targets.
+    count = 1;
+    while count < N {
+        if let Some(apic_id) =
+            crate::memory::kernel_guards::smp_apic_for_ap_slot(count, bsp_apic_id)
+        {
+            out[count] = apic_id;
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    (out, count)
+}
+
+/// Hardware SMP lockup detector tracking per-CPU progress ticks across periodic epochs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmpLockupWatchdog<const N: usize> {
+    last_ticks: [u64; N],
+    stalled_epochs: [u32; N],
+    threshold_epochs: u32,
+}
+
+impl<const N: usize> SmpLockupWatchdog<N> {
+    /// Construct a lockup watchdog flagging any online AP that fails to advance ticks
+    /// across `threshold_epochs` consecutive checks.
+    pub const fn new(threshold_epochs: u32) -> Self {
+        let thresh = if threshold_epochs == 0 { 1 } else { threshold_epochs };
+        Self {
+            last_ticks: [0u64; N],
+            stalled_epochs: [0u32; N],
+            threshold_epochs: thresh,
+        }
+    }
+
+    /// Compare `observed_ticks` for `0..online_cpus` against the previous check and return
+    /// a bitmask (`bit c = 1`) of secondary AP cores (`1 <= c < online_cpus`) stalled past threshold.
+    pub fn check_stalled_mask(&mut self, online_cpus: usize, observed_ticks: &[u64; N]) -> u32 {
+        let limit = if online_cpus > N { N } else { online_cpus };
+        let mut mask = 0u32;
+        let mut c = 0usize;
+        while c < limit && c < 32 {
+            let cur = observed_ticks[c];
+            if cur != self.last_ticks[c] {
+                self.last_ticks[c] = cur;
+                self.stalled_epochs[c] = 0;
+            } else if c > 0 {
+                self.stalled_epochs[c] = self.stalled_epochs[c].saturating_add(1);
+                if self.stalled_epochs[c] >= self.threshold_epochs {
+                    mask |= 1u32 << c;
+                }
+            }
+            c += 1;
+        }
+        mask
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +758,60 @@ mod tests {
                 assert_eq!(topo.aps[i] as usize, i + 1);
             }
         }
+    }
+
+    #[test]
+    fn stage14_sparse_madt_x2apic_topology_and_lockup_watchdog() {
+        // 1. Sparse non-contiguous MADT with non-zero BSP (`bsp_apic_id = 4`), Type-0 xAPIC (`0, 2`),
+        //    disabled entry (`8`, flags = 0), and Type-9 x2APIC (`6`, Online-Capable).
+        let mut madt_buf = [0u8; madt::HEADER_LEN + 3 * 8 + MADT_LOCAL_X2APIC_LEN];
+        let madt_len = madt_buf.len() as u32;
+        madt_buf[0..4].copy_from_slice(&madt::SIG_APIC);
+        madt_buf[4..8].copy_from_slice(&madt_len.to_le_bytes());
+
+        let mut off = madt::HEADER_LEN;
+        for &(apic_id, flags) in &[
+            (0u8, madt::LOCAL_APIC_FLAG_ENABLED),
+            (2u8, madt::LOCAL_APIC_FLAG_ENABLED),
+            (8u8, 0u32), // disabled -> must be ignored!
+        ] {
+            madt_buf[off] = madt::ENTRY_LOCAL_APIC;
+            madt_buf[off + 1] = 8;
+            madt_buf[off + 3] = apic_id;
+            madt_buf[off + 4..off + 8].copy_from_slice(&flags.to_le_bytes());
+            off += 8;
+        }
+        // Type-9 Local x2APIC entry (`apic_id = 6`, Online-Capable)
+        madt_buf[off] = MADT_ENTRY_LOCAL_X2APIC;
+        madt_buf[off + 1] = MADT_LOCAL_X2APIC_LEN as u8;
+        madt_buf[off + 4..off + 8].copy_from_slice(&6u32.to_le_bytes());
+        madt_buf[off + 8..off + 12].copy_from_slice(&MADT_FLAG_ONLINE_CAPABLE.to_le_bytes());
+
+        let (targets, count) = resolve_ap_apic_targets::<4>(Some(&madt_buf), 4);
+        assert_eq!(count, 4);
+        assert_eq!(targets, [4, 0, 2, 6], "BSP=4 must stay slot 0, followed by sparse APs 0, 2, 6");
+
+        // Malformed MADT (entry length = 0) falls back cleanly without panicking or targeting BSP.
+        let mut bad = madt_buf;
+        bad[madt::HEADER_LEN + 1] = 0;
+        let (fb, fb_cnt) = resolve_ap_apic_targets::<4>(Some(&bad), 2);
+        assert_eq!(fb_cnt, 4);
+        assert_eq!(fb[0], 2);
+        assert!(!fb[1..].contains(&2), "fallback must never target BSP");
+
+        // 2. Multi-core lockup watchdog detects stalled secondary APs and clears once ticks advance.
+        let mut wd = SmpLockupWatchdog::<4>::new(2);
+        assert_eq!(wd.check_stalled_mask(4, &[10, 5, 5, 5]), 0);
+        assert_eq!(wd.check_stalled_mask(4, &[11, 6, 5, 6]), 0); // AP 2 stalled 1st epoch (< 2)
+        assert_eq!(
+            wd.check_stalled_mask(4, &[12, 7, 5, 7]),
+            1 << 2,
+            "AP 2 stalled across 2 epochs must raise bit 2"
+        );
+        assert_eq!(
+            wd.check_stalled_mask(4, &[13, 8, 6, 8]),
+            0,
+            "AP 2 advancing tick must clear stall mask"
+        );
     }
 }

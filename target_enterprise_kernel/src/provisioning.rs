@@ -145,12 +145,87 @@ fn read_rdrand_u64() -> Option<u64> {
     None
 }
 
-/// Read a 64-bit hardware random word via `rdrand` if CPUID.01H:ECX[30]
-/// advertises `RDRAND` support, falling back to `rdtsc` mixed with CMOS RTC
-/// registers and the 8254 PIT counter if the CPU/emulator does not implement `rdrand`.
+/// Read a 64-bit physical TRNG seed via `rdseed` if CPUID.(EAX=7, ECX=0):EBX[18]
+/// advertises `RDSEED` support and the hardware conditioner succeeds within 16 retries.
+fn read_rdseed_u64() -> Option<u64> {
+    let has_rdseed: bool = {
+        let max_leaf: u32;
+        // SAFETY: CPUID leaf 0 is supported on all x86-64 processors; `rbx` is preserved.
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "xor eax, eax",
+                "cpuid",
+                "pop rbx",
+                out("eax") max_leaf,
+                out("ecx") _,
+                out("edx") _,
+                options(nomem, preserves_flags),
+            );
+        }
+        if max_leaf >= 7 {
+            let ebx_7: u32;
+            // SAFETY: `max_leaf >= 7` verified leaf 7 support; `rbx` is saved in `r9` and restored.
+            unsafe {
+                core::arch::asm!(
+                    "mov r9, rbx",
+                    "mov eax, 7",
+                    "xor ecx, ecx",
+                    "cpuid",
+                    "mov {out_ebx:e}, ebx",
+                    "mov rbx, r9",
+                    out_ebx = out(reg) ebx_7,
+                    out("eax") _,
+                    out("ecx") _,
+                    out("edx") _,
+                    out("r9") _,
+                    options(nomem, preserves_flags),
+                );
+            }
+            (ebx_7 & (1 << 18)) != 0
+        } else {
+            false
+        }
+    };
+
+    if has_rdseed {
+        let mut tries = 0u32;
+        while tries < 16 {
+            let val: u64;
+            let ok: u8;
+            // SAFETY: CPUID.07H:EBX[18] confirmed `rdseed` instruction support; `rdseed`
+            // writes a 64-bit physical entropy word into `val` and sets CF=1 on success.
+            unsafe {
+                core::arch::asm!(
+                    "rdseed {val}",
+                    "setc {ok}",
+                    val = out(reg) val,
+                    ok = out(reg_byte) ok,
+                    options(nomem, nostack),
+                );
+            }
+            if ok != 0 && val != 0 && val != u64::MAX {
+                return Some(val);
+            }
+            tries += 1;
+        }
+    }
+    None
+}
+
+/// Read a 64-bit hardware random word mixing `rdseed` (when available) + `rdrand`
+/// if CPUID.01H:ECX[30] advertises `RDRAND` support, falling back to `rdtsc` mixed
+/// with CMOS RTC registers and the 8254 PIT counter if `rdrand` is unavailable.
 fn read_hw_entropy_u64(round: u64) -> u64 {
+    let seed_opt = read_rdseed_u64();
     if let Some(val) = read_rdrand_u64() {
-        return val;
+        return match seed_opt {
+            Some(s) => val ^ s.rotate_left(17),
+            None => val,
+        };
+    }
+    if let Some(s) = seed_opt {
+        return s;
     }
 
     let cmos_pit = read_cmos_and_pit_word(round);
@@ -360,11 +435,16 @@ pub(crate) fn tls_rng_seed(mac: [u8; 6], boot_count: u64) -> Option<([u8; 32], &
     let mut has_rdrand = true;
     let mut r = 0usize;
     while r < 16 {
+        let seed_mix = read_rdseed_u64().unwrap_or(0);
         match read_rdrand_u64() {
-            Some(w) => hw_words[r] = w,
+            Some(w) => hw_words[r] = w ^ seed_mix.rotate_left(13),
             None => {
-                has_rdrand = false;
-                hw_words[r] = read_hw_entropy_u64(0x544c_5300 + r as u64);
+                if seed_mix != 0 {
+                    hw_words[r] = seed_mix;
+                } else {
+                    has_rdrand = false;
+                    hw_words[r] = read_hw_entropy_u64(0x544c_5300 + r as u64);
+                }
             }
         }
         r += 1;
@@ -430,4 +510,26 @@ pub(crate) fn derive_runtime_attest_key() -> [u8; 32] {
     let out = target_enterprise::durable_seal::derive_attest_key(&master, b"cuttle-quote-v1");
     target_enterprise::durable_seal::zeroize_secret_bytes(&mut master);
     out
+}
+
+/// Non-blocking (`try_lock`) emergency zeroization of all cached master and derived
+/// runtime keys in `.bss`, safe to invoke inside the hardware panic/fault path without
+/// risking spinlock deadlock if the faulting core held a provisioning lock.
+pub(crate) fn scrub_all_runtime_keys_emergency() {
+    if let Some(mut guard) = PROVISIONED_MASTER_KEY.try_lock() {
+        if let Some((ref mut master, ref mut prov)) = *guard {
+            target_enterprise::durable_seal::zeroize_secret_bytes(master);
+            *prov = false;
+        }
+        *guard = None;
+    }
+    if let Some(mut sub_guard) = CACHED_SUBKEYS.try_lock() {
+        if let Some(ref mut sub) = *sub_guard {
+            target_enterprise::durable_seal::zeroize_secret_bytes(&mut sub.seal_key);
+            target_enterprise::durable_seal::zeroize_secret_bytes(&mut sub.legacy_seal_key);
+            target_enterprise::durable_seal::zeroize_secret_bytes(&mut sub.attest_key);
+        }
+        *sub_guard = None;
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
