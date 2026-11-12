@@ -204,6 +204,7 @@ pub(crate) fn banner_virtio_hw() {
 // without duplicating 400 lines of MMIO setup.
 // ---------------------------------------------------------------------------
 #[allow(dead_code)]
+#[derive(Clone, Copy)]
 pub(crate) struct AhciHwPort {
     pub(crate) abar: u64,
     pub(crate) pbase: u64,
@@ -569,28 +570,40 @@ impl AhciHwPort {
         }
     }
 
-    /// Issue one H2D command in slot 0 against the running port with `prdtl` PRDT entries (`0` or `1`).
-    pub(crate) fn issue_with_prdtl(
+    /// Issue one H2D command in slot 0 against the running port with `prdtl` PRDT entries
+    /// (`0` or `1`) and report how it ended.
+    ///
+    /// Completion is checked against everything the HBA reports: the port
+    /// interrupt status error bits, the task-file error and device-fault bits,
+    /// and, when `expect_bytes` is given, the byte count the device says it
+    /// transferred. Nothing here panics, so a caller can fall back to another
+    /// copy or refuse a commit.
+    pub(crate) fn try_issue_with_prdtl(
         &self,
         fis_params: &cuttle_contracts::H2dFisParams,
         write: bool,
         prdtl: u16,
-        tag: &[u8],
-    ) {
+        expect_bytes: Option<u32>,
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
         use cuttle_contracts::{
             AhciCmd, AhciCmdHeader, AhciFis, AhciPrdt, AHCI_CFL_H2D, AHCI_CMD_HDR_LEN,
             AHCI_FIS_H2D_LEN, AHCI_PRDT_LEN,
         };
         use target_enterprise::ahci_cmd::AhciCmdImpl;
         use target_enterprise::ahci_fis::AhciFisImpl;
+        use target_enterprise::state_store::IoFault;
 
         const PORT_IS: u64 = 0x10;
         const PORT_TFD: u64 = 0x20;
         const PORT_CI: u64 = 0x38;
+        /// PxIS: task-file error, host bus fatal, host bus data, interface fatal.
+        const PORT_IS_ERRORS: u32 = (1 << 30) | (1 << 29) | (1 << 28) | (1 << 27);
+        /// PxTFD status: ERR and DF.
+        const TFD_ERR_OR_FAULT: u32 = 0x01 | 0x20;
 
         let mut fis = [0u8; AHCI_FIS_H2D_LEN];
         if AhciFisImpl::encode_h2d(fis_params, &mut fis).is_err() {
-            panic!("AHCI_HW: FIS encode");
+            return Err(IoFault::OutOfRange);
         }
         let hdr = AhciCmdHeader {
             cfl: AHCI_CFL_H2D,
@@ -602,7 +615,7 @@ impl AhciHwPort {
         };
         let mut hbuf = [0u8; AHCI_CMD_HDR_LEN];
         if AhciCmdImpl::encode_header(&hdr, &mut hbuf).is_err() {
-            panic!("AHCI_HW: header encode");
+            return Err(IoFault::OutOfRange);
         }
         let mut pbuf = [0u8; AHCI_PRDT_LEN];
         if prdtl > 0 {
@@ -612,11 +625,26 @@ impl AhciHwPort {
                 ioc: true,
             };
             if AhciCmdImpl::encode_prdt(&prdt, &mut pbuf).is_err() {
-                panic!("AHCI_HW: PRDT encode");
+                return Err(IoFault::OutOfRange);
             }
         }
+        // Keep console input flowing while the disk is busy (see `SerialRxRing`).
+        crate::serial_rx_pump();
         // SAFETY: `ctba_pa` and `clb_pa` are disjoint, aligned subregions of the reserved DMA window mapped via `pa_to_va`, and slot 0 is idle (`PxCI & 1 == 0`) while we populate descriptors.
         unsafe {
+            let mut spins = 0u32;
+            loop {
+                let busy = mmio_read32(self.pbase + PORT_TFD) & 0x80 != 0;
+                let in_flight = mmio_read32(self.pbase + PORT_CI) & 1 != 0;
+                if !busy && !in_flight {
+                    break;
+                }
+                spins = spins.wrapping_add(1);
+                if spins > 20_000_000 {
+                    return Err(IoFault::Timeout);
+                }
+                core::hint::spin_loop();
+            }
             let ct = pa_to_va(self.ctba_pa);
             let mut i = 0usize;
             while i < 0x100 {
@@ -641,37 +669,59 @@ impl AhciHwPort {
                 core::ptr::write_volatile(cl.add(i), hbuf[i]);
                 i += 1;
             }
-            let mut spins = 0u32;
-            loop {
-                let tfd = mmio_read32(self.pbase + PORT_TFD);
-                if tfd & 0x80 == 0 {
-                    break;
-                }
-                spins = spins.wrapping_add(1);
-                if spins > 20_000_000 {
-                    panic!("AHCI_HW: TFD BSY timeout");
-                }
-                core::hint::spin_loop();
-            }
             mmio_write32(self.pbase + PORT_IS, 0xFFFF_FFFF);
             mmio_write32(self.pbase + PORT_CI, 1);
             spins = 0;
             loop {
+                // On a task-file error the HBA leaves PxCI set, so the error
+                // bits are the only prompt signal that the command is over.
+                if mmio_read32(self.pbase + PORT_IS) & PORT_IS_ERRORS != 0 {
+                    return Err(IoFault::DeviceError);
+                }
                 if mmio_read32(self.pbase + PORT_CI) & 1 == 0 {
                     break;
                 }
                 spins = spins.wrapping_add(1);
                 if spins > 40_000_000 {
-                    let _ = tag;
-                    panic!("AHCI_HW: command CI timeout");
+                    return Err(IoFault::Timeout);
+                }
+                if spins % 256 == 0 {
+                    crate::serial_rx_pump();
                 }
                 core::hint::spin_loop();
             }
-            let tfd = mmio_read32(self.pbase + PORT_TFD);
-            if tfd & 0x01 != 0 {
-                let _ = tag;
-                panic!("AHCI_HW: command TFD ERR");
+            if mmio_read32(self.pbase + PORT_TFD) & TFD_ERR_OR_FAULT != 0
+                || mmio_read32(self.pbase + PORT_IS) & PORT_IS_ERRORS != 0
+            {
+                return Err(IoFault::DeviceError);
             }
+            if let Some(want) = expect_bytes {
+                // PRDBC: bytes the device transferred, DW1 of the command header.
+                let prdbc = core::ptr::read_volatile(cl.add(4).cast::<u32>());
+                if u32::from_le(prdbc) != want {
+                    return Err(IoFault::DeviceError);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Panicking form of [`Self::try_issue_with_prdtl`] for the boot self-tests,
+    /// where a failed command means the banner cannot be proved.
+    pub(crate) fn issue_with_prdtl(
+        &self,
+        fis_params: &cuttle_contracts::H2dFisParams,
+        write: bool,
+        prdtl: u16,
+        tag: &[u8],
+    ) {
+        use target_enterprise::state_store::IoFault;
+        let _ = tag;
+        match self.try_issue_with_prdtl(fis_params, write, prdtl, None) {
+            Ok(()) => {}
+            Err(IoFault::Timeout) => panic!("AHCI_HW: command timeout"),
+            Err(IoFault::OutOfRange) => panic!("AHCI_HW: command encode"),
+            Err(_) => panic!("AHCI_HW: command TFD ERR"),
         }
     }
 
@@ -741,6 +791,83 @@ impl AhciHwPort {
         self.issue(&wr, true, b"write");
     }
 
+    /// ATA `FLUSH CACHE`, reporting failure.
+    pub(crate) fn try_flush_cache(&self) -> Result<(), target_enterprise::state_store::IoFault> {
+        use cuttle_contracts::{H2dFisParams, ATA_DEV_LBA};
+        const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
+        let fl = H2dFisParams {
+            command: ATA_CMD_FLUSH_CACHE,
+            features: 0,
+            lba: 0,
+            count: 0,
+            device: ATA_DEV_LBA,
+            pm_port: 0,
+            is_command: true,
+        };
+        self.try_issue_with_prdtl(&fl, false, 0, None)
+    }
+
+    /// ATA WRITE DMA one 512-byte sector at `lba`, reporting failure.
+    pub(crate) fn try_write_sector(
+        &self,
+        lba: u64,
+        data: &[u8; 512],
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        use cuttle_contracts::{H2dFisParams, ATA_DEV_LBA};
+        const ATA_CMD_WRITE_DMA: u8 = 0xCA;
+        if lba >= AHCI_LBA28_LIMIT {
+            return Err(target_enterprise::state_store::IoFault::OutOfRange);
+        }
+        self.fill_data(data);
+        let wr = H2dFisParams {
+            command: ATA_CMD_WRITE_DMA,
+            features: 0,
+            lba,
+            count: 1,
+            device: ATA_DEV_LBA,
+            pm_port: 0,
+            is_command: true,
+        };
+        self.try_issue_with_prdtl(&wr, true, 1, Some(512))
+    }
+
+    /// ATA READ DMA one 512-byte sector at `lba` into `out`, reporting failure.
+    pub(crate) fn try_read_sector(
+        &self,
+        lba: u64,
+        out: &mut [u8; 512],
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        use cuttle_contracts::AhciFis;
+        use target_enterprise::ahci_fis::AhciFisImpl;
+        use target_enterprise::state_store::IoFault;
+        if lba >= AHCI_LBA28_LIMIT {
+            return Err(IoFault::OutOfRange);
+        }
+        let rd = AhciFisImpl::read_dma(lba, 1, 0).map_err(|_| IoFault::OutOfRange)?;
+        self.try_issue_with_prdtl(&rd, false, 1, Some(512))?;
+        *out = self.drain_data();
+        Ok(())
+    }
+
+    /// ATA IDENTIFY DEVICE: the number of addressable sectors.
+    pub(crate) fn try_identify_sectors(&self) -> Result<u64, target_enterprise::state_store::IoFault> {
+        use cuttle_contracts::AhciFis;
+        use target_enterprise::ahci_fis::AhciFisImpl;
+        use target_enterprise::state_store::IoFault;
+        let params = AhciFisImpl::identify(0).map_err(|_| IoFault::OutOfRange)?;
+        self.fill_data(&[0u8; 512]);
+        self.try_issue_with_prdtl(&params, false, 1, None)?;
+        let data = self.drain_data();
+        let word = |w: usize| u16::from_le_bytes([data[2 * w], data[2 * w + 1]]) as u64;
+        let lba28 = word(60) | (word(61) << 16);
+        let lba48 = word(100) | (word(101) << 16) | (word(102) << 32) | (word(103) << 48);
+        let sectors = if lba48 != 0 { lba48 } else { lba28 };
+        if sectors == 0 {
+            return Err(IoFault::DeviceError);
+        }
+        Ok(sectors)
+    }
+
     /// ATA READ DMA one 512-byte sector at `lba`.
     pub(crate) fn read_sector(&self, lba: u64) -> [u8; 512] {
         use cuttle_contracts::{AhciFis, ATA_CMD_READ_DMA};
@@ -754,6 +881,88 @@ impl AhciHwPort {
         }
         self.issue(&rd, false, b"read");
         self.drain_data()
+    }
+}
+
+/// `READ DMA` / `WRITE DMA` carry a 28-bit LBA; a larger one would alias.
+pub(crate) const AHCI_LBA28_LIMIT: u64 = 1 << 28;
+
+/// The AHCI port and capacity the durable state store runs on, probed once.
+static AHCI_STATE_DISK: spin::Mutex<Option<(AhciHwPort, u64)>> = spin::Mutex::new(None);
+
+/// The AHCI disk as a fallible sector device for
+/// [`target_enterprise::state_store`].
+pub(crate) struct AhciDisk {
+    port: AhciHwPort,
+    sectors: u64,
+}
+
+impl AhciDisk {
+    /// The state disk. The first call probes the HBA and reads the device
+    /// capacity; later calls reuse both, so a commit no longer restarts the
+    /// port.
+    pub(crate) fn state_disk() -> Result<Self, target_enterprise::state_store::IoFault> {
+        let mut cached = AHCI_STATE_DISK.lock();
+        if let Some((port, sectors)) = *cached {
+            return Ok(AhciDisk { port, sectors });
+        }
+        let port = AhciHwPort::probe_start_quiet();
+        let sectors = port.try_identify_sectors()?;
+        *cached = Some((port, sectors));
+        Ok(AhciDisk { port, sectors })
+    }
+
+    /// After a failed command the port holds error state and will not run
+    /// another. Restart it so the caller's fallback (the other slot, a
+    /// repair write) has a working device.
+    fn restart_port_after_fault(&mut self) {
+        self.port = AhciHwPort::probe_start_quiet();
+        *AHCI_STATE_DISK.lock() = Some((self.port, self.sectors));
+    }
+
+    fn checked<T>(
+        &mut self,
+        r: Result<T, target_enterprise::state_store::IoFault>,
+    ) -> Result<T, target_enterprise::state_store::IoFault> {
+        if r.is_err() {
+            self.restart_port_after_fault();
+        }
+        r
+    }
+}
+
+impl target_enterprise::state_store::SectorIo for AhciDisk {
+    fn capacity_sectors(&self) -> u64 {
+        self.sectors.min(AHCI_LBA28_LIMIT)
+    }
+
+    fn read_sector(
+        &mut self,
+        lba: u64,
+        out: &mut [u8; 512],
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        if lba >= self.capacity_sectors() {
+            return Err(target_enterprise::state_store::IoFault::OutOfRange);
+        }
+        let r = self.port.try_read_sector(lba, out);
+        self.checked(r)
+    }
+
+    fn write_sector(
+        &mut self,
+        lba: u64,
+        data: &[u8; 512],
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        if lba >= self.capacity_sectors() {
+            return Err(target_enterprise::state_store::IoFault::OutOfRange);
+        }
+        let r = self.port.try_write_sector(lba, data);
+        self.checked(r)
+    }
+
+    fn flush(&mut self) -> Result<(), target_enterprise::state_store::IoFault> {
+        let r = self.port.try_flush_cache();
+        self.checked(r)
     }
 }
 
@@ -887,6 +1096,47 @@ pub(crate) const CONTINUITY_MAGIC: &[u8; 8] = b"CTTLWAL1";
 pub(crate) const CONTINUITY_LEGACY_MAGIC: &[u8; 8] = b"PRTSWAL1";
 pub(crate) const CONTINUITY_WAL_SECTORS: u64 = (kf::WAL_CAPACITY / 512) as u64;
 
+/// Durable cursor and region CRC written by [`banner_continuity`] this boot,
+/// kept so [`continuity_set_boots`] can rewrite the header.
+static CONTINUITY_CURSOR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CONTINUITY_CRC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn continuity_header(boots: u64, cursor: u32, crc: u32) -> [u8; 512] {
+    let mut hdr = [0u8; 512];
+    hdr[..8].copy_from_slice(CONTINUITY_MAGIC);
+    hdr[8..16].copy_from_slice(&boots.to_le_bytes());
+    hdr[16..20].copy_from_slice(&cursor.to_le_bytes());
+    hdr[20..24].copy_from_slice(&crc.to_le_bytes());
+    hdr
+}
+
+/// Move the boot counter forward to `boots` in memory and in the continuity
+/// header.
+///
+/// The counter is only a hint: the sealed shell state carries the
+/// authoritative boot generation. When the two disagree (the continuity
+/// region was lost and restarted at 1, say) the shell store reports the
+/// generation to use and this brings the counter back in line, so the next
+/// boot counts on from the right place. A failed rewrite is not fatal: the
+/// next boot simply reconciles again.
+pub(crate) fn continuity_set_boots(boots: u64) {
+    use target_enterprise::state_store::SectorIo;
+    CONTINUITY_BOOT_COUNT.store(boots, core::sync::atomic::Ordering::Relaxed);
+    let cursor = CONTINUITY_CURSOR.load(core::sync::atomic::Ordering::Relaxed) as u32;
+    let crc = CONTINUITY_CRC.load(core::sync::atomic::Ordering::Relaxed) as u32;
+    let hdr = continuity_header(boots, cursor, crc);
+    let wrote = match AhciDisk::state_disk() {
+        Ok(mut disk) => disk
+            .write_sector(CONTINUITY_LBA, &hdr)
+            .and_then(|()| disk.flush())
+            .is_ok(),
+        Err(_) => false,
+    };
+    if !wrote {
+        serial_write_str("CONTINUITY NOTICE: boot counter rewrite failed; next boot will reconcile\n");
+    }
+}
+
 #[inline(never)]
 pub(crate) fn banner_continuity() {
     use target_enterprise::wal::crc32_ieee;
@@ -964,7 +1214,7 @@ pub(crate) fn banner_continuity() {
 
     // Append the boot-marker frame: payload = [boot counter, resumed
     // frame count] — each morph boot leaves an auditable trace.
-    let this_boot = resumed_boots + 1;
+    let this_boot = resumed_boots.saturating_add(1);
     // Publish for the UDP status payload ("CUTTLE-STATUS boots=N").
     CONTINUITY_BOOT_COUNT.store(this_boot, core::sync::atomic::Ordering::Relaxed);
     let mut marker = [0u8; 16];
@@ -1001,13 +1251,15 @@ pub(crate) fn banner_continuity() {
         port.write_sector(CONTINUITY_LBA + 1 + s, &sec);
         s += 1;
     }
+    // Barrier: the region must be on the platter before a header that
+    // vouches for it, or a power cut could leave a valid header over a
+    // half-written region.
+    port.flush_cache();
     let new_crc = crc32_ieee(backing);
-    let mut hdr_out = [0u8; 512];
-    hdr_out[..8].copy_from_slice(CONTINUITY_MAGIC);
-    hdr_out[8..16].copy_from_slice(&this_boot.to_le_bytes());
-    hdr_out[16..20].copy_from_slice(&(wal.durable_cursor() as u32).to_le_bytes());
-    hdr_out[20..24].copy_from_slice(&new_crc.to_le_bytes());
-    port.write_sector(CONTINUITY_LBA, &hdr_out);
+    CONTINUITY_CURSOR.store(wal.durable_cursor() as u64, core::sync::atomic::Ordering::Relaxed);
+    CONTINUITY_CRC.store(new_crc as u64, core::sync::atomic::Ordering::Relaxed);
+    port.write_sector(CONTINUITY_LBA, &continuity_header(this_boot, wal.durable_cursor() as u32, new_crc));
+    port.flush_cache();
 
     {
         let mut line = [0u8; 64];

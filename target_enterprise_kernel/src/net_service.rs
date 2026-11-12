@@ -859,14 +859,11 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
         {
             let mut sh_guard = KERNEL_SHELL.lock();
             let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
-            if sh.fs.inode_count() == 0 {
-                sh.seal_key = derive_runtime_seal_key();
-                sh.legacy_seal_key = derive_runtime_legacy_seal_key();
-                sh.attest_key = derive_runtime_attest_key();
-                sh.seed_defaults();
-                let _ = restore_shell_from_ahci(sh);
-            }
+            // `shell_store_boot` already restored the shell. Requests served
+            // in this window follow the same rule as the main loop: what they
+            // change is committed before the reply is transmitted.
             svc.handle_frame_with_shell(&frame[..flen], boots, sh, &mut replies);
+            persist_shell_if_changed(sh, false);
         }
         let mut ri = 0usize;
         while ri < replies.len() {
@@ -1354,15 +1351,10 @@ pub(crate) fn service_udp_status_legacy() {
         {
             let mut sh_guard = KERNEL_SHELL.lock();
             let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
-            if sh.fs.inode_count() == 0 {
-                sh.seal_key = derive_runtime_seal_key();
-                sh.legacy_seal_key = derive_runtime_legacy_seal_key();
-                sh.attest_key = derive_runtime_attest_key();
-                sh.seed_defaults();
-                let _ = restore_shell_from_ahci(sh);
-            }
+            // `shell_store_boot` already restored the shell; commit before replying.
             // Legacy RX copies 1536 bytes; LivedNet uses IPv4 total_length.
             svc.handle_frame_with_shell(&frame[..1536.min(frame.len())], boots, sh, &mut replies);
+            persist_shell_if_changed(sh, false);
         }
         let mut ri = 0usize;
         while ri < replies.len() {

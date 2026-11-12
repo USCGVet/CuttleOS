@@ -47,6 +47,15 @@ pub const SQL_OWNER_TRIAD: u64 = 0xFFFF_0003;
 pub const SQL_OWNER_UDP: u64 = 0xFFFF_0004;
 /// SQL session owner ID for unauthenticated HTTP gateway queries (`GET /sql`, `POST /sql`).
 pub const SQL_OWNER_HTTP_ANON: u64 = 0xFFFF_0005;
+/// Why [`SqlDb::try_save_partition`] produced no image.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SqlSaveError {
+    /// The seal key is all zero.
+    KeyUnset,
+    /// The committed tables and rows do not fit the partition.
+    TooLarge,
+}
+
 /// Initial `tx_seq` value after `SqlDb::new()` seeds default system tables (`services`, `kv`).
 pub const SQL_GENESIS_TX_SEQ: u64 = 7;
 
@@ -398,6 +407,11 @@ pub struct SqlDb {
     pub tx_undo_row: [u8; SQL_TX_UNDO_CAP],
     /// Pre-transaction row snapshot for each undo slot.
     pub tx_undo_prev: [SqlRow; SQL_TX_UNDO_CAP],
+    /// The last transaction was rolled back by the idle timeout and its owner
+    /// has not yet acknowledged that with `ROLLBACK`, `COMMIT` or `BEGIN`.
+    pub tx_aborted: bool,
+    /// Owner of the transaction the idle timeout rolled back.
+    pub tx_aborted_owner: u64,
 }
 
 impl Default for SqlDb {
@@ -421,6 +435,8 @@ impl SqlDb {
             tx_undo_table: [0u8; SQL_TX_UNDO_CAP],
             tx_undo_row: [0u8; SQL_TX_UNDO_CAP],
             tx_undo_prev: [SqlRow::empty(); SQL_TX_UNDO_CAP],
+            tx_aborted: false,
+            tx_aborted_owner: 0,
         }
     }
 
@@ -509,13 +525,22 @@ impl SqlDb {
     /// Advance the active transaction idle timer by one tick, automatically rolling back
     /// any abandoned transaction that has been idle for [`SQL_TX_MAX_IDLE_TICKS`] ticks.
     /// Returns `true` if a stale transaction was rolled back.
+    ///
+    /// The owner of a transaction rolled back here is left in an *aborted*
+    /// state: its next mutating statements are refused until it sends
+    /// `ROLLBACK`, `COMMIT` (which reports the loss) or `BEGIN`. Otherwise the
+    /// remaining statements of a multi-statement transaction would run one by
+    /// one in autocommit and persist half of it.
     pub fn tick_transaction_timeout(&mut self) -> bool {
         if !self.tx_active {
             return false;
         }
         self.tx_age_ticks = self.tx_age_ticks.saturating_add(1);
         if self.tx_age_ticks >= SQL_TX_MAX_IDLE_TICKS {
+            let owner = self.tx_owner;
             self.rollback_active_transaction();
+            self.tx_aborted = true;
+            self.tx_aborted_owner = owner;
             return true;
         }
         false
@@ -841,6 +866,29 @@ impl SqlDb {
         }
         if self.tx_active {
             self.tx_age_ticks = 0;
+        }
+
+        // This owner's transaction was rolled back by the idle timeout. Until
+        // it acknowledges that, nothing it sends may change the database.
+        if self.tx_aborted && self.tx_aborted_owner == owner {
+            if eq_ignore_ascii_case(kw, b"ROLLBACK") {
+                self.tx_aborted = false;
+                return copy_str(b"ROLLBACK OK\n", out);
+            }
+            if eq_ignore_ascii_case(kw, b"COMMIT") {
+                self.tx_aborted = false;
+                return copy_str(
+                    b"error: transaction timed out and was rolled back; nothing was committed\n",
+                    out,
+                );
+            }
+            if !eq_ignore_ascii_case(kw, b"BEGIN") {
+                return copy_str(
+                    b"error: transaction timed out and was rolled back; send ROLLBACK before further statements\n",
+                    out,
+                );
+            }
+            self.tx_aborted = false;
         }
 
         if eq_ignore_ascii_case(kw, b"BEGIN") {
@@ -1372,6 +1420,28 @@ impl SqlDb {
         let Some(c_idx) = self.tables[t_idx].find_col(cname) else {
             return copy_str(b"error: column not found in CREATE INDEX\n", out);
         };
+        // The index name is stored in the partition image. Admit it only if the
+        // image still fits; otherwise `save_partition` could not hold the table's rows.
+        let col_count = (self.tables[t_idx].col_count as usize).min(SQL_MAX_COLS);
+        let had_idx = self.tables[t_idx].index_name_len > 0
+            && (self.tables[t_idx].indexed_col as usize) < col_count;
+        let old_idx_bytes = if had_idx {
+            2 + (self.tables[t_idx].index_name_len as usize).min(SQL_IDENT_LEN)
+        } else {
+            0
+        };
+        let new_idx_bytes = 2 + idx_name.len().min(SQL_IDENT_LEN);
+        if self
+            .serialized_partition_bytes()
+            .saturating_sub(old_idx_bytes)
+            .saturating_add(new_idx_bytes)
+            > SQL_PART_SECTORS * 512 - 8
+        {
+            return copy_str(
+                b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)\n",
+                out,
+            );
+        }
         self.tables[t_idx].indexed_col = c_idx as u8;
         self.tables[t_idx].index_name = [0u8; SQL_IDENT_LEN];
         self.tables[t_idx].index_name[..idx_name.len()].copy_from_slice(idx_name);
@@ -2079,26 +2149,103 @@ impl SqlDb {
     /// If a `BEGIN` transaction is currently open, serializes the last **committed**
     /// pre-transaction state (`tx_undo_seq` and `committed_row`) so uncommitted rows
     /// are never persisted to disk before `COMMIT`.
+    ///
+    /// If the image cannot be produced (unset key, or a database too large for
+    /// the partition) `sectors` is zero-filled, which no loader accepts. Use
+    /// [`SqlDb::try_save_partition`] to learn why.
     pub fn save_partition(
         &self,
         key: &[u8; DURABLE_DIGEST_LEN],
         sectors: &mut [[u8; 512]; SQL_PART_SECTORS],
     ) {
-        if !is_seal_key_set(key) {
-            let mut s = 0usize;
-            while s < SQL_PART_SECTORS {
-                sectors[s] = [0u8; 512];
-                s += 1;
-            }
-            return;
-        }
-        let mut flat = [0u8; SQL_PART_SECTORS * 512];
-        flat[0..8].copy_from_slice(SQL_PART_MAGIC);
-        let committed_seq = if self.tx_active {
+        let _ = self.try_save_partition(key, sectors);
+    }
+
+    /// The sequence number [`SqlDb::save_partition`] stores in the partition
+    /// header: `tx_seq` of the last committed statement. While a transaction
+    /// is open it stays at the pre-`BEGIN` value and jumps on `COMMIT`, so a
+    /// change in this value means the persisted image changed.
+    pub fn committed_seq(&self) -> u64 {
+        if self.tx_active {
             self.tx_undo_seq
         } else {
             self.tx_seq
-        };
+        }
+    }
+
+    /// Exact size in bytes of the image [`SqlDb::save_partition`] would
+    /// produce for the committed state (the pre-transaction rows while a
+    /// transaction is open).
+    pub fn committed_partition_bytes(&self) -> usize {
+        let mut pos = 52usize;
+        let mut t = 0usize;
+        while t < SQL_MAX_TABLES {
+            let tbl = &self.tables[t];
+            if !tbl.used {
+                pos += 1;
+                t += 1;
+                continue;
+            }
+            let col_count = (tbl.col_count as usize).min(SQL_MAX_COLS);
+            let has_idx = tbl.index_name_len > 0 && (tbl.indexed_col as usize) < col_count;
+            pos += 4 + SQL_IDENT_LEN + col_count * (2 + SQL_IDENT_LEN);
+            if has_idx {
+                pos += 2 + (tbl.index_name_len as usize).min(SQL_IDENT_LEN);
+            }
+            let mut r = 0usize;
+            while r < SQL_MAX_ROWS {
+                let row = self.committed_row(t, r);
+                if row.used {
+                    let mut c = 0usize;
+                    while c < col_count {
+                        pos += match row.cells[c] {
+                            SqlVal::Int(v) => {
+                                if v >= (i16::MIN as i64) && v <= (i16::MAX as i64) {
+                                    3
+                                } else {
+                                    9
+                                }
+                            }
+                            SqlVal::Text(_, len) => 2 + (len as usize).min(SQL_TEXT_LEN),
+                        };
+                        c += 1;
+                    }
+                }
+                r += 1;
+            }
+            t += 1;
+        }
+        pos
+    }
+
+    /// As [`SqlDb::save_partition`], but reports failure instead of producing
+    /// an unusable image.
+    ///
+    /// Every table and every committed row is written, or nothing is: a
+    /// database that does not fit is refused with
+    /// [`SqlSaveError::TooLarge`] rather than saved without its last rows.
+    /// The statement-level capacity checks keep a database from growing past
+    /// the partition, so `TooLarge` signals a missed check, and the caller
+    /// must treat it as a failed save.
+    pub fn try_save_partition(
+        &self,
+        key: &[u8; DURABLE_DIGEST_LEN],
+        sectors: &mut [[u8; 512]; SQL_PART_SECTORS],
+    ) -> Result<(), SqlSaveError> {
+        let mut s = 0usize;
+        while s < SQL_PART_SECTORS {
+            sectors[s] = [0u8; 512];
+            s += 1;
+        }
+        if !is_seal_key_set(key) {
+            return Err(SqlSaveError::KeyUnset);
+        }
+        if self.committed_partition_bytes() > SQL_PART_SECTORS * 512 {
+            return Err(SqlSaveError::TooLarge);
+        }
+        let mut flat = [0u8; SQL_PART_SECTORS * 512];
+        flat[0..8].copy_from_slice(SQL_PART_MAGIC);
+        let committed_seq = self.committed_seq();
         flat[8..16].copy_from_slice(&committed_seq.to_le_bytes());
 
         // Header layout:
@@ -2167,9 +2314,10 @@ impl SqlDb {
                         };
                         rc0 += 1;
                     }
-                    // Reserve 8 bytes at the end of `flat` so remaining table headers always fit.
-                    if pos + row_bytes + 8 > flat.len() {
-                        break;
+                    // `committed_partition_bytes` was checked above, so every row fits.
+                    // Refuse outright if that ever stops holding; never drop a row.
+                    if pos + row_bytes > flat.len() {
+                        return Err(SqlSaveError::TooLarge);
                     }
                     let mut rc = 0usize;
                     while rc < col_count {
@@ -2221,6 +2369,7 @@ impl SqlDb {
             sectors[s].copy_from_slice(&flat[s * 512..(s + 1) * 512]);
             s += 1;
         }
+        Ok(())
     }
 
     /// Restore the database from an 8-sector (`4 KiB`) partition image after verifying
@@ -2432,6 +2581,8 @@ impl SqlDb {
         self.tx_owner = 0;
         self.tx_age_ticks = 0;
         self.tx_undo_len = 0;
+        self.tx_aborted = false;
+        self.tx_aborted_owner = 0;
         true
     }
 }
@@ -3549,6 +3700,185 @@ mod tests {
             core::str::from_utf8(&out[..n_bad_upd])
         );
         assert!(SqlVal::try_from_text(&[b'x'; 25]).is_none());
+    }
+
+    #[test]
+    fn idle_timeout_aborts_the_transaction_until_its_owner_acknowledges_it() {
+        let mut db = SqlDb::new();
+        let mut out = [0u8; 256];
+        let owner = 2u64;
+        let other = 3u64;
+        let run = |db: &mut SqlDb, who: u64, q: &[u8], out: &mut [u8; 256]| -> alloc::string::String {
+            let n = db.exec_as(who, q, out);
+            alloc::string::String::from_utf8_lossy(&out[..n]).into_owned()
+        };
+
+        // A two-statement transfer: the first half is sent, then the client stalls.
+        assert_eq!(run(&mut db, owner, b"BEGIN", &mut out), "BEGIN OK\n");
+        assert_eq!(
+            run(&mut db, owner, b"INSERT INTO kv VALUES ('debit', '100', 1)", &mut out),
+            "INSERT 1\n"
+        );
+        let rows_before = db.total_rows();
+        for _ in 0..SQL_TX_MAX_IDLE_TICKS - 1 {
+            assert!(!db.tick_transaction_timeout());
+        }
+        assert!(db.tick_transaction_timeout(), "the idle transaction must be rolled back");
+        assert_eq!(db.total_rows(), rows_before - 1, "the first half must be undone");
+        let committed = db.committed_seq();
+
+        // The second half arrives late. It must not be applied on its own.
+        let late = run(&mut db, owner, b"INSERT INTO kv VALUES ('credit', '100', 1)", &mut out);
+        assert!(late.starts_with("error: transaction timed out"), "{late}");
+        let late = run(&mut db, owner, b"UPDATE kv SET v = 'x' WHERE k = 'boot.state'", &mut out);
+        assert!(late.starts_with("error: transaction timed out"), "{late}");
+        let late = run(&mut db, owner, b"DELETE FROM kv WHERE k = 'credit'", &mut out);
+        assert!(late.starts_with("error: transaction timed out"), "{late}");
+        assert_eq!(db.total_rows(), rows_before - 1);
+        assert_eq!(db.committed_seq(), committed, "nothing may be committed while aborted");
+
+        // Reads still work, and other sessions are not affected.
+        assert!(run(&mut db, owner, b"SELECT k FROM kv", &mut out).starts_with("k\n"));
+        assert_eq!(
+            run(&mut db, other, b"INSERT INTO kv VALUES ('other', '1', 1)", &mut out),
+            "INSERT 1\n"
+        );
+
+        // COMMIT reports the loss instead of claiming success, and clears the state.
+        let c = run(&mut db, owner, b"COMMIT", &mut out);
+        assert!(c.starts_with("error: transaction timed out"), "{c}");
+        assert_eq!(
+            run(&mut db, owner, b"INSERT INTO kv VALUES ('after', '1', 1)", &mut out),
+            "INSERT 1\n"
+        );
+
+        // ROLLBACK and BEGIN also acknowledge it.
+        for ack in [b"ROLLBACK".as_slice(), b"BEGIN".as_slice()] {
+            assert_eq!(run(&mut db, owner, b"BEGIN", &mut out), "BEGIN OK\n");
+            for _ in 0..SQL_TX_MAX_IDLE_TICKS {
+                db.tick_transaction_timeout();
+            }
+            assert!(db.tx_aborted && !db.tx_active);
+            let r = run(&mut db, owner, ack, &mut out);
+            assert!(r.ends_with(" OK\n"), "{r}");
+            assert!(!db.tx_aborted);
+            if db.tx_active {
+                assert_eq!(run(&mut db, owner, b"ROLLBACK", &mut out), "ROLLBACK OK\n");
+            }
+        }
+    }
+
+    #[test]
+    fn create_index_respects_partition_capacity_and_a_full_database_saves_every_row() {
+        let key = [0x5Cu8; DURABLE_DIGEST_LEN];
+        let mut db = SqlDb::new();
+        let mut out = [0u8; 256];
+        let n = db.exec(b"CREATE TABLE tiny (n INT)", &mut out);
+        assert_eq!(&out[..n], b"CREATE TABLE tiny OK\n");
+
+        // Fill the partition with wide rows, then top it up with 3-byte rows
+        // so that less than one index header of headroom is left.
+        let mut wide = 0u32;
+        loop {
+            let q = alloc::format!(
+                "INSERT INTO kv VALUES ('key-{wide:04}-padpadpadpadpad', 'value-{wide:04}-padpadpadpad', {wide})"
+            );
+            let n = db.exec(q.as_bytes(), &mut out);
+            if &out[..n] != b"INSERT 1\n" {
+                break;
+            }
+            wide += 1;
+            assert!(wide < 200, "kv never filled");
+        }
+        let n = db.exec(b"CREATE TABLE big (a TEXT, b TEXT, c TEXT, d TEXT)", &mut out);
+        assert_eq!(&out[..n], b"CREATE TABLE big OK
+");
+        let mut bulk = 0u32;
+        loop {
+            let q = alloc::format!(
+                "INSERT INTO big VALUES ('a-{bulk:04}-padpadpadpadpadpa', 'b-{bulk:04}-padpadpadpadpadpa', 'c-{bulk:04}-padpadpadpadpadpa', 'd-{bulk:04}-padpadpadpadpadpa')"
+            );
+            let n = db.exec(q.as_bytes(), &mut out);
+            if &out[..n] != b"INSERT 1
+" {
+                assert_eq!(
+                    &out[..n],
+                    b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)
+"
+                );
+                break;
+            }
+            bulk += 1;
+            assert!(bulk < 200, "big never filled");
+        }
+        let mut small = 0u32;
+        loop {
+            let q = alloc::format!("INSERT INTO tiny VALUES ({small})");
+            let n = db.exec(q.as_bytes(), &mut out);
+            if &out[..n] != b"INSERT 1\n" {
+                break;
+            }
+            small += 1;
+            assert!(small < 200, "tiny never filled");
+        }
+        let cap = SQL_PART_SECTORS * 512 - 8;
+        assert!(db.serialized_partition_bytes() <= cap);
+        assert!(
+            db.serialized_partition_bytes() + 18 > cap,
+            "setup left {} bytes free; the index would fit and the test would prove nothing",
+            cap - db.serialized_partition_bytes()
+        );
+
+        // An index name is stored in the partition; here it no longer fits.
+        let seq = db.tx_seq;
+        let n = db.exec(b"CREATE INDEX idx_kv_key_name0 ON kv (k)", &mut out);
+        assert_eq!(
+            &out[..n],
+            b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)\n"
+        );
+        assert_eq!(db.tx_seq, seq, "a refused statement must not change the database");
+
+        // The full database round-trips with every row.
+        let mut secs = [[0u8; 512]; SQL_PART_SECTORS];
+        assert_eq!(db.try_save_partition(&key, &mut secs), Ok(()));
+        assert_eq!(db.committed_partition_bytes(), db.serialized_partition_bytes());
+        let mut back = SqlDb::new();
+        assert!(back.load_partition(&key, &secs));
+        assert_eq!(back.total_rows(), db.total_rows());
+        assert_eq!(back.state_hash(), db.state_hash());
+
+        // A database that cannot fit is refused outright, never saved short.
+        // (Reachable only by bypassing the statement-level checks, as here.)
+        let mut over = db;
+        let last = over.tables.iter().rposition(|t| t.used).expect("a table");
+        over.tables[last].index_name_len = SQL_IDENT_LEN as u8;
+        over.tables[last].indexed_col = 0;
+        assert!(over.committed_partition_bytes() > SQL_PART_SECTORS * 512 - 8);
+        let mut grown = over;
+        let mut t = 0usize;
+        while grown.committed_partition_bytes() <= SQL_PART_SECTORS * 512 && t < SQL_MAX_TABLES {
+            if grown.tables[t].used && grown.tables[t].index_name_len == 0 {
+                grown.tables[t].index_name_len = SQL_IDENT_LEN as u8;
+                grown.tables[t].indexed_col = 0;
+            }
+            t += 1;
+        }
+        if grown.committed_partition_bytes() > SQL_PART_SECTORS * 512 {
+            let mut secs2 = [[0xEEu8; 512]; SQL_PART_SECTORS];
+            assert_eq!(
+                grown.try_save_partition(&key, &mut secs2),
+                Err(SqlSaveError::TooLarge)
+            );
+            assert!(
+                secs2.iter().all(|s| s.iter().all(|&b| b == 0)),
+                "a refused save must not leave a partial image"
+            );
+            assert!(!SqlDb::new().load_partition(&key, &secs2));
+        }
+        assert_eq!(
+            SqlDb::new().try_save_partition(&[0u8; DURABLE_DIGEST_LEN], &mut secs),
+            Err(SqlSaveError::KeyUnset)
+        );
     }
 
     #[test]

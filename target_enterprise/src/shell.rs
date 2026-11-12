@@ -54,7 +54,7 @@ use crate::syscall::{
 };
 use crate::tpm::{TpmImpl, TPM_MAX_CMD_LEN};
 use crate::vfs::MemRamFs;
-use crate::wal::{durable_wal_proof, WalError, WalImpl};
+use crate::wal::{durable_wal_proof, WalError, WalImpl, FRAME_HEADER_BYTES};
 
 /// Maximum length of an interactive command line in bytes.
 pub const SHELL_LINE_MAX: usize = 256;
@@ -80,6 +80,75 @@ pub const SHELL_MAX_SESSIONS: usize = 4;
 pub const SHELL_MAX_CRON_JOBS: usize = 4;
 /// Interactive console prompt string.
 pub const SHELL_PROMPT: &[u8] = b"cuttle> ";
+
+/// Why [`OsShell::pack_state_image`] could not build an image.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StatePackError {
+    /// The shell header or journal could not be sealed (unset key, or state
+    /// records that do not fit the journal sector).
+    Journal(WalError),
+    /// The filesystem partition could not be built.
+    Filesystem(WalError),
+    /// The SQL partition could not be built.
+    Sql(crate::sql::SqlSaveError),
+}
+
+/// What [`OsShell::unpack_state_image`] restored.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct StateRestore {
+    /// Boot generation the image was written under.
+    pub saved_boots: u64,
+    /// Journal records applied.
+    pub records: usize,
+    /// User files restored from the filesystem partition.
+    pub files: usize,
+    /// At least one part used the pre-rebrand `PRTS*` format; the caller
+    /// should commit the state again to rewrite it in the current format.
+    pub migrated_legacy: bool,
+}
+
+/// Why [`OsShell::unpack_state_image`] refused an image.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StateRestoreError {
+    /// The shell header or journal failed verification.
+    Journal {
+        /// The header carried the pre-rebrand `PRTS` magic.
+        legacy_header: bool,
+    },
+    /// The filesystem partition is missing, failed verification, or could
+    /// not be recreated in full.
+    Filesystem,
+    /// The filesystem partition belongs to a different boot generation than
+    /// the shell header.
+    GenerationMismatch,
+    /// The SQL partition is missing or failed verification.
+    Sql,
+}
+
+/// Size of the shell journal that [`OsShell::pack_disk_image`] seals into one disk sector.
+pub const SHELL_JOURNAL_BYTES: usize = 512;
+/// Payload bytes of a worker-task (`T`) journal record.
+const STATE_REC_TASK_LEN: usize = 13;
+/// Payload bytes of a firewall-rule (`W`) journal record.
+const STATE_REC_FW_LEN: usize = 7;
+/// Payload bytes of the anti-replay watermark (`Q`) journal record.
+const STATE_REC_AUTH_LEN: usize = 9;
+/// Payload bytes of the security-watermark (`S`) journal record.
+const STATE_REC_SEC_LEN: usize = 28;
+/// Journal bytes kept free for records no operator command asks for: the
+/// anti-replay watermark (`Q`), the security watermarks (`S`), and the one
+/// firewall rule `guard lockdown` installs. Reserving them means an
+/// authenticated datagram, a login or a lockdown can never be the change
+/// that makes the state too large to persist.
+pub const SHELL_JOURNAL_RESERVE: usize = (FRAME_HEADER_BYTES + STATE_REC_AUTH_LEN)
+    + (FRAME_HEADER_BYTES + STATE_REC_SEC_LEN)
+    + (FRAME_HEADER_BYTES + STATE_REC_FW_LEN);
+/// Reply for a file write refused because the file would not fit.
+const FS_NO_SPACE_MSG: &[u8] =
+    b"error: ENOSPC (file does not fit; nothing was changed)\n";
+/// Reply for a command refused because its journal record would not fit.
+const JOURNAL_FULL_MSG: &[u8] =
+    b"error: ENOSPC (durable state journal full; remove a task, firewall rule, IMA digest or cron job)\n";
 
 /// Periodic scheduled task entry in CuttleChronos (`cron`).
 #[derive(Copy, Clone, Debug)]
@@ -990,11 +1059,22 @@ impl OsShell {
                     }
                     WritablePathPolicy::Allowed(nlen) => {
                         let cpath = &norm_path[..nlen];
-                        if let Ok(fh) =
+                        if !self.fs.can_replace(cpath, mb_body.len()) {
+                            // Refuse before truncating: the existing file stays as it was.
+                            self.record_net_audit(AuditVerdict::Error, b"net:http:fs-nospace");
+                            let n = copy_into(FS_NO_SPACE_MSG, resp_out);
+                            (507u16, n)
+                        } else if let Ok(fh) =
                             self.fs.open(cpath, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC)
                         {
-                            let written = self.fs.write(fh, 0, mb_body).unwrap_or(0);
+                            let wrote = self.fs.write(fh, 0, mb_body);
                             let _ = self.fs.close(fh);
+                            let Ok(written) = wrote else {
+                                self.record_net_audit(AuditVerdict::Error, b"net:http:fs-io-err");
+                                let n = copy_into(b"error: write failed\n", resp_out);
+                                self.svc.complete_mailbox_response(target, 500, n);
+                                return Ok((500u16, n));
+                            };
                             self.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-put");
                             let mut mpos = 0usize;
                             mpos += copy_into(b"wrote ", &mut resp_out[mpos..]);
@@ -1064,8 +1144,97 @@ impl OsShell {
     }
 
     /// Serialize `self.db` into an 8-sector (`4 KiB`) partition image sealed with `self.seal_key`.
+    ///
+    /// If the image cannot be produced, `sectors` is zero-filled; use
+    /// [`OsShell::try_pack_sql_partition`] to detect that.
     pub fn pack_sql_partition(&self, sectors: &mut [[u8; 512]; crate::sql::SQL_PART_SECTORS]) {
         self.db.save_partition(&self.seal_key, sectors);
+    }
+
+    /// As [`OsShell::pack_sql_partition`], but reports an unset key or a
+    /// database too large for the partition instead of zero-filling.
+    pub fn try_pack_sql_partition(
+        &self,
+        sectors: &mut [[u8; 512]; crate::sql::SQL_PART_SECTORS],
+    ) -> Result<(), crate::sql::SqlSaveError> {
+        self.db.try_save_partition(&self.seal_key, sectors)
+    }
+
+    /// Serialise everything that must survive a reboot into `image`: the
+    /// sealed shell header and journal, the filesystem partition and the SQL
+    /// partition, all stamped with boot generation `boots`.
+    ///
+    /// Returns the number of journal records written. On `Err` the contents
+    /// of `image` are unspecified and must not be committed.
+    pub fn pack_state_image(
+        &mut self,
+        boots: u64,
+        image: &mut crate::state_store::StateImage,
+    ) -> Result<usize, StatePackError> {
+        let (hdr, wal) = image.wal.split_at_mut(1);
+        let records = self
+            .pack_disk_image(boots, &mut hdr[0], &mut wal[0])
+            .map_err(StatePackError::Journal)?;
+        self.pack_fs_partition(boots, &mut image.fs)
+            .map_err(StatePackError::Filesystem)?;
+        self.try_pack_sql_partition(&mut image.sql)
+            .map_err(StatePackError::Sql)?;
+        Ok(records)
+    }
+
+    /// Verify and load a state image produced by [`OsShell::pack_state_image`]
+    /// into this shell, which must be freshly seeded.
+    ///
+    /// All three parts are required and each is checked against its own
+    /// keyed seal; the filesystem partition must carry the same boot
+    /// generation as the shell header. A missing part is an error rather than
+    /// "nothing to restore": an image that lost its filesystem or SQL
+    /// partition must not be mistaken for an empty one. The one exception is
+    /// an image with the pre-rebrand `PRTS` header, which may have been
+    /// written before those partitions existed.
+    ///
+    /// On `Err` the shell may be partly restored and must be discarded.
+    pub fn unpack_state_image(
+        &mut self,
+        image: &crate::state_store::StateImage,
+    ) -> Result<StateRestore, StateRestoreError> {
+        let legacy_header = bytes_eq(&image.wal[0][0..4], b"PRTS");
+        let (saved_boots, applied) = self
+            .unpack_disk_image(&image.wal[0], &image.wal[1])
+            .map_err(|_| StateRestoreError::Journal { legacy_header })?;
+
+        // Pre-rebrand (`PRTS`) images may predate the filesystem and SQL
+        // partitions. Only for those is an all-zero partition "not there
+        // yet"; in the current format it is damage.
+        let blank = |part: &[[u8; 512]]| part.iter().all(|s| s.iter().all(|&b| b == 0));
+        let mut migrated = legacy_header;
+        let mut files = 0usize;
+        if !(legacy_header && blank(&image.fs)) {
+            let (generation, restored, _) = self
+                .unpack_fs_partition(&image.fs)
+                .map_err(|_| StateRestoreError::Filesystem)?;
+            if generation != saved_boots {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:fs:generation-mismatch");
+                return Err(StateRestoreError::GenerationMismatch);
+            }
+            files = restored;
+            migrated |= bytes_eq(&image.fs[0][0..4], b"PRTS");
+        }
+
+        if !(legacy_header && blank(&image.sql)) {
+            if !self.unpack_sql_partition(&image.sql) {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:sql:seal-mismatch");
+                return Err(StateRestoreError::Sql);
+            }
+            migrated |= bytes_eq(&image.sql[0][0..4], b"PRTS");
+        }
+
+        Ok(StateRestore {
+            saved_boots,
+            records: applied,
+            files,
+            migrated_legacy: migrated,
+        })
     }
 
     /// Verify and restore `self.db` from an 8-sector (`4 KiB`) partition image sealed with `self.seal_key`
@@ -1131,79 +1300,44 @@ impl OsShell {
         false
     }
 
-    /// Checkpoint all user/mutable files, active worker tasks (`pid >= 5`)
-    /// plus their capability and eBPF Seccomp masks, stateless firewall CIDR
-    /// rules (`W`), custom enrolled IMA binary digests (`I`), and the monotonic
-    /// UDP anti-replay sequence watermark (`Q`) into `wal`, flushing with a
-    /// `DURABLE_WAL_WRITE` [`cuttle_contracts::CapProof`].
+    /// Emit every record that must survive a reboot and has no other home on
+    /// disk, in a fixed order: worker tasks with their capability and Seccomp
+    /// masks (`T`), firewall rules (`W`), custom IMA digests (`I`), the UDP
+    /// anti-replay watermark (`Q`), the security watermarks (`S`) and cron
+    /// jobs (`C`). Returns the number of records emitted.
     ///
-    /// Returns the number of WAL records written.
-    pub fn checkpoint_wal<const C: usize>(&mut self, wal: &mut WalImpl<C>) -> Result<usize, WalError> {
-        let proof = match durable_wal_proof(self.task_caps[4]) {
-            Ok(p) => p,
-            Err(_) => {
-                self.record_audit(19, AuditVerdict::Denied, b"shell:wal:no-cap");
-                return Ok(0);
-            }
-        };
-
+    /// [`OsShell::checkpoint_wal`], [`OsShell::state_journal_bytes`] and
+    /// [`OsShell::durable_fingerprint`] all run this one enumeration, so the
+    /// size the admission checks compute and the change the kernel detects
+    /// are by construction the bytes the checkpoint writes.
+    fn for_each_state_record(
+        &self,
+        emit: &mut dyn FnMut(&[u8]) -> Result<(), WalError>,
+    ) -> Result<usize, WalError> {
         let mut count = 0usize;
-        let mut i = 0usize;
-        while i < SHELL_FS_INODES {
-            if let Some((path, data)) = self.fs.inode_data(i) {
-                if !is_default_system_file(path) && path.len() <= 128 && data.len() <= 256 {
-                    let mut rec = [0u8; 390];
-                    rec[0] = b'F';
-                    rec[1] = path.len() as u8;
-                    let mut k = 0usize;
-                    while k < path.len() {
-                        rec[2 + k] = path[k];
-                        k += 1;
-                    }
-                    let d_off = 2 + path.len();
-                    let mut m = 0usize;
-                    while m < data.len() {
-                        rec[d_off + m] = data[m];
-                        m += 1;
-                    }
-                    wal.append(&rec[..d_off + data.len()])?;
-                    count += 1;
-                }
-            }
-            i += 1;
-        }
 
         let mut s = 0usize;
         while s < SHELL_MAX_TASKS {
             if let Some(t) = self.sched.slot(s) {
                 if t.state != TaskState::Empty && t.state != TaskState::Exited && t.id >= 5 {
-                    let mut rec = [0u8; 13];
+                    let mut rec = [0u8; STATE_REC_TASK_LEN];
                     rec[0] = b'T';
-                    let pid_b = t.id.to_le_bytes();
-                    rec[1] = pid_b[0];
-                    rec[2] = pid_b[1];
-                    rec[3] = pid_b[2];
-                    rec[4] = pid_b[3];
+                    rec[1..5].copy_from_slice(&t.id.to_le_bytes());
                     let cap_mask = if (t.id as usize) < SHELL_MAX_TASKS {
                         (self.task_caps[t.id as usize] & 0x00FF_FFFF_FFFF_FFFF)
                             | ((self.seccomp_mask[t.id as usize] as u64) << 56)
                     } else {
                         0
                     };
-                    let cap_b = cap_mask.to_le_bytes();
-                    let mut c = 0usize;
-                    while c < 8 {
-                        rec[5 + c] = cap_b[c];
-                        c += 1;
-                    }
-                    wal.append(&rec)?;
+                    rec[5..13].copy_from_slice(&cap_mask.to_le_bytes());
+                    emit(&rec)?;
                     count += 1;
                 }
             }
             s += 1;
         }
 
-        // Persist stateless CIDR firewall rules (`W` records, 7 bytes each).
+        // Stateless CIDR firewall rules.
         let rules = self.fw.as_slice();
         let mut r_idx = 0usize;
         while r_idx < rules.len() {
@@ -1213,7 +1347,7 @@ impl OsShell {
                 FilterAction::Drop => 1u8,
                 FilterAction::Reject => 2u8,
             };
-            let rec = [
+            let rec: [u8; STATE_REC_FW_LEN] = [
                 b'W',
                 r.src_ip[0],
                 r.src_ip[1],
@@ -1222,12 +1356,12 @@ impl OsShell {
                 r.src_mask,
                 act_byte,
             ];
-            wal.append(&rec)?;
+            emit(&rec)?;
             count += 1;
             r_idx += 1;
         }
 
-        // Persist custom enrolled IMA binary digests (`I` records, 2 + plen + 32 bytes).
+        // Custom enrolled IMA binary digests (the two built-ins are re-seeded at boot).
         let mut ima_i = 0usize;
         while ima_i < self.ima_count {
             let plen = self.ima_path_lens[ima_i] as usize;
@@ -1236,34 +1370,25 @@ impl OsShell {
                 let mut rec = [0u8; 2 + 32 + DURABLE_DIGEST_LEN];
                 rec[0] = b'I';
                 rec[1] = plen as u8;
-                let mut k = 0usize;
-                while k < plen {
-                    rec[2 + k] = path[k];
-                    k += 1;
-                }
+                rec[2..2 + plen].copy_from_slice(path);
                 let d_off = 2 + plen;
-                let mut d = 0usize;
-                while d < DURABLE_DIGEST_LEN {
-                    rec[d_off + d] = self.ima_digests[ima_i][d];
-                    d += 1;
-                }
-                wal.append(&rec[..d_off + DURABLE_DIGEST_LEN])?;
+                rec[d_off..d_off + DURABLE_DIGEST_LEN].copy_from_slice(&self.ima_digests[ima_i]);
+                emit(&rec[..d_off + DURABLE_DIGEST_LEN])?;
                 count += 1;
             }
             ima_i += 1;
         }
 
-        // Persist monotonic UDP control-plane anti-replay sequence watermark (`Q` record, 9 bytes).
+        // Monotonic UDP control-plane anti-replay sequence watermark.
         if self.auth_seq > 0 {
-            let sb = self.auth_seq.to_le_bytes();
-            let rec = [
-                b'Q', sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7],
-            ];
-            wal.append(&rec)?;
+            let mut rec = [0u8; STATE_REC_AUTH_LEN];
+            rec[0] = b'Q';
+            rec[1..9].copy_from_slice(&self.auth_seq.to_le_bytes());
+            emit(&rec)?;
             count += 1;
         }
 
-        // Persist security watermarks and lockdown posture (`S` record, 28 bytes).
+        // Security watermarks and lockdown posture.
         if self.guard_lockdown
             || self.http_login_seq > 0
             || self.triad_tx_seq > 0
@@ -1271,7 +1396,7 @@ impl OsShell {
             || self.triad_node_id != 0
             || (self.vault_nonce_seq != 0 && self.vault_nonce_seq != self.vault_nonce_default)
         {
-            let mut rec = [0u8; 28];
+            let mut rec = [0u8; STATE_REC_SEC_LEN];
             rec[0] = b'S';
             rec[1] = (if self.guard_lockdown { 1u8 } else { 0u8 })
                 | ((self.triad_node_id & 0x03) << 1);
@@ -1279,11 +1404,11 @@ impl OsShell {
             rec[4..12].copy_from_slice(&self.http_login_seq.to_le_bytes());
             rec[12..20].copy_from_slice(&self.triad_tx_seq.to_le_bytes());
             rec[20..28].copy_from_slice(&self.triad_min_epoch.to_le_bytes());
-            wal.append(&rec)?;
+            emit(&rec)?;
             count += 1;
         }
 
-        // Persist active CuttleChronos scheduled jobs (`C` records, 7 + cmd_len bytes).
+        // Active CuttleChronos scheduled jobs.
         let mut cj = 0usize;
         while cj < SHELL_MAX_CRON_JOBS {
             let job = &self.cron_jobs[cj];
@@ -1295,10 +1420,156 @@ impl OsShell {
                 rec[2..6].copy_from_slice(&(job.interval_ticks as u32).to_le_bytes());
                 rec[6] = clen as u8;
                 rec[7..7 + clen].copy_from_slice(&job.cmd[..clen]);
-                wal.append(&rec[..7 + clen])?;
+                emit(&rec[..7 + clen])?;
                 count += 1;
             }
             cj += 1;
+        }
+
+        Ok(count)
+    }
+
+    /// Bytes of the [`SHELL_JOURNAL_BYTES`]-byte shell journal sector that the
+    /// operator-controlled records (`T`, `W`, `I`, `C`) of the current state
+    /// occupy, frame headers included.
+    ///
+    /// The `Q` and `S` records are left out: the kernel raises them on its
+    /// own (an authenticated datagram, a login, a Triad commit), so their
+    /// space is set aside permanently in [`SHELL_JOURNAL_RESERVE`] instead.
+    pub fn state_journal_bytes(&self) -> usize {
+        let mut total = 0usize;
+        let _ = self.for_each_state_record(&mut |rec: &[u8]| {
+            if rec[0] != b'Q' && rec[0] != b'S' {
+                total += FRAME_HEADER_BYTES + rec.len();
+            }
+            Ok(())
+        });
+        total
+    }
+
+    /// `true` iff one more journal record with a `payload_len`-byte payload
+    /// still fits the shell journal sector alongside the reserve.
+    ///
+    /// Every command that adds a `T`, `W`, `I` or `C` record asks this first
+    /// and refuses with `ENOSPC` otherwise. Without that check a state too
+    /// large for the sector would be accepted in memory, and every later
+    /// commit of *any* state (files and SQL included) would fail to pack.
+    pub fn journal_admits(&self, payload_len: usize) -> bool {
+        self.state_journal_bytes()
+            .saturating_add(FRAME_HEADER_BYTES)
+            .saturating_add(payload_len)
+            .saturating_add(SHELL_JOURNAL_RESERVE)
+            <= SHELL_JOURNAL_BYTES
+    }
+
+    /// `true` iff `norm_path` (already normalised) has an IMA digest enrolled.
+    fn ima_is_enrolled(&self, norm_path: &[u8]) -> bool {
+        let mut i = 0usize;
+        while i < self.ima_count {
+            let plen = self.ima_path_lens[i] as usize;
+            if bytes_eq(&self.ima_paths[i][..plen], norm_path) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// A digest that changes whenever the state [`OsShell::pack_state_image`]
+    /// would persist changes: every journal record, every filesystem
+    /// mutation, and the committed SQL sequence.
+    ///
+    /// The kernel compares this after each command or network frame and
+    /// commits when it differs. It is derived from the same record
+    /// enumeration the checkpoint writes, from a counter inside the
+    /// filesystem that every mutating call advances, and from the sequence
+    /// the SQL partition header stores, so no command can change durable
+    /// state without changing it. It may also change when the packed image
+    /// does not (a file rewritten with identical bytes); the commit path
+    /// de-duplicates on the image digests.
+    pub fn durable_fingerprint(&self) -> [u8; DURABLE_DIGEST_LEN] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"cuttle-durable-fingerprint-v1\0");
+        let _ = self.for_each_state_record(&mut |rec: &[u8]| {
+            hasher.update((rec.len() as u32).to_le_bytes());
+            hasher.update(rec);
+            Ok(())
+        });
+        hasher.update([0xFFu8]);
+        hasher.update(self.fs.mutation_seq().to_le_bytes());
+        hasher.update(self.db.committed_seq().to_le_bytes());
+        let mut out = [0u8; DURABLE_DIGEST_LEN];
+        out.copy_from_slice(&hasher.finalize());
+        out
+    }
+
+    /// Checkpoint small user files (`F`), active worker tasks (`pid >= 5`)
+    /// plus their capability and eBPF Seccomp masks (`T`), stateless firewall
+    /// CIDR rules (`W`), custom enrolled IMA binary digests (`I`), the
+    /// monotonic UDP anti-replay sequence watermark (`Q`), security
+    /// watermarks (`S`) and cron jobs (`C`) into `wal`, flushing with a
+    /// `DURABLE_WAL_WRITE` [`cuttle_contracts::CapProof`].
+    ///
+    /// The state records (`T` to `C`) are mandatory: if they do not fit, the
+    /// checkpoint fails with [`WalError::OutOfCapacity`]. The file records
+    /// are a redundant copy (the filesystem partition written by
+    /// [`OsShell::pack_fs_partition`] is the authority for file contents and
+    /// holds files of every size), so they are written first, as they always
+    /// were, but only while enough room remains for every state record. A
+    /// file that would crowd out a state record is left out instead of
+    /// failing the checkpoint.
+    ///
+    /// Returns the number of WAL records written.
+    pub fn checkpoint_wal<const C: usize>(&mut self, wal: &mut WalImpl<C>) -> Result<usize, WalError> {
+        let proof = match durable_wal_proof(self.task_caps[4]) {
+            Ok(p) => p,
+            Err(_) => {
+                self.record_audit(19, AuditVerdict::Denied, b"shell:wal:no-cap");
+                return Ok(0);
+            }
+        };
+
+        // Room the state records need, set aside before any file copy is written.
+        let mut state_bytes = 0usize;
+        let _ = self.for_each_state_record(&mut |rec: &[u8]| {
+            state_bytes += FRAME_HEADER_BYTES + rec.len();
+            Ok(())
+        });
+
+        let mut count = 0usize;
+        let mut i = 0usize;
+        while i < SHELL_FS_INODES {
+            if let Some((path, data)) = self.fs.inode_data(i) {
+                if !is_default_system_file(path) && path.len() <= 128 && data.len() <= 256 {
+                    let mut rec = [0u8; 390];
+                    rec[0] = b'F';
+                    rec[1] = path.len() as u8;
+                    rec[2..2 + path.len()].copy_from_slice(path);
+                    let d_off = 2 + path.len();
+                    rec[d_off..d_off + data.len()].copy_from_slice(data);
+                    let framed = FRAME_HEADER_BYTES + d_off + data.len();
+                    let fits = wal
+                        .write_cursor()
+                        .saturating_add(framed)
+                        .saturating_add(state_bytes)
+                        <= C;
+                    // No room beside the state records: the filesystem
+                    // partition has the file, so skip this copy.
+                    if fits {
+                        wal.append(&rec[..d_off + data.len()])?;
+                        count += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        match self.for_each_state_record(&mut |rec: &[u8]| wal.append(rec).map(|_| ())) {
+            Ok(n) => count += n,
+            Err(e) => {
+                self.record_audit(19, AuditVerdict::Error, b"shell:wal:journal-full");
+                return Err(e);
+            }
         }
 
         wal.flush(proof)?;
@@ -1857,95 +2128,99 @@ impl OsShell {
             return Err(WalError::PayloadTooLarge);
         }
 
+        // Pass 1: every directory entry must be well formed before anything
+        // in the live filesystem is touched.
+        let mut norm_path_buf = [0u8; cuttle_contracts::FS_PATH_MAX];
+        let mut exact_bytes = 0usize;
         let mut idx = 0usize;
         while idx < file_count {
-            let dir_sec = 1 + (idx / 8);
-            let dir_off = (idx % 8) * 64;
-            let plen = u16::from_le_bytes([
-                sectors[dir_sec][dir_off],
-                sectors[dir_sec][dir_off + 1],
-            ]) as usize;
-            let doff = u16::from_le_bytes([
-                sectors[dir_sec][dir_off + 2],
-                sectors[dir_sec][dir_off + 3],
-            ]) as usize;
-            let dlen = u32::from_le_bytes([
-                sectors[dir_sec][dir_off + 4],
-                sectors[dir_sec][dir_off + 5],
-                sectors[dir_sec][dir_off + 6],
-                sectors[dir_sec][dir_off + 7],
-            ]) as usize;
-            let mtime = u64::from_le_bytes([
-                sectors[dir_sec][dir_off + 56],
-                sectors[dir_sec][dir_off + 57],
-                sectors[dir_sec][dir_off + 58],
-                sectors[dir_sec][dir_off + 59],
-                sectors[dir_sec][dir_off + 60],
-                sectors[dir_sec][dir_off + 61],
-                sectors[dir_sec][dir_off + 62],
-                sectors[dir_sec][dir_off + 63],
-            ]);
-            if plen == 0 || plen > SHELL_MAX_WRITABLE_PATH || doff.saturating_add(dlen) > data_bytes {
+            let Some((_, _, dlen, _)) = parse_fs_dirent(sectors, idx, data_bytes, &mut norm_path_buf)
+            else {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:fs:dirent-corrupt");
                 return Err(WalError::PayloadTooLarge);
-            }
-            let mut raw_path_buf = [0u8; SHELL_MAX_WRITABLE_PATH];
-            let inline_len = plen.min(46);
-            raw_path_buf[..inline_len]
-                .copy_from_slice(&sectors[dir_sec][dir_off + 8..dir_off + 8 + inline_len]);
-            if plen > 46 {
-                let ext_base = idx * 160;
-                let tail_len = plen - 46;
-                let mut k = 0usize;
-                while k < tail_len {
-                    let abs_ext = ext_base + k;
-                    raw_path_buf[46 + k] = sectors[11 + (abs_ext / 512)][abs_ext % 512];
-                    k += 1;
+            };
+            exact_bytes = exact_bytes.saturating_add(dlen);
+            idx += 1;
+        }
+
+        // The partition is the complete set of user files. Remove whatever
+        // user files are present (for example the small-file copies replayed
+        // from the journal) so their pool reservations cannot crowd out a
+        // file that is about to be restored.
+        let mut i = 0usize;
+        while i < SHELL_FS_INODES {
+            let mut stale = [0u8; cuttle_contracts::FS_PATH_MAX];
+            let stale_len = match self.fs.inode_entry(i) {
+                Some((path, _)) if !is_default_system_file(path) => {
+                    stale[..path.len()].copy_from_slice(path);
+                    path.len()
                 }
+                _ => 0,
+            };
+            if stale_len > 0 && self.fs.unlink(&stale[..stale_len]).is_err() {
+                self.record_audit(21, AuditVerdict::Error, b"shell:fs:restore-failed");
+                return Err(WalError::OutOfCapacity);
             }
-            let mut norm_path_buf = [0u8; cuttle_contracts::FS_PATH_MAX];
-            let Ok(nlen) = crate::vfs::normalise_path(&raw_path_buf[..plen], &mut norm_path_buf)
+            i += 1;
+        }
+
+        // Pass 2: restore. Each file reserves at least its own length, which
+        // always fits because the same bytes fitted when the image was
+        // written. A small file is given the usual 256-byte reservation only
+        // while that still leaves room for every file after it.
+        let mut later_bytes = exact_bytes;
+        let mut chunk = [0u8; 256];
+        let mut idx = 0usize;
+        while idx < file_count {
+            let Some((nlen, doff, dlen, mtime)) =
+                parse_fs_dirent(sectors, idx, data_bytes, &mut norm_path_buf)
             else {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:fs:dirent-corrupt");
                 return Err(WalError::PayloadTooLarge);
             };
             let path = &norm_path_buf[..nlen];
-            if is_default_system_file(path) {
-                self.record_audit(21, AuditVerdict::Denied, b"shell:fs:dirent-corrupt");
-                return Err(WalError::PayloadTooLarge);
-            }
-            let mut chunk = [0u8; 256];
-            if dlen <= 256 {
-                let mut b = 0usize;
-                while b < dlen {
-                    let abs = doff + b;
-                    chunk[b] = sectors[3 + (abs / 512)][abs % 512];
-                    b += 1;
-                }
-                if let Ok(fh) = self.fs.open(path, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC) {
-                    let _ = self.fs.write(fh, 0, &chunk[..dlen]);
-                    let _ = self.fs.close(fh);
-                }
+            later_bytes -= dlen;
+            let free = self
+                .fs
+                .pool_capacity()
+                .saturating_sub(self.fs.pool_used() as usize);
+            let spare = free.saturating_sub(dlen).saturating_sub(later_bytes);
+            let reserve = if dlen < 256 {
+                dlen + (256 - dlen).min(spare)
             } else {
-                let _ = self.fs.unlink(path);
-                if self.fs.seed_file(path, &[], dlen, mtime).is_ok() {
-                    if let Ok(fh) = self.fs.open(path, FS_O_RDWR) {
+                dlen
+            };
+            let mut ok = self.fs.seed_file(path, &[], reserve, mtime).is_ok();
+            if ok {
+                match self.fs.open(path, FS_O_RDWR) {
+                    Ok(fh) => {
                         let mut rel = 0usize;
                         while rel < dlen {
-                            let rem = dlen - rel;
-                            let step = if rem < 256 { rem } else { 256 };
+                            let step = (dlen - rel).min(chunk.len());
                             let mut b = 0usize;
                             while b < step {
                                 let abs = doff + rel + b;
                                 chunk[b] = sectors[3 + (abs / 512)][abs % 512];
                                 b += 1;
                             }
-                            let _ = self.fs.write(fh, rel as u64, &chunk[..step]);
+                            if self.fs.write(fh, rel as u64, &chunk[..step]) != Ok(step) {
+                                ok = false;
+                                break;
+                            }
                             rel += step;
                         }
-                        let _ = self.fs.close(fh);
+                        if self.fs.close(fh).is_err() {
+                            ok = false;
+                        }
                     }
+                    Err(_) => ok = false,
                 }
+            }
+            if !ok {
+                // A file from a verified image could not be recreated. Fail
+                // the restore: continuing would persist the state without it.
+                self.record_audit(21, AuditVerdict::Error, b"shell:fs:restore-failed");
+                return Err(WalError::OutOfCapacity);
             }
             idx += 1;
         }
@@ -2191,6 +2466,11 @@ impl OsShell {
                     b"error: EACCES (svc-sh disabled by node role or policy)\n",
                     out,
                 );
+                return ShellAction::Continue(n);
+            }
+            if !self.journal_admits(STATE_REC_TASK_LEN) {
+                self.record_audit(5, AuditVerdict::Error, b"shell:spawn:journal-full");
+                let n = copy_into(JOURNAL_FULL_MSG, out);
                 return ShellAction::Continue(n);
             }
             let pid = self.next_pid;
@@ -3089,6 +3369,11 @@ impl OsShell {
         };
         let cpath = &norm_path[..nlen];
         if offset == 0 {
+            if !self.fs.can_replace(cpath, plen) {
+                // Refuse before removing: the existing file stays as it was.
+                self.record_audit(9, AuditVerdict::Error, b"shell:writehex:nospace");
+                return copy_into(FS_NO_SPACE_MSG, out);
+            }
             let _ = self.fs.unlink(cpath);
         }
         let flags = if offset == 0 {
@@ -3165,6 +3450,17 @@ impl OsShell {
             self.record_audit(9, AuditVerdict::Error, b"shell:write:too-large");
             return copy_into(b"error: write payload exceeds maximum length\n", out);
         }
+        let mut payload = [0u8; SHELL_LINE_MAX];
+        let mut plen = copy_into(content, &mut payload);
+        if plen < payload.len() {
+            payload[plen] = b'\n';
+            plen += 1;
+        }
+        if !self.fs.can_replace(cpath, plen) {
+            // Refuse before truncating: the existing file stays as it was.
+            self.record_audit(9, AuditVerdict::Error, b"shell:write:nospace");
+            return copy_into(FS_NO_SPACE_MSG, out);
+        }
         let h = match self.fs.open(cpath, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC) {
             Ok(h) => h,
             Err(_) => {
@@ -3172,12 +3468,6 @@ impl OsShell {
                 return copy_into(b"error: cannot open path for write\n", out);
             }
         };
-        let mut payload = [0u8; SHELL_LINE_MAX];
-        let mut plen = copy_into(content, &mut payload);
-        if plen < payload.len() {
-            payload[plen] = b'\n';
-            plen += 1;
-        }
         let written = match self.fs.write(h, 0, &payload[..plen]) {
             Ok(w) => w,
             Err(_) => {
@@ -3936,6 +4226,10 @@ impl OsShell {
             let Some(slot) = free_slot else {
                 return copy_into(b"error: cron table full (max 4)\n", out);
             };
+            if !self.journal_admits(7 + cmd_line.len()) {
+                self.record_audit(37, AuditVerdict::Error, b"shell:cron:journal-full");
+                return copy_into(JOURNAL_FULL_MSG, out);
+            }
             let mut job = CronJob::empty();
             job.active = true;
             job.id = (slot + 1) as u8;
@@ -4789,6 +5083,12 @@ impl OsShell {
             let _ = self.fs.close(h);
             let mut dig = [0u8; DURABLE_DIGEST_LEN];
             dig.copy_from_slice(&hasher.finalize());
+            if !self.ima_is_enrolled(path)
+                && !self.journal_admits(2 + path.len() + DURABLE_DIGEST_LEN)
+            {
+                self.record_audit(24, AuditVerdict::Error, b"shell:ima:journal-full");
+                return copy_into(JOURNAL_FULL_MSG, out);
+            }
             if !self.enroll_ima_digest(path, &dig) {
                 self.record_audit(24, AuditVerdict::Error, b"shell:ima:full");
                 return copy_into(b"error: ima table full or path too long\n", out);
@@ -4890,6 +5190,10 @@ impl OsShell {
                 dst_port_end: FW_PORT_ANY,
                 action: act,
             };
+            if !self.journal_admits(STATE_REC_FW_LEN) {
+                self.record_audit(25, AuditVerdict::Error, b"shell:fw:journal-full");
+                return copy_into(JOURNAL_FULL_MSG, out);
+            }
             if self.fw.insert(rule).is_err() {
                 self.record_audit(25, AuditVerdict::Error, b"shell:fw:full");
                 return copy_into(b"error: firewall rule table full\n", out);
@@ -5034,6 +5338,52 @@ fn is_default_system_file(path: &[u8]) -> bool {
         || bytes_eq(path, b"/sbin/svc-http")
         || bytes_eq(path, b"/sbin/svc-sql")
         || bytes_eq(path, b"/sbin/svc-sh")
+}
+
+/// Decode directory entry `idx` of a `CTTLFS01` partition image.
+///
+/// Writes the normalised path into `norm_out` and returns
+/// `(path_len, data_offset, data_len, mtime)`. Returns `None` if the entry is
+/// malformed: an empty or over-long path, a path that does not normalise or
+/// that names a built-in system file, or data lying outside `data_bytes`.
+fn parse_fs_dirent(
+    sectors: &[[u8; 512]; SHELL_FS_PART_SECTORS],
+    idx: usize,
+    data_bytes: usize,
+    norm_out: &mut [u8; cuttle_contracts::FS_PATH_MAX],
+) -> Option<(usize, usize, usize, u64)> {
+    if idx >= SHELL_FS_INODES {
+        return None;
+    }
+    let dir_sec = 1 + (idx / 8);
+    let dir_off = (idx % 8) * 64;
+    let ent = &sectors[dir_sec][dir_off..dir_off + 64];
+    let plen = u16::from_le_bytes([ent[0], ent[1]]) as usize;
+    let doff = u16::from_le_bytes([ent[2], ent[3]]) as usize;
+    let dlen = u32::from_le_bytes([ent[4], ent[5], ent[6], ent[7]]) as usize;
+    let mut mtime_b = [0u8; 8];
+    mtime_b.copy_from_slice(&ent[56..64]);
+    let mtime = u64::from_le_bytes(mtime_b);
+    if plen == 0 || plen > SHELL_MAX_WRITABLE_PATH || doff.saturating_add(dlen) > data_bytes {
+        return None;
+    }
+    let mut raw_path = [0u8; SHELL_MAX_WRITABLE_PATH];
+    let inline_len = plen.min(46);
+    raw_path[..inline_len].copy_from_slice(&ent[8..8 + inline_len]);
+    if plen > 46 {
+        let ext_base = idx * 160;
+        let mut k = 0usize;
+        while k < plen - 46 {
+            let abs_ext = ext_base + k;
+            raw_path[46 + k] = sectors[11 + (abs_ext / 512)][abs_ext % 512];
+            k += 1;
+        }
+    }
+    let nlen = crate::vfs::normalise_path(&raw_path[..plen], norm_out).ok()?;
+    if is_default_system_file(&norm_out[..nlen]) {
+        return None;
+    }
+    Some((nlen, doff, dlen, mtime))
 }
 
 fn serialize_wal_for_seal<const C: usize>(wal: &WalImpl<C>, out: &mut [u8]) -> usize {
@@ -7107,6 +7457,120 @@ mod tests {
         // Verify `/etc/os-release` remained completely intact!
         let check_act = sh.exec_line(b"cat /etc/os-release", 1, 0, 0, &mut out);
         assert_eq!(&out[..check_act.bytes_written()], &orig_release[..orig_len]);
+    }
+
+    /// An overwrite that cannot fit must be refused before the old contents
+    /// are discarded. Previously the file was truncated first and the write
+    /// then failed, leaving it empty.
+    #[test]
+    fn overwrite_that_does_not_fit_leaves_the_existing_file_untouched() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 512];
+        // A file with a small reservation, as a restored file has, and a
+        // pool with only 10 bytes left.
+        sh.fs.seed_file(b"/var/keep", b"original\n", 9, 1).unwrap();
+        let free = sh.fs.pool_capacity() - sh.fs.pool_used() as usize;
+        sh.fs.seed_file(b"/var/fill", &[], free - 10, 1).unwrap();
+
+        let big = [b'x'; 200];
+        let mut line = [0u8; 256];
+        let mut n = copy_into(b"write /var/keep ", &mut line);
+        n += copy_into(&big, &mut line[n..]);
+        let act = sh.exec_line(&line[..n], 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"error: ENOSPC (file does not fit; nothing was changed)\n"
+        );
+        let act = sh.exec_line(b"cat /var/keep", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act.bytes_written()], b"original\n");
+
+        // Same through `writehex` at offset 0, which replaces the file.
+        let mut hexline = [0u8; 256];
+        let mut h = copy_into(b"writehex /var/keep 0 ", &mut hexline);
+        for _ in 0..100 {
+            h += copy_into(b"41", &mut hexline[h..]);
+        }
+        let act = sh.exec_line(&hexline[..h], 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"error: ENOSPC (file does not fit; nothing was changed)\n"
+        );
+        let act = sh.exec_line(b"cat /var/keep", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act.bytes_written()], b"original\n");
+
+        // A replacement that does fit still works.
+        let act = sh.exec_line(b"write /var/keep new", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act.bytes_written()], b"wrote 4 bytes to /var/keep\n");
+        let act = sh.exec_line(b"cat /var/keep", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act.bytes_written()], b"new\n");
+    }
+
+    /// Restoring the filesystem partition must bring back every file even
+    /// when the small-file copies replayed from the journal have already
+    /// taken their default 256-byte reservations. Previously a large file
+    /// could find the pool crowded, fail to restore, and be dropped without
+    /// an error; the next commit then persisted the state without it.
+    #[test]
+    fn filesystem_restore_recreates_every_file_when_the_pool_is_tight() {
+        let mut sh = OsShell::new();
+        let mut out = [0u8; 512];
+        // Small files first (these are also copied into the journal)...
+        for name in [&b"/var/s1"[..], b"/var/s2", b"/var/s3", b"/var/s4"] {
+            let mut line = [0u8; 64];
+            let mut n = copy_into(b"write ", &mut line);
+            n += copy_into(name, &mut line[n..]);
+            n += copy_into(b" tiny", &mut line[n..]);
+            let act = sh.exec_line(&line[..n], 1, 0, 0, &mut out);
+            assert!(out[..act.bytes_written()].starts_with(b"wrote "));
+        }
+        // ...then shrink their reservations to what a restore gives them and
+        // use the rest of the pool for one large file.
+        let mut hdr = [0u8; 512];
+        let mut wal = [0u8; 512];
+        let mut fs_secs = [[0u8; 512]; SHELL_FS_PART_SECTORS];
+        sh.pack_disk_image(1, &mut hdr, &mut wal).unwrap();
+        sh.pack_fs_partition(1, &mut fs_secs).unwrap();
+        let mut tight = OsShell::new();
+        tight.unpack_fs_partition(&fs_secs).unwrap();
+        let free = tight.fs.pool_capacity() - tight.fs.pool_used() as usize;
+        assert!(free > 2500, "free={free}");
+        // `free` is what is left beside four 256-byte reservations; 600 bytes
+        // more than that only fits once those reservations are gone.
+        let big_len = free + 600;
+        let mut big = [0u8; 4096];
+        for (i, b) in big.iter_mut().enumerate() {
+            *b = (i % 253) as u8;
+        }
+        // Give the small files exact reservations so the large one fits now
+        // but would not fit beside four default 256-byte reservations.
+        for name in [&b"/var/s1"[..], b"/var/s2", b"/var/s3", b"/var/s4"] {
+            tight.fs.unlink(name).unwrap();
+            tight.fs.seed_file(name, b"tiny\n", 5, 1).unwrap();
+        }
+        tight.fs.seed_file(b"/var/big", &big[..big_len], big_len, 1).unwrap();
+
+        tight.pack_disk_image(2, &mut hdr, &mut wal).unwrap();
+        let (files, _) = tight.pack_fs_partition(2, &mut fs_secs).unwrap();
+        assert_eq!(files, 5);
+
+        // Boot: the journal replays the small files, then the partition is restored.
+        let mut boot = OsShell::new();
+        boot.unpack_disk_image(&hdr, &wal).unwrap();
+        let (generation, restored, _) = boot
+            .unpack_fs_partition(&fs_secs)
+            .expect("a verified partition must restore in full");
+        assert_eq!((generation, restored), (2, 5));
+        let h = boot.fs.open(b"/var/big", FS_O_RDONLY).expect("/var/big was dropped");
+        let mut got = [0u8; 4096];
+        let n = boot.fs.read(h, 0, &mut got).unwrap();
+        boot.fs.close(h).unwrap();
+        assert_eq!(&got[..n], &big[..big_len]);
+        for name in [&b"/var/s1"[..], b"/var/s2", b"/var/s3", b"/var/s4"] {
+            let h = boot.fs.open(name, FS_O_RDONLY).expect("small file missing");
+            let n = boot.fs.read(h, 0, &mut got).unwrap();
+            boot.fs.close(h).unwrap();
+            assert_eq!(&got[..n], b"tiny\n");
+        }
     }
 
     #[test]

@@ -596,6 +596,78 @@ pub(crate) fn serial_write_byte(b: u8) {
     fb_write_byte(b);
 }
 
+/// Console bytes received while the kernel was busy and could not get
+/// back to its input poll.
+///
+/// The UART is polled, and its own FIFO holds 16 bytes. A state commit keeps
+/// the kernel in disk waits for far longer than 16 characters take to
+/// arrive, so without this buffer everything typed or pasted during a commit
+/// was dropped.
+pub(crate) struct SerialRxRing {
+    buf: [u8; 512],
+    head: usize,
+    len: usize,
+    /// Bytes discarded because the ring was full.
+    pub(crate) overruns: u64,
+}
+
+impl SerialRxRing {
+    const fn new() -> Self {
+        Self {
+            buf: [0u8; 512],
+            head: 0,
+            len: 0,
+            overruns: 0,
+        }
+    }
+
+    fn push(&mut self, b: u8) {
+        if self.len == self.buf.len() {
+            self.overruns = self.overruns.wrapping_add(1);
+            return;
+        }
+        let tail = (self.head + self.len) % self.buf.len();
+        self.buf[tail] = b;
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.len == 0 {
+            return None;
+        }
+        let b = self.buf[self.head];
+        self.head = (self.head + 1) % self.buf.len();
+        self.len -= 1;
+        Some(b)
+    }
+}
+
+static SERIAL_RX_RING: spin::Mutex<SerialRxRing> = spin::Mutex::new(SerialRxRing::new());
+
+/// Move every byte waiting in the COM1 receive FIFO into [`SERIAL_RX_RING`].
+/// Cheap when nothing is waiting; called from the main loop and from inside
+/// long device waits. Only the boot CPU reads the console.
+pub(crate) fn serial_rx_pump() {
+    let Some(mut ring) = SERIAL_RX_RING.try_lock() else {
+        return;
+    };
+    // SAFETY: Running at CPL=0; port 0x3FD is the COM1 Line Status Register and 0x3F8 the
+    // receive buffer, read only while LSR bit 0 reports a byte ready.
+    unsafe {
+        let mut budget = 64u32;
+        while budget > 0 && inb(COM1 + 5) & 0x01 != 0 {
+            ring.push(inb(COM1));
+            budget -= 1;
+        }
+    }
+}
+
+/// Next console byte, if one has arrived.
+pub(crate) fn serial_rx_take() -> Option<u8> {
+    serial_rx_pump();
+    SERIAL_RX_RING.lock().pop()
+}
+
 pub(crate) fn serial_write_str(s: &str) {
     for b in s.bytes() {
         if b == b'\n' {
@@ -867,6 +939,9 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Cross-morph durable-state continuity: real WAL replay + persist
     // on the AHCI disk; a morphed successor boot resumes it.
     banner_continuity();
+    // Restore the node's durable state (or seed defaults) before anything
+    // below can serve a request against it.
+    shell_store_boot();
     // REAL WORKLOAD: lived net on the first virtio-net — UDP/8080
     // status, TCP/80 HTTP /status, ICMP echo. Bounded poll loop;
     // exits to HALT when the window closes.
@@ -968,15 +1043,6 @@ pub(crate) fn live_os_console_loop() -> ! {
     scrub_cached_master_key();
     let mut net_rx: u64 = 0;
     let mut net_tx: u64 = 0;
-    let mut last_persisted_state = (
-        sh.db.tx_seq,
-        sh.auth_seq,
-        sh.http_login_seq,
-        sh.triad_min_epoch,
-        sh.triad_tx_seq,
-        sh.vault_nonce_seq,
-        sh.guard_lockdown,
-    );
     let mut last_rto_irq: u64 = read_hw_irq_wakeups();
 
     smp_hw_tick_and_sync(sh);
@@ -1025,6 +1091,9 @@ pub(crate) fn live_os_console_loop() -> ! {
                     let mut rep_guard = CONSOLE_NET_REPLIES.lock();
                     *rep_guard = target_enterprise::ReplySet::new();
                     svc.handle_frame_with_shell(&f_guard[..flen], boots, sh, &mut *rep_guard);
+                    // Durable first, then acknowledged: whatever this frame
+                    // changed is on disk before any reply leaves the node.
+                    persist_shell_if_changed(sh, false);
                     let mut ri = 0usize;
                     while ri < rep_guard.len() {
                         if let Some(r) = rep_guard.get(ri) {
@@ -1035,29 +1104,15 @@ pub(crate) fn live_os_console_loop() -> ! {
                     }
                 }
                 vnet_rx_recycle(vn, head_id);
-                let cur_state = (
-                    sh.db.tx_seq,
-                    sh.auth_seq,
-                    sh.http_login_seq,
-                    sh.triad_min_epoch,
-                    sh.triad_tx_seq,
-                    sh.vault_nonce_seq,
-                    sh.guard_lockdown,
-                );
-                if cur_state != last_persisted_state {
-                    last_persisted_state = cur_state;
-                    let _ = persist_shell_to_ahci(sh, boots);
-                }
             }
         }
 
         let mut maybe_byte: Option<u8> = None;
 
-        // 1. Poll COM1 (16550 UART LSR bit 0 = data ready).
-        // SAFETY: Running at CPL=0; port 0x3FD is the read-only COM1 Line Status Register and reading it has no memory side effects.
-        if unsafe { inb(COM1 + 5) & 0x01 != 0 } {
-            // SAFETY: COM1 LSR bit 0 confirmed a received byte is ready in RBR (0x3F8).
-            maybe_byte = Some(unsafe { inb(COM1) });
+        // 1. COM1: bytes buffered during a commit first, then whatever the
+        //    UART holds now.
+        if let Some(b) = serial_rx_take() {
+            maybe_byte = Some(b);
         } else {
             // 2. Poll PS/2 8042 status port (bit 0 = output buffer full; bit 5 = AUXB mouse; bits 6..7 = error).
             // SAFETY: Running at CPL=0; port 0x64 is the read-only i8042 PS/2 controller status register and reading it has no memory side effects.
@@ -1092,32 +1147,23 @@ pub(crate) fn live_os_console_loop() -> ! {
             let rlen = act.bytes_written();
             if rlen > 0 {
                 smp_hw_tick_and_sync(sh);
-                let cur_state = (
-                    sh.db.tx_seq,
-                    sh.auth_seq,
-                    sh.http_login_seq,
-                    sh.triad_min_epoch,
-                    sh.triad_tx_seq,
-                    sh.vault_nonce_seq,
-                    sh.guard_lockdown,
-                );
-                if reply[..rlen].starts_with(b"sync: ok ") || cur_state != last_persisted_state {
-                    last_persisted_state = cur_state;
-                    let _ = persist_shell_to_ahci(sh, boots);
-                }
+                // Durable first, then acknowledged. `sync` forces a commit
+                // (a no-op on disk if nothing changed), so its "ok" is only
+                // printed once the state is known to be saved.
+                persist_shell_if_changed(sh, reply[..rlen].starts_with(b"sync: ok "));
                 serial_write_bytes(&reply[..rlen]);
             }
             match act {
                 ShellAction::Continue(_) => {}
                 ShellAction::Halt(_) => {
-                    let _ = persist_shell_to_ahci(sh, boots);
+                    persist_shell_if_changed(sh, true);
                     // QEMU/Bochs ACPI PM1a_CNT S5 poweroff (0x604 <- 0x2000).
                     // SAFETY: Running at CPL=0 during shutdown; port 0x604 is the QEMU/Bochs ACPI PM1a_CNT register where writing 0x2000 asserts SLP_TYP=S5 | SLP_EN.
                     unsafe { outw(0x604, 0x2000) };
                     halt_forever();
                 }
                 ShellAction::Reboot(_) => {
-                    let _ = persist_shell_to_ahci(sh, boots);
+                    persist_shell_if_changed(sh, true);
                     // 8042 keyboard controller CPU reset pulse (0x64 <- 0xFE).
                     // SAFETY: Running at CPL=0 during reboot; port 0x64 is the i8042 command register where 0xFE pulses the x86 CPU INIT/reset line.
                     unsafe { outb(0x64, 0xFE) };
@@ -1174,13 +1220,39 @@ pub(crate) fn panic(info: &PanicInfo) -> ! {
         asm!("cli", options(nomem, nostack, preserves_flags));
     }
 
-    // 2. One-shot atomic re-entry guard (`set_dumped()` returns `false` on first entry):
-    //    halt peer APs, zeroize runtime secrets, and commit a forensic CRC32-C-sealed
-    //    `CTTLPAN1` dump to AHCI `LBA 1536..1568` using `.bss` scratch (`PANIC_DUMP_SCRATCH`).
-    if !target_enterprise::panic_dump::set_dumped() {
+    // 2. One-shot atomic re-entry guard (`set_dumped()` returns `false` on first entry).
+    //    On first entry stop the other CPUs and wipe runtime secrets before
+    //    anything that can block.
+    let first_entry = !target_enterprise::panic_dump::set_dumped();
+    if first_entry {
         smp_broadcast_panic_halt();
         scrub_all_runtime_keys_emergency();
+    }
 
+    // 3. Report. The dump below needs MMIO and the disk, either of which may
+    //    be the reason for the panic; the message must not depend on them.
+    serial_write_str("CUTTLE-TE PANIC: ");
+    {
+        use core::fmt::Write;
+        struct Sw;
+        impl Write for Sw {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                serial_write_str(s);
+                Ok(())
+            }
+        }
+        let _ = write!(Sw, "{}", info.message());
+    }
+    serial_write_str(" @ ");
+    if let Some(loc) = info.location() {
+        serial_write_str(loc.file());
+    }
+    serial_write_str("
+");
+
+    // 4. Commit a forensic CRC32-C-sealed `CTTLPAN1` dump to AHCI `LBA 1536..1568`
+    //    using `.bss` scratch (`PANIC_DUMP_SCRATCH`).
+    if first_entry {
         let rip_val: u64;
         let rsp_val: u64;
         let tsc_lo: u32;
@@ -1247,23 +1319,6 @@ pub(crate) fn panic(info: &PanicInfo) -> ! {
         let _ = PanicDumpImpl::dump_to_sink(&ctx, dump_buf, &mut sink);
     }
 
-    serial_write_str("CUTTLE-TE PANIC: ");
-    {
-        use core::fmt::Write;
-        struct Sw;
-        impl Write for Sw {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                serial_write_str(s);
-                Ok(())
-            }
-        }
-        let _ = write!(Sw, "{}", info.message());
-    }
-    serial_write_str(" @ ");
-    if let Some(loc) = info.location() {
-        serial_write_str(loc.file());
-    }
-    serial_write_str("\n");
     halt_forever();
 }
 

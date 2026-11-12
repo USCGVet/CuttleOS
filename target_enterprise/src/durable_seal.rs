@@ -302,6 +302,15 @@ pub mod ab_journal {
 
     /// Decide whether to use `Slot A`, forward-replay an `IN_FLIGHT` `Slot B` redo journal,
     /// treat the disk as fresh (`Empty`), or reject an at-rest tampered `Slot A`.
+    ///
+    /// The kernel no longer uses this table. Boot recovery is
+    /// [`crate::state_store::recover`], which makes the same roll-forward
+    /// decision but differs in two cases this table gets wrong for a single
+    /// node: a `QUIESCENT` record with a damaged primary slot and an intact
+    /// shadow slot is restored from the shadow slot (and reported) instead of
+    /// rejected, and an all-zero primary slot under a valid record is damage,
+    /// not a fresh disk. This function is kept for callers that only need the
+    /// roll-forward decision.
     pub const fn decide_ab_recovery(
         primary_all_zero: bool,
         primary_valid: bool,

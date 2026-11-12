@@ -577,313 +577,208 @@ impl ComposeVfsArena {
 pub(crate) static KERNEL_SHELL: spin::Mutex<target_enterprise::OsShell> =
     spin::Mutex::new(target_enterprise::OsShell::empty());
 
-/// First LBA of the 2-sector (`CTTLSHL1` header + 512-byte WAL) sealed
-/// `OsShell` persistence region on the AHCI disk (`LBA 1040..=1041`).
-pub(crate) const SHELL_DISK_LBA: u64 = 1040;
-/// First LBA of the 16-sector (`8 KiB`, `CTTLFS01` superblock + inode table +
-/// data pool) block-backed filesystem partition on the AHCI disk (`LBA 1042..=1057`).
-pub(crate) const SHELL_FS_DISK_LBA: u64 = 1042;
-/// First LBA of the 8-sector (`4 KiB`, `CTTLSQL1` superblock + relational tables)
-/// embedded SQL database partition on the AHCI disk (`LBA 1058..=1065`).
-pub(crate) const SHELL_SQL_DISK_LBA: u64 = 1058;
-/// First LBA of the 2-sector shadow `Slot B` WAL staging window (`LBA 1072..=1073`).
-pub(crate) const SHELL_SHADOW_WAL_LBA: u64 = 1072;
-/// First LBA of the 16-sector shadow `Slot B` FS staging window (`LBA 1074..=1089`).
-pub(crate) const SHELL_SHADOW_FS_LBA: u64 = 1074;
-/// First LBA of the 8-sector shadow `Slot B` SQL staging window (`LBA 1090..=1097`).
-pub(crate) const SHELL_SHADOW_SQL_LBA: u64 = 1090;
-/// Single-sector HMAC-SHA256-sealed `CTTLAB01` two-phase commit record (`LBA 1098`).
-pub(crate) const SHELL_AB_COMMIT_LBA: u64 = 1098;
-
-static AB_COMMIT_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
+/// Scratch for the in-memory seal round-trip in [`banner_shell_compose`].
 static FS_PART_SECTORS: spin::Mutex<[[u8; 512]; target_enterprise::shell::SHELL_FS_PART_SECTORS]> =
     spin::Mutex::new([[0u8; 512]; target_enterprise::shell::SHELL_FS_PART_SECTORS]);
 
+/// Scratch for the in-memory seal round-trip in [`banner_shell_compose`].
 static SQL_PART_SECTORS_BUF: spin::Mutex<[[u8; 512]; target_enterprise::SQL_PART_SECTORS]> =
     spin::Mutex::new([[0u8; 512]; target_enterprise::SQL_PART_SECTORS]);
 
-pub(crate) fn persist_shell_to_ahci(sh: &mut target_enterprise::OsShell, boots: u64) -> Option<usize> {
-    use target_enterprise::durable_seal::ab_journal::{
-        pack_ab_commit_sector, AbCommitHeader, AB_STATE_IN_FLIGHT, AB_STATE_QUIESCENT,
-    };
+/// The node's durable state on the AHCI disk: primary slot `LBA 1040..=1065`,
+/// shadow slot `1072..=1097`, commit record `1098`, quarantine area
+/// `1152..=1205`. All ordering, verification and recovery decisions live in
+/// [`target_enterprise::state_store`], where they are tested against a
+/// fault-injecting disk; this file only supplies the device and reports.
+static SHELL_STORE: spin::Mutex<target_enterprise::state_store::ShellStore> =
+    spin::Mutex::new(target_enterprise::state_store::ShellStore::new(
+        target_enterprise::state_store::AHCI_STATE_LAYOUT,
+        target_enterprise::state_store::AHCI_QUARANTINE_LBA,
+    ));
 
-    let mut wal_pair = [[0u8; 512]; 2];
-    let (hdr_slice, wal_slice) = wal_pair.split_at_mut(1);
-    let count = sh
-        .pack_disk_image(boots, &mut hdr_slice[0], &mut wal_slice[0])
-        .ok()?;
-    let mut fs_secs = FS_PART_SECTORS.lock();
-    sh.pack_fs_partition(boots, &mut *fs_secs).ok()?;
-    let mut sql_secs = SQL_PART_SECTORS_BUF.lock();
-    sh.pack_sql_partition(&mut *sql_secs);
+/// [`target_enterprise::OsShell::durable_fingerprint`] at the last commit.
+static LAST_DURABLE_FP: spin::Mutex<[u8; 32]> = spin::Mutex::new([0u8; 32]);
 
-    let seal_key = if target_enterprise::durable_seal::is_seal_key_set(&sh.seal_key) {
-        sh.seal_key
-    } else {
-        derive_runtime_seal_key()
-    };
+/// What [`shell_store_boot`] found, for [`banner_shell_compose`].
+static SHELL_BOOT_REPORT: spin::Mutex<Option<target_enterprise::state_store::BootReport>> =
+    spin::Mutex::new(None);
 
-    // Compute the 3 partition SHA-256 digests concurrently across AP cores `CPU 1..3`.
-    // SAFETY: `[[u8; 512]; N]` has identical contiguous layout and alignment (`1`) to `[u8; N * 512]`.
-    let (wal_sha, fs_sha, sql_sha) = unsafe {
-        let wb = core::slice::from_raw_parts(wal_pair.as_ptr().cast::<u8>(), 2 * 512);
-        let fb = core::slice::from_raw_parts(
-            fs_secs.as_ptr().cast::<u8>(),
-            target_enterprise::shell::SHELL_FS_PART_SECTORS * 512,
-        );
-        let sb = core::slice::from_raw_parts(
-            sql_secs.as_ptr().cast::<u8>(),
-            target_enterprise::SQL_PART_SECTORS * 512,
-        );
-        crate::smp_hw::smp_parallel_sha256_3way(wb, fb, sb)
-    };
-    let commit_seq = AB_COMMIT_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-
-    let port = AhciHwPort::probe_start_quiet();
-
-    // Stage 1: Write complete 26-sector image to Shadow `Slot B` (`LBA 1072..=1097`) and flush
-    // while Primary `Slot A` (`LBA 1040..=1065`) remains untouched.
-    port.write_sector(SHELL_SHADOW_WAL_LBA, &wal_pair[0]);
-    port.write_sector(SHELL_SHADOW_WAL_LBA + 1, &wal_pair[1]);
-    let mut s = 0usize;
-    while s < target_enterprise::shell::SHELL_FS_PART_SECTORS {
-        port.write_sector(SHELL_SHADOW_FS_LBA + (s as u64), &fs_secs[s]);
-        s += 1;
-    }
-    let mut sq = 0usize;
-    while sq < target_enterprise::SQL_PART_SECTORS {
-        port.write_sector(SHELL_SHADOW_SQL_LBA + (sq as u64), &sql_secs[sq]);
-        sq += 1;
-    }
-    port.flush_cache();
-
-    // Stage 2: Atomically seal & flush `AB_STATE_IN_FLIGHT` commit sector (`LBA 1098`).
-    let mut commit_sec = [0u8; 512];
-    let in_flight_hdr = AbCommitHeader {
-        state: AB_STATE_IN_FLIGHT,
-        boots,
-        commit_seq,
-        wal_sha,
-        fs_sha,
-        sql_sha,
-    };
-    if pack_ab_commit_sector(&seal_key, &in_flight_hdr, &mut commit_sec) {
-        port.write_sector(SHELL_AB_COMMIT_LBA, &commit_sec);
-        port.flush_cache();
-    }
-
-    // Stage 3: Install payload sectors then superblock/header sectors into Primary `Slot A` (`1040..=1065`).
-    sq = 1;
-    while sq < target_enterprise::SQL_PART_SECTORS {
-        port.write_sector(SHELL_SQL_DISK_LBA + (sq as u64), &sql_secs[sq]);
-        sq += 1;
-    }
-    s = 1;
-    while s < target_enterprise::shell::SHELL_FS_PART_SECTORS {
-        port.write_sector(SHELL_FS_DISK_LBA + (s as u64), &fs_secs[s]);
-        s += 1;
-    }
-    port.write_sector(SHELL_DISK_LBA + 1, &wal_pair[1]);
-    port.flush_cache();
-    port.write_sector(SHELL_SQL_DISK_LBA, &sql_secs[0]);
-    port.write_sector(SHELL_FS_DISK_LBA, &fs_secs[0]);
-    port.write_sector(SHELL_DISK_LBA, &wal_pair[0]);
-    port.flush_cache();
-
-    // Stage 4: Transition commit sector (`LBA 1098`) to `AB_STATE_QUIESCENT` and flush.
-    let quiescent_hdr = AbCommitHeader {
-        state: AB_STATE_QUIESCENT,
-        ..in_flight_hdr
-    };
-    if pack_ab_commit_sector(&seal_key, &quiescent_hdr, &mut commit_sec) {
-        port.write_sector(SHELL_AB_COMMIT_LBA, &commit_sec);
-        port.flush_cache();
-    }
-    Some(count)
+/// Stop the node: its durable state can no longer be guaranteed.
+///
+/// A node that cannot write its state must not keep answering as if it had.
+/// Halting leaves the disk as the last successful commit (or an interrupted
+/// one, which the next boot rolls forward or back as a whole).
+pub(crate) fn storage_fault(what: &'static str) -> ! {
+    panic!("STORAGE FAULT: {}", what);
 }
 
-pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Option<(u64, usize)> {
-    use target_enterprise::durable_seal::ab_journal::{
-        decide_ab_recovery, hash_sector_slice, pack_ab_commit_sector, verify_ab_commit_sector,
-        AbCommitHeader, AbRecoveryDecision, AB_STATE_IN_FLIGHT, AB_STATE_QUIESCENT,
+fn persist_error_str(e: &target_enterprise::state_store::PersistError) -> &'static str {
+    use target_enterprise::shell::StatePackError;
+    use target_enterprise::state_store::{CommitError, CommitStage, PersistError};
+    match e {
+        PersistError::Pack(StatePackError::Journal(_)) => "state journal could not be packed",
+        PersistError::Pack(StatePackError::Filesystem(_)) => {
+            "filesystem partition could not be packed"
+        }
+        PersistError::Pack(StatePackError::Sql(_)) => "SQL partition could not be packed",
+        PersistError::Commit(CommitError::KeyUnset) => "seal key unset",
+        PersistError::Commit(CommitError::BadLayout) => "state disk too small for the store",
+        PersistError::Commit(CommitError::Io {
+            stage: CommitStage::Stage,
+            ..
+        }) => "device error staging the shadow slot (previous state intact)",
+        PersistError::Commit(CommitError::Io {
+            stage: CommitStage::Journal,
+            ..
+        }) => "device error writing the commit record",
+        PersistError::Commit(CommitError::Io {
+            stage: CommitStage::Install,
+            ..
+        }) => "device error installing the primary slot (new state is in the shadow slot)",
+        PersistError::Commit(CommitError::Io {
+            stage: CommitStage::Finalize,
+            ..
+        }) => "device error closing the commit record",
+        PersistError::Commit(CommitError::Verify {
+            stage: CommitStage::Stage,
+        }) => "shadow slot read back differently (previous state intact)",
+        PersistError::Commit(CommitError::Verify { .. }) => "a written sector read back differently",
+    }
+}
+
+/// Commit the shell's state to the AHCI disk, stamped with generation `boots`.
+/// Returns once the state is durable in both slots, or says why it is not.
+pub(crate) fn persist_shell_to_ahci(
+    sh: &mut target_enterprise::OsShell,
+    boots: u64,
+) -> Result<target_enterprise::state_store::Committed, target_enterprise::state_store::PersistError>
+{
+    use target_enterprise::state_store::{CommitError, CommitStage, PersistError};
+    let mut disk = AhciDisk::state_disk().map_err(|fault| {
+        PersistError::Commit(CommitError::Io {
+            stage: CommitStage::Stage,
+            fault,
+        })
+    })?;
+    SHELL_STORE.lock().commit(&mut disk, sh, boots)
+}
+
+/// Make the shell's state durable if anything durable changed since the last
+/// commit (or unconditionally with `force`).
+///
+/// Callers run this **before** they acknowledge the request that changed the
+/// state: before transmitting a reply frame, before printing a console reply.
+/// It returns only when the state is on disk. If the commit fails the node
+/// stops, so an acknowledgement is never sent for state that was not saved.
+pub(crate) fn persist_shell_if_changed(sh: &mut target_enterprise::OsShell, force: bool) {
+    let fp = sh.durable_fingerprint();
+    if !force && *LAST_DURABLE_FP.lock() == fp {
+        return;
+    }
+    let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    match persist_shell_to_ahci(sh, boots) {
+        Ok(_) => *LAST_DURABLE_FP.lock() = fp,
+        Err(e) => storage_fault(persist_error_str(&e)),
+    }
+}
+
+/// Bring [`KERNEL_SHELL`] to the state this boot starts from: restored from
+/// the store, or seeded defaults. Runs once, right after the boot counter is
+/// known and before anything serves requests.
+pub(crate) fn shell_store_boot() {
+    use target_enterprise::state_store::{
+        BootError, BootOutcome, RecoverySource, ShellKeys,
+    };
+    let keys = ShellKeys {
+        seal: derive_runtime_seal_key(),
+        legacy_seal: derive_runtime_legacy_seal_key(),
+        attest: derive_runtime_attest_key(),
+    };
+    let counter = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let mut sh_guard = KERNEL_SHELL.lock();
+    let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
+
+    let booted = match AhciDisk::state_disk() {
+        Ok(mut disk) => SHELL_STORE.lock().boot(&mut disk, sh, &keys, counter),
+        Err(fault) => Err(BootError::Io(fault)),
+    };
+    let report = match booted {
+        Ok(r) => r,
+        Err(BootError::KeyUnset) => storage_fault("seal key unset at boot"),
+        Err(BootError::BadLayout) => storage_fault("state disk too small for the store"),
+        Err(BootError::Io(_)) => storage_fault("state disk unusable at boot"),
+        Err(BootError::Persist(e)) => storage_fault(persist_error_str(&e)),
     };
 
-    if !target_enterprise::durable_seal::is_seal_key_set(&sh.legacy_seal_key) {
-        sh.legacy_seal_key = derive_runtime_legacy_seal_key();
-    }
-    let seal_key = if target_enterprise::durable_seal::is_seal_key_set(&sh.seal_key) {
-        sh.seal_key
-    } else {
-        derive_runtime_seal_key()
-    };
-    let port = AhciHwPort::probe_start_quiet();
-
-    // Check `LBA 1098` for an interrupted `AB_STATE_IN_FLIGHT` shadow-journal commit; if valid and
-    // `Slot B` (`LBA 1072..=1097`) matches all 3 authenticated SHA-256 digests, replay `Slot B -> Slot A`.
-    let commit_sec = port.read_sector(SHELL_AB_COMMIT_LBA);
-    if let Some(hdr) = verify_ab_commit_sector(&seal_key, &commit_sec) {
-        if hdr.state == AB_STATE_IN_FLIGHT {
-            let wal_b = [
-                port.read_sector(SHELL_SHADOW_WAL_LBA),
-                port.read_sector(SHELL_SHADOW_WAL_LBA + 1),
-            ];
-            let mut fs_b = FS_PART_SECTORS.lock();
-            let mut s = 0usize;
-            while s < target_enterprise::shell::SHELL_FS_PART_SECTORS {
-                fs_b[s] = port.read_sector(SHELL_SHADOW_FS_LBA + (s as u64));
-                s += 1;
-            }
-            let mut sql_b = SQL_PART_SECTORS_BUF.lock();
-            let mut sq = 0usize;
-            while sq < target_enterprise::SQL_PART_SECTORS {
-                sql_b[sq] = port.read_sector(SHELL_SHADOW_SQL_LBA + (sq as u64));
-                sq += 1;
-            }
-            let journal_ok = hash_sector_slice(&wal_b) == hdr.wal_sha
-                && hash_sector_slice(&*fs_b) == hdr.fs_sha
-                && hash_sector_slice(&*sql_b) == hdr.sql_sha;
-            if matches!(
-                decide_ab_recovery(false, false, Some(hdr), journal_ok),
-                AbRecoveryDecision::ReplayJournalToPrimary(_)
-            ) {
-                sq = 1;
-                while sq < target_enterprise::SQL_PART_SECTORS {
-                    port.write_sector(SHELL_SQL_DISK_LBA + (sq as u64), &sql_b[sq]);
-                    sq += 1;
-                }
-                s = 1;
-                while s < target_enterprise::shell::SHELL_FS_PART_SECTORS {
-                    port.write_sector(SHELL_FS_DISK_LBA + (s as u64), &fs_b[s]);
-                    s += 1;
-                }
-                port.write_sector(SHELL_DISK_LBA + 1, &wal_b[1]);
-                port.flush_cache();
-                port.write_sector(SHELL_SQL_DISK_LBA, &sql_b[0]);
-                port.write_sector(SHELL_FS_DISK_LBA, &fs_b[0]);
-                port.write_sector(SHELL_DISK_LBA, &wal_b[0]);
-                port.flush_cache();
-                let mut q_sec = [0u8; 512];
-                let q_hdr = AbCommitHeader {
-                    state: AB_STATE_QUIESCENT,
-                    ..hdr
-                };
-                if pack_ab_commit_sector(&seal_key, &q_hdr, &mut q_sec) {
-                    port.write_sector(SHELL_AB_COMMIT_LBA, &q_sec);
-                    port.flush_cache();
-                }
-            }
-        }
+    if report.boots != counter {
+        // The sealed state is at or past the counter's generation: the
+        // counter was lost or fell behind. Follow the sealed state.
+        continuity_set_boots(report.boots);
+        serial_write_str("SHELL resume NOTICE: boot counter advanced to follow sealed state\n");
     }
 
-    let hdr_sec = port.read_sector(SHELL_DISK_LBA);
-    let wal_sec = port.read_sector(SHELL_DISK_LBA + 1);
-    let mut all_zero = true;
-    let mut i = 0usize;
-    while i < 512 {
-        if hdr_sec[i] != 0 || wal_sec[i] != 0 {
-            all_zero = false;
-            break;
-        }
-        i += 1;
-    }
-    if all_zero {
-        return None;
-    }
-    let mut had_legacy_magic = &hdr_sec[0..4] == b"PRTS";
-    let res = match sh.unpack_disk_image(&hdr_sec, &wal_sec) {
-        Ok(res) => res,
-        Err(_) => {
-            if &hdr_sec[0..4] == b"PRTS" {
-                sh.audit = target_enterprise::audit::AuditLogImpl::new();
+    match report.outcome {
+        BootOutcome::Fresh => {}
+        BootOutcome::Restored {
+            source,
+            from_quarantine,
+            repaired_shadow,
+            repair_fault,
+            ..
+        } => {
+            if from_quarantine {
                 serial_write_str(
-                    "SHELL resume NOTICE: legacy format, state not migrated\n",
+                    "SHELL resume RECOVERED: state set aside by an earlier unverified boot was restored\n",
                 );
-            } else {
-                serial_write_str(
-                    "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
+                sh.record_net_audit(
+                    cuttle_contracts::AuditVerdict::Denied,
+                    b"shell:store:quarantine-restored",
                 );
             }
-            return None;
-        }
-    };
-    let sb_sec = port.read_sector(SHELL_FS_DISK_LBA);
-    let mut fs_present = false;
-    let mut j = 0usize;
-    while j < 512 {
-        if sb_sec[j] != 0 {
-            fs_present = true;
-            break;
-        }
-        j += 1;
-    }
-    if fs_present {
-        if &sb_sec[0..4] == b"PRTS" {
-            had_legacy_magic = true;
-        }
-        let mut fs_secs = FS_PART_SECTORS.lock();
-        fs_secs[0] = sb_sec;
-        let mut s = 1usize;
-        while s < target_enterprise::shell::SHELL_FS_PART_SECTORS {
-            fs_secs[s] = port.read_sector(SHELL_FS_DISK_LBA + (s as u64));
-            s += 1;
-        }
-        match sh.unpack_fs_partition(&*fs_secs) {
-            Ok((generation, _, _)) if generation == res.0 => {}
-            _ => {
-                if &sb_sec[0..4] == b"PRTS" {
-                    sh.audit = target_enterprise::audit::AuditLogImpl::new();
+            match source {
+                RecoverySource::JournalReplay => serial_write_str(
+                    "SHELL resume NOTICE: interrupted commit rolled forward from shadow slot\n",
+                ),
+                RecoverySource::ShadowHeal => {
                     serial_write_str(
-                        "SHELL resume NOTICE: legacy format, state not migrated\n",
+                        "SHELL resume REPAIRED: primary slot failed verification; state restored from shadow slot\n",
                     );
-                } else {
-                    serial_write_str(
-                        "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
+                    sh.record_net_audit(
+                        cuttle_contracts::AuditVerdict::Denied,
+                        b"shell:store:primary-healed",
                     );
                 }
-                return None;
+                RecoverySource::Unjournaled => serial_write_str(
+                    "SHELL resume NOTICE: commit record missing; state verified by partition seals and re-journaled\n",
+                ),
+                _ => {}
             }
-        }
-    }
-    let sql_sb = port.read_sector(SHELL_SQL_DISK_LBA);
-    let mut sql_present = false;
-    let mut k = 0usize;
-    while k < 512 {
-        if sql_sb[k] != 0 {
-            sql_present = true;
-            break;
-        }
-        k += 1;
-    }
-    if sql_present {
-        if &sql_sb[0..4] == b"PRTS" {
-            had_legacy_magic = true;
-        }
-        let mut sql_secs = SQL_PART_SECTORS_BUF.lock();
-        sql_secs[0] = sql_sb;
-        let mut sq = 1usize;
-        while sq < target_enterprise::SQL_PART_SECTORS {
-            sql_secs[sq] = port.read_sector(SHELL_SQL_DISK_LBA + (sq as u64));
-            sq += 1;
-        }
-        if !sh.unpack_sql_partition(&*sql_secs) {
-            if &sql_sb[0..4] == b"PRTS" {
-                sh.audit = target_enterprise::audit::AuditLogImpl::new();
+            if repaired_shadow {
+                serial_write_str("SHELL resume NOTICE: shadow slot re-synchronised from primary\n");
+            }
+            if repair_fault.is_some() {
                 serial_write_str(
-                    "SHELL resume NOTICE: legacy format, state not migrated\n",
-                );
-            } else {
-                serial_write_str(
-                    "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
+                    "SHELL resume WARNING: device refused a slot repair; redundancy is reduced\n",
                 );
             }
-            return None;
+            serial_write_str("SHELL resume OK\n");
+        }
+        BootOutcome::Rejected { .. } => {
+            serial_write_str(
+                "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
+            );
+            serial_write_str(
+                "SHELL resume NOTICE: unverifiable state preserved in quarantine (LBA 1152..1205)\n",
+            );
+            sh.record_net_audit(
+                cuttle_contracts::AuditVerdict::Denied,
+                b"shell:wal:seal-mismatch",
+            );
         }
     }
-    if had_legacy_magic {
-        let _ = persist_shell_to_ahci(sh, res.0);
-    }
-    Some(res)
+
+    *LAST_DURABLE_FP.lock() = sh.durable_fingerprint();
+    *SHELL_BOOT_REPORT.lock() = Some(report);
 }
 
 /// Decode the 32-byte MAC from the `hmac=<hex64>` field of an `attest:` quote line.
@@ -988,51 +883,34 @@ fn run_shell_compose_fixtures(
 /// preserving operator VFS, firewall, cron, SQL, and anti-replay state across reboots.
 #[inline(never)]
 pub(crate) fn banner_shell_compose() {
+    use target_enterprise::state_store::{BootError, BootOutcome, Committed};
+
     let seal_key = derive_runtime_seal_key();
     let legacy_seal_key = derive_runtime_legacy_seal_key();
     let attest_key = derive_runtime_attest_key();
     let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
     let mut sh_guard = KERNEL_SHELL.lock();
     let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
-    *sh = target_enterprise::OsShell::empty();
-    sh.seal_key = seal_key;
-    sh.legacy_seal_key = legacy_seal_key;
-    sh.attest_key = attest_key;
-    sh.seed_defaults_for_boot(boots);
+
+    let Some(report) = SHELL_BOOT_REPORT.lock().take() else {
+        panic!("SHELL compose: shell_store_boot did not run");
+    };
+    let seal_rejected = matches!(report.outcome, BootOutcome::Rejected { .. });
+    // The shell already holds real state if it was restored at boot, or if
+    // the boot service window committed something since. Either way it is
+    // left alone: nothing below may depend on, or replace, what a user stored.
+    let resumed_ok = matches!(report.outcome, BootOutcome::Restored { .. })
+        || SHELL_STORE.lock().commit_seq() > 0;
 
     let mut out = [0u8; 256];
-    let mut seal_rejected = false;
-    let mut resumed_ok = false;
-
-    if boots > 1 {
-        if let Some((prev_boots, applied)) = restore_shell_from_ahci(sh) {
-            if prev_boots + 1 != boots || applied < 1 {
-                panic!("SHELL resume: cross-boot AHCI state drift");
-            }
-            let ar = sh.exec_line(b"cat /var/boot.ok", boots, 0, 0, &mut out);
-            if &out[..ar.bytes_written()] != b"ready\n" {
-                panic!("SHELL resume: cross-boot /var/boot.ok drift");
-            }
-            if sh.db.total_rows() > 3 {
-                let sq_n = sh
-                    .db
-                    .exec(b"SELECT v, rev FROM kv WHERE k = 'boot.state'", &mut out);
-                if &out[..sq_n] != b"v|rev\nready|1\n" {
-                    panic!("SHELL resume: cross-boot SQL partition drift");
-                }
-            }
-            resumed_ok = true;
-            serial_write_str("SHELL resume OK\n");
-        } else {
-            if sh.audit.len() > 0 {
-                seal_rejected = true;
-            }
-            *sh = target_enterprise::OsShell::empty();
-            sh.seal_key = seal_key;
-            sh.legacy_seal_key = legacy_seal_key;
-            sh.attest_key = attest_key;
-            sh.seed_defaults_for_boot(boots);
-        }
+    if !resumed_ok {
+        // First boot (or a rejected disk, whose contents are in quarantine):
+        // start the fixture run from pristine defaults.
+        *sh = target_enterprise::OsShell::empty();
+        sh.seal_key = seal_key;
+        sh.legacy_seal_key = legacy_seal_key;
+        sh.attest_key = attest_key;
+        sh.seed_defaults_for_boot(boots);
     }
 
     static VERIFY_SHELL: spin::Mutex<target_enterprise::OsShell> =
@@ -1073,12 +951,20 @@ pub(crate) fn banner_shell_compose() {
         }
     } else {
         run_shell_compose_fixtures(sh, boots, &mut out);
-        // Persist sealed WAL (F + T + W + Q = 4 records), 16-sector FS partition, and 8-sector SQL partition to physical AHCI disk:
-        if persist_shell_to_ahci(sh, boots) != Some(4) {
-            panic!("SHELL compose: AHCI persist expected 4 records");
+        // Commit the sealed journal (F + T + W + Q = 4 records), 16-sector FS partition and
+        // 8-sector SQL partition to the AHCI disk, then read the disk back into a second shell.
+        match persist_shell_to_ahci(sh, boots) {
+            Ok(Committed::Written { records: 4, .. }) => {}
+            Ok(_) => panic!("SHELL compose: AHCI persist expected 4 records"),
+            Err(e) => storage_fault(persist_error_str(&e)),
         }
-        if restore_shell_from_ahci(vsh) != Some((boots, 4)) {
-            panic!("SHELL compose: AHCI sealed restore failed");
+        let loaded = match AhciDisk::state_disk() {
+            Ok(mut disk) => SHELL_STORE.lock().load_into(&mut disk, vsh),
+            Err(fault) => Err(BootError::Io(fault)),
+        };
+        match loaded {
+            Ok(r) if r.saved_boots == boots && r.records == 4 => {}
+            _ => panic!("SHELL compose: AHCI sealed restore failed"),
         }
     }
     if vsh.fw.len() != 1 || vsh.auth_seq != 7 || vsh.seccomp_mask[5] != 8 {
@@ -1170,16 +1056,14 @@ pub(crate) fn banner_shell_compose() {
         .set_ring3_cap_hw_hook(crate::banners_arch_platform::exec_service_ring3_cap_live);
     sh.svc
         .set_ring3_mailbox_hw_hook(crate::banners_arch_platform::exec_service_ring3_mailbox_live);
-    if resumed_ok {
-        let _ = persist_shell_to_ahci(sh, boots);
-    } else {
+    if !resumed_ok {
         let _ = sh.exec_line(b"seccomp clear 5", boots, 0, 0, &mut out);
         let _ = sh.exec_line(b"fw clear", boots, 0, 0, &mut out);
         sh.auth_seq = 0;
-        if !seal_rejected {
-            let _ = persist_shell_to_ahci(sh, boots);
-        }
     }
+    // Stamp this boot's generation on disk. A rejected disk is committed over
+    // too: its previous contents were copied to the quarantine area first.
+    persist_shell_if_changed(sh, true);
 
     serial_write_str("SHELL compose OK tasks=5 files=5 audit=5\n");
     if seal_rejected {

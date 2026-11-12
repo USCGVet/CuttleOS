@@ -346,6 +346,9 @@ pub struct MemRamFs<const I: usize, const P: usize> {
     /// Whether this filesystem is mounted read-only. The mount call
     /// sets this; `open` honours it.
     read_only: bool,
+    /// Advanced by every call that creates, truncates, writes or removes a
+    /// file. Never decreases while the filesystem is alive.
+    mutation_seq: u64,
 }
 
 impl<const I: usize, const P: usize> MemRamFs<I, P> {
@@ -357,7 +360,21 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
             pool: [0u8; P],
             pool_used: 0,
             read_only: false,
+            mutation_seq: 0,
         }
+    }
+
+    /// A counter that advances whenever file contents or the set of files
+    /// may have changed (`seed_file`, a creating or truncating `open`,
+    /// `write`, `unlink`).
+    ///
+    /// Callers that persist the filesystem compare it against the value at
+    /// their last save to learn that a save is due. Because the inode table
+    /// and pool are private, these calls are the only way to change them, so
+    /// an unchanged counter means unchanged contents. The reverse does not
+    /// hold: a write of identical bytes still advances it.
+    pub const fn mutation_seq(&self) -> u64 {
+        self.mutation_seq
     }
 
     /// Number of inodes currently in use.
@@ -463,7 +480,45 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         slot.data_len = contents.len() as u32;
         slot.capacity = cap as u32;
         slot.mtime = mtime;
+        self.mutation_seq = self.mutation_seq.wrapping_add(1);
         Ok(idx as u32)
+    }
+
+    /// `true` iff replacing the whole contents of `path` with `len` bytes is
+    /// certain to succeed: an `open` with `FS_O_RDWR | FS_O_CREATE |
+    /// FS_O_TRUNC` followed by one `write` of `len` bytes at offset 0.
+    ///
+    /// Truncation discards the old contents before the write is attempted,
+    /// so a caller that must not lose the old file on a full pool asks this
+    /// first. The answer accounts for the pool bytes the existing file gives
+    /// back when it is truncated.
+    pub fn can_replace(&self, path: &[u8], len: usize) -> bool {
+        if self.read_only || len > u32::MAX as usize {
+            return false;
+        }
+        let mut norm = [0u8; FS_PATH_MAX];
+        let Ok(n) = normalise_path(path, &mut norm) else {
+            return false;
+        };
+        if &norm[..n] == b"/" {
+            return false;
+        }
+        let mut open_slot_free = false;
+        let mut inode_free = false;
+        let mut i = 0usize;
+        while i < I {
+            open_slot_free |= !self.open[i].used;
+            inode_free |= !self.inodes[i].used;
+            i += 1;
+        }
+        if !open_slot_free {
+            return false;
+        }
+        let free = P.saturating_sub(self.pool_used as usize);
+        match self.find_inode(&norm[..n]) {
+            Some(idx) => len <= free + self.inodes[idx].capacity as usize,
+            None => inode_free && free > 0 && len <= free,
+        }
     }
 
     /// Inspect an inode slot by index (`0..I`). Returns `Some((path_bytes, data_len))`
@@ -512,10 +567,12 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         }
         self.reclaim_inode_capacity(idx);
         self.inodes[idx] = EMPTY_INODE;
+        self.mutation_seq = self.mutation_seq.wrapping_add(1);
         Ok(())
     }
 
     fn truncate_inode(&mut self, idx: usize) {
+        self.mutation_seq = self.mutation_seq.wrapping_add(1);
         if self.inodes[idx].capacity > 256 {
             self.reclaim_inode_capacity(idx);
             let remaining = (P as u64).saturating_sub(self.pool_used as u64);
@@ -691,6 +748,7 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
                 inode_slot.data_len = 0;
                 inode_slot.capacity = init_cap;
                 inode_slot.mtime = 0;
+                self.mutation_seq = self.mutation_seq.wrapping_add(1);
                 idx
             }
         };
@@ -806,6 +864,7 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
             }
             self.inodes[inode_idx].data_len = end as u32;
         }
+        self.mutation_seq = self.mutation_seq.wrapping_add(1);
         Ok(buf.len())
     }
 
@@ -1602,6 +1661,58 @@ mod tests {
             vfs.mount(b"/data", fs_b as &mut dyn Filesystem),
             Err(FsError::NoSpace)
         );
+    }
+
+    /// `can_replace` must predict exactly what a truncating open followed
+    /// by one write does, for existing and new files around the pool limit.
+    #[test]
+    fn can_replace_predicts_truncating_overwrite_exactly() {
+        fn build() -> MemRamFs<4, 512> {
+            let mut fs = MemRamFs::<4, 512>::new();
+            fs.seed_file(b"/small", b"0123456789", 16, 1).unwrap();
+            fs.seed_file(b"/large", &[7u8; 300], 300, 2).unwrap();
+            fs.seed_file(b"/other", b"keep", 100, 3).unwrap();
+            fs
+        }
+        let free = 512 - build().pool_used() as usize;
+        assert_eq!(free, 96);
+        let data = [0x5Au8; 600];
+        for (path, len) in [
+            (&b"/small"[..], 0usize),
+            (b"/small", 16),
+            (b"/small", 16 + free),
+            (b"/small", 16 + free + 1),
+            (b"/large", 300 + free),
+            (b"/large", 300 + free + 1),
+            (b"/new", 1),
+            (b"/new", free),
+            (b"/new", free + 1),
+        ] {
+            let predicted = build().can_replace(path, len);
+            let mut fs = build();
+            let actual = match fs.open(path, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC) {
+                Ok(h) => fs.write(h, 0, &data[..len]) == Ok(len),
+                Err(_) => false,
+            };
+            assert_eq!(
+                predicted,
+                actual,
+                "can_replace({:?}, {len}) disagrees with open+write",
+                core::str::from_utf8(path)
+            );
+        }
+        let fs = build();
+        assert!(!fs.can_replace(b"/", 1));
+        assert!(!fs.can_replace(b"relative", 1));
+        // No free inode for a fourth file once the table is full.
+        let mut full = build();
+        full.seed_file(b"/fourth", b"x", 1, 4).unwrap();
+        assert!(!full.can_replace(b"/fifth", 1));
+        assert!(full.can_replace(b"/fourth", 2));
+        // Read-only filesystems accept nothing.
+        let mut ro = build();
+        ro.set_read_only(true);
+        assert!(!ro.can_replace(b"/small", 1));
     }
 
     #[test]

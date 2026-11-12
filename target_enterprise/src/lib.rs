@@ -75,6 +75,7 @@ pub mod random;
 pub mod smp;
 pub mod sntp;
 pub mod stack_canary;
+pub mod state_store;
 pub mod symbols;
 pub mod tcp;
 pub mod timer;

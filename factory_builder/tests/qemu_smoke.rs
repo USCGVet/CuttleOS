@@ -785,33 +785,95 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
         );
     }
 
-    // Tamper with the sealed WAL payload at LBA 1041 (offset 1041 * 512 + 8).
+    // The store keeps two copies of the state (primary slot LBA 1040..=1065,
+    // shadow slot LBA 1072..=1097) under one HMAC-sealed commit record.
+    //
+    // Case 1: damage one copy. Flip a byte of the sealed journal sector in the
+    // primary slot (LBA 1041, offset 8). The tampered bytes must never be
+    // used, and one damaged copy must not cost the node its state: boot 2
+    // has to restore from the intact shadow copy and say that it did.
     let mut disk_bytes = std::fs::read(&tampered_disk).expect("read ahci_tamper_test.img");
-    let wal_offset = 1041 * 512 + 8;
-    disk_bytes[wal_offset] ^= 0xFF;
+    let primary_wal = 1041 * 512 + 8;
+    disk_bytes[primary_wal] ^= 0xFF;
     std::fs::write(&tampered_disk, &disk_bytes).expect("write tampered ahci_tamper_test.img");
 
-    // Boot 2: the tampered disk must emit SHELL resume REJECTED and must NOT emit SHELL resume OK.
     let (log2, reached2) = vm.boot(&tamper_log, halted);
-    for disk in scratch_disks {
-        let _ = std::fs::remove_file(disk);
-    }
     assert!(
         reached2,
         "tamper test boot 2 did not reach CUTTLE-TE HALT within 45s!\nSerial log:\n{}",
         log2
     );
     assert!(
-        log2.contains("SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)"),
-        "tamper test boot 2 did not emit SHELL resume REJECTED!\nSerial log:\n{}",
+        log2.contains("SHELL resume REPAIRED: primary slot failed verification; state restored from shadow slot"),
+        "tamper test boot 2 did not report the repair of the tampered primary slot!\nSerial log:\n{}",
         log2
     );
     assert!(
-        !log2.contains("SHELL resume OK"),
-        "tamper test boot 2 unexpectedly emitted SHELL resume OK on a tampered disk!\nSerial log:\n{}",
+        log2.contains("SHELL resume OK") && !log2.contains("SHELL resume REJECTED"),
+        "tamper test boot 2 must resume from the intact shadow copy!\nSerial log:\n{}",
         log2
     );
-    eprintln!("smoke: tampered AHCI seal was rejected as expected; TAMPER TEST PASSED");
+    let healed = std::fs::read(&tampered_disk).expect("read ahci_tamper_test.img after boot 2");
+    assert_eq!(
+        &healed[1040 * 512..1040 * 512 + 8],
+        b"CTTLSHL1",
+        "boot 2 did not leave a sealed primary slot behind"
+    );
+    assert_eq!(
+        &healed[1040 * 512..1066 * 512],
+        &healed[1072 * 512..1098 * 512],
+        "after the repair both slots must hold the same image"
+    );
+
+    // Case 2: damage both copies (the same journal sector in each slot).
+    // Nothing on the disk can be authenticated any more, so boot 3 must
+    // reject it and must NOT resume, exactly as before. What changes is
+    // that the rejected sectors are set aside instead of being overwritten.
+    let mut disk_bytes = healed;
+    let shadow_wal = 1073 * 512 + 8;
+    disk_bytes[primary_wal] ^= 0xFF;
+    disk_bytes[shadow_wal] ^= 0xFF;
+    let rejected_primary = disk_bytes[1040 * 512..1066 * 512].to_vec();
+    let rejected_shadow = disk_bytes[1072 * 512..1098 * 512].to_vec();
+    std::fs::write(&tampered_disk, &disk_bytes).expect("write doubly tampered ahci_tamper_test.img");
+
+    let (log3, reached3) = vm.boot(&tamper_log, halted);
+    let after3 = std::fs::read(&tampered_disk).expect("read ahci_tamper_test.img after boot 3");
+    for disk in scratch_disks {
+        let _ = std::fs::remove_file(disk);
+    }
+    assert!(
+        reached3,
+        "tamper test boot 3 did not reach CUTTLE-TE HALT within 45s!\nSerial log:\n{}",
+        log3
+    );
+    assert!(
+        log3.contains("SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)"),
+        "tamper test boot 3 did not emit SHELL resume REJECTED!\nSerial log:\n{}",
+        log3
+    );
+    assert!(
+        !log3.contains("SHELL resume OK"),
+        "tamper test boot 3 unexpectedly emitted SHELL resume OK on a tampered disk!\nSerial log:\n{}",
+        log3
+    );
+    assert!(
+        log3.contains("SHELL resume NOTICE: unverifiable state preserved in quarantine (LBA 1152..1205)"),
+        "tamper test boot 3 did not report preserving the rejected state!\nSerial log:\n{}",
+        log3
+    );
+    // Quarantine area: primary copy at LBA 1152, shadow copy at 1178, marker at 1205.
+    assert_eq!(
+        &after3[1205 * 512..1205 * 512 + 8],
+        b"CTTLQUA1",
+        "quarantine marker missing at LBA 1205"
+    );
+    assert!(
+        after3[1152 * 512..1178 * 512] == rejected_primary[..]
+            && after3[1178 * 512..1204 * 512] == rejected_shadow[..],
+        "the quarantine area does not hold the rejected slots byte for byte"
+    );
+    eprintln!("smoke: one tampered copy was repaired, two were rejected and preserved; TAMPER TEST PASSED");
 }
 
 #[test]

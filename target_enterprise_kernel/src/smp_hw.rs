@@ -2071,9 +2071,15 @@ pub(crate) fn smp_hw_tick_and_sync(sh: &mut target_enterprise::OsShell) {
         sh.smp_irq_wakeups = hw_irqs;
         if cur_epochs > prev_epochs {
             let delta = (cur_epochs - prev_epochs).min(8);
+            let boots = crate::CONTINUITY_BOOT_COUNT.load(Ordering::Relaxed);
             let mut d = 0u64;
             while d < delta {
                 sh.tick_login_cooldown();
+                // Cron and the SQL transaction idle timeout are measured in
+                // these timer epochs. They used to advance once per received
+                // frame, so a burst of unrelated packets could expire an open
+                // transaction between two of its statements.
+                let _ = sh.tick_cron_jobs(boots);
                 d += 1;
             }
             let mut live_ticks = [0u64; MAX_SMP_CPUS];
@@ -2103,7 +2109,6 @@ pub(crate) fn smp_hw_tick_and_sync(sh: &mut target_enterprise::OsShell) {
         }
         t += 1;
     }
-    let _ = sh.tick_cron_jobs(1);
 }
 
 /// Self-verify Intel VT-d (`vtd_hw`) Root Table -> Bus-0 Context Table -> 4-level SLPT

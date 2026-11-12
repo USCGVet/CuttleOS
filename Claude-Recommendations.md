@@ -1,421 +1,232 @@
 # Claude Recommendations
 
-Review of the 26 commits after `3dae6cf`, up to `917109c`:
-- **Round 8 fixes:** `66955c7` (#1), `556ec3b` (#2), `5f2db72` (#3), `7d88d4b` (#4), `849a638` (#5), `04838f7` (#6) and `3788fbb` (#7), plus seven status-line commits.
-- **A side branch merged in `e2ccfcb`:** `35cff85`, `ee99e53`, `bc2e012` and `d445ae7`.
-  - It was based on `1c59464`, 20 commits behind `3dae6cf`.
-  - The merge is clean: against `3dae6cf` it adds only the branch's changes, and the few lines it removed were replaced by stricter quorum checks.
-- **New features and docs:** `c2d9d35`, `284dd9a`, `50f5fba`, `1d4e870`, `0669eff`, `0886ce2` and `917109c`.
+This round was not a normal review round. The user asked me to review the core OS and improve it directly, with one bar: *would you trust your own data on it*. So this file has two parts:
 
-Excluding this file, the range is 21 files, +10,068 / −413 lines. Line numbers are from `917109c`. The checkout had no uncommitted changes, and `main` matches `origin/main`.
+1. **What I changed** in the working tree (nothing is committed), each with the test that proves it.
+2. **What is still open** for the builder, by priority.
 
-I split the new feature areas across four parallel reviewer passes and checked every finding below against the code. "I reproduced" means I ran it myself. "A reviewer harness reproduced" means a scratch harness built outside the repo did, and I confirmed the cause in the code.
+**Scope.** I read the core at `d279d75`: the kernel crate (`target_enterprise_kernel/src`) and the storage, filesystem, SQL, shell-persistence, memory and SMP modules of `target_enterprise/src`. Three read-only reviewer passes covered the storage library, the memory/interrupt/SMP core, and the drivers and key provisioning; I checked every finding below against the code before acting on it or listing it. I did **not** review the diff of the 22 commits `917109c..d279d75` as a whole, and I did **not** verify last round's status lines (see the table below).
 
-An untracked `Cuttle-OS-Recommendations.md`, from a second recommender, appeared in the repo root during the review. It isn't part of this round.
+Line numbers are from the working tree as I left it.
 
-**Test status at review time** (the user's Windows 11 host; stable 1.93.1; pinned `nightly-2026-10-22`; QEMU 11.1, TCG)
-- `cargo test --workspace --no-fail-fast`: **2,478 passed, 0 failed, 16 ignored** (up from 2,454 / 15).
-- `(cd target_enterprise_kernel && cargo build --release)`: **passed.**
-- `cargo test -p factory_builder --test qemu_smoke -- --ignored`: **3 passed**, including the new `morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu`.
-- **Python:** AST parse, `https_check.py --self-test`, `triad_controller.py --unit-test`, `cuttle_fleet.run_fleet_unit_tests` and `verify_metrics_independent.py --self-test` all passed.
-- **Live, on real VMs** (beyond the required checks):
-  - `triad_controller.py --self-test` (3 VMs): **failed** at its `/api/guard status` step (High #1). I then answered only that one read with a reviewer wrapper (no repo change). Every remaining step passed: SQL writes during a morph, restarts, a legacy WAL, and a wiped disk that was detected, healed and re-morphed.
-  - `cuttle_fleet.py --self-test` (18 VMs): failed with the default `auto` accelerator. WHPX guests on this host produced no output within 8 s, so the controller fell back to TCG, and the test's accelerator assertion doesn't allow that (Low). **Passed** with `--accel tcg`.
-- **GitHub Actions:** all 12 runs since the workflow was added in `284dd9a` failed, including the run for `917109c` (Medium #4).
+## Test status
+
+Host: the user's Windows 11 machine; stable 1.93.1; pinned `nightly-2026-10-22`; QEMU, TCG.
+
+- `cargo test --workspace --no-fail-fast`: **exit 0; 4,470 passed, 16 ignored** by cargo's own counts (4,390 passed, 16 ignored before my changes, same host, same day). Both figures include the verifier's nested release run of `target_enterprise`, whose one deliberate failing probe (`watchdog::stage8_verifier_gate_probe::must_run_in_verifier`) appears in the log in both runs.
+  The run predates one last kernel-only change (the panic handler's ordering). The kernel is outside the workspace; the suites that read its ELF (`cuttle-binmorph`, `cuttle-mtd-metrics`) were re-run on the final build and passed.
+- `target_enterprise` unit tests: **1,835 passed** (1,796 before this round; 39 new).
+- `cargo test -p factory_builder --test qemu_smoke -- --ignored`: **3 passed**. `tampered_ahci_seal_is_rejected_under_qemu` was rewritten; see "Behaviour changes" below.
+- `(cd target_enterprise_kernel && cargo build --release)`: **passed**, no warnings from the crate. The production variant (`factory_builder build-kernel --prod`) also builds.
+- `python -c "import ast; ..."` on `tools/triad_controller.py`: **passed**.
+- `python tools/triad_controller.py --unit-test`: **passed** (it drives the real shell through `shell_harness`).
+- **Live, on real VMs** (beyond the required checks): `python tools/triad_controller.py --self-test --accel tcg` (3 VMs): **passed**. Two caveats:
+  - `target/cuttle_images/run_bios.img` was from 23 October, so the self-test would have run an old kernel. I rebuilt it from the current ELF first (Low list).
+  - The run logged `TMR parity vote could not verify 2/3 majority: unreadable state probe` on all three nodes three times, each right after a restart step. The test does not treat that as a failure, and I did not establish whether those alerts predate this round.
+  - It ran before one last change to the panic handler's ordering; the QEMU smoke tests were re-run after it.
+- `tools/cuttle_fleet.py --self-test` (18 VMs): **not run.**
+
+One trap I walked into: building the `--prod` kernel leaves that variant at `target_enterprise_kernel/target/x86_64-unknown-none/release/`, and three workspace tests that read "the real kernel ELF" then fail on their size thresholds. They pass again once the default kernel is rebuilt. It is listed below as Medium #9.
 
 ## Verification of last round's items
 
-| # | Item | Verdict | Notes |
+I did not do this step this round. Every item is carried over unverified.
+
+| # | Item | Builder's status | Verdict |
 |---|---|---|---|
-| 1 | A non-printable vote cell turned off the vote, or was dropped on heal | **Verified fixed** | Cells stay bytes end to end, and probes encode them as `T:<hex>` / `I:<int>`. Checkpoint cells use a quoted literal when it is printable and shorter, otherwise `X'<hex>'`. A `None` probe is retried. One unreadable node beside two agreeing nodes is healed; two unreadable nodes log an ALERT. Tests 1a–1c run on the real shell. The worst-case checkpoint statement (a 16-character table with four 24-byte binary cells) is 253 bytes with the `/*t*/` prefix, inside the 256-byte line limit. |
-| 2 | The first `.dump` chunk overflowed for wide tables | **Verified fixed** | Rows are sized against the buffer minus the 8-byte prompt, and `count=` reports the rows actually written. The limit is clamped to 1..=3, so the single-digit patch is safe. The controller rejects rows with the wrong cell count. The Rust test goes through `feed_byte`, and the controller test checkpoints and heals a max-width table. |
-| 3 | The immutable-file guard compared the raw path | **Verified fixed** | One helper normalizes with `vfs::normalise_path`. The normalized path is used for both the check and the open or unlink in `write`, `writehex`, `rm`, `VfsWrite` and `VfsDelete`. Seven spellings are tested on all five. The remaining raw `fs.open` writes are restore paths for HMAC-sealed data. |
-| 4 | `writehex` lines exceeded the 256-byte input limit | **Partly fixed** | Done: the kernel rejects an over-long line with an error and an audit event, the harness drives `feed_byte`, and chunks are sized from the line limit. Remaining: paths near `FS_PATH_MAX` still don't fit, and a path of 244–256 characters stops the web Triad's vote (Medium #12). The test uses a 68-character path. |
-| 5 | The new probe format invalidated saved digests | **Partly fixed** | Done: the WAL records the probe and checkpoint format versions, a pre-`.dump` checkpoint is refused, and a Triad whose three nodes agree upgrades its digests. Remaining: the genesis guard doesn't recognize multi-table probes, so the upgrade adopts a wiped Triad (Medium #11). Also, `04838f7` changed the digest input after v2 was defined without bumping the version (Low). |
-| 6 | Each write triggered a full dump of every vote table | **Verified fixed** | `.dump <table> digest` returns only the header. The vote probes all nodes in parallel, and checkpoint dumps run outside `wal_lock` and re-check `tx_seq` afterwards. Tests count the commands and check the lock. Two side effects: the vote now rests on each node's own FNV-1a digest (Medium #3), and the rows fetched "to diagnose" a mismatch are thrown away (Low). |
-| 7 | Smaller items | **Verified fixed** | The harness is rebuilt on every run. Paths with spaces must be quoted, and the guessing is gone. TEXT and `X'..'` literals over 24 bytes are rejected, and the truncating `from_text` has no callers left. A full budget now returns 503, with a 256 KiB per-peer share (tested). The per-peer share keys on source IP, which can't tell clients apart behind QEMU's NAT (Low). |
+| 1–14 | Round 9 items in the previous version of this file | Fixed (`d9869f1`, `a3ce4bf`, `fddcbf6`, `82fd583`, `a6ca484`) | **Not verified this round** |
+| R1–R15 | `Cuttle-OS-Recommendations.md` | Fixed (`82fd583`, `a6ca484`, `d9869f1`) | **Not verified this round** |
+
+One of them I touched in passing: Round 9 #13 asked the multi-seed QEMU test to check persisted state on disk. It does (it pins the first journal record at `LBA 1041`), and that assertion caught a byte-order change I had made to the journal; I restored the order.
+
+---
+
+## What I changed
+
+All of it is in the working tree, uncommitted. The idea behind most of it: the code that decides whether data survives was inlined in the kernel, where it cannot be unit-tested, and the one "power cut at every sector" test re-implemented the write sequence in the test body instead of calling it. That logic now lives in one library module and is tested against a disk model that misbehaves the way disks do.
+
+### New: `target_enterprise/src/state_store.rs`
+
+- **Commit** (`commit`): stage the image in the shadow slot, flush, read back; write the `IN_FLIGHT` record, flush, read back; install the primary slot, flush, read back; write the `QUIESCENT` record, flush, read back. Four flush barriers (there were five); the module docs say what each is for.
+- **Recovery** (`recover`): authenticate the commit record, then use the primary slot if it matches, otherwise the shadow slot if it matches (roll-forward for `IN_FLIGHT`, a reported repair for `QUIESCENT`), otherwise refuse and leave the disk untouched. An unreadable sector counts as a damaged one.
+- **Node policy** (`ShellStore`): pack and commit a live `OsShell`; decide at boot what the shell starts from; copy state that cannot be authenticated to a quarantine area (`LBA 1152..=1205`) before starting over, and restore it on a later boot that can authenticate it.
+- **Disk model for tests** (`testdisk::MemDisk`): a volatile write cache, a power cut at a chosen operation that tears the sector being written and keeps all, none or a random subset of unflushed writes, reported I/O errors, silently dropped writes, unreadable sectors.
+
+### Defects fixed
+
+| # | Defect (before) | Fix | Proof |
+|---|---|---|---|
+| 1 | A commit failure was discarded (`let _ = persist_shell_to_ahci(..)` at four call sites) and `sync` printed `sync: ok` regardless. | `persist_shell_if_changed` returns only when the state is on disk; a failed commit stops the node with `STORAGE FAULT: <reason>`. | `state_store::node_tests::failed_commit_is_reported_and_the_next_boot_is_consistent`; `state_store::tests::io_error_at_every_operation_fails_the_commit_and_recovers_cleanly` |
+| 2 | The 512-byte journal sector overflowed once the state held a few firewall rules, tasks, cron jobs and IMA digests, or two 200-byte files. From then on **every** commit failed to pack and nothing (files and SQL included) reached the disk again, silently. | Commands that add a journal record check an exact size budget first and refuse with `ENOSPC`; file copies in the journal are optional and never crowd out a state record. | `state_store::node_tests::every_state_the_shell_accepts_can_be_packed_and_restored` (fails with `Journal(OutOfCapacity)` after `fw block 10.4.0.0/16` when the budget is disabled); `...many_and_large_files_persist_and_restore_byte_for_byte` |
+| 3 | Only seven counters triggered a commit. File writes, firewall rules, tasks, capability grants, cron jobs and IMA digests were not saved until something else changed; a SQL `COMMIT` did not trigger one either, so a committed transaction could be lost. | The trigger is `OsShell::durable_fingerprint`, built from the same record enumeration the journal writes, a mutation counter inside the filesystem, and the SQL committed sequence. | `state_store::node_tests::every_durable_change_moves_the_fingerprint`; `...committed_transaction_is_on_disk_and_uncommitted_one_is_not` |
+| 4 | Network replies were transmitted before the commit. | Commit first, then transmit (main loop and boot service window). | Ordering is in `main.rs` and `net_service.rs`; the property it relies on is #1. Not separately tested under QEMU. |
+| 5 | Boot panicked with `SHELL resume: cross-boot AHCI state drift` whenever the boot counter and the saved generation were not exactly one apart. A power cut between the counter update and the first commit of a boot (several seconds) made every later boot panic. | The generation comes from the sealed state; the counter is a hint and is rewritten to follow it. | `state_store::node_tests::boot_counter_ahead_of_or_behind_the_saved_generation_still_restores` |
+| 6 | If the continuity header was lost, the counter restarted at 1, the restore was skipped (`if boots > 1`), and fixture state was committed over the real state. | Restore no longer depends on the counter. | Same test as #5 (the "behind" case). |
+| 7 | Boot panicked unless `/var/boot.ok` read `ready` and the `kv` row `boot.state` was `ready|1`; both are ordinary user-writable state. | Removed. A resumed boot never asserts on stored content. | Code removal in `banner_shell_compose`; QEMU multi-seed test still passes. |
+| 8 | A damaged primary slot was rejected even when the shadow slot held a verified copy; an all-zero primary slot, or an all-zero filesystem or SQL superblock, was treated as "nothing stored" and then overwritten. | Recovery checks both slots against the commit record; a missing partition is an error. | `state_store::tests::damage_to_any_primary_sector_is_healed_from_shadow_and_reported`; `state_store::node_tests::damaged_or_zeroed_primary_slot_is_healed_not_treated_as_a_blank_disk`; `...a_partition_zeroed_in_both_slots_is_rejected_not_silently_reset`; QEMU `tampered_ahci_seal_is_rejected_under_qemu` |
+| 9 | A rejected disk was overwritten in the same boot. One boot without the `-fw_cfg` device key therefore destroyed the stored state. | The slots are copied to the quarantine area first; a later boot that can authenticate the copy restores it. | `state_store::node_tests::state_survives_boots_without_the_device_key`; `...unverifiable_state_is_preserved_before_the_node_starts_over`; QEMU tamper test (boot 3) |
+| 10 | Every AHCI error or timeout was a panic, the HBA was re-probed and the port restarted on every commit, and only `TFD.ERR` was checked. | `try_issue_with_prdtl` returns a fault and checks the `PxIS` error bits, `TFD` ERR/DF and the transferred byte count; the port is probed once; capacity comes from IDENTIFY and every LBA is range-checked. | Engine side: `state_store::tests::unreadable_sector_in_either_slot_or_the_commit_record_does_not_stop_recovery`. Driver side: exercised by the three QEMU tests; error paths not injected under QEMU. |
+| 11 | Restoring the filesystem partition ignored `open`/`write` failures. With the journal's small-file copies already holding 256-byte reservations, a large file could fail to restore, be dropped without an error, and then be absent from the next commit. | Two passes: validate every directory entry, remove existing user files, then recreate each file with a reservation that is guaranteed to fit. Any failure fails the restore. | `shell::tests::filesystem_restore_recreates_every_file_when_the_pool_is_tight` |
+| 12 | `write`, `writehex` at offset 0 and HTTP `PUT /fs` truncated the file before knowing the new contents fit; a failed write left it empty. HTTP reported `201` with `wrote 0 bytes`. | `MemRamFs::can_replace` is asked first; the reply is `ENOSPC` (HTTP 507) and the file is unchanged. | `vfs::tests::can_replace_predicts_truncating_overwrite_exactly`; `shell::tests::overwrite_that_does_not_fit_leaves_the_existing_file_untouched` |
+| 13 | `CREATE INDEX` had no capacity check. On a nearly full database the save then dropped rows silently (`break`) or indexed past the buffer. | Capacity check added; `try_save_partition` writes every committed row or returns `TooLarge`. | `sql::tests::create_index_respects_partition_capacity_and_a_full_database_saves_every_row` |
+| 14 | The SQL transaction idle timeout advanced once per received Ethernet frame. Sixteen unrelated frames rolled back an open transaction; the client's remaining statements then ran in autocommit and were saved: half a transaction on disk. | The timeout and cron tick on the calibrated timer epoch (about one second). After a timeout the owner's statements are refused until it sends `ROLLBACK`, `COMMIT` (which reports the loss) or `BEGIN`. | `sql::tests::idle_timeout_aborts_the_transaction_until_its_owner_acknowledges_it`. The kernel-side tick change is not tested under QEMU. |
+| 15 | The boot service window restored the shell itself, served mutating requests, never committed, and its state was then discarded. | The store is booted once, before the window; the window commits before replying; `banner_shell_compose` no longer resets a shell that holds real state. | QEMU smoke tests; no test sends a mutating request during the window. |
+| 16 | The continuity region was rewritten in place with no flush, and `resumed_boots + 1` could overflow. | Flush after the region and after the header; saturating add. | Not tested (the region is now only a hint). |
+| 17 | The panic handler attempted the crash dump (MMIO and disk) before printing the message, so a panic caused by either could hang silently. | Order is now: stop the other CPUs and scrub keys, print the message, then attempt the dump. | Not tested. |
+| 18 | The commit path used the AP SHA-256 offload, which can return a stale digest after a timeout. | The store hashes on the boot CPU. | Covered by the store tests; the offload itself is unchanged (Low list). |
+| 19 | Console input arriving during a commit was dropped (polled UART, 16-byte FIFO). This became visible once every mutating command committed. | A 512-byte receive ring, pumped from the AHCI wait loops. | QEMU `morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu` (its interactive part failed without it). |
+
+The central guarantee, old state or new state after a power cut and never a mixture, is `state_store::tests::power_cut_at_every_operation_recovers_old_or_new_never_a_mixture` (every device operation, four cache-loss models), `...power_cut_during_a_second_consecutive_commit_never_loses_the_first`, and on a real shell `state_store::node_tests::power_cut_during_commit_boots_into_old_or_new_state_never_a_mixture`. I checked that these have teeth: removing the flush after the shadow slot makes the first one fail.
+
+### Behaviour changes the builder should know about
+
+- **One tampered slot is repaired, not rejected.** `tampered_ahci_seal_is_rejected_under_qemu` used to flip one byte at `LBA 1041` and expect `SHELL resume REJECTED`. It now has two cases: that same flip must produce `SHELL resume REPAIRED` and `SHELL resume OK` with both slots identical afterwards; the same flip in both slots must produce `SHELL resume REJECTED`, no `SHELL resume OK`, and the rejected sectors byte for byte in the quarantine area. The tampered bytes are never used in either case. The old assertion is kept for the case where it still holds.
+- **Every durable change commits before its reply.** A mutating console command now takes about a second under TCG (Medium #1). Each `writehex` chunk is one such command.
+- **Cron ticks are timer epochs** (about one second), no longer one per command or frame.
+- **New replies:** `error: ENOSPC (durable state journal full; ...)`, `error: ENOSPC (file does not fit; nothing was changed)` (HTTP 507), `error: transaction timed out and was rolled back; ...`.
+- **New serial lines:** `SHELL resume REPAIRED`, `SHELL resume RECOVERED`, `SHELL resume NOTICE: ...`, `SHELL resume WARNING: ...`, `CUTTLE-TE PANIC: STORAGE FAULT: ...`. `SHELL resume OK` and `SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)` are unchanged; both are now printed right after the `CONTINUITY` lines.
+- **On-disk format is unchanged**, including the journal's record order. New on disk: the quarantine area at `LBA 1152..=1205`.
+- `durable_seal::ab_journal::decide_ab_recovery` is no longer called by the kernel. I left it and its test in place with a doc note.
 
 ---
 
 ## High priority
 
-### 1. Reads whose output differs per node by design are refused as split-brain (regression from `bc2e012`)
+### 1. The host controller does not know about repair, rejection, quarantine or a storage halt
 - **Where:**
-  - `tools/triad_controller.py:2300-2336` (SQL reads) and `:2542-2566` (app reads). Both changed in `bc2e012` and were merged in `e2ccfcb`.
-  - Per-node output in `target_enterprise/src/shell.rs`:
-    - `:3429-3452`: `guard status` prints `cpl3_runs`, `audit_denied` and `pcr10`.
-    - `:3159-3165`: `vault list` returns each node's ciphertext.
-    - `:3466-3490`: `guard alerts` lists each node's own audit events.
-- **Problem:**
-  - Both read paths now require two byte-identical raw outputs. Otherwise they refuse, log an ALERT and set `parity_syndrome_ok = False`. Before `bc2e012`, they returned the most common output.
-  - Outputs differ by design wherever a node reports its own measurements or its own ciphertext.
-  - The reverse problem also exists: the SQL path counts error replies as answers. `send_shell_cmd` returns strings such as `"error: command timed out"`, so two identical errors become a "2-of-3 Majority Verified" result.
-- **I reproduced it on real VMs:**
-  - `--self-test` fails at `/api/guard status` (`:6156-6164`). The three nodes report different `pcr10` values (`39269efa…`, `d7a24534…`, `48c4687c…`), different `cpl3_runs` (17/15/15) and different `audit_denied` counts (3/4/4).
-  - After one `vault put`, `SELECT * FROM kv` through `execute_triad_sql` returns `1/3 SPLIT-BRAIN REFUSED`, because each node's `v:` row holds its own ciphertext. `vault list` is refused the same way. `cron list` agrees.
-  - Unit tests pass because the three harness shells run the same build. The live self-test would have caught this, but it wasn't run after `bc2e012` or the merge.
-- **Effect:** on a real Triad:
-  - The console's Guard button and `/api/guard status` always fail.
-  - `SELECT` on `kv` fails as soon as any vault secret exists.
-  - Every such read logs a false split-brain ALERT and marks parity as failed until the next parity run.
-- **Fix:**
-  - Vote on normalized output:
-    - For SQL, reuse `_normalize_kv_for_tmr`, which replaces vault rows with `<HW_SEALED>` and sorts rows.
-    - For app reads, compare only replicated fields (posture, role, running count, key names), and return per-node diagnostics alongside without a quorum claim.
-  - Leave error replies out of the vote. With fewer than two good answers, return an availability error, not split-brain.
-  - Let only `compute_and_verify_raid_parity` change `parity_syndrome_ok`.
-  - Add tests:
-    - a unit test where the nodes differ only in per-node fields;
-    - a unit test with two timeouts;
-    - a live self-test step that runs a voted `SELECT` after a `vault put`.
-  - Run `--self-test` before marking any controller change done.
-
-Status: Fixed — test: `run_unit_self_tests`, `triad_controller.py --self-test` — commit: `d9869f1`
-
-### 2. The "Ring-3 user-space request parser" runs in Ring 0
-- **Where:**
-  - `target_enterprise/src/svc_runtime.rs:1165-1321`: `parse_and_validate_ring3_mailbox`, documented as running "in Ring-3 user space". It is called directly from `target_enterprise/src/shell.rs:782-792`.
-  - The only hardware `CPL=3` step is the hook at `svc_runtime.rs:1106-1120`.
-  - Claims: `README.md:115`, `experiments/redteam/RESULTS.json:198` and the `0669eff` message.
-- **Problem:**
-  - The parser is an ordinary method call inside `dispatch_mailbox_op`. On the kernel it runs at CPL=0, with no privilege change and no separate address space.
-  - The stub the hook runs at `CPL=3` receives only `(canary << 32) | seq`. The request path and body are never mapped to user mode.
-  - `user_l4` is a software `PageTable<8>` model that the kernel never loads. The kernel's only CR3 write is in the SMP AP trampoline (`target_enterprise_kernel/src/smp_hw.rs:927`).
+  - `tools/triad_controller.py`: no occurrence of `SHELL resume REPAIRED`, `SHELL resume REJECTED`, `SHELL resume RECOVERED` or `STORAGE FAULT`; boot classification at `:1973-1975` reads only the `CONTINUITY` lines.
+  - `docs/runbooks/README.md`: no entry for any of them.
+  - The kernel side is `shell_store_boot` and `storage_fault` in `target_enterprise_kernel/src/banners_compose.rs`.
+- **Problem:** the node now repairs a damaged primary slot, sets unverifiable state aside, and halts when a commit fails. Each of these is one serial line and, for the first two, one audit event. Nothing on the host reads them.
 - **Effect:**
-  - The advertised user-space isolation of request parsing doesn't exist.
-  - A parser fault is a Ring-0 fault and halts the node.
-  - The engines still consume the same bytes in Ring 0.
-- **Fix, one of:**
-  - Implement it:
-    - copy the request into the service's user address space;
-    - load that page table;
-    - run the parser at CPL=3 and return only a verdict;
-    - re-check in the kernel;
-    - add a QEMU banner that proves CPL=3 at parse time.
-  - Or rename it to what it is, a kernel-mode lexical pre-filter, and correct README:115, RESULTS.json:198 and the doc comments.
+  - A repaired slot is evidence that sectors changed outside a commit. Today nobody is told, so self-healing hides the event it should surface.
+  - A node halted by `STORAGE FAULT` looks like any hung node; the heal path will reboot the same disk.
+  - The quarantine area is released at the next verified boot, whether or not anyone looked at it.
+- **Fix:**
+  - Parse these lines when a node boots and add alert codes and runbook entries for them.
+  - Treat `STORAGE FAULT` as a failed disk (replace the image, then heal), not as a hang.
+  - On `REJECTED`, copy the quarantine sectors out of the node's AHCI image on the host before the node's next verified boot releases them.
+  - Add controller unit tests with fake serial logs for each line.
 
-Status: Fixed — test: `svc_runtime::tests::ring3_mailbox_parser_blocks_sql_injection_shell_chaining_path_traversal_and_exec_abuse`, `lived_net::tests::http_request_prefilter_accepts_binary_vfs_valid_sql_and_shell_and_returns_400_without_counter_inflation` — commit: `a3ce4bf`
+### 2. The fleet self-test has not been run against this kernel
+- **Where:** `tools/cuttle_fleet.py --self-test`; the `web` and `index` jobs, which sync files with many `writehex` chunks.
+- **Problem:** this round changed what the controllers drive: commit timing (every mutating console command now commits, including each `writehex` chunk), cron cadence, the transaction-timeout replies and the boot sequence. The Triad self-test passed on three VMs. The 18-VM fleet self-test was not run, and it is the one that exercises file sync and cron.
+- **Effect:** I do not know whether the fleet's timeouts and cron expectations still hold. The Triad run also logged three `unreadable state probe` alerts that I could not attribute (see Test status).
+- **Fix:**
+  - Run the fleet self-test with `--accel tcg` before building on this.
+  - Compare the Triad self-test's alert log with a run of `d279d75` to settle whether the probe alerts are new.
+  - If file sync is too slow, fix it in the driver (Medium #1), not by loosening the commit rule.
 
 ---
 
 ## Medium priority
 
-### 3. The Triad vote now trusts a 64-bit FNV-1a digest computed by each node
-- **Where:**
-  - `tools/triad_controller.py:1894-1939` and `:1996-2041`: `_state_probe` votes on `.dump <table> digest` headers only.
-  - `target_enterprise/src/sql.rs:912-982`: the digest is a 64-bit FNV-1a hash.
-- **Problem:**
-  - Until `04838f7`, the controller compared the rows themselves. It now compares `#rows` plus a non-cryptographic hash that each node computes over its own rows.
-  - My Round 8 #6 suggestion asked for a digest-only mode without saying the digest had to be collision resistant. That gap was mine.
-- **Effect:**
-  - Accidental divergence is still caught.
-  - A deliberate change to one node's rows can be chosen so that the row count and FNV-1a value stay the same. The vote then never flags or heals that node.
-  - A node running attacker code can lie under any scheme; this change weakens the data-only case.
-  - The WAL's `triad_state_digest` is now a hash of these headers, so it has the same strength.
-- **Fix:**
-  - Make `.dump <table> digest` return a SHA-256 (already linked for the seals) over the canonical row encoding.
-  - Mirror it in `format_kernel_sqldump_reply` and pin it with a golden test.
-  - Bump `WAL_PROBE_FORMAT_VERSION`.
+### 1. A commit is about 110 single-sector AHCI commands
+- **Where:** `AhciHwPort::try_write_sector` / `try_read_sector` in `target_enterprise_kernel/src/hw_storage_drivers.rs`; `write_slot` and `slot_digests` in `target_enterprise/src/state_store.rs`.
+- **Problem:** each of the 26 sectors of a slot is one `WRITE DMA`, and each read-back one `READ DMA`, through a single 512-byte DMA buffer. Under TCG a commit takes about a second.
+- **Effect:** slow writes, long stretches in which the kernel serves nothing, and a longer window in which a power cut interrupts a commit (recovery handles it, but shorter is better).
+- **Fix:** give `SectorIo` a multi-sector read and write, back it with a 13 KiB DMA buffer and one PRD entry, and use READ/WRITE DMA EXT so the 28-bit LBA limit goes too. Keep the per-sector fault model in the tests.
 
-Status: Fixed — test: `sql::tests::sqldump_digest_only_mode_matches_full_dump_header_and_rejects_bad_args`, `run_unit_self_tests`, `triad_controller.py --self-test` — commit: `d9869f1`
+### 2. The journal is one 512-byte sector
+- **Where:** `SHELL_JOURNAL_BYTES` at `target_enterprise/src/shell.rs:129`; the layout in `state_store::AHCI_STATE_LAYOUT`.
+- **Problem:** the worst-case state records (12 worker tasks, 8 firewall rules, 6 IMA digests, 4 cron jobs, two watermarks) need about 1,120 bytes. The budget now refuses the command that would overflow, which is correct but arrives early: a full task table and a full firewall table leave room for one cron job.
+- **Effect:** `ENOSPC` on ordinary configurations.
+- **Fix:** a version-2 layout with a journal of at least three sectors (there is free space on the disk), a format version in the commit record, and a migration test. The same change can lift the 4 KiB limits on files and SQL.
 
-### 4. CI has failed on every run because the QEMU tests can't find QEMU on Linux
-- **Where:**
-  - `factory_builder/tests/qemu_smoke.rs:30-50`: `find_qemu` runs Windows' `where`, then tries `C:/Program Files/qemu`.
-  - `qemu_smoke.rs:94-102` (skip), `:530-532` and `:636-638` (panic).
-  - `.github/workflows/ci.yml:29-39`: the toolchain fallback.
-- **Problem:**
-  - `ubuntu-latest` has no `where`, so QEMU is never found. `boots_under_qemu_and_emits_banner` prints SKIP and passes, while the tamper and multi-seed tests panic.
-  - All 12 runs since `284dd9a` failed at that step (exit 101, within a second). Every earlier step passed.
-  - If the pinned nightly can't be installed, the workflow quietly rewrites both toolchain files to a floating nightly. Round 7 #4 removed exactly that failure mode, and a different compiler changes the very `.text` the suites measure.
-- **Effect:**
-  - CI has never verified a QEMU boot.
-  - A red pipeline has become normal.
-  - Where QEMU really is missing, the main smoke test passes without running.
-- **Fix:**
-  - Find QEMU portably by searching `PATH` for `qemu-system-x86_64[.exe]`.
-  - In CI, set an env var (for example `CUTTLE_REQUIRE_QEMU=1`) that turns every SKIP into a failure.
-  - Fail the toolchain step instead of falling back.
-  - Treat a red run as blocking.
+### 3. Rolling the whole disk back is not detected
+- **Where:** `commit_seq` in `AbCommitHeader`; `ShellStore::boot`.
+- **Problem:** `commit_seq` now continues across boots, but it is anchored only on the disk it protects. An older, validly sealed image of the whole disk (both slots and the commit sector) boots as valid.
+- **Effect:** a single node cannot tell that its state went backwards. The Triad vote catches it only if the other two nodes disagree.
+- **Fix:** keep the high-water `commit_seq` somewhere the disk cannot rewrite: a TPM NV counter, or the controller (it already tracks `tx_seq` per node) refusing a node that reports a lower one.
 
-Status: Fixed — test: `qemu_smoke::find_qemu_searches_path_portably`, `qemu_smoke::boots_under_qemu_and_emits_banner` — commit: `82fd583`
+### 4. The kernel installs no IDT until the last boot step, and CPU exceptions bypass the panic path
+- **Where:** `init_runtime_idt_and_isrs` at `target_enterprise_kernel/src/smp_hw.rs:1074`, first reached from `banner_smp_hw` (`:2391`); `ISR_CPU_FAULT_DIAG` at `:1132`.
+- **Problem:** the disk restore, the boot service window and most of boot run on whatever IDT the bootloader left. After the IDT is installed, vectors 0–31 share one stub that prints `!EXC` and halts that CPU, recording nothing.
+- **Effect:** an exception early in boot is a triple fault: a reset loop with no message. Later, a fault is indistinguishable from any other, skips the key scrub and crash dump, and leaves the other CPUs running.
+- **Fix:** install the IDT, GDT and TSS right after `set_phys_offset`; give each vector a stub that records vector, error code, RIP and CR2 and enters the panic path.
 
-### 5. Degraded split-brain refuses reads but still commits writes, and the failure model says otherwise
-- **Where:**
-  - `tools/triad_controller.py:2338-2441`: writes count accepting nodes, with no agreement check.
-  - `TRIAD_FAILURE_MODEL` at `:4133-4173`. Its only test (`:4188-4189`) checks the dictionary's size.
-  - The `917109c` campaign at `:5764-5866`.
-- **Problem:**
-  - With one node down and the other two disagreeing, reads fail closed, but a write is accepted, recorded in the WAL and applied to both divergent replicas. A reviewer harness reproduced this with fakes. `TRIAD_FAILURE_MODEL` says "reads and writes fail closed".
-  - Other entries describe code the controller doesn't have:
-    - "reconstructed via D_lost = D_peer ^ P": the heal only logs the XOR result's hash (`:2976-2987`), then rebuilds from the WAL.
-    - "heal refused (ImaVerificationFailed)": this is the Rust voter's error, not controller behaviour.
-    - "orphan triad_wal.json.tmp … reconciled at boot": nothing reads or removes temp files.
-  - The campaign's Stage B (`:5797-5801`) plants `triad_wal.json.tmp`, a name the controller never uses. Its real temp files are `.triad_wal.json.<pid>.<hex>.tmp` (`:243`).
-  - Stage C calls the heal directly, so detection isn't tested.
-- **Effect:**
-  - Writes can deepen a split-brain.
-  - The failure model reads as a tested guarantee when it isn't one.
-- **Fix:**
-  - Refuse writes while the latest parity verdict is a split-brain, or check agreement under `wal_lock` before the write-ahead. Add a test.
-  - Tie every `TRIAD_FAILURE_MODEL` entry to a behavioural test, or remove it.
-  - Use the real temp-file name in the campaign, and drive detection through `compute_and_verify_raid_parity`.
+### 5. The boot service window has no absolute deadline
+- **Where:** `target_enterprise_kernel/src/net_service.rs:805-815` (`max_idle` at `:808`), and the legacy path at `:1274`.
+- **Problem:** the window closes only after 2,000,000 idle polls, and every frame resets the count. It also exposes the full mutating surface before the boot self-tests have finished.
+- **Effect:** steady traffic keeps a node in the window indefinitely, so it never reaches the main loop. (What it serves there is now committed.)
+- **Fix:** an absolute deadline, and status/ICMP/ARP only until the main loop.
 
-Status: Fixed — test: `run_fault_injection_unit_tests`, `run_unit_self_tests` — commit: `d9869f1`
+### 6. A node without its device key still accepts and saves writes
+- **Where:** `target_enterprise_kernel/src/provisioning.rs:334` (`FwCfgKeyStatus::Absent => (generate_hw_entropy_master_key(), false)`).
+- **Problem:** with the key absent or malformed the node runs on a throwaway key. It cannot read its disk, starts from defaults, and commits new state sealed with a key that will not exist after the reboot. `Absent` logs nothing.
+- **Effect:** the original state is now preserved in quarantine and comes back when the key does, but everything written during the keyless boot is unreadable afterwards, and it was acknowledged.
+- **Fix:** without a provisioned key, refuse durable writes (or refuse to serve), and say so on the console.
 
-### 6. The new request filter rejects valid requests and doesn't match what the engines parse
-- **Where:**
-  - `target_enterprise/src/svc_runtime.rs:1767-1780` (body bytes), `:1787-1858` (SQL) and `:1937-1995` (shell).
-  - Routing at `target_enterprise/src/lived_net.rs:2032` and `:2087-2095` classifies with `SqlDb::is_readonly_query`, which disagrees with the filter.
-- **Problem:** a reviewer harness reproduced each of these through `dispatch_mailbox_op`, and I confirmed the rules in the code.
-  - `PUT /fs` refuses any body containing a control byte other than tab, LF or CR, so binary uploads fail.
-  - `POST /sh` refuses `write /var/note it's`, `a;b` and `fish&chips`, which the console runs as given. `POST /cron` accepts the same text and runs it on the next tick.
-  - `POST /sql` refuses an empty body, `SELECT … ;;`, `.TABLES` and `.dump`. The last two are classified as mutating.
-  - Every rejection is reported as `EPERM (service isolation policy violation)` (`lived_net.rs:3030`) and counted as a served request.
-  - The engines run one statement or command per line and don't interpret `--`, `/* */`, `;`-chaining, pipes or `$()`. So "blocks stacked SQL injection, comment smuggling and shell chaining" refers to syntax that has no effect downstream.
-  - The one real effect is incidental: rejecting `/*` keeps SqlDb's in-band `/*triad*/` and `/*t*/` owner prefixes (`/*t*/` is new in `7d88d4b`) away from HTTP callers.
-- **Effect:**
-  - Documented endpoints reject legitimate input.
-  - Whether a request is accepted depends on the transport.
-  - Telemetry records malformed input as isolation violations.
-- **Fix:**
-  - Classify with one shared function, and don't reject syntax the engines don't interpret.
-  - Allow binary `VfsWrite` bodies, or document text-only and return 400 or 415.
-  - Validate before any counter changes, and return a distinct 400.
-  - Remove the owner override at its source: refuse the prefix in `exec_as` for callers other than the Triad controller, and add a test.
-  - Add should-pass tests through `LivedNet`.
+### 7. Time is counted in HLT wake-ups, and the receive loop can starve everything else
+- **Where:** `live_os_console_loop` in `target_enterprise_kernel/src/main.rs` (the `while let Some(..) = vnet_rx(..)` drain); `HW_IRQ_WAKEUP_COUNTER` in `smp_hw.rs`.
+- **Problem:** the timer interrupt only runs while the boot CPU is halted, so a busy stretch of any length counts as at most one tick. The drain loop does not exit while frames keep arriving.
+- **Effect:** under sustained traffic the TCP retransmit timer, the login cooldown, cron and the SQL transaction timeout stop advancing, and the console is not polled.
+- **Fix:** take time from the TSC or HPET by subtraction, and bound the frames handled per pass.
 
-Status: Fixed — test: `sql::tests::sql_owner_triad_prefix_refused_for_non_triad_and_non_console_owners`, `lived_net::tests::http_request_prefilter_accepts_binary_vfs_valid_sql_and_shell_and_returns_400_without_counter_inflation` — commit: `a3ce4bf`
+### 8. A pending timer interrupt is delivered as a false preemption of the Ring-3 worker
+- **Where:** `target_enterprise_kernel/src/banners_arch_platform.rs:859-884`, used by `exec_service_ring3_mailbox_live` (`:1178`).
+- **Problem:** the periodic timer and the preemption timer share vector `0x40`. The main loop runs with interrupts off, so after 4 ms of work a timer interrupt is latched. The preemption setup does not drain it before entering Ring 3.
+- **Effect:** a legitimate request is reported as a sandbox fault and fails. It needs more than 4 ms of work without an idle halt first, which a commit in the receive path provides.
+- **Fix:** mask and drain the periodic timer before arming, or give the preemption timer its own vector.
 
-### 7. `TriadIngressVoter` is an unused library, and its test overwrites the voter's state to pass
-- **Where:**
-  - `target_enterprise/src/lived_net.rs`: `:2613-2618` (doc), `:2752-2821` (vote), `:2830-2918` (rolling morph) and `:2965-2971` (heal).
-  - The test sets `voter.node_seq = [2, 2, 2];` at `:6072`.
-  - Claims: `README.md:117`, `RESULTS.json:197`.
-- **Problem:**
-  - Only two unit tests use it; the kernel, the controller and the fleet don't. Its single `cluster_key` doesn't match live nodes, which seal with per-node keys.
-  - It mixes two counters:
-    - `node_seq` counts mutating votes, including requests every node rejected.
-    - The heal compares against and copies `SqlDb.tx_seq`, which counts statements and starts at 7.
-  - A reviewer harness reproduced the result: after a valid heal `node_seq` becomes `[2, 2, 9]`, and the next catch-up of an up-to-date node is refused. The test hides this by overwriting `node_seq`; I confirmed the override.
-  - An isolated node can rejoin through `begin_rolling_morph` and `complete_catchup` without the heal, because catch-up trusts the hash and sequence number the caller supplies.
-  - A two-node rollback wins the vote and moves `node_hash` backwards.
-- **Effect:**
-  - The "anti-rollback hardening" in `917109c` isn't proven.
-  - A test was written around a defect.
-  - The docs describe a gateway capability the system doesn't have.
-- **Fix:**
-  - Use one counter: each node's committed tx id, advanced only on success.
-  - Remove the override, and assert that the later catch-up succeeds.
-  - Require `Online` in `begin_rolling_morph`, and bind catch-up to a hash the node reports.
-  - Label it an unintegrated library in README and RESULTS.json until something uses it.
+### 9. Three workspace tests depend on which kernel variant was built last
+- **Where:** `binmorph/src/lib.rs:4622` (`funcs.len() >= 2000`), `binmorph/tests/differential_equiv.rs:2509`, `mtd_metrics/tests/independent_verifier.rs:366`.
+- **Problem:** they read the ELF at `target_enterprise_kernel/target/x86_64-unknown-none/release/`. A `--prod` build writes its smaller ELF to the same path.
+- **Effect:** after any production build the workspace run fails until the default kernel is rebuilt. I reproduced this.
+- **Fix:** build each variant to its own path, or have the tests build the input they measure.
 
-Status: Fixed — test: `lived_net::tests::triad_sustained_adversarial_campaign_concurrent_morph_partial_wal_and_raid5_heal` — commit: `a3ce4bf`
+### 10. Writes to built-in files are accepted and never saved
+- **Where:** `check_writable_vfs_path` at `target_enterprise/src/shell.rs:5780` (protects only `/etc/os-release`); `is_default_system_file` at `:5331` (excluded from the filesystem partition).
+- **Problem:** `write /etc/hostname x` or `write /etc/motd x` succeeds, and the change is gone after a reboot.
+- **Effect:** an acknowledged write that silently does not persist.
+- **Fix:** refuse writes to every path `is_default_system_file` names, or persist them.
 
-### 8. `BTreePager` is an unused prototype documented as SQL storage, and its seal doesn't detect rollback
-- **Where:**
-  - `target_enterprise/src/btree_pager.rs:225-281` (seal and verify) and `:746-764` (heal).
-  - It has no callers outside its own tests. `target_enterprise/src/lib.rs:43` and `:118-120` only re-export it.
-  - Claims: `README.md:112`, `:116` and `RESULTS.json:199`.
-- **Problem:**
-  - It isn't connected to `SqlDb` (still four 64-row tables in one 4 KiB partition), the VFS, the disks or the kernel. It has no load path and no production key.
-  - The HMAC binds the page number, but nothing checks an expected LSN, epoch or tree ID, and the root and page-count metadata aren't sealed. A reviewer harness reproduced three consequences:
-    - restoring an older sealed page brings back a deleted row and drops a newer one;
-    - healing with stale parity restores an old value;
-    - a page from another pager with the same key verifies.
-  - Smaller issues:
-    - A validly sealed page with an out-of-range link panics on the next insert.
-    - Deletes never free pages: after filling and emptying the pager, only 64 inserts fit.
-    - `scan_range` truncates silently.
-- **Effect:**
-  - README's "scales structured storage beyond a single 4 KiB table partition" describes a capability that doesn't exist.
-  - "Sealed" overstates what the seal protects.
-- **Fix:** label it a standalone prototype, or integrate it with:
-  - a sealed manifest holding the tree ID, epoch, root, page count and per-page LSN;
-  - a per-tree derived key;
-  - link validation;
-  - a load path;
-  - a QEMU test.
+### 11. The vault nonce is a 15-bit counter seeded from the boot count
+- **Where:** `target_enterprise/src/shell.rs:527`, `:3771`.
+- **Problem:** the counter only moves toward `0x7FFF`, after which `vault put` fails for good. After a state reset under the same seal key, a `(key name, nonce)` pair can repeat.
+- **Effect:** a permanent failure in the long run, and keystream reuse after a reset.
+- **Fix:** a 96-bit random or persisted monotonic nonce stored with each ciphertext.
 
-Status: Fixed — test: `btree_pager::tests::btree_pager_rejects_rollback_stale_parity_cross_tree_swap_corrupt_links_and_reclaims_deleted_pages`, `btree_pager::tests::btree_pager_scales_to_512_rows_across_split_4kib_leaf_pages_and_verifies_hmac_seals` — commit: `a3ce4bf`
-
-### 9. binmorph still injects `ret`-family bytes, and the "independent verifier" doesn't check the metrics
-- **Where:**
-  - binmorph:
-    - `binmorph/src/lib.rs:1389-1587` (register renaming) and `:2196-2308` (scheduling).
-    - `:3546-3555`: only pass 6 checks for `ret` bytes. The `35cff85` fix is at `:3489-3491`.
-  - Verifier: `tools/verify_metrics_independent.py:232-290` and `mtd_metrics/tests/independent_verifier.rs:104-284`.
-  - Claims: `README.md:65`, `:151` and `:156`; `RESULTS.json:153`, `:156` and `:175-177`.
-- **Problem, in binmorph:**
-  - Register renaming and rescheduling re-encode ModRM, REX and displacement bytes without checking for `ret`-family bytes.
-  - binmorph's own test `try_swap_r14_r15_applies_consistently` (`:3874-3883`) expects `49 89 CE` → `49 89 CF`.
-  - Two reviewer harnesses measured 31 functions gaining interior C3/CF bytes at seed 42 on the current kernel. `35cff85` fixed this only inside pass 6.
-  - README:65 promises "100% scrubbing", and README:156 says "0 injected".
-- **Problem, in the verifier:**
-  - The script recomputes none of what `cuttle_mtd_metrics` produces: gadget survival, chain viability, pairwise survival. It computes different byte-level proxies instead.
-  - No test compares the two. `cross_check_mtd_metrics_against_independent_python_verifier` calls no `cuttle_mtd_metrics` function.
-  - RESULTS.json credits the script with a "table-driven x86-64 decoder" it doesn't have.
-  - Its "interior C3/CF" count includes every such byte except a function's last, including real early `ret`s (about 1,386 of 2,953 at HEAD). It reports only totals, so it can't support "0 injected".
-  - Its checks are bare `assert`s, so under `python -O` a no-op binmorph passes. It also passes when there is no kernel ELF.
-  - The Rust tests' bounds sit just below the recorded output.
-- **Effect:**
-  - Two README rows overstate scrubbing.
-  - A bug in the metric code would still pass "independent verification".
-- **Fix:**
-  - In binmorph, reject any rename or reschedule that adds a `ret`-family byte (compare per-function counts pass by pass), and add a real-kernel test that per-function counts never increase.
-  - Either re-scope the script as a binmorph-output auditor and say so, or add a real cross-check against `churn()` and the other metrics.
-  - Use explicit exit codes, and fail when the kernel ELF is missing.
-  - Correct README:65, README:156 and RESULTS.json.
-
-Status: Fixed — test: `cuttle_binmorph::tests::real_kernel_functions_never_gain_ret_family_or_c3_cf_bytes_across_seeds`, `independent_verifier::cross_check_real_compiled_kernel_elf_with_independent_python_verifier_and_dataflow_chains`, `independent_verifier::cross_check_mtd_metrics_against_independent_python_verifier` — commit: `fddcbf6`
-
-### 10. The differential-equivalence suite silently drops a third of the kernel and misses two kinds of morph bug
-- **Where:**
-  - `binmorph/tests/differential_equiv.rs:2346-2373`: sections are mapped raw.
-  - `:2402-2457`: functions that fault are dropped.
-  - Thresholds at `:2477-2496`.
-  - Claims: `README.md:161` and `RESULTS.json:140-152`.
-- **Problem: relocations are never applied.**
-  - The kernel is a PIE with 4,542 `R_X86_64_RELATIVE` relocations into `.got` and `.data.rel.ro`, and each of those slots is 0 in the file.
-  - Functions that load a global or function pointer fault and are dropped without being counted. The dropped set leans toward pointer-heavy code.
-  - I reproduced it: 754 functions are verified as shipped, and 1,111 when the relocations are applied in a scratch copy.
-  - The `.data/.bss` copy-on-write support added in `0886ce2` exercises 0 functions as shipped, and 20 with relocations applied.
-- **Problem: two guards can be removed without the suite noticing.** I re-ran the reviewer's mutants:
-  - Without the upper-32 guard (`lib.rs:3287`, used at `:3432`), 19,053 verified (function, seed) morphs change and the suite reports 0 mismatches.
-  - Without the RIP-relative guard in the cross-width pass (`lib.rs:3197`, `:3207`), 552 change and it reports 0 mismatches.
-  - In a micro-oracle, both mutants produce real divergences (26 and 25 of 64 seeds), and HEAD produces none.
-  - Only `0886ce2`'s unit test guards against the second, and it just asserts that the pass changes nothing.
-- **Problem: coverage and docs.**
-  - The suite executes only about 15% of the changed bytes in `.text`.
-  - README and RESULTS.json still cite the 522-function run. The current run prints 754 functions, 632 faults caught and 10 input profiles, against 6 in RESULTS.json. The synthetic run is 32 inputs × 64 seeds.
-- **Effect:**
-  - "Verified on 754 real kernel functions" covers about a third of the rewritten code.
-  - A reintroduced upper-32 or RIP-shift bug would ship green.
-- **Fix:**
-  - Apply the RELATIVE relocations (bias 0) to both images, and assert that the count matches `.rela.dyn`.
-  - Fix the emulator's call handling first. With relocations applied, two functions diverge because the emulator follows calls into morphed callees; the reviewer traced this to the harness, not binmorph.
-  - Add corpus functions for:
-    - a 32-bit self-test after a 64-bit write with a non-zero upper half;
-    - an interior `[rip+disp32]` inside a shiftable window.
-  - Report "N verified of M rewritten", and regenerate the doc numbers from a run.
-
-Status: Fixed — test: `differential_equiv::differential_equivalence_on_real_compiled_kernel_elf_functions`, `differential_equiv::differential_equivalence_across_all_passes_and_64_seeds`, `differential_equiv::differential_equivalence_catches_injected_semantic_bugs_meta_test` — commit: `fddcbf6`
-
-### 11. Round 8 #5 residual: an upgrade boot adopts a wiped Triad when more than one table is voted
-- **Where:** `tools/triad_controller.py:119-129` (`_is_genesis_sql_probe`), used at `:3246` (upgrade), `:3107` and `:3351`.
-- **Problem:** the digest-only genesis marker only matches a probe of at most two lines. With `vote_tables = ["kv", "idx"]`, as in the fleet's `index` job, a genesis probe has three lines, so it is never recognized.
-- **I reproduced it on the real shell.** Setup: a legacy (pre-v2) WAL holding three committed writes, with all three nodes back at genesis.
-  - With one vote table, boot replays the WAL (6 rows).
-  - With two, it logs `Probe format upgraded to v2: 3/3 nodes agree`, adopts the empty state at `tx_seq=3`, and drops the three rows with no ALERT.
-- **Effect:** in that narrow upgrade case, every committed write is lost silently.
-- **Fix:**
-  - Check genesis per table: split on `\n--\n` and compare each header with that table's genesis digest.
-  - Refuse the 3/3 upgrade when every table is at genesis and the WAL has entries.
-  - Add a multi-table test.
-
-Status: Fixed — test: `run_unit_self_tests` — commit: `d9869f1`
-
-### 12. Round 8 #4 residual: a path near the 256-byte limit stops the web Triad's vote
-- **Where:**
-  - `tools/triad_controller.py:1698`: `cathex` refuses commands over 256 bytes.
-  - `:2021-2028`: the web probe returns `None` if any file is unreadable.
-  - `contracts/src/storage_and_fs.rs:102`: `FS_PATH_MAX = 256`.
-- **Problem:**
-  - `cathex <path> <offset> 128` doesn't fit in 256 bytes for paths over about 243 characters, and the cutoff is lower at larger offsets.
-  - Such paths are legal: the console's `write` creates them up to 248 characters.
-- **I reproduced it on the real shell,** with the same file on all three web nodes:
-  - A 243-character path votes 3/3.
-  - At 244, 246 and 248 characters every probe returns `None`, and each vote logs `TMR parity vote could not verify 2/3 majority`.
-- **Effect:** a single long file name turns off divergence detection for the web Triad. Unlike Round 8 #1, it is now loud.
-- **Fix:**
-  - Cap VFS paths so the longest controller command always fits, and reject longer paths when a file is created. Or address files without repeating the path.
-  - Test at the maximum length.
-
-Status: Fixed — test: `shell::tests::writable_vfs_path_enforces_200_byte_cap_and_fits_cathex_writehex_line_limit`, `run_unit_self_tests` — commit: `d9869f1`
-
-### 13. Docs overstate the Triad and the boot tests
-- **Where:** `README.md:9-21` (the new overview) and `:162-163`; `experiments/redteam/RESULTS.json:188-200`.
-- **Problem:**
-  - "Every read and write is checked by a 2-of-3 majority vote plus 4 KiB RAID-style XOR parity":
-    - Writes are counted, not voted on.
-    - Parity is never used to check or repair anything. The heal logs the XOR result's hash, then rebuilds from the WAL.
-    - `reconstruct_sql_partition_from_xor_parity` (`tools/triad_controller.py:2247-2268`) is called only from tests, and handles only nodes 1 and 2.
-  - "native UDP `:8081` quorum state-hash checks … detect the divergence":
-    - The controller never sends `TRIAD_*` datagrams.
-    - Each node sits on its own NATed network with only TCP 80 and 443 forwarded.
-    - `triad_node_id` is set only in tests.
-    - Detection is actually the controller's serial-console vote.
-  - "reboot into a freshly scrambled binary in ~140 ms": 140 ms is the binmorph step; a boot takes seconds.
-  - The multi-seed QEMU row and RESULTS.json say three boots "emitted all 130 required boot banners + SHELL resume OK" with intact `CTTLSHL1`/`CTTLFS01`/`CTTLSQL1` state. The test:
-    - checks 18 milestone banners;
-    - checks `SHELL resume OK` only on boots 2–3;
-    - writes no SQL or file state for later boots to read back.
-  - RESULTS.json labels the `bc2e012` test "in_kernel_triad_and_raid", but the XOR is computed in the test body.
-  - RESULTS.json claims XOR reconstruction "across all 3 node losses", but node 3 raises an error.
-- **Fix:**
-  - Describe what actually runs: a serial-console digest vote and a WAL rebuild, with parity for information only.
-  - Make the boot-test row match its assertions, or make the test assert all 130 banners and persist state that later boots must read back.
-
-Status: Fixed — test: `qemu_smoke::morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu`, `run_unit_self_tests`, `run_fault_injection_unit_tests` — commit: `82fd583`, `a6ca484`
+### 12. The WAL frame format accepts a zero-filled tail, and `from_backing` erases what follows a bad frame
+- **Where:** `target_enterprise/src/wal.rs:145-181` and the replay loop; used by the continuity region.
+- **Problem:** a length of 0 with a CRC of 0 is a valid frame, so zeros past the true end parse as records. `from_backing` zero-fills everything after the first invalid frame and reports nothing.
+- **Effect:** a lost tail is not reported as lost; one damaged frame discards every later record. The shell journal is unaffected (its cursor is under the header HMAC).
+- **Fix:** a per-frame magic or sequence number covered by the CRC; return the number of bytes dropped instead of zeroing them.
 
 ---
 
 ## Low priority
 
-### 14. Smaller items
-- **Dataflow chain metric (`mtd_metrics/src/chainsim.rs:384-451`, `:540-567`):**
-  - It treats `call` and `jmp` as no-ops, and counts any register write as control of that register.
-  - Its static check accepts a different gadget at the same offset.
-  - So the recorded 0.068 and 0.55 don't measure ROP-chain survival. The error favours the attacker, so it doesn't inflate the defence claims.
-  - Those figures and the seed-42 metrics came from an older kernel (`.text` 719,232 B, against 725,160 B today).
-  - `1d4e870` dropped the table-header scope that applied to the older rows (25.8%, 0/2,000, 1.15%, 8.80%).
-  - Record the build and seed with every number, and regenerate the numbers from a script.
-- **Probe format version (`tools/triad_controller.py:116`):** `04838f7` changed the digest input from full rows to headers after v2 was defined. Bump the version whenever the probe text changes, and add a golden test that pins the probe text for a known table.
-- **Mismatch diagnosis (`:2128-2132`):** the full rows fetched after a digest mismatch are thrown away. Either log the differing rows or drop the fetch.
-- **Per-peer budget (`target_enterprise/src/lived_net.rs:65`, `:354`):** it keys on source IP. The Triad VMs use QEMU user-mode NAT (`tools/triad_controller.py:1309-1316`), where every client appears as 10.0.2.2, so there it just halves the budget.
-- **`do_POST` (`:3979-3990`, changed in `917109c` without mention):**
-  - It reads unauthenticated bodies of up to 64 KiB before answering 401, and the handler has no socket timeout.
-  - It is local only, but set `TriadHttpHandler.timeout` and add a stalled-body test.
-- **`reconstruct_sql_partition_from_xor_parity` (`:2247-2268`):**
-  - It has no production caller, writes unverified bytes, skips fsync, and zero-fills short peer images.
-  - Delete it, or verify and fsync before wiring it in.
-- **Fleet self-test (`tools/cuttle_fleet.py:1079-1084`):**
-  - It expects WHPX whenever the probe reports WHPX available, but the controller legitimately falls back to TCG when a WHPX guest stays silent. That is why it failed on `auto` here.
-  - Assert the accelerator each node actually reports.
-- **Parser bookkeeping (`target_enterprise/src/shell.rs:787-792`):** the post-parse checks compare values derived from the same `op`, so they can't fail. The "bytecode digest" is an FNV-1a hash that nothing verifies.
-- **Metrics details:**
-  - Pairwise positional survival is asymmetric, and fewer than 2 variants returns zeros (`mtd_metrics/src/lib.rs:495-535`).
-  - The script exits 0 when arguments are missing.
-  - Several of its docstrings describe window lengths and checks it doesn't perform.
-- **`TRIAD_ACK` de-duplication (`lived_net.rs:1018-1046`):** it remembers only the last `(seq, hash)` per peer. This affects telemetry only, on a path the live Triad doesn't use.
-- **binmorph tidy-up:**
-  - `fn _noop_guard() {}` at `binmorph/src/lib.rs:3598` is dead code.
-  - `rewrite_elf_bytes` duplicates `diversify_elf`'s ELF walk.
-- **Boot provisioning (`tools/triad_controller.py:3454`):** after the merge, `_provision_sql` fails with "quorum lost" if fewer than 2 nodes boot, and it is never retried.
-
-Status: Fixed — test: `run_unit_self_tests`, `run_fault_injection_unit_tests`, `cuttle_mtd_metrics::tests::pairwise_diversity_reports_unique_seeds_and_nonzero_byte_diff`, `cuttle_mtd_metrics::chainsim::tests::dataflow_chain_sim_breaks_under_register_permutation`, `lived_net::tests::tcp_per_peer_slot_cap_exempts_qemu_slirp_nat_gateway_and_caps_external_peers`, `lived_net::tests::triad_ack_dedup_remembers_multiple_recent_seq_per_peer`, `python tools/cuttle_fleet.py --self-test --accel tcg` — commit: `d9869f1`, `a3ce4bf`, `fddcbf6`, `a6ca484`
+### 13. Smaller items
+- **AP SHA-256 offload (`smp_hw.rs:701-761`):** a timed-out job is not cancelled and results carry no job id, so a late AP can hand the next caller the previous digest. It is off the commit path now; the boot banner still uses it.
+- **Emergency crash-dump writer (`hw_storage_drivers.rs:225`):** it shares slot 0 and the DMA buffers with the normal path and reaches MMIO through `PT_MOD_LOCK`. A panic raised under that lock still hangs after printing its message.
+- **Boot counter (`banner_continuity`):** the header is unauthenticated. It no longer gates the restore, but attestation quotes still print it.
+- **Aborted SQL transactions (`sql.rs`, `tx_aborted_owner`):** the state is per owner id, and anonymous HTTP clients share one id.
+- **Partial restore on failure:** `unpack_disk_image`, `unpack_fs_partition` and `unpack_sql_partition` each verify before they apply, but a failure in the second or third leaves the first applied. `ShellStore` resets the shell; any other caller must too.
+- **File times:** `pack_fs_partition` writes `mtime = 1` for every file (`shell.rs:1992`).
+- **Production boot panics on a timing check:** `smp_hw.rs:2532` panics unless every AP acknowledges a TLB shootdown within 100,000 spins.
+- **Heap exhaustion is a panic,** and the comment in `heap.rs` that nothing else allocates is wrong (`LivedNet` holds `Vec`s).
+- **Serial output:** `serial_write_byte` (`main.rs:591`) waits on the transmitter without a bound, and the service window prints a line per frame.
+- **virtio-net:** a transmit is dropped silently when the previous frame has not completed; `vnet_rx` returns "empty" for a discarded completion; the legacy fallback uses a 12-byte header where 10 is correct.
+- **`decide_ab_recovery`:** unused by the kernel now. Remove it with its test, or keep it as documented.
+- **Stale Triad base image:** `triad.bat` builds `target/cuttle_images/run_bios.img` only when it is missing, and the controller reuses it. Here it was three weeks older than the kernel ELF. I rebuilt it by hand and did not check what the controller does with a stale one. Rebuild it whenever the ELF is newer.
+- **README:** the QEMU row says 130 banners; the smoke test checks 131. The `https.rs` import of `kernel_fixtures` is unused under `cuttle_prod` (one warning in the production build).
 
 ---
 
 ## Process notes
-- **Status lines:** all seven named a test and a commit. The claims for #1, #2, #3, #6 and #7 matched the code and tests. #4 and #5 left residuals at the edges their tests didn't reach: a 68-character path and a single-table spec.
-- **How High #1 got in:**
-  - The live self-test wasn't run after `bc2e012` or the merge. Last round's notes asked for it.
-  - The harness can't catch per-node differences, because its three shells run the same build.
-  - Make `triad_controller.py --self-test` and `cuttle_fleet.py --self-test` part of done for any controller change.
-- **The side branch** was based on a 10-day-old commit, and before the merge its controller changes were tested only against fakes.
-- **New capability claims:** README and RESULTS.json overstate all four new capabilities: the Ring-3 parser, the B+Tree pager, the ingress voter and the independent verifier. Before adding a capability row, link the test that exercises it in the product path. A unit test of an unused library doesn't count.
-- **CI** has been red for its whole life. Fix the QEMU step first, then treat a red run as blocking.
+- **Put the decision logic where it can be tested.** Most of the High defects I fixed were in kernel glue: ignored results, an ordering, a panic on a counter. None of it could be reached by a unit test. The kernel side of persistence is now a device and some `serial_write_str` calls; keep it that way.
+- **A test that re-implements the sequence it is testing proves the test.** `stage17_ab_journal_survives_power_cut_at_every_sector...` wrote its own copy of the commit steps. The kernel's real sequence differed from it (payload sectors, flush, then superblocks) and its recovery skipped half the table.
+- **"`let _ =`" on a persistence call is a finding by itself.** Four of them hid the journal overflow.
+- **Boot must not assert on stored content.** A self-test that panics on what a user can write is a way to brick a node.
 
 ## Not reviewed this round
-- `Cuttle-OS-Recommendations.md`, the second recommender's untracked file.
-- The content of the `svc_runtime` isolation-matrix test, beyond the fact that its expected results come from the same policy tables the code enforces.
-- The internals of the CPL=3 stub.
-- The `exec_as` owner-selection logic, beyond the Triad prefix.
-- CuttleGuard and CuttleChronos, beyond earlier paths.
-- GitHub Actions logs. They require authentication, so I read only step results and annotations.
-- WHPX: every live run on this host fell back to TCG.
-- Carried over from earlier rounds:
-  - `rustls` key-material clean-up when a reclaimed session is dropped.
-  - Measured heap use under load on a VM.
-  - The rest of `triad_console.html`, and the provider's proxying and poll loop.
+- Last round's status lines for #1–#14 and R1–R15 (table above).
+- The diff of `917109c..d279d75` outside the files listed under Scope: `binmorph`, `diversifier`, `morph_engine`, `mtd_metrics`, `verifier`, `factory_builder` (apart from `qemu_smoke.rs`), `fuzz/`, CI.
+- `tools/triad_controller.py`, `tools/cuttle_fleet.py`, `tools/chaos.py`: not read beyond the heal path and the disk-layout constants.
+- `lived_net.rs`, `svc_runtime.rs`, the TCP/TLS/HTTP stack, `x509.rs`, `tpm.rs`, `ebpf.rs`, `iommu.rs`: not reviewed, apart from call sites into the shell.
+- The Ring-3 stubs and KPTI tables beyond what the memory pass read.
+- The bootloader's behaviour (stack guard page, IDT state at entry).
+- Under QEMU I did not inject AHCI errors, cut power mid-commit, or send a mutating request during the boot service window. Those paths are tested against the disk model only.
+- WHPX: every run here was TCG.
+- Carried over from earlier rounds: `rustls` key-material clean-up when a reclaimed session is dropped; measured heap use under load on a VM; the rest of `triad_console.html`.
