@@ -286,10 +286,24 @@ fn boots_under_qemu_and_emits_banner() {
         );
     }
     assert!(
-        log_contents.contains("tlb_ipi=3 vtd_slpt=ok"),
-        "QEMU smoke: expected OS_ARMOR cross-CPU TLB shootdown ACKs (tlb_ipi=3) + vtd_slpt=ok!\nSerial log:\n{}",
+        log_contents.contains("tlb_ipi=3 vtd_slpt=ok ap_crypto=3 ioapic=1 vtd_drhd=ok"),
+        "QEMU smoke: expected OS_ARMOR tlb_ipi=3 vtd_slpt=ok ap_crypto=3 ioapic=1 vtd_drhd=ok!\nSerial log:\n{}",
         log_contents
     );
+    {
+        let ahci_bytes = std::fs::read(&ahci_disk).expect("read ahci_hw.img after boot 1");
+        let commit_off = 1098 * 512;
+        assert_eq!(
+            &ahci_bytes[commit_off..commit_off + 8],
+            b"CTTLAB01",
+            "QEMU smoke: expected CTTLAB01 atomic journal commit sector at LBA 1098"
+        );
+        assert_eq!(
+            ahci_bytes[commit_off + 8],
+            0x02,
+            "QEMU smoke: expected AB_STATE_QUIESCENT (0x02) at LBA 1098 after clean commit"
+        );
+    }
     if log_contents.contains("CONTINUITY resume OK") {
         assert!(
             log_contents.contains("SHELL resume OK"),

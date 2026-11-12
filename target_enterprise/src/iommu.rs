@@ -722,6 +722,12 @@ pub mod vtd_hw {
 
     use super::{DeviceId, PAGE_MASK, PAGE_SHIFT, PAGE_SIZE};
 
+    /// VT-d Version Register (`VER_REG`) MMIO offset.
+    pub const VTD_REG_VER: u64 = 0x00;
+    /// VT-d Capability Register (`CAP_REG`) MMIO offset.
+    pub const VTD_REG_CAP: u64 = 0x08;
+    /// VT-d Extended Capability Register (`ECAP_REG`) MMIO offset.
+    pub const VTD_REG_ECAP: u64 = 0x10;
     /// VT-d Global Command Register (`GCMD_REG`) MMIO offset.
     pub const VTD_REG_GCMD: u64 = 0x18;
     /// VT-d Global Status Register (`GSTS_REG`) MMIO offset.
@@ -730,12 +736,26 @@ pub mod vtd_hw {
     pub const VTD_REG_RTADDR: u64 = 0x20;
     /// VT-d Context Command Register (`CCMD_REG`) MMIO offset.
     pub const VTD_REG_CCMD: u64 = 0x28;
+    /// `CAP.SAGAW` bit (`bit 10`, i.e., `SAGAW[2]`) indicating 48-bit 4-level SLPT support.
+    pub const CAP_SAGAW_48BIT_4LVL: u64 = 1u64 << 10;
     /// `GCMD.TE` (`bit 31`): Translation Enable.
     pub const GCMD_TE: u32 = 1 << 31;
     /// `GCMD.SRTP` (`bit 30`): Set Root Table Pointer.
     pub const GCMD_SRTP: u32 = 1 << 30;
+    /// `GSTS.TES` (`bit 31`): Translation Enable Status.
+    pub const GSTS_TES: u32 = 1 << 31;
+    /// `GSTS.RTPS` (`bit 30`): Root Table Pointer Status.
+    pub const GSTS_RTPS: u32 = 1 << 30;
+    /// Mask preserving persistent `GSTS` state bits without re-triggering one-shot `GCMD` actions (§10.4.4).
+    pub const GSTS_PERSISTENT_MASK: u32 = 0x96FF_FFFF;
+    /// `CCMD.ICC` (`bit 63`): Invalidate Context-Cache trigger/busy bit.
+    pub const CCMD_ICC: u64 = 1u64 << 63;
     /// `CCMD.ICC` (`bit 63`) | Global Context Invalidation (`01b << 61`).
-    pub const CCMD_GLOBAL_INVAL: u64 = (1u64 << 63) | (1u64 << 61);
+    pub const CCMD_GLOBAL_INVAL: u64 = CCMD_ICC | (1u64 << 61);
+    /// `IOTLB.IVT` (`bit 63`): Invalidate IOTLB trigger/busy bit.
+    pub const IOTLB_IVT: u64 = 1u64 << 63;
+    /// `IOTLB.IVT` (`bit 63`) | Global IOTLB Invalidation (`01b << 60`).
+    pub const IOTLB_GLOBAL_INVAL: u64 = IOTLB_IVT | (1u64 << 60);
 
     /// VT-d Second-Level PTE Read permission (`bit 0`).
     pub const SLPT_READ: u64 = 1 << 0;
@@ -968,6 +988,131 @@ pub mod vtd_hw {
             return Err(IommuError::PermissionDenied);
         }
         Ok((l1 & VTD_PHYS_MASK) | (iova & (PAGE_SIZE - 1)))
+    }
+
+    /// Abstract MMIO register bus for an Intel VT-d `DRHD` remapping hardware unit (`4 KiB` register bank).
+    pub trait VtdMmioBus {
+        /// Read a 32-bit little-endian VT-d register at `offset`.
+        fn read_u32(&mut self, offset: u64) -> u32;
+        /// Write a 32-bit little-endian VT-d register at `offset`.
+        fn write_u32(&mut self, offset: u64, val: u32);
+        /// Read a 64-bit little-endian VT-d register at `offset`.
+        fn read_u64(&mut self, offset: u64) -> u64;
+        /// Write a 64-bit little-endian VT-d register at `offset`.
+        fn write_u64(&mut self, offset: u64, val: u64);
+    }
+
+    /// Hardware initialization failures surfaced by [`enable_drhd_translation_hw`].
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum VtdDrhdError {
+        /// `root_table_phys` is zero, unaligned, or exceeds 52-bit VT-d physical width, or `max_spins == 0`.
+        BadRootTableAddress,
+        /// Hardware `CAP_REG` is all-zeros/all-ones or lacks 48-bit 4-level SLPT (`SAGAW[2]`).
+        UnsupportedSagaw48,
+        /// `GSTS.RTPS` did not assert within `max_spins` after `GCMD.SRTP`.
+        SrtpTimeout,
+        /// `CCMD.ICC` did not clear within `max_spins` after global context-cache invalidation.
+        ContextInvalTimeout,
+        /// `IOTLB.IVT` did not clear within `max_spins` after global IOTLB invalidation.
+        IotlbInvalTimeout,
+        /// `GSTS.TES` did not assert within `max_spins` after `GCMD.TE`.
+        TranslationEnableTimeout,
+    }
+
+    /// Compute the MMIO offset of `IOTLB_REG` (`IRO * 16 + 0x08`) from `ECAP_REG` (VT-d §10.4.3, §10.4.8).
+    #[inline]
+    pub const fn extract_ecap_iro_offset(ecap: u64) -> u64 {
+        ((ecap >> 8) & 0x3FF) * 16 + 0x08
+    }
+
+    /// Program an Intel VT-d `DRHD` unit to enforce `root_table_phys` via the specification's
+    /// mandatory sequence (`CAP.SAGAW` check -> `RTADDR` -> `GCMD.SRTP` + `GSTS.RTPS` ->
+    /// global `CCMD` invalidation -> global `IOTLB` invalidation -> `GCMD.TE` + `GSTS.TES`).
+    pub fn enable_drhd_translation_hw(
+        bus: &mut dyn VtdMmioBus,
+        root_table_phys: u64,
+        max_spins: u32,
+    ) -> Result<(), VtdDrhdError> {
+        if max_spins == 0
+            || root_table_phys == 0
+            || (root_table_phys & !PAGE_MASK) != 0
+            || (root_table_phys & !VTD_PHYS_MASK) != 0
+        {
+            return Err(VtdDrhdError::BadRootTableAddress);
+        }
+
+        let cap = bus.read_u64(VTD_REG_CAP);
+        if cap == 0 || cap == u64::MAX || (cap & CAP_SAGAW_48BIT_4LVL) == 0 {
+            return Err(VtdDrhdError::UnsupportedSagaw48);
+        }
+        let ecap = bus.read_u64(VTD_REG_ECAP);
+
+        // 1. Latch 4 KiB Root Table physical address (`RTADDR_REG`) and trigger `GCMD.SRTP`.
+        bus.write_u64(VTD_REG_RTADDR, root_table_phys & VTD_PHYS_MASK);
+        let gsts_pre_srtp = bus.read_u32(VTD_REG_GSTS) & GSTS_PERSISTENT_MASK;
+        bus.write_u32(VTD_REG_GCMD, gsts_pre_srtp | GCMD_SRTP);
+
+        let mut spins = 0u32;
+        let mut rtps_ok = false;
+        while spins < max_spins {
+            if (bus.read_u32(VTD_REG_GSTS) & GSTS_RTPS) != 0 {
+                rtps_ok = true;
+                break;
+            }
+            spins += 1;
+        }
+        if !rtps_ok {
+            return Err(VtdDrhdError::SrtpTimeout);
+        }
+
+        // 2. Global Context-Cache Invalidation (`CCMD_REG`).
+        bus.write_u64(VTD_REG_CCMD, CCMD_GLOBAL_INVAL);
+        spins = 0;
+        let mut ccmd_ok = false;
+        while spins < max_spins {
+            if (bus.read_u64(VTD_REG_CCMD) & CCMD_ICC) == 0 {
+                ccmd_ok = true;
+                break;
+            }
+            spins += 1;
+        }
+        if !ccmd_ok {
+            return Err(VtdDrhdError::ContextInvalTimeout);
+        }
+
+        // 3. Global IOTLB Invalidation (`ECAP.IRO * 16 + 0x08`).
+        let iotlb_off = extract_ecap_iro_offset(ecap);
+        bus.write_u64(iotlb_off, IOTLB_GLOBAL_INVAL);
+        spins = 0;
+        let mut iotlb_ok = false;
+        while spins < max_spins {
+            if (bus.read_u64(iotlb_off) & IOTLB_IVT) == 0 {
+                iotlb_ok = true;
+                break;
+            }
+            spins += 1;
+        }
+        if !iotlb_ok {
+            return Err(VtdDrhdError::IotlbInvalTimeout);
+        }
+
+        // 4. Enable DMA Remapping Translation (`GCMD.TE`) preserving persistent `GSTS` bits.
+        let gsts_pre_te = bus.read_u32(VTD_REG_GSTS) & GSTS_PERSISTENT_MASK;
+        bus.write_u32(VTD_REG_GCMD, gsts_pre_te | GCMD_TE);
+        spins = 0;
+        let mut tes_ok = false;
+        while spins < max_spins {
+            if (bus.read_u32(VTD_REG_GSTS) & GSTS_TES) != 0 {
+                tes_ok = true;
+                break;
+            }
+            spins += 1;
+        }
+        if !tes_ok {
+            return Err(VtdDrhdError::TranslationEnableTimeout);
+        }
+
+        Ok(())
     }
 }
 
@@ -1567,6 +1712,166 @@ mod tests {
                 AccessKind::Read,
             ),
             Err(IommuError::DeviceNotBound)
+        );
+    }
+
+    #[test]
+    fn stage20_vtd_drhd_mmio_driver_srtp_ccmd_iotlb_te_and_timeout_guards() {
+        use super::vtd_hw::*;
+
+        struct MockDrhd {
+            cap: u64,
+            ecap: u64,
+            gsts: u32,
+            rtaddr: u64,
+            ccmd: u64,
+            iotlb: u64,
+            stall_srtp: bool,
+            stall_ccmd: bool,
+            stall_iotlb: bool,
+            stall_te: bool,
+            ccmd_count: u32,
+            iotlb_count: u32,
+        }
+        impl MockDrhd {
+            fn new() -> Self {
+                Self {
+                    cap: CAP_SAGAW_48BIT_4LVL,
+                    ecap: 0x24u64 << 8, // IRO = 0x24 -> IOTLB at 0x248
+                    gsts: 1 << 25,      // persistent IRES status bit (VT-d §10.4.4) that must be preserved!
+                    rtaddr: 0,
+                    ccmd: 0,
+                    iotlb: 0,
+                    stall_srtp: false,
+                    stall_ccmd: false,
+                    stall_iotlb: false,
+                    stall_te: false,
+                    ccmd_count: 0,
+                    iotlb_count: 0,
+                }
+            }
+        }
+        impl VtdMmioBus for MockDrhd {
+            fn read_u32(&mut self, offset: u64) -> u32 {
+                if offset == VTD_REG_GSTS {
+                    self.gsts
+                } else {
+                    0x10
+                }
+            }
+            fn write_u32(&mut self, offset: u64, val: u32) {
+                if offset == VTD_REG_GCMD {
+                    let preserved = val & (1 << 25);
+                    self.gsts = (self.gsts & !(1 << 25)) | preserved;
+                    if (val & GCMD_SRTP) != 0 && !self.stall_srtp {
+                        self.gsts |= GSTS_RTPS;
+                    }
+                    if (val & GCMD_TE) != 0 && !self.stall_te {
+                        self.gsts |= GSTS_TES;
+                    }
+                }
+            }
+            fn read_u64(&mut self, offset: u64) -> u64 {
+                let iro_off = extract_ecap_iro_offset(self.ecap);
+                if offset == VTD_REG_CAP {
+                    self.cap
+                } else if offset == VTD_REG_ECAP {
+                    self.ecap
+                } else if offset == VTD_REG_RTADDR {
+                    self.rtaddr
+                } else if offset == VTD_REG_CCMD {
+                    self.ccmd
+                } else if offset == iro_off {
+                    self.iotlb
+                } else {
+                    0
+                }
+            }
+            fn write_u64(&mut self, offset: u64, val: u64) {
+                let iro_off = extract_ecap_iro_offset(self.ecap);
+                if offset == VTD_REG_RTADDR {
+                    self.rtaddr = val;
+                } else if offset == VTD_REG_CCMD {
+                    self.ccmd_count += 1;
+                    self.ccmd = if self.stall_ccmd {
+                        val
+                    } else {
+                        val & !CCMD_ICC
+                    };
+                } else if offset == iro_off {
+                    self.iotlb_count += 1;
+                    self.iotlb = if self.stall_iotlb {
+                        val
+                    } else {
+                        val & !IOTLB_IVT
+                    };
+                }
+            }
+        }
+
+        assert_eq!(extract_ecap_iro_offset(0x24u64 << 8), 0x248);
+
+        // 1. Happy path: programs RTADDR, preserves persistent GSTS bits, flushes CCMD + IOTLB, enables TE.
+        let mut ok_bus = MockDrhd::new();
+        assert_eq!(enable_drhd_translation_hw(&mut ok_bus, 0x0080_4000, 16), Ok(()));
+        assert_eq!(ok_bus.rtaddr, 0x0080_4000);
+        assert_eq!(ok_bus.ccmd_count, 1);
+        assert_eq!(ok_bus.iotlb_count, 1);
+        assert_ne!(ok_bus.gsts & GSTS_RTPS, 0);
+        assert_ne!(ok_bus.gsts & GSTS_TES, 0);
+        assert_ne!(ok_bus.gsts & (1 << 25), 0, "persistent GSTS state bits must be preserved");
+
+        // 2. Bad root-table alignment / zero / zero max_spins.
+        assert_eq!(
+            enable_drhd_translation_hw(&mut ok_bus, 0, 16),
+            Err(VtdDrhdError::BadRootTableAddress)
+        );
+        assert_eq!(
+            enable_drhd_translation_hw(&mut ok_bus, 0x4001, 16),
+            Err(VtdDrhdError::BadRootTableAddress)
+        );
+        assert_eq!(
+            enable_drhd_translation_hw(&mut ok_bus, 0x4000, 0),
+            Err(VtdDrhdError::BadRootTableAddress)
+        );
+
+        // 3. Missing 48-bit 4-level SLPT capability or disconnected MMIO (`u64::MAX`).
+        let mut bad_cap = MockDrhd::new();
+        bad_cap.cap = 0;
+        assert_eq!(
+            enable_drhd_translation_hw(&mut bad_cap, 0x4000, 8),
+            Err(VtdDrhdError::UnsupportedSagaw48)
+        );
+        bad_cap.cap = u64::MAX;
+        assert_eq!(
+            enable_drhd_translation_hw(&mut bad_cap, 0x4000, 8),
+            Err(VtdDrhdError::UnsupportedSagaw48)
+        );
+
+        // 4. Deterministic bounded spin timeouts on every hardware handshake stage.
+        let mut s_srtp = MockDrhd::new();
+        s_srtp.stall_srtp = true;
+        assert_eq!(
+            enable_drhd_translation_hw(&mut s_srtp, 0x4000, 8),
+            Err(VtdDrhdError::SrtpTimeout)
+        );
+        let mut s_ccmd = MockDrhd::new();
+        s_ccmd.stall_ccmd = true;
+        assert_eq!(
+            enable_drhd_translation_hw(&mut s_ccmd, 0x4000, 8),
+            Err(VtdDrhdError::ContextInvalTimeout)
+        );
+        let mut s_iotlb = MockDrhd::new();
+        s_iotlb.stall_iotlb = true;
+        assert_eq!(
+            enable_drhd_translation_hw(&mut s_iotlb, 0x4000, 8),
+            Err(VtdDrhdError::IotlbInvalTimeout)
+        );
+        let mut s_te = MockDrhd::new();
+        s_te.stall_te = true;
+        assert_eq!(
+            enable_drhd_translation_hw(&mut s_te, 0x4000, 8),
+            Err(VtdDrhdError::TranslationEnableTimeout)
         );
     }
 }

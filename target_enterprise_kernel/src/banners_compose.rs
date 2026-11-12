@@ -586,6 +586,16 @@ pub(crate) const SHELL_FS_DISK_LBA: u64 = 1042;
 /// First LBA of the 8-sector (`4 KiB`, `CTTLSQL1` superblock + relational tables)
 /// embedded SQL database partition on the AHCI disk (`LBA 1058..=1065`).
 pub(crate) const SHELL_SQL_DISK_LBA: u64 = 1058;
+/// First LBA of the 2-sector shadow `Slot B` WAL staging window (`LBA 1072..=1073`).
+pub(crate) const SHELL_SHADOW_WAL_LBA: u64 = 1072;
+/// First LBA of the 16-sector shadow `Slot B` FS staging window (`LBA 1074..=1089`).
+pub(crate) const SHELL_SHADOW_FS_LBA: u64 = 1074;
+/// First LBA of the 8-sector shadow `Slot B` SQL staging window (`LBA 1090..=1097`).
+pub(crate) const SHELL_SHADOW_SQL_LBA: u64 = 1090;
+/// Single-sector HMAC-SHA256-sealed `CTTLAB01` two-phase commit record (`LBA 1098`).
+pub(crate) const SHELL_AB_COMMIT_LBA: u64 = 1098;
+
+static AB_COMMIT_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 static FS_PART_SECTORS: spin::Mutex<[[u8; 512]; target_enterprise::shell::SHELL_FS_PART_SECTORS]> =
     spin::Mutex::new([[0u8; 512]; target_enterprise::shell::SHELL_FS_PART_SECTORS]);
@@ -594,40 +604,178 @@ static SQL_PART_SECTORS_BUF: spin::Mutex<[[u8; 512]; target_enterprise::SQL_PART
     spin::Mutex::new([[0u8; 512]; target_enterprise::SQL_PART_SECTORS]);
 
 pub(crate) fn persist_shell_to_ahci(sh: &mut target_enterprise::OsShell, boots: u64) -> Option<usize> {
-    let mut hdr_sec = [0u8; 512];
-    let mut wal_sec = [0u8; 512];
-    let count = sh.pack_disk_image(boots, &mut hdr_sec, &mut wal_sec).ok()?;
+    use target_enterprise::durable_seal::ab_journal::{
+        pack_ab_commit_sector, AbCommitHeader, AB_STATE_IN_FLIGHT, AB_STATE_QUIESCENT,
+    };
+
+    let mut wal_pair = [[0u8; 512]; 2];
+    let (hdr_slice, wal_slice) = wal_pair.split_at_mut(1);
+    let count = sh
+        .pack_disk_image(boots, &mut hdr_slice[0], &mut wal_slice[0])
+        .ok()?;
     let mut fs_secs = FS_PART_SECTORS.lock();
     sh.pack_fs_partition(boots, &mut *fs_secs).ok()?;
     let mut sql_secs = SQL_PART_SECTORS_BUF.lock();
     sh.pack_sql_partition(&mut *sql_secs);
+
+    let seal_key = if target_enterprise::durable_seal::is_seal_key_set(&sh.seal_key) {
+        sh.seal_key
+    } else {
+        derive_runtime_seal_key()
+    };
+
+    // Compute the 3 partition SHA-256 digests concurrently across AP cores `CPU 1..3`.
+    // SAFETY: `[[u8; 512]; N]` has identical contiguous layout and alignment (`1`) to `[u8; N * 512]`.
+    let (wal_sha, fs_sha, sql_sha) = unsafe {
+        let wb = core::slice::from_raw_parts(wal_pair.as_ptr().cast::<u8>(), 2 * 512);
+        let fb = core::slice::from_raw_parts(
+            fs_secs.as_ptr().cast::<u8>(),
+            target_enterprise::shell::SHELL_FS_PART_SECTORS * 512,
+        );
+        let sb = core::slice::from_raw_parts(
+            sql_secs.as_ptr().cast::<u8>(),
+            target_enterprise::SQL_PART_SECTORS * 512,
+        );
+        crate::smp_hw::smp_parallel_sha256_3way(wb, fb, sb)
+    };
+    let commit_seq = AB_COMMIT_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+
     let port = AhciHwPort::probe_start_quiet();
-    // Phase 1: write all payload sectors across SQL, FS, and WAL partitions first.
-    let mut sq = 1usize;
+
+    // Stage 1: Write complete 26-sector image to Shadow `Slot B` (`LBA 1072..=1097`) and flush
+    // while Primary `Slot A` (`LBA 1040..=1065`) remains untouched.
+    port.write_sector(SHELL_SHADOW_WAL_LBA, &wal_pair[0]);
+    port.write_sector(SHELL_SHADOW_WAL_LBA + 1, &wal_pair[1]);
+    let mut s = 0usize;
+    while s < target_enterprise::shell::SHELL_FS_PART_SECTORS {
+        port.write_sector(SHELL_SHADOW_FS_LBA + (s as u64), &fs_secs[s]);
+        s += 1;
+    }
+    let mut sq = 0usize;
+    while sq < target_enterprise::SQL_PART_SECTORS {
+        port.write_sector(SHELL_SHADOW_SQL_LBA + (sq as u64), &sql_secs[sq]);
+        sq += 1;
+    }
+    port.flush_cache();
+
+    // Stage 2: Atomically seal & flush `AB_STATE_IN_FLIGHT` commit sector (`LBA 1098`).
+    let mut commit_sec = [0u8; 512];
+    let in_flight_hdr = AbCommitHeader {
+        state: AB_STATE_IN_FLIGHT,
+        boots,
+        commit_seq,
+        wal_sha,
+        fs_sha,
+        sql_sha,
+    };
+    if pack_ab_commit_sector(&seal_key, &in_flight_hdr, &mut commit_sec) {
+        port.write_sector(SHELL_AB_COMMIT_LBA, &commit_sec);
+        port.flush_cache();
+    }
+
+    // Stage 3: Install payload sectors then superblock/header sectors into Primary `Slot A` (`1040..=1065`).
+    sq = 1;
     while sq < target_enterprise::SQL_PART_SECTORS {
         port.write_sector(SHELL_SQL_DISK_LBA + (sq as u64), &sql_secs[sq]);
         sq += 1;
     }
-    let mut s = 1usize;
+    s = 1;
     while s < target_enterprise::shell::SHELL_FS_PART_SECTORS {
         port.write_sector(SHELL_FS_DISK_LBA + (s as u64), &fs_secs[s]);
         s += 1;
     }
-    port.write_sector(SHELL_DISK_LBA + 1, &wal_sec);
+    port.write_sector(SHELL_DISK_LBA + 1, &wal_pair[1]);
     port.flush_cache();
-    // Phase 2: commit sealed superblock / header sectors after payload barrier, then flush.
     port.write_sector(SHELL_SQL_DISK_LBA, &sql_secs[0]);
     port.write_sector(SHELL_FS_DISK_LBA, &fs_secs[0]);
-    port.write_sector(SHELL_DISK_LBA, &hdr_sec);
+    port.write_sector(SHELL_DISK_LBA, &wal_pair[0]);
     port.flush_cache();
+
+    // Stage 4: Transition commit sector (`LBA 1098`) to `AB_STATE_QUIESCENT` and flush.
+    let quiescent_hdr = AbCommitHeader {
+        state: AB_STATE_QUIESCENT,
+        ..in_flight_hdr
+    };
+    if pack_ab_commit_sector(&seal_key, &quiescent_hdr, &mut commit_sec) {
+        port.write_sector(SHELL_AB_COMMIT_LBA, &commit_sec);
+        port.flush_cache();
+    }
     Some(count)
 }
 
 pub(crate) fn restore_shell_from_ahci(sh: &mut target_enterprise::OsShell) -> Option<(u64, usize)> {
+    use target_enterprise::durable_seal::ab_journal::{
+        decide_ab_recovery, hash_sector_slice, pack_ab_commit_sector, verify_ab_commit_sector,
+        AbCommitHeader, AbRecoveryDecision, AB_STATE_IN_FLIGHT, AB_STATE_QUIESCENT,
+    };
+
     if !target_enterprise::durable_seal::is_seal_key_set(&sh.legacy_seal_key) {
         sh.legacy_seal_key = derive_runtime_legacy_seal_key();
     }
+    let seal_key = if target_enterprise::durable_seal::is_seal_key_set(&sh.seal_key) {
+        sh.seal_key
+    } else {
+        derive_runtime_seal_key()
+    };
     let port = AhciHwPort::probe_start_quiet();
+
+    // Check `LBA 1098` for an interrupted `AB_STATE_IN_FLIGHT` shadow-journal commit; if valid and
+    // `Slot B` (`LBA 1072..=1097`) matches all 3 authenticated SHA-256 digests, replay `Slot B -> Slot A`.
+    let commit_sec = port.read_sector(SHELL_AB_COMMIT_LBA);
+    if let Some(hdr) = verify_ab_commit_sector(&seal_key, &commit_sec) {
+        if hdr.state == AB_STATE_IN_FLIGHT {
+            let wal_b = [
+                port.read_sector(SHELL_SHADOW_WAL_LBA),
+                port.read_sector(SHELL_SHADOW_WAL_LBA + 1),
+            ];
+            let mut fs_b = FS_PART_SECTORS.lock();
+            let mut s = 0usize;
+            while s < target_enterprise::shell::SHELL_FS_PART_SECTORS {
+                fs_b[s] = port.read_sector(SHELL_SHADOW_FS_LBA + (s as u64));
+                s += 1;
+            }
+            let mut sql_b = SQL_PART_SECTORS_BUF.lock();
+            let mut sq = 0usize;
+            while sq < target_enterprise::SQL_PART_SECTORS {
+                sql_b[sq] = port.read_sector(SHELL_SHADOW_SQL_LBA + (sq as u64));
+                sq += 1;
+            }
+            let journal_ok = hash_sector_slice(&wal_b) == hdr.wal_sha
+                && hash_sector_slice(&*fs_b) == hdr.fs_sha
+                && hash_sector_slice(&*sql_b) == hdr.sql_sha;
+            if matches!(
+                decide_ab_recovery(false, false, Some(hdr), journal_ok),
+                AbRecoveryDecision::ReplayJournalToPrimary(_)
+            ) {
+                sq = 1;
+                while sq < target_enterprise::SQL_PART_SECTORS {
+                    port.write_sector(SHELL_SQL_DISK_LBA + (sq as u64), &sql_b[sq]);
+                    sq += 1;
+                }
+                s = 1;
+                while s < target_enterprise::shell::SHELL_FS_PART_SECTORS {
+                    port.write_sector(SHELL_FS_DISK_LBA + (s as u64), &fs_b[s]);
+                    s += 1;
+                }
+                port.write_sector(SHELL_DISK_LBA + 1, &wal_b[1]);
+                port.flush_cache();
+                port.write_sector(SHELL_SQL_DISK_LBA, &sql_b[0]);
+                port.write_sector(SHELL_FS_DISK_LBA, &fs_b[0]);
+                port.write_sector(SHELL_DISK_LBA, &wal_b[0]);
+                port.flush_cache();
+                let mut q_sec = [0u8; 512];
+                let q_hdr = AbCommitHeader {
+                    state: AB_STATE_QUIESCENT,
+                    ..hdr
+                };
+                if pack_ab_commit_sector(&seal_key, &q_hdr, &mut q_sec) {
+                    port.write_sector(SHELL_AB_COMMIT_LBA, &q_sec);
+                    port.flush_cache();
+                }
+            }
+        }
+    }
+
     let hdr_sec = port.read_sector(SHELL_DISK_LBA);
     let wal_sec = port.read_sector(SHELL_DISK_LBA + 1);
     let mut all_zero = true;
@@ -1020,6 +1168,8 @@ pub(crate) fn banner_shell_compose() {
     }
     sh.svc
         .set_ring3_cap_hw_hook(crate::banners_arch_platform::exec_service_ring3_cap_live);
+    sh.svc
+        .set_ring3_mailbox_hw_hook(crate::banners_arch_platform::exec_service_ring3_mailbox_live);
     if resumed_ok {
         let _ = persist_shell_to_ahci(sh, boots);
     } else {
@@ -1040,7 +1190,7 @@ pub(crate) fn banner_shell_compose() {
 #[inline(never)]
 fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
     use target_enterprise::svc_runtime::{
-        IpcOp, NodeRole, ServiceError, ServiceId, SvcSyscall, SERVICE_COUNT,
+        IpcOp, NodeRole, ServiceError, ServiceId, ServiceState, SvcSyscall, SERVICE_COUNT,
     };
 
     if vsh.svc.running_count() != 3 {
@@ -1073,6 +1223,8 @@ fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
     }
     vsh.svc
         .set_ring3_cap_hw_hook(crate::banners_arch_platform::exec_service_ring3_cap_live);
+    vsh.svc
+        .set_ring3_mailbox_hw_hook(crate::banners_arch_platform::exec_service_ring3_mailbox_live);
     let mut mb_out = [0u8; 64];
     if vsh
         .dispatch_mailbox_op(IpcOp::HttpGetStatus, true, false, 1, b"/status", b"", &mut mb_out)
@@ -1080,6 +1232,37 @@ fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
         || vsh.svc.services[ServiceId::Http.index()].mailbox.cpl3_runs < 2
     {
         panic!("SVC_RUNTIME compose: live dispatch_mailbox_op did not increment hardware cpl3_runs");
+    }
+    // 0b. Verify real hardware `CPL=3` mailbox sanitizer rejects path traversal (`..`) in user space
+    //     and contains + auto-restarts a live `ud2` (`#UD`) Ring-3 worker fault without disrupting peers!
+    if vsh.dispatch_mailbox_op(
+        IpcOp::HttpGetStatus,
+        true,
+        false,
+        1,
+        b"/../etc/shadow",
+        b"",
+        &mut mb_out,
+    ) != Err(ServiceError::BadRequest)
+    {
+        panic!("SVC_RUNTIME compose: CPL=3 mailbox worker failed to reject path traversal");
+    }
+    vsh.svc.arm_ring3_fault_injection_once(ServiceId::Http);
+    if vsh.dispatch_mailbox_op(IpcOp::HttpGetStatus, true, false, 1, b"/status", b"", &mut mb_out)
+        != Err(ServiceError::SandboxTrap)
+        || vsh.svc.services[ServiceId::Http.index()].state != ServiceState::Faulted
+        || vsh.svc.services[ServiceId::Sql.index()].state != ServiceState::Running
+        || vsh.svc.services[ServiceId::Shell.index()].state != ServiceState::Running
+    {
+        panic!("SVC_RUNTIME compose: CPL=3 ud2 fault was not isolated to ServiceId::Http");
+    }
+    if vsh
+        .dispatch_mailbox_op(IpcOp::HttpGetStatus, true, false, 1, b"/status", b"", &mut mb_out)
+        .is_err()
+        || vsh.svc.services[ServiceId::Http.index()].state != ServiceState::Running
+        || vsh.svc.services[ServiceId::Http.index()].restarts < 1
+    {
+        panic!("SVC_RUNTIME compose: supervisor failed to auto-restart faulted CPL=3 service");
     }
     // 1. Deny-by-default cross-service syscall/capability violations must be refused:
     if vsh

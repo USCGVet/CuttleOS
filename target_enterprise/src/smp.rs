@@ -375,6 +375,134 @@ impl<const N: usize> SmpLockupWatchdog<N> {
         mask
     }
 }
+
+/// MADT entry type `1` (`I/O APIC`, 12 bytes, ACPI 6.4 §5.2.12.3).
+pub const MADT_ENTRY_IOAPIC: u8 = 1;
+/// Fixed byte length of a MADT I/O APIC subtable.
+pub const MADT_IOAPIC_LEN: usize = 12;
+/// MADT entry type `2` (`Interrupt Source Override`, 10 bytes, ACPI 6.4 §5.2.12.5).
+pub const MADT_ENTRY_ISO: u8 = 2;
+/// Fixed byte length of a MADT Interrupt Source Override subtable.
+pub const MADT_ISO_LEN: usize = 10;
+/// Standard x86 PC/Q35 fallback I/O APIC MMIO base (`0xFEC0_0000`).
+pub const DEFAULT_IOAPIC_PHYS: u64 = 0xFEC0_0000;
+
+/// Extract `(ioapic_id, ioapic_phys_base, gsi_base)` from the first valid Type-1 I/O APIC
+/// subtable in an ACPI `MADT` (`"APIC"`) table, returning `None` if absent or malformed.
+#[inline(never)]
+pub fn extract_madt_ioapic_phys(madt_bytes: &[u8]) -> Option<(u8, u64, u32)> {
+    if madt_bytes.len() < madt::HEADER_LEN || &madt_bytes[0..4] != madt::SIG_APIC.as_slice() {
+        return None;
+    }
+    let tlen = u32::from_le_bytes([
+        madt_bytes[4],
+        madt_bytes[5],
+        madt_bytes[6],
+        madt_bytes[7],
+    ]) as usize;
+    if tlen < madt::HEADER_LEN || tlen > madt_bytes.len() {
+        return None;
+    }
+    let mut cur = madt::HEADER_LEN;
+    let mut found: Option<(u8, u64, u32)> = None;
+    while cur + 2 <= tlen {
+        let etype = madt_bytes[cur];
+        let elen = madt_bytes[cur + 1] as usize;
+        if elen < 2 || cur + elen > tlen {
+            return None;
+        }
+        if etype == MADT_ENTRY_IOAPIC && elen >= MADT_IOAPIC_LEN && found.is_none() {
+            let id = madt_bytes[cur + 2];
+            let phys = u32::from_le_bytes([
+                madt_bytes[cur + 4],
+                madt_bytes[cur + 5],
+                madt_bytes[cur + 6],
+                madt_bytes[cur + 7],
+            ]) as u64;
+            let gsi_base = u32::from_le_bytes([
+                madt_bytes[cur + 8],
+                madt_bytes[cur + 9],
+                madt_bytes[cur + 10],
+                madt_bytes[cur + 11],
+            ]);
+            if phys != 0 && (phys & 0xFFF) == 0 {
+                found = Some((id, phys, gsi_base));
+            }
+        }
+        cur += elen;
+    }
+    found
+}
+
+/// Resolve an ISA `irq` (`0..16`, e.g. `COM1 = 4`) to its Global System Interrupt (`GSI`)
+/// by walking MADT Type-2 `Interrupt Source Override` entries, defaulting to `irq as u32`.
+#[inline(never)]
+pub fn resolve_isa_irq_to_gsi(madt_opt: Option<&[u8]>, isa_irq: u8) -> u32 {
+    if let Some(madt_bytes) = madt_opt {
+        if madt_bytes.len() >= madt::HEADER_LEN && &madt_bytes[0..4] == madt::SIG_APIC.as_slice() {
+            let tlen = u32::from_le_bytes([
+                madt_bytes[4],
+                madt_bytes[5],
+                madt_bytes[6],
+                madt_bytes[7],
+            ]) as usize;
+            if tlen >= madt::HEADER_LEN && tlen <= madt_bytes.len() {
+                let mut cur = madt::HEADER_LEN;
+                while cur + 2 <= tlen {
+                    let etype = madt_bytes[cur];
+                    let elen = madt_bytes[cur + 1] as usize;
+                    if elen < 2 || cur + elen > tlen {
+                        break;
+                    }
+                    if etype == MADT_ENTRY_ISO
+                        && elen >= MADT_ISO_LEN
+                        && madt_bytes[cur + 2] == 0
+                        && madt_bytes[cur + 3] == isa_irq
+                    {
+                        return u32::from_le_bytes([
+                            madt_bytes[cur + 4],
+                            madt_bytes[cur + 5],
+                            madt_bytes[cur + 6],
+                            madt_bytes[cur + 7],
+                        ]);
+                    }
+                    cur += elen;
+                }
+            }
+        }
+    }
+    isa_irq as u32
+}
+
+/// Cryptographic digest / MAC operation executable on secondary Application Processors (`CPU 1..3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmpCryptoOp {
+    /// Unkeyed FIPS 180-4 SHA-256 digest (`seal_bytes`).
+    Sha256,
+    /// Keyed RFC 2104 HMAC-SHA256 tag (`seal_bytes_keyed`).
+    HmacSha256([u8; 32]),
+}
+
+/// Execute `op` over `payload` into `out_digest` (lock-free, `no_std`, stack-bounded for AP workers).
+#[inline(never)]
+pub fn exec_smp_crypto_digest(op: SmpCryptoOp, payload: &[u8], out_digest: &mut [u8; 32]) {
+    match op {
+        SmpCryptoOp::Sha256 => crate::durable_seal::seal_bytes(payload, out_digest),
+        SmpCryptoOp::HmacSha256(ref key) => {
+            crate::durable_seal::seal_bytes_keyed(key, payload, out_digest)
+        }
+    }
+}
+
+/// Compute a 512-byte RAID-Z1 XOR parity sector `out = left ^ right` on an AP worker core.
+#[inline(never)]
+pub fn exec_smp_xor_parity_512(left: &[u8; 512], right: &[u8; 512], out: &mut [u8; 512]) {
+    let mut i = 0usize;
+    while i < 512 {
+        out[i] = left[i] ^ right[i];
+        i += 1;
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +941,73 @@ mod tests {
             0,
             "AP 2 advancing tick must clear stall mask"
         );
+    }
+
+    #[test]
+    fn stage19_madt_ioapic_iso_discovery_and_parallel_crypto_parity_ops() {
+        // 1. Build MADT with Type-1 IOAPIC (`id=2, phys=0xFEC0_1000, gsi_base=0`) + two Type-2 ISOs (`IRQ 0 -> GSI 2`, `IRQ 4 -> GSI 9`).
+        let mut madt_buf = [0u8; madt::HEADER_LEN + MADT_IOAPIC_LEN + 2 * MADT_ISO_LEN];
+        let tlen = madt_buf.len() as u32;
+        madt_buf[0..4].copy_from_slice(&madt::SIG_APIC);
+        madt_buf[4..8].copy_from_slice(&tlen.to_le_bytes());
+
+        let mut c = madt::HEADER_LEN;
+        madt_buf[c] = MADT_ENTRY_IOAPIC;
+        madt_buf[c + 1] = MADT_IOAPIC_LEN as u8;
+        madt_buf[c + 2] = 2;
+        madt_buf[c + 4..c + 8].copy_from_slice(&0xFEC0_1000u32.to_le_bytes());
+        madt_buf[c + 8..c + 12].copy_from_slice(&0u32.to_le_bytes());
+        c += MADT_IOAPIC_LEN;
+
+        for &(irq, gsi) in &[(0u8, 2u32), (4u8, 9u32)] {
+            madt_buf[c] = MADT_ENTRY_ISO;
+            madt_buf[c + 1] = MADT_ISO_LEN as u8;
+            madt_buf[c + 2] = 0; // ISA bus
+            madt_buf[c + 3] = irq;
+            madt_buf[c + 4..c + 8].copy_from_slice(&gsi.to_le_bytes());
+            c += MADT_ISO_LEN;
+        }
+
+        assert_eq!(extract_madt_ioapic_phys(&madt_buf), Some((2, 0xFEC0_1000, 0)));
+        assert_eq!(extract_madt_ioapic_phys(&[]), None);
+        assert_eq!(resolve_isa_irq_to_gsi(Some(&madt_buf), 0), 2);
+        assert_eq!(resolve_isa_irq_to_gsi(Some(&madt_buf), 4), 9);
+        assert_eq!(resolve_isa_irq_to_gsi(Some(&madt_buf), 1), 1);
+        assert_eq!(resolve_isa_irq_to_gsi(None, 4), 4);
+
+        // Unaligned IOAPIC MMIO base must be rejected.
+        let mut unaligned = madt_buf;
+        unaligned[madt::HEADER_LEN + 4..madt::HEADER_LEN + 8]
+            .copy_from_slice(&0xFEC0_1004u32.to_le_bytes());
+        assert_eq!(extract_madt_ioapic_phys(&unaligned), None);
+
+        // 2. Parallel AP crypto & RAID-Z1 512-byte parity reconstruction.
+        let mut sha_out = [0u8; 32];
+        exec_smp_crypto_digest(SmpCryptoOp::Sha256, b"abc", &mut sha_out);
+        let nist_abc: [u8; 32] = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(sha_out, nist_abc);
+
+        let key = [0x3Cu8; 32];
+        let mut hmac_out = [0u8; 32];
+        let mut hmac_exp = [0u8; 32];
+        exec_smp_crypto_digest(SmpCryptoOp::HmacSha256(key), b"ap-work", &mut hmac_out);
+        crate::durable_seal::seal_bytes_keyed(&key, b"ap-work", &mut hmac_exp);
+        assert_eq!(hmac_out, hmac_exp);
+
+        let mut left = [0u8; 512];
+        let mut right = [0u8; 512];
+        for i in 0..512 {
+            left[i] = (i as u8).wrapping_mul(3);
+            right[i] = (i as u8).wrapping_mul(7) ^ 0xA5;
+        }
+        let mut parity = [0u8; 512];
+        let mut recovered = [0u8; 512];
+        exec_smp_xor_parity_512(&left, &right, &mut parity);
+        exec_smp_xor_parity_512(&parity, &right, &mut recovered);
+        assert_eq!(recovered, left);
     }
 }

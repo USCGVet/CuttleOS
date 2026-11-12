@@ -62,6 +62,8 @@ const SMP_DOORBELL_VECTOR: u32 = 0x41;
 const SMP_TLB_SHOOTDOWN_VECTOR: u32 = 0x42;
 /// Interrupt vector for Emergency Panic Halt IPI (`0x43`).
 const SMP_PANIC_HALT_VECTOR: u32 = 0x43;
+/// Interrupt vector for Hardware IOAPIC `COM1` Serial Wakeup IRQ (`0x44`).
+const IOAPIC_IO_WAKE_VECTOR: u32 = 0x44;
 
 /// Physical and identity-mapped virtual address of the AP startup trampoline page.
 const TRAMPOLINE_PAGE_PHYS: u64 = 0x8000;
@@ -91,6 +93,8 @@ const ISR_CPU_FAULT_DIAG_PHYS: u64 = 0x83B0;
 const TLB_ACKS_PTR_PHYS: u64 = 0x83D0;
 /// Physical address storing `&HW_NMI_COUNT` (`.bss` `RW+NX` atomic pointer).
 const NMI_COUNT_PTR_PHYS: u64 = 0x83D8;
+/// Physical address storing `&HW_IO_IRQS` (`.bss` `RW+NX` atomic pointer).
+const IO_IRQ_COUNT_PTR_PHYS: u64 = 0x83E0;
 /// Physical address of the Runtime 64-bit GDT (`5 * 8 + 4 * 16 = 104` bytes: `0x08..0x20` + 4 per-CPU TSS).
 const RUNTIME_GDT_PHYS: u64 = 0x8400;
 /// Physical base of the 4 per-CPU 104-byte `Tss64` structures (`0x80` byte stride -> `0x8500..0x8700`).
@@ -103,6 +107,8 @@ const ISR_PANIC_HALT_PHYS: u64 = 0x8740;
 const ISR_NMI_WATCHDOG_PHYS: u64 = 0x8760;
 /// Physical address of `LOAD_GDT_IDT_TSS_CODE` (33 bytes: `lgdt`, `lidt`, segment reload, `ltr dx`).
 const LOAD_GDT_IDT_TSS_PHYS: u64 = 0x8780;
+/// Physical address of `ISR_IO_WAKE` (37 bytes, IOAPIC `COM1` vector `0x44`).
+const ISR_IO_WAKE_PHYS: u64 = 0x87B0;
 /// Physical page holding the 256-entry Runtime 64-bit IDT (`4096` bytes).
 const RUNTIME_IDT_PHYS: u64 = 0x9000;
 
@@ -270,8 +276,42 @@ static LAPIC_MMIO_READY: AtomicBool = AtomicBool::new(false);
 static ACPI_MADT_FOUND: AtomicBool = AtomicBool::new(false);
 /// Firmware HPET MMIO base physical address discovered via ACPI `"HPET"` table (`0` if absent).
 static ACPI_HPET_PHYS: AtomicU64 = AtomicU64::new(0);
-/// True if a firmware Intel VT-d `"DMAR"` table was discovered via `RSDP -> XSDT/RSDT`.
+///Firmware Intel VT-d `"DMAR"` table discovery flag and primary `DRHD` MMIO base (`0` if absent).
 static ACPI_DMAR_FOUND: AtomicBool = AtomicBool::new(false);
+static ACPI_DMAR_DRHD0_PHYS: AtomicU64 = AtomicU64::new(0);
+/// Firmware IOAPIC MMIO base (`default 0xFEC0_0000`) and `COM1` Global System Interrupt (`default 4`).
+static ACPI_IOAPIC_PHYS: AtomicU64 =
+    AtomicU64::new(target_enterprise::smp::DEFAULT_IOAPIC_PHYS);
+static ACPI_COM1_GSI: AtomicU32 = AtomicU32::new(4);
+static IOAPIC_COM1_READY: AtomicBool = AtomicBool::new(false);
+/// Hardware IOAPIC `COM1` (`vector 0x44`) wakeup counter in `.bss` (`RW+NX`).
+static HW_IO_IRQS: AtomicU64 = AtomicU64::new(0);
+/// Lock-free per-AP (`CPU 1..3`) cryptographic digest work slots (`0 = Idle`, `1 = Armed`, `2 = Done`).
+static AP_CRYPTO_PTR: [AtomicU64; MAX_SMP_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static AP_CRYPTO_LEN: [core::sync::atomic::AtomicUsize; MAX_SMP_CPUS] = [
+    core::sync::atomic::AtomicUsize::new(0),
+    core::sync::atomic::AtomicUsize::new(0),
+    core::sync::atomic::AtomicUsize::new(0),
+    core::sync::atomic::AtomicUsize::new(0),
+];
+static AP_CRYPTO_OUT: [[AtomicU64; 4]; MAX_SMP_CPUS] = [
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+];
+static AP_CRYPTO_STATE: [AtomicU32; MAX_SMP_CPUS] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+static HW_AP_CRYPTO_JOBS: AtomicU64 = AtomicU64::new(0);
 /// Multi-core hard-lockup watchdog tracking per-CPU tick progress across scheduling epochs.
 static SMP_WATCHDOG: spin::Mutex<target_enterprise::smp::SmpLockupWatchdog<MAX_SMP_CPUS>> =
     spin::Mutex::new(target_enterprise::smp::SmpLockupWatchdog::new(8));
@@ -604,6 +644,39 @@ pub extern "C" fn cuttle_ap_entry(cpu_id: u64) -> ! {
     AP_BOOT_READY[idx].store(true, Ordering::SeqCst);
 
     loop {
+        if AP_CRYPTO_STATE[idx].load(Ordering::Acquire) == 1 {
+            let ptr = AP_CRYPTO_PTR[idx].load(Ordering::Acquire) as *const u8;
+            let len = AP_CRYPTO_LEN[idx].load(Ordering::Acquire);
+            if !ptr.is_null() {
+                // SAFETY: BSP published `(ptr, len)` and spins until `AP_CRYPTO_STATE[idx] == 2`.
+                let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+                let mut dig = [0u8; 32];
+                target_enterprise::smp::exec_smp_crypto_digest(
+                    target_enterprise::smp::SmpCryptoOp::Sha256,
+                    slice,
+                    &mut dig,
+                );
+                let mut w = 0usize;
+                while w < 4 {
+                    let word = u64::from_le_bytes([
+                        dig[w * 8],
+                        dig[w * 8 + 1],
+                        dig[w * 8 + 2],
+                        dig[w * 8 + 3],
+                        dig[w * 8 + 4],
+                        dig[w * 8 + 5],
+                        dig[w * 8 + 6],
+                        dig[w * 8 + 7],
+                    ]);
+                    AP_CRYPTO_OUT[idx][w].store(word, Ordering::Relaxed);
+                    w += 1;
+                }
+                HW_CPU_TICKS[idx].fetch_add(1, Ordering::Relaxed);
+                HW_CPU_JOBS[idx].fetch_add(1, Ordering::Release);
+                HW_AP_CRYPTO_JOBS.fetch_add(1, Ordering::AcqRel);
+            }
+            AP_CRYPTO_STATE[idx].store(2, Ordering::Release);
+        }
         while CPU_PENDING_JOBS[idx].load(Ordering::SeqCst) > 0 {
             CPU_PENDING_JOBS[idx].fetch_sub(1, Ordering::SeqCst);
             let seed = CPU_WORK_SEED[idx].load(Ordering::Relaxed);
@@ -619,6 +692,72 @@ pub extern "C" fn cuttle_ap_entry(cpu_id: u64) -> ! {
         }
         HW_CPU_TICKS[idx].fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Dispatch three independent FIPS 180-4 SHA-256 digests (`b1`, `b2`, `b3`) concurrently across
+/// secondary Application Processors `CPU 1`, `CPU 2`, and `CPU 3` (falling back to BSP `seal_bytes`
+/// for any core not online in <4-vCPU configurations).
+#[inline(never)]
+pub(crate) fn smp_parallel_sha256_3way(
+    b1: &[u8],
+    b2: &[u8],
+    b3: &[u8],
+) -> ([u8; 32], [u8; 32], [u8; 32]) {
+    use target_enterprise::durable_seal::seal_bytes;
+
+    let online = HW_ONLINE_CPUS.load(Ordering::Acquire);
+    if !SMP_HW_INITIALIZED.load(Ordering::Acquire) || online < 4 {
+        let (mut d1, mut d2, mut d3) = ([0u8; 32], [0u8; 32], [0u8; 32]);
+        seal_bytes(b1, &mut d1);
+        seal_bytes(b2, &mut d2);
+        seal_bytes(b3, &mut d3);
+        return (d1, d2, d3);
+    }
+
+    let inputs: [&[u8]; 3] = [b1, b2, b3];
+    let mut ap = 1usize;
+    while ap <= 3 {
+        let slice = inputs[ap - 1];
+        AP_CRYPTO_PTR[ap].store(slice.as_ptr() as usize as u64, Ordering::Relaxed);
+        AP_CRYPTO_LEN[ap].store(slice.len(), Ordering::Relaxed);
+        AP_CRYPTO_STATE[ap].store(1, Ordering::Release);
+        ap += 1;
+    }
+    ring_smp_doorbell();
+
+    let mut spins = 0u32;
+    while spins < 200_000 {
+        if AP_CRYPTO_STATE[1].load(Ordering::Acquire) == 2
+            && AP_CRYPTO_STATE[2].load(Ordering::Acquire) == 2
+            && AP_CRYPTO_STATE[3].load(Ordering::Acquire) == 2
+        {
+            break;
+        }
+        if spins == 15_000 || spins == 50_000 {
+            ring_smp_doorbell();
+        }
+        core::hint::spin_loop();
+        spins += 1;
+    }
+
+    let mut outs = [[0u8; 32]; 3];
+    let mut c = 1usize;
+    while c <= 3 {
+        if AP_CRYPTO_STATE[c].load(Ordering::Acquire) == 2 {
+            let mut w = 0usize;
+            while w < 4 {
+                let bytes = AP_CRYPTO_OUT[c][w].load(Ordering::Relaxed).to_le_bytes();
+                outs[c - 1][w * 8..w * 8 + 8].copy_from_slice(&bytes);
+                w += 1;
+            }
+            AP_CRYPTO_STATE[c].store(0, Ordering::Release);
+        } else {
+            AP_CRYPTO_STATE[c].store(0, Ordering::Release);
+            seal_bytes(inputs[c - 1], &mut outs[c - 1]);
+        }
+        c += 1;
+    }
+    (outs[0], outs[1], outs[2])
 }
 
 /// Invoke the 27-byte hardware stack context switcher via `smp_rx_va(0x8200)` (`W^X`).
@@ -944,13 +1083,15 @@ unsafe fn init_runtime_idt_and_isrs() {
     let wakeup_counter_va = HW_IRQ_WAKEUP_COUNTER.as_ptr() as usize as u64;
     let tlb_acks_va = HW_TLB_SHOOTDOWN_ACKS.as_ptr() as usize as u64;
     let nmi_count_va = HW_NMI_COUNT.as_ptr() as usize as u64;
+    let io_irq_count_va = HW_IO_IRQS.as_ptr() as usize as u64;
 
-    // 2. Store `.bss` (`RW+NX`) atomic pointers at `0x8380`, `0x8388`, `0x83D0`, `0x83D8`.
+    // 2. Store `.bss` (`RW+NX`) atomic pointers at `0x8380`, `0x8388`, `0x83D0`, `0x83D8`, `0x83E0`.
     // SAFETY: All pointer slots are 8-byte-aligned inside the mapped `0x8000` frame (`PHYS_MAP_OFFSET`, `RW+NX`).
     unsafe {
         HW_IRQ_WAKEUP_COUNTER.store(0, Ordering::Release);
         HW_TLB_SHOOTDOWN_ACKS.store(0, Ordering::Release);
         HW_NMI_COUNT.store(0, Ordering::Release);
+        HW_IO_IRQS.store(0, Ordering::Release);
         core::ptr::write_volatile(
             pa_to_va(IRQ_WAKEUPS_PTR_PHYS).cast::<u64>(),
             wakeup_counter_va,
@@ -958,6 +1099,7 @@ unsafe fn init_runtime_idt_and_isrs() {
         core::ptr::write_volatile(pa_to_va(LAPIC_EOI_PTR_PHYS).cast::<u64>(), lapic_eoi_va);
         core::ptr::write_volatile(pa_to_va(TLB_ACKS_PTR_PHYS).cast::<u64>(), tlb_acks_va);
         core::ptr::write_volatile(pa_to_va(NMI_COUNT_PTR_PHYS).cast::<u64>(), nmi_count_va);
+        core::ptr::write_volatile(pa_to_va(IO_IRQ_COUNT_PTR_PHYS).cast::<u64>(), io_irq_count_va);
     }
 
     // 3. Install `ISR_LAPIC_EOI` at `0x8300` (Local APIC Timer `0x40`):
@@ -1035,8 +1177,23 @@ unsafe fn init_runtime_idt_and_isrs() {
         0x0F, 0x00, 0xDA,                         // ltr dx
         0xC3,                                     // ret
     ];
+    // 12b. Install `ISR_IO_WAKE` at `0x87B0` (IOAPIC `COM1` vector `0x44`: mask `0x3F9`, `lock inc` `0x83E0`, `LAPIC_EOI`):
+    const ISR_IO_WAKE: [u8; 37] = [
+        0x50,                                     // push rax
+        0x52,                                     // push rdx
+        0x66, 0xBA, 0xF9, 0x03,                   // mov dx, 0x03F9 (COM1 IER)
+        0x31, 0xC0,                               // xor eax, eax
+        0xEE,                                     // out dx, al (one-shot wakeup mask)
+        0x48, 0x8B, 0x05, 0x20, 0xFC, 0xFF, 0xFF, // mov rax, [rip - 0x3E0] -> 0x83E0
+        0xF0, 0x48, 0xFF, 0x00,                   // lock inc qword ptr [rax]
+        0x48, 0x8B, 0x05, 0xBD, 0xFB, 0xFF, 0xFF, // mov rax, [rip - 0x443] -> 0x8388
+        0xC7, 0x00, 0x00, 0x00, 0x00, 0x00,       // mov dword ptr [rax], 0 (LAPIC_EOI)
+        0x5A,                                     // pop rdx
+        0x58,                                     // pop rax
+        0x48, 0xCF,                               // iretq
+    ];
 
-    // SAFETY: All destination offsets (`0x8300..0x87A1`) lie within the mapped `0x8000` page (`PHYS_MAP_OFFSET`, `RW+NX`).
+    // SAFETY: All destination offsets (`0x8300..0x87D5`) lie within the mapped `0x8000` page (`PHYS_MAP_OFFSET`, `RW+NX`).
     unsafe {
         let copy_stub = |phys: u64, bytes: &[u8]| {
             let dst = pa_to_va(phys);
@@ -1056,6 +1213,7 @@ unsafe fn init_runtime_idt_and_isrs() {
         copy_stub(ISR_PANIC_HALT_PHYS, &ISR_PANIC_HALT);
         copy_stub(ISR_NMI_WATCHDOG_PHYS, &ISR_NMI_WATCHDOG);
         copy_stub(LOAD_GDT_IDT_TSS_PHYS, &LOAD_GDT_IDT_TSS_CODE);
+        copy_stub(ISR_IO_WAKE_PHYS, &ISR_IO_WAKE);
     }
 
     // 13. Build the 104-byte Runtime GDT at `pa_to_va(0x8400)` (`5` code/data slots + `4` per-CPU 16B TSS slots)
@@ -1077,6 +1235,7 @@ unsafe fn init_runtime_idt_and_isrs() {
     let isr_tlb_va = smp_rx_va(ISR_TLB_SHOOTDOWN_PHYS);
     let isr_panic_va = smp_rx_va(ISR_PANIC_HALT_PHYS);
     let isr_nmi_va = smp_rx_va(ISR_NMI_WATCHDOG_PHYS);
+    let isr_io_wake_va = smp_rx_va(ISR_IO_WAKE_PHYS);
 
     // SAFETY: `RUNTIME_GDT_PHYS` (`0x8400`), `RUNTIME_TSS_BASE_PHYS` (`0x8500`), and `RUNTIME_IDT_PHYS` (`0x9000`) are mapped RAM.
     unsafe {
@@ -1135,6 +1294,8 @@ unsafe fn init_runtime_idt_and_isrs() {
                 (isr_tlb_va, 0u8)
             } else if v == (SMP_PANIC_HALT_VECTOR as usize) {
                 (isr_panic_va, 0u8)
+            } else if v == (IOAPIC_IO_WAKE_VECTOR as usize) {
+                (isr_io_wake_va, 0u8)
             } else {
                 (isr_doorbell_va, 0u8)
             };
@@ -1283,8 +1444,8 @@ unsafe fn read_firmware_phys_bytes(phys: u64, out: &mut [u8]) -> bool {
 }
 
 /// Discover firmware ACPI `RSDP` (`BOOT_RSDP_PHYS` or BIOS EBDA/`0xE0000..0x100000`), walk
-/// `XSDT`/`RSDT` with full checksum verification, and populate `EXPECTED_APIC_IDS` (`MADT`),
-/// `ACPI_HPET_PHYS` (`HPET`), and `ACPI_DMAR_FOUND` (`DMAR`).
+/// `XSDT`/`RSDT` with full checksum verification, and populate `EXPECTED_APIC_IDS` + `ACPI_IOAPIC_PHYS`
+/// + `ACPI_COM1_GSI` (`MADT`), `ACPI_HPET_PHYS` (`HPET`), and `ACPI_DMAR_DRHD0_PHYS` (`DMAR`).
 #[inline(never)]
 // SAFETY: Caller must execute in Ring-0 after `set_phys_offset` initialized `PHYS_MAP_OFFSET`.
 unsafe fn discover_firmware_acpi_tables(bsp_apic_id: u32) {
@@ -1292,7 +1453,10 @@ unsafe fn discover_firmware_acpi_tables(bsp_apic_id: u32) {
         extract_sdt_table_addrs, parse_rsdp_any, parse_sdt_header, scan_bios_rsdp_offset,
         ACPI_SDT_HDR_LEN, RSDP_V2_LEN,
     };
-    use target_enterprise::smp::resolve_ap_apic_targets;
+    use target_enterprise::smp::{
+        extract_madt_ioapic_phys, resolve_ap_apic_targets, resolve_isa_irq_to_gsi,
+        DEFAULT_IOAPIC_PHYS,
+    };
 
     let mut found_rsdp = None;
     let boot_rsdp = BOOT_RSDP_PHYS.load(Ordering::Relaxed);
@@ -1391,6 +1555,23 @@ unsafe fn discover_firmware_acpi_tables(bsp_apic_id: u32) {
                                                                 .store(targets[s], Ordering::Release);
                                                             s += 1;
                                                         }
+                                                        if let Some((_, ioapic_pa, _)) =
+                                                            extract_madt_ioapic_phys(&t_buf[..t_len])
+                                                        {
+                                                            ACPI_IOAPIC_PHYS
+                                                                .store(ioapic_pa, Ordering::Release);
+                                                        } else {
+                                                            ACPI_IOAPIC_PHYS.store(
+                                                                DEFAULT_IOAPIC_PHYS,
+                                                                Ordering::Release,
+                                                            );
+                                                        }
+                                                        let com1_gsi = resolve_isa_irq_to_gsi(
+                                                            Some(&t_buf[..t_len]),
+                                                            4,
+                                                        );
+                                                        ACPI_COM1_GSI
+                                                            .store(com1_gsi, Ordering::Release);
                                                         ACPI_MADT_FOUND
                                                             .store(true, Ordering::Release);
                                                         madt_parsed = true;
@@ -1411,6 +1592,23 @@ unsafe fn discover_firmware_acpi_tables(bsp_apic_id: u32) {
                                                     } else if &th.signature == b"DMAR" {
                                                         ACPI_DMAR_FOUND
                                                             .store(true, Ordering::Release);
+                                                        if let Ok(dmar_info) =
+                                                            target_enterprise::iommu::dmar::parse_dmar(
+                                                                &t_buf[..t_len],
+                                                            )
+                                                        {
+                                                            if dmar_info.drhd_count > 0
+                                                                && dmar_info.drhd[0].register_base
+                                                                    != 0
+                                                                && dmar_info.drhd[0].register_base
+                                                                    < 0x0001_0000_0000_0000
+                                                            {
+                                                                ACPI_DMAR_DRHD0_PHYS.store(
+                                                                    dmar_info.drhd[0].register_base,
+                                                                    Ordering::Release,
+                                                                );
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1432,6 +1630,46 @@ unsafe fn discover_firmware_acpi_tables(bsp_apic_id: u32) {
         while s < MAX_SMP_CPUS {
             EXPECTED_APIC_IDS[s].store(targets[s], Ordering::Release);
             s += 1;
+        }
+        ACPI_IOAPIC_PHYS.store(DEFAULT_IOAPIC_PHYS, Ordering::Release);
+        ACPI_COM1_GSI.store(4, Ordering::Release);
+    }
+}
+
+/// Program the firmware IOAPIC (`ACPI_IOAPIC_PHYS`) redirection entry for `COM1` (`ACPI_COM1_GSI`,
+/// ISA IRQ 4) to route fixed vector [`IOAPIC_IO_WAKE_VECTOR`] (`0x44`) to `bsp_apic_id`, while
+/// keeping UART `IER` (`0x3F9`) masked until `CPU 0` enters [`smp_hw_idle_wait`].
+#[inline(never)]
+// SAFETY: Caller must execute in Ring-0 after `init_runtime_idt_and_isrs` and `discover_firmware_acpi_tables`.
+unsafe fn program_ioapic_com1_irq(bsp_apic_id: u32) {
+    let ioapic_pa = ACPI_IOAPIC_PHYS.load(Ordering::Acquire);
+    let gsi = ACPI_COM1_GSI.load(Ordering::Acquire);
+    if ioapic_pa == 0 || gsi > 23 || bsp_apic_id > 0xFF {
+        return;
+    }
+    // SAFETY: Mapping the 4 KiB IOAPIC MMIO page (`UC + NX`) and programming `IOREGSEL`/`IOWIN` (`+0x00`/`+0x10`).
+    unsafe {
+        let _ = ensure_mmio_page(ioapic_pa);
+        outb(0x3F9, 0x00);
+        outb(0x3FC, inb(0x3FC) | 0x08);
+        mmio_write32(ioapic_pa, 0x01);
+        let ver = mmio_read32(ioapic_pa + 0x10);
+        let max_redir = (ver >> 16) & 0xFF;
+        if ver == 0 || ver == u32::MAX || gsi > max_redir {
+            return;
+        }
+        let reg_lo = 0x10 + gsi * 2;
+        let reg_hi = reg_lo + 1;
+        mmio_write32(ioapic_pa, reg_lo);
+        mmio_write32(ioapic_pa + 0x10, 0x0001_0000 | IOAPIC_IO_WAKE_VECTOR);
+        mmio_write32(ioapic_pa, reg_hi);
+        mmio_write32(ioapic_pa + 0x10, bsp_apic_id << 24);
+        mmio_write32(ioapic_pa, reg_lo);
+        mmio_write32(ioapic_pa + 0x10, IOAPIC_IO_WAKE_VECTOR);
+        mmio_write32(ioapic_pa, reg_lo);
+        let rb_lo = mmio_read32(ioapic_pa + 0x10);
+        if (rb_lo & 0x0001_00FF) == IOAPIC_IO_WAKE_VECTOR {
+            IOAPIC_COM1_READY.store(true, Ordering::Release);
         }
     }
 }
@@ -1537,16 +1775,24 @@ pub(crate) fn smp_hw_enable_bsp_timer() {
 }
 
 /// Put `CPU 0` (the BSP) into hardware `HLT` sleep until the next interrupt
-/// (`vector 0x40` Local APIC Timer wakeup).
+/// (`vector 0x40` Local APIC Timer wakeup or `vector 0x44` IOAPIC `COM1` serial RX wakeup).
 #[inline]
 pub(crate) fn smp_hw_idle_wait() {
     if !SMP_HW_INITIALIZED.load(Ordering::Acquire) {
         core::hint::spin_loop();
         return;
     }
-    // SAFETY: `smp_hw_enable_bsp_timer` armed the periodic Local APIC timer on vector `0x40`.
+    let ioapic_ready = IOAPIC_COM1_READY.load(Ordering::Acquire);
+    // SAFETY: `smp_hw_enable_bsp_timer` armed the periodic Local APIC timer on vector `0x40`,
+    // and when `ioapic_ready` is true, `ISR_IO_WAKE` is bound to IOAPIC GSI 4 (`vector 0x44`).
     unsafe {
+        if ioapic_ready {
+            outb(0x3F9, 0x01);
+        }
         invoke_cpu_sleep_hlt();
+        if ioapic_ready {
+            outb(0x3F9, 0x00);
+        }
     }
     HW_CPU_TICKS[0].fetch_add(1, Ordering::Relaxed);
 }
@@ -1666,6 +1912,7 @@ pub(crate) fn smp_hw_init() -> usize {
         mmio_write32(LAPIC_PHYS_BASE + LAPIC_TPR, 0);
         mmio_write32(LAPIC_PHYS_BASE + LAPIC_ESR, 0);
         discover_firmware_acpi_tables(id);
+        program_ioapic_com1_irq(id);
         id
     };
 
@@ -2000,6 +2247,136 @@ fn verify_vtd_slpt_confinement_live() {
     if cross != Err(IommuError::Unmapped) {
         panic!("OS_ARMOR: VT-d failed to block cross-device DMA into AHCI window");
     }
+
+    // 3. Exercise the full VT-d `DRHD` MMIO initialization sequence (`enable_drhd_translation_hw`:
+    //    `CAP.SAGAW` -> `RTADDR` -> `GCMD.SRTP`/`GSTS.RTPS` -> `CCMD` -> `IOTLB` -> `GCMD.TE`/`GSTS.TES`),
+    //    and probe any firmware-advertised physical `DRHD` unit (`ACPI_DMAR_DRHD0_PHYS`).
+    {
+        use target_enterprise::iommu::vtd_hw::{
+            enable_drhd_translation_hw, extract_ecap_iro_offset, VtdMmioBus, CAP_SAGAW_48BIT_4LVL,
+            CCMD_ICC, GCMD_SRTP, GCMD_TE, GSTS_RTPS, GSTS_TES, IOTLB_IVT, VTD_REG_CAP,
+            VTD_REG_CCMD, VTD_REG_ECAP, VTD_REG_GCMD, VTD_REG_GSTS, VTD_REG_RTADDR, VTD_REG_VER,
+        };
+
+        struct SimVtdMmioBus {
+            cap: u64,
+            ecap: u64,
+            gsts: u32,
+            rtaddr: u64,
+            ccmd: u64,
+            iotlb: u64,
+            ccmd_flushes: u32,
+            iotlb_flushes: u32,
+        }
+        impl VtdMmioBus for SimVtdMmioBus {
+            fn read_u32(&mut self, offset: u64) -> u32 {
+                match offset {
+                    VTD_REG_VER => 0x0000_0010,
+                    VTD_REG_GSTS => self.gsts,
+                    _ => 0,
+                }
+            }
+            fn write_u32(&mut self, offset: u64, val: u32) {
+                if offset == VTD_REG_GCMD {
+                    if (val & GCMD_SRTP) != 0 {
+                        self.gsts |= GSTS_RTPS;
+                    }
+                    if (val & GCMD_TE) != 0 {
+                        self.gsts |= GSTS_TES;
+                    } else {
+                        self.gsts &= !GSTS_TES;
+                    }
+                }
+            }
+            fn read_u64(&mut self, offset: u64) -> u64 {
+                let iro_off = extract_ecap_iro_offset(self.ecap);
+                if offset == VTD_REG_CAP {
+                    self.cap
+                } else if offset == VTD_REG_ECAP {
+                    self.ecap
+                } else if offset == VTD_REG_RTADDR {
+                    self.rtaddr
+                } else if offset == VTD_REG_CCMD {
+                    self.ccmd
+                } else if offset == iro_off {
+                    self.iotlb
+                } else {
+                    0
+                }
+            }
+            fn write_u64(&mut self, offset: u64, val: u64) {
+                let iro_off = extract_ecap_iro_offset(self.ecap);
+                if offset == VTD_REG_RTADDR {
+                    self.rtaddr = val;
+                } else if offset == VTD_REG_CCMD {
+                    if (val & CCMD_ICC) != 0 {
+                        self.ccmd_flushes += 1;
+                    }
+                    self.ccmd = val & !CCMD_ICC;
+                } else if offset == iro_off {
+                    if (val & IOTLB_IVT) != 0 {
+                        self.iotlb_flushes += 1;
+                    }
+                    self.iotlb = val & !IOTLB_IVT;
+                }
+            }
+        }
+
+        let mut sim = SimVtdMmioBus {
+            cap: CAP_SAGAW_48BIT_4LVL,
+            ecap: 0x10u64 << 8, // IRO = 0x10 -> IOTLB at 0x108
+            gsts: 0,
+            rtaddr: 0,
+            ccmd: 0,
+            iotlb: 0,
+            ccmd_flushes: 0,
+            iotlb_flushes: 0,
+        };
+        if enable_drhd_translation_hw(&mut sim, 0x40_0000, 64).is_err()
+            || sim.rtaddr != 0x40_0000
+            || (sim.gsts & (GSTS_RTPS | GSTS_TES)) != (GSTS_RTPS | GSTS_TES)
+            || sim.ccmd_flushes != 1
+            || sim.iotlb_flushes != 1
+        {
+            panic!("OS_ARMOR: VT-d DRHD MMIO initialization sequence failed self-proof");
+        }
+
+        let drhd_pa = ACPI_DMAR_DRHD0_PHYS.load(Ordering::Acquire);
+        if drhd_pa != 0 {
+            struct HwVtdMmioBus {
+                base: u64,
+            }
+            impl VtdMmioBus for HwVtdMmioBus {
+                fn read_u32(&mut self, offset: u64) -> u32 {
+                    // SAFETY: `base` and `base + 0x1000` are mapped UC+NX via `ensure_mmio_page`.
+                    unsafe { mmio_read32(self.base + offset) }
+                }
+                fn write_u32(&mut self, offset: u64, val: u32) {
+                    // SAFETY: `base` and `base + 0x1000` are mapped UC+NX via `ensure_mmio_page`.
+                    unsafe { mmio_write32(self.base + offset, val) }
+                }
+                fn read_u64(&mut self, offset: u64) -> u64 {
+                    // SAFETY: `base` and `base + 0x1000` are mapped UC+NX via `ensure_mmio_page`.
+                    unsafe { mmio_read64(self.base + offset) }
+                }
+                fn write_u64(&mut self, offset: u64, val: u64) {
+                    // SAFETY: `base` and `base + 0x1000` are mapped UC+NX via `ensure_mmio_page`.
+                    unsafe { mmio_write64(self.base + offset, val) }
+                }
+            }
+            // SAFETY: Mapping the physical VT-d DRHD register bank (`UC + NX`) advertised by ACPI DMAR.
+            unsafe {
+                let _ = ensure_mmio_page(drhd_pa);
+                let _ = ensure_mmio_page(drhd_pa + 0x1000);
+            }
+            let mut hw_bus = HwVtdMmioBus { base: drhd_pa };
+            let ver = hw_bus.read_u32(VTD_REG_VER);
+            let cap = hw_bus.read_u64(VTD_REG_CAP);
+            if ver == 0 || ver == u32::MAX || cap == 0 || cap == u64::MAX {
+                panic!("OS_ARMOR: live ACPI DMAR DRHD0 MMIO returned invalid VER/CAP");
+            }
+        }
+    }
 }
 
 /// Boot self-proof banner for hardware SMP AP bringup, strict `W^X` RX trampoline,
@@ -2182,13 +2559,39 @@ pub(crate) fn banner_smp_hw() {
     #[cfg(not(cuttle_prod))]
     {
         verify_vtd_slpt_confinement_live();
+
+        // Exercise parallel FIPS 180-4 SHA-256 across AP cores `CPU 1..3` and verify exact bit-parity!
+        {
+            use target_enterprise::durable_seal::seal_bytes;
+            let b1 = b"cuttle-ap1-wal-partition";
+            let b2 = b"cuttle-ap2-fs-partition";
+            let b3 = b"cuttle-ap3-sql-partition";
+            let (d1, d2, d3) = smp_parallel_sha256_3way(b1, b2, b3);
+            let (mut e1, mut e2, mut e3) = ([0u8; 32], [0u8; 32], [0u8; 32]);
+            seal_bytes(b1, &mut e1);
+            seal_bytes(b2, &mut e2);
+            seal_bytes(b3, &mut e3);
+            if d1 != e1 || d2 != e2 || d3 != e3 {
+                panic!("OS_ARMOR: parallel AP SHA-256 digest mismatch against FIPS 180-4");
+            }
+            if online >= 4 && HW_AP_CRYPTO_JOBS.load(Ordering::Acquire) < 3 {
+                panic!("OS_ARMOR: 4-vCPU SMP failed to offload 3-way SHA-256 to APs 1..3");
+            }
+        }
+
         let madt_flag: u64 = if ACPI_MADT_FOUND.load(Ordering::Acquire) {
             1
         } else {
             0
         };
+        let ioapic_flag: u64 = if IOAPIC_COM1_READY.load(Ordering::Acquire) {
+            1
+        } else {
+            0
+        };
+        let ap_crypto_jobs = HW_AP_CRYPTO_JOBS.load(Ordering::Acquire);
         let total_acks = HW_TLB_SHOOTDOWN_ACKS.load(Ordering::Acquire);
-        let mut armor = [0u8; 128];
+        let mut armor = [0u8; 192];
         let mut apos = 0usize;
         let a0 = b"OS_ARMOR OK mmio_nx=1 guarded_stacks=16 tss_ltr=";
         armor[apos..apos + a0.len()].copy_from_slice(a0);
@@ -2209,9 +2612,17 @@ pub(crate) fn banner_smp_hw() {
         armor[apos..apos + a3.len()].copy_from_slice(a3);
         apos += a3.len();
         apos += dec_u64(total_acks, &mut armor[apos..]);
-        let a4 = b" vtd_slpt=ok\n";
+        let a4 = b" vtd_slpt=ok ap_crypto=";
         armor[apos..apos + a4.len()].copy_from_slice(a4);
         apos += a4.len();
+        apos += dec_u64(ap_crypto_jobs, &mut armor[apos..]);
+        let a5 = b" ioapic=";
+        armor[apos..apos + a5.len()].copy_from_slice(a5);
+        apos += a5.len();
+        apos += dec_u64(ioapic_flag, &mut armor[apos..]);
+        let a6 = b" vtd_drhd=ok\n";
+        armor[apos..apos + a6.len()].copy_from_slice(a6);
+        apos += a6.len();
         serial_write_bytes(&armor[..apos]);
     }
 }

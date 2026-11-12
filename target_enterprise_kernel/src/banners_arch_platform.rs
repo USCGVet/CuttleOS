@@ -344,6 +344,13 @@ pub(crate) fn exec_service_ring3_stub_isolated(
     )
 }
 
+struct MailboxWorkerStaging<'a> {
+    canary: u32,
+    strict_vfs: bool,
+    path: &'a [u8],
+    body: &'a [u8],
+}
+
 #[inline(never)]
 pub(crate) fn exec_service_ring3_stub_with_opts(
     task_id: u64,
@@ -353,6 +360,30 @@ pub(crate) fn exec_service_ring3_stub_with_opts(
     expected_arg0: u64,
     corrupt_canary: bool,
     preempt_timer_ticks: Option<u32>,
+) -> Result<Ring3ExecOutcome, Ring3FaultOutcome> {
+    exec_service_ring3_core(
+        task_id,
+        cap_mask,
+        ring3_code,
+        mailbox_req_word,
+        expected_arg0,
+        corrupt_canary,
+        preempt_timer_ticks,
+        None,
+    )
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn exec_service_ring3_core(
+    task_id: u64,
+    cap_mask: u64,
+    ring3_code: &[u8],
+    mailbox_req_word: u64,
+    expected_arg0: u64,
+    corrupt_canary: bool,
+    preempt_timer_ticks: Option<u32>,
+    mut worker_staging: Option<(MailboxWorkerStaging<'_>, &mut (u64, u32))>,
 ) -> Result<Ring3ExecOutcome, Ring3FaultOutcome> {
     use target_enterprise::gdt::{
         Gdt, Tss64, KERNEL_CODE_SEL, KERNEL_DATA_SEL, TSS64_LEN, TSS_SEL, USER_CODE_SEL,
@@ -489,27 +520,55 @@ pub(crate) fn exec_service_ring3_stub_with_opts(
         }
     }
 
-    // Populate `user_code_phys` (`PT[0]`) with the 32-byte Ring-3 stub, and `user_data_phys + 0xFD0`
-    // (`PT[2]`, `[user_rsp - 0x20]`) with the IPC mailbox request + canary word.
+    // Populate `user_code_phys` (`PT[0]`) with `ring3_code`, and `user_data_phys` (`PT[2]`)
+    // with either the structured mailbox sanitizer page or `[user_rsp - 0x20]` request word.
     let planted_req = if corrupt_canary {
         mailbox_req_word ^ 0xDEAD_BEEF_0000_0000
     } else {
         mailbox_req_word
     };
+    let code_len = ring3_code.len().min(4096);
     // SAFETY: `user_code_phys` and `user_data_phys` are dedicated 4 KiB frames mapped RW in `PHYS_MAP_OFFSET`.
     unsafe {
         let code_dst = pa_to_va(user_code_phys);
         let mut i = 0usize;
-        while i < ring3_code.len() {
+        while i < code_len {
             core::ptr::write_volatile(code_dst.add(i), ring3_code[i]);
             i += 1;
         }
         let data_dst = pa_to_va(user_data_phys);
-        let req_bytes = planted_req.to_le_bytes();
-        let mut k = 0usize;
-        while k < 8 {
-            core::ptr::write_volatile(data_dst.add(0xFD0 + k), req_bytes[k]);
-            k += 1;
+        if let Some((ref stg, _)) = worker_staging {
+            let can_b = stg.canary.to_le_bytes();
+            let plen = stg.path.len().min(64);
+            let blen = stg.body.len().min(512);
+            let blen_b = (blen as u16).to_le_bytes();
+            let mut c = 0usize;
+            while c < 4 {
+                core::ptr::write_volatile(data_dst.add(c), can_b[c]);
+                core::ptr::write_volatile(data_dst.add(0x260 + c), can_b[c]);
+                c += 1;
+            }
+            core::ptr::write_volatile(data_dst.add(0x04), u8::from(stg.strict_vfs));
+            core::ptr::write_volatile(data_dst.add(0x05), plen as u8);
+            core::ptr::write_volatile(data_dst.add(0x06), blen_b[0]);
+            core::ptr::write_volatile(data_dst.add(0x07), blen_b[1]);
+            let mut pi = 0usize;
+            while pi < plen {
+                core::ptr::write_volatile(data_dst.add(0x10 + pi), stg.path[pi]);
+                pi += 1;
+            }
+            let mut bi = 0usize;
+            while bi < blen {
+                core::ptr::write_volatile(data_dst.add(0x50 + bi), stg.body[bi]);
+                bi += 1;
+            }
+        } else {
+            let req_bytes = planted_req.to_le_bytes();
+            let mut k = 0usize;
+            while k < 8 {
+                core::ptr::write_volatile(data_dst.add(0xFD0 + k), req_bytes[k]);
+                k += 1;
+            }
         }
     }
 
@@ -809,6 +868,7 @@ pub(crate) fn exec_service_ring3_stub_with_opts(
             crate::outb(0xA1, 0x01);
             crate::outb(0x21, 0xFF);
             crate::outb(0xA1, 0xFF);
+            crate::outb(0x3F9, 0x00);
 
             saved_lvt_timer = crate::mmio_read32(LAPIC_BASE + LAPIC_LVT_TIMER_OFF);
             saved_timer_init = crate::mmio_read32(LAPIC_BASE + LAPIC_TIMER_INIT_OFF);
@@ -825,6 +885,9 @@ pub(crate) fn exec_service_ring3_stub_with_opts(
     }
 
     // Execute live GDT/TSS/IDT load, `int3` on `IST1`, and hardware `CR3`-isolated Ring-3 round-trip.
+    // Preserve all live kernel & callee-saved GPRs on the kernel stack across `call r8` and scrub
+    // upper GPRs before entering Ring-3 so untrusted `CPL=3` code sees zero kernel register state
+    // and cannot corrupt kernel recovery even if it clobbers every GPR (`rax..r15`, `rbx`, `rbp`).
     // SAFETY: Interrupts are masked (`cli`); `entry_stub_va` switches `CR3` to `user_pml4_phys` and
     // `isr_syscall_int80` / `common_fault_handler` / `isr_preempt_timer` restores `kernel_cr3` before returning here.
     unsafe {
@@ -850,7 +913,30 @@ pub(crate) fn exec_service_ring3_stub_with_opts(
             "ltr ax",
             "lidt [r12]",
             "int3",
+            "push rbx",
+            "push rbp",
+            "push r9",
+            "push r10",
+            "push r13",
+            "push r14",
+            "push r15",
+            "xor ebx, ebx",
+            "xor ebp, ebp",
+            "xor r9d, r9d",
+            "xor r10d, r10d",
+            "xor r11d, r11d",
+            "xor r12d, r12d",
+            "xor r13d, r13d",
+            "xor r14d, r14d",
+            "xor r15d, r15d",
             "call r8",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r10",
+            "pop r9",
+            "pop rbp",
+            "pop rbx",
             "lgdt [r9]",
             "push r13",
             "lea rax, [rip + 5f]",
@@ -864,11 +950,11 @@ pub(crate) fn exec_service_ring3_stub_with_opts(
             "lidt [r10]",
             "push r15",
             "popfq",
-            in("r8") entry_stub_va,
-            in("r9") gdtr_orig_va,
-            in("r10") idtr_orig_va,
-            in("r11") gdtr_new_va,
-            in("r12") idtr_new_va,
+            inout("r8") entry_stub_va => _,
+            inout("r9") gdtr_orig_va => _,
+            inout("r10") idtr_orig_va => _,
+            inout("r11") gdtr_new_va => _,
+            inout("r12") idtr_new_va => _,
             inout("rsi") user_rsp => _,
             inout("rdi") user_va => _,
             out("rax") _,
@@ -921,14 +1007,24 @@ pub(crate) fn exec_service_ring3_stub_with_opts(
         preempt_flag,
         preempt_rip,
         mb_resp,
+        mb_fnv,
+        mb_verdict,
     ) = unsafe {
         let st = pa_to_va(gdt_phys + 0x200) as *const u64;
         let user_ptr = pa_to_va(user_data_phys);
         let mut mb_bytes = [0u8; 8];
+        let mut fnv_bytes = [0u8; 8];
         let mut m = 0usize;
         while m < 8 {
             mb_bytes[m] = core::ptr::read_volatile(user_ptr.add(0xFD8 + m));
+            fnv_bytes[m] = core::ptr::read_volatile(user_ptr.add(0x268 + m));
             m += 1;
+        }
+        let mut verd_bytes = [0u8; 4];
+        let mut v = 0usize;
+        while v < 4 {
+            verd_bytes[v] = core::ptr::read_volatile(user_ptr.add(0x270 + v));
+            v += 1;
         }
         let vals = (
             core::ptr::read_volatile(st.add(0)),
@@ -947,6 +1043,8 @@ pub(crate) fn exec_service_ring3_stub_with_opts(
             core::ptr::read_volatile(st.add(16)),
             core::ptr::read_volatile(st.add(17)),
             u64::from_le_bytes(mb_bytes),
+            u64::from_le_bytes(fnv_bytes),
+            u32::from_le_bytes(verd_bytes),
         );
         core::ptr::write_volatile(kernel_pml4_va.add(pml4_slot), 0);
         let mut p = 0u64;
@@ -982,11 +1080,31 @@ pub(crate) fn exec_service_ring3_stub_with_opts(
     if observed_cr3 != user_pml4_phys || observed_cr3 == kernel_cr3 {
         return Err(Ring3FaultOutcome::MailboxOrTrapMismatch);
     }
-    if (r3_cs as u16) != USER_CODE_SEL
-        || (frame_cs as u16) != USER_CODE_SEL
+    if (frame_cs as u16) != USER_CODE_SEL
         || (frame_ss as u16) != USER_DATA_SEL
         || trap_rsp != rsp0_top - 40
     {
+        return Err(Ring3FaultOutcome::MailboxOrTrapMismatch);
+    }
+    if let Some((_, ref mut out_pair)) = worker_staging {
+        if sys_nr != 0x52 {
+            return Err(Ring3FaultOutcome::MailboxOrTrapMismatch);
+        }
+        let verified_fnv = if mb_verdict == 1 && sys_arg0 == mb_fnv {
+            mb_fnv
+        } else {
+            0
+        };
+        **out_pair = (verified_fnv, mb_verdict);
+        return Ok(Ring3ExecOutcome {
+            user_va,
+            kernel_cr3,
+            user_cr3: user_pml4_phys,
+            observed_cr3,
+            pid: task_id,
+        });
+    }
+    if (r3_cs as u16) != USER_CODE_SEL {
         return Err(Ring3FaultOutcome::MailboxOrTrapMismatch);
     }
     let expected_resp = mailbox_req_word ^ expected_arg0;
@@ -1052,6 +1170,48 @@ pub(crate) fn exec_service_ring3_cap_live(
         false,
     )
     .is_ok()
+}
+
+/// Bare-metal `CPL=3` (`CS=0x23`, isolated KPTI `user_pml4_phys`, `W^X` `User RX` + `User RW+NX`,
+/// Local APIC `0x40` preemption armed) mailbox sanitizer & FNV-1a worker callback.
+#[inline(never)]
+pub(crate) fn exec_service_ring3_mailbox_live(
+    svc: target_enterprise::svc_runtime::ServiceId,
+    worker_code: &[u8],
+    canary: u32,
+    strict_vfs: bool,
+    path: &[u8],
+    body: &[u8],
+    _expected_fnv: u64,
+) -> target_enterprise::svc_runtime::Ring3MailboxHwVerdict {
+    use target_enterprise::svc_runtime::Ring3MailboxHwVerdict;
+
+    let mut out_pair: (u64, u32) = (0, 0);
+    let stg = MailboxWorkerStaging {
+        canary,
+        strict_vfs,
+        path,
+        body,
+    };
+    let res = exec_service_ring3_core(
+        svc.pid() as u64,
+        svc.policy().cap_mask,
+        worker_code,
+        0,
+        0,
+        false,
+        Some(20_000_000),
+        Some((stg, &mut out_pair)),
+    );
+    match res {
+        Ok(_) => match out_pair.1 {
+            1 if out_pair.0 != 0 => Ring3MailboxHwVerdict::Ok(out_pair.0),
+            2 => Ring3MailboxHwVerdict::RejectedPath,
+            3 => Ring3MailboxHwVerdict::RejectedBody,
+            _ => Ring3MailboxHwVerdict::FaultedOrPreempted,
+        },
+        Err(_) => Ring3MailboxHwVerdict::FaultedOrPreempted,
+    }
 }
 
 #[cfg(not(cuttle_prod))]

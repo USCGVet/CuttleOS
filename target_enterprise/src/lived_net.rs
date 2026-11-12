@@ -158,6 +158,31 @@ impl ReplySet {
     }
 }
 
+/// Maximum out-of-order TCP segments buffered per connection slot for WAN gap reassembly.
+const OOO_SLOTS_PER_CONN: usize = 2;
+/// Maximum forward sequence gap (`8 KiB`) accepted for out-of-order TCP reassembly.
+const OOO_MAX_GAP_BYTES: u32 = 8192;
+/// Maximum unacknowledged server payload bytes retained per slot for RTO retransmission.
+const MAX_TX_INFLIGHT_PER_SLOT: usize = 8192;
+
+struct OooSegment {
+    present: bool,
+    seq: u32,
+    fin: bool,
+    data: alloc::vec::Vec<u8>,
+}
+
+impl OooSegment {
+    const fn empty() -> Self {
+        Self {
+            present: false,
+            seq: 0,
+            fin: false,
+            data: alloc::vec::Vec::new(),
+        }
+    }
+}
+
 /// Multi-connection guest network service supporting ARP, ICMP echo,
 /// authenticated UDP control plane (`8080`), Peer-to-Peer Triad replication (`8081`),
 /// HTTP/1.1 (`80`), and HTTPS (`443`, TLS 1.3 via rustls once
@@ -183,6 +208,15 @@ pub struct LivedNet {
     pub tls_sessions_started: u64,
     /// Total TCP retransmission / half-open reclamation events triggered by RTO timers.
     pub rto_retransmits: u64,
+    /// Total stateless HMAC-SHA256 SYN Cookie `SYN|ACK` challenges emitted under slot saturation.
+    pub syn_cookies_sent: u64,
+    /// Total stateless HMAC-SHA256 SYN Cookie handshakes verified and promoted to `Established`.
+    pub syn_cookies_accepted: u64,
+    /// Total out-of-order TCP segments coalesced into contiguous stream order.
+    pub ooo_reassembled: u64,
+    /// Total unacknowledged server TCP payload segments re-emitted on RTO timeout.
+    pub payload_retransmits: u64,
+    syn_cookie_threshold: usize,
     active_http_peer_ip: [u8; 4],
     login_rl_ips: [[u8; 4]; 8],
     login_rl_streaks: [u8; 8],
@@ -191,6 +225,7 @@ pub struct LivedNet {
     tcbs: [Tcb; TCP_MAX_SLOTS],
     slot_last_tick: [u32; TCP_MAX_SLOTS],
     slot_rto_ticks: [u32; TCP_MAX_SLOTS],
+    slot_rto_shift: [u8; TCP_MAX_SLOTS],
     slot_remote_mac: [[u8; 6]; TCP_MAX_SLOTS],
     http_input_closed: [bool; TCP_MAX_SLOTS],
     ticks: u32,
@@ -198,6 +233,9 @@ pub struct LivedNet {
     ip_ident: u16,
     http_bufs: [alloc::vec::Vec<u8>; TCP_MAX_SLOTS],
     http_tx: [alloc::vec::Vec<u8>; TCP_MAX_SLOTS],
+    tx_inflight_seq: [u32; TCP_MAX_SLOTS],
+    tx_inflight_buf: [alloc::vec::Vec<u8>; TCP_MAX_SLOTS],
+    ooo_segs: [[OooSegment; OOO_SLOTS_PER_CONN]; TCP_MAX_SLOTS],
     slot_tls_buffered: [usize; TCP_MAX_SLOTS],
     peak_tls_pending_tx: usize,
     heap_headroom_fn: Option<fn(usize) -> bool>,
@@ -222,6 +260,11 @@ impl LivedNet {
             triad_min_epoch: 0,
             tls_sessions_started: 0,
             rto_retransmits: 0,
+            syn_cookies_sent: 0,
+            syn_cookies_accepted: 0,
+            ooo_reassembled: 0,
+            payload_retransmits: 0,
+            syn_cookie_threshold: TCP_MAX_SLOTS,
             active_http_peer_ip: [0u8; 4],
             login_rl_ips: [[0u8; 4]; 8],
             login_rl_streaks: [0u8; 8],
@@ -230,6 +273,7 @@ impl LivedNet {
             tcbs: [Tcb::EMPTY; TCP_MAX_SLOTS],
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
+            slot_rto_shift: [0u8; TCP_MAX_SLOTS],
             slot_remote_mac: [[0u8; 6]; TCP_MAX_SLOTS],
             http_input_closed: [false; TCP_MAX_SLOTS],
             ticks: 1,
@@ -237,8 +281,12 @@ impl LivedNet {
             ip_ident: 1,
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
+            tx_inflight_seq: [0u32; TCP_MAX_SLOTS],
+            tx_inflight_buf: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
+            ooo_segs: [const { [const { OooSegment::empty() }; OOO_SLOTS_PER_CONN] };
+                TCP_MAX_SLOTS],
             slot_tls_buffered: [0usize; TCP_MAX_SLOTS],
-            peak_tls_pending_tx: 0,
+            peak_tls_pending_tx: usize::MIN,
             heap_headroom_fn: None,
             tls_config: None,
             tls: [const { None }; TCP_MAX_SLOTS],
@@ -263,6 +311,11 @@ impl LivedNet {
             triad_min_epoch: 0,
             tls_sessions_started: 0,
             rto_retransmits: 0,
+            syn_cookies_sent: 0,
+            syn_cookies_accepted: 0,
+            ooo_reassembled: 0,
+            payload_retransmits: 0,
+            syn_cookie_threshold: TCP_MAX_SLOTS,
             active_http_peer_ip: [0u8; 4],
             login_rl_ips: [[0u8; 4]; 8],
             login_rl_streaks: [0u8; 8],
@@ -271,6 +324,7 @@ impl LivedNet {
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
+            slot_rto_shift: [0u8; TCP_MAX_SLOTS],
             slot_remote_mac: [[0u8; 6]; TCP_MAX_SLOTS],
             http_input_closed: [false; TCP_MAX_SLOTS],
             ticks: 1,
@@ -278,6 +332,10 @@ impl LivedNet {
             ip_ident: 1,
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
+            tx_inflight_seq: [0u32; TCP_MAX_SLOTS],
+            tx_inflight_buf: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
+            ooo_segs: [const { [const { OooSegment::empty() }; OOO_SLOTS_PER_CONN] };
+                TCP_MAX_SLOTS],
             slot_tls_buffered: [0usize; TCP_MAX_SLOTS],
             peak_tls_pending_tx: 0,
             heap_headroom_fn: None,
@@ -299,6 +357,11 @@ impl LivedNet {
             triad_min_epoch: 0,
             tls_sessions_started: 0,
             rto_retransmits: 0,
+            syn_cookies_sent: 0,
+            syn_cookies_accepted: 0,
+            ooo_reassembled: 0,
+            payload_retransmits: 0,
+            syn_cookie_threshold: TCP_MAX_SLOTS,
             active_http_peer_ip: [0u8; 4],
             login_rl_ips: [[0u8; 4]; 8],
             login_rl_streaks: [0u8; 8],
@@ -307,6 +370,7 @@ impl LivedNet {
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
+            slot_rto_shift: [0u8; TCP_MAX_SLOTS],
             slot_remote_mac: [[0u8; 6]; TCP_MAX_SLOTS],
             http_input_closed: [false; TCP_MAX_SLOTS],
             ticks: 1,
@@ -314,6 +378,10 @@ impl LivedNet {
             ip_ident: 1,
             http_bufs: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
             http_tx: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
+            tx_inflight_seq: [0u32; TCP_MAX_SLOTS],
+            tx_inflight_buf: [const { alloc::vec::Vec::new() }; TCP_MAX_SLOTS],
+            ooo_segs: [const { [const { OooSegment::empty() }; OOO_SLOTS_PER_CONN] };
+                TCP_MAX_SLOTS],
             slot_tls_buffered: [0usize; TCP_MAX_SLOTS],
             peak_tls_pending_tx: 0,
             heap_headroom_fn: None,
@@ -429,6 +497,35 @@ impl LivedNet {
         count
     }
 
+    /// Configure the active-slot threshold at or above which incoming `SYN` frames switch to
+    /// zero-state HMAC-SHA256 SYN Cookies (`0..=TCP_MAX_SLOTS`, default `TCP_MAX_SLOTS`).
+    pub fn set_syn_cookie_threshold(&mut self, threshold: usize) {
+        self.syn_cookie_threshold = threshold.min(TCP_MAX_SLOTS);
+    }
+
+    /// Return total unacknowledged server payload bytes retained for RTO retransmission.
+    pub fn total_inflight_tx_bytes(&self) -> usize {
+        let mut total = 0usize;
+        let mut i = 0usize;
+        while i < TCP_MAX_SLOTS {
+            total = total.saturating_add(self.tx_inflight_buf[i].len());
+            i += 1;
+        }
+        total
+    }
+
+    fn slot_ooo_bytes(&self, idx: usize) -> usize {
+        let mut n = 0usize;
+        let mut k = 0usize;
+        while k < OOO_SLOTS_PER_CONN {
+            if self.ooo_segs[idx][k].present {
+                n = n.saturating_add(self.ooo_segs[idx][k].data.len());
+            }
+            k += 1;
+        }
+        n
+    }
+
     /// Return total unread input and queued output bytes buffered across all
     /// [`TCP_MAX_SLOTS`] HTTP and HTTPS connection slots.
     pub fn total_buffered_bytes(&self) -> usize {
@@ -438,6 +535,7 @@ impl LivedNet {
             total = total
                 .saturating_add(self.http_bufs[i].len())
                 .saturating_add(self.http_tx[i].len())
+                .saturating_add(self.slot_ooo_bytes(i))
                 .saturating_add(self.slot_tls_buffered[i]);
             i += 1;
         }
@@ -458,6 +556,7 @@ impl LivedNet {
                 total = total
                     .saturating_add(self.http_bufs[i].len())
                     .saturating_add(self.http_tx[i].len())
+                    .saturating_add(self.slot_ooo_bytes(i))
                     .saturating_add(self.slot_tls_buffered[i]);
             }
             i += 1;
@@ -471,9 +570,16 @@ impl LivedNet {
         let mut total = 0usize;
         let mut i = 0usize;
         while i < TCP_MAX_SLOTS {
+            let mut ooo_cap = 0usize;
+            let mut k = 0usize;
+            while k < OOO_SLOTS_PER_CONN {
+                ooo_cap = ooo_cap.saturating_add(self.ooo_segs[i][k].data.capacity());
+                k += 1;
+            }
             total = total
                 .saturating_add(self.http_bufs[i].capacity())
                 .saturating_add(self.http_tx[i].capacity())
+                .saturating_add(ooo_cap)
                 .saturating_add(self.slot_tls_buffered[i]);
             i += 1;
         }
@@ -482,12 +588,55 @@ impl LivedNet {
 
     fn release_slot_buffers(&mut self, idx: usize) {
         self.http_input_closed[idx] = false;
+        self.slot_rto_shift[idx] = 0;
+        self.tx_inflight_seq[idx] = 0;
         crate::https::scrub_vec_all_bytes(&mut self.http_bufs[idx]);
         self.http_bufs[idx].shrink_to_fit();
         crate::https::scrub_vec_all_bytes(&mut self.http_tx[idx]);
         self.http_tx[idx].shrink_to_fit();
+        crate::https::scrub_vec_all_bytes(&mut self.tx_inflight_buf[idx]);
+        self.tx_inflight_buf[idx].shrink_to_fit();
+        let mut k = 0usize;
+        while k < OOO_SLOTS_PER_CONN {
+            self.ooo_segs[idx][k].present = false;
+            self.ooo_segs[idx][k].seq = 0;
+            self.ooo_segs[idx][k].fin = false;
+            crate::https::scrub_vec_all_bytes(&mut self.ooo_segs[idx][k].data);
+            self.ooo_segs[idx][k].data.shrink_to_fit();
+            k += 1;
+        }
         self.slot_tls_buffered[idx] = 0;
         self.tls[idx] = None;
+    }
+
+    #[inline(never)]
+    fn retransmit_inflight_chunk(&mut self, idx: usize, out: &mut ReplySet) -> bool {
+        if self.tx_inflight_buf[idx].is_empty() || out.len() >= MAX_REPLIES {
+            return false;
+        }
+        let tcb = self.tcbs[idx];
+        if tcb.remote_ip == [0, 0, 0, 0] {
+            return false;
+        }
+        let n = self.tx_inflight_buf[idx].len().min(TCP_SEGMENT_PAYLOAD);
+        let mut chunk = [0u8; TCP_SEGMENT_PAYLOAD];
+        chunk[..n].copy_from_slice(&self.tx_inflight_buf[idx][..n]);
+        let dst_mac = self.slot_remote_mac[idx];
+        let reply_ip = nat_reply_ip(tcb.remote_ip);
+        let before = out.len();
+        self.emit_tcp(
+            tcb.local_port,
+            tcb.remote_port,
+            dst_mac,
+            reply_ip,
+            self.tx_inflight_seq[idx],
+            tcb.rcv_nxt,
+            tcp_flags::PSH | tcp_flags::ACK,
+            tcb.rcv_wnd,
+            &chunk[..n],
+            out,
+        );
+        out.len() > before
     }
 
     /// Advance per-slot TCP Retransmission Timeout (RTO) timers by one calibrated
@@ -500,7 +649,8 @@ impl LivedNet {
         self.tick_tcp_rto_with_replies(&mut discard)
     }
 
-    /// Advance per-slot TCP RTO timers by one calibrated Local APIC timer interrupt
+    /// Advance per-slot TCP RTO timers by one calibrated Local APIC timer interrupt,
+    /// retransmit unacknowledged server TCP payloads with RFC 6298 exponential backoff,
     /// and emit a `RST | ACK` segment into `out` whenever an idle `Established` or
     /// `CloseWait` connection slot is reclaimed.
     pub fn tick_tcp_rto_with_replies(&mut self, out: &mut ReplySet) -> usize {
@@ -533,33 +683,50 @@ impl LivedNet {
                         self.slot_remote_mac[i] = [0u8; 6];
                         self.release_slot_buffers(i);
                     } else {
+                        if (st == TcpState::FinWait1 || st == TcpState::LastAck)
+                            && self.retransmit_inflight_chunk(i, out)
+                        {
+                            self.payload_retransmits = self.payload_retransmits.wrapping_add(1);
+                            self.slot_rto_shift[i] = (self.slot_rto_shift[i] + 1).min(4);
+                        }
                         self.slot_rto_ticks[i] = self.ticks;
                     }
                 }
-            } else if (st == TcpState::Established || st == TcpState::CloseWait)
-                && self.ticks.wrapping_sub(self.slot_last_tick[i]) >= idle_ticks
-            {
-                let tcb = self.tcbs[i];
-                if tcb.remote_ip != [0, 0, 0, 0] && out.len() < MAX_REPLIES {
-                    let dst_mac = self.slot_remote_mac[i];
-                    let reply_ip = nat_reply_ip(tcb.remote_ip);
-                    self.emit_tcp(
-                        tcb.local_port,
-                        tcb.remote_port,
-                        dst_mac,
-                        reply_ip,
-                        tcb.snd_nxt,
-                        tcb.rcv_nxt,
-                        tcp_flags::RST | tcp_flags::ACK,
-                        0,
-                        b"",
-                        out,
-                    );
+            } else if st == TcpState::Established || st == TcpState::CloseWait {
+                if self.ticks.wrapping_sub(self.slot_last_tick[i]) >= idle_ticks {
+                    let tcb = self.tcbs[i];
+                    if tcb.remote_ip != [0, 0, 0, 0] && out.len() < MAX_REPLIES {
+                        let dst_mac = self.slot_remote_mac[i];
+                        let reply_ip = nat_reply_ip(tcb.remote_ip);
+                        self.emit_tcp(
+                            tcb.local_port,
+                            tcb.remote_port,
+                            dst_mac,
+                            reply_ip,
+                            tcb.snd_nxt,
+                            tcb.rcv_nxt,
+                            tcp_flags::RST | tcp_flags::ACK,
+                            0,
+                            b"",
+                            out,
+                        );
+                    }
+                    self.tcbs[i] = Tcb::EMPTY;
+                    self.slot_remote_mac[i] = [0u8; 6];
+                    self.release_slot_buffers(i);
+                    actions += 1;
+                } else if !self.tx_inflight_buf[i].is_empty() {
+                    let backoff_rto = rto_ticks << (self.slot_rto_shift[i].min(4) as u32);
+                    if self.ticks.wrapping_sub(self.slot_rto_ticks[i]) >= backoff_rto {
+                        if self.retransmit_inflight_chunk(i, out) {
+                            self.payload_retransmits = self.payload_retransmits.wrapping_add(1);
+                        }
+                        self.rto_retransmits = self.rto_retransmits.wrapping_add(1);
+                        self.slot_rto_ticks[i] = self.ticks;
+                        self.slot_rto_shift[i] = (self.slot_rto_shift[i] + 1).min(4);
+                        actions += 1;
+                    }
                 }
-                self.tcbs[i] = Tcb::EMPTY;
-                self.slot_remote_mac[i] = [0u8; 6];
-                self.release_slot_buffers(i);
-                actions += 1;
             }
             i += 1;
         }
@@ -1360,12 +1527,74 @@ impl LivedNet {
         n
     }
 
-    fn select_tcp_slot(
-        &mut self,
+    fn syn_cookie_epoch(&self) -> u32 {
+        let window_ticks = self.timer_hz.max(1).saturating_mul(32);
+        self.ticks / window_ticks.max(1)
+    }
+
+    fn syn_cookie_secret(&self) -> [u8; 32] {
+        let mut key = self.auth_key;
+        let mut i = 0usize;
+        while i < 6 {
+            key[i] ^= self.mac[i].wrapping_mul(0x5B);
+            key[i + 16] ^= self.mac[i] ^ 0xA5;
+            i += 1;
+        }
+        key[31] ^= 0xC7;
+        key
+    }
+
+    /// Compute a stateless RFC 4987 32-bit TCP Initial Sequence Number (SYN Cookie) via
+    /// `HMAC-SHA256` over `(mac, src_ip, dst_ip, src_port, dst_port, client_isn, epoch)`.
+    pub fn compute_syn_cookie_isn(
+        &self,
         src_ip: [u8; 4],
         src_port: u16,
         dst_port: u16,
-        flags: u8,
+        client_isn: u32,
+        epoch: u32,
+    ) -> u32 {
+        let secret = self.syn_cookie_secret();
+        let mut msg = [0u8; 44];
+        msg[..20].copy_from_slice(b"cuttle-syn-cookie-v1");
+        msg[20..26].copy_from_slice(&self.mac);
+        msg[26..30].copy_from_slice(&src_ip);
+        msg[30..34].copy_from_slice(&self.ip);
+        msg[34..36].copy_from_slice(&src_port.to_be_bytes());
+        msg[36..38].copy_from_slice(&dst_port.to_be_bytes());
+        msg[38..42].copy_from_slice(&client_isn.to_be_bytes());
+        let ep_bytes = epoch.to_be_bytes();
+        let mut tag = [0u8; 32];
+        crate::tls::hmac_sha256_parts(&secret, &[&msg[..42], &ep_bytes], &mut tag);
+        u32::from_be_bytes([tag[0], tag[1], tag[2], tag[3]])
+    }
+
+    fn verify_syn_cookie_ack(
+        &self,
+        src_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        ack_seq: u32,
+        ack_num: u32,
+    ) -> Option<u32> {
+        let client_isn = ack_seq.wrapping_sub(1);
+        let candidate = ack_num.wrapping_sub(1);
+        let ep = self.syn_cookie_epoch();
+        let cur = self.compute_syn_cookie_isn(src_ip, src_port, dst_port, client_isn, ep);
+        let prev =
+            self.compute_syn_cookie_isn(src_ip, src_port, dst_port, client_isn, ep.wrapping_sub(1));
+        if (candidate ^ cur) == 0 || (candidate ^ prev) == 0 {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    fn find_existing_tcp_slot(
+        &self,
+        src_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
     ) -> Option<usize> {
         let mut i = 0usize;
         while i < TCP_MAX_SLOTS {
@@ -1380,9 +1609,25 @@ impl LivedNet {
             }
             i += 1;
         }
-        if (flags & tcp_flags::SYN) == 0 || (flags & tcp_flags::ACK) != 0 {
-            return None;
+        None
+    }
+
+    fn can_accept_syn_cookie(&self) -> bool {
+        let idle_ticks = self.idle_timeout_ticks();
+        let mut j = 0usize;
+        while j < TCP_MAX_SLOTS {
+            let st = self.tcbs[j].state;
+            if st != TcpState::Established
+                || self.ticks.wrapping_sub(self.slot_last_tick[j]) >= idle_ticks
+            {
+                return true;
+            }
+            j += 1;
         }
+        false
+    }
+
+    fn claim_verified_tcp_slot(&mut self, dst_port: u16, allow_evict_half_open: bool) -> Option<usize> {
         let mut free_slot: Option<usize> = None;
         let mut half_open_slot: Option<usize> = None;
         let mut half_open_tick = u32::MAX;
@@ -1395,8 +1640,6 @@ impl LivedNet {
                 free_slot = Some(j);
                 break;
             }
-            // Red Team SYN-flood mitigation: prefer evicting half-open (`SynReceived`)
-            // or closing (`CloseWait`, `LastAck`) slots before any `Established` connection.
             if st != TcpState::Established && self.slot_last_tick[j] < half_open_tick {
                 half_open_tick = self.slot_last_tick[j];
                 half_open_slot = Some(j);
@@ -1407,24 +1650,216 @@ impl LivedNet {
             }
             j += 1;
         }
-        let idx = match free_slot.or(half_open_slot) {
-            Some(s) => s,
-            None => {
-                // All 16 slots are `Established`: only evict an `Established` connection if it has
-                // already exceeded `idle_timeout_ticks()`; never let a SYN flood tear down active peers.
-                if self.ticks.wrapping_sub(self.slot_last_tick[lru_slot]) >= self.idle_timeout_ticks()
-                {
-                    lru_slot
-                } else {
-                    return None;
-                }
+        let idx = if let Some(s) = free_slot {
+            s
+        } else if allow_evict_half_open {
+            if let Some(s) = half_open_slot {
+                s
+            } else if self.ticks.wrapping_sub(self.slot_last_tick[lru_slot])
+                >= self.idle_timeout_ticks()
+            {
+                lru_slot
+            } else {
+                return None;
             }
+        } else {
+            return None;
         };
         self.tcbs[idx] = Tcb::listen(self.ip, dst_port, 65535);
         self.slot_rto_ticks[idx] = self.ticks;
         self.slot_remote_mac[idx] = [0u8; 6];
         self.release_slot_buffers(idx);
         Some(idx)
+    }
+
+    fn record_inflight_tx(&mut self, idx: usize, seq: u32, payload: &[u8]) {
+        if payload.is_empty() {
+            return;
+        }
+        if self.tx_inflight_buf[idx].is_empty() {
+            self.tx_inflight_seq[idx] = seq;
+        }
+        let expected_end =
+            self.tx_inflight_seq[idx].wrapping_add(self.tx_inflight_buf[idx].len() as u32);
+        if expected_end == seq
+            && self.tx_inflight_buf[idx]
+                .len()
+                .saturating_add(payload.len())
+                <= MAX_TX_INFLIGHT_PER_SLOT
+        {
+            self.tx_inflight_buf[idx].extend_from_slice(payload);
+            self.slot_rto_ticks[idx] = self.ticks;
+        }
+    }
+
+    fn trim_inflight_tx(&mut self, idx: usize) {
+        if self.tx_inflight_buf[idx].is_empty() {
+            return;
+        }
+        let snd_una = self.tcbs[idx].snd_una;
+        let base = self.tx_inflight_seq[idx];
+        let delta = snd_una.wrapping_sub(base);
+        if delta > 0 && delta < 0x8000_0000 {
+            let acked = (delta as usize).min(self.tx_inflight_buf[idx].len());
+            if acked > 0 {
+                self.tx_inflight_buf[idx].drain(..acked);
+                self.tx_inflight_seq[idx] = base.wrapping_add(acked as u32);
+                self.slot_rto_shift[idx] = 0;
+                self.slot_rto_ticks[idx] = self.ticks;
+                if self.tx_inflight_buf[idx].is_empty() && self.tx_inflight_buf[idx].capacity() > 4096
+                {
+                    self.tx_inflight_buf[idx].shrink_to_fit();
+                }
+            }
+        }
+    }
+
+    fn has_staged_ooo(&self, idx: usize) -> bool {
+        let mut k = 0usize;
+        while k < OOO_SLOTS_PER_CONN {
+            if self.ooo_segs[idx][k].present {
+                return true;
+            }
+            k += 1;
+        }
+        false
+    }
+
+    #[inline(never)]
+    fn handle_ooo_or_dup_segment(
+        &mut self,
+        idx: usize,
+        seg: &cuttle_contracts::TcpSegmentView<'_>,
+        dst_mac: [u8; 6],
+        reply_ip: [u8; 4],
+        out: &mut ReplySet,
+    ) {
+        if (seg.flags & tcp_flags::ACK) != 0 {
+            let una = self.tcbs[idx].snd_una;
+            let nxt = self.tcbs[idx].snd_nxt;
+            let d_una = seg.ack.wrapping_sub(una);
+            let d_nxt = nxt.wrapping_sub(seg.ack);
+            if d_una > 0 && d_una < 0x8000_0000 && d_nxt < 0x8000_0000 {
+                self.tcbs[idx].snd_una = seg.ack;
+                self.trim_inflight_tx(idx);
+            }
+        }
+        let rcv_nxt = self.tcbs[idx].rcv_nxt;
+        let forward_gap = seg.seq.wrapping_sub(rcv_nxt);
+        if forward_gap > 0
+            && forward_gap <= OOO_MAX_GAP_BYTES
+            && seg.payload.len() <= TCP_SEGMENT_PAYLOAD
+        {
+            let slot_used = self.http_bufs[idx]
+                .len()
+                .saturating_add(self.slot_ooo_bytes(idx));
+            if slot_used.saturating_add(seg.payload.len()) <= MAX_HTTP_BUFFER_BYTES
+                && self
+                    .total_buffered_bytes()
+                    .saturating_add(seg.payload.len())
+                    <= MAX_TOTAL_BUFFERED_BYTES
+            {
+                let mut target_k: Option<usize> = None;
+                let mut k = 0usize;
+                while k < OOO_SLOTS_PER_CONN {
+                    if self.ooo_segs[idx][k].present && self.ooo_segs[idx][k].seq == seg.seq {
+                        target_k = Some(k);
+                        break;
+                    }
+                    if !self.ooo_segs[idx][k].present && target_k.is_none() {
+                        target_k = Some(k);
+                    }
+                    k += 1;
+                }
+                if let Some(slot_k) = target_k {
+                    self.ooo_segs[idx][slot_k].present = true;
+                    self.ooo_segs[idx][slot_k].seq = seg.seq;
+                    self.ooo_segs[idx][slot_k].fin = (seg.flags & tcp_flags::FIN) != 0;
+                    self.ooo_segs[idx][slot_k].data.clear();
+                    self.ooo_segs[idx][slot_k].data.extend_from_slice(seg.payload);
+                }
+            }
+            let tcb = self.tcbs[idx];
+            self.emit_tcp(
+                tcb.local_port,
+                tcb.remote_port,
+                dst_mac,
+                reply_ip,
+                tcb.snd_nxt,
+                tcb.rcv_nxt,
+                tcp_flags::ACK,
+                tcb.rcv_wnd,
+                b"",
+                out,
+            );
+        } else if rcv_nxt.wrapping_sub(seg.seq) <= 16_384 {
+            let tcb = self.tcbs[idx];
+            self.emit_tcp(
+                tcb.local_port,
+                tcb.remote_port,
+                dst_mac,
+                reply_ip,
+                tcb.snd_nxt,
+                tcb.rcv_nxt,
+                tcp_flags::ACK,
+                tcb.rcv_wnd,
+                b"",
+                out,
+            );
+        }
+    }
+
+    #[inline(never)]
+    fn coalesce_staged_ooo(
+        &mut self,
+        idx: usize,
+        head: &[u8],
+        hint: &mut crate::tcp::Reply,
+    ) -> alloc::vec::Vec<u8> {
+        let mut merged = alloc::vec::Vec::from(head);
+        let mut pass = 0usize;
+        while pass < OOO_SLOTS_PER_CONN {
+            let mut progressed = false;
+            let mut k = 0usize;
+            while k < OOO_SLOTS_PER_CONN {
+                if self.ooo_segs[idx][k].present {
+                    let rcv_nxt = self.tcbs[idx].rcv_nxt;
+                    let seg_seq = self.ooo_segs[idx][k].seq;
+                    let seg_len = self.ooo_segs[idx][k].data.len() as u32;
+                    let behind = rcv_nxt.wrapping_sub(seg_seq);
+                    if behind <= seg_len {
+                        let overlap = behind as usize;
+                        let tail_len = self.ooo_segs[idx][k].data.len() - overlap;
+                        if tail_len > 0 {
+                            merged.extend_from_slice(&self.ooo_segs[idx][k].data[overlap..]);
+                            self.tcbs[idx].rcv_nxt = rcv_nxt.wrapping_add(tail_len as u32);
+                        }
+                        if self.ooo_segs[idx][k].fin {
+                            self.tcbs[idx].rcv_nxt = self.tcbs[idx].rcv_nxt.wrapping_add(1);
+                            self.tcbs[idx].state = TcpState::CloseWait;
+                        }
+                        self.ooo_segs[idx][k].present = false;
+                        self.ooo_segs[idx][k].seq = 0;
+                        self.ooo_segs[idx][k].fin = false;
+                        crate::https::scrub_vec_all_bytes(&mut self.ooo_segs[idx][k].data);
+                        self.ooo_segs[idx][k].data.shrink_to_fit();
+                        self.ooo_reassembled = self.ooo_reassembled.wrapping_add(1);
+                        hint.present = true;
+                        hint.seq = self.tcbs[idx].snd_nxt;
+                        hint.ack = self.tcbs[idx].rcv_nxt;
+                        hint.flags = tcp_flags::ACK;
+                        hint.window = self.tcbs[idx].rcv_wnd;
+                        progressed = true;
+                    }
+                }
+                k += 1;
+            }
+            if !progressed {
+                break;
+            }
+            pass += 1;
+        }
+        merged
     }
 
     #[inline(never)]
@@ -1448,16 +1883,100 @@ impl LivedNet {
         if seg.dst_port == HTTPS_PORT && self.tls_config.is_none() {
             return;
         }
-        let idx = match self.select_tcp_slot(src_ip, seg.src_port, seg.dst_port, seg.flags) {
-            Some(i) => i,
-            None => return,
+        let idx = if let Some(existing) =
+            self.find_existing_tcp_slot(src_ip, seg.src_port, seg.dst_port)
+        {
+            existing
+        } else if (seg.flags & tcp_flags::SYN) != 0
+            && (seg.flags & (tcp_flags::ACK | tcp_flags::RST | tcp_flags::FIN)) == 0
+        {
+            let alloc_slot = if self.active_tcp_slots() < self.syn_cookie_threshold {
+                self.claim_verified_tcp_slot(seg.dst_port, false)
+            } else {
+                None
+            };
+            match alloc_slot {
+                Some(s) => s,
+                None => {
+                    if !self.can_accept_syn_cookie() {
+                        return;
+                    }
+                    let cookie_isn = self.compute_syn_cookie_isn(
+                        src_ip,
+                        seg.src_port,
+                        seg.dst_port,
+                        seg.seq,
+                        self.syn_cookie_epoch(),
+                    );
+                    self.syn_cookies_sent = self.syn_cookies_sent.wrapping_add(1);
+                    self.emit_tcp(
+                        seg.dst_port,
+                        seg.src_port,
+                        dst_mac,
+                        reply_ip,
+                        cookie_isn,
+                        seg.seq.wrapping_add(1),
+                        tcp_flags::SYN | tcp_flags::ACK,
+                        65535,
+                        b"",
+                        out,
+                    );
+                    return;
+                }
+            }
+        } else if (seg.flags & tcp_flags::ACK) != 0
+            && (seg.flags & (tcp_flags::SYN | tcp_flags::RST)) == 0
+        {
+            let Some(cookie_isn) = self.verify_syn_cookie_ack(
+                src_ip,
+                seg.src_port,
+                seg.dst_port,
+                seg.seq,
+                seg.ack,
+            ) else {
+                return;
+            };
+            let Some(s) = self.claim_verified_tcp_slot(seg.dst_port, true) else {
+                return;
+            };
+            self.tcbs[s] = Tcb {
+                state: TcpState::Established,
+                local_ip: self.ip,
+                local_port: seg.dst_port,
+                remote_ip: src_ip,
+                remote_port: seg.src_port,
+                snd_iss: cookie_isn,
+                snd_una: seg.ack,
+                snd_nxt: seg.ack,
+                snd_wnd: seg.window,
+                rcv_irs: seg.seq.wrapping_sub(1),
+                rcv_nxt: seg.seq,
+                rcv_wnd: 65535,
+            };
+            self.slot_last_tick[s] = self.ticks;
+            self.slot_rto_ticks[s] = self.ticks;
+            self.slot_remote_mac[s] = dst_mac;
+            self.syn_cookies_accepted = self.syn_cookies_accepted.wrapping_add(1);
+            s
+        } else {
+            return;
         };
+
+        if self.tcbs[idx].state == TcpState::Established
+            && (seg.flags & tcp_flags::RST) == 0
+            && (!seg.payload.is_empty() || (seg.flags & tcp_flags::FIN) != 0)
+            && seg.seq != self.tcbs[idx].rcv_nxt
+        {
+            self.handle_ooo_or_dup_segment(idx, &seg, dst_mac, reply_ip, out);
+            return;
+        }
+
         let was_close_wait = matches!(
             self.tcbs[idx].state,
             TcpState::CloseWait | TcpState::FinWait1 | TcpState::FinWait2 | TcpState::LastAck
         );
         let inbound_payload = seg.payload;
-        let (next, hint) = match process_segment(self.tcbs[idx], &seg, self.ticks) {
+        let (next, mut hint) = match process_segment(self.tcbs[idx], &seg, self.ticks) {
             Ok(t) => t,
             Err(_) => return,
         };
@@ -1468,10 +1987,24 @@ impl LivedNet {
         if self.tcbs[idx].remote_ip == [0, 0, 0, 0] {
             self.tcbs[idx].remote_ip = src_ip;
         }
-        let effective_payload = if was_close_wait || self.http_input_closed[idx] {
+        self.trim_inflight_tx(idx);
+
+        let raw_payload = if was_close_wait || self.http_input_closed[idx] {
             &[][..]
         } else {
             inbound_payload
+        };
+        let ooo_merged = if !was_close_wait
+            && !self.http_input_closed[idx]
+            && self.has_staged_ooo(idx)
+        {
+            Some(self.coalesce_staged_ooo(idx, raw_payload, &mut hint))
+        } else {
+            None
+        };
+        let effective_payload: &[u8] = match &ooo_merged {
+            Some(v) => v.as_slice(),
+            None => raw_payload,
         };
 
         if seg.dst_port == HTTPS_PORT {
@@ -1667,6 +2200,7 @@ impl LivedNet {
                 break;
             }
             self.tcbs[idx] = next;
+            self.record_inflight_tx(idx, data_hint.seq, &chunk[..n]);
             self.http_tx[idx].drain(..n);
             sent = true;
         }
@@ -1974,6 +2508,7 @@ impl LivedNet {
                 break;
             }
             self.tcbs[idx] = next;
+            self.record_inflight_tx(idx, data_hint.seq, &chunk[..n]);
             if let Some(session) = self.tls[idx].as_mut() {
                 session.consume_tx(n);
                 self.slot_tls_buffered[idx] = session
@@ -7577,5 +8112,245 @@ mod tests {
             audit_str.contains("net:tls:heap_reserve"),
             "audit log must record net:tls:heap_reserve denial, got: {audit_str}"
         );
+    }
+
+    #[test]
+    fn stage18_wan_tcp_syn_cookies_ooo_reassembly_and_payload_rto_retransmit() {
+        let mut net = LivedNet::with_auth_key(MAC, [0x77u8; 32]);
+        net.set_syn_cookie_threshold(4);
+        let mut sh = crate::shell::OsShell::new();
+
+        // --- Part 1: 64-SYN flood with stateless HMAC-SHA256 SYN Cookies ---
+        let mut saved_cookie_sa_seq: u32 = 0;
+        let flood_base_port: u16 = 40000;
+        for i in 0..64u16 {
+            let cport = flood_base_port + i;
+            let cisn = 0x1000_0000u32.wrapping_add((i as u32) * 0x1000);
+            let mut syn = [0u8; 40];
+            let ns = TcpImpl::build_segment(
+                cport,
+                HTTP_PORT,
+                cisn,
+                0,
+                tcp_flags::SYN,
+                65535,
+                b"",
+                PEER_IP,
+                GUEST_IP,
+                &mut syn,
+            )
+            .unwrap();
+            let (f, flen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn[..ns]);
+            let mut out = ReplySet::new();
+            net.handle_frame_with_shell(&f[..flen], 1, &mut sh, &mut out);
+            assert_eq!(out.len(), 1, "SYN #{i} must receive SYN-ACK");
+            let sa = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+            assert_eq!(sa.flags, tcp_flags::SYN | tcp_flags::ACK);
+            if i == 50 {
+                saved_cookie_sa_seq = sa.seq;
+            }
+        }
+        assert_eq!(net.active_tcp_slots(), 4, "SYN cookies must cap half-open slot usage at threshold");
+        assert_eq!(net.syn_cookies_sent, 60);
+
+        // Forged cookie ACK must be dropped without allocating a TCB slot.
+        let c50_port = flood_base_port + 50;
+        let c50_isn = 0x1000_0000u32.wrapping_add(50 * 0x1000);
+        let req_get = b"GET /healthz HTTP/1.1\r\nHost: cuttle\r\n\r\n";
+        let mut forged = [0u8; 128];
+        let nf = TcpImpl::build_segment(
+            c50_port,
+            HTTP_PORT,
+            c50_isn.wrapping_add(1),
+            saved_cookie_sa_seq.wrapping_add(0xDEAD),
+            tcp_flags::ACK | tcp_flags::PSH,
+            65535,
+            req_get,
+            PEER_IP,
+            GUEST_IP,
+            &mut forged,
+        )
+        .unwrap();
+        let (ff, fflen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &forged[..nf]);
+        let mut fout = ReplySet::new();
+        net.handle_frame_with_shell(&ff[..fflen], 1, &mut sh, &mut fout);
+        assert_eq!(net.syn_cookies_accepted, 0);
+        assert_eq!(net.active_tcp_slots(), 4);
+
+        // Valid cookie ACK+PSH promotes statelessly into Slot #5 and serves `200 OK` immediately!
+        let mut valid_ack = [0u8; 128];
+        let nv = TcpImpl::build_segment(
+            c50_port,
+            HTTP_PORT,
+            c50_isn.wrapping_add(1),
+            saved_cookie_sa_seq.wrapping_add(1),
+            tcp_flags::ACK | tcp_flags::PSH,
+            65535,
+            req_get,
+            PEER_IP,
+            GUEST_IP,
+            &mut valid_ack,
+        )
+        .unwrap();
+        let (vf, vflen) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &valid_ack[..nv]);
+        let mut vout = ReplySet::new();
+        net.handle_frame_with_shell(&vf[..vflen], 1, &mut sh, &mut vout);
+        assert_eq!(net.syn_cookies_accepted, 1);
+        let mut saw_cookie_200 = false;
+        for idx in 0..vout.len() {
+            let seg = TcpImpl::parse_segment(&vout.get(idx).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+            if seg.payload.starts_with(b"HTTP/1.1 200 OK") {
+                saw_cookie_200 = true;
+            }
+        }
+        assert!(saw_cookie_200, "stateless SYN cookie promotion must deliver HTTP 200 OK");
+
+        // --- Part 2: Out-of-Order (`OOO`) TCP reassembly + RFC 5681 duplicate ACK ---
+        let mut net2 = LivedNet::with_auth_key(MAC, [0x88u8; 32]);
+        let ooo_port: u16 = 41000;
+        let ooo_isn: u32 = 0x2200_0000;
+        let mut syn2 = [0u8; 40];
+        let ns2 = TcpImpl::build_segment(
+            ooo_port,
+            HTTP_PORT,
+            ooo_isn,
+            0,
+            tcp_flags::SYN,
+            65535,
+            b"",
+            PEER_IP,
+            GUEST_IP,
+            &mut syn2,
+        )
+        .unwrap();
+        let (fs2, fls2) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn2[..ns2]);
+        let mut out_sa2 = ReplySet::new();
+        net2.handle_frame_with_shell(&fs2[..fls2], 1, &mut sh, &mut out_sa2);
+        let sa2 = TcpImpl::parse_segment(&out_sa2.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+
+        let mut ack3 = [0u8; 40];
+        let na3 = TcpImpl::build_segment(
+            ooo_port,
+            HTTP_PORT,
+            ooo_isn.wrapping_add(1),
+            sa2.seq.wrapping_add(1),
+            tcp_flags::ACK,
+            65535,
+            b"",
+            PEER_IP,
+            GUEST_IP,
+            &mut ack3,
+        )
+        .unwrap();
+        let (fa3, fla3) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &ack3[..na3]);
+        let mut out_a3 = ReplySet::new();
+        net2.handle_frame_with_shell(&fa3[..fla3], 1, &mut sh, &mut out_a3);
+
+        let part1 = b"GET /healthz ";
+        let part2 = b"HTTP/1.1\r\nHost: cuttle\r\n\r\n";
+
+        // Send `part2` FIRST (out-of-order forward gap = `part1.len()`): expect Dup-ACK for `ooo_isn + 1`.
+        let mut seg_p2 = [0u8; 128];
+        let np2 = TcpImpl::build_segment(
+            ooo_port,
+            HTTP_PORT,
+            ooo_isn.wrapping_add(1 + part1.len() as u32),
+            sa2.seq.wrapping_add(1),
+            tcp_flags::ACK | tcp_flags::PSH,
+            65535,
+            part2,
+            PEER_IP,
+            GUEST_IP,
+            &mut seg_p2,
+        )
+        .unwrap();
+        let (fp2, flp2) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &seg_p2[..np2]);
+        let mut out_dup = ReplySet::new();
+        net2.handle_frame_with_shell(&fp2[..flp2], 1, &mut sh, &mut out_dup);
+        assert_eq!(out_dup.len(), 1, "OOO segment must trigger immediate RFC 5681 duplicate ACK");
+        let dup_ack = TcpImpl::parse_segment(&out_dup.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        assert_eq!(dup_ack.ack, ooo_isn.wrapping_add(1));
+        assert!(dup_ack.payload.is_empty());
+
+        // Now send missing `part1`: OOO queue coalesces `part1 + part2` and emits `HTTP/1.1 200 OK`!
+        let mut seg_p1 = [0u8; 128];
+        let np1 = TcpImpl::build_segment(
+            ooo_port,
+            HTTP_PORT,
+            ooo_isn.wrapping_add(1),
+            sa2.seq.wrapping_add(1),
+            tcp_flags::ACK | tcp_flags::PSH,
+            65535,
+            part1,
+            PEER_IP,
+            GUEST_IP,
+            &mut seg_p1,
+        )
+        .unwrap();
+        let (fp1, flp1) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &seg_p1[..np1]);
+        let mut out_coal = ReplySet::new();
+        net2.handle_frame_with_shell(&fp1[..flp1], 1, &mut sh, &mut out_coal);
+        assert_eq!(net2.ooo_reassembled, 1);
+
+        let mut resp_seq: u32 = 0;
+        let mut resp_len: u32 = 0;
+        for idx in 0..out_coal.len() {
+            let seg = TcpImpl::parse_segment(&out_coal.get(idx).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+            if seg.payload.starts_with(b"HTTP/1.1 200 OK") {
+                assert_eq!(
+                    seg.ack,
+                    ooo_isn.wrapping_add(1 + (part1.len() + part2.len()) as u32)
+                );
+                resp_seq = seg.seq;
+                resp_len = seg.payload.len() as u32;
+            }
+        }
+        assert!(resp_len > 0, "coalesced OOO HTTP request must produce HTTP 200 OK");
+
+        // --- Part 3: Unacknowledged Server Payload RTO Retransmit + RFC 6298 Backoff ---
+        assert_eq!(net2.total_inflight_tx_bytes(), resp_len as usize);
+        let base_rto = net2.rto_retransmit_ticks();
+        let mut rto_out = ReplySet::new();
+        for _ in 0..base_rto {
+            let _ = net2.tick_tcp_rto_with_replies(&mut rto_out);
+        }
+        assert_eq!(net2.payload_retransmits, 1, "first RTO expiry must retransmit dropped HTTP response");
+        let rtx_seg = TcpImpl::parse_segment(&rto_out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        assert_eq!(rtx_seg.seq, resp_seq);
+        assert!(rtx_seg.payload.starts_with(b"HTTP/1.1 200 OK"));
+
+        // Exponential backoff (`2 * base_rto` required before 2nd retransmit):
+        let mut half_backoff = ReplySet::new();
+        for _ in 0..base_rto {
+            let _ = net2.tick_tcp_rto_with_replies(&mut half_backoff);
+        }
+        assert_eq!(
+            net2.payload_retransmits, 1,
+            "exponential backoff must double RTO interval before 2nd retransmit"
+        );
+        for _ in 0..base_rto {
+            let _ = net2.tick_tcp_rto_with_replies(&mut half_backoff);
+        }
+        assert_eq!(net2.payload_retransmits, 2);
+
+        // Peer cumulative ACK clears `tx_inflight_buf` to 0 bytes!
+        let mut final_ack = [0u8; 40];
+        let nfa = TcpImpl::build_segment(
+            ooo_port,
+            HTTP_PORT,
+            ooo_isn.wrapping_add(1 + (part1.len() + part2.len()) as u32),
+            resp_seq.wrapping_add(resp_len),
+            tcp_flags::ACK,
+            65535,
+            b"",
+            PEER_IP,
+            GUEST_IP,
+            &mut final_ack,
+        )
+        .unwrap();
+        let (ffa, flfa) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &final_ack[..nfa]);
+        let mut ack_out = ReplySet::new();
+        net2.handle_frame_with_shell(&ffa[..flfa], 1, &mut sh, &mut ack_out);
+        assert_eq!(net2.total_inflight_tx_bytes(), 0);
     }
 }

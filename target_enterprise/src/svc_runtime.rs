@@ -630,6 +630,8 @@ pub struct ServiceSlot {
     pub elf_len: usize,
     /// In-memory ELF64 service binary (`[0; 256]` when `Unloaded` to minimize memory footprint).
     pub elf_image: [u8; SVC_ELF_CAP],
+    /// Armed one-shot Ring-3 (`CPL=3`) `#UD` fault injection flag for live supervisor containment proofs.
+    pub inject_ring3_fault_once: bool,
 }
 
 impl ServiceSlot {
@@ -652,6 +654,7 @@ impl ServiceSlot {
             elf_sha256: [0u8; DURABLE_DIGEST_LEN],
             elf_len: 0,
             elf_image: [0u8; SVC_ELF_CAP],
+            inject_ring3_fault_once: false,
         }
     }
 }
@@ -684,6 +687,27 @@ pub fn derive_service_base_seed(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> u64 {
     derive_service_base_seed_for_boot(seal_key, 1)
 }
 
+/// Maximum machine-code capacity for the position-independent `CPL=3` mailbox sanitizer & FNV-1a worker.
+pub const SVC_RING3_WORKER_CAP: usize = 512;
+
+/// Verdict returned by hardware `CPL=3` execution of the synthesized Ring-3 mailbox sanitizer worker.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Ring3MailboxHwVerdict {
+    /// Request path, control-byte rules, and mailbox canaries passed at `CPL=3`, returning 64-bit FNV-1a hash.
+    Ok(u64),
+    /// Request path failed `CPL=3` structural or `..` traversal validation (`verdict == 2`).
+    RejectedPath,
+    /// Request body contained forbidden NUL or ASCII control bytes at `CPL=3` (`verdict == 3`).
+    RejectedBody,
+    /// Hardware Ring-3 worker faulted (`#UD`/`#PF`/`#GP`), mismatched canaries, or was preempted (`0x40`).
+    FaultedOrPreempted,
+}
+
+/// Hardware Ring-3 (`CPL=3`) mailbox sanitizer & FNV-1a worker callback:
+/// `fn(service_id, worker_code, canary, strict_vfs, path, body, expected_fnv1a) -> Ring3MailboxHwVerdict`.
+pub type Ring3MailboxHwHook =
+    fn(ServiceId, &[u8], u32, bool, &[u8], &[u8], u64) -> Ring3MailboxHwVerdict;
+
 /// Hardware Ring-3 (`CPL=3`, `CS=0x23`/`SS=0x1B`, `PTE_U` user page) execution callback:
 /// `fn(ring3_code, mailbox_req_word, expected_arg0) -> bool`.
 pub type Ring3HwHook = fn(&[u8; SVC_RING3_STUB_LEN], u64, u64) -> bool;
@@ -715,6 +739,8 @@ pub struct ServiceSupervisor {
     pub ring3_hw_hook: Option<Ring3HwHook>,
     /// Optional capability-aware hardware Ring-3 (`CPL=3`) execution callback receiving `(ServiceId, code, req, exp, cap_mask)`.
     pub ring3_cap_hw_hook: Option<Ring3CapHwHook>,
+    /// Optional bare-metal hardware Ring-3 (`CPL=3`) mailbox sanitizer & FNV-1a worker callback.
+    pub ring3_mailbox_hw_hook: Option<Ring3MailboxHwHook>,
 }
 
 impl ServiceSupervisor {
@@ -735,6 +761,7 @@ impl ServiceSupervisor {
             ipc_total: 0,
             ring3_hw_hook: None,
             ring3_cap_hw_hook: None,
+            ring3_mailbox_hw_hook: None,
         }
     }
 
@@ -749,6 +776,17 @@ impl ServiceSupervisor {
     /// `(service_id, ring3_code, mailbox_req_word, expected_arg0, service_cap_mask)`.
     pub fn set_ring3_cap_hw_hook(&mut self, hook: Ring3CapHwHook) {
         self.ring3_cap_hw_hook = Some(hook);
+    }
+
+    /// Register a bare-metal hardware Ring-3 (`CPL=3`) mailbox sanitizer & FNV-1a worker callback.
+    pub fn set_ring3_mailbox_hw_hook(&mut self, hook: Ring3MailboxHwHook) {
+        self.ring3_mailbox_hw_hook = Some(hook);
+    }
+
+    /// Arm a one-shot Ring-3 (`CPL=3`) illegal-instruction (`ud2`) fault on `svc`'s next mailbox
+    /// sanitizer run to prove live hardware trap containment (`Faulted`) and supervisor auto-restart.
+    pub fn arm_ring3_fault_injection_once(&mut self, svc: ServiceId) {
+        self.services[svc.index()].inject_ring3_fault_once = true;
     }
 
     /// Derive a per-service variant seed from the node's `base_seed` and `svc`.
@@ -1277,6 +1315,13 @@ impl ServiceSupervisor {
 
         let is_vfs_op = matches!(op, IpcOp::VfsRead | IpcOp::VfsWrite | IpcOp::VfsDelete);
 
+        // 0. Execute real position-independent x86-64 Ring-3 (`CPL=3`) mailbox sanitizer &
+        //    FNV-1a worker over isolated KPTI user pages (`User RX` + `User RW+NX`) when
+        //    armed on bare metal (or when one-shot fault injection is armed).
+        if self.services[idx].inject_ring3_fault_once || self.ring3_mailbox_hw_hook.is_some() {
+            self.invoke_ring3_mailbox_worker_hook(svc, is_vfs_op, path, body, audit)?;
+        }
+
         // 1. Validate request path.
         if !ring3_validate_path(path, is_vfs_op) {
             self.services[idx].mailbox.ring3_parser_rejects = self.services[idx]
@@ -1402,6 +1447,88 @@ impl ServiceSupervisor {
             is_mutating,
             parser_digest,
         })
+    }
+
+    /// Synthesize and invoke the service's position-independent `CPL=3` x86-64 mailbox worker
+    /// via `ring3_mailbox_hw_hook` (or trigger contained `Faulted` transition on fault injection).
+    #[inline(never)]
+    fn invoke_ring3_mailbox_worker_hook<const N: usize>(
+        &mut self,
+        svc: ServiceId,
+        is_vfs_op: bool,
+        path: &[u8],
+        body: &[u8],
+        audit: &mut AuditLogImpl<N>,
+    ) -> Result<(), ServiceError> {
+        let idx = svc.index();
+        let inject_fault = self.services[idx].inject_ring3_fault_once;
+        self.services[idx].inject_ring3_fault_once = false;
+
+        let Some(hook) = self.ring3_mailbox_hw_hook else {
+            if inject_fault {
+                self.services[idx].state = ServiceState::Faulted;
+                self.services[idx].policy_denials =
+                    self.services[idx].policy_denials.wrapping_add(1);
+                record_svc_audit(audit, 46, AuditVerdict::Denied, b"svc:cpl3:fault-contained");
+                return Err(ServiceError::SandboxTrap);
+            }
+            return Ok(());
+        };
+
+        let seed = self.services[idx].variant_seed;
+        let canary = self.services[idx].mailbox.canary;
+        let mut worker_code = [0u8; SVC_RING3_WORKER_CAP];
+        let worker_len = build_ring3_mailbox_worker_code(svc, seed, &mut worker_code);
+        if inject_fault && worker_len >= 2 {
+            // Overwrite prologue with `ud2` (`0F 0B`) to prove live hardware `#UD` trap containment
+            // at `CPL=3` (`CS=0x23`) on `TSS.RSP0` without crashing the kernel or peer services.
+            worker_code[0] = 0x0F;
+            worker_code[1] = 0x0B;
+        }
+        let expected_fnv = compute_ring3_mailbox_fnv1a(svc, seed, path, body);
+        match hook(
+            svc,
+            &worker_code[..worker_len],
+            canary,
+            is_vfs_op,
+            path,
+            body,
+            expected_fnv,
+        ) {
+            Ring3MailboxHwVerdict::Ok(hw_fnv) => {
+                if hw_fnv != expected_fnv {
+                    self.services[idx].state = ServiceState::Faulted;
+                    self.services[idx].policy_denials =
+                        self.services[idx].policy_denials.wrapping_add(1);
+                    record_svc_audit(audit, 46, AuditVerdict::Denied, b"svc:cpl3:hash-mismatch");
+                    return Err(ServiceError::SandboxTrap);
+                }
+                Ok(())
+            }
+            Ring3MailboxHwVerdict::RejectedPath => {
+                self.services[idx].mailbox.ring3_parser_rejects = self.services[idx]
+                    .mailbox
+                    .ring3_parser_rejects
+                    .wrapping_add(1);
+                record_svc_audit(audit, 46, AuditVerdict::Denied, b"svc:cpl3:bad-path");
+                Err(ServiceError::BadRequest)
+            }
+            Ring3MailboxHwVerdict::RejectedBody => {
+                self.services[idx].mailbox.ring3_parser_rejects = self.services[idx]
+                    .mailbox
+                    .ring3_parser_rejects
+                    .wrapping_add(1);
+                record_svc_audit(audit, 46, AuditVerdict::Denied, b"svc:cpl3:ctrl-byte");
+                Err(ServiceError::BadRequest)
+            }
+            Ring3MailboxHwVerdict::FaultedOrPreempted => {
+                self.services[idx].state = ServiceState::Faulted;
+                self.services[idx].policy_denials =
+                    self.services[idx].policy_denials.wrapping_add(1);
+                record_svc_audit(audit, 46, AuditVerdict::Denied, b"svc:cpl3:fault-contained");
+                Err(ServiceError::SandboxTrap)
+            }
+        }
     }
 
     /// Execute the eBPF instruction stream inside `svc`'s loaded ELF64 `PT_LOAD` segment,
@@ -1775,6 +1902,333 @@ fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
         i += 1;
     }
     true
+}
+
+/// Compute the deterministic `variant_seed`-diversified 64-bit FNV-1a digest over `(path, 0xFF, body)`
+/// matching the hardware `CPL=3` worker synthesized by [`build_ring3_mailbox_worker_code`].
+pub fn compute_ring3_mailbox_fnv1a(
+    svc: ServiceId,
+    variant_seed: u64,
+    path: &[u8],
+    body: &[u8],
+) -> u64 {
+    const FNV_PRIME: u64 = 0x0000_0001_0000_01B3;
+    let svc_mix = ((svc.index() as u64) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut h = 0xCBF2_9CE4_8422_2325u64 ^ variant_seed ^ svc_mix;
+    let mut i = 0usize;
+    while i < path.len() {
+        h ^= path[i] as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    h ^= 0xFF;
+    h = h.wrapping_mul(FNV_PRIME);
+    let mut j = 0usize;
+    while j < body.len() {
+        h ^= body[j] as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+        j += 1;
+    }
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
+#[inline]
+fn emit_bytes(out: &mut [u8; SVC_RING3_WORKER_CAP], pos: &mut usize, bytes: &[u8]) {
+    let n = bytes.len();
+    out[*pos..*pos + n].copy_from_slice(bytes);
+    *pos += n;
+}
+
+#[inline]
+fn emit_jcc_rel32(out: &mut [u8; SVC_RING3_WORKER_CAP], pos: &mut usize, cc: u8) -> usize {
+    emit_bytes(out, pos, &[0x0F, cc, 0, 0, 0, 0]);
+    *pos - 4
+}
+
+#[inline]
+fn emit_jmp_rel32(out: &mut [u8; SVC_RING3_WORKER_CAP], pos: &mut usize) -> usize {
+    emit_bytes(out, pos, &[0xE9, 0, 0, 0, 0]);
+    *pos - 4
+}
+
+#[inline]
+fn patch_rel32(out: &mut [u8; SVC_RING3_WORKER_CAP], disp_off: usize, target: usize) {
+    let next_ip = disp_off + 4;
+    let rel = (target as isize - next_ip as isize) as i32;
+    out[disp_off..disp_off + 4].copy_from_slice(&rel.to_le_bytes());
+}
+
+/// Synthesize a position-independent x86-64 Ring-3 (`CPL=3`, `CS=0x23`) mailbox sanitizer and
+/// 64-bit FNV-1a worker for `svc` diversified by `variant_seed`.
+///
+/// Shared `User RW + NX` mailbox page layout at `rsi = rsp & -4096` (`user_va + 0x2000`):
+/// - `[rsi + 0x000]`: `canary: u32` (must be non-zero and match `[rsi + 0x260]`)
+/// - `[rsi + 0x004]`: `strict_vfs: u8` (`1` for VFS ops, `0` otherwise)
+/// - `[rsi + 0x005]`: `path_len: u8` (`1..=64`)
+/// - `[rsi + 0x006]`: `body_len: u16` (`0..=512`)
+/// - `[rsi + 0x010..0x050]`: `path` bytes
+/// - `[rsi + 0x050..0x250]`: `body` bytes
+/// - `[rsi + 0x260]`: `canary_tail: u32`
+/// - `[rsi + 0x268]`: output `u64` FNV-1a digest (also returned in `RDX` to `int 0x80`)
+/// - `[rsi + 0x270]`: output `u32` verdict (`1 = Ok`, `2 = RejectedPath`, `3 = RejectedBody`, `4 = BadCanary`)
+pub fn build_ring3_mailbox_worker_code(
+    svc: ServiceId,
+    variant_seed: u64,
+    out: &mut [u8; SVC_RING3_WORKER_CAP],
+) -> usize {
+    const CC_AE: u8 = 0x83;
+    const CC_Z: u8 = 0x84;
+    const CC_NZ: u8 = 0x85;
+    const CC_BE: u8 = 0x86;
+    const CC_A: u8 = 0x87;
+
+    *out = [0u8; SVC_RING3_WORKER_CAP];
+    let mut pos = 0usize;
+
+    // Seed-diversified polymorphic NOP prologue so each service & rotation shifts code offsets.
+    match variant_seed & 3 {
+        0 => {}
+        1 => emit_bytes(out, &mut pos, &[0x90]),
+        2 => emit_bytes(out, &mut pos, &[0x66, 0x90]),
+        _ => emit_bytes(out, &mut pos, &[0x0F, 0x1F, 0x00]),
+    }
+
+    // Position-independent mailbox base: `mov rsi, rsp; and rsi, -4096`.
+    emit_bytes(out, &mut pos, &[0x48, 0x89, 0xE6]);
+    emit_bytes(out, &mut pos, &[0x48, 0x81, 0xE6, 0x00, 0xF0, 0xFF, 0xFF]);
+
+    // Verify head/tail mailbox canaries (`[rsi + 0] != 0 && [rsi + 0] == [rsi + 0x260]`).
+    emit_bytes(out, &mut pos, &[0x8B, 0x06]); // mov eax, [rsi]
+    emit_bytes(out, &mut pos, &[0x85, 0xC0]); // test eax, eax
+    let j_can_zero = emit_jcc_rel32(out, &mut pos, CC_Z);
+    emit_bytes(out, &mut pos, &[0x3B, 0x86, 0x60, 0x02, 0x00, 0x00]); // cmp eax, [rsi + 0x260]
+    let j_can_mismatch = emit_jcc_rel32(out, &mut pos, CC_NZ);
+
+    // Load `strict_vfs` -> `edi`, `path_len` -> `ebx`, seeded FNV-1a basis -> `rdx`, prime -> `r8`.
+    emit_bytes(out, &mut pos, &[0x0F, 0xB6, 0x7E, 0x04]); // movzx edi, byte ptr [rsi + 4]
+    emit_bytes(out, &mut pos, &[0x0F, 0xB6, 0x5E, 0x05]); // movzx ebx, byte ptr [rsi + 5]
+
+    let svc_mix = ((svc.index() as u64) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let basis = 0xCBF2_9CE4_8422_2325u64 ^ variant_seed ^ svc_mix;
+    emit_bytes(out, &mut pos, &[0x48, 0xBA]); // movabs rdx, basis
+    emit_bytes(out, &mut pos, &basis.to_le_bytes());
+    emit_bytes(
+        out,
+        &mut pos,
+        &[0x49, 0xB8, 0xB3, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00],
+    ); // movabs r8, 0x100000001B3
+
+    let mut fail_path_patches = [0usize; 12];
+    let mut fp_n = 0usize;
+
+    // Path bounds & leading `/` check (`1 <= path_len <= 64 && path[0] == '/'`).
+    emit_bytes(out, &mut pos, &[0x85, 0xDB]); // test ebx, ebx
+    fail_path_patches[fp_n] = emit_jcc_rel32(out, &mut pos, CC_Z);
+    fp_n += 1;
+    emit_bytes(out, &mut pos, &[0x83, 0xFB, 0x40]); // cmp ebx, 64
+    fail_path_patches[fp_n] = emit_jcc_rel32(out, &mut pos, CC_A);
+    fp_n += 1;
+    emit_bytes(out, &mut pos, &[0x80, 0x7E, 0x10, 0x2F]); // cmp byte ptr [rsi + 0x10], '/'
+    fail_path_patches[fp_n] = emit_jcc_rel32(out, &mut pos, CC_NZ);
+    fp_n += 1;
+
+    // Strict VFS trailing slash check (`strict_vfs && path_len > 1 && path[path_len - 1] == '/'`).
+    emit_bytes(out, &mut pos, &[0x85, 0xFF]); // test edi, edi
+    let j_tr_not_vfs = emit_jcc_rel32(out, &mut pos, CC_Z);
+    emit_bytes(out, &mut pos, &[0x83, 0xFB, 0x01]); // cmp ebx, 1
+    let j_tr_len1 = emit_jcc_rel32(out, &mut pos, CC_BE);
+    emit_bytes(out, &mut pos, &[0x80, 0x7C, 0x1E, 0x0F, 0x2F]); // cmp byte ptr [rsi + rbx + 0x0F], '/'
+    fail_path_patches[fp_n] = emit_jcc_rel32(out, &mut pos, CC_Z);
+    fp_n += 1;
+    let lbl_skip_trail = pos;
+    patch_rel32(out, j_tr_not_vfs, lbl_skip_trail);
+    patch_rel32(out, j_tr_len1, lbl_skip_trail);
+
+    // Path character, `//`, and `..` traversal loop (`ecx = 0..ebx`).
+    emit_bytes(out, &mut pos, &[0x31, 0xC9]); // xor ecx, ecx
+    let lbl_path_loop = pos;
+    emit_bytes(out, &mut pos, &[0x39, 0xD9]); // cmp ecx, ebx
+    let j_path_done = emit_jcc_rel32(out, &mut pos, CC_AE);
+    emit_bytes(out, &mut pos, &[0x0F, 0xB6, 0x44, 0x0E, 0x10]); // movzx eax, byte ptr [rsi + rcx + 0x10]
+
+    emit_bytes(out, &mut pos, &[0x3C, 0x20]); // cmp al, 0x20
+    fail_path_patches[fp_n] = emit_jcc_rel32(out, &mut pos, CC_BE);
+    fp_n += 1;
+    emit_bytes(out, &mut pos, &[0x3C, 0x7F]); // cmp al, 0x7F
+    fail_path_patches[fp_n] = emit_jcc_rel32(out, &mut pos, CC_AE);
+    fp_n += 1;
+
+    // `strict_vfs` double-slash `//` check.
+    emit_bytes(out, &mut pos, &[0x85, 0xFF]); // test edi, edi
+    let j_db_not_vfs = emit_jcc_rel32(out, &mut pos, CC_Z);
+    emit_bytes(out, &mut pos, &[0x3C, 0x2F]); // cmp al, '/'
+    let j_db_not_sl = emit_jcc_rel32(out, &mut pos, CC_NZ);
+    emit_bytes(out, &mut pos, &[0x41, 0x89, 0xC9]); // mov r9d, ecx
+    emit_bytes(out, &mut pos, &[0x41, 0xFF, 0xC1]); // inc r9d
+    emit_bytes(out, &mut pos, &[0x41, 0x39, 0xD9]); // cmp r9d, ebx
+    let j_db_end = emit_jcc_rel32(out, &mut pos, CC_AE);
+    emit_bytes(out, &mut pos, &[0x80, 0x7C, 0x0E, 0x11, 0x2F]); // cmp byte ptr [rsi + rcx + 0x11], '/'
+    fail_path_patches[fp_n] = emit_jcc_rel32(out, &mut pos, CC_Z);
+    fp_n += 1;
+    let lbl_skip_dbl = pos;
+    patch_rel32(out, j_db_not_vfs, lbl_skip_dbl);
+    patch_rel32(out, j_db_not_sl, lbl_skip_dbl);
+    patch_rel32(out, j_db_end, lbl_skip_dbl);
+
+    // `..` path traversal segment check (`path[0] == '/'` guarantees `ecx >= 1` when `al == '.'`).
+    emit_bytes(out, &mut pos, &[0x3C, 0x2E]); // cmp al, '.'
+    let j_dd_not_dot = emit_jcc_rel32(out, &mut pos, CC_NZ);
+    emit_bytes(out, &mut pos, &[0x41, 0x89, 0xC9]); // mov r9d, ecx
+    emit_bytes(out, &mut pos, &[0x41, 0xFF, 0xC1]); // inc r9d
+    emit_bytes(out, &mut pos, &[0x41, 0x39, 0xD9]); // cmp r9d, ebx
+    let j_dd_end = emit_jcc_rel32(out, &mut pos, CC_AE);
+    emit_bytes(out, &mut pos, &[0x80, 0x7C, 0x0E, 0x11, 0x2E]); // cmp byte ptr [rsi + rcx + 0x11], '.'
+    let j_dd_not_dot2 = emit_jcc_rel32(out, &mut pos, CC_NZ);
+    emit_bytes(out, &mut pos, &[0x80, 0x7C, 0x0E, 0x0F, 0x2F]); // cmp byte ptr [rsi + rcx + 0x0F], '/'
+    let j_dd_no_prev_sl = emit_jcc_rel32(out, &mut pos, CC_NZ);
+    emit_bytes(out, &mut pos, &[0x41, 0xFF, 0xC1]); // inc r9d (`ecx + 2`)
+    emit_bytes(out, &mut pos, &[0x41, 0x39, 0xD9]); // cmp r9d, ebx
+    fail_path_patches[fp_n] = emit_jcc_rel32(out, &mut pos, CC_Z);
+    fp_n += 1;
+    emit_bytes(out, &mut pos, &[0x80, 0x7C, 0x0E, 0x12, 0x2F]); // cmp byte ptr [rsi + rcx + 0x12], '/'
+    fail_path_patches[fp_n] = emit_jcc_rel32(out, &mut pos, CC_Z);
+    fp_n += 1;
+    emit_bytes(out, &mut pos, &[0x80, 0x7C, 0x0E, 0x12, 0x3F]); // cmp byte ptr [rsi + rcx + 0x12], '?'
+    fail_path_patches[fp_n] = emit_jcc_rel32(out, &mut pos, CC_Z);
+    fp_n += 1;
+    let lbl_skip_dd = pos;
+    patch_rel32(out, j_dd_not_dot, lbl_skip_dd);
+    patch_rel32(out, j_dd_end, lbl_skip_dd);
+    patch_rel32(out, j_dd_not_dot2, lbl_skip_dd);
+    patch_rel32(out, j_dd_no_prev_sl, lbl_skip_dd);
+
+    // FNV-1a fold path byte: `xor rdx, rax; imul rdx, r8; inc ecx; jmp lbl_path_loop`.
+    emit_bytes(out, &mut pos, &[0x48, 0x31, 0xC2]);
+    emit_bytes(out, &mut pos, &[0x49, 0x0F, 0xAF, 0xD0]);
+    emit_bytes(out, &mut pos, &[0xFF, 0xC1]);
+    let j_path_back = emit_jmp_rel32(out, &mut pos);
+    patch_rel32(out, j_path_back, lbl_path_loop);
+
+    let lbl_path_done = pos;
+    patch_rel32(out, j_path_done, lbl_path_done);
+
+    // Domain separator `0xFF` between `path` and `body`.
+    emit_bytes(out, &mut pos, &[0xB8, 0xFF, 0x00, 0x00, 0x00]); // mov eax, 0xFF
+    emit_bytes(out, &mut pos, &[0x48, 0x31, 0xC2]); // xor rdx, rax
+    emit_bytes(out, &mut pos, &[0x49, 0x0F, 0xAF, 0xD0]); // imul rdx, r8
+
+    // Body bounds & control-character validation + FNV-1a hashing (`body_len <= 512`).
+    let mut fail_body_patches = [0usize; 6];
+    let mut fb_n = 0usize;
+    emit_bytes(out, &mut pos, &[0x0F, 0xB7, 0x5E, 0x06]); // movzx ebx, word ptr [rsi + 6]
+    emit_bytes(out, &mut pos, &[0x81, 0xFB, 0x00, 0x02, 0x00, 0x00]); // cmp ebx, 512
+    fail_body_patches[fb_n] = emit_jcc_rel32(out, &mut pos, CC_A);
+    fb_n += 1;
+
+    emit_bytes(out, &mut pos, &[0x31, 0xC9]); // xor ecx, ecx
+    let lbl_body_loop = pos;
+    emit_bytes(out, &mut pos, &[0x39, 0xD9]); // cmp ecx, ebx
+    let j_body_done = emit_jcc_rel32(out, &mut pos, CC_AE);
+    emit_bytes(out, &mut pos, &[0x0F, 0xB6, 0x44, 0x0E, 0x50]); // movzx eax, byte ptr [rsi + rcx + 0x50]
+
+    emit_bytes(out, &mut pos, &[0x85, 0xFF]); // test edi, edi (`strict_vfs` permits binary VFS bodies)
+    let j_bc_vfs = emit_jcc_rel32(out, &mut pos, CC_NZ);
+    emit_bytes(out, &mut pos, &[0x85, 0xC0]); // test eax, eax
+    fail_body_patches[fb_n] = emit_jcc_rel32(out, &mut pos, CC_Z);
+    fb_n += 1;
+    emit_bytes(out, &mut pos, &[0x3C, 0x7F]); // cmp al, 0x7F
+    fail_body_patches[fb_n] = emit_jcc_rel32(out, &mut pos, CC_Z);
+    fb_n += 1;
+    emit_bytes(out, &mut pos, &[0x3C, 0x20]); // cmp al, 0x20
+    let j_bc_printable = emit_jcc_rel32(out, &mut pos, CC_AE);
+    emit_bytes(out, &mut pos, &[0x3C, 0x09]); // cmp al, '\t'
+    let j_bc_tab = emit_jcc_rel32(out, &mut pos, CC_Z);
+    emit_bytes(out, &mut pos, &[0x3C, 0x0A]); // cmp al, '\n'
+    let j_bc_lf = emit_jcc_rel32(out, &mut pos, CC_Z);
+    emit_bytes(out, &mut pos, &[0x3C, 0x0D]); // cmp al, '\r'
+    fail_body_patches[fb_n] = emit_jcc_rel32(out, &mut pos, CC_NZ);
+    fb_n += 1;
+
+    let lbl_skip_bctrl = pos;
+    patch_rel32(out, j_bc_vfs, lbl_skip_bctrl);
+    patch_rel32(out, j_bc_printable, lbl_skip_bctrl);
+    patch_rel32(out, j_bc_tab, lbl_skip_bctrl);
+    patch_rel32(out, j_bc_lf, lbl_skip_bctrl);
+
+    emit_bytes(out, &mut pos, &[0x48, 0x31, 0xC2]); // xor rdx, rax
+    emit_bytes(out, &mut pos, &[0x49, 0x0F, 0xAF, 0xD0]); // imul rdx, r8
+    emit_bytes(out, &mut pos, &[0xFF, 0xC1]); // inc ecx
+    let j_body_back = emit_jmp_rel32(out, &mut pos);
+    patch_rel32(out, j_body_back, lbl_body_loop);
+
+    let lbl_body_done = pos;
+    patch_rel32(out, j_body_done, lbl_body_done);
+
+    // Ensure non-zero FNV-1a digest (`if rdx == 0 { rdx = 1 }`), write `[rsi + 0x268]` & `[rsi + 0x270] = 1`.
+    emit_bytes(out, &mut pos, &[0x48, 0x85, 0xD2]); // test rdx, rdx
+    emit_bytes(out, &mut pos, &[0x75, 0x03]); // jnz +3
+    emit_bytes(out, &mut pos, &[0x48, 0xFF, 0xC2]); // inc rdx
+    emit_bytes(out, &mut pos, &[0x48, 0x89, 0x96, 0x68, 0x02, 0x00, 0x00]); // mov [rsi + 0x268], rdx
+    emit_bytes(
+        out,
+        &mut pos,
+        &[0xC7, 0x86, 0x70, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00],
+    ); // mov dword ptr [rsi + 0x270], 1
+    let j_exit_ok = emit_jmp_rel32(out, &mut pos);
+
+    // Failure path 1: RejectedPath (`verdict = 2`).
+    let lbl_fail_path = pos;
+    let mut k = 0usize;
+    while k < fp_n {
+        patch_rel32(out, fail_path_patches[k], lbl_fail_path);
+        k += 1;
+    }
+    emit_bytes(out, &mut pos, &[0x31, 0xD2]); // xor edx, edx
+    emit_bytes(
+        out,
+        &mut pos,
+        &[0xC7, 0x86, 0x70, 0x02, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00],
+    );
+    let j_exit_fp = emit_jmp_rel32(out, &mut pos);
+
+    // Failure path 2: RejectedBody (`verdict = 3`).
+    let lbl_fail_body = pos;
+    let mut m = 0usize;
+    while m < fb_n {
+        patch_rel32(out, fail_body_patches[m], lbl_fail_body);
+        m += 1;
+    }
+    emit_bytes(out, &mut pos, &[0x31, 0xD2]); // xor edx, edx
+    emit_bytes(
+        out,
+        &mut pos,
+        &[0xC7, 0x86, 0x70, 0x02, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00],
+    );
+    let j_exit_fb = emit_jmp_rel32(out, &mut pos);
+
+    // Failure path 3: BadCanary (`verdict = 4`).
+    let lbl_fail_canary = pos;
+    patch_rel32(out, j_can_zero, lbl_fail_canary);
+    patch_rel32(out, j_can_mismatch, lbl_fail_canary);
+    emit_bytes(out, &mut pos, &[0x31, 0xD2]); // xor edx, edx
+    emit_bytes(
+        out,
+        &mut pos,
+        &[0xC7, 0x86, 0x70, 0x02, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00],
+    );
+
+    // Exit cleanly via `SYS_EXIT` (`mov edi, 0x52; int 0x80`).
+    let lbl_exit = pos;
+    patch_rel32(out, j_exit_ok, lbl_exit);
+    patch_rel32(out, j_exit_fp, lbl_exit);
+    patch_rel32(out, j_exit_fb, lbl_exit);
+    emit_bytes(out, &mut pos, &[0xBF, 0x52, 0x00, 0x00, 0x00, 0xCD, 0x80]);
+
+    pos
 }
 
 fn eq_ascii_nocase(a: &[u8], b: &[u8]) -> bool {
@@ -2995,6 +3449,155 @@ mod tests {
         assert!(
             sup.validate_mailbox_request_prefilter(IpcOp::HttpGetStatus, &mut audit)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn stage16_ring3_mailbox_worker_codegen_diversity_and_fault_auto_restart() {
+        let mut code_a = [0u8; SVC_RING3_WORKER_CAP];
+        let mut code_b = [0u8; SVC_RING3_WORKER_CAP];
+        let len_a = build_ring3_mailbox_worker_code(ServiceId::Http, 0x1111_2222_3333_4444, &mut code_a);
+        let len_b = build_ring3_mailbox_worker_code(ServiceId::Http, 0x9999_AAAA_BBBB_CCCC, &mut code_b);
+        assert!((64..=SVC_RING3_WORKER_CAP).contains(&len_a));
+        assert!((64..=SVC_RING3_WORKER_CAP).contains(&len_b));
+        assert_ne!(
+            &code_a[..len_a],
+            &code_b[..len_b],
+            "MTD variant seeds must diversify Ring-3 mailbox worker machine code"
+        );
+        // Verify position-independent `mov rsi, rsp; and rsi, -4096` and `int 0x80` exit exist.
+        assert!(code_a[..len_a]
+            .windows(10)
+            .any(|w| w == [0x48, 0x89, 0xE6, 0x48, 0x81, 0xE6, 0x00, 0xF0, 0xFF, 0xFF]));
+        assert!(code_a[..len_a].windows(2).any(|w| w == [0xCD, 0x80]));
+
+        fn mock_ring3_mailbox_hw(
+            _svc: ServiceId,
+            code: &[u8],
+            _canary: u32,
+            is_vfs_op: bool,
+            path: &[u8],
+            body: &[u8],
+            expected_fnv: u64,
+        ) -> Ring3MailboxHwVerdict {
+            // Detect injected `ud2` (`0F 0B`) hardware trap!
+            if code.len() >= 2 && code[0] == 0x0F && code[1] == 0x0B {
+                return Ring3MailboxHwVerdict::FaultedOrPreempted;
+            }
+            if !ring3_validate_path(path, is_vfs_op) {
+                return Ring3MailboxHwVerdict::RejectedPath;
+            }
+            if !is_vfs_op {
+                for &b in body {
+                    if b == 0 || b == b'\r' || b == b'\n' || (b < 0x20 && b != b'\t') || b == 0x7F {
+                        return Ring3MailboxHwVerdict::RejectedBody;
+                    }
+                }
+            }
+            Ring3MailboxHwVerdict::Ok(expected_fnv)
+        }
+
+        let mut sh = crate::OsShell::new();
+        sh.svc.set_ring3_mailbox_hw_hook(mock_ring3_mailbox_hw);
+        let mut resp = [0u8; 256];
+
+        // 1. Valid request executes CPL=3 mailbox worker and succeeds.
+        let (st, n) = sh
+            .dispatch_mailbox_op(IpcOp::HttpGetStatus, true, false, 1, b"/status", b"", &mut resp)
+            .expect("valid CPL=3 mailbox dispatch");
+        assert_eq!(st, 200);
+        assert!(n > 0);
+
+        // 2. Path traversal (`..`) is rejected inside the CPL=3 worker (`BadRequest`).
+        assert_eq!(
+            sh.dispatch_mailbox_op(
+                IpcOp::HttpGetStatus,
+                true,
+                false,
+                1,
+                b"/../etc/passwd",
+                b"",
+                &mut resp,
+            ),
+            Err(ServiceError::BadRequest)
+        );
+
+        // 3. Control-byte injection in non-VFS body is rejected inside the CPL=3 worker (`BadRequest`).
+        assert_eq!(
+            sh.dispatch_mailbox_op(
+                IpcOp::SqlQuery,
+                true,
+                false,
+                1,
+                b"/sql",
+                b"SELECT 1\0DROP TABLE kv",
+                &mut resp,
+            ),
+            Err(ServiceError::BadRequest)
+        );
+
+        // 4. One-shot `ud2` Ring-3 fault injection isolates `ServiceId::Http` (`Faulted`) while
+        //    `Sql` and `Shell` keep running, and auto-restarts `Http` on the next call!
+        sh.svc.arm_ring3_fault_injection_once(ServiceId::Http);
+        assert_eq!(
+            sh.dispatch_mailbox_op(
+                IpcOp::HttpGetStatus,
+                true,
+                false,
+                1,
+                b"/status",
+                b"",
+                &mut resp,
+            ),
+            Err(ServiceError::SandboxTrap)
+        );
+        assert_eq!(
+            sh.svc.services[ServiceId::Http.index()].state,
+            ServiceState::Faulted
+        );
+        assert_eq!(
+            sh.svc.services[ServiceId::Sql.index()].state,
+            ServiceState::Running
+        );
+        assert_eq!(
+            sh.svc.services[ServiceId::Shell.index()].state,
+            ServiceState::Running
+        );
+
+        let (st2, _) = sh
+            .dispatch_mailbox_op(IpcOp::HttpGetStatus, true, false, 1, b"/status", b"", &mut resp)
+            .expect("Faulted CPL=3 service must auto-restart on next request");
+        assert_eq!(st2, 200);
+        assert_eq!(
+            sh.svc.services[ServiceId::Http.index()].state,
+            ServiceState::Running
+        );
+        assert_eq!(sh.svc.services[ServiceId::Http.index()].restarts, 1);
+
+        // 5. Forged FNV-1a digest from a compromised CPL=3 worker must be caught as `SandboxTrap`!
+        fn forged_fnv_hook(
+            _svc: ServiceId,
+            _code: &[u8],
+            _canary: u32,
+            _is_vfs_op: bool,
+            _path: &[u8],
+            _body: &[u8],
+            expected_fnv: u64,
+        ) -> Ring3MailboxHwVerdict {
+            Ring3MailboxHwVerdict::Ok(expected_fnv ^ 0xDEAD)
+        }
+        sh.svc.set_ring3_mailbox_hw_hook(forged_fnv_hook);
+        assert_eq!(
+            sh.dispatch_mailbox_op(
+                IpcOp::HttpGetStatus,
+                true,
+                false,
+                1,
+                b"/status",
+                b"",
+                &mut resp,
+            ),
+            Err(ServiceError::SandboxTrap)
         );
     }
 }

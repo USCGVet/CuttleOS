@@ -181,6 +181,148 @@ pub fn zeroize_secret_bytes(buf: &mut [u8]) {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
+/// Two-phase write-ahead `Slot B -> Slot A` atomic commit journal (`CTTLAB01`)
+/// protecting multi-sector AHCI persistence (`WAL + FS + SQL`) against mid-write
+/// power loss while preserving strict at-rest tamper rejection.
+pub mod ab_journal {
+    use super::{is_seal_key_set, seal_bytes, seal_bytes_keyed, seal_matches_keyed, DURABLE_DIGEST_LEN};
+
+    /// 8-byte magic header for the atomic shadow-journal commit sector (`LBA 1098`).
+    pub const AB_JOURNAL_MAGIC: [u8; 8] = *b"CTTLAB01";
+    /// Journal state `0x01`: `Slot B` (`LBA 1072..1097`) is fully staged and sealed;
+    /// `Slot A` (`LBA 1040..1065`) installation is currently in flight.
+    pub const AB_STATE_IN_FLIGHT: u8 = 0x01;
+    /// Journal state `0x02`: `Slot A` (`LBA 1040..1065`) installation completed and flushed;
+    /// any subsequent seal mismatch in `Slot A` indicates at-rest tampering.
+    pub const AB_STATE_QUIESCENT: u8 = 0x02;
+
+    /// Authenticated metadata stored in the 512-byte journal commit sector (`LBA 1098`).
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct AbCommitHeader {
+        /// Transaction phase (`AB_STATE_IN_FLIGHT` or `AB_STATE_QUIESCENT`).
+        pub state: u8,
+        /// Boot generation counter committed in this transaction.
+        pub boots: u64,
+        /// Monotonic journal commit sequence number.
+        pub commit_seq: u64,
+        /// SHA-256 over the 2-sector WAL bundle (`hdr_sec || wal_sec`, 1024 bytes).
+        pub wal_sha: [u8; DURABLE_DIGEST_LEN],
+        /// SHA-256 over the 16-sector FS partition (`8192` bytes).
+        pub fs_sha: [u8; DURABLE_DIGEST_LEN],
+        /// SHA-256 over the 8-sector SQL partition (`4096` bytes).
+        pub sql_sha: [u8; DURABLE_DIGEST_LEN],
+    }
+
+    /// Outcome of evaluating `Slot A` (`Primary`) and `Slot B` (`Journal`) at boot.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum AbRecoveryDecision {
+        /// Freshly formatted / zeroed disk (`Slot A` empty and no `IN_FLIGHT` journal).
+        Empty,
+        /// `Slot A` verified cleanly (normal boot or power cut occurred during `Slot B` staging before `IN_FLIGHT`).
+        UsePrimary,
+        /// Power cut interrupted `Slot A` installation while `Slot B` was `IN_FLIGHT` and verified intact;
+        /// caller must replay `Slot B -> Slot A`, flush, and mark `AB_STATE_QUIESCENT`.
+        ReplayJournalToPrimary(AbCommitHeader),
+        /// Journal is `QUIESCENT` (or absent/invalid) while `Slot A` is non-zero and fails HMAC verification.
+        TamperedPrimary,
+    }
+
+    /// Compute the SHA-256 digest over a contiguous slice of 512-byte sectors.
+    pub fn hash_sector_slice(sectors: &[[u8; 512]]) -> [u8; DURABLE_DIGEST_LEN] {
+        // SAFETY: `[[u8; 512]]` has identical layout and alignment (`1`) to `[u8]` of length `sectors.len() * 512`.
+        let flat = unsafe {
+            core::slice::from_raw_parts(sectors.as_ptr().cast::<u8>(), sectors.len() * 512)
+        };
+        let mut out = [0u8; DURABLE_DIGEST_LEN];
+        seal_bytes(flat, &mut out);
+        out
+    }
+
+    /// Pack and HMAC-SHA256-authenticate a 512-byte journal commit sector (`LBA 1098`).
+    pub fn pack_ab_commit_sector(
+        key: &[u8; DURABLE_DIGEST_LEN],
+        hdr: &AbCommitHeader,
+        out: &mut [u8; 512],
+    ) -> bool {
+        if !is_seal_key_set(key)
+            || (hdr.state != AB_STATE_IN_FLIGHT && hdr.state != AB_STATE_QUIESCENT)
+        {
+            return false;
+        }
+        *out = [0u8; 512];
+        out[0..8].copy_from_slice(&AB_JOURNAL_MAGIC);
+        out[8] = hdr.state;
+        out[16..24].copy_from_slice(&hdr.boots.to_le_bytes());
+        out[24..32].copy_from_slice(&hdr.commit_seq.to_le_bytes());
+        out[32..64].copy_from_slice(&hdr.wal_sha);
+        out[64..96].copy_from_slice(&hdr.fs_sha);
+        out[96..128].copy_from_slice(&hdr.sql_sha);
+        let mut mac = [0u8; DURABLE_DIGEST_LEN];
+        seal_bytes_keyed(key, &out[0..128], &mut mac);
+        out[128..160].copy_from_slice(&mac);
+        true
+    }
+
+    /// Verify a 512-byte journal commit sector (`LBA 1098`) in constant time and decode [`AbCommitHeader`].
+    pub fn verify_ab_commit_sector(
+        key: &[u8; DURABLE_DIGEST_LEN],
+        sec: &[u8; 512],
+    ) -> Option<AbCommitHeader> {
+        if !is_seal_key_set(key) || sec[0..8] != AB_JOURNAL_MAGIC {
+            return None;
+        }
+        let state = sec[8];
+        if state != AB_STATE_IN_FLIGHT && state != AB_STATE_QUIESCENT {
+            return None;
+        }
+        let mut expected_mac = [0u8; DURABLE_DIGEST_LEN];
+        expected_mac.copy_from_slice(&sec[128..160]);
+        if !seal_matches_keyed(key, &sec[0..128], &expected_mac) {
+            return None;
+        }
+        let mut boots_b = [0u8; 8];
+        let mut seq_b = [0u8; 8];
+        let mut wal_sha = [0u8; DURABLE_DIGEST_LEN];
+        let mut fs_sha = [0u8; DURABLE_DIGEST_LEN];
+        let mut sql_sha = [0u8; DURABLE_DIGEST_LEN];
+        boots_b.copy_from_slice(&sec[16..24]);
+        seq_b.copy_from_slice(&sec[24..32]);
+        wal_sha.copy_from_slice(&sec[32..64]);
+        fs_sha.copy_from_slice(&sec[64..96]);
+        sql_sha.copy_from_slice(&sec[96..128]);
+        Some(AbCommitHeader {
+            state,
+            boots: u64::from_le_bytes(boots_b),
+            commit_seq: u64::from_le_bytes(seq_b),
+            wal_sha,
+            fs_sha,
+            sql_sha,
+        })
+    }
+
+    /// Decide whether to use `Slot A`, forward-replay an `IN_FLIGHT` `Slot B` redo journal,
+    /// treat the disk as fresh (`Empty`), or reject an at-rest tampered `Slot A`.
+    pub const fn decide_ab_recovery(
+        primary_all_zero: bool,
+        primary_valid: bool,
+        commit_hdr: Option<AbCommitHeader>,
+        journal_digests_match: bool,
+    ) -> AbRecoveryDecision {
+        if let Some(hdr) = commit_hdr {
+            if hdr.state == AB_STATE_IN_FLIGHT && journal_digests_match {
+                return AbRecoveryDecision::ReplayJournalToPrimary(hdr);
+            }
+        }
+        if primary_all_zero {
+            AbRecoveryDecision::Empty
+        } else if primary_valid {
+            AbRecoveryDecision::UsePrimary
+        } else {
+            AbRecoveryDecision::TamperedPrimary
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +409,193 @@ mod tests {
         let legacy = derive_legacy_seal_key(&DEFAULT_LEGACY_DURABLE_SEAL_KEY, b"proteus-ahci-wal-seal-v1");
         let modern = derive_seal_key(&DEFAULT_DURABLE_SEAL_KEY, b"cuttle-ahci-wal-seal-v1");
         assert_ne!(legacy, modern);
+    }
+
+    #[test]
+    fn stage17_ab_journal_survives_power_cut_at_every_sector_and_rejects_at_rest_tamper() {
+        use super::ab_journal::*;
+
+        let key = derive_seal_key(&DEFAULT_DURABLE_SEAL_KEY, b"stage17-ab-journal");
+        let wrong_key = derive_seal_key(&DEFAULT_DURABLE_SEAL_KEY, b"stage17-wrong-key");
+
+        // Fresh zeroed disk must classify as Empty.
+        assert_eq!(
+            decide_ab_recovery(true, false, None, false),
+            AbRecoveryDecision::Empty
+        );
+
+        let make_gen = |gen_tag: u8| -> ([[u8; 512]; 2], [[u8; 512]; 16], [[u8; 512]; 8]) {
+            let mut w = [[0u8; 512]; 2];
+            let mut f = [[0u8; 512]; 16];
+            let mut q = [[0u8; 512]; 8];
+            for (i, sec) in w.iter_mut().enumerate() {
+                sec.fill(gen_tag.wrapping_add(i as u8));
+            }
+            for (i, sec) in f.iter_mut().enumerate() {
+                sec.fill(gen_tag.wrapping_add(0x20).wrapping_add(i as u8));
+            }
+            for (i, sec) in q.iter_mut().enumerate() {
+                sec.fill(gen_tag.wrapping_add(0x60).wrapping_add(i as u8));
+            }
+            (w, f, q)
+        };
+
+        let (w1, f1, q1) = make_gen(0x11);
+        let (w2, f2, q2) = make_gen(0x77);
+        let w1_sha = hash_sector_slice(&w1);
+        let f1_sha = hash_sector_slice(&f1);
+        let q1_sha = hash_sector_slice(&q1);
+        let w2_sha = hash_sector_slice(&w2);
+        let f2_sha = hash_sector_slice(&f2);
+        let q2_sha = hash_sector_slice(&q2);
+
+        let mut base_commit = [0u8; 512];
+        assert!(pack_ab_commit_sector(
+            &key,
+            &AbCommitHeader {
+                state: AB_STATE_QUIESCENT,
+                boots: 1,
+                commit_seq: 1,
+                wal_sha: w1_sha,
+                fs_sha: f1_sha,
+                sql_sha: q1_sha,
+            },
+            &mut base_commit,
+        ));
+        assert!(verify_ab_commit_sector(&wrong_key, &base_commit).is_none());
+
+        // Test power cut at EVERY single sector write step `0..=54` across:
+        //   steps 1..=26:  Shadow Slot B writes (2 WAL + 16 FS + 8 SQL)
+        //   step  27:      LBA 1098 `AB_STATE_IN_FLIGHT` commit write
+        //   steps 28..=53: Primary Slot A writes (26 sectors)
+        //   step  54:      LBA 1098 `AB_STATE_QUIESCENT` commit write
+        for cutoff in 0..=54usize {
+            let mut slot_a_w = w1;
+            let mut slot_a_f = f1;
+            let mut slot_a_q = q1;
+            let mut slot_b_w = [[0u8; 512]; 2];
+            let mut slot_b_f = [[0u8; 512]; 16];
+            let mut slot_b_q = [[0u8; 512]; 8];
+            let mut commit_sec = base_commit;
+
+            let mut step = 0usize;
+            'tx: {
+                for i in 0..2 {
+                    if step == cutoff {
+                        break 'tx;
+                    }
+                    slot_b_w[i] = w2[i];
+                    step += 1;
+                }
+                for i in 0..16 {
+                    if step == cutoff {
+                        break 'tx;
+                    }
+                    slot_b_f[i] = f2[i];
+                    step += 1;
+                }
+                for i in 0..8 {
+                    if step == cutoff {
+                        break 'tx;
+                    }
+                    slot_b_q[i] = q2[i];
+                    step += 1;
+                }
+                if step == cutoff {
+                    break 'tx;
+                }
+                let in_flight = AbCommitHeader {
+                    state: AB_STATE_IN_FLIGHT,
+                    boots: 2,
+                    commit_seq: 2,
+                    wal_sha: w2_sha,
+                    fs_sha: f2_sha,
+                    sql_sha: q2_sha,
+                };
+                assert!(pack_ab_commit_sector(&key, &in_flight, &mut commit_sec));
+                step += 1;
+
+                for i in 0..8 {
+                    if step == cutoff {
+                        break 'tx;
+                    }
+                    slot_a_q[i] = q2[i];
+                    step += 1;
+                }
+                for i in 0..16 {
+                    if step == cutoff {
+                        break 'tx;
+                    }
+                    slot_a_f[i] = f2[i];
+                    step += 1;
+                }
+                for i in 0..2 {
+                    if step == cutoff {
+                        break 'tx;
+                    }
+                    slot_a_w[i] = w2[i];
+                    step += 1;
+                }
+                if step == cutoff {
+                    break 'tx;
+                }
+                let quiescent = AbCommitHeader {
+                    state: AB_STATE_QUIESCENT,
+                    boots: 2,
+                    commit_seq: 2,
+                    wal_sha: w2_sha,
+                    fs_sha: f2_sha,
+                    sql_sha: q2_sha,
+                };
+                assert!(pack_ab_commit_sector(&key, &quiescent, &mut commit_sec));
+            }
+
+            let a_matches_gen1 = hash_sector_slice(&slot_a_w) == w1_sha
+                && hash_sector_slice(&slot_a_f) == f1_sha
+                && hash_sector_slice(&slot_a_q) == q1_sha;
+            let a_matches_gen2 = hash_sector_slice(&slot_a_w) == w2_sha
+                && hash_sector_slice(&slot_a_f) == f2_sha
+                && hash_sector_slice(&slot_a_q) == q2_sha;
+            let primary_valid = a_matches_gen1 || a_matches_gen2;
+
+            let hdr_opt = verify_ab_commit_sector(&key, &commit_sec);
+            let journal_ok = match hdr_opt {
+                Some(h) => {
+                    hash_sector_slice(&slot_b_w) == h.wal_sha
+                        && hash_sector_slice(&slot_b_f) == h.fs_sha
+                        && hash_sector_slice(&slot_b_q) == h.sql_sha
+                }
+                None => false,
+            };
+            let decision = decide_ab_recovery(false, primary_valid, hdr_opt, journal_ok);
+            if cutoff < 27 {
+                assert_eq!(decision, AbRecoveryDecision::UsePrimary);
+                assert!(a_matches_gen1, "cutoff={cutoff} corrupted Generation 1");
+            } else if cutoff < 54 {
+                assert!(
+                    matches!(decision, AbRecoveryDecision::ReplayJournalToPrimary(h) if h.boots == 2),
+                    "cutoff={cutoff} failed to replay IN_FLIGHT journal"
+                );
+                slot_a_w = slot_b_w;
+                slot_a_f = slot_b_f;
+                slot_a_q = slot_b_q;
+                assert_eq!(hash_sector_slice(&slot_a_w), w2_sha);
+                assert_eq!(hash_sector_slice(&slot_a_f), f2_sha);
+                assert_eq!(hash_sector_slice(&slot_a_q), q2_sha);
+            } else {
+                assert_eq!(decision, AbRecoveryDecision::UsePrimary);
+                assert!(a_matches_gen2, "cutoff=54 did not finalize Generation 2");
+            }
+        }
+
+        // At-rest tamper check: when journal is `AB_STATE_QUIESCENT`, a single flipped bit in
+        // `Slot A` MUST return `AbRecoveryDecision::TamperedPrimary` (never masked by `Slot B`!).
+        let hdr_q = verify_ab_commit_sector(&key, &base_commit);
+        assert_eq!(hdr_q.map(|h| h.state), Some(AB_STATE_QUIESCENT));
+        assert_eq!(
+            decide_ab_recovery(false, false, hdr_q, true),
+            AbRecoveryDecision::TamperedPrimary
+        );
     }
 }
 
