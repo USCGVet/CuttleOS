@@ -8,8 +8,35 @@
 
 use cuttle_contracts::{
     AhciFis, AhciFisError, H2dFisParams, AHCI_FIS_C_BIT, AHCI_FIS_H2D_LEN, AHCI_FIS_PMP_MASK,
-    AHCI_FIS_TYPE_H2D, ATA_CMD_IDENTIFY, ATA_CMD_READ_DMA, ATA_DEV_LBA,
+    AHCI_FIS_TYPE_H2D, ATA_CMD_IDENTIFY, ATA_CMD_READ_DMA, ATA_CMD_READ_DMA_EXT, ATA_DEV_LBA,
 };
+
+/// ATA command: WRITE DMA (28-bit LBA).
+pub const ATA_CMD_WRITE_DMA: u8 = 0xCA;
+/// ATA command: WRITE DMA EXT (48-bit LBA).
+pub const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
+/// ATA command: FLUSH CACHE (28-bit non-data).
+pub const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
+/// ATA command: FLUSH CACHE EXT (48-bit non-data).
+pub const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xEA;
+
+/// Exclusive sector ceiling for 28-bit LBA commands (`2^28` sectors = 128 GiB).
+pub const AHCI_LBA28_MAX_SECTORS: u64 = 1u64 << 28;
+/// Exclusive sector ceiling for 48-bit LBA EXT commands (`2^48` sectors = 128 PiB).
+pub const AHCI_LBA48_MAX_SECTORS: u64 = 1u64 << 48;
+
+/// Errors returned when constructing bounded 28-bit or 48-bit DMA FIS parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmaFisError {
+    /// Underlying port/FIS validation error.
+    Fis(AhciFisError),
+    /// Transfer count of zero sectors is rejected.
+    ZeroCount,
+    /// Sector count exceeds the command mode's per-command limit (`256` for LBA28, `65535` here for u16 LBA48).
+    CountTooLarge,
+    /// Starting LBA or `lba + count` exceeds the addressing mode's range (`2^28` or `2^48`).
+    LbaOutOfRange,
+}
 
 /// Concrete [`AhciFis`] implementation.
 pub struct AhciFisImpl;
@@ -134,6 +161,116 @@ pub fn banner_identify_cmd() -> u8 {
     let mut fis = [0u8; AHCI_FIS_H2D_LEN];
     AhciFisImpl::encode_h2d(&p, &mut fis).expect("encode");
     fis[2]
+}
+
+/// Build validated Register H2D FIS parameters for multi-sector DMA read or write.
+///
+/// - When `lba48` is `true`, emits `READ DMA EXT` (`0x25`) or `WRITE DMA EXT` (`0x35`),
+///   checking `1 <= count` and `lba + count <= 2^48`.
+/// - When `lba48` is `false`, emits 28-bit `READ DMA` (`0xC8`) or `WRITE DMA` (`0xCA`),
+///   packing `LBA[27:24]` into `device[3:0]` (`ATA_DEV_LBA | ((lba >> 24) & 0x0F)`) per
+///   ATA/SATA specification and checking `1 <= count <= 256` and `lba + count <= 2^28`.
+pub fn build_rw_dma_fis(
+    lba: u64,
+    count: u16,
+    write: bool,
+    lba48: bool,
+    pm_port: u8,
+) -> Result<H2dFisParams, DmaFisError> {
+    check_port(pm_port).map_err(DmaFisError::Fis)?;
+    if count == 0 {
+        return Err(DmaFisError::ZeroCount);
+    }
+    if lba48 {
+        let end = lba
+            .checked_add(count as u64)
+            .ok_or(DmaFisError::LbaOutOfRange)?;
+        if lba >= AHCI_LBA48_MAX_SECTORS || end > AHCI_LBA48_MAX_SECTORS {
+            return Err(DmaFisError::LbaOutOfRange);
+        }
+        Ok(H2dFisParams {
+            command: if write {
+                ATA_CMD_WRITE_DMA_EXT
+            } else {
+                ATA_CMD_READ_DMA_EXT
+            },
+            features: 0,
+            lba,
+            count,
+            device: ATA_DEV_LBA,
+            pm_port,
+            is_command: true,
+        })
+    } else {
+        if count > 256 {
+            return Err(DmaFisError::CountTooLarge);
+        }
+        let end = lba
+            .checked_add(count as u64)
+            .ok_or(DmaFisError::LbaOutOfRange)?;
+        if lba >= AHCI_LBA28_MAX_SECTORS || end > AHCI_LBA28_MAX_SECTORS {
+            return Err(DmaFisError::LbaOutOfRange);
+        }
+        let dev_hi = ((lba >> 24) & 0x0F) as u8;
+        // Classic 28-bit ATA encodes 256 sectors as 0 in the 8-bit sector count register.
+        let fis_count = if count == 256 { 0 } else { count & 0xFF };
+        Ok(H2dFisParams {
+            command: if write {
+                ATA_CMD_WRITE_DMA
+            } else {
+                ATA_CMD_READ_DMA
+            },
+            features: 0,
+            lba: lba & 0x00FF_FFFF,
+            count: fis_count,
+            device: ATA_DEV_LBA | dev_hi,
+            pm_port,
+            is_command: true,
+        })
+    }
+}
+
+/// Build Register H2D FIS parameters for `FLUSH CACHE EXT` (`0xEA`) or `FLUSH CACHE` (`0xE7`).
+pub fn build_flush_fis(lba48: bool, pm_port: u8) -> Result<H2dFisParams, AhciFisError> {
+    check_port(pm_port)?;
+    Ok(H2dFisParams {
+        command: if lba48 {
+            ATA_CMD_FLUSH_CACHE_EXT
+        } else {
+            ATA_CMD_FLUSH_CACHE
+        },
+        features: 0,
+        lba: 0,
+        count: 0,
+        device: ATA_DEV_LBA,
+        pm_port,
+        is_command: true,
+    })
+}
+
+/// Parse addressable sector capacity and 48-bit LBA capability `(sectors, supports_lba48)`
+/// from a 512-byte ATA `IDENTIFY DEVICE` payload.
+///
+/// Inspects Word 83 bit 10 (`48-bit Address feature set supported`), Words `100..=103`
+/// (48-bit max user LBA count), and Words `60..=61` (28-bit user addressable sectors).
+pub fn parse_identify_geometry(identify_data: &[u8; 512]) -> Option<(u64, bool)> {
+    if identify_data.iter().all(|&b| b == 0) {
+        return None;
+    }
+    let word = |w: usize| u16::from_le_bytes([identify_data[2 * w], identify_data[2 * w + 1]]) as u64;
+    let lba28 = word(60) | (word(61) << 16);
+    let lba48_raw = word(100) | (word(101) << 16) | (word(102) << 32) | (word(103) << 48);
+    let lba48 = lba48_raw & (AHCI_LBA48_MAX_SECTORS - 1);
+    let cmd_set_lba48 = (word(83) & (1 << 10)) != 0;
+    if cmd_set_lba48 && lba48 != 0 {
+        Some((lba48, true))
+    } else if lba28 != 0 {
+        Some((lba28.min(AHCI_LBA28_MAX_SECTORS), false))
+    } else if lba48 != 0 {
+        Some((lba48.min(AHCI_LBA28_MAX_SECTORS), false))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -399,5 +536,78 @@ mod tests {
         AhciFisImpl::encode_h2d(&p, &mut fis).unwrap();
         assert_eq!(fis[7], 0xE0);
         assert_eq!(AhciFisImpl::decode_h2d(&fis).unwrap().device, 0xE0);
+    }
+
+    #[test]
+    fn rw_dma_ext_48bit_and_28bit_boundary_encoding() {
+        // 48-bit READ DMA EXT / WRITE DMA EXT above 2^28 sectors.
+        let high_lba = (1u64 << 34) | 0x0504_0302;
+        let rd = build_rw_dma_fis(high_lba, 26, false, true, 0).unwrap();
+        assert_eq!(rd.command, ATA_CMD_READ_DMA_EXT);
+        assert_eq!(rd.lba, high_lba);
+        assert_eq!(rd.count, 26);
+        assert_eq!(rd.device, ATA_DEV_LBA);
+        let mut fis = [0u8; 20];
+        AhciFisImpl::encode_h2d(&rd, &mut fis).unwrap();
+        assert_eq!(AhciFisImpl::decode_h2d(&fis).unwrap(), rd);
+
+        let wr = build_rw_dma_fis(high_lba, 64, true, true, 0).unwrap();
+        assert_eq!(wr.command, ATA_CMD_WRITE_DMA_EXT);
+        assert_eq!(wr.count, 64);
+
+        // Bounds checks on 48-bit and 28-bit modes.
+        assert_eq!(
+            build_rw_dma_fis(0, 0, false, true, 0),
+            Err(DmaFisError::ZeroCount)
+        );
+        assert_eq!(
+            build_rw_dma_fis(AHCI_LBA48_MAX_SECTORS - 4, 5, true, true, 0),
+            Err(DmaFisError::LbaOutOfRange)
+        );
+        assert!(build_rw_dma_fis(AHCI_LBA48_MAX_SECTORS - 5, 5, true, true, 0).is_ok());
+
+        // 28-bit mode packs bits 27:24 into device[3:0] and rejects >= 2^28.
+        let lba28_hi = 0x0ABC_DEF0u64;
+        let rd28 = build_rw_dma_fis(lba28_hi, 256, false, false, 0).unwrap();
+        assert_eq!(rd28.command, ATA_CMD_READ_DMA);
+        assert_eq!(rd28.device, ATA_DEV_LBA | 0x0A);
+        assert_eq!(rd28.lba, 0x00BC_DEF0);
+        assert_eq!(rd28.count, 0);
+        assert_eq!(
+            build_rw_dma_fis(AHCI_LBA28_MAX_SECTORS, 1, false, false, 0),
+            Err(DmaFisError::LbaOutOfRange)
+        );
+        assert_eq!(
+            build_rw_dma_fis(0, 257, true, false, 0),
+            Err(DmaFisError::CountTooLarge)
+        );
+
+        assert_eq!(
+            build_flush_fis(true, 0).unwrap().command,
+            ATA_CMD_FLUSH_CACHE_EXT
+        );
+        assert_eq!(
+            build_flush_fis(false, 0).unwrap().command,
+            ATA_CMD_FLUSH_CACHE
+        );
+    }
+
+    #[test]
+    fn parse_identify_geometry_lba48_and_lba28_fallback() {
+        let mut id = [0u8; 512];
+        assert_eq!(parse_identify_geometry(&id), None);
+
+        // QEMU-style LBA48 drive > 128 GiB: word 83 bit 10 set, words 100..103 = 0x2_0000_0000.
+        let big_sectors: u64 = 0x2_0000_0000;
+        id[2 * 60..2 * 62].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+        id[2 * 83..2 * 84].copy_from_slice(&(1u16 << 10).to_le_bytes());
+        id[2 * 100..2 * 104].copy_from_slice(&big_sectors.to_le_bytes());
+        assert_eq!(parse_identify_geometry(&id), Some((big_sectors, true)));
+
+        // Legacy LBA28-only drive: word 83 bit 10 clear.
+        id[2 * 83..2 * 84].copy_from_slice(&0u16.to_le_bytes());
+        id[2 * 100..2 * 104].copy_from_slice(&0u64.to_le_bytes());
+        id[2 * 60..2 * 62].copy_from_slice(&2048u32.to_le_bytes());
+        assert_eq!(parse_identify_geometry(&id), Some((2048, false)));
     }
 }

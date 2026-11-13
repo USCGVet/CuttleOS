@@ -1243,6 +1243,222 @@ fn verify_family_push_pop_discipline(
         }
     }
 
+    // 3. Width-sensitive forward CFG must-define check:
+    //    `push fam.r64` saves caller's `fam.r64` onto the stack, leaving caller's
+    //    bits inside `fam`! An 8-bit (`mov r15b, 3`) or 16-bit write only overwrites
+    //    low bits, leaving `fam[63:8]` or `fam[63:16]` holding caller's incoming value.
+    //    Verify along EVERY reachable CFG path from entry (`defined_width = 0`) that
+    //    every read of `fam` of width `W` (`8`, `16`, `32`, `64`) has `defined_width >= W`.
+    verify_family_no_partial_live_in(instrs, branch_targets, fam)
+}
+
+fn family_reg_width_bits(r: iced_x86::Register, fam: &RegFamily) -> u8 {
+    if r == fam.r64 {
+        64
+    } else if r == fam.r32 {
+        32
+    } else if r == fam.r16 {
+        16
+    } else if r == fam.r8 {
+        8
+    } else {
+        0
+    }
+}
+
+fn is_setcc_mnemonic(m: Mnemonic) -> bool {
+    matches!(
+        m,
+        Mnemonic::Sete
+            | Mnemonic::Setne
+            | Mnemonic::Setb
+            | Mnemonic::Setae
+            | Mnemonic::Setbe
+            | Mnemonic::Seta
+            | Mnemonic::Setl
+            | Mnemonic::Setge
+            | Mnemonic::Setle
+            | Mnemonic::Setg
+            | Mnemonic::Sets
+            | Mnemonic::Setns
+            | Mnemonic::Setp
+            | Mnemonic::Setnp
+            | Mnemonic::Seto
+            | Mnemonic::Setno
+    )
+}
+
+fn step_family_defined_width(
+    ins: &Instruction,
+    fam: &RegFamily,
+    in_w: u8,
+) -> Option<u8> {
+    // Prologue `push fam.r64` reads caller's legitimate saved register without
+    // modifying `fam` (still `0` bits defined locally).
+    if ins.mnemonic() == Mnemonic::Push
+        && ins.op_count() == 1
+        && ins.op0_kind() == OpKind::Register
+        && ins.op0_register() == fam.r64
+    {
+        return Some(in_w);
+    }
+    // Epilogue `pop fam.r64` restores all 64 bits from the saved stack slot.
+    if ins.mnemonic() == Mnemonic::Pop
+        && ins.op_count() == 1
+        && ins.op0_kind() == OpKind::Register
+        && ins.op0_register() == fam.r64
+    {
+        return Some(64);
+    }
+    if !touches_family(ins, fam) {
+        return Some(in_w);
+    }
+
+    // Case A: self-zeroing `xor dst, dst` or `sub dst, dst` does not depend on
+    // incoming bits of `dst`. On x86-64, 32-bit writes zero-extend to 64 bits.
+    if ins.op_count() == 2
+        && ins.op0_kind() == OpKind::Register
+        && ins.op1_kind() == OpKind::Register
+        && ins.op0_register() == ins.op1_register()
+        && matches!(ins.mnemonic(), Mnemonic::Xor | Mnemonic::Sub)
+    {
+        let dst = ins.op0_register();
+        return if dst == fam.r64 || dst == fam.r32 {
+            Some(64)
+        } else if dst == fam.r16 {
+            Some(in_w.max(16))
+        } else if dst == fam.r8 {
+            Some(in_w.max(8))
+        } else {
+            None
+        };
+    }
+
+    // Case B: unconditional `setcc fam.r8` writes bits `[7:0]` without reading `fam`.
+    if ins.op_count() == 1
+        && ins.op0_kind() == OpKind::Register
+        && ins.op0_register() == fam.r8
+        && is_setcc_mnemonic(ins.mnemonic())
+    {
+        return Some(in_w.max(8));
+    }
+
+    // Case C: pure overwrite (`mov`, `movzx`, `movsx`, `movsxd`, `lea`) into `fam`.
+    if ins.op_count() == 2
+        && ins.op0_kind() == OpKind::Register
+        && fam.contains(ins.op0_register())
+        && matches!(
+            ins.mnemonic(),
+            Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd | Mnemonic::Lea
+        )
+    {
+        let mut src_read = 0u8;
+        if fam.contains(ins.memory_base()) || fam.contains(ins.memory_index()) {
+            src_read = 64;
+        }
+        if ins.op1_kind() == OpKind::Register && fam.contains(ins.op1_register()) {
+            src_read = src_read.max(family_reg_width_bits(ins.op1_register(), fam));
+        }
+        if in_w < src_read {
+            return None;
+        }
+        let dst = ins.op0_register();
+        return if dst == fam.r64 || dst == fam.r32 {
+            Some(64)
+        } else if dst == fam.r16 {
+            Some(in_w.max(16))
+        } else if dst == fam.r8 {
+            Some(in_w.max(8))
+        } else {
+            None
+        };
+    }
+
+    // Case D: any other instruction touching `fam` (ALU RMW, `cmovcc`, `cmp`,
+    // `test`, `xchg`, memory store/load with `fam` base/index/src, etc.) requires
+    // every touched sub-register width of `fam` to already be defined!
+    let mut req_read = 0u8;
+    if fam.contains(ins.memory_base()) || fam.contains(ins.memory_index()) {
+        req_read = 64;
+    }
+    for k in 0..ins.op_count() {
+        if ins.op_kind(k) == OpKind::Register && fam.contains(ins.op_register(k)) {
+            req_read = req_read.max(family_reg_width_bits(ins.op_register(k), fam));
+        }
+    }
+    if req_read == 0 {
+        req_read = 64;
+    }
+    if in_w < req_read {
+        return None;
+    }
+    Some(in_w)
+}
+
+fn verify_family_no_partial_live_in(
+    instrs: &[Instruction],
+    branch_targets: &[u64],
+    fam: &RegFamily,
+) -> bool {
+    use iced_x86::FlowControl;
+
+    if instrs.is_empty() {
+        return true;
+    }
+    // Every internal branch target must land on an exact decoded instruction boundary.
+    for &t in branch_targets {
+        if instrs.binary_search_by_key(&t, |i| i.ip()).is_err() {
+            return false;
+        }
+    }
+
+    const UNVISITED: u8 = u8::MAX;
+    let mut in_width = vec![UNVISITED; instrs.len()];
+    let mut worklist: Vec<usize> = Vec::with_capacity(instrs.len());
+    in_width[0] = 0;
+    worklist.push(0);
+
+    let propagate = |succ: usize, w: u8, in_w: &mut [u8], wl: &mut Vec<usize>| {
+        let merged = in_w[succ].min(w);
+        if merged < in_w[succ] {
+            in_w[succ] = merged;
+            wl.push(succ);
+        }
+    };
+
+    while let Some(idx) = worklist.pop() {
+        let cur_in = in_width[idx];
+        let ins = &instrs[idx];
+        let Some(out_w) = step_family_defined_width(ins, fam, cur_in) else {
+            return false;
+        };
+        match ins.flow_control() {
+            FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {
+                if idx + 1 < instrs.len() {
+                    propagate(idx + 1, out_w, &mut in_width, &mut worklist);
+                }
+            }
+            FlowControl::ConditionalBranch => {
+                let Ok(t_idx) = instrs.binary_search_by_key(&ins.near_branch_target(), |i| i.ip())
+                else {
+                    return false;
+                };
+                propagate(t_idx, out_w, &mut in_width, &mut worklist);
+                if idx + 1 < instrs.len() {
+                    propagate(idx + 1, out_w, &mut in_width, &mut worklist);
+                }
+            }
+            FlowControl::UnconditionalBranch => {
+                let Ok(t_idx) = instrs.binary_search_by_key(&ins.near_branch_target(), |i| i.ip())
+                else {
+                    return false;
+                };
+                propagate(t_idx, out_w, &mut in_width, &mut worklist);
+            }
+            FlowControl::Return | FlowControl::Exception => {}
+            _ => return false,
+        }
+    }
     true
 }
 
@@ -4828,6 +5044,69 @@ mod tests {
                 "seed {seed}: `FF 29` (`0xFF /5`) gadget survived `pass_reg_reg_morph`: {buf:02x?}"
             );
         }
+    }
+
+    #[test]
+    fn callee_saved_swap_rejects_partial_register_write_leaking_caller_high_bits() {
+        // 1. Unsound straight-line pattern (exact bug from `AhciHwPort::try_issue_slot0_bytes`):
+        //    `push r15; push r14; mov r15b, 3; mov eax, r15d; pop r14; pop r15; ret`
+        //    `mov r15b, 3` writes only bits `[7:0]`, leaving `r15[31:8]` equal to caller's `r15[31:8]`,
+        //    which `mov eax, r15d` then copies into `eax[31:8]`. Swapping `r14 <-> r15` would leak
+        //    caller's `r14[31:8]` into `eax[31:8]` instead.
+        let leak_straight: [u8; 15] = [
+            0x41, 0x57, // push r15
+            0x41, 0x56, // push r14
+            0x41, 0xB7, 0x03, // mov r15b, 3
+            0x44, 0x89, 0xF8, // mov eax, r15d
+            0x41, 0x5E, // pop r14
+            0x41, 0x5F, // pop r15
+            0xC3, // ret
+        ];
+        let mut buf = leak_straight.to_vec();
+        let mut stats = Stats::default();
+        assert!(
+            !try_swap_callee_saved_family(&mut buf, 0x1000, &FAM_R14, &FAM_R15, &mut stats),
+            "must reject r14<->r15 swap when 8-bit write `mov r15b, 3` feeds 32-bit read `mov eax, r15d`"
+        );
+        assert_eq!(buf, leak_straight);
+
+        // 2. Unsound diamond-branch join: one arm writes 32-bit `mov r15d, 7` (64 bits defined),
+        //    the other arm writes 8-bit `mov r15b, 3` (only 8 bits defined), join reads `mov eax, r15d`.
+        let leak_join: [u8; 27] = [
+            0x41, 0x57, // push r15
+            0x41, 0x56, // push r14
+            0x85, 0xFF, // test edi, edi
+            0x74, 0x08, // je +8 -> mov r15b, 3
+            0x41, 0xBF, 0x07, 0x00, 0x00, 0x00, // mov r15d, 7
+            0xEB, 0x03, // jmp +3 -> mov eax, r15d
+            0x41, 0xB7, 0x03, // mov r15b, 3
+            0x44, 0x89, 0xF8, // mov eax, r15d
+            0x41, 0x5E, // pop r14
+            0x41, 0x5F, // pop r15
+            0xC3, // ret
+        ];
+        let mut buf_join = leak_join.to_vec();
+        assert!(
+            !try_swap_callee_saved_family(&mut buf_join, 0x2000, &FAM_R14, &FAM_R15, &mut stats),
+            "must reject r14<->r15 swap when one CFG arm only defines 8 bits before a 32-bit join read"
+        );
+
+        // 3. Sound narrow pattern: `mov r15b, 3; movzx eax, r15b` reads ONLY the defined 8-bit `r15b`.
+        let sound_narrow: [u8; 16] = [
+            0x41, 0x57, // push r15
+            0x41, 0x56, // push r14
+            0x41, 0xB7, 0x03, // mov r15b, 3
+            0x41, 0x0F, 0xB6, 0xC7, // movzx eax, r15b
+            0x41, 0x5E, // pop r14
+            0x41, 0x5F, // pop r15
+            0xC3, // ret
+        ];
+        let mut buf_ok = sound_narrow.to_vec();
+        assert!(
+            try_swap_callee_saved_family(&mut buf_ok, 0x3000, &FAM_R14, &FAM_R15, &mut stats),
+            "must allow r14<->r15 swap when `mov r15b, 3` feeds narrow 8-bit `movzx eax, r15b`"
+        );
+        assert_ne!(buf_ok, sound_narrow);
     }
 }
 

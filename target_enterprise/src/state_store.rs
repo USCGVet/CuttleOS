@@ -141,6 +141,80 @@ pub trait SectorIo {
     fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), IoFault>;
     /// Make every preceding successful write durable against power loss.
     fn flush(&mut self) -> Result<(), IoFault>;
+
+    /// Read a contiguous slice of sectors starting at `lba` into `out`.
+    ///
+    /// Default implementation loops sector-by-sector so fault-injecting test
+    /// devices keep single-sector operation granularity; hardware DMA drivers
+    /// override this to transfer multiple sectors per command.
+    fn read_sectors(
+        &mut self,
+        lba: u64,
+        out: &mut [[u8; SECTOR_BYTES]],
+    ) -> Result<(), IoFault> {
+        let mut i = 0usize;
+        while i < out.len() {
+            let cur = lba.checked_add(i as u64).ok_or(IoFault::OutOfRange)?;
+            self.read_sector(cur, &mut out[i])?;
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// Write a contiguous slice of sectors starting at `lba`.
+    ///
+    /// Default implementation loops sector-by-sector so fault-injecting test
+    /// devices keep single-sector torn-write and power-cut granularity;
+    /// hardware DMA drivers override this to transfer multiple sectors per command.
+    fn write_sectors(
+        &mut self,
+        lba: u64,
+        data: &[[u8; SECTOR_BYTES]],
+    ) -> Result<(), IoFault> {
+        let mut i = 0usize;
+        while i < data.len() {
+            let cur = lba.checked_add(i as u64).ok_or(IoFault::OutOfRange)?;
+            self.write_sector(cur, &data[i])?;
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// Read contiguous disk sectors starting at `lba` across multiple destination slices.
+    fn read_sector_slices(
+        &mut self,
+        lba: u64,
+        slices: &mut [&mut [[u8; SECTOR_BYTES]]],
+    ) -> Result<(), IoFault> {
+        let mut cur = lba;
+        let mut s = 0usize;
+        while s < slices.len() {
+            self.read_sectors(cur, slices[s])?;
+            cur = cur
+                .checked_add(slices[s].len() as u64)
+                .ok_or(IoFault::OutOfRange)?;
+            s += 1;
+        }
+        Ok(())
+    }
+
+    /// Write contiguous disk sectors starting at `lba` from multiple source slices.
+    fn write_sector_slices(
+        &mut self,
+        lba: u64,
+        slices: &[&[[u8; SECTOR_BYTES]]],
+    ) -> Result<(), IoFault> {
+        let mut cur = lba;
+        let mut s = 0usize;
+        while s < slices.len() {
+            self.write_sectors(cur, slices[s])?;
+            cur = cur
+                .checked_add(slices[s].len() as u64)
+                .ok_or(IoFault::OutOfRange)?;
+            s += 1;
+        }
+        Ok(())
+    }
 }
 
 /// Where the two slots and the commit sector live on the device.
@@ -408,18 +482,15 @@ fn slot_base(layout: &StoreLayout, slot: Slot) -> u64 {
 
 /// Write `image` into the slot at `base` and flush.
 fn write_slot<D: SectorIo>(dev: &mut D, base: u64, image: &StateImage) -> Result<(), IoFault> {
-    let mut i = 0usize;
-    while i < STATE_IMAGE_SECTORS {
-        dev.write_sector(base + i as u64, image.sector(i))?;
-        i += 1;
-    }
+    dev.write_sector_slices(base, &[&image.wal, &image.fs, &image.sql])?;
     dev.flush()
 }
 
 /// Read the slot at `base` back from the device and hash each partition
-/// without keeping the sectors.
+/// without keeping more than an 8-sector (`4 KiB`) stack chunk at a time.
 fn slot_digests<D: SectorIo>(dev: &mut D, base: u64) -> Result<ImageDigests, IoFault> {
-    let mut buf = [0u8; SECTOR_BYTES];
+    const CHUNK: usize = 8;
+    let mut chunk = [[0u8; SECTOR_BYTES]; CHUNK];
     let mut out = ImageDigests {
         wal: [0u8; DURABLE_DIGEST_LEN],
         fs: [0u8; DURABLE_DIGEST_LEN],
@@ -435,12 +506,17 @@ fn slot_digests<D: SectorIo>(dev: &mut D, base: u64) -> Result<ImageDigests, IoF
     while p < parts.len() {
         let (count, which) = parts[p];
         let mut hasher = Sha256::new();
-        let mut s = 0usize;
-        while s < count {
-            dev.read_sector(base + idx as u64, &mut buf)?;
-            hasher.update(buf);
-            idx += 1;
-            s += 1;
+        let mut rem = count;
+        while rem > 0 {
+            let take = rem.min(CHUNK);
+            dev.read_sectors(base + idx as u64, &mut chunk[..take])?;
+            let mut s = 0usize;
+            while s < take {
+                hasher.update(chunk[s]);
+                s += 1;
+            }
+            idx += take;
+            rem -= take;
         }
         let digest = hasher.finalize();
         match which {
@@ -563,12 +639,7 @@ pub fn read_slot<D: SectorIo>(
         return Err(IoFault::OutOfRange);
     }
     let base = slot_base(layout, slot);
-    let mut i = 0usize;
-    while i < STATE_IMAGE_SECTORS {
-        dev.read_sector(base + i as u64, out.sector_mut(i))?;
-        i += 1;
-    }
-    Ok(())
+    dev.read_sector_slices(base, &mut [&mut out.wal, &mut out.fs, &mut out.sql])
 }
 
 /// Rewrite one slot from `image` and confirm the device returns it intact.
@@ -781,22 +852,39 @@ pub fn quarantine<D: SectorIo>(
         return Ok(false);
     }
     let dst = quarantine_layout(base);
-    let mut buf = [0u8; SECTOR_BYTES];
     // An unreadable source sector is preserved as zeros: the copy exists to
     // keep whatever can still be read, so one bad sector must not stop it.
-    let mut copy = |dev: &mut D, from: u64, to: u64| -> Result<(), IoFault> {
-        if dev.read_sector(from, &mut buf).is_err() {
-            buf = [0u8; SECTOR_BYTES];
+    // Copy in 8-sector batches on healthy media, falling back to per-sector
+    // reads only when a chunk encounters a bad sector.
+    fn copy_range<D: SectorIo>(dev: &mut D, from: u64, to: u64, total: usize) -> Result<(), IoFault> {
+        const CHUNK: usize = 8;
+        let mut chunk = [[0u8; SECTOR_BYTES]; CHUNK];
+        let mut off = 0usize;
+        while off < total {
+            let take = (total - off).min(CHUNK);
+            if dev
+                .read_sectors(from + off as u64, &mut chunk[..take])
+                .is_err()
+            {
+                let mut s = 0usize;
+                while s < take {
+                    if dev
+                        .read_sector(from + (off + s) as u64, &mut chunk[s])
+                        .is_err()
+                    {
+                        chunk[s] = [0u8; SECTOR_BYTES];
+                    }
+                    s += 1;
+                }
+            }
+            dev.write_sectors(to + off as u64, &chunk[..take])?;
+            off += take;
         }
-        dev.write_sector(to, &buf)
-    };
-    let mut i = 0u64;
-    while i < STATE_IMAGE_SECTORS as u64 {
-        copy(dev, layout.primary_lba + i, dst.primary_lba + i)?;
-        copy(dev, layout.shadow_lba + i, dst.shadow_lba + i)?;
-        i += 1;
+        Ok(())
     }
-    copy(dev, layout.commit_lba, dst.commit_lba)?;
+    copy_range(dev, layout.primary_lba, dst.primary_lba, STATE_IMAGE_SECTORS)?;
+    copy_range(dev, layout.shadow_lba, dst.shadow_lba, STATE_IMAGE_SECTORS)?;
+    copy_range(dev, layout.commit_lba, dst.commit_lba, 1)?;
     dev.flush()?;
     // The marker goes last, behind a flush, so a marked area is always complete.
     let mut marker = [0u8; SECTOR_BYTES];
@@ -1875,6 +1963,203 @@ mod tests {
         assert_eq!(img.saved_boots(), 0x0102_0304_0506_0708);
         img.clear();
         assert!(img.is_all_zero());
+    }
+
+    #[test]
+    fn batched_commit_and_recovery_uses_multisector_transfers_and_supports_lba48() {
+        use std::collections::BTreeMap;
+
+        struct BatchSparseDisk {
+            capacity: u64,
+            max_batch: usize,
+            sectors: BTreeMap<u64, [u8; SECTOR_BYTES]>,
+            read_cmds: usize,
+            write_cmds: usize,
+            flush_cmds: usize,
+            fail_cmd_at: Option<usize>,
+        }
+
+        impl BatchSparseDisk {
+            fn new(capacity: u64, max_batch: usize) -> Self {
+                Self {
+                    capacity,
+                    max_batch,
+                    sectors: BTreeMap::new(),
+                    read_cmds: 0,
+                    write_cmds: 0,
+                    flush_cmds: 0,
+                    fail_cmd_at: None,
+                }
+            }
+
+            fn total_cmds(&self) -> usize {
+                self.read_cmds + self.write_cmds + self.flush_cmds
+            }
+
+            fn check_cmd(&mut self) -> Result<(), IoFault> {
+                if self.fail_cmd_at == Some(self.total_cmds()) {
+                    self.fail_cmd_at = None;
+                    return Err(IoFault::DeviceError);
+                }
+                Ok(())
+            }
+        }
+
+        impl SectorIo for BatchSparseDisk {
+            fn capacity_sectors(&self) -> u64 {
+                self.capacity
+            }
+
+            fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), IoFault> {
+                self.read_sectors(lba, core::slice::from_mut(out))
+            }
+
+            fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), IoFault> {
+                self.write_sectors(lba, core::slice::from_ref(data))
+            }
+
+            fn flush(&mut self) -> Result<(), IoFault> {
+                self.check_cmd()?;
+                self.flush_cmds += 1;
+                Ok(())
+            }
+
+            fn read_sectors(
+                &mut self,
+                lba: u64,
+                out: &mut [[u8; SECTOR_BYTES]],
+            ) -> Result<(), IoFault> {
+                let end = lba.checked_add(out.len() as u64).ok_or(IoFault::OutOfRange)?;
+                if end > self.capacity {
+                    return Err(IoFault::OutOfRange);
+                }
+                let mut off = 0usize;
+                while off < out.len() {
+                    let take = (out.len() - off).min(self.max_batch);
+                    self.check_cmd()?;
+                    self.read_cmds += 1;
+                    for i in 0..take {
+                        let cur = lba + (off + i) as u64;
+                        out[off + i] = self.sectors.get(&cur).copied().unwrap_or([0u8; SECTOR_BYTES]);
+                    }
+                    off += take;
+                }
+                Ok(())
+            }
+
+            fn write_sectors(
+                &mut self,
+                lba: u64,
+                data: &[[u8; SECTOR_BYTES]],
+            ) -> Result<(), IoFault> {
+                let end = lba.checked_add(data.len() as u64).ok_or(IoFault::OutOfRange)?;
+                if end > self.capacity {
+                    return Err(IoFault::OutOfRange);
+                }
+                let mut off = 0usize;
+                while off < data.len() {
+                    let take = (data.len() - off).min(self.max_batch);
+                    self.check_cmd()?;
+                    self.write_cmds += 1;
+                    for i in 0..take {
+                        let cur = lba + (off + i) as u64;
+                        self.sectors.insert(cur, data[off + i]);
+                    }
+                    off += take;
+                }
+                Ok(())
+            }
+
+            fn read_sector_slices(
+                &mut self,
+                lba: u64,
+                slices: &mut [&mut [[u8; SECTOR_BYTES]]],
+            ) -> Result<(), IoFault> {
+                let total: usize = slices.iter().map(|s| s.len()).sum();
+                let end = lba.checked_add(total as u64).ok_or(IoFault::OutOfRange)?;
+                if end > self.capacity {
+                    return Err(IoFault::OutOfRange);
+                }
+                let mut flat = std::vec![[0u8; SECTOR_BYTES]; total];
+                self.read_sectors(lba, &mut flat)?;
+                let mut pos = 0usize;
+                for s in slices.iter_mut() {
+                    let n = s.len();
+                    s.copy_from_slice(&flat[pos..pos + n]);
+                    pos += n;
+                }
+                Ok(())
+            }
+
+            fn write_sector_slices(
+                &mut self,
+                lba: u64,
+                slices: &[&[[u8; SECTOR_BYTES]]],
+            ) -> Result<(), IoFault> {
+                let total: usize = slices.iter().map(|s| s.len()).sum();
+                let end = lba.checked_add(total as u64).ok_or(IoFault::OutOfRange)?;
+                if end > self.capacity {
+                    return Err(IoFault::OutOfRange);
+                }
+                let mut flat = std::vec::Vec::with_capacity(total);
+                for s in slices {
+                    flat.extend_from_slice(s);
+                }
+                self.write_sectors(lba, &flat)
+            }
+        }
+
+        // 1. Place layout past the 28-bit LBA limit (`1 << 28` = 268,435,456 sectors).
+        let high_base = (1u64 << 28) + 4096;
+        let high_layout = StoreLayout {
+            primary_lba: high_base,
+            shadow_lba: high_base + 64,
+            commit_lba: high_base + 128,
+        };
+        let mut batch_disk = BatchSparseDisk::new(1u64 << 32, 64);
+        let img1 = image(7);
+        commit(&mut batch_disk, &key(), &high_layout, 3, 1, &img1).expect("LBA48 batched commit");
+
+        // Unbatched single-sector commit needed 112 device commands (4*26 + 8).
+        // With batched slot writes and chunked read-back, a full 4-barrier commit
+        // must take at most 18 device commands (2 slot writes + 8 read-back chunks
+        // + 2 commit writes + 2 commit reads + 4 flushes).
+        assert!(
+            batch_disk.total_cmds() <= 18,
+            "expected batched commit <= 18 device commands, got {} (reads={} writes={} flushes={})",
+            batch_disk.total_cmds(),
+            batch_disk.read_cmds,
+            batch_disk.write_cmds,
+            batch_disk.flush_cmds,
+        );
+        assert_eq!(batch_disk.flush_cmds, 4);
+
+        // 2. Equivalence against single-sector MemDisk at standard layout.
+        let mut mem_disk = MemDisk::new(DISK_SECTORS);
+        commit(&mut mem_disk, &key(), &LAYOUT, 3, 1, &img1).expect("mem commit");
+        for i in 0..STATE_IMAGE_SECTORS as u64 {
+            assert_eq!(
+                batch_disk.sectors.get(&(high_layout.primary_lba + i)).copied().unwrap(),
+                mem_disk.peek(LAYOUT.primary_lba + i)
+            );
+            assert_eq!(
+                batch_disk.sectors.get(&(high_layout.shadow_lba + i)).copied().unwrap(),
+                mem_disk.peek(LAYOUT.shadow_lba + i)
+            );
+        }
+        assert_eq!(
+            batch_disk.sectors.get(&high_layout.commit_lba).copied().unwrap(),
+            mem_disk.peek(LAYOUT.commit_lba)
+        );
+
+        // 3. Recovery and shadow self-heal at 48-bit LBA with batched reads/writes.
+        batch_disk.sectors.get_mut(&(high_layout.primary_lba + 19)).unwrap()[0] ^= 0xFF;
+        let mut recovered = Box::new(StateImage::zeroed());
+        let rep = recover(&mut batch_disk, &key(), &high_layout, &mut recovered)
+            .expect("LBA48 shadow heal");
+        assert_eq!(rep.source, RecoverySource::ShadowHeal);
+        assert!(rep.repaired_primary);
+        assert!(same(&recovered, &img1));
     }
 }
 

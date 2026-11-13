@@ -208,50 +208,81 @@ pub(crate) fn banner_virtio_hw() {
 pub(crate) struct AhciHwPort {
     pub(crate) abar: u64,
     pub(crate) pbase: u64,
+    pub(crate) pbase_va: u64,
     pub(crate) clb_pa: u64,
     pub(crate) ctba_pa: u64,
     pub(crate) data_pa: u64,
     pub(crate) slot: u8,
 }
 
-static AHCI_CACHED_PBASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static AHCI_CACHED_PBASE_VA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static AHCI_CACHED_CLB_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static AHCI_CACHED_CTBA_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static AHCI_CACHED_DATA_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static AHCI_CACHED_EMERG_CTBA_PA: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static AHCI_CACHED_EMERG_DATA_PA: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static AHCI_CACHED_EMERG_SLOT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static AHCI_CACHED_LBA48: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+// SAFETY: Caller must supply a pre-mapped uncached MMIO virtual base (`pbase_va`) and 4-byte-aligned register offset.
+#[inline]
+unsafe fn port_mmio_read32(pbase_va: u64, reg_off: u64) -> u32 {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    // SAFETY: `pbase_va` was mapped uncached via `ensure_mmio_page` during `probe_start_inner`, and `reg_off` is 4-byte aligned within the 0x80-byte AHCI port window.
+    let val = unsafe { core::ptr::read_volatile((pbase_va + reg_off) as *const u32) };
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    val
+}
+
+// SAFETY: Caller must supply a pre-mapped uncached MMIO virtual base (`pbase_va`) and 4-byte-aligned register offset.
+#[inline]
+unsafe fn port_mmio_write32(pbase_va: u64, reg_off: u64, val: u32) {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    // SAFETY: `pbase_va` was mapped uncached via `ensure_mmio_page` during `probe_start_inner`, and `reg_off` is 4-byte aligned within the 0x80-byte AHCI port window.
+    unsafe {
+        core::ptr::write_volatile((pbase_va + reg_off) as *mut u32, val);
+    }
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+}
 
 /// Non-panicking best-effort emergency 512-byte sector write for `#[panic_handler]`.
-/// Uses the previously initialized AHCI port state (`AHCI_CACHED_*`) with bounded timeouts
-/// so a kernel panic never triggers a recursive panic if storage is absent or wedged.
+///
+/// Uses a dedicated command slot (`slot 1` when `CAP.NCS >= 2`), dedicated DMA command table
+/// (`AHCI_CTBA_EMERG_OFF`) and sector buffer (`AHCI_DATA_EMERG_OFF`), and the pre-mapped port
+/// MMIO virtual address (`AHCI_CACHED_PBASE_VA`) so a panic raised mid-commit or while holding
+/// `PT_MOD_LOCK` never deadlocks on page-table locking or overwrites Slot 0's buffers.
 pub(crate) fn try_write_ahci_sector_emergency(lba: u64, data: &[u8; 512]) -> bool {
     use core::sync::atomic::Ordering;
     use cuttle_contracts::{
-        AhciCmd, AhciCmdHeader, AhciFis, AhciPrdt, H2dFisParams, AHCI_CFL_H2D, AHCI_CMD_HDR_LEN,
-        AHCI_FIS_H2D_LEN, AHCI_PRDT_LEN, ATA_DEV_LBA,
+        AhciCmd, AhciCmdHeader, AhciFis, AhciPrdt, AHCI_CFL_H2D, AHCI_CMD_HDR_LEN,
+        AHCI_FIS_H2D_LEN, AHCI_PRDT_LEN,
     };
     use target_enterprise::ahci_cmd::AhciCmdImpl;
-    use target_enterprise::ahci_fis::AhciFisImpl;
+    use target_enterprise::ahci_fis::{build_rw_dma_fis, AhciFisImpl};
 
     const PORT_IS: u64 = 0x10;
     const PORT_TFD: u64 = 0x20;
     const PORT_CI: u64 = 0x38;
-    const ATA_CMD_WRITE_DMA: u8 = 0xCA;
 
-    let pbase = AHCI_CACHED_PBASE.load(Ordering::Acquire);
+    let pbase_va = AHCI_CACHED_PBASE_VA.load(Ordering::Acquire);
     let clb_pa = AHCI_CACHED_CLB_PA.load(Ordering::Acquire);
-    let ctba_pa = AHCI_CACHED_CTBA_PA.load(Ordering::Acquire);
-    let data_pa = AHCI_CACHED_DATA_PA.load(Ordering::Acquire);
-    if pbase == 0 || clb_pa == 0 || ctba_pa == 0 || data_pa == 0 || phys_map_offset() == 0 {
+    let ctba_pa = AHCI_CACHED_EMERG_CTBA_PA.load(Ordering::Acquire);
+    let data_pa = AHCI_CACHED_EMERG_DATA_PA.load(Ordering::Acquire);
+    let slot_idx = AHCI_CACHED_EMERG_SLOT.load(Ordering::Acquire);
+    let lba48 = AHCI_CACHED_LBA48.load(Ordering::Acquire);
+    if pbase_va == 0
+        || clb_pa == 0
+        || ctba_pa == 0
+        || data_pa == 0
+        || slot_idx >= 32
+        || phys_map_offset() == 0
+    {
         return false;
     }
 
-    let fis_params = H2dFisParams {
-        command: ATA_CMD_WRITE_DMA,
-        features: 0,
-        lba,
-        count: 1,
-        device: ATA_DEV_LBA,
-        pm_port: 0,
-        is_command: true,
+    let Ok(fis_params) = build_rw_dma_fis(lba, 1, true, lba48, 0) else {
+        return false;
     };
     let mut fis = [0u8; AHCI_FIS_H2D_LEN];
     if AhciFisImpl::encode_h2d(&fis_params, &mut fis).is_err() {
@@ -279,10 +310,15 @@ pub(crate) fn try_write_ahci_sector_emergency(lba: u64, data: &[u8; 512]) -> boo
         return false;
     }
 
-    // SAFETY: `pbase`, `clb_pa`, `ctba_pa`, and `data_pa` were validated and mapped during `AhciHwPort::probe_start_inner`.
+    let slot_bit = 1u32 << (slot_idx as u32);
+    let cl_slot_off = (slot_idx as usize) * AHCI_CMD_HDR_LEN;
+
+    // SAFETY: `pbase_va` was pre-mapped uncached and `clb_pa`, `ctba_pa`, `data_pa` are disjoint regions in mapped DMA RAM.
     unsafe {
         let mut spins = 0u32;
-        while (mmio_read32(pbase + PORT_CI) & 1) != 0 || (mmio_read32(pbase + PORT_TFD) & 0x80) != 0 {
+        while port_mmio_read32(pbase_va, PORT_CI) != 0
+            || (port_mmio_read32(pbase_va, PORT_TFD) & 0x88) != 0
+        {
             spins = spins.wrapping_add(1);
             if spins > 2_000_000 {
                 return false;
@@ -311,23 +347,23 @@ pub(crate) fn try_write_ahci_sector_emergency(lba: u64, data: &[u8; 512]) -> boo
             core::ptr::write_volatile(ct.add(0x80 + i), pbuf[i]);
             i += 1;
         }
-        let cl = pa_to_va(clb_pa);
+        let cl = pa_to_va(clb_pa).add(cl_slot_off);
         i = 0;
         while i < AHCI_CMD_HDR_LEN {
             core::ptr::write_volatile(cl.add(i), hbuf[i]);
             i += 1;
         }
-        mmio_write32(pbase + PORT_IS, 0xFFFF_FFFF);
-        mmio_write32(pbase + PORT_CI, 1);
+        port_mmio_write32(pbase_va, PORT_IS, 0xFFFF_FFFF);
+        port_mmio_write32(pbase_va, PORT_CI, slot_bit);
         spins = 0;
-        while (mmio_read32(pbase + PORT_CI) & 1) != 0 {
+        while (port_mmio_read32(pbase_va, PORT_CI) & slot_bit) != 0 {
             spins = spins.wrapping_add(1);
             if spins > 4_000_000 {
                 return false;
             }
             core::hint::spin_loop();
         }
-        (mmio_read32(pbase + PORT_TFD) & 0x01) == 0
+        (port_mmio_read32(pbase_va, PORT_TFD) & 0x21) == 0
     }
 }
 
@@ -500,27 +536,42 @@ impl AhciHwPort {
             None => panic!("AHCI_HW: no port with device present"),
         };
         let pbase = abar + 0x100 + (port as u64) * 0x80;
+        // Pre-map both edge pages of the 0x80-byte port register block once so neither
+        // normal DMA polling nor the emergency panic-dump writer ever needs `PT_MOD_LOCK`.
+        // SAFETY: Running at CPL=0 with active 4-level paging; `pbase..pbase+0x7C` is the PCI-discovered AHCI port MMIO block.
+        let pbase_va = unsafe {
+            let page_va = ensure_mmio_page(pbase) as u64;
+            let _ = ensure_mmio_page(pbase + 0x7C);
+            page_va + (pbase & 0xFFF)
+        };
 
-        let dma = dma_phys_base() + 0x1_0000;
-        let clb_pa = dma; // 1 KiB aligned
-        let fb_pa = dma + 0x0400; // 256 B aligned
-        let ctba_pa = dma + 0x0800; // 128 B aligned
-        let data_pa = dma + 0x1000;
+        use target_enterprise::memory::dma_layout::{
+            AHCI_CLB_OFF, AHCI_CTBA_EMERG_OFF, AHCI_CTBA_SLOT0_OFF, AHCI_CTRL_ZERO_BYTES,
+            AHCI_DATA_EMERG_OFF, AHCI_DATA_SLOT0_OFF, AHCI_FB_OFF,
+        };
+        let dma_root = dma_phys_base();
+        let clb_pa = dma_root + AHCI_CLB_OFF;
+        let fb_pa = dma_root + AHCI_FB_OFF;
+        let ctba_pa = dma_root + AHCI_CTBA_SLOT0_OFF;
+        let emerg_ctba_pa = dma_root + AHCI_CTBA_EMERG_OFF;
+        let emerg_data_pa = dma_root + AHCI_DATA_EMERG_OFF;
+        let data_pa = dma_root + AHCI_DATA_SLOT0_OFF;
+        let emerg_slot: u8 = if ((cap >> 8) & 0x1F) >= 1 { 1 } else { 0 };
 
-        // SAFETY: `dma..dma+0x1400` lies within the 128 KiB reserved physical DMA pool mapped via `pa_to_va`, and the port engine is stopped (`ST=0, CR=0`) before reprogramming `CLB`/`FB`.
+        // SAFETY: `clb_pa..clb_pa+AHCI_CTRL_ZERO_BYTES` lies within the audited 48 KiB `AHCI_REGION` mapped via `pa_to_va`, and the port engine is stopped (`ST=0, CR=0`) before reprogramming `CLB`/`FB`.
         unsafe {
-            let base = pa_to_va(dma);
+            let base = pa_to_va(clb_pa);
             let mut i = 0usize;
-            while i < 0x1400 {
+            while i < AHCI_CTRL_ZERO_BYTES {
                 core::ptr::write_volatile(base.add(i), 0);
                 i += 1;
             }
-            let mut c = mmio_read32(pbase + PORT_CMD);
+            let mut c = port_mmio_read32(pbase_va, PORT_CMD);
             c &= !(PX_CMD_ST | PX_CMD_FRE);
-            mmio_write32(pbase + PORT_CMD, c);
+            port_mmio_write32(pbase_va, PORT_CMD, c);
             let mut spins = 0u32;
             loop {
-                let c2 = mmio_read32(pbase + PORT_CMD);
+                let c2 = port_mmio_read32(pbase_va, PORT_CMD);
                 if c2 & (PX_CMD_CR | PX_CMD_FR) == 0 {
                     break;
                 }
@@ -530,18 +581,18 @@ impl AhciHwPort {
                 }
                 core::hint::spin_loop();
             }
-            mmio_write32(pbase + PORT_CLB, clb_pa as u32);
-            mmio_write32(pbase + PORT_CLBU, (clb_pa >> 32) as u32);
-            mmio_write32(pbase + PORT_FB, fb_pa as u32);
-            mmio_write32(pbase + PORT_FBU, (fb_pa >> 32) as u32);
-            mmio_write32(pbase + PORT_SERR, 0xFFFF_FFFF);
-            mmio_write32(pbase + PORT_IS, 0xFFFF_FFFF);
-            let mut c = mmio_read32(pbase + PORT_CMD);
+            port_mmio_write32(pbase_va, PORT_CLB, clb_pa as u32);
+            port_mmio_write32(pbase_va, PORT_CLBU, (clb_pa >> 32) as u32);
+            port_mmio_write32(pbase_va, PORT_FB, fb_pa as u32);
+            port_mmio_write32(pbase_va, PORT_FBU, (fb_pa >> 32) as u32);
+            port_mmio_write32(pbase_va, PORT_SERR, 0xFFFF_FFFF);
+            port_mmio_write32(pbase_va, PORT_IS, 0xFFFF_FFFF);
+            let mut c = port_mmio_read32(pbase_va, PORT_CMD);
             c |= PX_CMD_FRE;
-            mmio_write32(pbase + PORT_CMD, c);
+            port_mmio_write32(pbase_va, PORT_CMD, c);
             spins = 0;
             loop {
-                if mmio_read32(pbase + PORT_CMD) & PX_CMD_FR != 0 {
+                if port_mmio_read32(pbase_va, PORT_CMD) & PX_CMD_FR != 0 {
                     break;
                 }
                 spins = spins.wrapping_add(1);
@@ -550,19 +601,21 @@ impl AhciHwPort {
                 }
                 core::hint::spin_loop();
             }
-            c = mmio_read32(pbase + PORT_CMD);
+            c = port_mmio_read32(pbase_va, PORT_CMD);
             c |= PX_CMD_ST;
-            mmio_write32(pbase + PORT_CMD, c);
+            port_mmio_write32(pbase_va, PORT_CMD, c);
         }
 
-        AHCI_CACHED_PBASE.store(pbase, core::sync::atomic::Ordering::Release);
+        AHCI_CACHED_PBASE_VA.store(pbase_va, core::sync::atomic::Ordering::Release);
         AHCI_CACHED_CLB_PA.store(clb_pa, core::sync::atomic::Ordering::Release);
-        AHCI_CACHED_CTBA_PA.store(ctba_pa, core::sync::atomic::Ordering::Release);
-        AHCI_CACHED_DATA_PA.store(data_pa, core::sync::atomic::Ordering::Release);
+        AHCI_CACHED_EMERG_CTBA_PA.store(emerg_ctba_pa, core::sync::atomic::Ordering::Release);
+        AHCI_CACHED_EMERG_DATA_PA.store(emerg_data_pa, core::sync::atomic::Ordering::Release);
+        AHCI_CACHED_EMERG_SLOT.store(emerg_slot, core::sync::atomic::Ordering::Release);
 
         AhciHwPort {
             abar,
             pbase,
+            pbase_va,
             clb_pa,
             ctba_pa,
             data_pa,
@@ -571,18 +624,19 @@ impl AhciHwPort {
     }
 
     /// Issue one H2D command in slot 0 against the running port with `prdtl` PRDT entries
-    /// (`0` or `1`) and report how it ended.
+    /// (`0` or `1`) transferring `prdt_bytes` bytes (`1..=32768`) and report how it ended.
     ///
     /// Completion is checked against everything the HBA reports: the port
     /// interrupt status error bits, the task-file error and device-fault bits,
     /// and, when `expect_bytes` is given, the byte count the device says it
     /// transferred. Nothing here panics, so a caller can fall back to another
     /// copy or refuse a commit.
-    pub(crate) fn try_issue_with_prdtl(
+    pub(crate) fn try_issue_slot0_bytes(
         &self,
         fis_params: &cuttle_contracts::H2dFisParams,
         write: bool,
         prdtl: u16,
+        prdt_bytes: u32,
         expect_bytes: Option<u32>,
     ) -> Result<(), target_enterprise::state_store::IoFault> {
         use cuttle_contracts::{
@@ -591,6 +645,7 @@ impl AhciHwPort {
         };
         use target_enterprise::ahci_cmd::AhciCmdImpl;
         use target_enterprise::ahci_fis::AhciFisImpl;
+        use target_enterprise::memory::dma_layout::AHCI_MAX_BATCH_SECTORS;
         use target_enterprise::state_store::IoFault;
 
         const PORT_IS: u64 = 0x10;
@@ -600,6 +655,11 @@ impl AhciHwPort {
         const PORT_IS_ERRORS: u32 = (1 << 30) | (1 << 29) | (1 << 28) | (1 << 27);
         /// PxTFD status: ERR and DF.
         const TFD_ERR_OR_FAULT: u32 = 0x01 | 0x20;
+        const MAX_DMA_BYTES: u32 = (AHCI_MAX_BATCH_SECTORS as u32) * 512;
+
+        if prdtl > 1 || (prdtl == 1 && (prdt_bytes == 0 || prdt_bytes > MAX_DMA_BYTES)) {
+            return Err(IoFault::OutOfRange);
+        }
 
         let mut fis = [0u8; AHCI_FIS_H2D_LEN];
         if AhciFisImpl::encode_h2d(fis_params, &mut fis).is_err() {
@@ -621,7 +681,7 @@ impl AhciHwPort {
         if prdtl > 0 {
             let prdt = AhciPrdt {
                 dba: self.data_pa,
-                byte_count: 512,
+                byte_count: prdt_bytes,
                 ioc: true,
             };
             if AhciCmdImpl::encode_prdt(&prdt, &mut pbuf).is_err() {
@@ -630,12 +690,12 @@ impl AhciHwPort {
         }
         // Keep console input flowing while the disk is busy (see `SerialRxRing`).
         crate::serial_rx_pump();
-        // SAFETY: `ctba_pa` and `clb_pa` are disjoint, aligned subregions of the reserved DMA window mapped via `pa_to_va`, and slot 0 is idle (`PxCI & 1 == 0`) while we populate descriptors.
+        // SAFETY: `pbase_va` is pre-mapped uncached, `ctba_pa` and `clb_pa` are disjoint aligned subregions of the reserved DMA window mapped via `pa_to_va`, and slot 0 is idle (`PxCI & 1 == 0`) while we populate descriptors.
         unsafe {
             let mut spins = 0u32;
             loop {
-                let busy = mmio_read32(self.pbase + PORT_TFD) & 0x80 != 0;
-                let in_flight = mmio_read32(self.pbase + PORT_CI) & 1 != 0;
+                let busy = port_mmio_read32(self.pbase_va, PORT_TFD) & 0x88 != 0;
+                let in_flight = port_mmio_read32(self.pbase_va, PORT_CI) & 1 != 0;
                 if !busy && !in_flight {
                     break;
                 }
@@ -669,16 +729,16 @@ impl AhciHwPort {
                 core::ptr::write_volatile(cl.add(i), hbuf[i]);
                 i += 1;
             }
-            mmio_write32(self.pbase + PORT_IS, 0xFFFF_FFFF);
-            mmio_write32(self.pbase + PORT_CI, 1);
+            port_mmio_write32(self.pbase_va, PORT_IS, 0xFFFF_FFFF);
+            port_mmio_write32(self.pbase_va, PORT_CI, 1);
             spins = 0;
             loop {
                 // On a task-file error the HBA leaves PxCI set, so the error
                 // bits are the only prompt signal that the command is over.
-                if mmio_read32(self.pbase + PORT_IS) & PORT_IS_ERRORS != 0 {
+                if port_mmio_read32(self.pbase_va, PORT_IS) & PORT_IS_ERRORS != 0 {
                     return Err(IoFault::DeviceError);
                 }
-                if mmio_read32(self.pbase + PORT_CI) & 1 == 0 {
+                if port_mmio_read32(self.pbase_va, PORT_CI) & 1 == 0 {
                     break;
                 }
                 spins = spins.wrapping_add(1);
@@ -690,8 +750,8 @@ impl AhciHwPort {
                 }
                 core::hint::spin_loop();
             }
-            if mmio_read32(self.pbase + PORT_TFD) & TFD_ERR_OR_FAULT != 0
-                || mmio_read32(self.pbase + PORT_IS) & PORT_IS_ERRORS != 0
+            if port_mmio_read32(self.pbase_va, PORT_TFD) & TFD_ERR_OR_FAULT != 0
+                || port_mmio_read32(self.pbase_va, PORT_IS) & PORT_IS_ERRORS != 0
             {
                 return Err(IoFault::DeviceError);
             }
@@ -704,6 +764,18 @@ impl AhciHwPort {
             }
         }
         Ok(())
+    }
+
+    /// Single-sector wrapper around [`Self::try_issue_slot0_bytes`].
+    pub(crate) fn try_issue_with_prdtl(
+        &self,
+        fis_params: &cuttle_contracts::H2dFisParams,
+        write: bool,
+        prdtl: u16,
+        expect_bytes: Option<u32>,
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        let prdt_bytes = if prdtl > 0 { 512 } else { 0 };
+        self.try_issue_slot0_bytes(fis_params, write, prdtl, prdt_bytes, expect_bytes)
     }
 
     /// Panicking form of [`Self::try_issue_with_prdtl`] for the boot self-tests,
@@ -732,140 +804,198 @@ impl AhciHwPort {
 
     /// Issue non-data ATA `FLUSH CACHE` (`0xE7`, `PRDTL = 0`) as a write-order durability barrier.
     pub(crate) fn flush_cache(&self) {
-        use cuttle_contracts::{H2dFisParams, ATA_DEV_LBA};
-        const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
-        let fl = H2dFisParams {
-            command: ATA_CMD_FLUSH_CACHE,
-            features: 0,
-            lba: 0,
-            count: 0,
-            device: ATA_DEV_LBA,
-            pm_port: 0,
-            is_command: true,
-        };
+        use target_enterprise::ahci_fis::build_flush_fis;
+        let fl = build_flush_fis(false, 0).expect("flush fis");
         self.issue_with_prdtl(&fl, false, 0, b"flush");
     }
 
     /// Read the DMA data buffer back into a 512-byte array.
     pub(crate) fn drain_data(&self) -> [u8; 512] {
         let mut out = [0u8; 512];
-        // SAFETY: `self.data_pa` points to a 512-byte sector buffer in the reserved DMA window.
+        // SAFETY: `self.data_pa` points to the 32 KiB sector buffer in the reserved DMA window.
         unsafe {
             let d = pa_to_va(self.data_pa);
-            let mut i = 0usize;
-            while i < 512 {
-                out[i] = core::ptr::read_volatile(d.add(i));
-                i += 1;
-            }
+            core::ptr::copy_nonoverlapping(d, out.as_mut_ptr(), 512);
         }
         out
     }
 
     /// Fill the DMA data buffer from a 512-byte array.
     pub(crate) fn fill_data(&self, src: &[u8; 512]) {
-        // SAFETY: `self.data_pa` points to a 512-byte sector buffer in the reserved DMA window.
+        // SAFETY: `self.data_pa` points to the 32 KiB sector buffer in the reserved DMA window.
         unsafe {
             let d = pa_to_va(self.data_pa);
-            let mut i = 0usize;
-            while i < 512 {
-                core::ptr::write_volatile(d.add(i), src[i]);
-                i += 1;
-            }
+            core::ptr::copy_nonoverlapping(src.as_ptr(), d, 512);
         }
     }
 
     /// ATA WRITE DMA one 512-byte sector at `lba`.
     pub(crate) fn write_sector(&self, lba: u64, data: &[u8; 512]) {
-        use cuttle_contracts::{H2dFisParams, ATA_DEV_LBA};
-        const ATA_CMD_WRITE_DMA: u8 = 0xCA;
+        use target_enterprise::ahci_fis::build_rw_dma_fis;
         self.fill_data(data);
-        let wr = H2dFisParams {
-            command: ATA_CMD_WRITE_DMA,
-            features: 0,
-            lba,
-            count: 1,
-            device: ATA_DEV_LBA,
-            pm_port: 0,
-            is_command: true,
-        };
+        let wr = build_rw_dma_fis(lba, 1, true, false, 0).expect("write_dma params");
         self.issue(&wr, true, b"write");
     }
 
-    /// ATA `FLUSH CACHE`, reporting failure.
-    pub(crate) fn try_flush_cache(&self) -> Result<(), target_enterprise::state_store::IoFault> {
-        use cuttle_contracts::{H2dFisParams, ATA_DEV_LBA};
-        const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
-        let fl = H2dFisParams {
-            command: ATA_CMD_FLUSH_CACHE,
-            features: 0,
-            lba: 0,
-            count: 0,
-            device: ATA_DEV_LBA,
-            pm_port: 0,
-            is_command: true,
-        };
-        self.try_issue_with_prdtl(&fl, false, 0, None)
-    }
-
-    /// ATA WRITE DMA one 512-byte sector at `lba`, reporting failure.
-    pub(crate) fn try_write_sector(
+    /// ATA `FLUSH CACHE` / `FLUSH CACHE EXT`, reporting failure.
+    pub(crate) fn try_flush_cache(
         &self,
-        lba: u64,
-        data: &[u8; 512],
+        lba48: bool,
     ) -> Result<(), target_enterprise::state_store::IoFault> {
-        use cuttle_contracts::{H2dFisParams, ATA_DEV_LBA};
-        const ATA_CMD_WRITE_DMA: u8 = 0xCA;
-        if lba >= AHCI_LBA28_LIMIT {
-            return Err(target_enterprise::state_store::IoFault::OutOfRange);
-        }
-        self.fill_data(data);
-        let wr = H2dFisParams {
-            command: ATA_CMD_WRITE_DMA,
-            features: 0,
-            lba,
-            count: 1,
-            device: ATA_DEV_LBA,
-            pm_port: 0,
-            is_command: true,
-        };
-        self.try_issue_with_prdtl(&wr, true, 1, Some(512))
-    }
-
-    /// ATA READ DMA one 512-byte sector at `lba` into `out`, reporting failure.
-    pub(crate) fn try_read_sector(
-        &self,
-        lba: u64,
-        out: &mut [u8; 512],
-    ) -> Result<(), target_enterprise::state_store::IoFault> {
-        use cuttle_contracts::AhciFis;
-        use target_enterprise::ahci_fis::AhciFisImpl;
+        use target_enterprise::ahci_fis::build_flush_fis;
         use target_enterprise::state_store::IoFault;
-        if lba >= AHCI_LBA28_LIMIT {
-            return Err(IoFault::OutOfRange);
+        let fl = build_flush_fis(lba48, 0).map_err(|_| IoFault::OutOfRange)?;
+        self.try_issue_slot0_bytes(&fl, false, 0, 0, None)
+    }
+
+    /// Multi-sector DMA write across one or more slices using `WRITE DMA EXT` (`lba48 = true`)
+    /// or `WRITE DMA` (`lba48 = false`) in chunks of up to `AHCI_MAX_BATCH_SECTORS` (`64` sectors = `32 KiB`).
+    pub(crate) fn try_write_sector_slices(
+        &self,
+        lba: u64,
+        lba48: bool,
+        slices: &[&[[u8; 512]]],
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        use target_enterprise::ahci_fis::build_rw_dma_fis;
+        use target_enterprise::memory::dma_layout::AHCI_MAX_BATCH_SECTORS;
+        use target_enterprise::state_store::IoFault;
+
+        let mut cur_lba = lba;
+        let mut s_idx = 0usize;
+        let mut s_off = 0usize;
+        while s_idx < slices.len() {
+            if s_off >= slices[s_idx].len() {
+                s_idx += 1;
+                s_off = 0;
+                continue;
+            }
+            let mut batch_secs = 0usize;
+            // SAFETY: `self.data_pa..self.data_pa + 32 KiB` is the dedicated Slot 0 DMA buffer in mapped physical RAM, idle while Slot 0 is not in flight.
+            unsafe {
+                let d = pa_to_va(self.data_pa);
+                while batch_secs < AHCI_MAX_BATCH_SECTORS && s_idx < slices.len() {
+                    let rem_in_slice = slices[s_idx].len() - s_off;
+                    if rem_in_slice == 0 {
+                        s_idx += 1;
+                        s_off = 0;
+                        continue;
+                    }
+                    let take = rem_in_slice.min(AHCI_MAX_BATCH_SECTORS - batch_secs);
+                    core::ptr::copy_nonoverlapping(
+                        slices[s_idx][s_off].as_ptr(),
+                        d.add(batch_secs * 512),
+                        take * 512,
+                    );
+                    batch_secs += take;
+                    s_off += take;
+                }
+            }
+            if batch_secs == 0 {
+                break;
+            }
+            let byte_count = (batch_secs as u32) * 512;
+            let wr = build_rw_dma_fis(cur_lba, batch_secs as u16, true, lba48, 0)
+                .map_err(|_| IoFault::OutOfRange)?;
+            self.try_issue_slot0_bytes(&wr, true, 1, byte_count, Some(byte_count))?;
+            cur_lba = cur_lba
+                .checked_add(batch_secs as u64)
+                .ok_or(IoFault::OutOfRange)?;
         }
-        let rd = AhciFisImpl::read_dma(lba, 1, 0).map_err(|_| IoFault::OutOfRange)?;
-        self.try_issue_with_prdtl(&rd, false, 1, Some(512))?;
-        *out = self.drain_data();
         Ok(())
     }
 
-    /// ATA IDENTIFY DEVICE: the number of addressable sectors.
-    pub(crate) fn try_identify_sectors(&self) -> Result<u64, target_enterprise::state_store::IoFault> {
+    /// Multi-sector DMA read into one or more destination slices using `READ DMA EXT` (`lba48 = true`)
+    /// or `READ DMA` (`lba48 = false`) in chunks of up to `AHCI_MAX_BATCH_SECTORS` (`64` sectors = `32 KiB`).
+    pub(crate) fn try_read_sector_slices(
+        &self,
+        lba: u64,
+        lba48: bool,
+        slices: &mut [&mut [[u8; 512]]],
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        use target_enterprise::ahci_fis::build_rw_dma_fis;
+        use target_enterprise::memory::dma_layout::AHCI_MAX_BATCH_SECTORS;
+        use target_enterprise::state_store::IoFault;
+
+        let mut total_rem = 0usize;
+        let mut k = 0usize;
+        while k < slices.len() {
+            total_rem = total_rem
+                .checked_add(slices[k].len())
+                .ok_or(IoFault::OutOfRange)?;
+            k += 1;
+        }
+        let mut cur_lba = lba;
+        let mut s_idx = 0usize;
+        let mut s_off = 0usize;
+        while total_rem > 0 {
+            let batch_secs = total_rem.min(AHCI_MAX_BATCH_SECTORS);
+            let byte_count = (batch_secs as u32) * 512;
+            let rd = build_rw_dma_fis(cur_lba, batch_secs as u16, false, lba48, 0)
+                .map_err(|_| IoFault::OutOfRange)?;
+            self.try_issue_slot0_bytes(&rd, false, 1, byte_count, Some(byte_count))?;
+            let mut copied = 0usize;
+            // SAFETY: `self.data_pa..self.data_pa + byte_count` holds the freshly transferred DMA payload in mapped physical RAM after Slot 0 completed cleanly.
+            unsafe {
+                let d = pa_to_va(self.data_pa);
+                while copied < batch_secs && s_idx < slices.len() {
+                    let rem_in_slice = slices[s_idx].len() - s_off;
+                    if rem_in_slice == 0 {
+                        s_idx += 1;
+                        s_off = 0;
+                        continue;
+                    }
+                    let take = rem_in_slice.min(batch_secs - copied);
+                    core::ptr::copy_nonoverlapping(
+                        d.add(copied * 512),
+                        slices[s_idx][s_off].as_mut_ptr(),
+                        take * 512,
+                    );
+                    copied += take;
+                    s_off += take;
+                }
+            }
+            cur_lba = cur_lba
+                .checked_add(batch_secs as u64)
+                .ok_or(IoFault::OutOfRange)?;
+            total_rem -= batch_secs;
+        }
+        Ok(())
+    }
+
+    /// ATA WRITE DMA / WRITE DMA EXT one 512-byte sector at `lba`, reporting failure.
+    pub(crate) fn try_write_sector(
+        &self,
+        lba: u64,
+        lba48: bool,
+        data: &[u8; 512],
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        self.try_write_sector_slices(lba, lba48, &[core::slice::from_ref(data)])
+    }
+
+    /// ATA READ DMA / READ DMA EXT one 512-byte sector at `lba` into `out`, reporting failure.
+    pub(crate) fn try_read_sector(
+        &self,
+        lba: u64,
+        lba48: bool,
+        out: &mut [u8; 512],
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        self.try_read_sector_slices(lba, lba48, &mut [core::slice::from_mut(out)])
+    }
+
+    /// ATA IDENTIFY DEVICE: addressable sector count and 48-bit LBA capability.
+    pub(crate) fn try_identify_geometry(
+        &self,
+    ) -> Result<(u64, bool), target_enterprise::state_store::IoFault> {
         use cuttle_contracts::AhciFis;
-        use target_enterprise::ahci_fis::AhciFisImpl;
+        use target_enterprise::ahci_fis::{parse_identify_geometry, AhciFisImpl};
         use target_enterprise::state_store::IoFault;
         let params = AhciFisImpl::identify(0).map_err(|_| IoFault::OutOfRange)?;
         self.fill_data(&[0u8; 512]);
-        self.try_issue_with_prdtl(&params, false, 1, None)?;
+        self.try_issue_slot0_bytes(&params, false, 1, 512, None)?;
         let data = self.drain_data();
-        let word = |w: usize| u16::from_le_bytes([data[2 * w], data[2 * w + 1]]) as u64;
-        let lba28 = word(60) | (word(61) << 16);
-        let lba48 = word(100) | (word(101) << 16) | (word(102) << 32) | (word(103) << 48);
-        let sectors = if lba48 != 0 { lba48 } else { lba28 };
-        if sectors == 0 {
-            return Err(IoFault::DeviceError);
-        }
-        Ok(sectors)
+        let (sectors, lba48) = parse_identify_geometry(&data).ok_or(IoFault::DeviceError)?;
+        AHCI_CACHED_LBA48.store(lba48, core::sync::atomic::Ordering::Release);
+        Ok((sectors, lba48))
     }
 
     /// ATA READ DMA one 512-byte sector at `lba`.
@@ -884,32 +1014,37 @@ impl AhciHwPort {
     }
 }
 
-/// `READ DMA` / `WRITE DMA` carry a 28-bit LBA; a larger one would alias.
-pub(crate) const AHCI_LBA28_LIMIT: u64 = 1 << 28;
+/// The AHCI port, sector capacity, and LBA48 capability the durable state store runs on, probed once.
+static AHCI_STATE_DISK: spin::Mutex<Option<(AhciHwPort, u64, bool)>> = spin::Mutex::new(None);
 
-/// The AHCI port and capacity the durable state store runs on, probed once.
-static AHCI_STATE_DISK: spin::Mutex<Option<(AhciHwPort, u64)>> = spin::Mutex::new(None);
-
-/// The AHCI disk as a fallible sector device for
+/// The AHCI disk as a fallible multi-sector DMA block device for
 /// [`target_enterprise::state_store`].
 pub(crate) struct AhciDisk {
     port: AhciHwPort,
     sectors: u64,
+    lba48: bool,
 }
 
 impl AhciDisk {
     /// The state disk. The first call probes the HBA and reads the device
-    /// capacity; later calls reuse both, so a commit no longer restarts the
-    /// port.
+    /// geometry; later calls reuse it, so commits never re-probe the port.
     pub(crate) fn state_disk() -> Result<Self, target_enterprise::state_store::IoFault> {
         let mut cached = AHCI_STATE_DISK.lock();
-        if let Some((port, sectors)) = *cached {
-            return Ok(AhciDisk { port, sectors });
+        if let Some((port, sectors, lba48)) = *cached {
+            return Ok(AhciDisk {
+                port,
+                sectors,
+                lba48,
+            });
         }
         let port = AhciHwPort::probe_start_quiet();
-        let sectors = port.try_identify_sectors()?;
-        *cached = Some((port, sectors));
-        Ok(AhciDisk { port, sectors })
+        let (sectors, lba48) = port.try_identify_geometry()?;
+        *cached = Some((port, sectors, lba48));
+        Ok(AhciDisk {
+            port,
+            sectors,
+            lba48,
+        })
     }
 
     /// After a failed command the port holds error state and will not run
@@ -917,7 +1052,7 @@ impl AhciDisk {
     /// repair write) has a working device.
     fn restart_port_after_fault(&mut self) {
         self.port = AhciHwPort::probe_start_quiet();
-        *AHCI_STATE_DISK.lock() = Some((self.port, self.sectors));
+        *AHCI_STATE_DISK.lock() = Some((self.port, self.sectors, self.lba48));
     }
 
     fn checked<T>(
@@ -929,11 +1064,30 @@ impl AhciDisk {
         }
         r
     }
+
+    fn check_range(
+        &self,
+        lba: u64,
+        count: usize,
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        use target_enterprise::state_store::IoFault;
+        let end = lba.checked_add(count as u64).ok_or(IoFault::OutOfRange)?;
+        if end > target_enterprise::state_store::SectorIo::capacity_sectors(self) {
+            return Err(IoFault::OutOfRange);
+        }
+        Ok(())
+    }
 }
 
 impl target_enterprise::state_store::SectorIo for AhciDisk {
     fn capacity_sectors(&self) -> u64 {
-        self.sectors.min(AHCI_LBA28_LIMIT)
+        use target_enterprise::ahci_fis::{AHCI_LBA28_MAX_SECTORS, AHCI_LBA48_MAX_SECTORS};
+        let cap_max = if self.lba48 {
+            AHCI_LBA48_MAX_SECTORS
+        } else {
+            AHCI_LBA28_MAX_SECTORS
+        };
+        self.sectors.min(cap_max)
     }
 
     fn read_sector(
@@ -941,10 +1095,8 @@ impl target_enterprise::state_store::SectorIo for AhciDisk {
         lba: u64,
         out: &mut [u8; 512],
     ) -> Result<(), target_enterprise::state_store::IoFault> {
-        if lba >= self.capacity_sectors() {
-            return Err(target_enterprise::state_store::IoFault::OutOfRange);
-        }
-        let r = self.port.try_read_sector(lba, out);
+        self.check_range(lba, 1)?;
+        let r = self.port.try_read_sector(lba, self.lba48, out);
         self.checked(r)
     }
 
@@ -953,15 +1105,67 @@ impl target_enterprise::state_store::SectorIo for AhciDisk {
         lba: u64,
         data: &[u8; 512],
     ) -> Result<(), target_enterprise::state_store::IoFault> {
-        if lba >= self.capacity_sectors() {
-            return Err(target_enterprise::state_store::IoFault::OutOfRange);
+        self.check_range(lba, 1)?;
+        let r = self.port.try_write_sector(lba, self.lba48, data);
+        self.checked(r)
+    }
+
+    fn read_sectors(
+        &mut self,
+        lba: u64,
+        out: &mut [[u8; 512]],
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        self.check_range(lba, out.len())?;
+        let r = self.port.try_read_sector_slices(lba, self.lba48, &mut [out]);
+        self.checked(r)
+    }
+
+    fn write_sectors(
+        &mut self,
+        lba: u64,
+        data: &[[u8; 512]],
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        self.check_range(lba, data.len())?;
+        let r = self.port.try_write_sector_slices(lba, self.lba48, &[data]);
+        self.checked(r)
+    }
+
+    fn read_sector_slices(
+        &mut self,
+        lba: u64,
+        slices: &mut [&mut [[u8; 512]]],
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        use target_enterprise::state_store::IoFault;
+        let mut total = 0usize;
+        let mut i = 0usize;
+        while i < slices.len() {
+            total = total.checked_add(slices[i].len()).ok_or(IoFault::OutOfRange)?;
+            i += 1;
         }
-        let r = self.port.try_write_sector(lba, data);
+        self.check_range(lba, total)?;
+        let r = self.port.try_read_sector_slices(lba, self.lba48, slices);
+        self.checked(r)
+    }
+
+    fn write_sector_slices(
+        &mut self,
+        lba: u64,
+        slices: &[&[[u8; 512]]],
+    ) -> Result<(), target_enterprise::state_store::IoFault> {
+        use target_enterprise::state_store::IoFault;
+        let mut total = 0usize;
+        let mut i = 0usize;
+        while i < slices.len() {
+            total = total.checked_add(slices[i].len()).ok_or(IoFault::OutOfRange)?;
+            i += 1;
+        }
+        self.check_range(lba, total)?;
+        let r = self.port.try_write_sector_slices(lba, self.lba48, slices);
         self.checked(r)
     }
 
     fn flush(&mut self) -> Result<(), target_enterprise::state_store::IoFault> {
-        let r = self.port.try_flush_cache();
+        let r = self.port.try_flush_cache(self.lba48);
         self.checked(r)
     }
 }

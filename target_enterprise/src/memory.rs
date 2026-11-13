@@ -220,6 +220,64 @@ pub mod dma_layout {
     pub const VIRTIO_REGION: (u64, u64) = (0x0_0000, 0x0_C000);
     /// AHCI CLB/FB/CTBA/sector DMA region `[0x1_0000 .. 0x1_C000)`.
     pub const AHCI_REGION: (u64, u64) = (0x1_0000, 0x1_C000);
+    /// AHCI Command List Base offset (`1 KiB`, 32 command headers; slot 0 normal, slot 1 panic dump).
+    pub const AHCI_CLB_OFF: u64 = 0x1_0000;
+    /// AHCI Received FIS offset (`256 B`).
+    pub const AHCI_FB_OFF: u64 = 0x1_0400;
+    /// AHCI Slot 0 Command Table offset (`256 B`, 128-byte aligned).
+    pub const AHCI_CTBA_SLOT0_OFF: u64 = 0x1_0800;
+    /// AHCI Slot 1 Emergency Crash-Dump Command Table offset (`256 B`, 128-byte aligned, isolated from Slot 0).
+    pub const AHCI_CTBA_EMERG_OFF: u64 = 0x1_0900;
+    /// AHCI Slot 1 Emergency Crash-Dump 512-byte sector DMA buffer offset (isolated from Slot 0).
+    pub const AHCI_DATA_EMERG_OFF: u64 = 0x1_0A00;
+    /// AHCI Slot 0 Multi-Sector DMA data buffer offset (`32 KiB` = `64` sectors at `[0x1_1000 .. 0x1_9000)`).
+    pub const AHCI_DATA_SLOT0_OFF: u64 = 0x1_1000;
+    /// Maximum sectors transferred in a single Slot 0 AHCI DMA command (`64` sectors = `32 KiB`).
+    pub const AHCI_MAX_BATCH_SECTORS: usize = 64;
+    /// Total bytes zeroed during AHCI port initialization (`CLB + FB + Slot0/Slot1 CTBAs + Emerg Buf` = `0x1000` bytes).
+    pub const AHCI_CTRL_ZERO_BYTES: usize = 0x1000;
+
+    /// Validate that all AHCI control, multi-sector DMA, and emergency panic-dump subregions
+    /// satisfy hardware alignment rules and are pairwise non-overlapping inside [`AHCI_REGION`].
+    pub const fn validate_ahci_subregions() -> Result<(), (usize, usize)> {
+        if (AHCI_CLB_OFF & 0x3FF) != 0
+            || (AHCI_FB_OFF & 0xFF) != 0
+            || (AHCI_CTBA_SLOT0_OFF & 0x7F) != 0
+            || (AHCI_CTBA_EMERG_OFF & 0x7F) != 0
+            || (AHCI_DATA_EMERG_OFF & 0x1FF) != 0
+            || (AHCI_DATA_SLOT0_OFF & 0xFFF) != 0
+        {
+            return Err((0, 0));
+        }
+        let subs: [(u64, u64); 6] = [
+            (AHCI_CLB_OFF, AHCI_CLB_OFF + 0x0400),
+            (AHCI_FB_OFF, AHCI_FB_OFF + 0x0100),
+            (AHCI_CTBA_SLOT0_OFF, AHCI_CTBA_SLOT0_OFF + 0x0100),
+            (AHCI_CTBA_EMERG_OFF, AHCI_CTBA_EMERG_OFF + 0x0100),
+            (AHCI_DATA_EMERG_OFF, AHCI_DATA_EMERG_OFF + 0x0200),
+            (
+                AHCI_DATA_SLOT0_OFF,
+                AHCI_DATA_SLOT0_OFF + (AHCI_MAX_BATCH_SECTORS as u64) * 512,
+            ),
+        ];
+        let mut i = 0usize;
+        while i < subs.len() {
+            let (s_i, e_i) = subs[i];
+            if s_i >= e_i || s_i < AHCI_REGION.0 || e_i > AHCI_REGION.1 {
+                return Err((i, i));
+            }
+            let mut j = i + 1;
+            while j < subs.len() {
+                let (s_j, e_j) = subs[j];
+                if s_i < e_j && s_j < e_i {
+                    return Err((i, j));
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        Ok(())
+    }
     /// Intel e1000 TX/RX descriptor rings and frame buffers `[0x2_0000 .. 0x2_3000)`.
     pub const E1000_REGION: (u64, u64) = (0x2_0000, 0x2_3000);
     /// Dedicated 9-frame isolated `CR3` KPTI Ring-3 sandbox `[0x2_4000 .. 0x2_D000)`.
@@ -871,5 +929,6 @@ mod tests {
         ));
         assert!(!heap_has_headroom(0, total, usize::MAX, reserve));
         assert!(!heap_has_headroom(total + 1, total, 0, reserve));
+        assert_eq!(super::dma_layout::validate_ahci_subregions(), Ok(()));
     }
 }
