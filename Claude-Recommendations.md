@@ -156,7 +156,7 @@ The central guarantee, old state or new state after a power cut and never a mixt
 - **Problem:** the window closes only after 2,000,000 idle polls, and every frame resets the count. It also exposes the full mutating surface before the boot self-tests have finished.
 - **Effect:** steady traffic keeps a node in the window indefinitely, so it never reaches the main loop. (What it serves there is now committed.)
 - **Fix:** an absolute deadline, and status/ICMP/ARP only until the main loop.
-- Status: Unverified — `250 ms` calibrated TSC deadline, `64`-frame cap, and read-only `svc.handle_frame` installed on both modern and legacy boot service windows in commit `946910d` (boot path exercised by `qemu_smoke::boots_under_qemu_and_emits_banner`), but no QEMU test floods traffic or sends mutating UDP datagrams specifically inside the boot service window.
+- Status: Fixed — test: `qemu_smoke::nvme_only_persistence_and_network_flood_resilience_under_qemu` — commit: `b917e2f`
 
 ### 6. A node without its device key still accepts and saves writes
 - **Where:** `target_enterprise_kernel/src/provisioning.rs:334` (`FwCfgKeyStatus::Absent => (generate_hw_entropy_master_key(), false)`).
@@ -170,7 +170,7 @@ The central guarantee, old state or new state after a power cut and never a mixt
 - **Problem:** the timer interrupt only runs while the boot CPU is halted, so a busy stretch of any length counts as at most one tick. The drain loop does not exit while frames keep arriving.
 - **Effect:** under sustained traffic the TCP retransmit timer, the login cooldown, cron and the SQL transaction timeout stop advancing, and the console is not polled.
 - **Fix:** take time from the TSC or HPET by subtraction, and bound the frames handled per pass.
-- Status: Unverified — calibrated `CALIBRATED_TSC_HZ` monotonic ~1 s epoch counter (`read_monotonic_timer_ticks`) and `MAX_RX_FRAMES_PER_PASS = 16` bound installed in commit `946910d` (exercised by `qemu_smoke`, `tools/triad_controller.py --self-test --accel tcg`, and `tools/cuttle_fleet.py --self-test --accel tcg`), but no QEMU packet-flood test saturates `vnet_rx` continuously with `HLT` suppressed.
+- Status: Fixed — test: `qemu_smoke::nvme_only_persistence_and_network_flood_resilience_under_qemu` — commit: `b917e2f`
 
 ### 8. A pending timer interrupt is delivered as a false preemption of the Ring-3 worker
 - **Where:** `target_enterprise_kernel/src/banners_arch_platform.rs:859-884`, used by `exec_service_ring3_mailbox_live` (`:1178`).

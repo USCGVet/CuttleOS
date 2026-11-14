@@ -646,6 +646,48 @@ fn persist_error_str(e: &target_enterprise::state_store::PersistError) -> &'stat
     }
 }
 
+/// Synchronize `SHELL_STORE.min_commit_seq` from hardware TPM 2.0 NV monotonic counter
+/// `0x0150_0010` when a physical or `swtpm` TIS controller is present at `0xFED4_0000`.
+fn sync_hw_tpm_rollback_floor_on_boot() {
+    use target_enterprise::tpm::{
+        TpmTisDriver, TPM_NV_INDEX_ROLLBACK_CTR, TPM_TIS_BASE_PHYS,
+    };
+    let mut drv = TpmTisDriver::new(HwTpmTisBus {
+        base_phys: TPM_TIS_BASE_PHYS,
+    });
+    if drv.probe_did_vid().is_none() {
+        return;
+    }
+    if drv.startup(cuttle_contracts::TPM_SU_STATE).is_err() {
+        let _ = drv.startup(TPM_SU_CLEAR);
+    }
+    if let Ok(floor) = drv.nv_ensure_and_read_counter(TPM_NV_INDEX_ROLLBACK_CTR) {
+        if floor > 0 {
+            let mut store = SHELL_STORE.lock();
+            if floor > store.min_commit_seq() {
+                store.set_min_commit_seq(floor);
+            }
+        }
+    }
+    drv.relinquish_locality_0();
+}
+
+/// Advance hardware TPM 2.0 NV monotonic counter `0x0150_0010` to `new_seq` after a
+/// durable disk commit succeeds when a physical TIS controller is attached.
+fn advance_hw_tpm_rollback_counter_on_commit(new_seq: u64) {
+    use target_enterprise::tpm::{
+        TpmTisDriver, TPM_NV_INDEX_ROLLBACK_CTR, TPM_TIS_BASE_PHYS,
+    };
+    let mut drv = TpmTisDriver::new(HwTpmTisBus {
+        base_phys: TPM_TIS_BASE_PHYS,
+    });
+    if drv.probe_did_vid().is_none() {
+        return;
+    }
+    let _ = drv.nv_advance_counter_to(TPM_NV_INDEX_ROLLBACK_CTR, new_seq);
+    drv.relinquish_locality_0();
+}
+
 /// Commit the shell's state to the AHCI disk, stamped with generation `boots`.
 /// Returns once the state is durable in both slots, or says why it is not.
 pub(crate) fn persist_shell_to_ahci(
@@ -653,14 +695,18 @@ pub(crate) fn persist_shell_to_ahci(
     boots: u64,
 ) -> Result<target_enterprise::state_store::Committed, target_enterprise::state_store::PersistError>
 {
-    use target_enterprise::state_store::{CommitError, CommitStage, PersistError};
+    use target_enterprise::state_store::{CommitError, CommitStage, Committed, PersistError};
     let mut disk = StorageDisk::state_disk().map_err(|fault| {
         PersistError::Commit(CommitError::Io {
             stage: CommitStage::Stage,
             fault,
         })
     })?;
-    SHELL_STORE.lock().commit(&mut disk, sh, boots)
+    let res = SHELL_STORE.lock().commit(&mut disk, sh, boots)?;
+    if let Committed::Written { ref commit, .. } = res {
+        advance_hw_tpm_rollback_counter_on_commit(commit.commit_seq);
+    }
+    Ok(res)
 }
 
 /// Make the shell's state durable if anything durable changed since the last
@@ -720,6 +766,7 @@ pub(crate) fn shell_store_boot() {
         return;
     }
 
+    sync_hw_tpm_rollback_floor_on_boot();
     let booted = match StorageDisk::state_disk() {
         Ok(mut disk) => SHELL_STORE.lock().boot(&mut disk, sh, &keys, counter),
         Err(fault) => Err(BootError::Io(fault)),

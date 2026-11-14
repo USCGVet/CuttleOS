@@ -381,6 +381,7 @@ const REQUIRED_BANNERS: &[&str] = &[
     "TPM getrandom OK len=12 cc=0000017b",
     "TPM parse OK rc=00000000 random_len=16",
     "TPM2_TIS driver OK did_vid=000115d1 locality=0 pcr10=extended",
+    "TPM_NV_ROLLBACK OK idx=0x01500010 monotonic=verified",
     "AUDIT append OK events=3",
     "AUDIT snapshot OK bytes=308",
     "SNTP request OK mode=3 vn=4 xmt=429496729600",
@@ -1987,6 +1988,303 @@ fn enterprise_paged_store_4mib_sql_and_vfs_scale_persists_across_qemu_reboot() {
     );
     eprintln!(
         "smoke[paged_4mib]: 4 MiB PagedBlockStore (6 SQL tables, 1060 rows, B+Tree range query, 37/96 VFS inodes, append+cp) persisted across QEMU reboot PASSED"
+    );
+}
+
+fn find_ovmf_firmware(qemu_bin: &Path) -> Option<(PathBuf, Option<PathBuf>)> {
+    let mut dirs = Vec::new();
+    if let Some(parent) = qemu_bin.parent() {
+        dirs.push(parent.join("share"));
+        if let Some(grand) = parent.parent() {
+            dirs.push(grand.join("share"));
+            dirs.push(grand.join("share").join("qemu"));
+        }
+    }
+    for d in [
+        "C:/Program Files/qemu/share",
+        "/usr/share/OVMF",
+        "/usr/share/edk2/ovmf",
+        "/usr/share/qemu",
+        "/usr/local/share/qemu",
+    ] {
+        dirs.push(PathBuf::from(d));
+    }
+    for dir in dirs {
+        for (code_name, vars_name) in [
+            ("edk2-x86_64-code.fd", "edk2-i386-vars.fd"),
+            ("OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd"),
+            ("OVMF_CODE.fd", "OVMF_VARS.fd"),
+        ] {
+            let code_p = dir.join(code_name);
+            if code_p.is_file() {
+                let vars_p = dir.join(vars_name);
+                return Some((code_p, vars_p.is_file().then_some(vars_p)));
+            }
+        }
+    }
+    None
+}
+
+#[test]
+#[ignore]
+fn boots_uefi_ovmf_under_qemu_and_emits_banners() {
+    let _guard = QEMU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = workspace_root();
+    let kernel_crate = root.join("target_enterprise_kernel");
+    let pkg_crate = root.join("factory_builder_pkg");
+    let require_qemu = std::env::var("CUTTLE_REQUIRE_QEMU").as_deref() == Ok("1");
+
+    if !kernel_crate.join("Cargo.toml").exists() || !pkg_crate.join("Cargo.toml").exists() {
+        if require_qemu {
+            panic!("CUTTLE_REQUIRE_QEMU=1: kernel or pkg crate missing for UEFI smoke test");
+        }
+        eprintln!("SKIP[uefi]: out-of-workspace kernel or packager crate missing");
+        return;
+    }
+    let Some(qemu) = find_qemu() else {
+        if require_qemu {
+            panic!("CUTTLE_REQUIRE_QEMU=1: qemu-system-x86_64 not found");
+        }
+        eprintln!("SKIP[uefi]: qemu-system-x86_64 not found");
+        return;
+    };
+    let Some((ovmf_code, ovmf_vars_tpl)) = find_ovmf_firmware(&qemu) else {
+        if require_qemu {
+            panic!("CUTTLE_REQUIRE_QEMU=1: OVMF / edk2-x86_64-code.fd UEFI firmware not found");
+        }
+        eprintln!("SKIP[uefi]: OVMF / edk2-x86_64-code.fd UEFI firmware not found");
+        return;
+    };
+
+    let bk = Command::new(factory_builder_bin())
+        .arg("build-kernel")
+        .arg("--kernel-crate")
+        .arg(&kernel_crate)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .expect("spawn factory_builder build-kernel for UEFI");
+    assert!(
+        bk.status.success(),
+        "UEFI smoke: build-kernel failed (exit={:?})",
+        bk.status.code()
+    );
+    let elf = PathBuf::from(
+        String::from_utf8_lossy(&bk.stdout)
+            .lines()
+            .next()
+            .expect("stdout from build-kernel")
+            .trim(),
+    );
+
+    let images_dir = root.join("target").join("cuttle_images");
+    std::fs::create_dir_all(&images_dir).ok();
+    let bios_out = images_dir.join("qemu_smoke_uefi_companion_bios.img");
+    let uefi_img = images_dir.join("qemu_smoke_uefi.img");
+    let pkg_out = Command::new(factory_builder_bin())
+        .arg("--candidate")
+        .arg(&elf)
+        .arg("--out")
+        .arg(&bios_out)
+        .arg("--uefi")
+        .arg(&uefi_img)
+        .output()
+        .expect("spawn factory_builder --uefi package");
+    assert!(
+        pkg_out.status.success(),
+        "UEFI smoke: packaging `--uefi` failed:\n{}",
+        String::from_utf8_lossy(&pkg_out.stderr)
+    );
+    let pkg_stdout = String::from_utf8_lossy(&pkg_out.stdout);
+    assert!(
+        pkg_stdout.lines().any(|l| l.starts_with("uefi ")),
+        "factory_builder stdout missing 'uefi ' image digest line: {pkg_stdout}"
+    );
+    let uefi_len = std::fs::metadata(&uefi_img).expect("stat uefi.img").len();
+    assert!(
+        uefi_len > 1024 * 1024,
+        "UEFI GPT/FAT32 disk image suspiciously small: {uefi_len} bytes"
+    );
+
+    let uefi_vars = images_dir.join("qemu_smoke_uefi_vars.fd");
+    if let Some(ref tpl) = ovmf_vars_tpl {
+        std::fs::copy(tpl, &uefi_vars).expect("copy OVMF NVRAM template");
+    }
+
+    let virtio_disk = images_dir.join("uefi_virtio_hw.img");
+    let ahci_disk = images_dir.join("uefi_ahci_hw.img");
+    let nvme_disk = images_dir.join("uefi_nvme_hw.img");
+    std::fs::write(&virtio_disk, vec![0u8; 1024 * 1024]).expect("create uefi_virtio_hw.img");
+    std::fs::write(&ahci_disk, vec![0u8; 4 * 1024 * 1024]).expect("create 4 MiB uefi_ahci_hw.img");
+    std::fs::write(&nvme_disk, vec![0u8; 1024 * 1024]).expect("create uefi_nvme_hw.img");
+
+    let device_key_path = root.join(factory_builder::DEVICE_SECRET_KEY_FILENAME);
+    factory_builder::ensure_device_secret_key(&device_key_path)
+        .expect("provision 32-byte CSPRNG device_secret_key.bin");
+
+    let boot_uefi_once = |serial_log: &Path, done: &dyn Fn(&str) -> bool| -> (String, bool) {
+        let _ = std::fs::remove_file(serial_log);
+        let mut cmd = Command::new(&qemu);
+        cmd.args(smoke_accel_args())
+            .arg("-cpu")
+            .arg(PINNED_QEMU_CPU_MODEL)
+            .arg("-smp")
+            .arg("4")
+            .arg("-drive")
+            .arg(format!(
+                "if=pflash,format=raw,unit=0,readonly=on,file={}",
+                ovmf_code.display()
+            ));
+        if ovmf_vars_tpl.is_some() {
+            cmd.arg("-drive").arg(format!(
+                "if=pflash,format=raw,unit=1,file={}",
+                uefi_vars.display()
+            ));
+        }
+        let mut qproc = cmd
+            .arg("-fw_cfg")
+            .arg(format!(
+                "name={},file={}",
+                factory_builder::FW_CFG_DEVICE_KEY_NAME,
+                device_key_path.display()
+            ))
+            .arg("-drive")
+            .arg(format!("format=raw,file={},if=ide", uefi_img.display()))
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=vd0,format=raw,file={}",
+                virtio_disk.display()
+            ))
+            .arg("-device")
+            .arg("virtio-blk-pci,drive=vd0,disable-legacy=off,disable-modern=on")
+            .arg("-netdev")
+            .arg("hubport,id=n0,hubid=1")
+            .arg("-device")
+            .arg("virtio-net-pci,netdev=n0,disable-legacy=off,disable-modern=on")
+            .arg("-netdev")
+            .arg("hubport,id=n1,hubid=1")
+            .arg("-device")
+            .arg("virtio-net-pci,netdev=n1,disable-legacy=off,disable-modern=on")
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=ahd0,format=raw,file={}",
+                ahci_disk.display()
+            ))
+            .arg("-device")
+            .arg("ahci,id=ahci0")
+            .arg("-device")
+            .arg("ide-hd,drive=ahd0,bus=ahci0.0")
+            .arg("-netdev")
+            .arg("hubport,id=e0,hubid=2")
+            .arg("-device")
+            .arg("e1000,netdev=e0")
+            .arg("-netdev")
+            .arg("hubport,id=e1,hubid=2")
+            .arg("-device")
+            .arg("e1000,netdev=e1")
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=nvme0,format=raw,file={}",
+                nvme_disk.display()
+            ))
+            .arg("-device")
+            .arg("nvme,drive=nvme0,serial=CUTTLE-NVME-HW")
+            .arg("-serial")
+            .arg(format!("file:{}", serial_log.display()))
+            .arg("-display")
+            .arg("none")
+            .arg("-no-reboot")
+            .arg("-m")
+            .arg("256M")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn UEFI QEMU");
+
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut reached = false;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+            if let Ok(s) = std::fs::read_to_string(serial_log) {
+                if done(&s) {
+                    reached = true;
+                    break;
+                }
+            }
+        }
+        let _ = qproc.kill();
+        let _ = qproc.wait();
+        (std::fs::read_to_string(serial_log).unwrap_or_default(), reached)
+    };
+
+    eprintln!(
+        "smoke[uefi]: booting UEFI image under OVMF ({})...",
+        ovmf_code.display()
+    );
+    let uefi_expected_banners: Vec<&str> = REQUIRED_BANNERS
+        .iter()
+        .map(|&b| {
+            if b == "AHCI_HW identify OK sectors=2048" {
+                "AHCI_HW identify OK sectors=8192"
+            } else {
+                b
+            }
+        })
+        .collect();
+    let log1_path = images_dir.join("qemu_smoke_uefi_boot1.log");
+    let (log1, halted1) = boot_uefi_once(&log1_path, &|s| s.contains("CUTTLE-TE HALT"));
+    let missing: Vec<&&str> = uefi_expected_banners
+        .iter()
+        .filter(|b| !log1.contains(**b))
+        .collect();
+    if !halted1 || !missing.is_empty() {
+        panic!(
+            "UEFI OVMF Boot #1 missing required banners (halted={}): {:?}\nSerial log:\n{}",
+            halted1, missing, log1
+        );
+    }
+    assert!(
+        log1.contains("UEFI bootloader started"),
+        "UEFI OVMF Boot #1 must boot via OVMF UEFI BOOTX64.EFI:\n{}",
+        log1
+    );
+    let mut cursor = 0usize;
+    for b in &uefi_expected_banners {
+        match log1[cursor..].find(b) {
+            Some(rel) => cursor += rel + b.len(),
+            None => panic!(
+                "UEFI OVMF Boot #1 banner {:?} out-of-order after offset {}:\n{}",
+                b, cursor, log1
+            ),
+        }
+    }
+    assert!(
+        log1.contains("CONTINUITY genesis") && !log1.contains("SHELL resume REJECTED"),
+        "UEFI OVMF Boot #1 expected clean CONTINUITY genesis:\n{}",
+        log1
+    );
+
+    let log2_path = images_dir.join("qemu_smoke_uefi_boot2.log");
+    let (log2, ok2) = boot_uefi_once(&log2_path, &|s| s.contains("CUTTLE-TE HALT"));
+    for f in [
+        &bios_out,
+        &uefi_img,
+        &uefi_vars,
+        &virtio_disk,
+        &ahci_disk,
+        &nvme_disk,
+        &log1_path,
+        &log2_path,
+    ] {
+        let _ = std::fs::remove_file(f);
+    }
+    assert!(
+        ok2 && log2.contains("CONTINUITY resume OK") && log2.contains("SHELL resume OK"),
+        "UEFI OVMF Boot #2 failed to resume sealed 4 MiB state cleanly!\nSerial log:\n{}",
+        log2
+    );
+    eprintln!(
+        "smoke[uefi]: UEFI (OVMF) GetMemoryMap + ACPI RSDP + GOP + 4x SMP + 4 MiB PagedBlockStore resume PASSED"
     );
 }
 

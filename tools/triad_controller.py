@@ -2579,20 +2579,7 @@ class TriadController:
             if n.state == "ONLINE":
                 self.check_node_heartbeat(n)
 
-    def send_shell_cmd(self, node: TriadNode, cmd_str: str, timeout: float = 5.0) -> str:
-        """
-        Send a single-line command over the node's serial console (paced for the 16-byte 16550 UART FIFO)
-        and capture output. Rejects any command containing non-printable or control characters (such as
-        0x08 BS or 0x7F DEL) so callers cannot manipulate the kernel's serial line buffer.
-        """
-        if any(not (0x20 <= ord(ch) <= 0x7E) for ch in cmd_str):
-            raise ValueError("command contains non-printable or control characters")
-        clean_cmd = cmd_str.strip()
-        if not clean_cmd:
-            return ""
-        http_rpc = self._try_http_node_rpc(node, clean_cmd, timeout)
-        if http_rpc is not None:
-            return http_rpc
+    def _send_shell_cmd_uart_once(self, node: TriadNode, clean_cmd: str, timeout: float) -> str:
         with node.cmd_lock:
             if not node.proc or node.proc.poll() is not None:
                 return "error: node offline"
@@ -2600,14 +2587,14 @@ class TriadController:
                 node.response_lines.clear()
             payload = clean_cmd + "\n"
             try:
-                for i in range(0, len(payload), 6):
-                    node.proc.stdin.write(payload[i : i + 6])
+                for i in range(0, len(payload), 4):
+                    node.proc.stdin.write(payload[i : i + 4])
                     node.proc.stdin.flush()
-                    if i + 6 < len(payload):
-                        time.sleep(0.025)
+                    if i + 4 < len(payload):
+                        time.sleep(0.030)
                 # Send a second newline after a brief pause so the trailing `cuttle> ` prompt
                 # is terminated with `\r\n` and flushed immediately through line-buffered stdout.
-                time.sleep(0.030)
+                time.sleep(0.035)
                 node.proc.stdin.write("\n")
                 node.proc.stdin.flush()
             except OSError:
@@ -2616,6 +2603,8 @@ class TriadController:
             collected: list[str] = []
             sent_at = time.monotonic()
             deadline = sent_at + timeout
+            last_nudge_at = sent_at
+            nudges = 0
             saw_prompt_end = False
             saw_cmd_or_output = False
             while time.monotonic() < deadline:
@@ -2653,6 +2642,20 @@ class TriadController:
                     ):
                         break
                     node.line_cond.wait(timeout=0.06)
+                now_m = time.monotonic()
+                if (
+                    not saw_cmd_or_output
+                    and nudges < 2
+                    and now_m < deadline
+                    and (now_m - last_nudge_at) >= 0.75
+                ):
+                    nudges += 1
+                    last_nudge_at = now_m
+                    try:
+                        node.proc.stdin.write("\n")
+                        node.proc.stdin.flush()
+                    except OSError:
+                        break
             if not saw_prompt_end and not (
                 collected and self._response_looks_complete(clean_cmd, collected)
             ):
@@ -2660,6 +2663,30 @@ class TriadController:
                     node.response_lines.clear()
                 return "error: command timed out"
             return "\n".join(collected).strip()
+
+    def send_shell_cmd(self, node: TriadNode, cmd_str: str, timeout: float = 5.0) -> str:
+        """
+        Send a single-line command over the node's serial console (paced for the 16-byte 16550 UART FIFO)
+        and capture output. Rejects any command containing non-printable or control characters (such as
+        0x08 BS or 0x7F DEL) so callers cannot manipulate the kernel's serial line buffer.
+        """
+        if any(not (0x20 <= ord(ch) <= 0x7E) for ch in cmd_str):
+            raise ValueError("command contains non-printable or control characters")
+        clean_cmd = cmd_str.strip()
+        if not clean_cmd:
+            return ""
+        http_rpc = self._try_http_node_rpc(node, clean_cmd, timeout)
+        if http_rpc is not None:
+            return http_rpc
+        out = self._send_shell_cmd_uart_once(node, clean_cmd, timeout)
+        if (
+            not self.unit_test
+            and is_readonly_shell_command(clean_cmd)
+            and (out == "error: command timed out" or out.startswith("error: unknown command"))
+        ):
+            time.sleep(0.05)
+            out = self._send_shell_cmd_uart_once(node, clean_cmd, max(timeout, 5.0))
+        return out
 
     def _response_looks_complete(self, cmd_str: str, lines: list[str]) -> bool:
         joined = "\n".join(lines)
@@ -8692,6 +8719,67 @@ def run_stage8_security_and_wal_unit_tests(tmp_dir: Path, sc_harness: RealOsShel
     out_fb = rpc_ctrl.send_node_rpc(node0, "uname", timeout=0.6)
     assert out_fb == "uart:uname", f"expected UART fallback when HTTP RPC port is closed, got {out_fb!r}"
     assert rpc_ctrl.rpc_uart_fallback_total == 1
+
+    # 8d. UART 16550A newline-nudge + read-only retry resilience under heavy TCG scheduling stalls:
+    uart_ctrl = TriadController(
+        show_gui=False,
+        spec=TriadSpec(name="sb5-uart", state_dir=tmp_dir / "stage_b5_uart", forward_node_ports=False, write_operator_token=False),
+        unit_test=True,
+    )
+    uart_ctrl.shutdown()
+    uart_ctrl.unit_test = False
+    unode = uart_ctrl.nodes[0]
+    unode.state = "ONLINE"
+
+    class _SwallowInitialNewlinesStdin:
+        def __init__(self, target_node: TriadNode):
+            self.node = target_node
+            self.buf = ""
+            self.nl_seen = 0
+
+        def write(self, s: str) -> int:
+            for ch in s:
+                if ch == "\n":
+                    self.nl_seen += 1
+                    # Drop the initial 2 newlines (simulating 16-byte 16550A FIFO overflow under 36-vCPU TCG load)
+                    if self.nl_seen >= 3 and self.buf.strip():
+                        cmd_now = self.buf.strip()
+                        self.buf = ""
+                        with self.node.line_cond:
+                            self.node.response_lines.append(cmd_now)
+                            self.node.response_lines.append("service: role=wfe running=1/3")
+                            self.node.response_lines.append("svc-sh path=/sbin/svc-sh state=stopped")
+                            self.node.response_lines.append("cuttle> ")
+                            self.node.line_cond.notify_all()
+                else:
+                    self.buf += ch
+            return len(s)
+
+        def flush(self) -> None:
+            return
+
+    unode.proc = type(
+        "_UartProc",
+        (),
+        {"poll": staticmethod(lambda: None), "stdin": _SwallowInitialNewlinesStdin(unode)},
+    )()
+    nudged_out = uart_ctrl.send_shell_cmd(unode, "service status", timeout=2.0)
+    assert "role=wfe" in nudged_out, f"UART newline nudge must recover dropped trailing newline, got {nudged_out!r}"
+
+    uart_attempts = {"ro": 0, "rw": 0}
+
+    def _mock_uart_once(n, c, t):
+        if c == "service status":
+            uart_attempts["ro"] += 1
+            return "error: command timed out" if uart_attempts["ro"] == 1 else "service: role=sql running=1/3\nsvc-sh stopped"
+        uart_attempts["rw"] += 1
+        return "error: command timed out"
+
+    uart_ctrl._send_shell_cmd_uart_once = _mock_uart_once
+    assert "role=sql" in uart_ctrl.send_shell_cmd(unode, "service status", timeout=0.5)
+    assert uart_attempts["ro"] == 2, "read-only UART command must retry once on transient timeout"
+    assert uart_ctrl.send_shell_cmd(unode, "write /var/x 1", timeout=0.5) == "error: command timed out"
+    assert uart_attempts["rw"] == 1, "mutating UART command must never auto-retry on timeout"
 
 
 def main():

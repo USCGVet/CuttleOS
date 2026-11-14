@@ -329,6 +329,47 @@ fn generate_hw_entropy_master_key() -> [u8; 32] {
     out
 }
 
+/// Probe physical TPM 2.0 TIS Locality 0 (`0xFED4_0000`) for a sealed 32-byte out-of-band
+/// device master key stored in NV index `0x0150_0011` (`TPM_NV_INDEX_DEVICE_KEY`) on
+/// non-`fw_cfg` bare-metal / UEFI hardware platforms.
+fn probe_hw_tpm_nv_device_key() -> Option<[u8; 32]> {
+    use target_enterprise::tls_provider::{classify_fw_cfg_device_key, FwCfgKeyStatus};
+    use target_enterprise::tpm::{
+        TpmTisDriver, TPMA_NV_WRITTEN, TPM_NV_INDEX_DEVICE_KEY, TPM_TIS_BASE_PHYS,
+    };
+    let mut drv = TpmTisDriver::new(HwTpmTisBus {
+        base_phys: TPM_TIS_BASE_PHYS,
+    });
+    let _did_vid = drv.probe_did_vid()?;
+    if drv.startup(cuttle_contracts::TPM_SU_STATE).is_err() {
+        let _ = drv.startup(TPM_SU_CLEAR);
+    }
+    let info = match drv.nv_read_public(TPM_NV_INDEX_DEVICE_KEY) {
+        Ok(i) => i,
+        Err(_) => {
+            drv.relinquish_locality_0();
+            return None;
+        }
+    };
+    if info.data_size != 32 || (info.attributes & TPMA_NV_WRITTEN) == 0 {
+        drv.relinquish_locality_0();
+        return None;
+    }
+    let mut raw = [0u8; 32];
+    let read_ok = drv.nv_read_bytes(TPM_NV_INDEX_DEVICE_KEY, 0, &mut raw).is_ok();
+    drv.relinquish_locality_0();
+    if !read_ok {
+        target_enterprise::durable_seal::zeroize_secret_bytes(&mut raw);
+        return None;
+    }
+    let out = match classify_fw_cfg_device_key(Some((32, &raw))) {
+        FwCfgKeyStatus::Valid(valid) => Some(valid),
+        _ => None,
+    };
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut raw);
+    out
+}
+
 /// Resolve and return `(master_key, is_fw_cfg_provisioned)`.
 fn device_master_key_state() -> ([u8; 32], bool) {
     use target_enterprise::tls_provider::FwCfgKeyStatus;
@@ -339,10 +380,17 @@ fn device_master_key_state() -> ([u8; 32], bool) {
     let state = match read_fw_cfg_device_key_status() {
         FwCfgKeyStatus::Valid(provisioned) => (provisioned, true),
         FwCfgKeyStatus::Absent => {
-            serial_write_str(
-                "PROVISIONING WARNING: fw_cfg opt/cuttle_device_key absent; durable writes refused (ephemeral mode)\n",
-            );
-            (generate_hw_entropy_master_key(), false)
+            if let Some(tpm_key) = probe_hw_tpm_nv_device_key() {
+                serial_write_str(
+                    "PROVISIONING OK: device master key loaded from TPM 2.0 NV 0x01500011\n",
+                );
+                (tpm_key, true)
+            } else {
+                serial_write_str(
+                    "PROVISIONING WARNING: fw_cfg opt/cuttle_device_key absent; durable writes refused (ephemeral mode)\n",
+                );
+                (generate_hw_entropy_master_key(), false)
+            }
         }
         FwCfgKeyStatus::Invalid { size } => {
             let mut line = [0u8; 112];

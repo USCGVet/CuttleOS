@@ -1031,6 +1031,8 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(not(cuttle_prod))]
     banner_tpm();
     #[cfg(not(cuttle_prod))]
+    banner_tpm_nv_rollback();
+    #[cfg(not(cuttle_prod))]
     banner_audit();
     #[cfg(not(cuttle_prod))]
     banner_sntp();

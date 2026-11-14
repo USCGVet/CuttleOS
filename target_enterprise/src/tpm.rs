@@ -480,6 +480,334 @@ pub const TPM_TIS_MAX_SPINS: usize = 4096;
 /// Header (10) + `pcrUpdateCounter` (4) + `pcrSelectionOut` (10) + `pcrValues` (4 + 2 + 32) = 62 bytes.
 pub const TPM_PCR_READ_SHA256_RESP_LEN: usize = 62;
 
+// ---------------------------------------------------------------------
+// TCG TPM 2.0 Part 2 / Part 3 Non-Volatile (NV) Storage & Monotonic Counter
+// ---------------------------------------------------------------------
+
+/// TPM 2.0 command code: `TPM2_NV_DefineSpace` (TCG Library Pt 3 §31.3).
+pub const TPM_CC_NV_DEFINE_SPACE: u32 = 0x0000_012A;
+
+/// TPM 2.0 command code: `TPM2_NV_Increment` (TCG Library Pt 3 §31.7).
+pub const TPM_CC_NV_INCREMENT: u32 = 0x0000_0134;
+
+/// TPM 2.0 command code: `TPM2_NV_Write` (TCG Library Pt 3 §31.8).
+pub const TPM_CC_NV_WRITE: u32 = 0x0000_0137;
+
+/// TPM 2.0 command code: `TPM2_NV_Read` (TCG Library Pt 3 §31.10).
+pub const TPM_CC_NV_READ: u32 = 0x0000_014E;
+
+/// TPM 2.0 command code: `TPM2_NV_ReadPublic` (TCG Library Pt 3 §31.6).
+pub const TPM_CC_NV_READ_PUBLIC: u32 = 0x0000_0169;
+
+/// Permanent Storage Hierarchy Owner handle (`TPM_RH_OWNER`, TCG Pt 2 §7.5).
+pub const TPM_RH_OWNER: u32 = 0x4000_0001;
+
+/// Handle type byte (`[31:24]`) for TPM 2.0 NV Index handles (`TPM_HT_NV_INDEX = 0x01`).
+pub const TPM_HT_NV_INDEX: u8 = 0x01;
+
+/// Dedicated Cuttle OS TPM 2.0 NV monotonic counter index (`0x0150_0010`) anchoring
+/// standalone `ShellStore` `commit_seq` against whole-disk snapshot rollback.
+pub const TPM_NV_INDEX_ROLLBACK_CTR: u32 = 0x0150_0010;
+
+/// Dedicated Cuttle OS TPM 2.0 NV ordinary space index (`0x0150_0011`) holding an
+/// optional 32-byte out-of-band provisioned device master key on non-`fw_cfg` hardware.
+pub const TPM_NV_INDEX_DEVICE_KEY: u32 = 0x0150_0011;
+
+/// `TPM_NT` field value (`TPMA_NV[7:4]`) for an ordinary byte-array NV index.
+pub const TPM_NT_ORDINARY: u32 = 0x0;
+
+/// `TPM_NT` field value (`TPMA_NV[7:4]`) for a 64-bit monotonic counter NV index.
+pub const TPM_NT_COUNTER: u32 = 0x1;
+
+/// `TPMA_NV_OWNERWRITE` attribute bit (`bit 1`).
+pub const TPMA_NV_OWNERWRITE: u32 = 1 << 1;
+
+/// `TPMA_NV_AUTHWRITE` attribute bit (`bit 2`).
+pub const TPMA_NV_AUTHWRITE: u32 = 1 << 2;
+
+/// `TPMA_NV_OWNERREAD` attribute bit (`bit 17`).
+pub const TPMA_NV_OWNERREAD: u32 = 1 << 17;
+
+/// `TPMA_NV_AUTHREAD` attribute bit (`bit 18`).
+pub const TPMA_NV_AUTHREAD: u32 = 1 << 18;
+
+/// `TPMA_NV_NO_DA` attribute bit (`bit 25`, exempts NV index from dictionary-attack lockout).
+pub const TPMA_NV_NO_DA: u32 = 1 << 25;
+
+/// `TPMA_NV_WRITTEN` attribute bit (`bit 29`, set by TPM on first write/increment).
+pub const TPMA_NV_WRITTEN: u32 = 1 << 29;
+
+/// Canonical `TPMA_NV` attribute mask for the 8-byte Cuttle OS anti-rollback counter (`0x0206_0016`).
+pub const TPM_NV_COUNTER_ATTRS: u32 = (TPM_NT_COUNTER << 4)
+    | TPMA_NV_OWNERWRITE
+    | TPMA_NV_AUTHWRITE
+    | TPMA_NV_OWNERREAD
+    | TPMA_NV_AUTHREAD
+    | TPMA_NV_NO_DA;
+
+/// Canonical `TPMA_NV` attribute mask for the 32-byte Cuttle OS provisioned device-key NV index (`0x0206_0006`).
+pub const TPM_NV_ORDINARY_ATTRS: u32 = (TPM_NT_ORDINARY << 4)
+    | TPMA_NV_OWNERWRITE
+    | TPMA_NV_AUTHWRITE
+    | TPMA_NV_OWNERREAD
+    | TPMA_NV_AUTHREAD
+    | TPMA_NV_NO_DA;
+
+/// Locked wire length of `TPM2_NV_DefineSpace` with empty auth and empty policy (`45` bytes).
+pub const TPM_NV_DEFINE_SPACE_CMD_LEN: usize = 45;
+
+/// Locked wire length of `TPM2_NV_ReadPublic` (`14` bytes).
+pub const TPM_NV_READ_PUBLIC_CMD_LEN: usize = 14;
+
+/// Locked wire length of `TPM2_NV_Increment` with PWAP session (`31` bytes).
+pub const TPM_NV_INCREMENT_CMD_LEN: usize = 31;
+
+/// Locked wire length of `TPM2_NV_Read` with PWAP session (`35` bytes).
+pub const TPM_NV_READ_CMD_LEN: usize = 35;
+
+/// Maximum inline NV buffer payload accepted by this bounded `no_std` codec (`64` bytes).
+pub const TPM_NV_MAX_DATA_BYTES: usize = 64;
+
+/// Decoded `TPMS_NV_PUBLIC` metadata returned by [`parse_nv_read_public_response`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TpmNvPublicInfo {
+    /// NV handle (`0x01xx_xxxx`).
+    pub nv_index: u32,
+    /// Name hash algorithm (`TPM_ALG_SHA256 = 0x000B`).
+    pub name_alg: u16,
+    /// `TPMA_NV` bitmask (including `TPMA_NV_WRITTEN` once initialized).
+    pub attributes: u32,
+    /// Defined byte size of the NV index (`8` for counters, `32` for device key).
+    pub data_size: u16,
+}
+
+fn validate_nv_handle(nv_index: u32) -> Result<(), TpmError> {
+    if ((nv_index >> 24) as u8) != TPM_HT_NV_INDEX {
+        return Err(TpmError::BadTag);
+    }
+    Ok(())
+}
+
+fn write_pwap_session(out: &mut [u8], off: usize) -> Result<usize, TpmError> {
+    if off + 4 + AUTH_SESSION_LEN > out.len() {
+        return Err(TpmError::BufferTooSmall);
+    }
+    put_u32_be(out, off, AUTH_SESSION_LEN as u32)?;
+    put_u32_be(out, off + 4, TPM_RS_PW)?;
+    put_u16_be(out, off + 8, 0)?;
+    out[off + 10] = 0;
+    put_u16_be(out, off + 11, 0)?;
+    Ok(off + 4 + AUTH_SESSION_LEN)
+}
+
+/// Build a `TPM2_NV_DefineSpace` command (`45` bytes) under `TPM_RH_OWNER` empty-password PWAP.
+pub fn build_nv_define_space(
+    out: &mut [u8],
+    nv_index: u32,
+    attributes: u32,
+    data_size: u16,
+) -> Result<usize, TpmError> {
+    validate_nv_handle(nv_index)?;
+    if data_size == 0 || (data_size as usize) > TPM_NV_MAX_DATA_BYTES {
+        return Err(TpmError::BadByteCount);
+    }
+    if (attributes & 0xF0) == (TPM_NT_COUNTER << 4) && data_size != 8 {
+        return Err(TpmError::BadByteCount);
+    }
+    if out.len() < TPM_NV_DEFINE_SPACE_CMD_LEN {
+        return Err(TpmError::BufferTooSmall);
+    }
+    write_header(
+        out,
+        TPM_ST_SESSIONS,
+        TPM_NV_DEFINE_SPACE_CMD_LEN as u32,
+        TPM_CC_NV_DEFINE_SPACE,
+    )?;
+    put_u32_be(out, TPM_HEADER_LEN, TPM_RH_OWNER)?;
+    let mut off = write_pwap_session(out, TPM_HEADER_LEN + 4)?;
+    // auth: TPM2B_AUTH (empty = 0)
+    put_u16_be(out, off, 0)?;
+    off += 2;
+    // publicInfo: TPM2B_NV_PUBLIC (size = 14 bytes)
+    put_u16_be(out, off, 14)?;
+    off += 2;
+    put_u32_be(out, off, nv_index)?;
+    off += 4;
+    put_u16_be(out, off, TPM_ALG_SHA256)?;
+    off += 2;
+    put_u32_be(out, off, attributes)?;
+    off += 4;
+    // authPolicy: TPM2B_DIGEST (empty = 0)
+    put_u16_be(out, off, 0)?;
+    off += 2;
+    put_u16_be(out, off, data_size)?;
+    off += 2;
+    debug_assert_eq!(off, TPM_NV_DEFINE_SPACE_CMD_LEN);
+    Ok(TPM_NV_DEFINE_SPACE_CMD_LEN)
+}
+
+/// Build a `TPM2_NV_ReadPublic` command (`14` bytes).
+pub fn build_nv_read_public(out: &mut [u8], nv_index: u32) -> Result<usize, TpmError> {
+    validate_nv_handle(nv_index)?;
+    if out.len() < TPM_NV_READ_PUBLIC_CMD_LEN {
+        return Err(TpmError::BufferTooSmall);
+    }
+    write_header(
+        out,
+        TPM_ST_NO_SESSIONS,
+        TPM_NV_READ_PUBLIC_CMD_LEN as u32,
+        TPM_CC_NV_READ_PUBLIC,
+    )?;
+    put_u32_be(out, TPM_HEADER_LEN, nv_index)?;
+    Ok(TPM_NV_READ_PUBLIC_CMD_LEN)
+}
+
+/// Parse a `TPM2_NV_ReadPublic` response frame and validate all nested `TPM2B` size fields.
+pub fn parse_nv_read_public_response(buf: &[u8]) -> Result<TpmNvPublicInfo, TpmError> {
+    let view = parse_response(buf)?;
+    if view.tag != TPM_ST_NO_SESSIONS || view.response_code != cuttle_contracts::TPM_RC_SUCCESS {
+        return Err(TpmError::BadTag);
+    }
+    if view.body.len() < 2 {
+        return Err(TpmError::Truncated);
+    }
+    let pub_size = read_u16_be(view.body, 0) as usize;
+    if pub_size < 14 || 2 + pub_size + 2 > view.body.len() {
+        return Err(TpmError::BadSizeField);
+    }
+    let pub_slice = &view.body[2..2 + pub_size];
+    let nv_index = read_u32_be(pub_slice, 0);
+    validate_nv_handle(nv_index)?;
+    let name_alg = read_u16_be(pub_slice, 4);
+    let attributes = read_u32_be(pub_slice, 6);
+    let policy_len = read_u16_be(pub_slice, 10) as usize;
+    if 12 + policy_len + 2 != pub_size {
+        return Err(TpmError::BadSizeField);
+    }
+    let data_size = read_u16_be(pub_slice, 12 + policy_len);
+    let name_off = 2 + pub_size;
+    let name_size = read_u16_be(view.body, name_off) as usize;
+    if name_off + 2 + name_size != view.body.len() {
+        return Err(TpmError::BadSizeField);
+    }
+    Ok(TpmNvPublicInfo {
+        nv_index,
+        name_alg,
+        attributes,
+        data_size,
+    })
+}
+
+/// Build a `TPM2_NV_Increment` command (`31` bytes) using index self-auth under PWAP.
+pub fn build_nv_increment(out: &mut [u8], nv_index: u32) -> Result<usize, TpmError> {
+    validate_nv_handle(nv_index)?;
+    if out.len() < TPM_NV_INCREMENT_CMD_LEN {
+        return Err(TpmError::BufferTooSmall);
+    }
+    write_header(
+        out,
+        TPM_ST_SESSIONS,
+        TPM_NV_INCREMENT_CMD_LEN as u32,
+        TPM_CC_NV_INCREMENT,
+    )?;
+    put_u32_be(out, TPM_HEADER_LEN, nv_index)?;
+    put_u32_be(out, TPM_HEADER_LEN + 4, nv_index)?;
+    let end = write_pwap_session(out, TPM_HEADER_LEN + 8)?;
+    debug_assert_eq!(end, TPM_NV_INCREMENT_CMD_LEN);
+    Ok(TPM_NV_INCREMENT_CMD_LEN)
+}
+
+/// Build a `TPM2_NV_Write` command (`35 + data.len()` bytes) using index self-auth under PWAP.
+pub fn build_nv_write(
+    out: &mut [u8],
+    nv_index: u32,
+    data: &[u8],
+    offset: u16,
+) -> Result<usize, TpmError> {
+    validate_nv_handle(nv_index)?;
+    if data.is_empty() || data.len() > TPM_NV_MAX_DATA_BYTES {
+        return Err(TpmError::BadByteCount);
+    }
+    let cmd_len = 35 + data.len();
+    if out.len() < cmd_len {
+        return Err(TpmError::BufferTooSmall);
+    }
+    write_header(out, TPM_ST_SESSIONS, cmd_len as u32, TPM_CC_NV_WRITE)?;
+    put_u32_be(out, TPM_HEADER_LEN, nv_index)?;
+    put_u32_be(out, TPM_HEADER_LEN + 4, nv_index)?;
+    let mut off = write_pwap_session(out, TPM_HEADER_LEN + 8)?;
+    put_u16_be(out, off, data.len() as u16)?;
+    off += 2;
+    out[off..off + data.len()].copy_from_slice(data);
+    off += data.len();
+    put_u16_be(out, off, offset)?;
+    off += 2;
+    debug_assert_eq!(off, cmd_len);
+    Ok(cmd_len)
+}
+
+/// Build a `TPM2_NV_Read` command (`35` bytes) using index self-auth under PWAP.
+pub fn build_nv_read(
+    out: &mut [u8],
+    nv_index: u32,
+    size: u16,
+    offset: u16,
+) -> Result<usize, TpmError> {
+    validate_nv_handle(nv_index)?;
+    if size == 0 || (size as usize) > TPM_NV_MAX_DATA_BYTES {
+        return Err(TpmError::BadByteCount);
+    }
+    if out.len() < TPM_NV_READ_CMD_LEN {
+        return Err(TpmError::BufferTooSmall);
+    }
+    write_header(
+        out,
+        TPM_ST_SESSIONS,
+        TPM_NV_READ_CMD_LEN as u32,
+        TPM_CC_NV_READ,
+    )?;
+    put_u32_be(out, TPM_HEADER_LEN, nv_index)?;
+    put_u32_be(out, TPM_HEADER_LEN + 4, nv_index)?;
+    let mut off = write_pwap_session(out, TPM_HEADER_LEN + 8)?;
+    put_u16_be(out, off, size)?;
+    off += 2;
+    put_u16_be(out, off, offset)?;
+    off += 2;
+    debug_assert_eq!(off, TPM_NV_READ_CMD_LEN);
+    Ok(TPM_NV_READ_CMD_LEN)
+}
+
+/// Parse a `TPM2_NV_Read` `TPM_ST_SESSIONS` response and return the `TPM2B_MAX_NV_BUFFER` slice.
+pub fn parse_nv_read_response(buf: &[u8]) -> Result<&[u8], TpmError> {
+    let view = parse_response(buf)?;
+    if view.tag != TPM_ST_SESSIONS || view.response_code != cuttle_contracts::TPM_RC_SUCCESS {
+        return Err(TpmError::BadTag);
+    }
+    // Body: parameterSize(4) + TPM2B_MAX_NV_BUFFER { size(2) + bytes } + session_resp(>=5).
+    if view.body.len() < 4 + 2 + 5 {
+        return Err(TpmError::Truncated);
+    }
+    let param_size = read_u32_be(view.body, 0) as usize;
+    if param_size < 2 || 4 + param_size + 5 > view.body.len() {
+        return Err(TpmError::BadSizeField);
+    }
+    let data_len = read_u16_be(view.body, 4) as usize;
+    if data_len == 0 || data_len > TPM_NV_MAX_DATA_BYTES || 2 + data_len != param_size {
+        return Err(TpmError::BadSizeField);
+    }
+    let auth_off = 4 + param_size;
+    let nonce_sz = read_u16_be(view.body, auth_off) as usize;
+    if auth_off + 2 + nonce_sz + 1 + 2 > view.body.len() {
+        return Err(TpmError::BadSizeField);
+    }
+    let hmac_off = auth_off + 2 + nonce_sz + 1;
+    let hmac_sz = read_u16_be(view.body, hmac_off) as usize;
+    if hmac_off + 2 + hmac_sz != view.body.len() {
+        return Err(TpmError::BadSizeField);
+    }
+    Ok(&view.body[6..6 + data_len])
+}
+
 /// Compute the FIPS 180-4 SHA-256 PCR extension `SHA256(current_pcr || extend_digest)`.
 pub fn tpm_pcr_extend_sha256_math(current: &[u8; 32], extend_digest: &[u8; 32]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -747,28 +1075,179 @@ impl<B: TpmTisBus> TpmTisDriver<B> {
         out.copy_from_slice(rnd);
         Ok(rnd.len())
     }
+
+    /// Define an NV space (`TPM2_NV_DefineSpace`) over the TIS FIFO under `TPM_RH_OWNER` PWAP.
+    pub fn nv_define_space(
+        &mut self,
+        nv_index: u32,
+        attributes: u32,
+        data_size: u16,
+    ) -> Result<(), TpmError> {
+        let mut cmd = [0u8; TPM_NV_DEFINE_SPACE_CMD_LEN];
+        let cmd_len = build_nv_define_space(&mut cmd, nv_index, attributes, data_size)?;
+        let mut resp = [0u8; 64];
+        let resp_len = self.transceive(&cmd[..cmd_len], &mut resp)?;
+        let view = parse_response(&resp[..resp_len])?;
+        if view.response_code != cuttle_contracts::TPM_RC_SUCCESS {
+            return Err(TpmError::BadTag);
+        }
+        Ok(())
+    }
+
+    /// Read public metadata (`TPM2_NV_ReadPublic`) for `nv_index` over the TIS FIFO.
+    pub fn nv_read_public(&mut self, nv_index: u32) -> Result<TpmNvPublicInfo, TpmError> {
+        let mut cmd = [0u8; TPM_NV_READ_PUBLIC_CMD_LEN];
+        let cmd_len = build_nv_read_public(&mut cmd, nv_index)?;
+        let mut resp = [0u8; 160];
+        let resp_len = self.transceive(&cmd[..cmd_len], &mut resp)?;
+        parse_nv_read_public_response(&resp[..resp_len])
+    }
+
+    /// Read `out.len()` bytes (`1..=64`) from `nv_index` at `offset` via `TPM2_NV_Read`.
+    pub fn nv_read_bytes(
+        &mut self,
+        nv_index: u32,
+        offset: u16,
+        out: &mut [u8],
+    ) -> Result<(), TpmError> {
+        if out.is_empty() || out.len() > TPM_NV_MAX_DATA_BYTES {
+            return Err(TpmError::BadByteCount);
+        }
+        let mut cmd = [0u8; TPM_NV_READ_CMD_LEN];
+        let cmd_len = build_nv_read(&mut cmd, nv_index, out.len() as u16, offset)?;
+        let mut resp = [0u8; 160];
+        let resp_len = self.transceive(&cmd[..cmd_len], &mut resp)?;
+        let data = parse_nv_read_response(&resp[..resp_len])?;
+        if data.len() != out.len() {
+            return Err(TpmError::BadSizeField);
+        }
+        out.copy_from_slice(data);
+        Ok(())
+    }
+
+    /// Write `data` (`1..=64` bytes) into ordinary NV space `nv_index` at `offset` via `TPM2_NV_Write`.
+    pub fn nv_write_bytes(
+        &mut self,
+        nv_index: u32,
+        data: &[u8],
+        offset: u16,
+    ) -> Result<(), TpmError> {
+        let mut cmd = [0u8; 35 + TPM_NV_MAX_DATA_BYTES];
+        let cmd_len = build_nv_write(&mut cmd, nv_index, data, offset)?;
+        let mut resp = [0u8; 64];
+        let resp_len = self.transceive(&cmd[..cmd_len], &mut resp)?;
+        let view = parse_response(&resp[..resp_len])?;
+        if view.response_code != cuttle_contracts::TPM_RC_SUCCESS {
+            return Err(TpmError::BadTag);
+        }
+        Ok(())
+    }
+
+    /// Read a 64-bit big-endian TCG monotonic counter value from `nv_index`.
+    pub fn nv_read_counter(&mut self, nv_index: u32) -> Result<u64, TpmError> {
+        let mut raw = [0u8; 8];
+        self.nv_read_bytes(nv_index, 0, &mut raw)?;
+        Ok(u64::from_be_bytes(raw))
+    }
+
+    /// Increment a 64-bit TCG monotonic counter (`TPM2_NV_Increment`) and return its new value.
+    pub fn nv_increment_counter(&mut self, nv_index: u32) -> Result<u64, TpmError> {
+        let mut cmd = [0u8; TPM_NV_INCREMENT_CMD_LEN];
+        let cmd_len = build_nv_increment(&mut cmd, nv_index)?;
+        let mut resp = [0u8; 64];
+        let resp_len = self.transceive(&cmd[..cmd_len], &mut resp)?;
+        let view = parse_response(&resp[..resp_len])?;
+        if view.response_code != cuttle_contracts::TPM_RC_SUCCESS {
+            return Err(TpmError::BadTag);
+        }
+        self.nv_read_counter(nv_index)
+    }
+
+    /// Ensure 8-byte monotonic counter `nv_index` is defined and return its current high-water
+    /// value (`0` if newly defined or not yet incremented).
+    pub fn nv_ensure_and_read_counter(&mut self, nv_index: u32) -> Result<u64, TpmError> {
+        match self.nv_read_public(nv_index) {
+            Ok(info) => {
+                if info.data_size != 8 || (info.attributes & 0xF0) != (TPM_NT_COUNTER << 4) {
+                    return Err(TpmError::BadSizeField);
+                }
+                if (info.attributes & TPMA_NV_WRITTEN) == 0 {
+                    Ok(0)
+                } else {
+                    self.nv_read_counter(nv_index)
+                }
+            }
+            Err(_) => {
+                self.nv_define_space(nv_index, TPM_NV_COUNTER_ATTRS, 8)?;
+                Ok(0)
+            }
+        }
+    }
+
+    /// Monotonically advance `nv_index` up to `target_seq` (bounded to at most `64` increments
+    /// per call) and return the resulting TPM NV counter value.
+    pub fn nv_advance_counter_to(
+        &mut self,
+        nv_index: u32,
+        target_seq: u64,
+    ) -> Result<u64, TpmError> {
+        let mut cur = self.nv_ensure_and_read_counter(nv_index)?;
+        if target_seq <= cur {
+            return Ok(cur);
+        }
+        if target_seq - cur > 64 {
+            return Err(TpmError::BadByteCount);
+        }
+        while cur < target_seq {
+            cur = self.nv_increment_counter(nv_index)?;
+        }
+        Ok(cur)
+    }
+}
+
+#[derive(Copy, Clone)]
+struct MemNvSlot {
+    in_use: bool,
+    nv_index: u32,
+    attributes: u32,
+    data_size: u16,
+    data: [u8; TPM_NV_MAX_DATA_BYTES],
+}
+
+impl MemNvSlot {
+    const fn empty() -> Self {
+        Self {
+            in_use: false,
+            nv_index: 0,
+            attributes: 0,
+            data_size: 0,
+            data: [0u8; TPM_NV_MAX_DATA_BYTES],
+        }
+    }
 }
 
 /// Deterministic in-memory TCG PC Client PTP TPM 2.0 TIS Locality 0 emulator.
 ///
 /// Implements the hardware register state machine (`TPM_ACCESS_0`, `TPM_STS_0`,
-/// `TPM_DATA_FIFO_0`, `TPM_DID_VID_0`) and maintains a 24-PCR SHA-256 bank so
+/// `TPM_DATA_FIFO_0`, `TPM_DID_VID_0`), a 24-PCR SHA-256 bank, and persistent NVRAM
+/// slots (`TPM2_NV_DefineSpace` / `ReadPublic` / `Increment` / `Write` / `Read`) so
 /// [`TpmTisDriver`] executes identical register-level FIFO transfers on hosts
 /// and QEMU guests without an external `swtpm` socket.
 pub struct MemTpmTisBus {
     did_vid: u32,
     access: u8,
     sts: u8,
-    cmd_fifo: [u8; 128],
+    cmd_fifo: [u8; 256],
     cmd_len: usize,
     cmd_expected: usize,
-    resp_fifo: [u8; 128],
+    resp_fifo: [u8; 256],
     resp_len: usize,
     resp_pos: usize,
     started: bool,
     pcr_update_counter: u32,
     pcrs_sha256: [[u8; 32]; 24],
     rng_counter: u64,
+    nv_slots: [MemNvSlot; 4],
 }
 
 impl Default for MemTpmTisBus {
@@ -784,22 +1263,49 @@ impl MemTpmTisBus {
             did_vid: TPM_DEFAULT_DID_VID,
             access: TPM_ACCESS_VALID,
             sts: TPM_STS_VALID,
-            cmd_fifo: [0u8; 128],
+            cmd_fifo: [0u8; 256],
             cmd_len: 0,
             cmd_expected: 0,
-            resp_fifo: [0u8; 128],
+            resp_fifo: [0u8; 256],
             resp_len: 0,
             resp_pos: 0,
             started: false,
             pcr_update_counter: 0,
             pcrs_sha256: [[0u8; 32]; 24],
             rng_counter: 1,
+            nv_slots: [MemNvSlot::empty(); 4],
         }
     }
 
     /// Inspect a SHA-256 PCR value directly from the emulated bank.
     pub fn pcr_sha256(&self, index: usize) -> &[u8; 32] {
         &self.pcrs_sha256[index]
+    }
+
+    fn find_nv_slot(&self, nv_index: u32) -> Option<usize> {
+        let mut i = 0usize;
+        while i < self.nv_slots.len() {
+            if self.nv_slots[i].in_use && self.nv_slots[i].nv_index == nv_index {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn write_empty_sessions_ok(&mut self) {
+        let mut i = 0usize;
+        while i < 19 {
+            self.resp_fifo[i] = 0;
+            i += 1;
+        }
+        let _ = write_header(
+            &mut self.resp_fifo,
+            TPM_ST_SESSIONS,
+            19,
+            cuttle_contracts::TPM_RC_SUCCESS,
+        );
+        self.resp_len = 19;
     }
 
     /// Execute the command currently buffered in `cmd_fifo[..cmd_len]` and populate `resp_fifo`.
@@ -855,20 +1361,7 @@ impl MemTpmTisBus {
                 self.pcrs_sha256[pcr_idx] =
                     tpm_pcr_extend_sha256_math(&self.pcrs_sha256[pcr_idx], &extend_val);
                 self.pcr_update_counter = self.pcr_update_counter.wrapping_add(1);
-
-                // 19-byte TPM_ST_SESSIONS response: header(10) + paramSize(0, 4B) + PWAP auth(5B) = 19B.
-                let mut i = 0usize;
-                while i < 19 {
-                    self.resp_fifo[i] = 0;
-                    i += 1;
-                }
-                let _ = write_header(
-                    &mut self.resp_fifo,
-                    TPM_ST_SESSIONS,
-                    19,
-                    cuttle_contracts::TPM_RC_SUCCESS,
-                );
-                self.resp_len = 19;
+                self.write_empty_sessions_ok();
             }
             TPM_CC_PCR_READ => {
                 if !self.started || self.cmd_len != TPM_PCR_READ_CMD_LEN {
@@ -932,6 +1425,198 @@ impl MemTpmTisBus {
                 );
                 let _ = put_u16_be(&mut self.resp_fifo, 10, req as u16);
                 self.resp_fifo[12..12 + req].copy_from_slice(&digest[..req]);
+                self.resp_len = total_len;
+            }
+            TPM_CC_NV_DEFINE_SPACE => {
+                if !self.started
+                    || tag != TPM_ST_SESSIONS
+                    || self.cmd_len != TPM_NV_DEFINE_SPACE_CMD_LEN
+                {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_0100);
+                    return;
+                }
+                let auth_handle = read_u32_be(&self.cmd_fifo, 10);
+                let pub_len = read_u16_be(&self.cmd_fifo, 29) as usize;
+                let nv_index = read_u32_be(&self.cmd_fifo, 31);
+                let name_alg = read_u16_be(&self.cmd_fifo, 35);
+                let attrs = read_u32_be(&self.cmd_fifo, 37) & !TPMA_NV_WRITTEN;
+                let pol_len = read_u16_be(&self.cmd_fifo, 41) as usize;
+                let data_size = read_u16_be(&self.cmd_fifo, 43);
+                if auth_handle != TPM_RH_OWNER
+                    || pub_len != 14
+                    || pol_len != 0
+                    || name_alg != TPM_ALG_SHA256
+                    || ((nv_index >> 24) as u8) != TPM_HT_NV_INDEX
+                    || data_size == 0
+                    || (data_size as usize) > TPM_NV_MAX_DATA_BYTES
+                    || self.find_nv_slot(nv_index).is_some()
+                {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_014C);
+                    return;
+                }
+                let mut free_slot: Option<usize> = None;
+                let mut s = 0usize;
+                while s < self.nv_slots.len() {
+                    if !self.nv_slots[s].in_use {
+                        free_slot = Some(s);
+                        break;
+                    }
+                    s += 1;
+                }
+                let Some(slot_idx) = free_slot else {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_0902);
+                    return;
+                };
+                self.nv_slots[slot_idx] = MemNvSlot {
+                    in_use: true,
+                    nv_index,
+                    attributes: attrs,
+                    data_size,
+                    data: [0u8; TPM_NV_MAX_DATA_BYTES],
+                };
+                self.write_empty_sessions_ok();
+            }
+            TPM_CC_NV_READ_PUBLIC => {
+                if !self.started
+                    || tag != TPM_ST_NO_SESSIONS
+                    || self.cmd_len != TPM_NV_READ_PUBLIC_CMD_LEN
+                {
+                    self.write_error_response(TPM_ST_NO_SESSIONS, 0x0000_0100);
+                    return;
+                }
+                let nv_index = read_u32_be(&self.cmd_fifo, 10);
+                let Some(slot_idx) = self.find_nv_slot(nv_index) else {
+                    self.write_error_response(TPM_ST_NO_SESSIONS, 0x0000_018B);
+                    return;
+                };
+                let slot = self.nv_slots[slot_idx];
+                // Body: TPM2B_NV_PUBLIC(2 + 14 = 16) + TPM2B_NAME(2 + (2 + 32) = 36) = 52; total = 62.
+                let total_len = 10 + 16 + 36;
+                let _ = write_header(
+                    &mut self.resp_fifo,
+                    TPM_ST_NO_SESSIONS,
+                    total_len as u32,
+                    cuttle_contracts::TPM_RC_SUCCESS,
+                );
+                let _ = put_u16_be(&mut self.resp_fifo, 10, 14);
+                let _ = put_u32_be(&mut self.resp_fifo, 12, slot.nv_index);
+                let _ = put_u16_be(&mut self.resp_fifo, 16, TPM_ALG_SHA256);
+                let _ = put_u32_be(&mut self.resp_fifo, 18, slot.attributes);
+                let _ = put_u16_be(&mut self.resp_fifo, 22, 0);
+                let _ = put_u16_be(&mut self.resp_fifo, 24, slot.data_size);
+                let name_hash = {
+                    use sha2::{Digest, Sha256};
+                    let mut h = Sha256::new();
+                    h.update(&self.resp_fifo[12..26]);
+                    let res = h.finalize();
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&res);
+                    out
+                };
+                let _ = put_u16_be(&mut self.resp_fifo, 26, 34);
+                let _ = put_u16_be(&mut self.resp_fifo, 28, TPM_ALG_SHA256);
+                self.resp_fifo[30..62].copy_from_slice(&name_hash);
+                self.resp_len = total_len;
+            }
+            TPM_CC_NV_INCREMENT => {
+                if !self.started
+                    || tag != TPM_ST_SESSIONS
+                    || self.cmd_len != TPM_NV_INCREMENT_CMD_LEN
+                {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_0100);
+                    return;
+                }
+                let auth_h = read_u32_be(&self.cmd_fifo, 10);
+                let nv_index = read_u32_be(&self.cmd_fifo, 14);
+                let Some(slot_idx) = self.find_nv_slot(nv_index) else {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_018B);
+                    return;
+                };
+                let slot = &mut self.nv_slots[slot_idx];
+                if (auth_h != nv_index && auth_h != TPM_RH_OWNER)
+                    || (slot.attributes & 0xF0) != (TPM_NT_COUNTER << 4)
+                    || slot.data_size != 8
+                {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_0146);
+                    return;
+                }
+                let mut cur_bytes = [0u8; 8];
+                cur_bytes.copy_from_slice(&slot.data[0..8]);
+                let next = u64::from_be_bytes(cur_bytes).saturating_add(1);
+                slot.data[0..8].copy_from_slice(&next.to_be_bytes());
+                slot.attributes |= TPMA_NV_WRITTEN;
+                self.write_empty_sessions_ok();
+            }
+            TPM_CC_NV_WRITE => {
+                if !self.started || tag != TPM_ST_SESSIONS || self.cmd_len < 36 {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_0100);
+                    return;
+                }
+                let auth_h = read_u32_be(&self.cmd_fifo, 10);
+                let nv_index = read_u32_be(&self.cmd_fifo, 14);
+                let wlen = read_u16_be(&self.cmd_fifo, 31) as usize;
+                if 35 + wlen != self.cmd_len || wlen == 0 || wlen > TPM_NV_MAX_DATA_BYTES {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_0100);
+                    return;
+                }
+                let offset = read_u16_be(&self.cmd_fifo, 33 + wlen) as usize;
+                let Some(slot_idx) = self.find_nv_slot(nv_index) else {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_018B);
+                    return;
+                };
+                let slot = &mut self.nv_slots[slot_idx];
+                if (auth_h != nv_index && auth_h != TPM_RH_OWNER)
+                    || (slot.attributes & 0xF0) != (TPM_NT_ORDINARY << 4)
+                    || offset + wlen > (slot.data_size as usize)
+                {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_0146);
+                    return;
+                }
+                slot.data[offset..offset + wlen]
+                    .copy_from_slice(&self.cmd_fifo[33..33 + wlen]);
+                slot.attributes |= TPMA_NV_WRITTEN;
+                self.write_empty_sessions_ok();
+            }
+            TPM_CC_NV_READ => {
+                if !self.started || tag != TPM_ST_SESSIONS || self.cmd_len != TPM_NV_READ_CMD_LEN {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_0100);
+                    return;
+                }
+                let auth_h = read_u32_be(&self.cmd_fifo, 10);
+                let nv_index = read_u32_be(&self.cmd_fifo, 14);
+                let rlen = read_u16_be(&self.cmd_fifo, 31) as usize;
+                let offset = read_u16_be(&self.cmd_fifo, 33) as usize;
+                let Some(slot_idx) = self.find_nv_slot(nv_index) else {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_018B);
+                    return;
+                };
+                let slot = &self.nv_slots[slot_idx];
+                if (auth_h != nv_index && auth_h != TPM_RH_OWNER)
+                    || (slot.attributes & TPMA_NV_WRITTEN) == 0
+                    || rlen == 0
+                    || rlen > TPM_NV_MAX_DATA_BYTES
+                    || offset + rlen > (slot.data_size as usize)
+                {
+                    self.write_error_response(TPM_ST_SESSIONS, 0x0000_0148);
+                    return;
+                }
+                let param_size = 2 + rlen;
+                let total_len = 10 + 4 + param_size + 5;
+                let mut z = 0usize;
+                while z < total_len {
+                    self.resp_fifo[z] = 0;
+                    z += 1;
+                }
+                let _ = write_header(
+                    &mut self.resp_fifo,
+                    TPM_ST_SESSIONS,
+                    total_len as u32,
+                    cuttle_contracts::TPM_RC_SUCCESS,
+                );
+                let _ = put_u32_be(&mut self.resp_fifo, 10, param_size as u32);
+                let _ = put_u16_be(&mut self.resp_fifo, 14, rlen as u16);
+                self.resp_fifo[16..16 + rlen]
+                    .copy_from_slice(&slot.data[offset..offset + rlen]);
                 self.resp_len = total_len;
             }
             _ => {
@@ -1606,6 +2291,304 @@ mod tests {
         let mut drv = TpmTisDriver::new(MemTpmTisBus::new());
         let mut pcr = [0u8; 32];
         assert!(drv.pcr_read_sha256(0, &mut pcr).is_err());
+    }
+
+    #[test]
+    fn tpm_nv_wire_kats_and_edge_case_parsers() {
+        // 1. TCG TPM 2.0 Part 3 §31.3 KAT: TPM2_NV_DefineSpace(0x01500010, TPM_NV_COUNTER_ATTRS, 8) = 45 bytes
+        const DEFINE_COUNTER_KAT: [u8; TPM_NV_DEFINE_SPACE_CMD_LEN] = [
+            0x80, 0x02, // tag = TPM_ST_SESSIONS
+            0x00, 0x00, 0x00, 0x2D, // commandSize = 45
+            0x00, 0x00, 0x01, 0x2A, // commandCode = TPM_CC_NV_DefineSpace
+            0x40, 0x00, 0x00, 0x01, // authHandle = TPM_RH_OWNER
+            0x00, 0x00, 0x00, 0x09, // authorizationSize = 9
+            0x40, 0x00, 0x00, 0x09, // sessionHandle = TPM_RS_PW
+            0x00, 0x00, // nonceSize = 0
+            0x00, // sessionAttributes = 0
+            0x00, 0x00, // hmacSize = 0
+            0x00, 0x00, // auth: TPM2B_AUTH (size = 0)
+            0x00, 0x0E, // publicInfo: TPM2B_NV_PUBLIC (size = 14)
+            0x01, 0x50, 0x00, 0x10, // nvIndex = 0x01500010
+            0x00, 0x0B, // nameAlg = TPM_ALG_SHA256
+            0x02, 0x06, 0x00, 0x16, // attributes = TPM_NV_COUNTER_ATTRS (0x0206_0016)
+            0x00, 0x00, // authPolicy.size = 0
+            0x00, 0x08, // dataSize = 8
+        ];
+        let mut def_buf = [0u8; TPM_NV_DEFINE_SPACE_CMD_LEN];
+        assert_eq!(
+            build_nv_define_space(
+                &mut def_buf,
+                TPM_NV_INDEX_ROLLBACK_CTR,
+                TPM_NV_COUNTER_ATTRS,
+                8
+            ),
+            Ok(TPM_NV_DEFINE_SPACE_CMD_LEN)
+        );
+        assert_eq!(def_buf, DEFINE_COUNTER_KAT);
+
+        // 2. TCG Part 3 §31.6 KAT: TPM2_NV_ReadPublic(0x01500010) = 14 bytes
+        const READ_PUB_KAT: [u8; TPM_NV_READ_PUBLIC_CMD_LEN] = [
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x01, 0x69, 0x01, 0x50, 0x00, 0x10,
+        ];
+        let mut rp_buf = [0u8; TPM_NV_READ_PUBLIC_CMD_LEN];
+        assert_eq!(
+            build_nv_read_public(&mut rp_buf, TPM_NV_INDEX_ROLLBACK_CTR),
+            Ok(TPM_NV_READ_PUBLIC_CMD_LEN)
+        );
+        assert_eq!(rp_buf, READ_PUB_KAT);
+
+        // 3. TCG Part 3 §31.7 KAT: TPM2_NV_Increment(0x01500010) = 31 bytes
+        const INC_KAT: [u8; TPM_NV_INCREMENT_CMD_LEN] = [
+            0x80, 0x02, // tag = TPM_ST_SESSIONS
+            0x00, 0x00, 0x00, 0x1F, // commandSize = 31
+            0x00, 0x00, 0x01, 0x34, // commandCode = TPM_CC_NV_Increment
+            0x01, 0x50, 0x00, 0x10, // authHandle = nvIndex
+            0x01, 0x50, 0x00, 0x10, // nvIndex
+            0x00, 0x00, 0x00, 0x09, // authorizationSize = 9
+            0x40, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut inc_buf = [0u8; TPM_NV_INCREMENT_CMD_LEN];
+        assert_eq!(
+            build_nv_increment(&mut inc_buf, TPM_NV_INDEX_ROLLBACK_CTR),
+            Ok(TPM_NV_INCREMENT_CMD_LEN)
+        );
+        assert_eq!(inc_buf, INC_KAT);
+
+        // 4. TCG Part 3 §31.10 KAT: TPM2_NV_Read(0x01500010, size=8, offset=0) = 35 bytes
+        const READ_KAT: [u8; TPM_NV_READ_CMD_LEN] = [
+            0x80, 0x02, // tag = TPM_ST_SESSIONS
+            0x00, 0x00, 0x00, 0x23, // commandSize = 35
+            0x00, 0x00, 0x01, 0x4E, // commandCode = TPM_CC_NV_Read
+            0x01, 0x50, 0x00, 0x10, // authHandle = nvIndex
+            0x01, 0x50, 0x00, 0x10, // nvIndex
+            0x00, 0x00, 0x00, 0x09, // authorizationSize = 9
+            0x40, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, // PWAP
+            0x00, 0x08, // size = 8
+            0x00, 0x00, // offset = 0
+        ];
+        let mut rd_buf = [0u8; TPM_NV_READ_CMD_LEN];
+        assert_eq!(
+            build_nv_read(&mut rd_buf, TPM_NV_INDEX_ROLLBACK_CTR, 8, 0),
+            Ok(TPM_NV_READ_CMD_LEN)
+        );
+        assert_eq!(rd_buf, READ_KAT);
+
+        // 5. Negative builder & parser edge cases: empty, truncated, oversized, bad handle, bad size
+        assert_eq!(
+            build_nv_define_space(&mut def_buf[..44], TPM_NV_INDEX_ROLLBACK_CTR, TPM_NV_COUNTER_ATTRS, 8),
+            Err(TpmError::BufferTooSmall)
+        );
+        assert_eq!(
+            build_nv_define_space(&mut def_buf, 0x4000_0001, TPM_NV_COUNTER_ATTRS, 8),
+            Err(TpmError::BadTag)
+        );
+        assert_eq!(
+            build_nv_define_space(&mut def_buf, TPM_NV_INDEX_ROLLBACK_CTR, TPM_NV_COUNTER_ATTRS, 16),
+            Err(TpmError::BadByteCount)
+        );
+        assert_eq!(
+            build_nv_define_space(&mut def_buf, TPM_NV_INDEX_DEVICE_KEY, TPM_NV_ORDINARY_ATTRS, 0),
+            Err(TpmError::BadByteCount)
+        );
+        assert_eq!(
+            build_nv_define_space(&mut def_buf, TPM_NV_INDEX_DEVICE_KEY, TPM_NV_ORDINARY_ATTRS, 65),
+            Err(TpmError::BadByteCount)
+        );
+        let mut wr_buf = [0u8; 100];
+        assert_eq!(
+            build_nv_write(&mut wr_buf, TPM_NV_INDEX_DEVICE_KEY, &[], 0),
+            Err(TpmError::BadByteCount)
+        );
+        assert_eq!(
+            build_nv_write(&mut wr_buf, TPM_NV_INDEX_DEVICE_KEY, &[0xAA; 65], 0),
+            Err(TpmError::BadByteCount)
+        );
+
+        assert_eq!(parse_nv_read_public_response(&[]), Err(TpmError::Truncated));
+        assert_eq!(parse_nv_read_response(&[]), Err(TpmError::Truncated));
+
+        // Valid 29-byte NV_Read(8B) response vs corrupted parameterSize / trailing bytes:
+        let mut valid_nv_read_resp = [
+            0x80, 0x02, 0x00, 0x00, 0x00, 0x1D, 0x00, 0x00, 0x00, 0x00, // header (size=29)
+            0x00, 0x00, 0x00, 0x0A, // parameterSize = 10
+            0x00, 0x08, // TPM2B.size = 8
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, // counter = 7
+            0x00, 0x00, 0x00, 0x00, 0x00, // PWAP auth area (5B)
+        ];
+        assert_eq!(
+            parse_nv_read_response(&valid_nv_read_resp).unwrap(),
+            &7u64.to_be_bytes()
+        );
+        //Truncated slice:
+        assert_eq!(
+            parse_nv_read_response(&valid_nv_read_resp[..28]),
+            Err(TpmError::BadSizeField)
+        );
+        // Oversized buffer with trailing byte:
+        let mut oversized = [0u8; 30];
+        oversized[..29].copy_from_slice(&valid_nv_read_resp);
+        assert_eq!(parse_nv_read_response(&oversized), Err(TpmError::BadSizeField));
+        // Corrupted inner TPM2B length disagreeing with parameterSize:
+        valid_nv_read_resp[15] = 0x06;
+        assert_eq!(
+            parse_nv_read_response(&valid_nv_read_resp),
+            Err(TpmError::BadSizeField)
+        );
+    }
+
+    #[test]
+    fn tpm_nv_counter_standalone_shell_store_rollback_rejection_and_sealed_key_provisioning() {
+        use crate::durable_seal::{
+            derive_attest_key, derive_legacy_seal_key, derive_seal_key,
+        };
+        use crate::shell::OsShell;
+        use crate::state_store::{
+            BootError, Committed, IoFault, SectorIo, ShellKeys, ShellStore, AHCI_STATE_LAYOUT,
+            SECTOR_BYTES,
+        };
+
+        #[derive(Clone)]
+        struct RamDisk {
+            sectors: alloc::vec::Vec<[u8; SECTOR_BYTES]>,
+        }
+        impl RamDisk {
+            fn new(n: usize) -> Self {
+                Self {
+                    sectors: alloc::vec![[0u8; SECTOR_BYTES]; n],
+                }
+            }
+        }
+        impl SectorIo for RamDisk {
+            fn capacity_sectors(&self) -> u64 {
+                self.sectors.len() as u64
+            }
+            fn read_sector(
+                &mut self,
+                lba: u64,
+                out: &mut [u8; SECTOR_BYTES],
+            ) -> Result<(), IoFault> {
+                let s = self
+                    .sectors
+                    .get(lba as usize)
+                    .ok_or(IoFault::OutOfRange)?;
+                out.copy_from_slice(s);
+                Ok(())
+            }
+            fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), IoFault> {
+                let s = self
+                    .sectors
+                    .get_mut(lba as usize)
+                    .ok_or(IoFault::OutOfRange)?;
+                s.copy_from_slice(data);
+                Ok(())
+            }
+            fn flush(&mut self) -> Result<(), IoFault> {
+                Ok(())
+            }
+        }
+
+        let mut tpm = TpmTisDriver::new(MemTpmTisBus::new());
+        tpm.startup(TPM_SU_CLEAR).unwrap();
+
+        // 1. Provision a 32-byte non-fw_cfg device master key into TPM NV 0x0150_0011:
+        let provisioned_master = [0xA7u8; 32];
+        tpm.nv_define_space(TPM_NV_INDEX_DEVICE_KEY, TPM_NV_ORDINARY_ATTRS, 32)
+            .unwrap();
+        tpm.nv_write_bytes(TPM_NV_INDEX_DEVICE_KEY, &provisioned_master, 0)
+            .unwrap();
+
+        // Simulate guest warm reboot (PCRs clear, NVRAM persists!):
+        tpm.startup(TPM_SU_CLEAR).unwrap();
+        let pub_key_info = tpm.nv_read_public(TPM_NV_INDEX_DEVICE_KEY).unwrap();
+        assert_eq!(pub_key_info.data_size, 32);
+        assert_ne!(pub_key_info.attributes & TPMA_NV_WRITTEN, 0);
+        let mut recovered_master = [0u8; 32];
+        tpm.nv_read_bytes(TPM_NV_INDEX_DEVICE_KEY, 0, &mut recovered_master)
+            .unwrap();
+        assert_eq!(recovered_master, provisioned_master);
+
+        let keys = ShellKeys {
+            seal: derive_seal_key(&recovered_master, b"cuttle-ahci-wal-seal-v1"),
+            legacy_seal: derive_legacy_seal_key(&recovered_master, b"proteus-ahci-wal-seal-v1"),
+            attest: derive_attest_key(&recovered_master, b"cuttle-quote-v1"),
+        };
+
+        // 2. Boot #1 on standalone node: define NV counter 0x0150_0010 (floor = 0), commit #1,
+        //    advance NV counter to 1, and snapshot the entire validly-sealed disk image.
+        let mut disk = RamDisk::new(4096);
+        let mut store1 = ShellStore::new(AHCI_STATE_LAYOUT, 1216);
+        let floor1 = tpm
+            .nv_ensure_and_read_counter(TPM_NV_INDEX_ROLLBACK_CTR)
+            .unwrap();
+        assert_eq!(floor1, 0);
+        store1.set_min_commit_seq(floor1);
+
+        let mut sh1 = OsShell::empty();
+        sh1.seal_key = keys.seal;
+        sh1.legacy_seal_key = keys.legacy_seal;
+        sh1.attest_key = keys.attest;
+        sh1.seed_defaults_for_boot(1);
+        sh1.set_durable_provisioned(true);
+        store1.boot(&mut disk, &mut sh1, &keys, 1).unwrap();
+
+        let mut out = [0u8; 256];
+        sh1.exec_line(b"write /var/epoch.txt v1", 1, 0, 0, &mut out);
+        let seq1 = match store1.commit(&mut disk, &mut sh1, 1).unwrap() {
+            Committed::Written { commit, .. } => commit.commit_seq,
+            Committed::Unchanged => panic!("expected Written on commit #1"),
+        };
+        assert_eq!(seq1, 1);
+        assert_eq!(
+            tpm.nv_advance_counter_to(TPM_NV_INDEX_ROLLBACK_CTR, seq1)
+                .unwrap(),
+            1
+        );
+        let stale_whole_disk_snapshot = disk.clone();
+
+        // 3. Commit #2 advances both disk and TPM NV monotonic counter to 2:
+        sh1.exec_line(b"write /var/epoch.txt v2", 1, 0, 0, &mut out);
+        let seq2 = match store1.commit(&mut disk, &mut sh1, 1).unwrap() {
+            Committed::Written { commit, .. } => commit.commit_seq,
+            Committed::Unchanged => panic!("expected Written on commit #2"),
+        };
+        assert_eq!(seq2, 2);
+        assert_eq!(
+            tpm.nv_advance_counter_to(TPM_NV_INDEX_ROLLBACK_CTR, seq2)
+                .unwrap(),
+            2
+        );
+
+        // 4. Boot #2 with current disk (commit_seq=2 == TPM NV floor=2) succeeds cleanly:
+        tpm.startup(TPM_SU_CLEAR).unwrap();
+        let floor2 = tpm
+            .nv_ensure_and_read_counter(TPM_NV_INDEX_ROLLBACK_CTR)
+            .unwrap();
+        assert_eq!(floor2, 2);
+        let mut store2 = ShellStore::new(AHCI_STATE_LAYOUT, 1216);
+        store2.set_min_commit_seq(floor2);
+        let mut sh2 = OsShell::empty();
+        assert!(store2.boot(&mut disk, &mut sh2, &keys, 2).is_ok());
+
+        // 5. Attacker replaces the ENTIRE standalone disk (both A/B slots + commit sector +
+        //    paged region) with `stale_whole_disk_snapshot` (`commit_seq = 1`).
+        //    Even without a Triad coordinator, the TPM 2.0 NV monotonic counter (`floor = 2`)
+        //    catches and refuses the whole-disk rollback deterministically!
+        tpm.startup(TPM_SU_CLEAR).unwrap();
+        let floor3 = tpm
+            .nv_ensure_and_read_counter(TPM_NV_INDEX_ROLLBACK_CTR)
+            .unwrap();
+        assert_eq!(floor3, 2);
+        let mut rolled_back_disk = stale_whole_disk_snapshot;
+        let mut store3 = ShellStore::new(AHCI_STATE_LAYOUT, 1216);
+        store3.set_min_commit_seq(floor3);
+        let mut sh3 = OsShell::empty();
+        assert_eq!(
+            store3.boot(&mut rolled_back_disk, &mut sh3, &keys, 3),
+            Err(BootError::Rollback {
+                found: 1,
+                min_expected: 2,
+            })
+        );
     }
 }
 

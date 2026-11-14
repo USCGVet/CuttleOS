@@ -631,6 +631,148 @@ pub(crate) fn banner_tpm() {
     let _ = (TPM_CC_GET_RANDOM,); // suppress unused-import warning if any
 }
 
+/// Stage B6 boot self-proof: TPM 2.0 NV monotonic counter (`0x0150_0010`) + sealed
+/// device-key space (`0x0150_0011`) + standalone `ShellStore` whole-disk rollback rejection.
+///
+/// Emits `TPM_NV_ROLLBACK OK idx=0x01500010 monotonic=verified`.
+#[cfg(not(cuttle_prod))]
+#[inline(never)]
+pub(crate) fn banner_tpm_nv_rollback() {
+    use target_enterprise::durable_seal::{
+        derive_attest_key, derive_legacy_seal_key, derive_seal_key,
+    };
+    use target_enterprise::state_store::{
+        BootError, Committed, IoFault, SectorIo, ShellKeys, ShellStore, AHCI_STATE_LAYOUT,
+        SECTOR_BYTES,
+    };
+    use target_enterprise::tpm::{
+        MemTpmTisBus, TpmTisDriver, TPM_NV_INDEX_DEVICE_KEY, TPM_NV_INDEX_ROLLBACK_CTR,
+        TPM_NV_ORDINARY_ATTRS,
+    };
+
+    #[derive(Clone)]
+    struct MiniDisk {
+        sectors: alloc::vec::Vec<[u8; SECTOR_BYTES]>,
+    }
+    impl MiniDisk {
+        fn new(n: usize) -> Self {
+            Self {
+                sectors: alloc::vec![[0u8; SECTOR_BYTES]; n],
+            }
+        }
+    }
+    impl SectorIo for MiniDisk {
+        fn capacity_sectors(&self) -> u64 {
+            self.sectors.len() as u64
+        }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), IoFault> {
+            let s = self.sectors.get(lba as usize).ok_or(IoFault::OutOfRange)?;
+            out.copy_from_slice(s);
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), IoFault> {
+            let s = self
+                .sectors
+                .get_mut(lba as usize)
+                .ok_or(IoFault::OutOfRange)?;
+            s.copy_from_slice(data);
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), IoFault> {
+            Ok(())
+        }
+    }
+
+    let mut tpm = alloc::boxed::Box::new(TpmTisDriver::new(MemTpmTisBus::new()));
+    if tpm.startup(TPM_SU_CLEAR).is_err() {
+        panic!("TPM_NV_ROLLBACK: startup failed");
+    }
+    let master_in = [0x9Cu8; 32];
+    if tpm
+        .nv_define_space(TPM_NV_INDEX_DEVICE_KEY, TPM_NV_ORDINARY_ATTRS, 32)
+        .is_err()
+        || tpm
+            .nv_write_bytes(TPM_NV_INDEX_DEVICE_KEY, &master_in, 0)
+            .is_err()
+    {
+        panic!("TPM_NV_ROLLBACK: NV device-key define/write failed");
+    }
+    let _ = tpm.startup(TPM_SU_CLEAR);
+    let mut master_out = [0u8; 32];
+    if tpm
+        .nv_read_bytes(TPM_NV_INDEX_DEVICE_KEY, 0, &mut master_out)
+        .is_err()
+        || master_out != master_in
+    {
+        panic!("TPM_NV_ROLLBACK: NV device-key readback mismatch");
+    }
+
+    let keys = ShellKeys {
+        seal: derive_seal_key(&master_out, b"cuttle-ahci-wal-seal-v1"),
+        legacy_seal: derive_legacy_seal_key(&master_out, b"proteus-ahci-wal-seal-v1"),
+        attest: derive_attest_key(&master_out, b"cuttle-quote-v1"),
+    };
+
+    let mut disk = MiniDisk::new(1600);
+    let mut store = alloc::boxed::Box::new(ShellStore::new(AHCI_STATE_LAYOUT, 1216));
+    let f0 = tpm
+        .nv_ensure_and_read_counter(TPM_NV_INDEX_ROLLBACK_CTR)
+        .expect("TPM_NV_ROLLBACK: ensure counter");
+    if f0 != 0 {
+        panic!("TPM_NV_ROLLBACK: initial counter non-zero");
+    }
+    store.set_min_commit_seq(f0);
+    let mut sh = alloc::boxed::Box::new(target_enterprise::OsShell::with_seal_key(keys.seal));
+    sh.legacy_seal_key = keys.legacy_seal;
+    sh.attest_key = keys.attest;
+    sh.set_durable_provisioned(true);
+    if store.boot(&mut disk, &mut sh, &keys, 1).is_err() {
+        panic!("TPM_NV_ROLLBACK: boot #1 failed");
+    }
+    let mut out = [0u8; 128];
+    sh.exec_line(b"write /var/nv.txt gen1", 1, 0, 0, &mut out);
+    let s1 = match store.commit(&mut disk, &mut sh, 1) {
+        Ok(Committed::Written { commit, .. }) => commit.commit_seq,
+        _ => panic!("TPM_NV_ROLLBACK: commit #1 failed"),
+    };
+    if tpm.nv_advance_counter_to(TPM_NV_INDEX_ROLLBACK_CTR, s1) != Ok(1) {
+        panic!("TPM_NV_ROLLBACK: counter advance #1 failed");
+    }
+    let snapshot_gen1 = disk.clone();
+
+    sh.exec_line(b"write /var/nv.txt gen2", 1, 0, 0, &mut out);
+    let s2 = match store.commit(&mut disk, &mut sh, 1) {
+        Ok(Committed::Written { commit, .. }) => commit.commit_seq,
+        _ => panic!("TPM_NV_ROLLBACK: commit #2 failed"),
+    };
+    if tpm.nv_advance_counter_to(TPM_NV_INDEX_ROLLBACK_CTR, s2) != Ok(2) {
+        panic!("TPM_NV_ROLLBACK: counter advance #2 failed");
+    }
+
+    // Warm reboot: TPM NV counter stays at 2; replacing disk with gen1 snapshot must be rejected!
+    let _ = tpm.startup(TPM_SU_CLEAR);
+    let f_reboot = tpm
+        .nv_ensure_and_read_counter(TPM_NV_INDEX_ROLLBACK_CTR)
+        .expect("TPM_NV_ROLLBACK: read reboot counter");
+    if f_reboot != 2 {
+        panic!("TPM_NV_ROLLBACK: counter lost across startup");
+    }
+    let mut stale_disk = snapshot_gen1;
+    let mut store_rb = alloc::boxed::Box::new(ShellStore::new(AHCI_STATE_LAYOUT, 1216));
+    store_rb.set_min_commit_seq(f_reboot);
+    let mut sh_rb = alloc::boxed::Box::new(target_enterprise::OsShell::empty());
+    if store_rb.boot(&mut stale_disk, &mut sh_rb, &keys, 2)
+        != Err(BootError::Rollback {
+            found: 1,
+            min_expected: 2,
+        })
+    {
+        panic!("TPM_NV_ROLLBACK: whole-disk rollback was not rejected");
+    }
+
+    serial_write_str("TPM_NV_ROLLBACK OK idx=0x01500010 monotonic=verified\n");
+}
+
 /// Kernel audit-log subsystem banner (TASK-052).
 ///
 /// Exercises the locked [`AuditLog`] surface: appends three events of
