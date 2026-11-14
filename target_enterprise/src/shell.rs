@@ -81,6 +81,10 @@ pub const SHELL_FS_PART_SECTORS: usize = 32;
 pub const SHELL_FS_PART_BYTES: usize = SHELL_FS_PART_SECTORS * 512;
 /// 8-byte superblock magic for the block-backed filesystem partition (`CTTLFS01`).
 pub const SHELL_FS_MAGIC: &[u8; 8] = b"CTTLFS01";
+/// 8-byte superblock magic for a paged-store-backed filesystem stub (`CTTLFSP1`).
+pub const SHELL_FS_PAGED_MAGIC: &[u8; 8] = b"CTTLFSP1";
+/// 8-byte magic reported by `df` when enterprise paged VFS mode is active (`CTTLPGS1`).
+pub const SHELL_PAGED_DF_MAGIC: &[u8; 8] = b"CTTLPGS1";
 /// Maximum number of tasks in the live OS shell scheduler table.
 pub const SHELL_MAX_TASKS: usize = 16;
 /// Number of audit events retained in the live OS shell audit ring.
@@ -401,6 +405,10 @@ pub struct OsShell {
     line_len: usize,
     /// Set when the current interactive input line exceeded `SHELL_LINE_MAX` (`256` bytes).
     line_overflow: bool,
+    /// Whether enterprise page-granular CoW + CWAL mode (`PagedBlockStore`) is enabled.
+    paged_mode: bool,
+    /// Most recent cryptographic [`crate::paged_store::PagedAnchor`] cross-anchored in the shell WAL header.
+    paged_anchor: crate::paged_store::PagedAnchor,
 }
 
 impl OsShell {
@@ -461,6 +469,8 @@ impl OsShell {
             line_buf: [0u8; SHELL_LINE_MAX],
             line_len: 0,
             line_overflow: false,
+            paged_mode: false,
+            paged_anchor: crate::paged_store::PagedAnchor::zero(),
         }
     }
 
@@ -587,6 +597,368 @@ impl OsShell {
             crate::svc_runtime::derive_service_base_seed_for_boot(&self.seal_key, boot_gen.max(1));
         self.svc
             .init_role(crate::svc_runtime::NodeRole::Full, base_seed);
+        if self.paged_mode {
+            self.db.set_paged_mode(true);
+            self.fs.set_paged_mode(true);
+        }
+    }
+
+    /// Whether enterprise page-granular CoW + CWAL mode (`PagedBlockStore`) is enabled.
+    pub const fn is_paged_mode(&self) -> bool {
+        self.paged_mode
+    }
+
+    /// Enable or disable enterprise page-granular mode across `OsShell`, `SqlDb`, and `MemRamFs`.
+    pub fn set_paged_mode(&mut self, enabled: bool) {
+        self.paged_mode = enabled;
+        self.db.set_paged_mode(enabled);
+        self.fs.set_paged_mode(enabled);
+        if !enabled {
+            self.paged_anchor = crate::paged_store::PagedAnchor::zero();
+        }
+    }
+
+    /// Return the most recent [`crate::paged_store::PagedAnchor`] bound to this shell's WAL header.
+    pub const fn paged_anchor(&self) -> crate::paged_store::PagedAnchor {
+        self.paged_anchor
+    }
+
+    /// Update the [`crate::paged_store::PagedAnchor`] to be cross-anchored on the next `pack_state_image`.
+    pub fn set_paged_anchor(&mut self, anchor: crate::paged_store::PagedAnchor) {
+        self.paged_anchor = anchor;
+    }
+
+    /// Re-mark all `SqlDb` and `MemRamFs` pages dirty so a retry after an I/O fault resyncs in full.
+    pub fn mark_all_paged_dirty(&mut self) {
+        self.db.mark_all_paged_dirty();
+        self.fs.mark_all_paged_dirty();
+    }
+
+    /// Count `(user_files, user_bytes)` across all non-default VFS inodes.
+    pub fn user_file_summary(&self) -> (u32, u32) {
+        let mut files = 0u32;
+        let mut bytes = 0u32;
+        let max_ino = self.fs.max_inodes();
+        let mut i = 0usize;
+        while i < max_ino {
+            if let Some((path, data)) = self.fs.inode_data(i) {
+                if !is_default_system_file(path) {
+                    files = files.saturating_add(1);
+                    bytes = bytes.saturating_add(data.len() as u32);
+                }
+            }
+            i += 1;
+        }
+        (files, bytes)
+    }
+
+    /// Incrementally synchronize dirty VFS directory groups (`PageDomain::VfsDir`) and dirty
+    /// 4,000-byte file chunks (`PageDomain::VfsData`) into `store` (`O(dirty pages)`).
+    pub fn sync_vfs_to_paged_store(
+        &mut self,
+        store: &mut crate::paged_store::PagedBlockStore,
+        max_logical: usize,
+    ) -> Result<usize, crate::paged_store::PagedStoreError> {
+        use crate::paged_store::{PageDomain, PAGED_PAGE_PAYLOAD_BYTES};
+        if !self.paged_mode {
+            return Ok(0);
+        }
+        const VFS_DIR_GROUPS: usize = 8;
+        const VFS_INODES_PER_DIR_PAGE: usize = 12;
+        const VFS_DATA_CHUNK_CAP: usize = 4000;
+        const VFS_MAX_CHUNKS_PER_INODE: usize = 9;
+        const VFS_DIR_PAGE_MAGIC: &[u8; 8] = b"CTTLVFD1";
+        const VFS_DATA_PAGE_MAGIC: &[u8; 8] = b"CTTLVDT1";
+
+        let mut page_buf = alloc::vec![0u8; PAGED_PAGE_PAYLOAD_BYTES];
+        let mut mutated = 0usize;
+        let mut group_idx = 0usize;
+        while group_idx < VFS_DIR_GROUPS {
+            let base_slot = group_idx * VFS_INODES_PER_DIR_PAGE;
+            let mut group_dirty = false;
+            let mut s = 0usize;
+            while s < VFS_INODES_PER_DIR_PAGE {
+                if self.fs.is_inode_dirty(base_slot + s) {
+                    group_dirty = true;
+                    break;
+                }
+                s += 1;
+            }
+            if !group_dirty {
+                group_idx += 1;
+                continue;
+            }
+
+            let mut off = 0usize;
+            while off < VFS_INODES_PER_DIR_PAGE {
+                let slot_idx = base_slot + off;
+                if self.fs.is_inode_dirty(slot_idx) {
+                    let mut needed_chunks = 0usize;
+                    if let Some((path, data)) = self.fs.inode_data(slot_idx) {
+                        if !is_default_system_file(path) {
+                            if path.is_empty()
+                                || path.len() > SHELL_MAX_WRITABLE_PATH
+                                || data.len() > crate::vfs::PAGED_VFS_MAX_FILE_BYTES
+                            {
+                                return Err(crate::paged_store::PagedStoreError::CorruptOrTampered);
+                            }
+                            needed_chunks = if data.is_empty() {
+                                0
+                            } else {
+                                (data.len() + VFS_DATA_CHUNK_CAP - 1) / VFS_DATA_CHUNK_CAP
+                            };
+                            let mut c = 0usize;
+                            while c < needed_chunks {
+                                let start = c * VFS_DATA_CHUNK_CAP;
+                                let clen = (data.len() - start).min(VFS_DATA_CHUNK_CAP);
+                                page_buf[0..8].copy_from_slice(VFS_DATA_PAGE_MAGIC);
+                                page_buf[8..10].copy_from_slice(&(slot_idx as u16).to_le_bytes());
+                                page_buf[10..12].copy_from_slice(&(c as u16).to_le_bytes());
+                                page_buf[12..14].copy_from_slice(&(clen as u16).to_le_bytes());
+                                page_buf[14..16].copy_from_slice(&0u16.to_le_bytes());
+                                page_buf[16..16 + clen]
+                                    .copy_from_slice(&data[start..start + clen]);
+                                let owner_id = ((slot_idx as u32) << 8) | (c as u32);
+                                store.upsert_owned_page(
+                                    PageDomain::VfsData,
+                                    owner_id,
+                                    &page_buf[..16 + clen],
+                                    max_logical,
+                                )?;
+                                mutated += 1;
+                                c += 1;
+                            }
+                        }
+                    }
+                    let mut stale_c = needed_chunks;
+                    while stale_c < VFS_MAX_CHUNKS_PER_INODE {
+                        let owner_id = ((slot_idx as u32) << 8) | (stale_c as u32);
+                        if store.remove_owned_page(PageDomain::VfsData, owner_id)? {
+                            mutated += 1;
+                        }
+                        stale_c += 1;
+                    }
+                }
+                off += 1;
+            }
+
+            page_buf[0..8].copy_from_slice(VFS_DIR_PAGE_MAGIC);
+            page_buf[8..10].copy_from_slice(&(group_idx as u16).to_le_bytes());
+            page_buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+            let mut entry_count = 0u16;
+            let mut pos = 16usize;
+            let mut scan = 0usize;
+            while scan < VFS_INODES_PER_DIR_PAGE {
+                let slot_idx = base_slot + scan;
+                if let Some((path, data)) = self.fs.inode_data(slot_idx) {
+                    if !is_default_system_file(path) {
+                        let mtime = self.fs.inode_mtime(slot_idx).unwrap_or(0);
+                        page_buf[pos..pos + 2].copy_from_slice(&(slot_idx as u16).to_le_bytes());
+                        page_buf[pos + 2..pos + 4]
+                            .copy_from_slice(&(path.len() as u16).to_le_bytes());
+                        page_buf[pos + 4..pos + 8]
+                            .copy_from_slice(&(data.len() as u32).to_le_bytes());
+                        page_buf[pos + 8..pos + 16].copy_from_slice(&mtime.to_le_bytes());
+                        page_buf[pos + 16..pos + 16 + path.len()].copy_from_slice(path);
+                        pos += 16 + path.len();
+                        entry_count += 1;
+                    }
+                }
+                scan += 1;
+            }
+            page_buf[10..12].copy_from_slice(&entry_count.to_le_bytes());
+            if entry_count > 0 {
+                store.upsert_owned_page(
+                    PageDomain::VfsDir,
+                    group_idx as u32,
+                    &page_buf[..pos],
+                    max_logical,
+                )?;
+                mutated += 1;
+            } else if store.remove_owned_page(PageDomain::VfsDir, group_idx as u32)? {
+                mutated += 1;
+            }
+            group_idx += 1;
+        }
+        self.fs.clear_paged_dirty();
+        Ok(mutated)
+    }
+
+    /// Reconstruct all non-default VFS user files from `store` (`PageDomain::VfsDir` + `PageDomain::VfsData`),
+    /// preserving exact inode slot placement and rejecting any malformed, truncated, or unreferenced page.
+    pub fn load_vfs_from_paged_store(
+        &mut self,
+        store: &crate::paged_store::PagedBlockStore,
+    ) -> Result<(usize, usize), crate::paged_store::PagedStoreError> {
+        use crate::paged_store::{PageDomain, PagedStoreError, PAGED_PAGE_PAYLOAD_BYTES};
+        if !self.paged_mode {
+            self.set_paged_mode(true);
+        }
+        const VFS_DIR_GROUPS: usize = 8;
+        const VFS_INODES_PER_DIR_PAGE: usize = 12;
+        const VFS_DATA_CHUNK_CAP: usize = 4000;
+        const VFS_MAX_CHUNKS_PER_INODE: usize = 9;
+        const VFS_DIR_PAGE_MAGIC: &[u8; 8] = b"CTTLVFD1";
+        const VFS_DATA_PAGE_MAGIC: &[u8; 8] = b"CTTLVDT1";
+
+        let max_ino = self.fs.max_inodes();
+        let mut stale = [0u8; cuttle_contracts::FS_PATH_MAX];
+        let mut idx = 0usize;
+        while idx < max_ino {
+            let stale_len = match self.fs.inode_entry(idx) {
+                Some((path, _)) if !is_default_system_file(path) => {
+                    stale[..path.len()].copy_from_slice(path);
+                    path.len()
+                }
+                _ => 0,
+            };
+            if stale_len > 0 {
+                self.fs
+                    .unlink(&stale[..stale_len])
+                    .map_err(|_| PagedStoreError::CorruptOrTampered)?;
+            }
+            idx += 1;
+        }
+
+        let mut dir_buf = alloc::vec![0u8; PAGED_PAGE_PAYLOAD_BYTES];
+        let mut chunk_buf = alloc::vec![0u8; PAGED_PAGE_PAYLOAD_BYTES];
+        let mut file_data = alloc::vec::Vec::new();
+        let mut norm_buf = [0u8; cuttle_contracts::FS_PATH_MAX];
+        let mut total_files = 0usize;
+        let mut total_bytes = 0usize;
+        let mut consumed_dir_pages = 0usize;
+        let mut consumed_data_pages = 0usize;
+
+        let mut group_idx = 0usize;
+        while group_idx < VFS_DIR_GROUPS {
+            let Some(dlen) =
+                store.read_owned_page(PageDomain::VfsDir, group_idx as u32, &mut dir_buf)?
+            else {
+                group_idx += 1;
+                continue;
+            };
+            consumed_dir_pages += 1;
+            if dlen < 16 || &dir_buf[0..8] != VFS_DIR_PAGE_MAGIC {
+                return Err(PagedStoreError::CorruptOrTampered);
+            }
+            let hdr_group = u16::from_le_bytes([dir_buf[8], dir_buf[9]]) as usize;
+            let entry_count = u16::from_le_bytes([dir_buf[10], dir_buf[11]]) as usize;
+            let rsvd = u32::from_le_bytes([dir_buf[12], dir_buf[13], dir_buf[14], dir_buf[15]]);
+            if hdr_group != group_idx
+                || entry_count == 0
+                || entry_count > VFS_INODES_PER_DIR_PAGE
+                || rsvd != 0
+            {
+                return Err(PagedStoreError::CorruptOrTampered);
+            }
+
+            let base_slot = group_idx * VFS_INODES_PER_DIR_PAGE;
+            let mut prev_slot: Option<usize> = None;
+            let mut pos = 16usize;
+            let mut e = 0usize;
+            while e < entry_count {
+                if pos + 16 > dlen {
+                    return Err(PagedStoreError::CorruptOrTampered);
+                }
+                let slot_idx = u16::from_le_bytes([dir_buf[pos], dir_buf[pos + 1]]) as usize;
+                let plen = u16::from_le_bytes([dir_buf[pos + 2], dir_buf[pos + 3]]) as usize;
+                let flen = u32::from_le_bytes([
+                    dir_buf[pos + 4],
+                    dir_buf[pos + 5],
+                    dir_buf[pos + 6],
+                    dir_buf[pos + 7],
+                ]) as usize;
+                let mtime = u64::from_le_bytes([
+                    dir_buf[pos + 8],
+                    dir_buf[pos + 9],
+                    dir_buf[pos + 10],
+                    dir_buf[pos + 11],
+                    dir_buf[pos + 12],
+                    dir_buf[pos + 13],
+                    dir_buf[pos + 14],
+                    dir_buf[pos + 15],
+                ]);
+                if slot_idx < base_slot
+                    || slot_idx >= base_slot + VFS_INODES_PER_DIR_PAGE
+                    || prev_slot.is_some_and(|p| slot_idx <= p)
+                    || plen == 0
+                    || plen > SHELL_MAX_WRITABLE_PATH
+                    || pos + 16 + plen > dlen
+                    || flen > crate::vfs::PAGED_VFS_MAX_FILE_BYTES
+                {
+                    return Err(PagedStoreError::CorruptOrTampered);
+                }
+                prev_slot = Some(slot_idx);
+                let raw_path = &dir_buf[pos + 16..pos + 16 + plen];
+                pos += 16 + plen;
+                let WritablePathPolicy::Allowed(nlen) =
+                    check_writable_vfs_path(raw_path, &mut norm_buf)
+                else {
+                    return Err(PagedStoreError::CorruptOrTampered);
+                };
+                if nlen != plen || &norm_buf[..nlen] != raw_path {
+                    return Err(PagedStoreError::CorruptOrTampered);
+                }
+
+                file_data.clear();
+                let needed_chunks = if flen == 0 {
+                    0
+                } else {
+                    (flen + VFS_DATA_CHUNK_CAP - 1) / VFS_DATA_CHUNK_CAP
+                };
+                let mut c = 0usize;
+                while c < needed_chunks {
+                    let expected_chunk = (flen - c * VFS_DATA_CHUNK_CAP).min(VFS_DATA_CHUNK_CAP);
+                    let owner_id = ((slot_idx as u32) << 8) | (c as u32);
+                    let Some(clen_page) =
+                        store.read_owned_page(PageDomain::VfsData, owner_id, &mut chunk_buf)?
+                    else {
+                        return Err(PagedStoreError::CorruptOrTampered);
+                    };
+                    consumed_data_pages += 1;
+                    if clen_page != 16 + expected_chunk || &chunk_buf[0..8] != VFS_DATA_PAGE_MAGIC {
+                        return Err(PagedStoreError::CorruptOrTampered);
+                    }
+                    let c_slot = u16::from_le_bytes([chunk_buf[8], chunk_buf[9]]) as usize;
+                    let c_idx = u16::from_le_bytes([chunk_buf[10], chunk_buf[11]]) as usize;
+                    let c_len = u16::from_le_bytes([chunk_buf[12], chunk_buf[13]]) as usize;
+                    let c_rsvd = u16::from_le_bytes([chunk_buf[14], chunk_buf[15]]);
+                    if c_slot != slot_idx || c_idx != c || c_len != expected_chunk || c_rsvd != 0 {
+                        return Err(PagedStoreError::CorruptOrTampered);
+                    }
+                    file_data.extend_from_slice(&chunk_buf[16..16 + expected_chunk]);
+                    c += 1;
+                }
+                if needed_chunks < VFS_MAX_CHUNKS_PER_INODE {
+                    let trailing_id = ((slot_idx as u32) << 8) | (needed_chunks as u32);
+                    if store
+                        .read_owned_page(PageDomain::VfsData, trailing_id, &mut chunk_buf)?
+                        .is_some()
+                    {
+                        return Err(PagedStoreError::CorruptOrTampered);
+                    }
+                }
+                self.fs
+                    .seed_file_at_slot(slot_idx, &norm_buf[..nlen], &file_data, mtime)
+                    .map_err(|_| PagedStoreError::CorruptOrTampered)?;
+                total_files += 1;
+                total_bytes = total_bytes.saturating_add(flen);
+                e += 1;
+            }
+            if pos != dlen {
+                return Err(PagedStoreError::CorruptOrTampered);
+            }
+            group_idx += 1;
+        }
+
+        if store.count_domain_pages(PageDomain::VfsDir) != consumed_dir_pages
+            || store.count_domain_pages(PageDomain::VfsData) != consumed_data_pages
+        {
+            return Err(PagedStoreError::CorruptOrTampered);
+        }
+
+        self.fs.clear_paged_dirty();
+        Ok((total_files, total_bytes))
     }
 
     /// Mix external entropy (such as `rdtsc` jitter or hardware RNG words) into the
@@ -1327,12 +1699,17 @@ impl OsShell {
         image: &crate::state_store::StateImage,
     ) -> Result<StateRestore, StateRestoreError> {
         let legacy_header = bytes_eq(&image.wal[0][0..4], b"PRTS");
-        let (saved_boots, wal) = self
-            .validate_journal_sectors(&image.wal)
+        let (saved_boots, wal, extracted_anchor) = self
+            .validate_journal_sectors_with_anchor(&image.wal)
             .map_err(|_| StateRestoreError::Journal { legacy_header })?;
 
         let blank = |part: &[[u8; 512]]| part.iter().all(|s| s.iter().all(|&b| b == 0));
         let check_fs = !(legacy_header && blank(&image.fs));
+        let fs_is_paged_stub = check_fs && bytes_eq(&image.fs[0][0..8], SHELL_FS_PAGED_MAGIC);
+        if fs_is_paged_stub && (!self.paged_mode || !extracted_anchor.is_active()) {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:fs:paged-anchor-missing");
+            return Err(StateRestoreError::Filesystem);
+        }
         if check_fs {
             let (generation, _, _) = self
                 .validate_fs_partition_generic(
@@ -1349,6 +1726,13 @@ impl OsShell {
         }
 
         let check_sql = !(legacy_header && blank(&image.sql));
+        let sql_is_paged_stub = check_sql
+            && bytes_eq(&image.sql[0][0..8], crate::sql::SQL_PART_MAGIC)
+            && (image.sql[0][18] & crate::sql::SQL_PART_FLAG_PAGED) != 0;
+        if sql_is_paged_stub && (!self.paged_mode || !extracted_anchor.is_active()) {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:sql:paged-anchor-missing");
+            return Err(StateRestoreError::Sql);
+        }
         if check_sql
             && !crate::sql::SqlDb::validate_partition_slices(
                 &self.seal_key,
@@ -1376,6 +1760,7 @@ impl OsShell {
             }
             migrated |= bytes_eq(&image.sql[0][0..4], b"PRTS");
         }
+        self.paged_anchor = extracted_anchor;
 
         Ok(StateRestore {
             saved_boots,
@@ -1747,8 +2132,9 @@ impl OsShell {
         });
 
         let mut count = 0usize;
+        let max_ino = self.fs.max_inodes();
         let mut i = 0usize;
-        while i < SHELL_FS_INODES {
+        while i < max_ino {
             if let Some((path, data)) = self.fs.inode_data(i) {
                 if !is_default_system_file(path) && path.len() <= 128 && data.len() <= 256 {
                     let mut rec = [0u8; 390];
@@ -2111,16 +2497,37 @@ impl OsShell {
         seal_bytes_keyed(&self.seal_key, &hdr_msg, &mut hdr_seal);
         sectors[0][52..84].copy_from_slice(&hdr_seal);
 
+        if self.paged_anchor.is_active() {
+            let mut anchor_buf = [0u8; crate::paged_store::WAL_PAGED_ANCHOR_BYTES];
+            let mut hdr_prefix = [0u8; 84];
+            hdr_prefix.copy_from_slice(&sectors[0][0..84]);
+            crate::paged_store::pack_wal_paged_anchor(
+                &self.seal_key,
+                &hdr_prefix,
+                &self.paged_anchor,
+                &mut anchor_buf,
+            );
+            sectors[0][184..184 + crate::paged_store::WAL_PAGED_ANCHOR_BYTES]
+                .copy_from_slice(&anchor_buf);
+        }
+
         let mut sec_mac = [0u8; DURABLE_DIGEST_LEN];
         compute_journal_sectors_seal(&self.seal_key, sectors, &mut sec_mac);
         sectors[0][84..84 + DURABLE_DIGEST_LEN].copy_from_slice(&sec_mac);
         Ok(count)
     }
 
-    fn validate_journal_sectors(
+    fn validate_journal_sectors_with_anchor(
         &mut self,
         sectors: &[[u8; 512]; SHELL_JOURNAL_PART_SECTORS],
-    ) -> Result<(u64, WalImpl<SHELL_JOURNAL_BYTES>), WalError> {
+    ) -> Result<
+        (
+            u64,
+            WalImpl<SHELL_JOURNAL_BYTES>,
+            crate::paged_store::PagedAnchor,
+        ),
+        WalError,
+    > {
         let hdr_sector = &sectors[0];
         let is_legacy = bytes_eq(&hdr_sector[0..8], b"PRTSSHL1");
         if !bytes_eq(&hdr_sector[0..8], b"CTTLSHL1") && !is_legacy {
@@ -2174,7 +2581,7 @@ impl OsShell {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:wal:seal-mismatch");
                 return Err(WalError::PayloadTooLarge);
             }
-            Ok((saved_boots, wal))
+            Ok((saved_boots, wal, crate::paged_store::PagedAnchor::zero()))
         } else {
             if !is_seal_key_set(&self.seal_key) {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:wal:key-unset");
@@ -2197,6 +2604,30 @@ impl OsShell {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:wal:sector-seal-mismatch");
                 return Err(WalError::PayloadTooLarge);
             }
+            let mut anchor_slice = [0u8; crate::paged_store::WAL_PAGED_ANCHOR_BYTES];
+            anchor_slice.copy_from_slice(
+                &hdr_sector[184..184 + crate::paged_store::WAL_PAGED_ANCHOR_BYTES],
+            );
+            let extracted_anchor =
+                if anchor_slice == [0u8; crate::paged_store::WAL_PAGED_ANCHOR_BYTES] {
+                    crate::paged_store::PagedAnchor::zero()
+                } else {
+                    let mut hdr_prefix = [0u8; 84];
+                    hdr_prefix.copy_from_slice(&hdr_sector[0..84]);
+                    let Ok(Some(anc)) = crate::paged_store::unpack_wal_paged_anchor(
+                        &self.seal_key,
+                        &hdr_prefix,
+                        &anchor_slice,
+                    ) else {
+                        self.record_audit(
+                            21,
+                            AuditVerdict::Denied,
+                            b"shell:wal:paged-anchor-tamper",
+                        );
+                        return Err(WalError::PayloadTooLarge);
+                    };
+                    anc
+                };
             if wal.durable_cursor() != cursor {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:wal:frame-corrupt");
                 return Err(WalError::PayloadTooLarge);
@@ -2207,7 +2638,7 @@ impl OsShell {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:wal:seal-mismatch");
                 return Err(WalError::PayloadTooLarge);
             }
-            Ok((saved_boots, wal))
+            Ok((saved_boots, wal, extracted_anchor))
         }
     }
 
@@ -2217,8 +2648,9 @@ impl OsShell {
         &mut self,
         sectors: &[[u8; 512]; SHELL_JOURNAL_PART_SECTORS],
     ) -> Result<(u64, usize), WalError> {
-        let (saved_boots, wal) = self.validate_journal_sectors(sectors)?;
+        let (saved_boots, wal, anchor) = self.validate_journal_sectors_with_anchor(sectors)?;
         let applied = self.restore_wal(&wal);
+        self.paged_anchor = anchor;
         Ok((saved_boots, applied))
     }
 
@@ -2392,10 +2824,43 @@ impl OsShell {
             s += 1;
         }
 
+        let max_ino = self.fs.max_inodes();
+        let mut total_user_files = 0usize;
+        let mut total_user_bytes = 0usize;
+        let mut scan = 0usize;
+        while scan < max_ino {
+            if let Some((path, data)) = self.fs.inode_data(scan) {
+                if !is_default_system_file(path) {
+                    if path.is_empty() || path.len() > SHELL_MAX_WRITABLE_PATH {
+                        return Err(WalError::PayloadTooLarge);
+                    }
+                    total_user_files = total_user_files.saturating_add(1);
+                    total_user_bytes = total_user_bytes.saturating_add(data.len());
+                }
+            }
+            scan += 1;
+        }
+
+        if self.paged_mode && (total_user_files > max_inodes || total_user_bytes > max_pool) {
+            if total_user_files > crate::vfs::PAGED_VFS_MAX_INODES
+                || total_user_bytes > crate::vfs::PAGED_VFS_MAX_POOL
+            {
+                return Err(WalError::OutOfCapacity);
+            }
+            sectors[0][0..8].copy_from_slice(SHELL_FS_PAGED_MAGIC);
+            sectors[0][8..16].copy_from_slice(&generation.to_le_bytes());
+            sectors[0][16..20].copy_from_slice(&(total_user_files as u32).to_le_bytes());
+            sectors[0][20..24].copy_from_slice(&(total_user_bytes as u32).to_le_bytes());
+            let mut seal = [0u8; DURABLE_DIGEST_LEN];
+            compute_fs_partition_seal(&self.seal_key, sectors, &mut seal);
+            sectors[0][24..24 + DURABLE_DIGEST_LEN].copy_from_slice(&seal);
+            return Ok((total_user_files, total_user_bytes));
+        }
+
         let mut file_count = 0usize;
         let mut data_cursor = 0usize;
         let mut i = 0usize;
-        while i < SHELL_FS_INODES {
+        while i < max_ino {
             if let Some((path, data)) = self.fs.inode_data(i) {
                 if !is_default_system_file(path) {
                     if path.is_empty() || path.len() > SHELL_MAX_WRITABLE_PATH {
@@ -2522,7 +2987,8 @@ impl OsShell {
         ext_start_sec: usize,
     ) -> Result<(u64, usize, usize), WalError> {
         let is_legacy = bytes_eq(&sectors[0][0..8], b"PRTSFS01");
-        if !bytes_eq(&sectors[0][0..8], SHELL_FS_MAGIC) && !is_legacy {
+        let is_paged_stub = bytes_eq(&sectors[0][0..8], SHELL_FS_PAGED_MAGIC);
+        if !bytes_eq(&sectors[0][0..8], SHELL_FS_MAGIC) && !is_legacy && !is_paged_stub {
             self.record_audit(21, AuditVerdict::Denied, b"shell:fs:magic-corrupt");
             return Err(WalError::PayloadTooLarge);
         }
@@ -2548,6 +3014,28 @@ impl OsShell {
             sectors[0][22],
             sectors[0][23],
         ]) as usize;
+        if is_paged_stub {
+            if !self.paged_mode
+                || file_count > crate::vfs::PAGED_VFS_MAX_INODES
+                || data_bytes > crate::vfs::PAGED_VFS_MAX_POOL
+            {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:fs:bounds-overflow");
+                return Err(WalError::OutOfCapacity);
+            }
+            let mut expected_seal = [0u8; DURABLE_DIGEST_LEN];
+            expected_seal.copy_from_slice(&sectors[0][24..24 + DURABLE_DIGEST_LEN]);
+            if !is_seal_key_set(&self.seal_key)
+                || !verify_fs_partition_seal(&self.seal_key, sectors, &expected_seal)
+            {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:fs:seal-mismatch");
+                return Err(WalError::PayloadTooLarge);
+            }
+            if !sectors[1..].iter().all(|s| s.iter().all(|&b| b == 0)) {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:fs:dirent-corrupt");
+                return Err(WalError::PayloadTooLarge);
+            }
+            return Ok((generation, file_count, data_bytes));
+        }
         if file_count > max_inodes || data_bytes > max_pool {
             self.record_audit(21, AuditVerdict::Denied, b"shell:fs:bounds-overflow");
             return Err(WalError::OutOfCapacity);
@@ -2614,10 +3102,12 @@ impl OsShell {
             sectors[0][22],
             sectors[0][23],
         ]) as usize;
+        let is_paged_stub = bytes_eq(&sectors[0][0..8], SHELL_FS_PAGED_MAGIC);
         let mut norm_path_buf = [0u8; cuttle_contracts::FS_PATH_MAX];
 
+        let max_ino = self.fs.max_inodes();
         let mut i = 0usize;
-        while i < SHELL_FS_INODES {
+        while i < max_ino {
             let mut stale = [0u8; cuttle_contracts::FS_PATH_MAX];
             let stale_len = match self.fs.inode_entry(i) {
                 Some((path, _)) if !is_default_system_file(path) => {
@@ -2631,6 +3121,9 @@ impl OsShell {
                 return Err(WalError::OutOfCapacity);
             }
             i += 1;
+        }
+        if is_paged_stub {
+            return Ok((generation, file_count, data_bytes));
         }
 
         let mut later_bytes = exact_bytes;
@@ -2703,8 +3196,9 @@ impl OsShell {
         let mut hasher = Sha256::new();
         hasher.update(b"cuttle-state-seal-v2\0");
 
+        let max_ino = self.fs.max_inodes();
         let mut i = 0usize;
-        while i < SHELL_FS_INODES {
+        while i < max_ino {
             if let Some((path, data)) = self.fs.inode_data(i) {
                 hasher.update(&(path.len() as u32).to_be_bytes());
                 hasher.update(path);
@@ -2887,7 +3381,7 @@ impl OsShell {
         if bytes_eq(cmd, b"help") || bytes_eq(cmd, b"?") {
             self.record_audit(1, AuditVerdict::Allowed, b"shell:help");
             let n = copy_into(
-                b"commands: help uname status ps smp threads service spawn kill caps grant revoke syscall seccomp exec ima fw seal attest ls cat write rm stat df sync sql vault guard cron session net audit halt reboot\n",
+                b"commands: help uname status ps smp threads service spawn kill caps grant revoke syscall seccomp exec ima fw seal attest ls cat write append cp rm stat df sync sql vault guard cron session net audit halt reboot\n",
                 out,
             );
             return ShellAction::Continue(n);
@@ -3038,6 +3532,16 @@ impl OsShell {
 
         if bytes_eq(cmd, b"write") {
             let n = self.cmd_write(rest, out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"append") {
+            let n = self.cmd_append(rest, out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"cp") {
+            let n = self.cmd_cp(rest, out);
             return ShellAction::Continue(n);
         }
 
@@ -3713,8 +4217,9 @@ impl OsShell {
 
     fn cmd_ls(&self, out: &mut [u8]) -> usize {
         let mut pos = 0usize;
+        let max_ino = self.fs.max_inodes();
         let mut i = 0usize;
-        while i < SHELL_FS_INODES {
+        while i < max_ino {
             if let Some((path, len)) = self.fs.inode_entry(i) {
                 pos += copy_into(path, &mut out[pos..]);
                 pos += copy_into(b" (", &mut out[pos..]);
@@ -3980,6 +4485,224 @@ impl OsShell {
         pos
     }
 
+    fn cmd_append(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        if self
+            .svc
+            .mediate_endpoint(
+                crate::svc_runtime::IpcOp::VfsWrite,
+                false,
+                true,
+                &mut self.audit,
+            )
+            .is_err()
+        {
+            return copy_into(
+                b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                out,
+            );
+        }
+        if !self.durable_provisioned {
+            self.record_audit(9, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+            return copy_into(DURABLE_UNPROVISIONED_MSG, out);
+        }
+        let (path, content) = split_shell_path(arg);
+        if path.is_empty() || content.is_empty() {
+            self.record_audit(9, AuditVerdict::Error, b"shell:append:bad-args");
+            return copy_into(b"usage: append <path> <text>\n", out);
+        }
+        let mut norm_path = [0u8; cuttle_contracts::FS_PATH_MAX];
+        let cpath = match check_writable_vfs_path(path, &mut norm_path) {
+            WritablePathPolicy::Protected => {
+                self.record_audit(9, AuditVerdict::Denied, b"shell:append:protected");
+                return copy_into(b"error: permission denied (immutable system file)\n", out);
+            }
+            WritablePathPolicy::Allowed(nlen) => &norm_path[..nlen],
+            WritablePathPolicy::Invalid => {
+                self.record_audit(9, AuditVerdict::Error, b"shell:append:open-failed");
+                return copy_into(b"error: cannot open path for write\n", out);
+            }
+        };
+        if content.len() >= SHELL_LINE_MAX {
+            self.record_audit(9, AuditVerdict::Error, b"shell:append:too-large");
+            return copy_into(b"error: append payload exceeds maximum length\n", out);
+        }
+        let mut payload = [0u8; SHELL_LINE_MAX];
+        let mut plen = copy_into(content, &mut payload);
+        if plen < payload.len() {
+            payload[plen] = b'\n';
+            plen += 1;
+        }
+        let existing_len = match self.fs.stat(cpath) {
+            Ok(st) => Some(st.size as usize),
+            Err(_) => None,
+        };
+        let cur_len = existing_len.unwrap_or(0);
+        let new_len = cur_len.saturating_add(plen);
+        if self.paged_mode && new_len > crate::vfs::PAGED_VFS_MAX_FILE_BYTES {
+            self.record_audit(9, AuditVerdict::Error, b"shell:append:nospace");
+            return copy_into(FS_NO_SPACE_MSG, out);
+        }
+        if existing_len.is_none() && !self.fs.can_replace(cpath, plen) {
+            self.record_audit(9, AuditVerdict::Error, b"shell:append:nospace");
+            return copy_into(FS_NO_SPACE_MSG, out);
+        }
+        let h = match self.fs.open(cpath, FS_O_RDWR | FS_O_CREATE) {
+            Ok(h) => h,
+            Err(cuttle_contracts::FsError::NoSpace) => {
+                self.record_audit(9, AuditVerdict::Error, b"shell:append:nospace");
+                return copy_into(FS_NO_SPACE_MSG, out);
+            }
+            Err(_) => {
+                self.record_audit(9, AuditVerdict::Error, b"shell:append:open-failed");
+                return copy_into(b"error: cannot open path for write\n", out);
+            }
+        };
+        let written = match self.fs.write(h, cur_len as u64, &payload[..plen]) {
+            Ok(w) => w,
+            Err(cuttle_contracts::FsError::NoSpace) => {
+                let _ = self.fs.close(h);
+                self.record_audit(9, AuditVerdict::Error, b"shell:append:nospace");
+                return copy_into(FS_NO_SPACE_MSG, out);
+            }
+            Err(_) => {
+                let _ = self.fs.close(h);
+                self.record_audit(9, AuditVerdict::Error, b"shell:append:io-err");
+                return copy_into(b"error: write failed\n", out);
+            }
+        };
+        let _ = self.fs.close(h);
+        self.record_audit(9, AuditVerdict::Allowed, b"shell:append");
+        let mut pos = 0usize;
+        pos += copy_into(b"appended ", &mut out[pos..]);
+        pos += dec_u64(written as u64, &mut out[pos..]);
+        pos += copy_into(b" bytes to ", &mut out[pos..]);
+        pos += copy_into(path, &mut out[pos..]);
+        pos += copy_into(b" (size=", &mut out[pos..]);
+        pos += dec_u64(new_len as u64, &mut out[pos..]);
+        pos += copy_into(b")\n", &mut out[pos..]);
+        pos
+    }
+
+    fn cmd_cp(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
+        if self
+            .svc
+            .mediate_endpoint(
+                crate::svc_runtime::IpcOp::VfsWrite,
+                false,
+                true,
+                &mut self.audit,
+            )
+            .is_err()
+        {
+            return copy_into(
+                b"error: EACCES (svc-sh disabled by node role or policy)\n",
+                out,
+            );
+        }
+        if !self.durable_provisioned {
+            self.record_audit(9, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+            return copy_into(DURABLE_UNPROVISIONED_MSG, out);
+        }
+        let trimmed = trim_ascii(arg);
+        if trimmed.is_empty() {
+            self.record_audit(9, AuditVerdict::Error, b"shell:cp:bad-args");
+            return copy_into(b"usage: cp <src> <dst>\n", out);
+        }
+        let (src_raw, rest) = split_shell_path(trimmed);
+        if src_raw.is_empty() || rest.is_empty() {
+            self.record_audit(9, AuditVerdict::Error, b"shell:cp:bad-args");
+            return copy_into(b"usage: cp <src> <dst>\n", out);
+        }
+        let (dst_raw, trailing) = split_shell_path(rest);
+        if dst_raw.is_empty() || !trim_ascii(trailing).is_empty() {
+            self.record_audit(9, AuditVerdict::Error, b"shell:cp:bad-args");
+            return copy_into(b"usage: cp <src> <dst>\n", out);
+        }
+
+        let mut norm_src = [0u8; cuttle_contracts::FS_PATH_MAX];
+        let Ok(src_nlen) = crate::vfs::normalise_path(src_raw, &mut norm_src) else {
+            self.record_audit(9, AuditVerdict::Error, b"shell:cp:bad-src");
+            return copy_into(b"error: source file not found\n", out);
+        };
+        let src_cpath = &norm_src[..src_nlen];
+
+        let mut norm_dst = [0u8; cuttle_contracts::FS_PATH_MAX];
+        let dst_cpath = match check_writable_vfs_path(dst_raw, &mut norm_dst) {
+            WritablePathPolicy::Protected => {
+                self.record_audit(9, AuditVerdict::Denied, b"shell:cp:protected");
+                return copy_into(b"error: permission denied (immutable system file)\n", out);
+            }
+            WritablePathPolicy::Allowed(nlen) => &norm_dst[..nlen],
+            WritablePathPolicy::Invalid => {
+                self.record_audit(9, AuditVerdict::Error, b"shell:cp:bad-dst");
+                return copy_into(b"error: cannot open destination path for write\n", out);
+            }
+        };
+        if bytes_eq(src_cpath, dst_cpath) {
+            self.record_audit(9, AuditVerdict::Error, b"shell:cp:same-path");
+            return copy_into(b"error: source and destination paths are identical\n", out);
+        }
+
+        let src_st = match self.fs.stat(src_cpath) {
+            Ok(s) => s,
+            Err(_) => {
+                self.record_audit(9, AuditVerdict::Error, b"shell:cp:not-found");
+                return copy_into(b"error: source file not found\n", out);
+            }
+        };
+        let src_len = src_st.size as usize;
+        if src_len > crate::vfs::PAGED_VFS_MAX_FILE_BYTES || !self.fs.can_replace(dst_cpath, src_len)
+        {
+            self.record_audit(9, AuditVerdict::Error, b"shell:cp:nospace");
+            return copy_into(FS_NO_SPACE_MSG, out);
+        }
+        let h_src = match self.fs.open(src_cpath, FS_O_RDONLY) {
+            Ok(h) => h,
+            Err(_) => {
+                self.record_audit(9, AuditVerdict::Error, b"shell:cp:not-found");
+                return copy_into(b"error: source file not found\n", out);
+            }
+        };
+        let mut data_buf = alloc::vec![0u8; src_len];
+        let read_n = self.fs.read(h_src, 0, &mut data_buf).unwrap_or(0);
+        let _ = self.fs.close(h_src);
+        if read_n != src_len {
+            self.record_audit(9, AuditVerdict::Error, b"shell:cp:io-err");
+            return copy_into(b"error: source read failed\n", out);
+        }
+        let h_dst = match self
+            .fs
+            .open(dst_cpath, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC)
+        {
+            Ok(h) => h,
+            Err(_) => {
+                self.record_audit(9, AuditVerdict::Error, b"shell:cp:open-failed");
+                return copy_into(b"error: cannot open destination path for write\n", out);
+            }
+        };
+        let written = if src_len == 0 {
+            0usize
+        } else {
+            match self.fs.write(h_dst, 0, &data_buf) {
+                Ok(w) => w,
+                Err(_) => {
+                    let _ = self.fs.close(h_dst);
+                    self.record_audit(9, AuditVerdict::Error, b"shell:cp:io-err");
+                    return copy_into(b"error: write failed\n", out);
+                }
+            }
+        };
+        let _ = self.fs.close(h_dst);
+        self.record_audit(9, AuditVerdict::Allowed, b"shell:cp");
+        let mut pos = 0usize;
+        pos += copy_into(b"copied ", &mut out[pos..]);
+        pos += dec_u64(written as u64, &mut out[pos..]);
+        pos += copy_into(b" bytes to ", &mut out[pos..]);
+        pos += copy_into(dst_raw, &mut out[pos..]);
+        pos += copy_into(b"\n", &mut out[pos..]);
+        pos
+    }
+
     fn cmd_rm(&mut self, arg: &[u8], out: &mut [u8]) -> usize {
         if self
             .svc
@@ -4062,6 +4785,22 @@ impl OsShell {
     fn cmd_df(&mut self, out: &mut [u8]) -> usize {
         self.record_audit(28, AuditVerdict::Allowed, b"shell:df");
         let mut pos = 0usize;
+        if self.paged_mode {
+            pos += copy_into(b"fs: magic=", &mut out[pos..]);
+            pos += copy_into(SHELL_PAGED_DF_MAGIC, &mut out[pos..]);
+            pos += copy_into(b" inodes=", &mut out[pos..]);
+            pos += dec_u64(self.fs.inode_count() as u64, &mut out[pos..]);
+            pos += copy_into(b"/", &mut out[pos..]);
+            pos += dec_u64(self.fs.max_inodes() as u64, &mut out[pos..]);
+            pos += copy_into(b" pool_bytes=", &mut out[pos..]);
+            pos += dec_u64(self.fs.pool_used() as u64, &mut out[pos..]);
+            pos += copy_into(b"/", &mut out[pos..]);
+            pos += dec_u64(self.fs.pool_capacity() as u64, &mut out[pos..]);
+            pos += copy_into(b" tx_lsn=", &mut out[pos..]);
+            pos += dec_u64(self.paged_anchor.tx_lsn, &mut out[pos..]);
+            pos += copy_into(b"\n", &mut out[pos..]);
+            return pos;
+        }
         pos += copy_into(b"fs: magic=CTTLFS01 inodes=", &mut out[pos..]);
         pos += dec_u64(self.fs.inode_count() as u64, &mut out[pos..]);
         pos += copy_into(b"/", &mut out[pos..]);
@@ -4105,18 +4844,9 @@ impl OsShell {
         };
         proof.consume();
         self.record_audit(29, AuditVerdict::Allowed, b"shell:sync");
-        let mut user_files = 0usize;
-        let mut user_bytes = 0usize;
-        let mut i = 0usize;
-        while i < SHELL_FS_INODES {
-            if let Some((path, data)) = self.fs.inode_data(i) {
-                if !is_default_system_file(path) {
-                    user_files += 1;
-                    user_bytes += data.len();
-                }
-            }
-            i += 1;
-        }
+        let (uf, ub) = self.user_file_summary();
+        let user_files = uf as usize;
+        let user_bytes = ub as usize;
         let mut state_seal = [0u8; DURABLE_DIGEST_LEN];
         self.compute_state_seal(&mut state_seal);
         let mut hmac = [0u8; DURABLE_DIGEST_LEN];
@@ -6014,6 +6744,11 @@ fn compute_journal_sectors_seal(
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts 32-byte key");
     mac.update(b"CTTLSHL1-JNL2-v1:");
     mac.update(&sectors[0][0..84]);
+    let anchor_end = 184 + crate::paged_store::WAL_PAGED_ANCHOR_BYTES;
+    if sectors[0][184..anchor_end].iter().any(|&b| b != 0) {
+        mac.update(b"CTTLPGA1-BIND:");
+        mac.update(&sectors[0][184..anchor_end]);
+    }
     let mut s = 1usize;
     while s < SHELL_JOURNAL_PART_SECTORS {
         mac.update(&sectors[s]);
@@ -9054,7 +9789,7 @@ mod tests {
 
         // 1. Every console durable-mutation command fails closed with `DURABLE_UNPROVISIONED_MSG`
         //    and leaves `durable_fingerprint()` byte-identical.
-        let mutating_cmds: [&[u8]; 18] = [
+        let mutating_cmds: [&[u8]; 20] = [
             b"spawn",
             b"kill 5",
             b"grant 1 fs",
@@ -9062,6 +9797,8 @@ mod tests {
             b"seccomp deny 1 open",
             b"seccomp clear 1",
             b"write /var/ephem.txt nope",
+            b"append /var/ephem.txt nope",
+            b"cp /etc/motd /var/ephem.txt",
             b"writehex /var/ephem.txt 0 6162",
             b"rm /var/ephem.txt",
             b"sync",
@@ -9153,5 +9890,169 @@ mod tests {
         // Any regression or change in `commit_seq` invalidates the quote MAC.
         sh.commit_seq = 41;
         assert!(!sh.verify_attestation_mac(7, b"anti-rollback-nonce", &mac42));
+    }
+
+    #[test]
+    fn stage_b4_append_and_cp_parser_edge_cases_and_enospc_preservation() {
+        let mut sh = Box::new(OsShell::new());
+        sh.set_paged_mode(true);
+        let mut out = [0u8; 512];
+
+        // 1. Empty / missing / extra / unclosed-quote / oversized inputs fail closed without mutating state.
+        let fp0 = sh.durable_fingerprint();
+        for bad_cmd in [
+            &b"append"[..],
+            &b"append   "[..],
+            &b"append /var/only_one_arg"[..],
+            &b"append \"/var/unclosed hello"[..],
+            &b"cp"[..],
+            &b"cp   "[..],
+            &b"cp /etc/motd"[..],
+            &b"cp /etc/motd /var/a /var/extra"[..],
+            &b"cp \"/etc/motd /var/a"[..],
+            &b"cp /etc/motd \"/var/a"[..],
+            &b"cp /var/does_not_exist /var/dst"[..],
+            &b"append /etc/hostname hijack"[..],
+            &b"cp /etc/motd /etc/hostname"[..],
+        ] {
+            let act = sh.exec_line(bad_cmd, 1, 0, 0, &mut out);
+            let s = core::str::from_utf8(&out[..act.bytes_written()]).unwrap();
+            assert!(
+                s.starts_with("usage:") || s.starts_with("error:"),
+                "expected refusal for {:?}, got {s:?}",
+                core::str::from_utf8(bad_cmd)
+            );
+            assert_eq!(sh.durable_fingerprint(), fp0);
+        }
+
+        // Oversized line (>= 256 bytes) is rejected without truncation.
+        let mut over = [b'x'; 270];
+        over[..14].copy_from_slice(b"append /var/o ");
+        let act_over = sh.exec_line(&over, 1, 0, 0, &mut out);
+        assert!(out[..act_over.bytes_written()].starts_with(b"error:"));
+        assert!(sh.fs.stat(b"/var/o").is_err());
+
+        // 2. Normal `append` creates and extends files; `cp` copies exact bytes and rejects `src == dst`.
+        let act1 = sh.exec_line(b"append /var/log.txt alpha", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act1.bytes_written()],
+            b"appended 6 bytes to /var/log.txt (size=6)\n"
+        );
+        let act2 = sh.exec_line(b"append /var/log.txt beta", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act2.bytes_written()],
+            b"appended 5 bytes to /var/log.txt (size=11)\n"
+        );
+        let act_same = sh.exec_line(b"cp /var/./log.txt /var/log.txt", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_same.bytes_written()],
+            b"error: source and destination paths are identical\n"
+        );
+        let act_cp = sh.exec_line(b"cp /var/log.txt /var/log_copy.txt", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_cp.bytes_written()],
+            b"copied 11 bytes to /var/log_copy.txt\n"
+        );
+        let act_cat = sh.exec_line(b"cat /var/log_copy.txt", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act_cat.bytes_written()], b"alpha\nbeta\n");
+
+        // 3. `32 KiB` per-file ceiling in paged mode: appending past `32,768` bytes fails closed with
+        //    `ENOSPC` and leaves the existing `32,760`-byte file completely intact.
+        let big = alloc::vec![b'Q'; 32_760];
+        sh.fs.seed_file(b"/var/max32k.bin", &big, big.len(), 1).unwrap();
+        let act_cap = sh.exec_line(b"append /var/max32k.bin 0123456789", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act_cap.bytes_written()], FS_NO_SPACE_MSG);
+        assert_eq!(sh.fs.stat(b"/var/max32k.bin").unwrap().size, 32_760);
+
+        // 4. Pool-full `cp` onto an existing smaller destination refuses BEFORE truncating the destination!
+        let mut sh_inline = Box::new(OsShell::new()); // 10 KiB inline pool
+        let _ = sh_inline.exec_line(b"write /var/keep_dst precious-bytes", 1, 0, 0, &mut out);
+        let src_5k = [b'S'; 5000];
+        let pad_4k = [b'P'; 4000];
+        sh_inline.fs.seed_file(b"/var/src5k", &src_5k, 5000, 1).unwrap();
+        sh_inline.fs.seed_file(b"/var/pad", &pad_4k, 4000, 1).unwrap();
+        let act_full_cp = sh_inline.exec_line(b"cp /var/src5k /var/keep_dst", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act_full_cp.bytes_written()], FS_NO_SPACE_MSG);
+        let act_verify = sh_inline.exec_line(b"cat /var/keep_dst", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act_verify.bytes_written()], b"precious-bytes\n");
+    }
+
+    #[test]
+    fn stage_b4_append_and_cp_unauthenticated_refusal_across_all_roles_and_transports() {
+        use crate::lived_net::{LivedNet, ReplySet, GUEST_IP, UDP_STATUS_PORT};
+        use crate::net::ipv4_header_checksum;
+        use crate::svc_runtime::{IpcOp, NodeRole, ServiceError};
+        use cuttle_contracts::mm_and_isolation::IP_PROTO_UDP;
+        const PEER_IP: [u8; 4] = [10, 0, 2, 2];
+
+        assert!(!OsShell::is_readonly_command(b"append /var/x y"));
+        assert!(!OsShell::is_readonly_command(b"cp /etc/motd /var/x"));
+
+        let mut sh = Box::new(OsShell::new());
+        let key = sh.attest_key;
+        let mut net = LivedNet::with_auth_key([0x52, 0x54, 0x00, 0x12, 0x34, 0x56], key);
+        let mut out = [0u8; 512];
+
+        let build_udp_cmd_frame = |payload: &[u8]| -> ([u8; 256], usize) {
+            let ulen = 8 + payload.len();
+            let ip_len = 20 + ulen;
+            let mut frame = [0u8; 256];
+            frame[0..6].copy_from_slice(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+            frame[6..12].copy_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+            frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+            frame[14] = 0x45;
+            frame[16..18].copy_from_slice(&(ip_len as u16).to_be_bytes());
+            frame[22] = 64;
+            frame[23] = IP_PROTO_UDP;
+            frame[26..30].copy_from_slice(&PEER_IP);
+            frame[30..34].copy_from_slice(&GUEST_IP);
+            let ck = ipv4_header_checksum(&frame[14..34]);
+            frame[24..26].copy_from_slice(&ck.to_be_bytes());
+            frame[34..36].copy_from_slice(&45000u16.to_be_bytes());
+            frame[36..38].copy_from_slice(&UDP_STATUS_PORT.to_be_bytes());
+            frame[38..40].copy_from_slice(&(ulen as u16).to_be_bytes());
+            frame[42..42 + payload.len()].copy_from_slice(payload);
+            let uck = crate::net::udp_checksum(PEER_IP, GUEST_IP, &frame[34..34 + ulen]);
+            frame[40..42].copy_from_slice(&uck.to_be_bytes());
+            (frame, 14 + ip_len)
+        };
+
+        for role in [NodeRole::Full, NodeRole::Wfe, NodeRole::Sql, NodeRole::Shell] {
+            sh.svc.set_role(role, &mut sh.audit);
+            let fp_before = sh.durable_fingerprint();
+
+            for cmd in [&b"append /var/unauth.txt nope"[..], &b"cp /etc/motd /var/unauth.txt"[..]] {
+                // 1. Unauthenticated HTTP `POST /sh` (`session_verified == false`) is refused in EVERY role.
+                let res_http =
+                    sh.dispatch_mailbox_op(IpcOp::ShellExec, true, false, 1, b"/sh", cmd, &mut out);
+                if role == NodeRole::Full {
+                    assert_eq!(res_http, Err(ServiceError::Unauthenticated));
+                } else {
+                    assert_eq!(res_http, Err(ServiceError::RoleDisabled));
+                }
+
+                // 2. Unauthenticated UDP `CMD <cmd>` on `:8080` is refused with `EACCES` in EVERY role.
+                let mut udp_payload = alloc::vec::Vec::from(&b"CMD "[..]);
+                udp_payload.extend_from_slice(cmd);
+                let (frame, flen) = build_udp_cmd_frame(&udp_payload);
+                let mut replies = ReplySet::new();
+                net.handle_frame_with_shell(&frame[..flen], 1, &mut sh, &mut replies);
+                assert_eq!(replies.len(), 1);
+                let rep = replies.get(0).unwrap();
+                assert!(
+                    rep[42..].starts_with(b"error: EACCES (unauthenticated UDP"),
+                    "UDP unauthenticated {:?} in role {role:?} must be refused",
+                    core::str::from_utf8(cmd)
+                );
+
+                // 3. Even WITH credentials, roles without `svc-sh` (`Wfe`, `Sql`) refuse execution.
+                if role == NodeRole::Wfe || role == NodeRole::Sql {
+                    let act = sh.exec_line(cmd, 1, 0, 0, &mut out);
+                    assert!(out[..act.bytes_written()].starts_with(b"error: EACCES"));
+                }
+
+                assert_eq!(sh.durable_fingerprint(), fp_before);
+            }
+        }
     }
 }

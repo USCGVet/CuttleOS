@@ -931,11 +931,14 @@ pub(crate) fn banner_shell_compose() {
     let mut out = [0u8; 256];
     if !resumed_ok {
         // First boot (or a rejected disk, whose contents are in quarantine),
-        // or an unprovisioned ephemeral boot: start from pristine defaults.
+        // or an unprovisioned ephemeral boot: start from pristine defaults,
+        // preserving enterprise paged_mode if `shell_store_boot` enabled it.
+        let was_paged = sh.is_paged_mode();
         *sh = target_enterprise::OsShell::empty();
         sh.seal_key = seal_key;
         sh.legacy_seal_key = legacy_seal_key;
         sh.attest_key = attest_key;
+        sh.set_paged_mode(was_paged);
         sh.seed_defaults_for_boot(boots);
         sh.set_durable_provisioned(provisioned);
     }
@@ -1047,7 +1050,13 @@ pub(crate) fn banner_shell_compose() {
     serial_write_str(option_env!("CUTTLE_VARIANT_SEED").unwrap_or("default-variant"));
     serial_write_str(" quote=verified\n");
     let av_df = vsh.exec_line(b"df", boots, 0, 0, &mut out);
-    if &out[..av_df.bytes_written()]
+    if vsh.is_paged_mode() {
+        if !out[..av_df.bytes_written()]
+            .starts_with(b"fs: magic=CTTLPGS1 inodes=5/96 pool_bytes=454/262144 tx_lsn=")
+        {
+            panic!("SHELL compose: paged df output drift");
+        }
+    } else if &out[..av_df.bytes_written()]
         != b"fs: magic=CTTLFS01 inodes=5/24 pool_bytes=704/10240 part_sectors=32\n"
     {
         panic!("SHELL compose: df output drift");

@@ -44,10 +44,18 @@
 #![allow(missing_docs)]
 #![allow(clippy::needless_range_loop)]
 
+use alloc::vec::Vec;
 use cuttle_contracts::{
     FileStat, Filesystem, FsError, FsHandle, Vfs, FS_MAX_MOUNTS, FS_NAME_MAX, FS_O_ACCMODE,
     FS_O_CREATE, FS_O_EXCL, FS_O_RDONLY, FS_O_RDWR, FS_O_TRUNC, FS_O_WRONLY, FS_PATH_MAX,
 };
+
+/// Maximum number of VFS inodes supported when [`MemRamFs::is_paged_mode`] is active.
+pub const PAGED_VFS_MAX_INODES: usize = 96;
+/// Maximum total VFS pool bytes supported when [`MemRamFs::is_paged_mode`] is active (`256 KiB`).
+pub const PAGED_VFS_MAX_POOL: usize = 262_144;
+/// Maximum byte length of a single regular file in paged VFS mode (`32 KiB` = `8` x 4 KiB pages).
+pub const PAGED_VFS_MAX_FILE_BYTES: usize = 32_768;
 
 // ============================================================
 // Handle packing
@@ -338,10 +346,7 @@ pub struct MemRamFs<const I: usize, const P: usize> {
     /// gives extra headroom.
     open: [RamOpenFile; I],
     pool: [u8; P],
-    /// High-water mark for the pool. Allocations bump this; freeing
-    /// is **not** supported (the seed leaks pool bytes on close /
-    /// delete, which is fine for the kernel banner — the morph
-    /// engine doesn't churn files in production).
+    /// High-water mark for the pool in inline mode.
     pool_used: u32,
     /// Whether this filesystem is mounted read-only. The mount call
     /// sets this; `open` honours it.
@@ -349,10 +354,24 @@ pub struct MemRamFs<const I: usize, const P: usize> {
     /// Advanced by every call that creates, truncates, writes or removes a
     /// file. Never decreases while the filesystem is alive.
     mutation_seq: u64,
+    /// Whether page-granular extended capacity (`96` inodes, `256 KiB` pool) is enabled.
+    paged_mode: bool,
+    /// Total bytes reserved/consumed across all inodes in `paged_mode`.
+    paged_pool_used: u32,
+    /// Overflow inode slots (`I..PAGED_VFS_MAX_INODES`) allocated lazily in `paged_mode`.
+    overflow_inodes: Vec<RamInode>,
+    /// Overflow open-file handle slots (`I..PAGED_VFS_MAX_INODES`) in `paged_mode`.
+    overflow_open: Vec<RamOpenFile>,
+    /// Per-inode heap extents (`0..PAGED_VFS_MAX_INODES`) storing file data in `paged_mode`.
+    paged_extents: Vec<Vec<u8>>,
+    /// 128-bit dirty bitmask over `0..96` inode slots since last `PagedBlockStore` sync.
+    dirty_inode_mask: [u64; 2],
+    /// Whether directory metadata (`path`, `data_len`, `mtime`, or existence) changed since last sync.
+    dir_dirty: bool,
 }
 
 impl<const I: usize, const P: usize> MemRamFs<I, P> {
-    /// Construct an empty ramfs.
+    /// Construct an empty ramfs (`const fn`, zero heap allocations).
     pub const fn new() -> Self {
         MemRamFs {
             inodes: [EMPTY_INODE; I],
@@ -361,7 +380,177 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
             pool_used: 0,
             read_only: false,
             mutation_seq: 0,
+            paged_mode: false,
+            paged_pool_used: 0,
+            overflow_inodes: Vec::new(),
+            overflow_open: Vec::new(),
+            paged_extents: Vec::new(),
+            dirty_inode_mask: [0u64; 2],
+            dir_dirty: false,
         }
+    }
+
+    /// `true` when page-granular extended capacity (`96` files, `256 KiB` pool) is active.
+    #[inline]
+    pub const fn is_paged_mode(&self) -> bool {
+        self.paged_mode
+    }
+
+    /// Enable or disable page-granular VFS mode (`<= 96` inodes, `<= 256 KiB` pool).
+    ///
+    /// When transitioning from inline to paged mode, any already-seeded inline files
+    /// in `0..I` are migrated lossless into `paged_extents`.
+    pub fn set_paged_mode(&mut self, enabled: bool) {
+        if enabled && !self.paged_mode {
+            if self.paged_extents.len() < PAGED_VFS_MAX_INODES {
+                self.paged_extents
+                    .resize_with(PAGED_VFS_MAX_INODES, Vec::new);
+            }
+            let mut total = 0u32;
+            let mut i = 0usize;
+            while i < I {
+                if self.inodes[i].used {
+                    let off = self.inodes[i].data_off as usize;
+                    let len = (self.inodes[i].data_len as usize).min(P.saturating_sub(off));
+                    if i < PAGED_VFS_MAX_INODES {
+                        self.paged_extents[i].clear();
+                        self.paged_extents[i].extend_from_slice(&self.pool[off..off + len]);
+                    }
+                    self.inodes[i].data_off = 0;
+                    let cap = self.inodes[i].capacity.max(len as u32);
+                    self.inodes[i].capacity = cap;
+                    total = total.saturating_add(cap);
+                    self.mark_inode_dirty(i);
+                }
+                i += 1;
+            }
+            self.pool = [0u8; P];
+            self.pool_used = 0;
+            self.paged_pool_used = total;
+            self.paged_mode = true;
+            self.dir_dirty = true;
+        } else if !enabled && self.paged_mode {
+            self.paged_mode = false;
+        }
+    }
+
+    /// Maximum inode count supported in the current mode (`I` inline, `96` paged).
+    #[inline]
+    pub const fn max_inodes(&self) -> usize {
+        if self.paged_mode && PAGED_VFS_MAX_INODES > I {
+            PAGED_VFS_MAX_INODES
+        } else {
+            I
+        }
+    }
+
+    #[inline]
+    fn inode_slots_len(&self) -> usize {
+        if self.paged_mode {
+            I + self.overflow_inodes.len()
+        } else {
+            I
+        }
+    }
+
+    #[inline]
+    fn inode_at(&self, idx: usize) -> &RamInode {
+        if idx < I {
+            &self.inodes[idx]
+        } else {
+            self.overflow_inodes
+                .get(idx - I)
+                .unwrap_or(&EMPTY_INODE)
+        }
+    }
+
+    #[inline]
+    fn inode_mut(&mut self, idx: usize) -> &mut RamInode {
+        if idx < I {
+            &mut self.inodes[idx]
+        } else {
+            let ext = idx - I;
+            if self.overflow_inodes.len() <= ext {
+                self.overflow_inodes.resize(ext + 1, EMPTY_INODE);
+            }
+            &mut self.overflow_inodes[ext]
+        }
+    }
+
+    #[inline]
+    fn open_slots_len(&self) -> usize {
+        if self.paged_mode {
+            I + self.overflow_open.len()
+        } else {
+            I
+        }
+    }
+
+    #[inline]
+    fn open_at(&self, slot: usize) -> &RamOpenFile {
+        if slot < I {
+            &self.open[slot]
+        } else {
+            self.overflow_open.get(slot - I).unwrap_or(&EMPTY_OPEN)
+        }
+    }
+
+    #[inline]
+    fn open_mut(&mut self, slot: usize) -> &mut RamOpenFile {
+        if slot < I {
+            &mut self.open[slot]
+        } else {
+            let ext = slot - I;
+            if self.overflow_open.len() <= ext {
+                self.overflow_open.resize(ext + 1, EMPTY_OPEN);
+            }
+            &mut self.overflow_open[ext]
+        }
+    }
+
+    #[inline]
+    fn ensure_paged_extent(&mut self, idx: usize) {
+        if self.paged_extents.len() <= idx {
+            self.paged_extents.resize_with(idx + 1, Vec::new);
+        }
+    }
+
+    #[inline]
+    fn mark_inode_dirty(&mut self, idx: usize) {
+        let w = idx / 64;
+        if w < 2 {
+            self.dirty_inode_mask[w] |= 1u64 << (idx % 64);
+        }
+        self.dir_dirty = true;
+    }
+
+    /// `true` if directory metadata changed since the last paged-store sync.
+    #[inline]
+    pub const fn is_dir_dirty(&self) -> bool {
+        self.dir_dirty
+    }
+
+    /// `true` if inode slot `idx` changed since the last paged-store sync.
+    #[inline]
+    pub const fn is_inode_dirty(&self, idx: usize) -> bool {
+        let w = idx / 64;
+        if w < 2 {
+            (self.dirty_inode_mask[w] & (1u64 << (idx % 64))) != 0
+        } else {
+            false
+        }
+    }
+
+    /// Re-mark all inode slots and directory metadata dirty (e.g., after a device I/O fault).
+    pub fn mark_all_paged_dirty(&mut self) {
+        self.dirty_inode_mask = [u64::MAX, u64::MAX];
+        self.dir_dirty = true;
+    }
+
+    /// Clear dirty inode and directory flags after a successful `PagedBlockStore` sync.
+    pub fn clear_paged_dirty(&mut self) {
+        self.dirty_inode_mask = [0u64; 2];
+        self.dir_dirty = false;
     }
 
     /// A counter that advances whenever file contents or the set of files
@@ -380,9 +569,10 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
     /// Number of inodes currently in use.
     pub fn inode_count(&self) -> usize {
         let mut n = 0usize;
+        let len = self.inode_slots_len();
         let mut i = 0usize;
-        while i < I {
-            if self.inodes[i].used {
+        while i < len {
+            if self.inode_at(i).used {
                 n += 1;
             }
             i += 1;
@@ -392,12 +582,20 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
 
     /// Bytes of pool consumed.
     pub const fn pool_used(&self) -> u32 {
-        self.pool_used
+        if self.paged_mode {
+            self.paged_pool_used
+        } else {
+            self.pool_used
+        }
     }
 
-    /// Total pool capacity.
+    /// Total pool capacity (`P` inline, `262,144` in `paged_mode`).
     pub const fn pool_capacity(&self) -> usize {
-        P
+        if self.paged_mode && PAGED_VFS_MAX_POOL > P {
+            PAGED_VFS_MAX_POOL
+        } else {
+            P
+        }
     }
 
     /// Flip the read-only flag.
@@ -428,15 +626,13 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         validate_path(path)?;
         let mut norm = [0u8; FS_PATH_MAX];
         let n = normalise_path(path, &mut norm)?;
-        // Find an unused slot; reject if any existing slot matches.
+        let max_ino = self.max_inodes();
         let mut free_idx: Option<usize> = None;
         let mut i = 0usize;
-        while i < I {
-            if self.inodes[i].used {
-                if bytes_eq(
-                    &self.inodes[i].path[..self.inodes[i].path_len as usize],
-                    &norm[..n],
-                ) {
+        while i < max_ino {
+            let slot_ref = self.inode_at(i);
+            if slot_ref.used {
+                if bytes_eq(&slot_ref.path[..slot_ref.path_len as usize], &norm[..n]) {
                     return Err(FsError::AlreadyExists);
                 }
             } else if free_idx.is_none() {
@@ -453,6 +649,31 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         if cap > u32::MAX as usize {
             return Err(FsError::NoSpace);
         }
+        if self.paged_mode {
+            if contents.len() > PAGED_VFS_MAX_FILE_BYTES
+                || cap > PAGED_VFS_MAX_FILE_BYTES
+                || (self.paged_pool_used as usize).saturating_add(cap) > self.pool_capacity()
+            {
+                return Err(FsError::NoSpace);
+            }
+            self.ensure_paged_extent(idx);
+            self.paged_extents[idx].clear();
+            self.paged_extents[idx].extend_from_slice(contents);
+            self.paged_pool_used += cap as u32;
+            let slot = self.inode_mut(idx);
+            slot.used = true;
+            slot.path = [0u8; FS_PATH_MAX];
+            slot.path[..n].copy_from_slice(&norm[..n]);
+            slot.path_len = n as u16;
+            slot.data_off = 0;
+            slot.data_len = contents.len() as u32;
+            slot.capacity = cap as u32;
+            slot.mtime = mtime;
+            self.mark_inode_dirty(idx);
+            self.mutation_seq = self.mutation_seq.wrapping_add(1);
+            return Ok(idx as u32);
+        }
+
         if (self.pool_used as usize) + cap > P {
             return Err(FsError::NoSpace);
         }
@@ -484,6 +705,53 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         Ok(idx as u32)
     }
 
+    /// Restore a file directly into `slot_idx` (`paged_mode` only) so inode-to-`PageDomain::VfsData`
+    /// `owner_id` mappings remain 100% stable across `unlink` holes and reboots.
+    pub fn seed_file_at_slot(
+        &mut self,
+        slot_idx: usize,
+        path: &[u8],
+        contents: &[u8],
+        mtime: u64,
+    ) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
+        if !self.paged_mode || slot_idx >= self.max_inodes() {
+            return Err(FsError::BadPath);
+        }
+        let mut norm = [0u8; FS_PATH_MAX];
+        let n = normalise_path(path, &mut norm)?;
+        if &norm[..n] == b"/" {
+            return Err(FsError::IsADir);
+        }
+        if self.inode_at(slot_idx).used || self.find_inode(&norm[..n]).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+        let dlen = contents.len();
+        if dlen > PAGED_VFS_MAX_FILE_BYTES
+            || (self.paged_pool_used as usize).saturating_add(dlen) > self.pool_capacity()
+        {
+            return Err(FsError::NoSpace);
+        }
+        self.ensure_paged_extent(slot_idx);
+        self.paged_extents[slot_idx].clear();
+        self.paged_extents[slot_idx].extend_from_slice(contents);
+        self.paged_pool_used += dlen as u32;
+        let slot = self.inode_mut(slot_idx);
+        slot.used = true;
+        slot.path = [0u8; FS_PATH_MAX];
+        slot.path[..n].copy_from_slice(&norm[..n]);
+        slot.path_len = n as u16;
+        slot.data_off = 0;
+        slot.data_len = dlen as u32;
+        slot.capacity = dlen as u32;
+        slot.mtime = mtime;
+        self.mark_inode_dirty(slot_idx);
+        self.mutation_seq = self.mutation_seq.wrapping_add(1);
+        Ok(())
+    }
+
     /// `true` iff replacing the whole contents of `path` with `len` bytes is
     /// certain to succeed: an `open` with `FS_O_RDWR | FS_O_CREATE |
     /// FS_O_TRUNC` followed by one `write` of `len` bytes at offset 0.
@@ -496,6 +764,9 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         if self.read_only || len > u32::MAX as usize {
             return false;
         }
+        if self.paged_mode && len > PAGED_VFS_MAX_FILE_BYTES {
+            return false;
+        }
         let mut norm = [0u8; FS_PATH_MAX];
         let Ok(n) = normalise_path(path, &mut norm) else {
             return false;
@@ -503,40 +774,48 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         if &norm[..n] == b"/" {
             return false;
         }
+        let max_ino = self.max_inodes();
         let mut open_slot_free = false;
         let mut inode_free = false;
         let mut i = 0usize;
-        while i < I {
-            open_slot_free |= !self.open[i].used;
-            inode_free |= !self.inodes[i].used;
+        while i < max_ino {
+            open_slot_free |= !self.open_at(i).used;
+            inode_free |= !self.inode_at(i).used;
             i += 1;
         }
         if !open_slot_free {
             return false;
         }
-        let free = P.saturating_sub(self.pool_used as usize);
+        let free = self
+            .pool_capacity()
+            .saturating_sub(self.pool_used() as usize);
         match self.find_inode(&norm[..n]) {
-            Some(idx) => len <= free + self.inodes[idx].capacity as usize,
+            Some(idx) => len <= free + self.inode_at(idx).capacity as usize,
             None => inode_free && free > 0 && len <= free,
         }
     }
 
-    /// Inspect an inode slot by index (`0..I`). Returns `Some((path_bytes, data_len))`
+    /// Inspect an inode slot by index (`0..max_inodes()`). Returns `Some((path_bytes, data_len))`
     /// if the slot is currently occupied.
     pub fn inode_entry(&self, idx: usize) -> Option<(&[u8], u32)> {
-        if idx >= I || !self.inodes[idx].used {
+        if idx >= self.inode_slots_len() || !self.inode_at(idx).used {
             return None;
         }
-        let slot = &self.inodes[idx];
+        let slot = self.inode_at(idx);
         Some((&slot.path[..slot.path_len as usize], slot.data_len))
     }
 
-    /// Borrow both `(path_bytes, data_bytes)` for an occupied inode slot (`0..I`).
+    /// Borrow both `(path_bytes, data_bytes)` for an occupied inode slot (`0..max_inodes()`).
     pub fn inode_data(&self, idx: usize) -> Option<(&[u8], &[u8])> {
-        if idx >= I || !self.inodes[idx].used {
+        if idx >= self.inode_slots_len() || !self.inode_at(idx).used {
             return None;
         }
-        let slot = &self.inodes[idx];
+        let slot = self.inode_at(idx);
+        if self.paged_mode {
+            let ext = self.paged_extents.get(idx)?;
+            let end = (slot.data_len as usize).min(ext.len());
+            return Some((&slot.path[..slot.path_len as usize], &ext[..end]));
+        }
         let start = slot.data_off as usize;
         let end = start.saturating_add(slot.data_len as usize);
         if end > P {
@@ -545,12 +824,12 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         Some((&slot.path[..slot.path_len as usize], &self.pool[start..end]))
     }
 
-    /// Inspect the modification timestamp (`mtime`) of an occupied inode slot (`0..I`).
+    /// Inspect the modification timestamp (`mtime`) of an occupied inode slot (`0..max_inodes()`).
     pub fn inode_mtime(&self, idx: usize) -> Option<u64> {
-        if idx >= I || !self.inodes[idx].used {
+        if idx >= self.inode_slots_len() || !self.inode_at(idx).used {
             return None;
         }
-        Some(self.inodes[idx].mtime)
+        Some(self.inode_at(idx).mtime)
     }
 
     /// Update the modification timestamp (`mtime`) of an existing regular file.
@@ -564,7 +843,10 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
             return Err(FsError::IsADir);
         }
         let idx = self.find_inode(&norm[..n]).ok_or(FsError::NotFound)?;
-        self.inodes[idx].mtime = mtime;
+        self.inode_mut(idx).mtime = mtime;
+        if self.paged_mode {
+            self.mark_inode_dirty(idx);
+        }
         self.mutation_seq = self.mutation_seq.wrapping_add(1);
         Ok(())
     }
@@ -582,12 +864,26 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
             return Err(FsError::IsADir);
         }
         let idx = self.find_inode(&norm[..n]).ok_or(FsError::NotFound)?;
+        let open_len = self.open_slots_len();
         let mut i = 0usize;
-        while i < I {
-            if self.open[i].used && self.open[i].inode_idx as usize == idx {
+        while i < open_len {
+            let op = self.open_at(i);
+            if op.used && op.inode_idx as usize == idx {
                 return Err(FsError::Busy);
             }
             i += 1;
+        }
+        if self.paged_mode {
+            let old_cap = self.inode_at(idx).capacity;
+            self.paged_pool_used = self.paged_pool_used.saturating_sub(old_cap);
+            if let Some(ext) = self.paged_extents.get_mut(idx) {
+                ext.fill(0);
+                ext.clear();
+            }
+            *self.inode_mut(idx) = EMPTY_INODE;
+            self.mark_inode_dirty(idx);
+            self.mutation_seq = self.mutation_seq.wrapping_add(1);
+            return Ok(());
         }
         self.reclaim_inode_capacity(idx);
         self.inodes[idx] = EMPTY_INODE;
@@ -597,6 +893,19 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
 
     fn truncate_inode(&mut self, idx: usize) {
         self.mutation_seq = self.mutation_seq.wrapping_add(1);
+        if self.paged_mode {
+            let old_cap = self.inode_at(idx).capacity;
+            self.paged_pool_used = self.paged_pool_used.saturating_sub(old_cap);
+            if let Some(ext) = self.paged_extents.get_mut(idx) {
+                ext.fill(0);
+                ext.clear();
+            }
+            let slot = self.inode_mut(idx);
+            slot.data_len = 0;
+            slot.capacity = 0;
+            self.mark_inode_dirty(idx);
+            return;
+        }
         if self.inodes[idx].capacity > 256 {
             self.reclaim_inode_capacity(idx);
             let remaining = (P as u64).saturating_sub(self.pool_used as u64);
@@ -655,14 +964,11 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
     }
 
     fn find_inode(&self, norm_path: &[u8]) -> Option<usize> {
+        let len = self.inode_slots_len();
         let mut i = 0usize;
-        while i < I {
-            if self.inodes[i].used
-                && bytes_eq(
-                    &self.inodes[i].path[..self.inodes[i].path_len as usize],
-                    norm_path,
-                )
-            {
+        while i < len {
+            let slot = self.inode_at(i);
+            if slot.used && bytes_eq(&slot.path[..slot.path_len as usize], norm_path) {
                 return Some(i);
             }
             i += 1;
@@ -671,9 +977,10 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
     }
 
     fn allocate_open_slot(&mut self) -> Option<usize> {
+        let max_ino = self.max_inodes();
         let mut i = 0usize;
-        while i < I {
-            if !self.open[i].used {
+        while i < max_ino {
+            if !self.open_at(i).used {
                 return Some(i);
             }
             i += 1;
@@ -737,47 +1044,71 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
             }
             (None, false) => return Err(FsError::NotFound),
             (None, true) => {
-                // Allocate a fresh inode + zero-length file (growing pool capacity on demand in `write`).
+                let max_ino = self.max_inodes();
                 let mut free_idx: Option<usize> = None;
                 let mut k = 0usize;
-                while k < I {
-                    if !self.inodes[k].used {
+                while k < max_ino {
+                    if !self.inode_at(k).used {
                         free_idx = Some(k);
                         break;
                     }
                     k += 1;
                 }
                 let idx = free_idx.ok_or(FsError::NoSpace)?;
-                let remaining = (P as u64).saturating_sub(self.pool_used as u64);
-                if remaining == 0 {
-                    return Err(FsError::NoSpace);
+                if self.paged_mode {
+                    let remaining = self
+                        .pool_capacity()
+                        .saturating_sub(self.paged_pool_used as usize);
+                    if remaining == 0 {
+                        return Err(FsError::NoSpace);
+                    }
+                    self.ensure_paged_extent(idx);
+                    self.paged_extents[idx].clear();
+                    let inode_slot = self.inode_mut(idx);
+                    inode_slot.used = true;
+                    inode_slot.path = [0u8; FS_PATH_MAX];
+                    inode_slot.path[..n].copy_from_slice(&norm[..n]);
+                    inode_slot.path_len = n as u16;
+                    inode_slot.data_off = 0;
+                    inode_slot.data_len = 0;
+                    inode_slot.capacity = 0;
+                    inode_slot.mtime = 0;
+                    self.mark_inode_dirty(idx);
+                    self.mutation_seq = self.mutation_seq.wrapping_add(1);
+                    idx
+                } else {
+                    // Allocate a fresh inode + zero-length file (growing pool capacity on demand in `write`).
+                    let remaining = (P as u64).saturating_sub(self.pool_used as u64);
+                    if remaining == 0 {
+                        return Err(FsError::NoSpace);
+                    }
+                    let init_cap = 256u64.min(remaining) as u32;
+                    let off = self.pool_used;
+                    self.pool_used += init_cap;
+                    let inode_slot = &mut self.inodes[idx];
+                    inode_slot.used = true;
+                    inode_slot.path_len = n as u16;
+                    let mut p = 0usize;
+                    while p < FS_PATH_MAX {
+                        inode_slot.path[p] = 0;
+                        p += 1;
+                    }
+                    let mut p = 0usize;
+                    while p < n {
+                        inode_slot.path[p] = norm[p];
+                        p += 1;
+                    }
+                    inode_slot.data_off = off;
+                    inode_slot.data_len = 0;
+                    inode_slot.capacity = init_cap;
+                    inode_slot.mtime = 0;
+                    self.mutation_seq = self.mutation_seq.wrapping_add(1);
+                    idx
                 }
-                let init_cap = 256u64.min(remaining) as u32;
-                let off = self.pool_used;
-                self.pool_used += init_cap;
-                let inode_slot = &mut self.inodes[idx];
-                inode_slot.used = true;
-                inode_slot.path_len = n as u16;
-                let mut p = 0usize;
-                while p < FS_PATH_MAX {
-                    inode_slot.path[p] = 0;
-                    p += 1;
-                }
-                let mut p = 0usize;
-                while p < n {
-                    inode_slot.path[p] = norm[p];
-                    p += 1;
-                }
-                inode_slot.data_off = off;
-                inode_slot.data_len = 0;
-                inode_slot.capacity = init_cap;
-                inode_slot.mtime = 0;
-                self.mutation_seq = self.mutation_seq.wrapping_add(1);
-                idx
             }
         };
 
-        self.open[slot] = RamOpenFile {
+        *self.open_mut(slot) = RamOpenFile {
             used: true,
             inode_idx: inode_idx as u32,
             access_mode: access,
@@ -788,14 +1119,15 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
 
     fn read(&mut self, handle: FsHandle, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         let slot = handle.raw().checked_sub(1).ok_or(FsError::BadHandle)? as usize;
-        if slot >= I || !self.open[slot].used {
+        if slot >= self.open_slots_len() || !self.open_at(slot).used {
             return Err(FsError::BadHandle);
         }
-        let entry = self.open[slot];
+        let entry = *self.open_at(slot);
         if entry.access_mode == FS_O_WRONLY {
             return Err(FsError::BadHandle);
         }
-        let inode = &self.inodes[entry.inode_idx as usize];
+        let inode_idx = entry.inode_idx as usize;
+        let inode = self.inode_at(inode_idx);
         let len = inode.data_len as u64;
         if offset >= len {
             return Ok(0);
@@ -806,6 +1138,15 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
         } else {
             buf.len()
         };
+        if self.paged_mode {
+            let ext = self.paged_extents.get(inode_idx).ok_or(FsError::BadHandle)?;
+            let start = offset as usize;
+            if start + n > ext.len() {
+                return Err(FsError::BadHandle);
+            }
+            buf[..n].copy_from_slice(&ext[start..start + n]);
+            return Ok(n);
+        }
         let base = inode.data_off as usize + offset as usize;
         let mut i = 0usize;
         while i < n {
@@ -820,15 +1161,44 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
             return Err(FsError::ReadOnly);
         }
         let slot = handle.raw().checked_sub(1).ok_or(FsError::BadHandle)? as usize;
-        if slot >= I || !self.open[slot].used {
+        if slot >= self.open_slots_len() || !self.open_at(slot).used {
             return Err(FsError::BadHandle);
         }
-        let entry = self.open[slot];
+        let entry = *self.open_at(slot);
         if entry.access_mode == FS_O_RDONLY {
             return Err(FsError::BadHandle);
         }
         let inode_idx = entry.inode_idx as usize;
         let end = offset.saturating_add(buf.len() as u64);
+
+        if self.paged_mode {
+            if offset > PAGED_VFS_MAX_FILE_BYTES as u64 || end > PAGED_VFS_MAX_FILE_BYTES as u64 {
+                return Err(FsError::NoSpace);
+            }
+            let old_cap = self.inode_at(inode_idx).capacity as u64;
+            let new_cap = old_cap.max(end);
+            let growth = new_cap - old_cap;
+            if (self.paged_pool_used as u64).saturating_add(growth) > self.pool_capacity() as u64 {
+                return Err(FsError::NoSpace);
+            }
+            self.ensure_paged_extent(inode_idx);
+            let end_usize = end as usize;
+            let off_usize = offset as usize;
+            if self.paged_extents[inode_idx].len() < end_usize {
+                self.paged_extents[inode_idx].resize(end_usize, 0);
+            }
+            self.paged_extents[inode_idx][off_usize..end_usize].copy_from_slice(buf);
+            self.paged_pool_used += growth as u32;
+            let slot_mut = self.inode_mut(inode_idx);
+            if end as u32 > slot_mut.data_len {
+                slot_mut.data_len = end as u32;
+            }
+            slot_mut.capacity = new_cap as u32;
+            self.mark_inode_dirty(inode_idx);
+            self.mutation_seq = self.mutation_seq.wrapping_add(1);
+            return Ok(buf.len());
+        }
+
         let mut cap = self.inodes[inode_idx].capacity as u64;
         if end > cap && end <= u32::MAX as u64 {
             let needed = end - cap;
@@ -871,11 +1241,7 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
             self.pool[base + i] = buf[i];
             i += 1;
         }
-        // Zero-fill the gap if offset > current data_len (sparse
-        // extension). Actually we wrote into raw pool bytes already;
-        // ensure data_len reflects the new high water.
         if end > self.inodes[inode_idx].data_len as u64 {
-            // If there's a gap between data_len and offset, zero it.
             let old_len = self.inodes[inode_idx].data_len as u64;
             if offset > old_len {
                 let pad_base = self.inodes[inode_idx].data_off as usize + old_len as usize;
@@ -894,10 +1260,10 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
 
     fn close(&mut self, handle: FsHandle) -> Result<(), FsError> {
         let slot = handle.raw().checked_sub(1).ok_or(FsError::BadHandle)? as usize;
-        if slot >= I || !self.open[slot].used {
+        if slot >= self.open_slots_len() || !self.open_at(slot).used {
             return Err(FsError::BadHandle);
         }
-        self.open[slot] = EMPTY_OPEN;
+        *self.open_mut(slot) = EMPTY_OPEN;
         Ok(())
     }
 
@@ -908,7 +1274,7 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
             return Ok(FileStat::dir(0));
         }
         let idx = self.find_inode(&norm[..n]).ok_or(FsError::NotFound)?;
-        let inode = &self.inodes[idx];
+        let inode = self.inode_at(idx);
         Ok(FileStat::file(inode.data_len as u64, inode.mtime))
     }
 }
@@ -1883,5 +2249,77 @@ mod tests {
         let nb = vfs.read(hb, 0, &mut rbuf).unwrap();
         assert_eq!(&rbuf[..nb], b"BOOT", "wrapped mount_id must not alias active root mount");
         vfs.close(hb).unwrap();
+    }
+
+    #[test]
+    fn ramfs_paged_mode_scales_to_96_inodes_256kib_pool_32kib_files_and_dirty_mask() {
+        let mut fs: MemRamFs<24, 10240> = MemRamFs::new();
+        assert!(!fs.is_paged_mode());
+        assert_eq!(fs.max_inodes(), 24);
+        assert_eq!(fs.pool_capacity(), 10240);
+
+        fs.seed_file(b"/etc/hostname", b"cuttle\n", 64, 1).unwrap();
+        fs.set_paged_mode(true);
+        assert!(fs.is_paged_mode());
+        assert_eq!(fs.max_inodes(), PAGED_VFS_MAX_INODES);
+        assert_eq!(fs.pool_capacity(), PAGED_VFS_MAX_POOL);
+        assert_eq!(fs.inode_data(0).unwrap().1, b"cuttle\n");
+        fs.clear_paged_dirty();
+        assert!(!fs.is_dir_dirty());
+        assert!(!fs.is_inode_dirty(0));
+
+        // Create a 32 KiB file (`PAGED_VFS_MAX_FILE_BYTES`) and verify >32 KiB is rejected cleanly.
+        let h_big = fs.open(b"/data/blob.bin", FS_O_CREATE | FS_O_RDWR).unwrap();
+        let pattern: alloc::vec::Vec<u8> = (0..PAGED_VFS_MAX_FILE_BYTES)
+            .map(|i| ((i * 31 + 7) & 0xFF) as u8)
+            .collect();
+        assert_eq!(
+            fs.write(h_big, 0, &pattern).unwrap(),
+            PAGED_VFS_MAX_FILE_BYTES
+        );
+        assert_eq!(
+            fs.write(h_big, PAGED_VFS_MAX_FILE_BYTES as u64, b"x"),
+            Err(FsError::NoSpace),
+            "writes beyond PAGED_VFS_MAX_FILE_BYTES (32 KiB) must fail closed with NoSpace"
+        );
+        assert!(!fs.can_replace(b"/data/blob.bin", PAGED_VFS_MAX_FILE_BYTES + 1));
+        fs.close(h_big).unwrap();
+        assert!(fs.is_dir_dirty());
+        assert!(fs.is_inode_dirty(1));
+
+        let mut verify = alloc::vec![0u8; PAGED_VFS_MAX_FILE_BYTES];
+        let hr = fs.open(b"/data/blob.bin", FS_O_RDONLY).unwrap();
+        assert_eq!(fs.read(hr, 0, &mut verify).unwrap(), PAGED_VFS_MAX_FILE_BYTES);
+        assert_eq!(verify, pattern);
+        fs.close(hr).unwrap();
+
+        fs.clear_paged_dirty();
+
+        // Fill all remaining 94 inodes (total = 96) and verify 97th fails with NoSpace.
+        for idx in 2..PAGED_VFS_MAX_INODES {
+            let path = alloc::format!("/var/f_{idx:02}.txt");
+            let payload = alloc::format!("record-{idx:02}\n");
+            let h = fs.open(path.as_bytes(), FS_O_CREATE | FS_O_RDWR).unwrap();
+            assert_eq!(fs.write(h, 0, payload.as_bytes()).unwrap(), payload.len());
+            fs.close(h).unwrap();
+            assert!(fs.is_inode_dirty(idx));
+        }
+        assert_eq!(fs.inode_count(), PAGED_VFS_MAX_INODES);
+        assert_eq!(
+            fs.open(b"/var/overflow_97.txt", FS_O_CREATE | FS_O_RDWR),
+            Err(FsError::NoSpace)
+        );
+
+        // Unlinking reclaims pool bytes and marks only that inode + dir dirty.
+        fs.clear_paged_dirty();
+        let used_before_rm = fs.pool_used();
+        fs.unlink(b"/data/blob.bin").unwrap();
+        assert_eq!(
+            fs.pool_used(),
+            used_before_rm - PAGED_VFS_MAX_FILE_BYTES as u32
+        );
+        assert!(fs.is_dir_dirty());
+        assert!(fs.is_inode_dirty(1));
+        assert!(!fs.is_inode_dirty(2));
     }
 }

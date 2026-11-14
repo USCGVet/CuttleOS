@@ -1164,6 +1164,9 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Live PCI MSI/MSI-X (0x45 block, 0x46 net) + IoCompletionRing + 8-slot pipelined TX proof.
     #[cfg(not(cuttle_prod))]
     banner_async_dma_irq();
+    // Live encrypted Copy-on-Write + CWAL PagedBlockStore incremental commit + Merkle inclusion proof.
+    #[cfg(not(cuttle_prod))]
+    banner_paged_store();
 
     // ============================================================
     // RED-TEAM ATTACK HARNESS (deliberate, instrumented vulnerability)

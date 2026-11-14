@@ -1208,9 +1208,9 @@ pub enum Committed {
 }
 
 /// The durable state of one node: the store layout, the commit sequence,
-/// external anti-rollback floor, and a scratch image.
+/// external anti-rollback floor, page-granular CoW + CWAL engine, and a scratch image.
 ///
-/// 26.5 KiB. Kernel code keeps it in a `static`.
+/// Kernel code keeps it in a `static`.
 pub struct ShellStore {
     layout: StoreLayout,
     quarantine_lba: u64,
@@ -1218,6 +1218,10 @@ pub struct ShellStore {
     min_commit_seq: u64,
     /// Digests of the plaintext image known to be encrypted in both slots, if any.
     stored_plain: Option<ImageDigests>,
+    /// Durable `PagedBlockStore` anchor committed inside `AB_FORMAT_V3`.
+    durable_anchor: crate::paged_store::PagedAnchor,
+    /// Page-granular encrypted CoW + CWAL block engine (`LBA 2048..` when disk `>= 4096` sectors).
+    paged: crate::paged_store::PagedBlockStore,
     image: StateImage,
 }
 
@@ -1230,8 +1234,21 @@ impl ShellStore {
             commit_seq: 0,
             min_commit_seq: 0,
             stored_plain: None,
+            durable_anchor: crate::paged_store::PagedAnchor::zero(),
+            paged: crate::paged_store::PagedBlockStore::new(),
             image: StateImage::zeroed(),
         }
+    }
+
+    /// Borrow the underlying page-granular CoW + CWAL block storage engine.
+    pub const fn paged_store(&self) -> &crate::paged_store::PagedBlockStore {
+        &self.paged
+    }
+
+    /// Whether `dev` and `self.layout` activate enterprise page-granular persistence (`LBA 2048..`).
+    pub fn supports_paged_for<D: SectorIo>(&self, dev: &D) -> bool {
+        self.layout == AHCI_STATE_LAYOUT
+            && crate::paged_store::PagedBlockStore::supports_disk_capacity(dev.capacity_sectors())
     }
 
     /// Sequence number of the last commit this store wrote or recovered.
@@ -1251,6 +1268,65 @@ impl ShellStore {
         self.min_commit_seq = min_seq;
     }
 
+    fn map_paged_commit_err(err: crate::paged_store::PagedStoreError) -> PersistError {
+        use crate::paged_store::PagedStoreError;
+        match err {
+            PagedStoreError::KeyUnset => PersistError::Commit(CommitError::KeyUnset),
+            PagedStoreError::DiskTooSmall => PersistError::Commit(CommitError::BadLayout),
+            PagedStoreError::Io(fault) => PersistError::Commit(CommitError::Io {
+                stage: CommitStage::Stage,
+                fault,
+            }),
+            PagedStoreError::InvalidPageId
+            | PagedStoreError::PayloadTooLarge
+            | PagedStoreError::OutOfPages => {
+                PersistError::Pack(StatePackError::Filesystem(crate::WalError::OutOfCapacity))
+            }
+            PagedStoreError::CorruptOrTampered | PagedStoreError::RollbackOrAnchorMismatch => {
+                PersistError::Commit(CommitError::Io {
+                    stage: CommitStage::Stage,
+                    fault: IoFault::DeviceError,
+                })
+            }
+        }
+    }
+
+    fn hydrate_paged_into<D: SectorIo>(
+        &mut self,
+        dev: &mut D,
+        sh: &mut OsShell,
+        key: &[u8; DURABLE_DIGEST_LEN],
+        paged_cap: bool,
+        restore: &mut StateRestore,
+    ) -> Result<bool, IoFault> {
+        if sh.paged_anchor().is_active() {
+            if !paged_cap {
+                return Ok(false);
+            }
+            match self.paged.recover_at_anchor(dev, key, &sh.paged_anchor()) {
+                Ok(_) => {}
+                Err(crate::paged_store::PagedStoreError::Io(f)) => return Err(f),
+                Err(_) => return Ok(false),
+            }
+            if sh.db.load_from_paged_store(&self.paged).is_err() {
+                return Ok(false);
+            }
+            let Ok((pfiles, _)) = sh.load_vfs_from_paged_store(&self.paged) else {
+                return Ok(false);
+            };
+            restore.files = pfiles;
+            self.durable_anchor = sh.paged_anchor();
+            Ok(true)
+        } else {
+            self.paged.reset();
+            self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+            if paged_cap {
+                sh.mark_all_paged_dirty();
+            }
+            Ok(true)
+        }
+    }
+
     /// Make the current state of `sh` durable, stamped with generation `boots`,
     /// encrypted at rest under `ChaCha20-Poly1305` (`AB_FORMAT_V3` / [`STATE_AEAD_MAGIC`]).
     ///
@@ -1264,18 +1340,100 @@ impl ShellStore {
         sh: &mut OsShell,
         boots: u64,
     ) -> Result<Committed, PersistError> {
-        let records = sh
-            .pack_state_image(boots, &mut self.image)
-            .map_err(PersistError::Pack)?;
+        let key = sh.seal_key;
+        if !is_seal_key_set(&key) {
+            self.stored_plain = None;
+            return Err(PersistError::Commit(CommitError::KeyUnset));
+        }
+        if !self.layout.is_valid_for(dev.capacity_sectors()) {
+            self.stored_plain = None;
+            return Err(PersistError::Commit(CommitError::BadLayout));
+        }
+
+        let paged_cap = self.supports_paged_for(dev);
+        if paged_cap {
+            if !sh.is_paged_mode() {
+                sh.set_paged_mode(true);
+                sh.mark_all_paged_dirty();
+            }
+            if !self.durable_anchor.is_active() {
+                if self.paged.tx_lsn() != 0 {
+                    self.paged.reset();
+                }
+                sh.mark_all_paged_dirty();
+            } else if self.paged.tx_lsn() != self.durable_anchor.tx_lsn
+                || self.paged.merkle_root() != self.durable_anchor.merkle_root
+            {
+                match self
+                    .paged
+                    .recover_at_anchor(dev, &key, &self.durable_anchor)
+                {
+                    Ok(_) => sh.mark_all_paged_dirty(),
+                    Err(e) => return Err(Self::map_paged_commit_err(e)),
+                }
+            } else if sh.paged_anchor() != self.durable_anchor {
+                sh.mark_all_paged_dirty();
+            }
+
+            let need_paged_commit = !self.durable_anchor.is_active()
+                || sh.db.has_dirty_pages()
+                || sh.fs.is_dir_dirty();
+            if need_paged_commit {
+                let max_logical =
+                    crate::paged_store::PagedBlockStore::max_logical_pages_for_sectors(
+                        dev.capacity_sectors(),
+                    );
+                let sql_rows = match sh.db.sync_to_paged_store(&mut self.paged, max_logical) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        sh.set_paged_anchor(self.durable_anchor);
+                        sh.mark_all_paged_dirty();
+                        return Err(Self::map_paged_commit_err(e));
+                    }
+                };
+                if let Err(e) = sh.sync_vfs_to_paged_store(&mut self.paged, max_logical) {
+                    sh.set_paged_anchor(self.durable_anchor);
+                    sh.mark_all_paged_dirty();
+                    return Err(Self::map_paged_commit_err(e));
+                }
+                let (uf, ub) = sh.user_file_summary();
+                self.paged.set_summary_counts(sql_rows, uf, ub);
+                match self.paged.commit_dirty(dev, &key, boots) {
+                    Ok(anchor) => sh.set_paged_anchor(anchor),
+                    Err(e) => {
+                        sh.set_paged_anchor(self.durable_anchor);
+                        sh.mark_all_paged_dirty();
+                        return Err(Self::map_paged_commit_err(e));
+                    }
+                }
+            } else {
+                sh.set_paged_anchor(self.durable_anchor);
+            }
+        }
+
+        let records = match sh.pack_state_image(boots, &mut self.image) {
+            Ok(r) => r,
+            Err(pe) => {
+                if paged_cap {
+                    sh.set_paged_anchor(self.durable_anchor);
+                    sh.mark_all_paged_dirty();
+                }
+                return Err(PersistError::Pack(pe));
+            }
+        };
         let plain_digests = self.image.digests();
         if self.stored_plain == Some(plain_digests) {
             return Ok(Committed::Unchanged);
         }
         let seq = self.commit_seq.wrapping_add(1);
-        let key = sh.seal_key;
-        let nonce_base = derive_commit_nonce(&key, boots, seq, &plain_digests, sh.vault_entropy_snapshot());
+        let nonce_base =
+            derive_commit_nonce(&key, boots, seq, &plain_digests, sh.vault_entropy_snapshot());
         if !self.image.encrypt_in_place(&key, &nonce_base) {
             self.stored_plain = None;
+            if paged_cap {
+                sh.set_paged_anchor(self.durable_anchor);
+                sh.mark_all_paged_dirty();
+            }
             return Err(PersistError::Commit(CommitError::KeyUnset));
         }
         match commit(dev, &key, &self.layout, boots, seq, &self.image) {
@@ -1285,6 +1443,9 @@ impl ShellStore {
                     self.min_commit_seq = seq;
                 }
                 sh.commit_seq = seq;
+                if paged_cap {
+                    self.durable_anchor = sh.paged_anchor();
+                }
                 self.stored_plain = Some(plain_digests);
                 Ok(Committed::Written {
                     commit: hdr,
@@ -1295,6 +1456,10 @@ impl ShellStore {
                 // The slots are in an unknown intermediate state until the
                 // next recovery; forget what we believed was stored.
                 self.stored_plain = None;
+                if paged_cap {
+                    sh.set_paged_anchor(self.durable_anchor);
+                    sh.mark_all_paged_dirty();
+                }
                 Err(PersistError::Commit(e))
             }
         }
@@ -1353,6 +1518,10 @@ impl ShellStore {
         sh: &mut OsShell,
     ) -> Result<StateRestore, BootError> {
         let key = sh.seal_key;
+        let paged_cap = self.supports_paged_for(dev);
+        if paged_cap && !sh.is_paged_mode() {
+            sh.set_paged_mode(true);
+        }
         match recover(dev, &key, &self.layout, &mut self.image) {
             Ok(r) if r.source != RecoverySource::Empty => {
                 let legacy_plain = self
@@ -1361,6 +1530,11 @@ impl ShellStore {
                 let mut restore = sh
                     .unpack_state_image(&self.image)
                     .map_err(|_| BootError::Io(IoFault::DeviceError))?;
+                match self.hydrate_paged_into(dev, sh, &key, paged_cap, &mut restore) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(BootError::Io(IoFault::DeviceError)),
+                    Err(f) => return Err(BootError::Io(f)),
+                }
                 restore.migrated_legacy |= legacy_plain;
                 sh.commit_seq = r.commit.map(|h| h.commit_seq).unwrap_or(0);
                 Ok(restore)
@@ -1380,9 +1554,13 @@ impl ShellStore {
         sh: &mut OsShell,
         keys: &ShellKeys,
         counter_boots: u64,
+        paged_cap: bool,
     ) -> Option<(StateRestore, u64)> {
         let boots = counter_boots.max(self.image.saved_boots().saturating_add(1));
         reset_shell(sh, keys, boots);
+        if paged_cap {
+            sh.set_paged_mode(true);
+        }
         sh.unpack_state_image(&self.image).ok().map(|r| (r, boots))
     }
 
@@ -1396,6 +1574,7 @@ impl ShellStore {
         keys: &ShellKeys,
         counter_boots: u64,
     ) -> Result<Option<(Recovery, StateRestore, u64)>, BootError> {
+        let paged_cap = self.supports_paged_for(dev);
         let recovery = match recover(dev, &keys.seal, layout, &mut self.image) {
             Ok(r) => r,
             Err(RecoverError::Unrecoverable(_)) => return Ok(None),
@@ -1409,9 +1588,15 @@ impl ShellStore {
         if let Ok(legacy_plain) =
             self.decrypt_slot_if_needed(&keys.seal, recovery.commit.as_ref())
         {
-            if let Some((mut restore, boots)) = self.try_load(sh, keys, counter_boots) {
-                restore.migrated_legacy |= legacy_plain;
-                return Ok(Some((recovery, restore, boots)));
+            if let Some((mut restore, boots)) = self.try_load(sh, keys, counter_boots, paged_cap) {
+                match self.hydrate_paged_into(dev, sh, &keys.seal, paged_cap, &mut restore) {
+                    Ok(true) => {
+                        restore.migrated_legacy |= legacy_plain;
+                        return Ok(Some((recovery, restore, boots)));
+                    }
+                    Ok(false) => {}
+                    Err(f) => return Err(BootError::Io(f)),
+                }
             }
         }
         if recovery.source == RecoverySource::Unjournaled {
@@ -1419,9 +1604,17 @@ impl ShellStore {
             // per-partition seals decide. The primary failed them; give the shadow its turn.
             read_slot(dev, layout, Slot::Shadow, &mut self.image).map_err(BootError::Io)?;
             if let Ok(legacy_plain) = self.decrypt_slot_if_needed(&keys.seal, None) {
-                if let Some((mut restore, boots)) = self.try_load(sh, keys, counter_boots) {
-                    restore.migrated_legacy |= legacy_plain;
-                    return Ok(Some((recovery, restore, boots)));
+                if let Some((mut restore, boots)) =
+                    self.try_load(sh, keys, counter_boots, paged_cap)
+                {
+                    match self.hydrate_paged_into(dev, sh, &keys.seal, paged_cap, &mut restore) {
+                        Ok(true) => {
+                            restore.migrated_legacy |= legacy_plain;
+                            return Ok(Some((recovery, restore, boots)));
+                        }
+                        Ok(false) => {}
+                        Err(f) => return Err(BootError::Io(f)),
+                    }
                 }
             }
         }
@@ -1594,6 +1787,8 @@ impl ShellStore {
     ) -> Result<BootReport, BootError> {
         self.commit_seq = 0;
         self.stored_plain = None;
+        self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+        self.paged.reset();
         if !is_seal_key_set(&keys.seal) {
             return Err(BootError::KeyUnset);
         }
@@ -1601,6 +1796,7 @@ impl ShellStore {
             return Err(BootError::BadLayout);
         }
         let layout = self.layout;
+        let paged_cap = self.supports_paged_for(dev);
 
         // A blank disk is the one case with nothing to restore or preserve
         // (unless an external high-water `min_commit_seq` proves the disk was wiped).
@@ -1612,8 +1808,25 @@ impl ShellStore {
             && self.image.is_all_zero();
         let shadow_blank = read_slot(dev, &layout, Slot::Shadow, &mut self.image).is_ok()
             && self.image.is_all_zero();
-        if primary_blank && shadow_blank && commit_blank {
+        let paged_blank = if paged_cap {
+            let mut sb_a = [0u8; SECTOR_BYTES];
+            let mut sb_b = [0u8; SECTOR_BYTES];
+            dev.read_sector(crate::paged_store::SUPERBLOCK_A_LBA, &mut sb_a)
+                .is_ok()
+                && sb_a.iter().all(|&b| b == 0)
+                && dev
+                    .read_sector(crate::paged_store::SUPERBLOCK_B_LBA, &mut sb_b)
+                    .is_ok()
+                && sb_b.iter().all(|&b| b == 0)
+        } else {
+            true
+        };
+        if primary_blank && shadow_blank && commit_blank && paged_blank {
             reset_shell(sh, keys, counter_boots);
+            if paged_cap {
+                sh.set_paged_mode(true);
+                sh.mark_all_paged_dirty();
+            }
             if self.min_commit_seq > 0 {
                 return Err(BootError::Rollback {
                     found: 0,
@@ -1633,7 +1846,13 @@ impl ShellStore {
         if let Some((recovery, restore, boots)) = found {
             let found_seq = recovery.commit.map(|h| h.commit_seq).unwrap_or(0);
             if found_seq < self.min_commit_seq {
+                self.paged.reset();
+                self.durable_anchor = crate::paged_store::PagedAnchor::zero();
                 reset_shell(sh, keys, counter_boots);
+                if paged_cap {
+                    sh.set_paged_mode(true);
+                    sh.mark_all_paged_dirty();
+                }
                 return Err(BootError::Rollback {
                     found: found_seq,
                     min_expected: self.min_commit_seq,
@@ -1680,7 +1899,13 @@ impl ShellStore {
             {
                 let found_seq = recovery.commit.map(|h| h.commit_seq).unwrap_or(0);
                 if found_seq < self.min_commit_seq {
+                    self.paged.reset();
+                    self.durable_anchor = crate::paged_store::PagedAnchor::zero();
                     reset_shell(sh, keys, counter_boots);
+                    if paged_cap {
+                        sh.set_paged_mode(true);
+                        sh.mark_all_paged_dirty();
+                    }
                     return Err(BootError::Rollback {
                         found: found_seq,
                         min_expected: self.min_commit_seq,
@@ -1708,7 +1933,13 @@ impl ShellStore {
         // Keep a copy before this boot's first commit overwrites the slots.
         // `quarantine` leaves an existing copy alone.
         quarantine(dev, &layout, self.quarantine_lba).map_err(BootError::Io)?;
+        self.paged.reset();
+        self.durable_anchor = crate::paged_store::PagedAnchor::zero();
         reset_shell(sh, keys, counter_boots);
+        if paged_cap {
+            sh.set_paged_mode(true);
+            sh.mark_all_paged_dirty();
+        }
         Ok(BootReport {
             outcome: BootOutcome::Rejected { preserved: true },
             boots: counter_boots,
@@ -3756,6 +3987,254 @@ mod node_tests {
                 found: 0,
                 min_expected: 3,
             })
+        );
+    }
+
+    #[test]
+    fn stage_b4_enterprise_paged_store_scale_incremental_writes_crash_and_tamper_proof() {
+        use crate::paged_store::{
+            PAGED_STORE_DEFAULT_DISK_SECTORS, PAGE_POOL_BASE_LBA, SUPERBLOCK_A_LBA,
+            SUPERBLOCK_B_LBA,
+        };
+        let cap_sectors = PAGED_STORE_DEFAULT_DISK_SECTORS as usize; // 8,192 sectors = 4 MiB
+        let mut disk = MemDisk::new(cap_sectors);
+        let (rep0, mut sh, mut st) = boot(&mut disk, &keys(), 1);
+        assert_eq!(rep0.outcome, BootOutcome::Fresh);
+        assert!(sh.is_paged_mode());
+        assert!(sh.db.is_paged_mode());
+        assert!(sh.fs.is_paged_mode());
+
+        // 1. Scale SQL to 6 active tables (`services`, `kv` + 4 enterprise tables) and > 1,200 rows,
+        //    including an indexed INT table (`events` with `1,080` rows, exceeding legacy 64-row cap by 16x!).
+        assert_eq!(
+            sql(&mut sh, "CREATE TABLE events (id INT, msg TEXT)"),
+            "CREATE TABLE events OK\n"
+        );
+        assert_eq!(
+            sql(&mut sh, "CREATE INDEX idx_events_id ON events (id)"),
+            "CREATE INDEX idx_events_id OK\n"
+        );
+        for t in 1..=3 {
+            let ddl = std::format!("CREATE TABLE tenant_{t} (k INT, label TEXT)");
+            assert!(sql(&mut sh, &ddl).ends_with("OK\n"));
+            for r in 0..40 {
+                let ins = std::format!("INSERT INTO tenant_{t} VALUES ({r}, 't{t}-row-{r}')");
+                assert_eq!(sql(&mut sh, &ins), "INSERT 1\n");
+            }
+        }
+        // Insert 1,080 rows into `events` in multi-tuple batches of 6.
+        for batch in 0..180 {
+            let b0 = batch * 6;
+            let ins = std::format!(
+                "INSERT INTO events VALUES ({}, 'ev-{}'), ({}, 'ev-{}'), ({}, 'ev-{}'), ({}, 'ev-{}'), ({}, 'ev-{}'), ({}, 'ev-{}')",
+                b0, b0,
+                b0 + 1, b0 + 1,
+                b0 + 2, b0 + 2,
+                b0 + 3, b0 + 3,
+                b0 + 4, b0 + 4,
+                b0 + 5, b0 + 5
+            );
+            assert_eq!(sql(&mut sh, &ins), "INSERT 6\n");
+        }
+        assert_eq!(sh.db.table_count(), 6);
+        assert!(sh.db.total_rows() >= 1_205);
+
+        // 2. Scale VFS to 69 live user files (> 140 KiB total, exceeding legacy 24-inode / 10 KiB pool caps),
+        //    including a 20 KiB multi-chunk file AND an `unlink` hole at `/var/u_05.txt`.
+        let mut blob20k = Vec::with_capacity(20_480);
+        for i in 0..20_480usize {
+            blob20k.push(((i.wrapping_mul(37).wrapping_add(11)) & 0xFF) as u8);
+        }
+        sh.fs
+            .seed_file(b"/var/blob20k.bin", &blob20k, blob20k.len(), 100)
+            .expect("seed 20 KiB multi-chunk file");
+
+        let chunk_2k = std::vec![b'M'; 1800];
+        for f in 0..69usize {
+            let p = std::format!("/var/u_{f:02}.txt");
+            if f < 65 {
+                let mut content = chunk_2k.clone();
+                content.extend_from_slice(std::format!("-file-{f:02}\n").as_bytes());
+                sh.fs
+                    .seed_file(p.as_bytes(), &content, content.len(), 200 + f as u64)
+                    .expect("seed paged file");
+            } else {
+                let out_w = run(&mut sh, &std::format!("write {p} init-{f:02}"));
+                assert!(out_w.starts_with("wrote "), "write failed: {out_w}");
+            }
+        }
+        // Create an inode-table hole at `u_05` and copy `u_65` -> `u_copy.txt` to reach 70 user files (`blob20k` + 68 `u_*` + `u_copy`).
+        assert!(run(&mut sh, "rm /var/u_05.txt").starts_with("removed "));
+        assert!(run(&mut sh, "cp /var/u_65.txt /var/u_copy.txt").starts_with("copied "));
+        let (uf1, ub1) = sh.user_file_summary();
+        assert_eq!(uf1, 70);
+        assert!(ub1 > 135_000, "expected >135 KiB VFS user bytes, got {ub1}");
+
+        // 3. Initial full commit `C1`.
+        disk.ops = 0;
+        let c1 = st.commit(&mut disk, &mut sh, 1).expect("commit C1");
+        assert!(matches!(c1, Committed::Written { .. }));
+        let ops_c1 = disk.ops;
+        let initial_pages = st.paged_store().allocated_page_count();
+        assert!(
+            initial_pages >= 70,
+            "expected >=70 allocated 4KiB pages, got {initial_pages}"
+        );
+        assert_eq!(st.paged_store().tx_lsn(), 1);
+        let df_out = run(&mut sh, "df");
+        assert!(
+            df_out.starts_with("fs: magic=CTTLPGS1 inodes=74/96 ")
+                && df_out.contains("/262144 tx_lsn=1\n"),
+            "unexpected paged df output: {df_out:?}"
+        );
+
+        // Immediate no-op commit writes ZERO sectors.
+        let ops_before_noop = disk.ops;
+        assert_eq!(
+            st.commit(&mut disk, &mut sh, 1).expect("noop commit"),
+            Committed::Unchanged
+        );
+        assert_eq!(disk.ops, ops_before_noop);
+
+        // 4. Incremental commit `C2`: mutate ONLY 1 SQL row and ONLY 1 VFS file -> `O(dirty pages)`!
+        assert_eq!(
+            sql(&mut sh, "UPDATE events SET msg = 'patched-777' WHERE id = 777"),
+            "UPDATE 1\n"
+        );
+        assert!(run(&mut sh, "append /var/u_66.txt delta-tail").starts_with("appended "));
+        disk.ops = 0;
+        let c2 = st.commit(&mut disk, &mut sh, 1).expect("incremental commit C2");
+        assert!(matches!(c2, Committed::Written { .. }));
+        let ops_c2 = disk.ops;
+        let dirty_written = st.paged_store().last_dirty_pages_written();
+        assert!(
+            dirty_written <= 4,
+            "incremental commit must write <= 4 dirty 4KiB pages (SqlLeaf+SqlCatalog+VfsData+VfsDir), wrote {dirty_written}"
+        );
+        assert!(
+            ops_c2 * 3 < ops_c1,
+            "incremental commit ops ({ops_c2}) must be < 1/3 of full commit ops ({ops_c1})"
+        );
+        let snap_sb_a_c2 = disk.peek(SUPERBLOCK_A_LBA);
+        let snap_sb_b_c2 = disk.peek(SUPERBLOCK_B_LBA);
+
+        // 5. Reboot on the 4 MiB disk and verify 100% fidelity + slot-hole stability on `C3`.
+        disk.reboot();
+        let (rep_boot, mut sh2, mut st2) = boot(&mut disk, &keys(), 2);
+        assert!(matches!(
+            rep_boot.outcome,
+            BootOutcome::Restored {
+                recommitted: false,
+                ..
+            }
+        ));
+        assert_eq!(sh2.db.table_count(), 6);
+        assert_eq!(
+            sql(&mut sh2, "SELECT COUNT(*) FROM events"),
+            "count\n1080\n"
+        );
+        let hits_before = sh2.db.idx_hits;
+        assert_eq!(
+            sql(
+                &mut sh2,
+                "SELECT msg FROM events WHERE id >= 777 AND id <= 777"
+            ),
+            "msg\npatched-777\n"
+        );
+        assert!(
+            sh2.db.idx_hits > hits_before,
+            "B+Tree INT range index must accelerate >= / <= query after paged reboot"
+        );
+        assert!(sh2.fs.stat(b"/var/u_05.txt").is_err());
+        assert_eq!(
+            run(&mut sh2, "cat /var/u_66.txt"),
+            "init-66\ndelta-tail\n"
+        );
+        assert_eq!(run(&mut sh2, "cat /var/u_copy.txt"), "init-65\n");
+        let h_blob = sh2.fs.open(b"/var/blob20k.bin", cuttle_contracts::FS_O_RDONLY).unwrap();
+        let mut read_blob = std::vec![0u8; 20_480];
+        assert_eq!(sh2.fs.read(h_blob, 0, &mut read_blob).unwrap(), 20_480);
+        sh2.fs.close(h_blob).unwrap();
+        assert_eq!(read_blob, blob20k);
+
+        // Prove `seed_file_at_slot` preserved exact slot indices across the `u_05` hole:
+        // modifying 1 file after reboot still writes only 2 VFS pages (1 VfsData + 1 VfsDir)!
+        assert!(run(&mut sh2, "append /var/u_67.txt post-reboot").starts_with("appended "));
+        st2.commit(&mut disk, &mut sh2, 2).expect("commit C3");
+        assert_eq!(st2.paged_store().last_dirty_pages_written(), 2);
+        let snap_c3: Vec<[u8; SECTOR_BYTES]> =
+            (0..cap_sectors).map(|l| disk.peek(l as u64)).collect();
+        let clone_from_sectors = |secs: &[[u8; SECTOR_BYTES]]| -> MemDisk {
+            let mut d = MemDisk::new(secs.len());
+            for (i, s) in secs.iter().enumerate() {
+                d.poke(i as u64, |dst| *dst = *s);
+            }
+            d
+        };
+
+        // 6. Power-cut crash-atomicity sweep across incremental commit `C3 -> C4`.
+        let mut dry = clone_from_sectors(&snap_c3);
+        let (_, mut sh_dry, mut st_dry) = boot(&mut dry, &keys(), 3);
+        assert_eq!(
+            sql(&mut sh_dry, "UPDATE events SET msg = 'atomic-c4' WHERE id = 42"),
+            "UPDATE 1\n"
+        );
+        assert!(run(&mut sh_dry, "append /var/u_68.txt atomic-c4").starts_with("appended "));
+        dry.ops = 0;
+        st_dry.commit(&mut dry, &mut sh_dry, 3).expect("dry C4");
+        let total_c4_ops = dry.ops;
+        assert!(total_c4_ops > 4);
+
+        for cut in (1..=total_c4_ops).step_by(3) {
+            let mut crash_disk = clone_from_sectors(&snap_c3);
+            let (_, mut sh_c, mut st_c) = boot(&mut crash_disk, &keys(), 3);
+            let _ = sql(&mut sh_c, "UPDATE events SET msg = 'atomic-c4' WHERE id = 42");
+            let _ = run(&mut sh_c, "append /var/u_68.txt atomic-c4");
+            crash_disk.ops = 0;
+            crash_disk.cache_loss = CacheLoss::Random(0xC0FFEE00u64 ^ (cut as u64));
+            crash_disk.power_cut_at = Some(cut);
+            let _ = st_c.commit(&mut crash_disk, &mut sh_c, 3);
+            crash_disk.reboot();
+
+            let (rep_rec, mut sh_rec, _) = boot(&mut crash_disk, &keys(), 4);
+            assert!(
+                matches!(rep_rec.outcome, BootOutcome::Restored { .. }),
+                "cut at op {cut}/{total_c4_ops} failed to recover: {:?}",
+                rep_rec.outcome
+            );
+            let ev42 = sql(&mut sh_rec, "SELECT msg FROM events WHERE id = 42");
+            let u68 = run(&mut sh_rec, "cat /var/u_68.txt");
+            let is_c3 = ev42 == "msg\nev-42\n" && u68 == "init-68\n";
+            let is_c4 = ev42 == "msg\natomic-c4\n" && u68 == "init-68\natomic-c4\n";
+            assert!(
+                is_c3 || is_c4,
+                "cut at op {cut}/{total_c4_ops} produced torn transaction state: ev42={ev42:?} u68={u68:?}"
+            );
+        }
+
+        // 7a. Corrupt 1 byte in a committed home page (`SqlCatalog` or `VfsData` not in `C3`'s 2-page CWAL) -> `Rejected`.
+        let mut corrupt_disk = clone_from_sectors(&snap_c3);
+        let cat_lid = st2
+            .paged_store()
+            .find_page(crate::paged_store::PageDomain::SqlCatalog, 0)
+            .unwrap();
+        let cat_phys = st2.paged_store().merkle_proof(cat_lid).unwrap().entry.phys_slot;
+        let cat_lba = PAGE_POOL_BASE_LBA + (cat_phys as u64) * 8;
+        corrupt_disk.poke(cat_lba + 1, |sec| sec[100] ^= 0x80);
+        let (rep_corrupt, _, _) = boot(&mut corrupt_disk, &keys(), 4);
+        assert_eq!(
+            rep_corrupt.outcome,
+            BootOutcome::Rejected { preserved: true }
+        );
+
+        // 7b. Replay older valid `C2` superblocks (`tx_lsn=2`) while `AB_FORMAT_V3` demands `C3` (`tx_lsn=3`) -> `Rejected`.
+        let mut replay_disk = clone_from_sectors(&snap_c3);
+        replay_disk.poke(SUPERBLOCK_A_LBA, |sec| *sec = snap_sb_a_c2);
+        replay_disk.poke(SUPERBLOCK_B_LBA, |sec| *sec = snap_sb_b_c2);
+        let (rep_replay, _, _) = boot(&mut replay_disk, &keys(), 4);
+        assert_eq!(
+            rep_replay.outcome,
+            BootOutcome::Rejected { preserved: true }
         );
     }
 }

@@ -472,6 +472,7 @@ const REQUIRED_BANNERS: &[&str] = &[
     "RING3_ELF_MP OK procs=11 preempts=",
     "faults_isolated=4 respawn=1 leak=0",
     "ASYNC_DMA_IRQ OK blk_irqs=",
+    "PAGED_STORE OK lsn=2 dirty=1 merkle=ok",
     "CUTTLE-TE HALT",
 ];
 
@@ -1499,7 +1500,10 @@ fn nvme_only_persistence_and_network_flood_resilience_under_qemu() {
     let _ = q1.kill();
     let _ = q1.wait();
     let _ = r1.join();
-    let log1 = buf1.lock().map(|g| g.clone()).unwrap_or_default();
+    let log1 = buf1
+        .lock()
+        .map(|g| g.replace("\r\n", "\n"))
+        .unwrap_or_default();
 
     assert!(
         boot1_done,
@@ -1665,6 +1669,323 @@ fn nvme_only_persistence_and_network_flood_resilience_under_qemu() {
     );
     eprintln!(
         "smoke[nvme+flood]: AHCI-less NVMe persistence, MSI-X blk+net IRQs, emergency NVMe crash dump, and Medium #5/#7 UDP flood resilience PASSED"
+    );
+}
+
+#[test]
+#[ignore = "requires nightly rust-src + factory_builder_pkg + qemu-system-x86_64"]
+fn enterprise_paged_store_4mib_sql_and_vfs_scale_persists_across_qemu_reboot() {
+    let _guard = QEMU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let Some(qemu) = find_qemu() else {
+        panic!("qemu-system-x86_64 not found");
+    };
+    let root = workspace_root();
+    let images_dir = root.join("target").join("cuttle_images");
+    std::fs::create_dir_all(&images_dir).expect("create images_dir");
+
+    let kernel_crate = root.join("target_enterprise_kernel");
+    let pkg_crate = factory_builder::locate_pkg_crate().expect("locate_pkg_crate");
+    let elf = factory_builder::build_kernel(&kernel_crate).expect("build_kernel");
+    let bios = images_dir.join("qemu_paged_4mib_bios.img");
+    factory_builder::package_kernel_via_pkg(&pkg_crate, &elf, &bios, None)
+        .expect("package_kernel_via_pkg for 4 MiB paged store test");
+
+    // 4 MiB (8192-sector) AHCI disk activates `PagedBlockStore` (`LBA 2048..`) automatically!
+    let ahci_disk = images_dir.join("paged_4mib_ahci_test.img");
+    std::fs::write(&ahci_disk, vec![0u8; 4 * 1024 * 1024]).expect("init 4 MiB paged_4mib_ahci_test.img");
+    let virtio_disk = images_dir.join("paged_4mib_virtio_test.img");
+    std::fs::write(&virtio_disk, vec![0u8; 1024 * 1024]).expect("init 1 MiB paged_4mib_virtio_test.img");
+    let nvme_disk = images_dir.join("paged_4mib_nvme_test.img");
+    std::fs::write(&nvme_disk, vec![0u8; 1024 * 1024]).expect("init 1 MiB paged_4mib_nvme_test.img");
+
+    let device_key_path = root.join(factory_builder::DEVICE_SECRET_KEY_FILENAME);
+    factory_builder::ensure_device_secret_key(&device_key_path)
+        .expect("provision 32-byte CSPRNG device_secret_key.bin");
+
+    let spawn_paged_qemu = || -> std::process::Child {
+        Command::new(&qemu)
+            .args(smoke_accel_args())
+            .arg("-cpu")
+            .arg(PINNED_QEMU_CPU_MODEL)
+            .arg("-smp")
+            .arg("4")
+            .arg("-fw_cfg")
+            .arg(format!(
+                "name={},file={}",
+                factory_builder::FW_CFG_DEVICE_KEY_NAME,
+                device_key_path.display()
+            ))
+            .arg("-drive")
+            .arg(format!("format=raw,file={},if=ide", bios.display()))
+            .arg("-drive")
+            .arg(format!("if=none,id=vd0,format=raw,file={}", virtio_disk.display()))
+            .arg("-device")
+            .arg("virtio-blk-pci,drive=vd0,disable-legacy=off,disable-modern=on")
+            .arg("-netdev")
+            .arg("hubport,id=n0,hubid=1")
+            .arg("-device")
+            .arg("virtio-net-pci,netdev=n0,disable-legacy=off,disable-modern=on")
+            .arg("-netdev")
+            .arg("hubport,id=n1,hubid=1")
+            .arg("-device")
+            .arg("virtio-net-pci,netdev=n1,disable-legacy=off,disable-modern=on")
+            .arg("-drive")
+            .arg(format!("if=none,id=ahd0,format=raw,file={}", ahci_disk.display()))
+            .arg("-device")
+            .arg("ahci,id=ahci0")
+            .arg("-device")
+            .arg("ide-hd,drive=ahd0,bus=ahci0.0")
+            .arg("-drive")
+            .arg(format!("if=none,id=nvme0,format=raw,file={}", nvme_disk.display()))
+            .arg("-device")
+            .arg("nvme,drive=nvme0,serial=CUTTLE-NVME-HW")
+            .arg("-serial")
+            .arg("stdio")
+            .arg("-display")
+            .arg("none")
+            .arg("-no-reboot")
+            .arg("-m")
+            .arg("256M")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn 4 MiB paged-store QEMU")
+    };
+
+    let send_fast_line = |stdin: &mut std::process::ChildStdin,
+                          log_buf: &Arc<Mutex<String>>,
+                          line: &str| {
+        assert!(
+            line.len() < 256,
+            "interactive console command exceeds SHELL_LINE_MAX (256): len={}",
+            line.len()
+        );
+        let prompts_before = log_buf
+            .lock()
+            .map(|g| g.matches("cuttle> ").count())
+            .unwrap_or(0);
+        let payload = format!("{line}\n");
+        for chunk in payload.as_bytes().chunks(10) {
+            let _ = stdin.write_all(chunk);
+            let _ = stdin.flush();
+            std::thread::sleep(Duration::from_millis(6));
+        }
+        let is_terminal = matches!(line, "halt" | "reboot" | "poweroff");
+        if !is_terminal {
+            let cmd_wait = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < cmd_wait {
+                let cur = log_buf
+                    .lock()
+                    .map(|g| g.matches("cuttle> ").count())
+                    .unwrap_or(0);
+                if cur > prompts_before {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
+
+    // Boot #1 on 4 MiB AHCI disk:
+    // - Exceed legacy 4-table cap (6 tables total: kv, audit, e, t3, t4, t5)
+    // - Exceed legacy 64-row cap by >16x (1,060 rows in `e` + B+Tree INT index)
+    // - Exceed legacy 24-inode cap (`5` boot/system + `30` user files = `35/96` inodes) using `write`, `append`, and `cp`
+    let mut q1 = spawn_paged_qemu();
+    let mut out1 = q1.stdout.take().expect("q1 stdout");
+    let mut in1 = q1.stdin.take().expect("q1 stdin");
+    let buf1 = Arc::new(Mutex::new(String::new()));
+    let buf1_bg = Arc::clone(&buf1);
+    let r1 = std::thread::spawn(move || {
+        let mut chunk = [0u8; 512];
+        while let Ok(n) = out1.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut g) = buf1_bg.lock() {
+                g.push_str(&String::from_utf8_lossy(&chunk[..n]));
+            }
+        }
+    });
+
+    let deadline1 = Instant::now() + Duration::from_secs(120);
+    let mut sent1 = false;
+    let mut boot1_done = false;
+    while Instant::now() < deadline1 {
+        std::thread::sleep(Duration::from_millis(100));
+        let snap = buf1.lock().map(|g| g.clone()).unwrap_or_default();
+        if !sent1 && snap.contains("cuttle> ") {
+            std::thread::sleep(Duration::from_millis(50));
+            send_fast_line(&mut in1, &buf1, "df");
+            send_fast_line(&mut in1, &buf1, "sql CREATE TABLE e (id INT, v TEXT)");
+            send_fast_line(&mut in1, &buf1, "sql CREATE INDEX idx_e ON e (id)");
+            send_fast_line(&mut in1, &buf1, "sql CREATE TABLE t3 (k INT)");
+            send_fast_line(&mut in1, &buf1, "sql CREATE TABLE t4 (k INT)");
+            send_fast_line(&mut in1, &buf1, "sql CREATE TABLE t5 (k INT)");
+            send_fast_line(&mut in1, &buf1, "sql INSERT INTO t5 VALUES (99)");
+
+            // Insert 1,060 rows via 53 atomic multi-tuple INSERT batches of 20 tuples each (`<= 245` bytes/line).
+            for batch in 0..53usize {
+                let base = batch * 20;
+                let mut cmd = String::from("sql INSERT INTO e VALUES ");
+                for off in 0..20usize {
+                    let id = base + off;
+                    if off > 0 {
+                        cmd.push(',');
+                    }
+                    cmd.push_str(&format!("({id},'x')"));
+                }
+                send_fast_line(&mut in1, &buf1, &cmd);
+            }
+            send_fast_line(
+                &mut in1,
+                &buf1,
+                "sql UPDATE e SET v = 'tail-1059' WHERE id = 1059",
+            );
+
+            // Create 30 additional user files (`f00..f28` + `copied.txt`; total user files = 31 including `/var/boot.ok`, total inodes = 35/96).
+            for f in 0..29usize {
+                send_fast_line(
+                    &mut in1,
+                    &buf1,
+                    &format!("write /var/f{f:02}.txt vfs-val-{f:02}"),
+                );
+            }
+            send_fast_line(&mut in1, &buf1, "append /var/f28.txt appended-line");
+            send_fast_line(&mut in1, &buf1, "cp /var/f28.txt /var/copied.txt");
+            send_fast_line(&mut in1, &buf1, "sql SELECT COUNT(*) FROM e");
+            send_fast_line(&mut in1, &buf1, "df");
+            send_fast_line(&mut in1, &buf1, "sync");
+            send_fast_line(&mut in1, &buf1, "halt");
+            sent1 = true;
+        }
+        if sent1 && snap.contains("system halting...") {
+            boot1_done = true;
+            break;
+        }
+    }
+
+    drop(in1);
+    let _ = q1.kill();
+    let _ = q1.wait();
+    let _ = r1.join();
+    let log1 = buf1
+        .lock()
+        .map(|g| g.replace("\r\n", "\n"))
+        .unwrap_or_default();
+
+    assert!(
+        boot1_done,
+        "4 MiB paged-store Boot #1 did not complete within 120s!\nSerial log tail:\n{}",
+        &log1[log1.len().saturating_sub(2000)..]
+    );
+    assert!(
+        log1.contains("AHCI_HW identify OK sectors=8192")
+            && log1.contains("fs: magic=CTTLPGS1 inodes=37/96 ")
+            && log1.contains("count\n1060"),
+        "4 MiB Boot #1 did not reach 8192 sectors, 37/96 inodes, and 1060 SQL rows!\nSerial log tail:\n{}",
+        &log1[log1.len().saturating_sub(2000)..]
+    );
+
+    // Host inspection of raw 4 MiB AHCI disk: verify `CTTLPGS1` superblock at LBA 2048 or 2049
+    // and zero plaintext leakage of `'tail-1059'` or `'appended-line'` in the encrypted page pool (`LBA 2080..`).
+    let ahci_bytes_1 = std::fs::read(&ahci_disk).expect("read 4 MiB ahci_disk after Boot #1");
+    let sb_a_ok = &ahci_bytes_1[2048 * 512..2048 * 512 + 8] == b"CTTLPGS1";
+    let sb_b_ok = &ahci_bytes_1[2049 * 512..2049 * 512 + 8] == b"CTTLPGS1";
+    assert!(
+        sb_a_ok || sb_b_ok,
+        "4 MiB AHCI disk missing CTTLPGS1 superblock at LBA 2048/2049"
+    );
+    for secret in [&b"tail-1059"[..], &b"appended-line"[..]] {
+        assert!(
+            !ahci_bytes_1[2080 * 512..]
+                .windows(secret.len())
+                .any(|w| w == secret),
+            "raw 4 MiB AHCI page pool leaked plaintext {:?}",
+            core::str::from_utf8(secret)
+        );
+    }
+
+    // Boot #2 on the SAME 4 MiB AHCI disk: verify 100% persistence across physical VM reboot!
+    let mut q2 = spawn_paged_qemu();
+    let mut out2 = q2.stdout.take().expect("q2 stdout");
+    let mut in2 = q2.stdin.take().expect("q2 stdin");
+    let buf2 = Arc::new(Mutex::new(String::new()));
+    let buf2_bg = Arc::clone(&buf2);
+    let r2 = std::thread::spawn(move || {
+        let mut chunk = [0u8; 512];
+        while let Ok(n) = out2.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut g) = buf2_bg.lock() {
+                g.push_str(&String::from_utf8_lossy(&chunk[..n]));
+            }
+        }
+    });
+
+    let deadline2 = Instant::now() + Duration::from_secs(60);
+    let mut sent2 = false;
+    let mut boot2_done = false;
+    while Instant::now() < deadline2 {
+        std::thread::sleep(Duration::from_millis(100));
+        let snap = buf2.lock().map(|g| g.clone()).unwrap_or_default();
+        if !sent2 && snap.contains("cuttle> ") {
+            std::thread::sleep(Duration::from_millis(50));
+            for cmd in [
+                "df",
+                "sql SELECT COUNT(*) FROM e",
+                "sql SELECT v FROM e WHERE id >= 1059",
+                "sql SELECT k FROM t5",
+                "cat /var/copied.txt",
+                "halt",
+            ] {
+                send_fast_line(&mut in2, &buf2, cmd);
+            }
+            sent2 = true;
+        }
+        if sent2 && snap.contains("system halting...") {
+            boot2_done = true;
+            break;
+        }
+    }
+
+    drop(in2);
+    let _ = q2.kill();
+    let _ = q2.wait();
+    let _ = r2.join();
+    let log2 = buf2
+        .lock()
+        .map(|g| g.replace("\r\n", "\n"))
+        .unwrap_or_default();
+
+    for f in [&ahci_disk, &virtio_disk, &nvme_disk, &bios] {
+        let _ = std::fs::remove_file(f);
+    }
+
+    assert!(
+        boot2_done,
+        "4 MiB paged-store Boot #2 did not complete within 60s!\nSerial log:\n{log2}"
+    );
+    assert!(
+        log2.contains("CONTINUITY resume OK") && log2.contains("SHELL resume OK"),
+        "4 MiB Boot #2 did not resume sealed paged state cleanly!\nSerial log:\n{log2}"
+    );
+    assert!(
+        log2.contains("fs: magic=CTTLPGS1 inodes=35/96 pool_bytes=812/262144 tx_lsn=92")
+            && log2.contains("count\n1060")
+            && log2.contains("tail-1059")
+            && log2.contains("99")
+            && log2.contains("vfs-val-28\nappended-line"),
+        "4 MiB Boot #2 did not preserve 1060 SQL rows, 6 tables, and 31 user VFS files (35/96 inodes) across reboot!\nSerial log:\n{log2}"
+    );
+    eprintln!(
+        "smoke[paged_4mib]: 4 MiB PagedBlockStore (6 SQL tables, 1060 rows, B+Tree range query, 37/96 VFS inodes, append+cp) persisted across QEMU reboot PASSED"
     );
 }
 

@@ -683,3 +683,128 @@ pub(crate) fn banner_jfs() {
         serial_write_bytes(&line[..pos]);
     }
 }
+
+
+/// Stage B4 boot self-proof: page-granular encrypted Copy-on-Write + `CWAL` block storage engine
+/// (`PagedBlockStore`), proving multi-page epoch commit, `O(dirty pages)` incremental CoW update,
+/// 8-level SHA-256 Merkle inclusion proof verification + tamper rejection, and crash-safe recovery.
+#[cfg(not(cuttle_prod))]
+#[inline(never)]
+pub(crate) fn banner_paged_store() {
+    use target_enterprise::paged_store::{
+        verify_dir_merkle_proof, PageDomain, PagedBlockStore, PAGED_STORE_MIN_DISK_SECTORS,
+    };
+    use target_enterprise::state_store::{IoFault, SectorIo, SECTOR_BYTES};
+
+    struct SparseHeapDisk {
+        cap: u64,
+        written: alloc::vec::Vec<(u64, alloc::boxed::Box<[u8; SECTOR_BYTES]>)>,
+    }
+
+    impl SectorIo for SparseHeapDisk {
+        fn capacity_sectors(&self) -> u64 {
+            self.cap
+        }
+
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), IoFault> {
+            if lba >= self.cap {
+                return Err(IoFault::OutOfRange);
+            }
+            let mut i = 0usize;
+            while i < self.written.len() {
+                if self.written[i].0 == lba {
+                    *out = *self.written[i].1;
+                    return Ok(());
+                }
+                i += 1;
+            }
+            *out = [0u8; SECTOR_BYTES];
+            Ok(())
+        }
+
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), IoFault> {
+            if lba >= self.cap {
+                return Err(IoFault::OutOfRange);
+            }
+            let mut i = 0usize;
+            while i < self.written.len() {
+                if self.written[i].0 == lba {
+                    *self.written[i].1 = *data;
+                    return Ok(());
+                }
+                i += 1;
+            }
+            self.written.push((lba, alloc::boxed::Box::new(*data)));
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), IoFault> {
+            Ok(())
+        }
+    }
+
+    let mut disk = SparseHeapDisk {
+        cap: PAGED_STORE_MIN_DISK_SECTORS,
+        written: alloc::vec::Vec::new(),
+    };
+    let seal_key = [0x4Bu8; 32];
+    let mut store = alloc::boxed::Box::new(PagedBlockStore::new());
+    if store
+        .put_page(0, PageDomain::SqlCatalog, 0, 0, b"cat-v1")
+        .is_err()
+        || store
+            .put_page(1, PageDomain::SqlLeaf, 0, 1, b"leaf-row-v1")
+            .is_err()
+        || store
+            .put_page(2, PageDomain::VfsData, 0, 2, b"vfs-chunk-v1")
+            .is_err()
+    {
+        panic!("PAGED_STORE: put_page failed");
+    }
+    let anc1 = match store.commit_dirty(&mut disk, &seal_key, 1) {
+        Ok(a) => a,
+        Err(_) => panic!("PAGED_STORE: epoch 1 commit_dirty failed"),
+    };
+    if anc1.tx_lsn != 1 || store.last_dirty_pages_written() != 3 {
+        panic!("PAGED_STORE: epoch 1 lsn/dirty drift");
+    }
+
+    // Incremental commit: mutate ONLY logical page 1 -> writes exactly 1 dirty 4 KiB page!
+    if store
+        .put_page(1, PageDomain::SqlLeaf, 0, 1, b"leaf-row-v2-cow")
+        .is_err()
+    {
+        panic!("PAGED_STORE: incremental put_page failed");
+    }
+    let anc2 = match store.commit_dirty(&mut disk, &seal_key, 1) {
+        Ok(a) => a,
+        Err(_) => panic!("PAGED_STORE: epoch 2 commit_dirty failed"),
+    };
+    if anc2.tx_lsn != 2 || store.last_dirty_pages_written() != 1 {
+        panic!("PAGED_STORE: incremental commit expected lsn=2 dirty=1");
+    }
+
+    let Some(proof) = store.merkle_proof(1) else {
+        panic!("PAGED_STORE: merkle_proof(1) returned None");
+    };
+    let root = store.merkle_root();
+    if !verify_dir_merkle_proof(&proof, &root) {
+        panic!("PAGED_STORE: valid Merkle inclusion proof rejected");
+    }
+    let mut bad_root = root;
+    bad_root[0] ^= 0x01;
+    if verify_dir_merkle_proof(&proof, &bad_root) {
+        panic!("PAGED_STORE: forged Merkle root accepted");
+    }
+
+    let mut store2 = alloc::boxed::Box::new(PagedBlockStore::new());
+    if store2.recover_at_anchor(&mut disk, &seal_key, &anc2).is_err() {
+        panic!("PAGED_STORE: recover_at_anchor failed");
+    }
+    match store2.get_page(1) {
+        Some((PageDomain::SqlLeaf, 0, 1, b"leaf-row-v2-cow")) => {}
+        _ => panic!("PAGED_STORE: recovered page payload drift"),
+    }
+
+    serial_write_str("PAGED_STORE OK lsn=2 dirty=1 merkle=ok\n");
+}

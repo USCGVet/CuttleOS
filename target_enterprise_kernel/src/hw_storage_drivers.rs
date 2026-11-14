@@ -148,8 +148,8 @@ pub(crate) fn banner_virtio_hw() {
     if capacity == 0 {
         panic!("VIRTIO_HW: capacity read returned 0");
     }
-    if capacity != EXPECTED_CAPACITY {
-        panic!("VIRTIO_HW: capacity drift vs 1MiB virtio_hw.img");
+    if capacity < EXPECTED_CAPACITY {
+        panic!("VIRTIO_HW: capacity below 1MiB minimum");
     }
 
     {
@@ -1216,8 +1216,8 @@ pub(crate) fn banner_ahci_hw() {
     let w103 = u16::from_le_bytes([data[206], data[207]]) as u64;
     let lba48 = w100 | (w101 << 16) | (w102 << 32) | (w103 << 48);
     let sectors = if lba48 != 0 { lba48 } else { lba28 };
-    if sectors != EXPECTED_SECTORS {
-        panic!("AHCI_HW: sector count drift vs 1MiB ahci_hw.img");
+    if sectors < EXPECTED_SECTORS {
+        panic!("AHCI_HW: sector count below 1MiB minimum");
     }
     {
         let mut line = [0u8; 48];

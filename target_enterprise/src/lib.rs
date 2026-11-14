@@ -68,6 +68,7 @@ pub mod kpti;
 pub mod lived_net;
 pub mod lapic_icr;
 pub mod nvme;
+pub mod paged_store;
 pub mod panic_dump;
 pub mod pci;
 pub mod phys_mm;
