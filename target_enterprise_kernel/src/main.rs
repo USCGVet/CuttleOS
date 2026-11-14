@@ -586,10 +586,12 @@ pub(crate) fn serial_init() {
 }
 
 pub(crate) fn serial_write_byte(b: u8) {
-    // SAFETY: Running at CPL=0 after `serial_init`; port 0x3FD is COM1 LSR and port 0x3F8 is COM1 THR once LSR.THRE confirms FIFO space.
+    // SAFETY: Running at CPL=0 after `serial_init`; port 0x3FD is COM1 LSR and port 0x3F8 is COM1 THR once LSR.THRE confirms FIFO space (bounded so a wedged UART never hangs Ring-0).
     unsafe {
-        while inb(COM1 + 5) & LSR_THRE == 0 {
+        let mut spins = 0u32;
+        while inb(COM1 + 5) & LSR_THRE == 0 && spins < 1_000_000 {
             core::hint::spin_loop();
+            spins += 1;
         }
         outb(COM1, b);
     }
@@ -770,13 +772,19 @@ pub(crate) use smp_hw::*;
 pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     heap::init(); // before anything allocates (rustls on port 443)
     set_phys_offset(boot_info);
-    // Enforce hardware NXE + WP + SMEP + SMAP + UMIP + FSGSBASE immediately on the BSP.
+    // Enforce hardware NXE + WP + SMEP + SMAP + UMIP + FSGSBASE and install the early BSP
+    // GDT/TSS (`IST1` for `#DF`, `IST2` for `#MC`/`NMI`) + 256-vector `RUNTIME_IDT` BEFORE
+    // touching device MMIO, serial I/O, or boot banners so no early CPU fault can triple-fault.
     // SAFETY: Running at CPL=0 in 64-bit Long Mode before any Ring-3 or untrusted code runs.
     unsafe {
         enable_cpu_memory_protections();
     }
+    init_early_bsp_gdt_idt_tss();
     fb_register(boot_info);
     serial_init();
+    if !verify_early_bsp_idt_active() {
+        panic!("EARLY_IDT: BSP GDT/TSS/IDT failed early boot verification");
+    }
     serial_write_str("CUTTLE-TE OK\n");
     // Distinguishes production boots externally; absent in banner builds.
     #[cfg(cuttle_prod)]
@@ -1043,10 +1051,10 @@ pub(crate) fn live_os_console_loop() -> ! {
     scrub_cached_master_key();
     let mut net_rx: u64 = 0;
     let mut net_tx: u64 = 0;
-    let mut last_rto_irq: u64 = read_hw_irq_wakeups();
 
     smp_hw_tick_and_sync(sh);
     smp_hw_enable_bsp_timer();
+    let mut last_rto_irq: u64 = read_monotonic_timer_ticks();
     svc.set_timer_hz(read_calibrated_irqs_per_sec());
     fb_console_start();
     serial_write_str("Cuttle Enterprise OS interactive shell ready.\n");
@@ -1055,14 +1063,19 @@ pub(crate) fn live_os_console_loop() -> ! {
 
     let mut echo = [0u8; 32];
     let mut reply = [0u8; 1024];
+    #[cfg(not(cuttle_prod))]
+    let mut selftest_line = [0u8; 32];
+    #[cfg(not(cuttle_prod))]
+    let mut selftest_len = 0usize;
 
     loop {
         let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
         let mut did_io = false;
 
         // 0. Drain live VirtIO-Net interface for HTTP (:80), TLS 1.3 (:443), UDP (:8080/:8081), ICMP, and ARP.
+        //    Bounded to 16 frames per pass so continuous inbound traffic cannot starve serial/PS2 console or RTO ticks.
         if let Some(vn) = vnet_opt.as_mut() {
-            let now_irq = read_hw_irq_wakeups();
+            let now_irq = read_monotonic_timer_ticks();
             if now_irq > last_rto_irq {
                 let elapsed_irqs = (now_irq - last_rto_irq).min(64);
                 last_rto_irq = now_irq;
@@ -1074,16 +1087,23 @@ pub(crate) fn live_os_console_loop() -> ! {
                     let mut ri = 0usize;
                     while ri < rto_rep.len() {
                         if let Some(r) = rto_rep.get(ri) {
-                            vnet_tx(vn, r);
-                            net_tx = net_tx.wrapping_add(1);
+                            if vnet_tx(vn, r) {
+                                net_tx = net_tx.wrapping_add(1);
+                            }
                         }
                         ri += 1;
                     }
                     step += 1;
                 }
             }
+            const MAX_RX_FRAMES_PER_PASS: usize = 16;
+            let mut rx_pass = 0usize;
             let mut f_guard = CONSOLE_NET_FRAME.lock();
-            while let Some((flen, head_id)) = vnet_rx(vn, &mut *f_guard) {
+            while rx_pass < MAX_RX_FRAMES_PER_PASS {
+                let Some((flen, head_id)) = vnet_rx(vn, &mut *f_guard) else {
+                    break;
+                };
+                rx_pass += 1;
                 did_io = true;
                 net_rx = net_rx.wrapping_add(1);
                 if flen >= 14 {
@@ -1097,8 +1117,9 @@ pub(crate) fn live_os_console_loop() -> ! {
                     let mut ri = 0usize;
                     while ri < rep_guard.len() {
                         if let Some(r) = rep_guard.get(ri) {
-                            vnet_tx(vn, r);
-                            net_tx = net_tx.wrapping_add(1);
+                            if vnet_tx(vn, r) {
+                                net_tx = net_tx.wrapping_add(1);
+                            }
                         }
                         ri += 1;
                     }
@@ -1137,6 +1158,26 @@ pub(crate) fn live_os_console_loop() -> ! {
         }
 
         if let Some(b) = maybe_byte {
+            #[cfg(not(cuttle_prod))]
+            {
+                if b == b'\n' || b == b'\r' {
+                    if &selftest_line[..selftest_len] == b"__selftest_ud2_fault" {
+                        // Deliberate Ring-0 `#UD` (`vec=6`) trap for `qemu_smoke` verification of
+                        // `ISR_CPU_EXC_STUBS` + `kernel_cpu_exception_handler` + `CTTLPENC` crash dump.
+                        // Strictly absent from `--prod` (`#[cfg(not(cuttle_prod))]`).
+                        // SAFETY: Intentional Ring-0 `#UD` exception during non-prod QEMU test.
+                        unsafe {
+                            asm!("ud2", options(noreturn));
+                        }
+                    }
+                    selftest_len = 0;
+                } else if b == 0x08 || b == 0x7F {
+                    selftest_len = selftest_len.saturating_sub(1);
+                } else if selftest_len < selftest_line.len() {
+                    selftest_line[selftest_len] = b;
+                    selftest_len += 1;
+                }
+            }
             if b == b'\n' || b == b'\r' {
                 smp_hw_tick_and_sync(sh);
             }
@@ -1183,7 +1224,7 @@ pub(crate) fn live_os_console_loop() -> ! {
 pub(crate) const AHCI_PANIC_DUMP_LBA: u64 = 1536;
 
 struct PanicDumpScratch(core::cell::UnsafeCell<[u8; cuttle_contracts::CRASH_DUMP_BYTES]>);
-// SAFETY: Accessed exclusively inside `#[panic_handler]` after winning the one-shot
+// SAFETY: Accessed exclusively inside `write_emergency_crash_dump_with_scratch` after winning the one-shot
 // `!target_enterprise::panic_dump::set_dumped()` atomic latch and halting peer APs.
 unsafe impl Sync for PanicDumpScratch {}
 
@@ -1210,6 +1251,36 @@ impl target_enterprise::panic_dump::SectorSink for EmergencyAhciCrashSink {
             Err(cuttle_contracts::CrashDumpError::LayoutOverflow)
         }
     }
+}
+
+/// Shared emergency crash-dump writer used by both `#[panic_handler]` and
+/// `smp_hw::kernel_cpu_exception_handler` once `!target_enterprise::panic_dump::set_dumped()`
+/// has been won by the faulting CPU.
+pub(crate) fn write_emergency_crash_dump_with_scratch(
+    loc_str: &str,
+    msg_str: &str,
+    regs: &[u64; cuttle_contracts::CRASH_REG_COUNT],
+    rip_val: u64,
+    tsc_val: u64,
+    dump_aead_key: Option<&[u8; 32]>,
+) {
+    let bt = [rip_val];
+    let ctx = CrashContext {
+        wall_unix: 0,
+        tsc: tsc_val,
+        panic_loc: loc_str,
+        message: msg_str,
+        registers: regs,
+        backtrace: &bt,
+        kmsg: &[],
+    };
+    let mut sink = EmergencyAhciCrashSink;
+    // SAFETY: Caller won the one-shot `target_enterprise::panic_dump::set_dumped()` latch after halting peer APs.
+    let dump_buf = unsafe { &mut *PANIC_DUMP_SCRATCH.0.get() };
+    let mut nonce = [0u8; 12];
+    nonce[0..8].copy_from_slice(&tsc_val.to_le_bytes());
+    nonce[8..12].copy_from_slice(&(regs[0] as u32).to_le_bytes());
+    let _ = PanicDumpImpl::dump_encrypted_to_sink(&ctx, dump_aead_key, &nonce, dump_buf, &mut sink);
 }
 
 #[panic_handler]
@@ -1306,28 +1377,13 @@ pub(crate) fn panic(info: &PanicInfo) -> ! {
         regs[0] = read_current_lapic_id_safe() as u64;
         regs[7] = rsp_val;
         regs[16] = rip_val;
-        let bt = [rip_val];
-        let ctx = CrashContext {
-            wall_unix: 0,
-            tsc: ((tsc_hi as u64) << 32) | (tsc_lo as u64),
-            panic_loc: loc_str,
-            message: msg_str,
-            registers: &regs,
-            backtrace: &bt,
-            kmsg: &[],
-        };
-        let mut sink = EmergencyAhciCrashSink;
-        // SAFETY: `set_dumped()` guarantees single-winner exclusive access to `PANIC_DUMP_SCRATCH`.
-        let dump_buf = unsafe { &mut *PANIC_DUMP_SCRATCH.0.get() };
-        let mut nonce = [0u8; 12];
-        nonce[0..8].copy_from_slice(&ctx.tsc.to_le_bytes());
-        nonce[8..12].copy_from_slice(&(regs[0] as u32).to_le_bytes());
-        let _ = PanicDumpImpl::dump_encrypted_to_sink(
-            &ctx,
+        write_emergency_crash_dump_with_scratch(
+            loc_str,
+            msg_str,
+            &regs,
+            rip_val,
+            ((tsc_hi as u64) << 32) | (tsc_lo as u64),
             dump_aead_key.as_ref(),
-            &nonce,
-            dump_buf,
-            &mut sink,
         );
         if let Some(ref mut key) = dump_aead_key {
             target_enterprise::durable_seal::zeroize_secret_bytes(key);

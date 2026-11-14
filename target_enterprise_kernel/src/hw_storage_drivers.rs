@@ -1306,12 +1306,8 @@ static CONTINUITY_CURSOR: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 static CONTINUITY_CRC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn continuity_header(boots: u64, cursor: u32, crc: u32) -> [u8; 512] {
-    let mut hdr = [0u8; 512];
-    hdr[..8].copy_from_slice(CONTINUITY_MAGIC);
-    hdr[8..16].copy_from_slice(&boots.to_le_bytes());
-    hdr[16..20].copy_from_slice(&cursor.to_le_bytes());
-    hdr[20..24].copy_from_slice(&crc.to_le_bytes());
-    hdr
+    let seal_key = derive_runtime_seal_key();
+    target_enterprise::durable_seal::pack_continuity_header(boots, cursor, crc, &seal_key)
 }
 
 /// Move the boot counter forward to `boots` in memory and in the continuity
@@ -1326,6 +1322,9 @@ fn continuity_header(boots: u64, cursor: u32, crc: u32) -> [u8; 512] {
 pub(crate) fn continuity_set_boots(boots: u64) {
     use target_enterprise::state_store::SectorIo;
     CONTINUITY_BOOT_COUNT.store(boots, core::sync::atomic::Ordering::Relaxed);
+    if !is_device_key_provisioned() {
+        return;
+    }
     let cursor = CONTINUITY_CURSOR.load(core::sync::atomic::Ordering::Relaxed) as u32;
     let crc = CONTINUITY_CRC.load(core::sync::atomic::Ordering::Relaxed) as u32;
     let hdr = continuity_header(boots, cursor, crc);
@@ -1343,21 +1342,27 @@ pub(crate) fn continuity_set_boots(boots: u64) {
 
 #[inline(never)]
 pub(crate) fn banner_continuity() {
+    use target_enterprise::durable_seal::verify_continuity_header;
     use target_enterprise::wal::crc32_ieee;
 
+    if !is_device_key_provisioned() {
+        CONTINUITY_BOOT_COUNT.store(1, core::sync::atomic::Ordering::Relaxed);
+        serial_write_str(
+            "CONTINUITY ephemeral: device key not provisioned; continuity WAL untouched\n",
+        );
+        return;
+    }
+
+    let seal_key = derive_runtime_seal_key();
     let port = AhciHwPort::probe_start();
 
-    // Read header sector.
+    // Read and authenticate header sector under `seal_key`.
     let hdr = port.read_sector(CONTINUITY_LBA);
     let mut wal_buf = [0u8; kf::WAL_CAPACITY];
     let mut resumed_boots: u64 = 0;
     let mut resumed_cursor: usize = 0;
     let mut is_resume = false;
-    if hdr[..8] == CONTINUITY_MAGIC[..] || hdr[..8] == CONTINUITY_LEGACY_MAGIC[..] {
-        resumed_boots = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-        resumed_cursor =
-            u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as usize;
-        let want_crc = u32::from_le_bytes(hdr[20..24].try_into().unwrap());
+    if let Some((hdr_boots, hdr_cursor, want_crc)) = verify_continuity_header(&hdr, &seal_key) {
         let mut s = 0u64;
         while s < CONTINUITY_WAL_SECTORS {
             let sec = port.read_sector(CONTINUITY_LBA + 1 + s);
@@ -1365,9 +1370,15 @@ pub(crate) fn banner_continuity() {
             wal_buf[off..off + 512].copy_from_slice(&sec);
             s += 1;
         }
-        if crc32_ieee(&wal_buf) == want_crc && resumed_cursor <= kf::WAL_CAPACITY {
+        if crc32_ieee(&wal_buf) == want_crc && hdr_cursor <= kf::WAL_CAPACITY {
+            resumed_boots = hdr_boots;
+            resumed_cursor = hdr_cursor;
             is_resume = true;
         }
+    } else if hdr[..8] == CONTINUITY_MAGIC[..] || hdr[..8] == CONTINUITY_LEGACY_MAGIC[..] {
+        serial_write_str(
+            "CONTINUITY resume NOTICE: unauthenticated or tampered continuity header rejected\n",
+        );
     } else if &hdr[..4] == b"PRTS" {
         serial_write_str("CONTINUITY resume NOTICE: legacy format, state not migrated\n");
     }

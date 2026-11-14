@@ -50,6 +50,9 @@ pub const SQL_OWNER_TRIAD: u64 = 0xFFFF_0003;
 pub const SQL_OWNER_UDP: u64 = 0xFFFF_0004;
 /// SQL session owner ID for unauthenticated HTTP gateway queries (`GET /sql`, `POST /sql`).
 pub const SQL_OWNER_HTTP_ANON: u64 = 0xFFFF_0005;
+/// Maximum number of simultaneous unacknowledged timed-out transaction owners tracked by [`SqlDb`].
+pub const SQL_MAX_ABORTED_OWNERS: usize = 16;
+
 /// Why [`SqlDb::try_save_partition`] produced no image.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SqlSaveError {
@@ -414,11 +417,15 @@ pub struct SqlDb {
     pub tx_undo_row: [u8; SQL_TX_UNDO_CAP],
     /// Pre-transaction row snapshot for each undo slot.
     pub tx_undo_prev: [SqlRow; SQL_TX_UNDO_CAP],
-    /// The last transaction was rolled back by the idle timeout and its owner
-    /// has not yet acknowledged that with `ROLLBACK`, `COMMIT` or `BEGIN`.
+    /// The last transaction was rolled back by the idle timeout and at least one
+    /// owner has not yet acknowledged its rollback with `ROLLBACK`, `COMMIT` or `BEGIN`.
     pub tx_aborted: bool,
-    /// Owner of the transaction the idle timeout rolled back.
+    /// Most recent owner whose transaction was rolled back by the idle timeout.
     pub tx_aborted_owner: u64,
+    /// Bounded set of distinct owner IDs whose timed-out transactions remain unacknowledged.
+    pub tx_aborted_set: [u64; SQL_MAX_ABORTED_OWNERS],
+    /// Valid entry count in [`Self::tx_aborted_set`].
+    pub tx_aborted_count: u8,
 }
 
 impl Default for SqlDb {
@@ -444,6 +451,76 @@ impl SqlDb {
             tx_undo_prev: [SqlRow::empty(); SQL_TX_UNDO_CAP],
             tx_aborted: false,
             tx_aborted_owner: 0,
+            tx_aborted_set: [0u64; SQL_MAX_ABORTED_OWNERS],
+            tx_aborted_count: 0,
+        }
+    }
+
+    /// Return `true` if `owner` has an unacknowledged timed-out transaction rollback.
+    pub fn is_owner_aborted(&self, owner: u64) -> bool {
+        if self.tx_aborted && self.tx_aborted_owner == owner {
+            return true;
+        }
+        let n = (self.tx_aborted_count as usize).min(SQL_MAX_ABORTED_OWNERS);
+        let mut i = 0usize;
+        while i < n {
+            if self.tx_aborted_set[i] == owner {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn mark_owner_aborted(&mut self, owner: u64) {
+        let mut n = (self.tx_aborted_count as usize).min(SQL_MAX_ABORTED_OWNERS);
+        let mut i = 0usize;
+        while i < n {
+            if self.tx_aborted_set[i] == owner {
+                self.tx_aborted = true;
+                self.tx_aborted_owner = owner;
+                return;
+            }
+            i += 1;
+        }
+        if n == SQL_MAX_ABORTED_OWNERS {
+            let mut k = 1usize;
+            while k < SQL_MAX_ABORTED_OWNERS {
+                self.tx_aborted_set[k - 1] = self.tx_aborted_set[k];
+                k += 1;
+            }
+            n = SQL_MAX_ABORTED_OWNERS - 1;
+        }
+        self.tx_aborted_set[n] = owner;
+        self.tx_aborted_count = (n + 1) as u8;
+        self.tx_aborted = true;
+        self.tx_aborted_owner = owner;
+    }
+
+    fn clear_owner_aborted(&mut self, owner: u64) {
+        let mut n = (self.tx_aborted_count as usize).min(SQL_MAX_ABORTED_OWNERS);
+        let mut w = 0usize;
+        let mut r = 0usize;
+        while r < n {
+            if self.tx_aborted_set[r] != owner {
+                self.tx_aborted_set[w] = self.tx_aborted_set[r];
+                w += 1;
+            }
+            r += 1;
+        }
+        let mut z = w;
+        while z < SQL_MAX_ABORTED_OWNERS {
+            self.tx_aborted_set[z] = 0;
+            z += 1;
+        }
+        n = w;
+        self.tx_aborted_count = n as u8;
+        if n > 0 {
+            self.tx_aborted = true;
+            self.tx_aborted_owner = self.tx_aborted_set[n - 1];
+        } else if self.tx_aborted && self.tx_aborted_owner == owner {
+            self.tx_aborted = false;
+            self.tx_aborted_owner = 0;
         }
     }
 
@@ -546,8 +623,7 @@ impl SqlDb {
         if self.tx_age_ticks >= SQL_TX_MAX_IDLE_TICKS {
             let owner = self.tx_owner;
             self.rollback_active_transaction();
-            self.tx_aborted = true;
-            self.tx_aborted_owner = owner;
+            self.mark_owner_aborted(owner);
             return true;
         }
         false
@@ -888,13 +964,13 @@ impl SqlDb {
 
         // This owner's transaction was rolled back by the idle timeout. Until
         // it acknowledges that, nothing it sends may change the database.
-        if self.tx_aborted && self.tx_aborted_owner == owner {
+        if self.is_owner_aborted(owner) {
             if eq_ignore_ascii_case(kw, b"ROLLBACK") {
-                self.tx_aborted = false;
+                self.clear_owner_aborted(owner);
                 return copy_str(b"ROLLBACK OK\n", out);
             }
             if eq_ignore_ascii_case(kw, b"COMMIT") {
-                self.tx_aborted = false;
+                self.clear_owner_aborted(owner);
                 return copy_str(
                     b"error: transaction timed out and was rolled back; nothing was committed\n",
                     out,
@@ -906,7 +982,7 @@ impl SqlDb {
                     out,
                 );
             }
-            self.tx_aborted = false;
+            self.clear_owner_aborted(owner);
         }
 
         if eq_ignore_ascii_case(kw, b"BEGIN") {
@@ -2656,6 +2732,8 @@ impl SqlDb {
         self.tx_undo_len = 0;
         self.tx_aborted = false;
         self.tx_aborted_owner = 0;
+        self.tx_aborted_set = [0u64; SQL_MAX_ABORTED_OWNERS];
+        self.tx_aborted_count = 0;
         true
     }
 
@@ -2685,7 +2763,7 @@ impl SqlDb {
         if self.tx_active && self.tx_owner != owner {
             return false;
         }
-        if self.tx_aborted && self.tx_aborted_owner == owner {
+        if self.is_owner_aborted(owner) {
             return false;
         }
         let Some(t_idx) = self.find_table(b"kv") else {
@@ -4268,5 +4346,59 @@ mod tests {
             "CREATE TABLE with empty comma slot must reject: {:?}",
             core::str::from_utf8(&out[..n])
         );
+    }
+
+    #[test]
+    fn multiple_aborted_transaction_owners_are_tracked_independently() {
+        let mut db = SqlDb::new();
+        let mut out = [0u8; 256];
+        let owner_a: u64 = 0x1_0000_0100;
+        let owner_b: u64 = 0x1_0000_0201;
+        let owner_c: u64 = 0x1_0000_0302;
+
+        // Owner A opens a transaction and times out.
+        let n_begin_a = db.exec_as(owner_a, b"BEGIN", &mut out);
+        assert_eq!(&out[..n_begin_a], b"BEGIN OK\n");
+        let n = db.exec_as(owner_a, b"INSERT INTO kv VALUES ('a', '1', 1)", &mut out);
+        assert_eq!(&out[..n], b"INSERT 1\n");
+        for _ in 0..SQL_TX_MAX_IDLE_TICKS {
+            let _ = db.tick_transaction_timeout();
+        }
+        assert!(db.is_owner_aborted(owner_a));
+        assert!(!db.is_owner_aborted(owner_b));
+
+        // Before Owner A acknowledges, Owner B opens a transaction and ALSO times out.
+        let n_begin_b = db.exec_as(owner_b, b"BEGIN", &mut out);
+        assert_eq!(&out[..n_begin_b], b"BEGIN OK\n");
+        let n = db.exec_as(owner_b, b"INSERT INTO kv VALUES ('b', '2', 2)", &mut out);
+        assert_eq!(&out[..n], b"INSERT 1\n");
+        for _ in 0..SQL_TX_MAX_IDLE_TICKS {
+            let _ = db.tick_transaction_timeout();
+        }
+
+        // BOTH Owner A and Owner B remain aborted; Owner C is completely unaffected!
+        assert!(db.is_owner_aborted(owner_a));
+        assert!(db.is_owner_aborted(owner_b));
+        assert!(!db.is_owner_aborted(owner_c));
+
+        let n_c = db.exec_as(owner_c, b"INSERT INTO kv VALUES ('c', '3', 3)", &mut out);
+        assert_eq!(&out[..n_c], b"INSERT 1\n", "unaffected owner C must not be blocked");
+
+        let n_a = db.exec_as(owner_a, b"INSERT INTO kv VALUES ('a2', '9', 9)", &mut out);
+        assert!(
+            out[..n_a].starts_with(b"error: transaction timed out and was rolled back;"),
+            "owner A must still be refused even after owner B also timed out"
+        );
+
+        // Owner B acknowledges with ROLLBACK; Owner A is STILL aborted until it acknowledges!
+        let n_rb_b = db.exec_as(owner_b, b"ROLLBACK", &mut out);
+        assert_eq!(&out[..n_rb_b], b"ROLLBACK OK\n");
+        assert!(!db.is_owner_aborted(owner_b));
+        assert!(db.is_owner_aborted(owner_a));
+
+        let n_rb_a = db.exec_as(owner_a, b"ROLLBACK", &mut out);
+        assert_eq!(&out[..n_rb_a], b"ROLLBACK OK\n");
+        assert!(!db.is_owner_aborted(owner_a));
+        assert!(!db.tx_aborted);
     }
 }

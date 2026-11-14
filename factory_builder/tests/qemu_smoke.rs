@@ -865,6 +865,22 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
         |s| s.contains("system halting..."),
     );
     let after4 = std::fs::read(&tampered_disk).expect("read ahci_tamper_test.img after keyless boot");
+
+    // Case 4: Ring-0 hardware CPU exception (`ud2` = `#UD` vector 6) on a provisioned boot.
+    // Must trap through `ISR_CPU_EXC_STUBS` -> `kernel_cpu_exception_handler` (never `iretq`-looping),
+    // emit `CUTTLE-TE PANIC: CPU FAULT: vec=6` on COM1, and persist an AEAD-encrypted `CTTLPENC`
+    // crash dump via isolated AHCI Slot 1 (`LBA 1536..1568`) with zero plaintext leakage on disk.
+    std::fs::write(&tampered_disk, vec![0u8; 1024 * 1024]).expect("reset disk for CPU fault test");
+    let (log5, reached5) = vm.boot_interactive_opts(
+        true,
+        &["__selftest_ud2_fault"],
+        |s| {
+            s.contains("CUTTLE-TE PANIC: CPU FAULT: vec=6")
+                && s.contains("CRASH_DUMP emergency slot=1 lba=1536..1568")
+        },
+    );
+    let after5 = std::fs::read(&tampered_disk).expect("read ahci_tamper_test.img after CPU fault");
+
     for disk in scratch_disks {
         let _ = std::fs::remove_file(disk);
     }
@@ -918,11 +934,45 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
         log4
     );
     assert_eq!(
-        &after4[1040 * 512..1324 * 512],
-        &after3[1040 * 512..1324 * 512],
-        "unprovisioned keyless boot modified AHCI state or quarantine sectors!"
+        &after4[1024 * 512..1324 * 512],
+        &after3[1024 * 512..1324 * 512],
+        "unprovisioned keyless boot modified AHCI continuity, state, or quarantine sectors!"
     );
-    eprintln!("smoke: one tampered copy was repaired, two were rejected and preserved; TAMPER TEST PASSED");
+    assert!(
+        reached5 && log5.contains("CUTTLE-TE PANIC: CPU FAULT: vec=6"),
+        "Ring-0 `#UD` fault did not report `CUTTLE-TE PANIC: CPU FAULT: vec=6`!\nSerial log:\n{}",
+        log5
+    );
+    let mut dump_slice = after5[1536 * 512..1568 * 512].to_vec();
+    assert_eq!(
+        &dump_slice[..8],
+        b"CTTLPENC",
+        "Ring-0 CPU fault did not persist encrypted CTTLPENC crash dump at AHCI LBA 1536"
+    );
+    assert!(
+        !dump_slice.windows(9).any(|w| w == b"CPU FAULT"),
+        "raw AHCI crash dump leaked plaintext CPU FAULT string!"
+    );
+    {
+        use target_enterprise::durable_seal::{derive_crash_dump_aead_key, derive_seal_key};
+        use target_enterprise::panic_dump::{CrashDump, PanicDumpImpl};
+        let master_key: [u8; 32] = std::fs::read(&device_key_path)
+            .expect("read device_secret_key.bin")
+            .try_into()
+            .expect("32-byte device_secret_key.bin");
+        let seal_key = derive_seal_key(&master_key, b"cuttle-ahci-wal-seal-v1");
+        let crash_key = derive_crash_dump_aead_key(&seal_key);
+        PanicDumpImpl::decrypt_dump_in_place(&crash_key, &mut dump_slice)
+            .expect("decrypt CTTLPENC crash dump written by Ring-0 CPU exception handler");
+        PanicDumpImpl::verify_crc(&dump_slice).expect("verify decrypted crash dump CRC32-C");
+        let hdr = PanicDumpImpl::parse_header(&dump_slice).expect("parse decrypted crash dump header");
+        assert!(
+            hdr.message.as_bytes().starts_with(b"CPU FAULT: vec=6"),
+            "decrypted crash dump message did not record CPU FAULT: vec=6: {:?}",
+            hdr.message
+        );
+    }
+    eprintln!("smoke: one tampered copy was repaired, two were rejected and preserved, keyless EROFS & Ring-0 CPU fault dump verified; TAMPER TEST PASSED");
 }
 
 #[test]

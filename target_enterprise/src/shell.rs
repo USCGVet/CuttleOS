@@ -367,7 +367,9 @@ pub struct OsShell {
     pub durable_provisioned: bool,
     /// Monotonic durable store commit sequence number anchored by [`crate::state_store::ShellStore`].
     pub commit_seq: u64,
-    /// Most recently validated HTTP session slot owner ID (`0` = console/unauthenticated, `1..=SHELL_MAX_SESSIONS` = session slot).
+    /// Monotonic counter of minted HTTP/web sessions (disambiguates recycled session slots).
+    session_mint_seq: u64,
+    /// Most recently validated HTTP session owner ID (`0` = console/unauthenticated).
     pub last_session_owner: u64,
     /// Active SQL transaction owner override (`0` = console, `1..=4` = HTTP session, `SQL_OWNER_*` = internal subsystem).
     pub sql_owner_override: u64,
@@ -442,6 +444,7 @@ impl OsShell {
             boot_gen: 0,
             durable_provisioned: false,
             commit_seq: 0,
+            session_mint_seq: 0,
             last_session_owner: 0,
             sql_owner_override: 0,
             triad_node_id: 0,
@@ -566,6 +569,7 @@ impl OsShell {
         self.vault_nonce_seq = boot_gen.wrapping_mul(37) & 0x7FFF;
         self.vault_nonce_default = self.vault_nonce_seq;
         self.vault_entropy_pool = boot_gen.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xC077_1E05_5EED_0001;
+        self.session_mint_seq = 0;
         self.last_session_owner = 0;
         self.sql_owner_override = 0;
         self.triad_node_id = 0;
@@ -836,12 +840,13 @@ impl OsShell {
         let mut token_hex = [0u8; 32];
         let _ = hex_bytes(&digest[..16], &mut token_hex);
 
+        self.session_mint_seq = self.session_mint_seq.wrapping_add(1).max(1);
         let mut sess = WebSession::empty();
         sess.active = true;
         sess.token_hex = token_hex;
         sess.user[..ulen].copy_from_slice(&uname[..ulen]);
         sess.user_len = ulen as u8;
-        sess.created_seq = self.cmd_seq;
+        sess.created_seq = self.session_mint_seq.max(self.cmd_seq);
         sess.requests = 0;
         self.sessions[slot] = sess;
         self.record_audit(32, AuditVerdict::Allowed, b"shell:session:login");
@@ -887,7 +892,8 @@ impl OsShell {
     pub fn validate_session(&mut self, token_hex: &[u8]) -> Option<usize> {
         if let Some(idx) = self.find_session(token_hex) {
             self.sessions[idx].requests = self.sessions[idx].requests.wrapping_add(1);
-            self.last_session_owner = (idx + 1) as u64;
+            let mint_gen = self.sessions[idx].created_seq & 0x00FF_FFFF;
+            self.last_session_owner = (mint_gen << 8) | ((idx + 1) as u64);
             Some(idx)
         } else {
             self.last_session_owner = 0;

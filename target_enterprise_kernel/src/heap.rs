@@ -1,10 +1,13 @@
 //! Kernel heap.
 //!
-//! rustls (TLS 1.3 on port 443) needs `alloc`; nothing else in the kernel
-//! allocates. The heap is a fixed, zero-initialized region in `.bss` (so it adds
-//! nothing to the kernel ELF) managed by `linked_list_allocator` behind a spin
-//! lock, which is safe across SMP cores. Interrupt handlers never allocate, so the
-//! lock cannot be re-entered from an interrupt.
+//! `rustls` (TLS 1.3 `TlsSession` and `ServerIdentity` on port 443) and `LivedNet`
+//! per-slot TCP/HTTP/retransmit `Vec` buffers allocate from this fixed 8 MiB `.bss`
+//! region (adding nothing to the kernel ELF size), managed by `linked_list_allocator`
+//! behind an SMP-safe spin lock. Untrusted network and TLS session admissions check
+//! [`has_heap_headroom`] against [`KERNEL_HEAP_RESERVE_BYTES`] (`512 KiB`) before
+//! growing buffers, so connection floods are shed cleanly instead of exhausting the
+//! heap. Interrupt handlers never allocate, so the lock cannot be re-entered from an
+//! interrupt.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};

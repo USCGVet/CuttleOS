@@ -405,7 +405,11 @@ fn exec_service_ring3_core(
     const LAPIC_LVT_TIMER_OFF: u64 = 0x0320;
     const LAPIC_TIMER_INIT_OFF: u64 = 0x0380;
     const LAPIC_TIMER_DIV_OFF: u64 = 0x03E0;
-    const PREEMPT_TIMER_VEC: u8 = 0x40;
+    // Priority class 5 (`0x50`), strictly disjoint from and higher priority than
+    // the periodic BSP timer (`0x40`) and SMP/IOAPIC vectors (`0x41..0x44`, class 4).
+    const PREEMPT_TIMER_VEC: u8 = 0x50;
+    const LAPIC_ISR_PREEMPT_OFF: u64 = 0x0100 + (((PREEMPT_TIMER_VEC as u64) >> 5) * 0x10);
+    const LAPIC_ISR_PREEMPT_BIT: u32 = 1u32 << ((PREEMPT_TIMER_VEC as u32) & 31);
 
     let dma = dma_phys_base();
     if dma == 0 || phys_map_offset() == 0 {
@@ -647,7 +651,7 @@ fn exec_service_ring3_core(
         0xC3,                                                 // ret
     ];
 
-    // 5) `+0x360`: `isr_preempt_timer` (Vector `0x40`, `DPL=0`, `IST=0`: evicts runaway Ring-3 code
+    // 5) `+0x360`: `isr_preempt_timer` (Vector `0x50`, `DPL=0`, `IST=0`: evicts runaway Ring-3 code
     //    upon Local APIC timer expiry while `user_pml4_phys` is loaded in `CR3`, restores `kernel_cr3` + `RSP`)
     let isr_preempt_timer: [u8; 64] = [
         0x48, 0x8D, 0x05, 0x99, 0x0E, 0x00, 0x00,                   // lea rax, [rip + 0x0E99] -> user_va + 0x4200
@@ -852,6 +856,10 @@ fn exec_service_ring3_core(
     let entry_stub_va = kernel_trampoline_va + 0x040;
 
     // Save/arm Local APIC one-shot preemption timer when requested (with legacy 8259 PIC masked).
+    // Before loading the sandbox IDT/CR3, mask the periodic `0x40` timer, drain any already-latched
+    // class-4 interrupts through `RUNTIME_IDT`, and raise `LAPIC_TPR` to `0x40` so class-4 vectors
+    // (`0x40..0x44`) are architecturally held in `IRR` while `PREEMPT_TIMER_VEC` (`0x50`, class 5) runs.
+    let mut saved_tpr: u32 = 0;
     let mut saved_lvt_timer: u32 = 0;
     let mut saved_timer_init: u32 = 0;
     // SAFETY: Running at CPL=0; `LAPIC_BASE` was mapped above when `preempt_timer_ticks.is_some()`.
@@ -870,11 +878,18 @@ fn exec_service_ring3_core(
             crate::outb(0xA1, 0xFF);
             crate::outb(0x3F9, 0x00);
 
+            saved_tpr = crate::mmio_read32(LAPIC_BASE + LAPIC_TPR_OFF);
             saved_lvt_timer = crate::mmio_read32(LAPIC_BASE + LAPIC_LVT_TIMER_OFF);
             saved_timer_init = crate::mmio_read32(LAPIC_BASE + LAPIC_TIMER_INIT_OFF);
             let svr = crate::mmio_read32(LAPIC_BASE + LAPIC_SVR_OFF);
             crate::mmio_write32(LAPIC_BASE + LAPIC_SVR_OFF, svr | 0x1FF);
+            crate::mmio_write32(LAPIC_BASE + LAPIC_LVT_TIMER_OFF, 0x0001_0040);
+            crate::mmio_write32(LAPIC_BASE + LAPIC_TIMER_INIT_OFF, 0);
             crate::mmio_write32(LAPIC_BASE + LAPIC_TPR_OFF, 0);
+            if crate::smp_hw::is_bsp_idt_ready() {
+                asm!("sti", "nop", "nop", "cli", options(nomem, nostack));
+            }
+            crate::mmio_write32(LAPIC_BASE + LAPIC_TPR_OFF, 0x40);
             crate::mmio_write32(LAPIC_BASE + LAPIC_TIMER_DIV_OFF, 0x03);
             crate::mmio_write32(
                 LAPIC_BASE + LAPIC_LVT_TIMER_OFF,
@@ -971,7 +986,7 @@ fn exec_service_ring3_core(
     }
 
     // Disarm/EOI one-shot preemption timer and restore CPU 0's permanent guarded runtime TSS (`TR`).
-    // SAFETY: Running at CPL=0 with `kernel_cr3` active.
+    // SAFETY: Running at CPL=0 with `kernel_cr3` and `RUNTIME_IDT` active.
     unsafe {
         if preempt_timer_ticks.is_some() {
             crate::mmio_write32(
@@ -979,7 +994,12 @@ fn exec_service_ring3_core(
                 0x0001_0000 | (PREEMPT_TIMER_VEC as u32),
             );
             crate::mmio_write32(LAPIC_BASE + LAPIC_TIMER_INIT_OFF, 0);
-            crate::mmio_write32(LAPIC_BASE + LAPIC_EOI_OFF, 0);
+            if (crate::mmio_read32(LAPIC_BASE + LAPIC_ISR_PREEMPT_OFF) & LAPIC_ISR_PREEMPT_BIT)
+                != 0
+            {
+                crate::mmio_write32(LAPIC_BASE + LAPIC_EOI_OFF, 0);
+            }
+            crate::mmio_write32(LAPIC_BASE + LAPIC_TPR_OFF, saved_tpr);
             if (saved_lvt_timer & 0x0002_0000) != 0 && saved_timer_init != 0 {
                 crate::mmio_write32(LAPIC_BASE + LAPIC_LVT_TIMER_OFF, saved_lvt_timer);
                 crate::mmio_write32(LAPIC_BASE + LAPIC_TIMER_INIT_OFF, saved_timer_init);
@@ -1365,6 +1385,70 @@ pub(crate) fn banner_ring3_transition() {
     }
 
     serial_write_str("RING3 transition OK cpl=3->0 vec=0x80 ist1=ok rsp0=ok syscall=43\n");
+}
+
+/// Live hardware regression proof for Medium #8: arm the periodic Local APIC timer on vector
+/// `0x40` with `IF=0` until `IRR[0x40] == 1` is genuinely latched in hardware, then execute a
+/// preemptible Ring-3 worker (`IF=1`, `Some(20_000_000)`) and require it to complete cleanly
+/// without false preemption.
+#[cfg(not(cuttle_prod))]
+#[inline(never)]
+pub(crate) fn verify_ring3_under_latched_periodic_timer_live() {
+    const LAPIC_BASE: u64 = 0xFEE0_0000;
+    const LAPIC_SVR_OFF: u64 = 0x00F0;
+    const LAPIC_IRR_40_OFF: u64 = 0x0220; // IRR words: 0x200 + 0x10 * (0x40 >> 5) = 0x220, bit 0
+    const LAPIC_LVT_TIMER_OFF: u64 = 0x0320;
+    const LAPIC_TIMER_INIT_OFF: u64 = 0x0380;
+    const LAPIC_TIMER_DIV_OFF: u64 = 0x03E0;
+
+    let ring3_code: [u8; 32] = [
+        0x8C, 0xC8, // mov eax, cs
+        0x48, 0x89, 0xC6, // mov rsi, rax
+        0x48, 0x8B, 0x44, 0x24, 0xE0, // mov rax, [rsp - 0x20]
+        0x48, 0x89, 0xC2, // mov rdx, rax
+        0x48, 0x81, 0xF2, 0x2A, 0x00, 0x00, 0x00, // xor rdx, 42
+        0x48, 0x89, 0x54, 0x24, 0xE8, // mov [rsp - 0x18], rdx
+        0xBF, 0x02, 0x00, 0x00, 0x00, // mov edi, 2 (SYS_GETPID)
+        0xCD, 0x80, // int 0x80
+    ];
+
+    // SAFETY: Running at CPL=0 after `smp_hw_init` mapped `LAPIC_BASE` and installed `RUNTIME_IDT`.
+    unsafe {
+        asm!("cli", options(nomem, nostack, preserves_flags));
+        let _ = crate::ensure_mmio_page(LAPIC_BASE);
+        let svr = crate::mmio_read32(LAPIC_BASE + LAPIC_SVR_OFF);
+        crate::mmio_write32(LAPIC_BASE + LAPIC_SVR_OFF, svr | 0x1FF);
+        crate::mmio_write32(LAPIC_BASE + LAPIC_TIMER_DIV_OFF, 0x03);
+        crate::mmio_write32(LAPIC_BASE + LAPIC_LVT_TIMER_OFF, 0x0002_0040);
+        crate::mmio_write32(LAPIC_BASE + LAPIC_TIMER_INIT_OFF, 512);
+        let mut spins = 0u32;
+        while (crate::mmio_read32(LAPIC_BASE + LAPIC_IRR_40_OFF) & 1) == 0 && spins < 5_000_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        if (crate::mmio_read32(LAPIC_BASE + LAPIC_IRR_40_OFF) & 1) == 0 {
+            crate::mmio_write32(LAPIC_BASE + LAPIC_LVT_TIMER_OFF, 0x0001_0040);
+            crate::mmio_write32(LAPIC_BASE + LAPIC_TIMER_INIT_OFF, 0);
+            panic!("RING3: periodic LAPIC vector 0x40 failed to latch in IRR for regression proof");
+        }
+    }
+
+    let res = exec_service_ring3_stub_with_opts(1, 0, &ring3_code, 0, 42, false, Some(20_000_000));
+
+    // Disarm periodic `0x40` and drain any residual latched tick now that we're back in Ring-0.
+    // SAFETY: Running at CPL=0 with `RUNTIME_IDT` active.
+    unsafe {
+        crate::mmio_write32(LAPIC_BASE + LAPIC_LVT_TIMER_OFF, 0x0001_0040);
+        crate::mmio_write32(LAPIC_BASE + LAPIC_TIMER_INIT_OFF, 0);
+        asm!("sti", "nop", "nop", "cli", options(nomem, nostack));
+    }
+
+    if let Err(e) = res {
+        panic!(
+            "RING3: latched periodic timer 0x40 falsely preempted Ring-3 worker: {:?}",
+            e
+        );
+    }
 }
 
 // ============================================================

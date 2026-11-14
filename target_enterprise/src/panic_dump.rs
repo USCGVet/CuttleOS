@@ -73,8 +73,9 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+pub use cuttle_contracts::CrashDump;
 use cuttle_contracts::{
-    crash_offsets, CrashContext, CrashDump, CrashDumpError, CrashDumpHeader,
+    crash_offsets, CrashContext, CrashDumpError, CrashDumpHeader,
     CRASH_BACKTRACE_MAX, CRASH_DUMP_BYTES, CRASH_DUMP_MAGIC, CRASH_DUMP_SCHEMA, CRASH_KMSG_MAX,
     CRASH_LOC_MAX, CRASH_MSG_MAX, CRASH_REG_COUNT,
 };

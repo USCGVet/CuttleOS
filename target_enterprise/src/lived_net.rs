@@ -227,6 +227,8 @@ pub struct LivedNet {
     slot_rto_ticks: [u32; TCP_MAX_SLOTS],
     slot_rto_shift: [u8; TCP_MAX_SLOTS],
     slot_remote_mac: [[u8; 6]; TCP_MAX_SLOTS],
+    slot_conn_epoch: [u64; TCP_MAX_SLOTS],
+    next_conn_epoch: u64,
     http_input_closed: [bool; TCP_MAX_SLOTS],
     ticks: u32,
     timer_hz: u32,
@@ -275,6 +277,8 @@ impl LivedNet {
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
             slot_rto_shift: [0u8; TCP_MAX_SLOTS],
             slot_remote_mac: [[0u8; 6]; TCP_MAX_SLOTS],
+            slot_conn_epoch: [0u64; TCP_MAX_SLOTS],
+            next_conn_epoch: 1,
             http_input_closed: [false; TCP_MAX_SLOTS],
             ticks: 1,
             timer_hz: DEFAULT_TIMER_HZ,
@@ -326,6 +330,8 @@ impl LivedNet {
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
             slot_rto_shift: [0u8; TCP_MAX_SLOTS],
             slot_remote_mac: [[0u8; 6]; TCP_MAX_SLOTS],
+            slot_conn_epoch: [0u64; TCP_MAX_SLOTS],
+            next_conn_epoch: 1,
             http_input_closed: [false; TCP_MAX_SLOTS],
             ticks: 1,
             timer_hz: DEFAULT_TIMER_HZ,
@@ -372,6 +378,8 @@ impl LivedNet {
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
             slot_rto_shift: [0u8; TCP_MAX_SLOTS],
             slot_remote_mac: [[0u8; 6]; TCP_MAX_SLOTS],
+            slot_conn_epoch: [0u64; TCP_MAX_SLOTS],
+            next_conn_epoch: 1,
             http_input_closed: [false; TCP_MAX_SLOTS],
             ticks: 1,
             timer_hz: DEFAULT_TIMER_HZ,
@@ -1668,8 +1676,17 @@ impl LivedNet {
         self.tcbs[idx] = Tcb::listen(self.ip, dst_port, 65535);
         self.slot_rto_ticks[idx] = self.ticks;
         self.slot_remote_mac[idx] = [0u8; 6];
+        let epoch = self.next_conn_epoch.max(1);
+        self.next_conn_epoch = epoch.wrapping_add(1).max(1);
+        self.slot_conn_epoch[idx] = epoch;
         self.release_slot_buffers(idx);
         Some(idx)
+    }
+
+    #[inline]
+    fn slot_anon_sql_owner(&self, idx: usize) -> u64 {
+        let ep = self.slot_conn_epoch[idx].max(1) & 0x00FF_FFFF;
+        0x1_0000_0000u64 | (ep << 8) | ((idx & 0xFF) as u64)
     }
 
     fn record_inflight_tx(&mut self, idx: usize, seq: u32, payload: &[u8]) {
@@ -2095,8 +2112,19 @@ impl LivedNet {
                     HttpFrameOutcome::Complete(req) => {
                         close_after = http_wants_close(&req);
                         self.active_http_peer_ip = self.tcbs[idx].remote_ip;
+                        let anon_owner = self.slot_anon_sql_owner(idx);
+                        let prev_owner = shell.as_deref_mut().map(|s| {
+                            let p = s.sql_owner_override;
+                            if p == crate::sql::SQL_OWNER_CONSOLE {
+                                s.sql_owner_override = anon_owner;
+                            }
+                            p
+                        });
                         let written =
                             self.handle_http_request(&req, boots, shell.as_deref_mut(), &mut single);
+                        if let (Some(s), Some(p)) = (shell.as_deref_mut(), prev_owner) {
+                            s.sql_owner_override = p;
+                        }
                         self.active_http_peer_ip = [0u8; 4];
                         written
                     }
@@ -2369,12 +2397,23 @@ impl LivedNet {
                     HttpFrameOutcome::Complete(mut request) => {
                         close_after = http_wants_close(&request);
                         self.active_http_peer_ip = self.tcbs[idx].remote_ip;
+                        let anon_owner = self.slot_anon_sql_owner(idx);
+                        let prev_owner = shell.as_deref_mut().map(|s| {
+                            let p = s.sql_owner_override;
+                            if p == crate::sql::SQL_OWNER_CONSOLE {
+                                s.sql_owner_override = anon_owner;
+                            }
+                            p
+                        });
                         let written = self.handle_http_request(
                             &request,
                             boots,
                             shell.as_deref_mut(),
                             &mut response,
                         );
+                        if let (Some(s), Some(p)) = (shell.as_deref_mut(), prev_owner) {
+                            s.sql_owner_override = p;
+                        }
                         self.active_http_peer_ip = [0u8; 4];
                         crate::https::scrub_vec_all_bytes(&mut request);
                         written
@@ -8352,5 +8391,66 @@ mod tests {
         let mut ack_out = ReplySet::new();
         net2.handle_frame_with_shell(&ffa[..flfa], 1, &mut sh, &mut ack_out);
         assert_eq!(net2.total_inflight_tx_bytes(), 0);
+    }
+
+    #[test]
+    fn http_tcp_slots_and_recycled_sessions_use_isolated_sql_owners() {
+        let mut net = LivedNet::new([0x52, 0x54, 0, 0x12, 0x34, 0x56]);
+        let mut sh = crate::shell::OsShell::new();
+
+        // 1. Two concurrent TCP slots receive strictly distinct anonymous SQL owner IDs,
+        //    and a recycled slot receives a monotonically bumped epoch owner ID.
+        let s0 = net.claim_verified_tcp_slot(HTTP_PORT, false).unwrap();
+        net.tcbs[s0].state = TcpState::Established;
+        let s1 = net.claim_verified_tcp_slot(HTTP_PORT, false).unwrap();
+        net.tcbs[s1].state = TcpState::Established;
+        assert_ne!(s0, s1);
+        let owner_s0_first = net.slot_anon_sql_owner(s0);
+        let owner_s1 = net.slot_anon_sql_owner(s1);
+        assert_ne!(owner_s0_first, owner_s1);
+        assert_ne!(owner_s0_first, crate::sql::SQL_OWNER_HTTP_ANON);
+        assert_ne!(owner_s1, crate::sql::SQL_OWNER_HTTP_ANON);
+
+        net.tcbs[s0] = Tcb::EMPTY;
+        let s0_reused = net.claim_verified_tcp_slot(HTTP_PORT, false).unwrap();
+        assert_eq!(s0_reused, s0);
+        let owner_s0_second = net.slot_anon_sql_owner(s0_reused);
+        assert_ne!(
+            owner_s0_first, owner_s0_second,
+            "recycled TCP slot must get a fresh anonymous SQL owner ID"
+        );
+
+        // 2. Session A opens a transaction via HTTP POST /sql, times out (leaving Session A's
+        //    SQL owner in `tx_aborted`), and logs out. Session B is then minted in the same
+        //    recycled session slot 0 — Session B MUST receive a fresh owner ID and succeed!
+        let sid_a = sh.try_create_session(b"alice", b"chal-a").expect("mint sid_a");
+        let req_begin = alloc::format!(
+            "POST /sql HTTP/1.1\r\nHost: cuttle\r\nCookie: sid={}\r\nContent-Length: 5\r\n\r\nBEGIN",
+            core::str::from_utf8(&sid_a).unwrap()
+        );
+        let mut resp = [0u8; 1024];
+        let n = net.handle_http_request(req_begin.as_bytes(), 1, Some(&mut sh), &mut resp);
+        assert!(core::str::from_utf8(&resp[..n]).unwrap().contains("BEGIN OK"));
+
+        for _ in 0..16 {
+            let _ = sh.db.tick_transaction_timeout();
+        }
+        assert!(sh.db.tx_aborted);
+        assert!(sh.revoke_session(&sid_a));
+
+        let sid_b = sh.try_create_session(b"bob", b"chal-b").expect("mint sid_b in slot 0");
+        let body_ins = "INSERT INTO kv VALUES ('bob.iso', 'ok', 1)";
+        let req_ins = alloc::format!(
+            "POST /sql HTTP/1.1\r\nHost: cuttle\r\nCookie: sid={}\r\nContent-Length: {}\r\n\r\n{}",
+            core::str::from_utf8(&sid_b).unwrap(),
+            body_ins.len(),
+            body_ins
+        );
+        let n2 = net.handle_http_request(req_ins.as_bytes(), 1, Some(&mut sh), &mut resp);
+        let s2 = core::str::from_utf8(&resp[..n2]).unwrap();
+        assert!(
+            s2.contains("INSERT 1"),
+            "recycled session slot must not inherit previous session's aborted SQL state: {s2}"
+        );
     }
 }

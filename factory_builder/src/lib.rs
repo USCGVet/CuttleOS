@@ -747,6 +747,7 @@ pub fn build_kernel_with_layout_seed_and_prod(
     // flags would be silently dropped and cargo would try to link
     // against MSVC for the host target. We also clear `RUSTUP_TOOLCHAIN`
     // (set by the parent test runner) so rust-toolchain.toml wins.
+    let target_dir = kernel_target_dir(kernel_crate_dir, prod);
     let mut cmd = Command::new("cargo");
     cmd.current_dir(kernel_crate_dir)
         .env_remove("RUSTUP_TOOLCHAIN")
@@ -756,6 +757,9 @@ pub fn build_kernel_with_layout_seed_and_prod(
         .arg("--release")
         .arg("--manifest-path")
         .arg(&manifest);
+    if prod {
+        cmd.arg("--target-dir").arg(&target_dir);
+    }
     // Compose reproducible CARGO_ENCODED_RUSTFLAGS from the inherited base +
     // KERNEL_BASE_RUSTFLAGS + `--remap-path-prefix` for workspace, cargo_home,
     // and rustup_home so host build paths never leak into the ELF.
@@ -781,8 +785,7 @@ pub fn build_kernel_with_layout_seed_and_prod(
         // otherwise accumulate hundreds of old `.rmeta`/`.rlib` copies in
         // `target/x86_64-unknown-none/release/deps/`. Wipe `deps/` and
         // `incremental/` before a seeded build so disk usage stays flat.
-        let rel_dir = kernel_crate_dir
-            .join("target")
+        let rel_dir = target_dir
             .join("x86_64-unknown-none")
             .join("release");
         let _ = fs::remove_dir_all(rel_dir.join("deps"));
@@ -790,7 +793,10 @@ pub fn build_kernel_with_layout_seed_and_prod(
         let _ = fs::remove_dir_all(rel_dir.join(".fingerprint"));
     }
     if prod {
-        eprintln!("factory_builder: production kernel build (banner suite + attack harness stripped)");
+        eprintln!(
+            "factory_builder: production kernel build (banner suite + attack harness stripped, target={})",
+            target_dir.display()
+        );
     }
     let status = cmd
         .status()
@@ -801,14 +807,9 @@ pub fn build_kernel_with_layout_seed_and_prod(
             manifest.display()
         );
     }
-    let elf = kernel_crate_dir
-        .join("target")
-        .join("x86_64-unknown-none")
-        .join("release")
-        .join("target_enterprise_kernel");
+    let elf = kernel_elf_path(kernel_crate_dir, prod);
     if !elf.exists() {
-        let alt = kernel_crate_dir
-            .join("target")
+        let alt = target_dir
             .join("release")
             .join("target_enterprise_kernel");
         if alt.exists() {
@@ -820,6 +821,27 @@ pub fn build_kernel_with_layout_seed_and_prod(
         );
     }
     Ok(fs::canonicalize(elf)?)
+}
+
+/// Resolve the Cargo target directory for `kernel_crate_dir`.
+///
+/// Production builds (`prod = true`) write to `target/prod` so `--prod` never overwrites
+/// `target/x86_64-unknown-none/release/target_enterprise_kernel` expected by `binmorph`
+/// and `mtd_metrics` tests.
+pub fn kernel_target_dir(kernel_crate_dir: &Path, prod: bool) -> PathBuf {
+    if prod {
+        kernel_crate_dir.join("target").join("prod")
+    } else {
+        kernel_crate_dir.join("target")
+    }
+}
+
+/// Resolve the expected bare-metal release ELF path inside [`kernel_target_dir`].
+pub fn kernel_elf_path(kernel_crate_dir: &Path, prod: bool) -> PathBuf {
+    kernel_target_dir(kernel_crate_dir, prod)
+        .join("x86_64-unknown-none")
+        .join("release")
+        .join("target_enterprise_kernel")
 }
 
 /// Default filename for the 32-byte out-of-band per-device secret key
@@ -1352,5 +1374,21 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prod_kernel_target_dir_is_isolated_from_default_kernel_elf() {
+        let kdir = Path::new("target_enterprise_kernel");
+        let default_dir = kernel_target_dir(kdir, false);
+        let prod_dir = kernel_target_dir(kdir, true);
+        assert_ne!(default_dir, prod_dir);
+        assert_eq!(default_dir, kdir.join("target"));
+        assert_eq!(prod_dir, kdir.join("target").join("prod"));
+
+        let default_elf = kernel_elf_path(kdir, false);
+        let prod_elf = kernel_elf_path(kdir, true);
+        assert_ne!(default_elf, prod_elf);
+        assert!(default_elf.ends_with("target/x86_64-unknown-none/release/target_enterprise_kernel"));
+        assert!(prod_elf.ends_with("target/prod/x86_64-unknown-none/release/target_enterprise_kernel"));
     }
 }

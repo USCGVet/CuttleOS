@@ -162,6 +162,71 @@ pub fn is_seal_key_set(key: &[u8; DURABLE_DIGEST_LEN]) -> bool {
     !constant_time_eq(key, &[0u8; DURABLE_DIGEST_LEN])
 }
 
+/// Magic tag at `hdr[24..32]` marking an `HMAC-SHA256`-authenticated continuity header sector.
+pub const CONTINUITY_HMAC_TAG_MAGIC: [u8; 8] = *b"CTTLWL2H";
+
+/// Pack the 512-byte cross-morph continuity header (`CTTLWAL1`) authenticated under `seal_key`
+/// (`HMAC-SHA256(seal_key, "cuttle-continuity-hdr-v1:" || hdr[0..32])` at `hdr[32..64]`).
+pub fn pack_continuity_header(
+    boots: u64,
+    cursor: u32,
+    crc: u32,
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+) -> [u8; 512] {
+    let mut hdr = [0u8; 512];
+    hdr[0..8].copy_from_slice(b"CTTLWAL1");
+    hdr[8..16].copy_from_slice(&boots.to_le_bytes());
+    hdr[16..20].copy_from_slice(&cursor.to_le_bytes());
+    hdr[20..24].copy_from_slice(&crc.to_le_bytes());
+    if is_seal_key_set(seal_key) {
+        hdr[24..32].copy_from_slice(&CONTINUITY_HMAC_TAG_MAGIC);
+        let mut mac = [0u8; DURABLE_DIGEST_LEN];
+        hmac_sha256_parts(
+            seal_key,
+            &[b"cuttle-continuity-hdr-v1:", &hdr[0..32]],
+            &mut mac,
+        );
+        hdr[32..64].copy_from_slice(&mac);
+    }
+    hdr
+}
+
+/// Verify an `HMAC-SHA256`-authenticated continuity header sector (`CTTLWAL1` + `CTTLWL2H`)
+/// in constant time under `seal_key`, returning `Some((boots, cursor, crc))` iff authentic.
+pub fn verify_continuity_header(
+    hdr: &[u8; 512],
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+) -> Option<(u64, usize, u32)> {
+    if !is_seal_key_set(seal_key) {
+        return None;
+    }
+    if hdr[0..8] != *b"CTTLWAL1" || hdr[24..32] != CONTINUITY_HMAC_TAG_MAGIC {
+        return None;
+    }
+    let mut expected_mac = [0u8; DURABLE_DIGEST_LEN];
+    expected_mac.copy_from_slice(&hdr[32..64]);
+    let mut actual_mac = [0u8; DURABLE_DIGEST_LEN];
+    hmac_sha256_parts(
+        seal_key,
+        &[b"cuttle-continuity-hdr-v1:", &hdr[0..32]],
+        &mut actual_mac,
+    );
+    if !constant_time_eq(&actual_mac, &expected_mac) {
+        return None;
+    }
+    let mut boots_b = [0u8; 8];
+    let mut cur_b = [0u8; 4];
+    let mut crc_b = [0u8; 4];
+    boots_b.copy_from_slice(&hdr[8..16]);
+    cur_b.copy_from_slice(&hdr[16..20]);
+    crc_b.copy_from_slice(&hdr[20..24]);
+    Some((
+        u64::from_le_bytes(boots_b),
+        u32::from_le_bytes(cur_b) as usize,
+        u32::from_le_bytes(crc_b),
+    ))
+}
+
 /// Constant-time compare of two digests (avoid short-circuit on first
 /// mismatch for use with keyed MACs; cheap for 32 bytes).
 pub fn constant_time_eq(a: &[u8; DURABLE_DIGEST_LEN], b: &[u8; DURABLE_DIGEST_LEN]) -> bool {
@@ -894,6 +959,26 @@ mod tests {
                 "tampering byte {tamper_off} must invalidate AB_FORMAT_V3 commit sector"
             );
         }
+    }
+
+    #[test]
+    fn continuity_header_hmac_rejects_forged_boot_counter_and_unauthenticated_v1() {
+        let key = derive_seal_key(&DEFAULT_DURABLE_SEAL_KEY, b"continuity-hdr");
+        let hdr = pack_continuity_header(7, 144, 0xCAFE_BABE, &key);
+        assert_eq!(verify_continuity_header(&hdr, &key), Some((7, 144, 0xCAFE_BABE)));
+
+        // Forging `boots` (e.g. to spoof attestation quotes) invalidates HMAC.
+        let mut forged_boots = hdr;
+        forged_boots[8..16].copy_from_slice(&99_999u64.to_le_bytes());
+        assert_eq!(verify_continuity_header(&forged_boots, &key), None);
+
+        // Unauthenticated legacy header (`hdr[24..64] == 0`) is rejected.
+        let mut unauth = [0u8; 512];
+        unauth[0..8].copy_from_slice(b"CTTLWAL1");
+        unauth[8..16].copy_from_slice(&7u64.to_le_bytes());
+        unauth[16..20].copy_from_slice(&144u32.to_le_bytes());
+        unauth[20..24].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+        assert_eq!(verify_continuity_header(&unauth, &key), None);
     }
 }
 

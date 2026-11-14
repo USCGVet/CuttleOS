@@ -394,6 +394,10 @@ pub(crate) fn vnet_notify(n: &VnetModern, queue: u16) {
     }
 }
 
+/// Monotonic counter of VirtIO-Net TX frames dropped due to virtqueue completion timeout.
+pub(crate) static VNET_TX_DROPS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// TX one Ethernet frame (2-desc chain, waiting for any prior in-flight TX
 /// to complete before reusing `tx_buf_phys`). Returns false if `frame` is
 /// empty/oversized or if the ring bookkeeping misbehaves.
@@ -404,6 +408,8 @@ pub(crate) fn vnet_tx(n: &mut VnetModern, frame: &[u8]) -> bool {
     }
     // Wait for any previous in-flight TX descriptor chain to complete before mutating `tx_buf_phys`.
     if n.tx_used_seen != n.tx_avail_next {
+        let tsc_budget = (crate::smp_hw::ensure_tsc_calibrated() / 40).max(1_000_000);
+        let deadline_tsc = crate::smp_hw::read_tsc().wrapping_add(tsc_budget);
         let mut spins = 0u32;
         loop {
             // SAFETY: `n.tx_q_virt + VN_USED_OFF + 2` is 2-byte aligned inside the mapped TX virtqueue page.
@@ -415,7 +421,11 @@ pub(crate) fn vnet_tx(n: &mut VnetModern, frame: &[u8]) -> bool {
                 break;
             }
             spins = spins.wrapping_add(1);
-            if spins > 100_000 {
+            if spins > 4_000_000
+                || ((spins & 0x3FF) == 0
+                    && crate::smp_hw::read_tsc().wrapping_sub(deadline_tsc) < (1u64 << 63))
+            {
+                VNET_TX_DROPS.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             core::hint::spin_loop();
@@ -463,44 +473,46 @@ pub(crate) fn vnet_tx(n: &mut VnetModern, frame: &[u8]) -> bool {
 /// Poll one RX frame into `out`; returns (frame_len, hdr_buf_index) —
 /// the caller recycles by calling vnet_rx_recycle(idx).
 pub(crate) fn vnet_rx(n: &mut VnetModern, out: &mut [u8]) -> Option<(usize, u16)> {
-    // SAFETY: `n.rx_q_virt + VN_USED_OFF + 2` is 2-byte aligned inside the mapped RX virtqueue page; volatile load prevents compiler caching across poll iterations.
-    let cur = unsafe { core::ptr::read_volatile((n.rx_q_virt + VN_USED_OFF + 2) as *const u16) };
-    if cur == n.rx_used_seen {
-        return None;
-    }
-    let slot = (n.rx_used_seen as u64) & (VN_QSIZE as u64 - 1);
-    // SAFETY: `slot = (rx_used_seen % VN_QSIZE) < 64`, so `VN_USED_OFF + 4 + slot * 8` is 4-byte aligned and in bounds of the mapped RX virtqueue page.
-    let id = unsafe {
-        core::ptr::read_volatile((n.rx_q_virt + VN_USED_OFF + 4 + slot * 8) as *const u32)
-    } as u16;
-    // SAFETY: `slot < 64`, so `VN_USED_OFF + 4 + slot * 8 + 4` is 4-byte aligned and in bounds of the mapped RX virtqueue page.
-    let len = unsafe {
-        core::ptr::read_volatile((n.rx_q_virt + VN_USED_OFF + 4 + slot * 8 + 4) as *const u32)
-    } as usize;
-    n.rx_used_seen = n.rx_used_seen.wrapping_add(1);
-    let flen = match target_enterprise::memory::dma_layout::validate_modern_vnet_rx_used(
-        id,
-        len,
-        VN_RX_BUFFERS,
-        VN_HDR,
-        VN_RX_BUF - 0x40,
-        out.len(),
-    ) {
-        Some(flen) => flen,
-        None => {
+    let mut skipped = 0usize;
+    while skipped < VN_QSIZE as usize {
+        // SAFETY: `n.rx_q_virt + VN_USED_OFF + 2` is 2-byte aligned inside the mapped RX virtqueue page; volatile load prevents compiler caching across poll iterations.
+        let cur = unsafe { core::ptr::read_volatile((n.rx_q_virt + VN_USED_OFF + 2) as *const u16) };
+        if cur == n.rx_used_seen {
+            return None;
+        }
+        let slot = (n.rx_used_seen as u64) & (VN_QSIZE as u64 - 1);
+        // SAFETY: `slot = (rx_used_seen % VN_QSIZE) < 64`, so `VN_USED_OFF + 4 + slot * 8` is 4-byte aligned and in bounds of the mapped RX virtqueue page.
+        let id = unsafe {
+            core::ptr::read_volatile((n.rx_q_virt + VN_USED_OFF + 4 + slot * 8) as *const u32)
+        } as u16;
+        // SAFETY: `slot < 64`, so `VN_USED_OFF + 4 + slot * 8 + 4` is 4-byte aligned and in bounds of the mapped RX virtqueue page.
+        let len = unsafe {
+            core::ptr::read_volatile((n.rx_q_virt + VN_USED_OFF + 4 + slot * 8 + 4) as *const u32)
+        } as usize;
+        n.rx_used_seen = n.rx_used_seen.wrapping_add(1);
+        let Some(flen) = target_enterprise::memory::dma_layout::validate_modern_vnet_rx_used(
+            id,
+            len,
+            VN_RX_BUFFERS,
+            VN_HDR,
+            VN_RX_BUF - 0x40,
+            out.len(),
+        ) else {
             if (id as usize) < 2 * VN_RX_BUFFERS && (id & 1) == 0 {
                 vnet_rx_recycle(n, id);
             }
-            return None;
+            skipped += 1;
+            continue;
+        };
+        let bi = (id / 2) as u64;
+        let data_virt = pa_to_va(n.rx_q_phys + 0x2000 + bi * (VN_RX_BUF as u64) + 0x40);
+        // SAFETY: `bi < VN_RX_BUFFERS` and `flen <= VN_RX_BUF - 0x40` and `flen <= out.len()`, validated by `validate_modern_vnet_rx_used`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data_virt as *const u8, out.as_mut_ptr(), flen);
         }
-    };
-    let bi = (id / 2) as u64;
-    let data_virt = pa_to_va(n.rx_q_phys + 0x2000 + bi * (VN_RX_BUF as u64) + 0x40);
-    // SAFETY: `bi < VN_RX_BUFFERS` and `flen <= VN_RX_BUF - 0x40` and `flen <= out.len()`, validated by `validate_modern_vnet_rx_used`.
-    unsafe {
-        core::ptr::copy_nonoverlapping(data_virt as *const u8, out.as_mut_ptr(), flen);
+        return Some((flen, id));
     }
-    Some((flen, id))
+    None
 }
 
 /// Repost an RX buffer after consumption.
@@ -538,7 +550,9 @@ pub(crate) static CONTINUITY_BOOT_COUNT: core::sync::atomic::AtomicU64 =
 
 pub(crate) const UDP_SVC_IP: [u8; 4] = [10, 0, 2, 15];
 pub(crate) const UDP_SVC_PORT: u16 = 8080;
-pub(crate) const UDP_SVC_VIRTIO_HDR: usize = 12;
+/// Legacy VirtIO-Net header size when `VIRTIO_NET_F_MRG_RXBUF` is not negotiated (`outl(base + 4, 0)`):
+/// `flags(2) + gso_type(1) + hdr_len(2) + gso_size(2) + csum_start(2) + csum_offset(2)` = 10 bytes.
+pub(crate) const UDP_SVC_VIRTIO_HDR: usize = 10;
 
 pub(crate) fn service_udp_status() {
     // Modern driver first (slirp-proven); legacy I/O-port path as
@@ -802,7 +816,18 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
         pos += 1;
         serial_write_bytes(&line[..pos]);
     }
+    // Bounded boot-phase status window: hard cap of 64 frames AND 250 ms TSC deadline
+    // so steady inbound traffic cannot stall boot, and read-only `handle_frame` (`None` shell)
+    // so no state mutation or shell command executes before boot self-tests complete.
+    const BOOT_SVC_MAX_FRAMES: u64 = 64;
+    let window_deadline_tsc = crate::smp_hw::read_tsc()
+        .wrapping_add((crate::smp_hw::ensure_tsc_calibrated() / 4).max(10_000_000));
     loop {
+        if rx_count >= BOOT_SVC_MAX_FRAMES
+            || crate::smp_hw::read_tsc().wrapping_sub(window_deadline_tsc) < (1u64 << 63)
+        {
+            break;
+        }
         let Some((flen, head_id)) = vnet_rx(n, &mut frame) else {
             idle += 1;
             let max_idle: u64 = 2_000_000;
@@ -814,41 +839,6 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
         };
         idle = 0;
         rx_count += 1;
-        {
-            // Debug every consumed frame: len + etype + dst port.
-            let mut line = [0u8; 80];
-            let mut pos = 0usize;
-            let pre = b"UDP SVC got flen=";
-            line[..pre.len()].copy_from_slice(pre);
-            pos += pre.len();
-            pos += dec_u64_to_buf(flen as u64, &mut line[pos..]);
-            if flen >= 14 {
-                let et = u16::from_be_bytes([frame[12], frame[13]]);
-                let mid = b" etype=0x";
-                line[pos..pos + mid.len()].copy_from_slice(mid);
-                pos += mid.len();
-                let be = et.to_be_bytes();
-                let mut hx = [0u8; 4];
-                hex_encode(&be, 2, &mut hx);
-                line[pos..pos + 4].copy_from_slice(&hx);
-                pos += 4;
-            }
-            if let Some((sport, dport)) =
-                target_enterprise::memory::kernel_guards::ipv4_l4_ports_in_frame(&frame, flen)
-            {
-                let mid2 = b" dport=";
-                line[pos..pos + mid2.len()].copy_from_slice(mid2);
-                pos += mid2.len();
-                pos += dec_u64_to_buf(dport as u64, &mut line[pos..]);
-                let mid3 = b" sport=";
-                line[pos..pos + mid3.len()].copy_from_slice(mid3);
-                pos += mid3.len();
-                pos += dec_u64_to_buf(sport as u64, &mut line[pos..]);
-            }
-            line[pos] = b'\n';
-            pos += 1;
-            serial_write_bytes(&line[..pos]);
-        }
         if flen < 14 {
             vnet_rx_recycle(n, head_id);
             continue;
@@ -856,20 +846,13 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
 
         let boots = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
         let mut replies = target_enterprise::ReplySet::new();
-        {
-            let mut sh_guard = KERNEL_SHELL.lock();
-            let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
-            // `shell_store_boot` already restored the shell. Requests served
-            // in this window follow the same rule as the main loop: what they
-            // change is committed before the reply is transmitted.
-            svc.handle_frame_with_shell(&frame[..flen], boots, sh, &mut replies);
-            persist_shell_if_changed(sh, false);
-        }
+        svc.handle_frame(&frame[..flen], boots, &mut replies);
         let mut ri = 0usize;
         while ri < replies.len() {
             if let Some(r) = replies.get(ri) {
-                vnet_tx(n, r);
-                tx_count += 1;
+                if vnet_tx(n, r) {
+                    tx_count += 1;
+                }
             }
             ri += 1;
         }
@@ -1248,7 +1231,15 @@ pub(crate) fn service_udp_status_legacy() {
         pos += 1;
         serial_write_bytes(&line[..pos]);
     }
+    const BOOT_SVC_MAX_FRAMES: u64 = 64;
+    let window_deadline_tsc = crate::smp_hw::read_tsc()
+        .wrapping_add((crate::smp_hw::ensure_tsc_calibrated() / 4).max(10_000_000));
     loop {
+        if rx_count >= BOOT_SVC_MAX_FRAMES
+            || crate::smp_hw::read_tsc().wrapping_sub(window_deadline_tsc) < (1u64 << 63)
+        {
+            break;
+        }
         fence(Ordering::SeqCst);
         // SAFETY: rx_q is mapped and valid; reading the volatile 16-bit used ring idx.
         let rx_used = unsafe {
@@ -1258,20 +1249,7 @@ pub(crate) fn service_udp_status_legacy() {
         };
         if rx_used == rx_used_last {
             idle += 1;
-            if idle % 500_000_000 == 0 {
-                // Heartbeat debug: prove the poll loop is alive and
-                // report the raw used index (frame-arrival signal).
-                let mut line = [0u8; 48];
-                let mut pos = 0usize;
-                let pre = b"UDP SVC poll used=";
-                line[..pre.len()].copy_from_slice(pre);
-                pos += pre.len();
-                pos += dec_u64_to_buf(rx_used as u64, &mut line[pos..]);
-                line[pos] = b'\n';
-                pos += 1;
-                serial_write_bytes(&line[..pos]);
-            }
-            let max_idle: u64 = if rx_count == 0 { 2_000_000 } else { 200_000_000 };
+            let max_idle: u64 = 2_000_000;
             if idle > max_idle {
                 break;
             }
@@ -1326,36 +1304,9 @@ pub(crate) fn service_udp_status_legacy() {
 
         rx_count += 1;
 
-        // Debug: every consumed frame gets a line (first bytes + etype).
-        {
-            let mut line = [0u8; 64];
-            let mut pos = 0usize;
-            let pre = b"UDP SVC frame id=";
-            line[..pre.len()].copy_from_slice(pre);
-            pos += pre.len();
-            pos += dec_u64_to_buf(desc_id as u64, &mut line[pos..]);
-            let mid = b" etype=";
-            line[pos..pos + mid.len()].copy_from_slice(mid);
-            pos += mid.len();
-            let mut hx = [0u8; 4];
-            hex_encode(&[frame[12], frame[13]], 2, &mut hx);
-            line[pos..pos + 4].copy_from_slice(&hx);
-            pos += 4;
-            line[pos] = b'\n';
-            pos += 1;
-            serial_write_bytes(&line[..pos]);
-        }
-
         let boots = CONTINUITY_BOOT_COUNT.load(Ordering::Relaxed);
         let mut replies = target_enterprise::ReplySet::new();
-        {
-            let mut sh_guard = KERNEL_SHELL.lock();
-            let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
-            // `shell_store_boot` already restored the shell; commit before replying.
-            // Legacy RX copies 1536 bytes; LivedNet uses IPv4 total_length.
-            svc.handle_frame_with_shell(&frame[..1536.min(frame.len())], boots, sh, &mut replies);
-            persist_shell_if_changed(sh, false);
-        }
+        svc.handle_frame(&frame[..1536.min(frame.len())], boots, &mut replies);
         let mut ri = 0usize;
         while ri < replies.len() {
             if let Some(r) = replies.get(ri) {

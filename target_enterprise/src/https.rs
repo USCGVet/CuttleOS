@@ -27,6 +27,7 @@ use rustls::unbuffered::{
 };
 use sha2::{Digest, Sha256};
 
+#[cfg(any(test, not(cuttle_prod)))]
 use crate::kernel_fixtures as kf;
 use crate::lived_net::{LivedNet, ReplySet, GUEST_IP, HTTPS_PORT};
 use crate::tcp::TcpImpl;

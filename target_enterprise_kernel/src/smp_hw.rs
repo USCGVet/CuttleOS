@@ -11,7 +11,9 @@
 //!   `kthreadd-wal`, and `cuttle-sh`/`worker`.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use crate::{
     alloc_pt_frame, dec_u64, dma_phys_base, ensure_mmio_page, ensure_phys_ro_page, hex_u32, inb,
@@ -95,6 +97,8 @@ const TLB_ACKS_PTR_PHYS: u64 = 0x83D0;
 const NMI_COUNT_PTR_PHYS: u64 = 0x83D8;
 /// Physical address storing `&HW_IO_IRQS` (`.bss` `RW+NX` atomic pointer).
 const IO_IRQ_COUNT_PTR_PHYS: u64 = 0x83E0;
+/// Physical address storing `kernel_cpu_exception_handler as *const () as usize as u64`.
+const CPU_EXC_HANDLER_PTR_PHYS: u64 = 0x83E8;
 /// Physical address of the Runtime 64-bit GDT (`5 * 8 + 4 * 16 = 104` bytes: `0x08..0x20` + 4 per-CPU TSS).
 const RUNTIME_GDT_PHYS: u64 = 0x8400;
 /// Physical base of the 4 per-CPU 104-byte `Tss64` structures (`0x80` byte stride -> `0x8500..0x8700`).
@@ -109,6 +113,10 @@ const ISR_NMI_WATCHDOG_PHYS: u64 = 0x8760;
 const LOAD_GDT_IDT_TSS_PHYS: u64 = 0x8780;
 /// Physical address of `ISR_IO_WAKE` (37 bytes, IOAPIC `COM1` vector `0x44`).
 const ISR_IO_WAKE_PHYS: u64 = 0x87B0;
+/// Physical base of 32 16-byte per-vector Ring-0 CPU exception entry stubs (`0x8800..0x8A00`).
+const ISR_CPU_EXC_STUBS_PHYS: u64 = 0x8800;
+/// Physical address of the 35-byte System V AMD64 CPU exception bridge (`0x8A00..0x8A23`).
+const ISR_CPU_EXC_BRIDGE_PHYS: u64 = 0x8A00;
 /// Physical page holding the 256-entry Runtime 64-bit IDT (`4096` bytes).
 const RUNTIME_IDT_PHYS: u64 = 0x9000;
 
@@ -286,12 +294,27 @@ static ACPI_COM1_GSI: AtomicU32 = AtomicU32::new(4);
 static IOAPIC_COM1_READY: AtomicBool = AtomicBool::new(false);
 /// Hardware IOAPIC `COM1` (`vector 0x44`) wakeup counter in `.bss` (`RW+NX`).
 static HW_IO_IRQS: AtomicU64 = AtomicU64::new(0);
-/// Lock-free per-AP (`CPU 1..3`) cryptographic digest work slots (`0 = Idle`, `1 = Armed`, `2 = Done`).
-static AP_CRYPTO_PTR: [AtomicU64; MAX_SMP_CPUS] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
+/// Maximum payload bytes copied into per-AP static crypto scratch (`AP_CRYPTO_BUF`).
+const AP_CRYPTO_BUF_CAP: usize = 4096;
+
+#[repr(C, align(64))]
+struct ApCryptoScratch([AtomicU8; AP_CRYPTO_BUF_CAP]);
+
+impl ApCryptoScratch {
+    const fn new() -> Self {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const ZERO: AtomicU8 = AtomicU8::new(0);
+        Self([ZERO; AP_CRYPTO_BUF_CAP])
+    }
+}
+
+/// Lock-free per-AP (`CPU 1..3`) cryptographic digest work slots tagged with monotonic 64-bit job IDs
+/// and backed by static `.bss` buffers so timed-out jobs can never return stale digests or read popped stacks.
+static AP_CRYPTO_BUF: [ApCryptoScratch; MAX_SMP_CPUS] = [
+    ApCryptoScratch::new(),
+    ApCryptoScratch::new(),
+    ApCryptoScratch::new(),
+    ApCryptoScratch::new(),
 ];
 static AP_CRYPTO_LEN: [core::sync::atomic::AtomicUsize; MAX_SMP_CPUS] = [
     core::sync::atomic::AtomicUsize::new(0),
@@ -305,13 +328,42 @@ static AP_CRYPTO_OUT: [[AtomicU64; 4]; MAX_SMP_CPUS] = [
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
 ];
-static AP_CRYPTO_STATE: [AtomicU32; MAX_SMP_CPUS] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
+static NEXT_AP_CRYPTO_JOB_ID: AtomicU64 = AtomicU64::new(1);
+static AP_CRYPTO_REQ_JOB: [AtomicU64; MAX_SMP_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static AP_CRYPTO_DONE_JOB: [AtomicU64; MAX_SMP_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static AP_CRYPTO_LAST_SEEN: [AtomicU64; MAX_SMP_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static AP_CRYPTO_BUSY: [AtomicBool; MAX_SMP_CPUS] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
 ];
 static HW_AP_CRYPTO_JOBS: AtomicU64 = AtomicU64::new(0);
+/// True once `init_early_bsp_gdt_idt_tss` installed `RUNTIME_GDT`, `RUNTIME_TSS` (`0x28`), and `RUNTIME_IDT` on `CPU 0`.
+static BSP_EARLY_IDT_READY: AtomicBool = AtomicBool::new(false);
+/// Re-entrancy latch preventing recursive CPU exception dump loops.
+static CPU_FAULT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+/// Hardware-calibrated TSC frequency in cycles/second (`0` until calibrated against HPET/PIT).
+static CALIBRATED_TSC_HZ: AtomicU64 = AtomicU64::new(0);
+/// TSC value recorded when `smp_hw_enable_bsp_timer` armed the runtime timebase.
+static TSC_TIMER_ORIGIN: AtomicU64 = AtomicU64::new(0);
+/// True once `smp_hw_enable_bsp_timer` armed the monotonic runtime TSC clock.
+static TSC_TIMER_ARMED: AtomicBool = AtomicBool::new(false);
 /// Multi-core hard-lockup watchdog tracking per-CPU tick progress across scheduling epochs.
 static SMP_WATCHDOG: spin::Mutex<target_enterprise::smp::SmpLockupWatchdog<MAX_SMP_CPUS>> =
     spin::Mutex::new(target_enterprise::smp::SmpLockupWatchdog::new(8));
@@ -507,13 +559,241 @@ pub(crate) fn smp_broadcast_tlb_shootdown() {
         let icr_lo_va = pa_to_va(LAPIC_PHYS_BASE + LAPIC_ICR_LO).cast::<u32>();
         core::ptr::write_volatile(icr_lo_va, 0x000C_4000 | SMP_TLB_SHOOTDOWN_VECTOR);
     }
+    let deadline_tsc = read_tsc().wrapping_add(ensure_tsc_calibrated() / 20);
     let mut spins = 0u32;
-    while HW_TLB_SHOOTDOWN_ACKS.load(Ordering::Acquire) < before.saturating_add(peers)
-        && spins < 100_000
-    {
+    while HW_TLB_SHOOTDOWN_ACKS.load(Ordering::Acquire) < before.saturating_add(peers) {
+        if spins >= 2_000_000 && read_tsc().wrapping_sub(deadline_tsc) < (u64::MAX / 2) {
+            break;
+        }
         core::hint::spin_loop();
-        spins += 1;
+        spins = spins.saturating_add(1);
     }
+}
+
+/// Read the CPU 64-bit Time-Stamp Counter (`RDTSC`).
+#[inline]
+pub(crate) fn read_tsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: `rdtsc` is unprivileged when `CR4.TSD == 0` and has no memory side effects.
+    unsafe {
+        asm!(
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Calibrate `CALIBRATED_TSC_HZ` once against the 8254 PIT (`10 ms` Channel 2 window) if not yet
+/// calibrated, returning cycles per second clamped to `[50_000_000, 20_000_000_000]`.
+pub(crate) fn ensure_tsc_calibrated() -> u64 {
+    use target_enterprise::timer::PIT_CALIBRATION_TICKS_10MS;
+
+    let existing = CALIBRATED_TSC_HZ.load(Ordering::Acquire);
+    if existing != 0 {
+        return existing;
+    }
+    // SAFETY: Accessing 8254 PIT Channel 2 I/O ports `0x61`, `0x43`, `0x42` at CPL=0.
+    let hz = unsafe {
+        let gate = inb(0x61);
+        outb(0x61, (gate & 0xFC) | 0x01);
+        outb(0x43, 0xB0);
+        outb(0x42, (PIT_CALIBRATION_TICKS_10MS & 0xFF) as u8);
+        outb(0x42, (PIT_CALIBRATION_TICKS_10MS >> 8) as u8);
+        let t0 = read_tsc();
+        let mut spins = 0u32;
+        while (inb(0x61) & 0x20) == 0 && spins < 500_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        let elapsed = read_tsc().wrapping_sub(t0);
+        elapsed.saturating_mul(100).clamp(50_000_000, 20_000_000_000)
+    };
+    CALIBRATED_TSC_HZ.store(hz, Ordering::Release);
+    hz
+}
+
+/// Read monotonic runtime timer ticks (`irqs_per_sec` Hz) derived from calibrated `RDTSC`
+/// wall-clock elapsed time (with `HW_IRQ_WAKEUP_COUNTER` floor), advancing smoothly even when
+/// `CPU 0` is 100% busy servicing network bursts or AHCI DMA commits without executing `HLT`.
+#[inline]
+pub(crate) fn read_monotonic_timer_ticks() -> u64 {
+    let hw = read_hw_irq_wakeups();
+    if !TSC_TIMER_ARMED.load(Ordering::Acquire) {
+        return hw;
+    }
+    let tsc_hz = CALIBRATED_TSC_HZ.load(Ordering::Acquire);
+    if tsc_hz == 0 {
+        return hw;
+    }
+    let origin = TSC_TIMER_ORIGIN.load(Ordering::Acquire);
+    let elapsed_cycles = read_tsc().wrapping_sub(origin);
+    let irqs_per_sec = read_calibrated_irqs_per_sec();
+    let tsc_ticks = ((elapsed_cycles as u128).saturating_mul(irqs_per_sec as u128)
+        / (tsc_hz as u128)) as u64;
+    tsc_ticks.max(hw)
+}
+
+/// Return `true` once the BSP Runtime GDT/TSS/IDT is installed on `CPU 0`.
+#[inline]
+pub(crate) fn is_bsp_idt_ready() -> bool {
+    BSP_EARLY_IDT_READY.load(Ordering::Acquire) || SMP_HW_INITIALIZED.load(Ordering::Acquire)
+}
+
+/// Install the guarded `RUNTIME_GDT`, `CPU 0` `Tss64` (`selector 0x28`, with guarded `RSP0`,
+/// `IST1`, `IST2`), and 256-entry `RUNTIME_IDT` (with 32 per-vector CPU fault stubs) immediately
+/// after `set_phys_offset` in `kernel_main`, before `serial_init` or any boot banner executes.
+pub(crate) fn init_early_bsp_gdt_idt_tss() {
+    if BSP_EARLY_IDT_READY
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    // SAFETY: Called at CPL=0 right after `set_phys_offset` initialized `PHYS_MAP_OFFSET` and `PT_ALLOC_NEXT`.
+    unsafe {
+        let bsp_sec = crate::banners_arch_platform::enable_cpu_memory_protections();
+        HW_AP_SEC_BITS[0].store(bsp_sec, Ordering::Release);
+        let _ = map_smp_rx_trampoline_page();
+        init_runtime_idt_and_isrs();
+    }
+}
+
+/// Verify via hardware `SIDT` and `STR` instructions that `RUNTIME_IDT` and `CPU 0` `RUNTIME_TSS`
+/// (`selector 0x28`) are live on the executing Bootstrap Processor.
+pub(crate) fn verify_early_bsp_idt_active() -> bool {
+    if !is_bsp_idt_ready() {
+        return false;
+    }
+    let mut idtr = [0u8; 10];
+    let tr: u16;
+    // SAFETY: `sidt` and `str` read active descriptor-table registers at CPL=0 with no side effects.
+    unsafe {
+        asm!(
+            "sidt [{}]",
+            "str {:x}",
+            in(reg) idtr.as_mut_ptr(),
+            out(reg) tr,
+            options(nostack, preserves_flags),
+        );
+    }
+    let lim = u16::from_le_bytes([idtr[0], idtr[1]]);
+    let base = u64::from_le_bytes([
+        idtr[2], idtr[3], idtr[4], idtr[5], idtr[6], idtr[7], idtr[8], idtr[9],
+    ]);
+    lim == 4095 && base == (pa_to_va(RUNTIME_IDT_PHYS) as u64) && tr == cpu_tss_selector(0)
+}
+
+#[inline]
+fn fmt_hex64(val: u64, out: &mut [u8; 16]) {
+    let mut hi = [0u8; 8];
+    let mut lo = [0u8; 8];
+    hex_u32((val >> 32) as u32, &mut hi);
+    hex_u32(val as u32, &mut lo);
+    out[..8].copy_from_slice(&hi);
+    out[8..16].copy_from_slice(&lo);
+}
+
+/// Unified Ring-0 CPU exception handler reached from the 32 per-vector entry stubs at `0x8800..0x8A00`
+/// via `ISR_CPU_EXC_BRIDGE` (`0x8A00`). Freezes peer APs, scrubs `.bss` secrets while snapshotting
+/// the emergency crash-dump AEAD key, emits vector/error-code/RIP/CR2/CS/RSP to `COM1` first, writes
+/// an encrypted `CTTLPENC` crash dump to isolated AHCI Slot 1 (`LBA 1536..1568`), and halts.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn kernel_cpu_exception_handler(
+    vec: u64,
+    err_code: u64,
+    frame: *const u64,
+    cr2: u64,
+) -> ! {
+    use target_enterprise::durable_seal::zeroize_secret_bytes;
+
+    // 1. Freeze peer APs and scrub `.bss` cryptographic keys immediately.
+    smp_broadcast_panic_halt();
+    let mut dump_aead_key = crate::provisioning::take_emergency_dump_aead_key_and_scrub();
+    if CPU_FAULT_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        if let Some(ref mut k) = dump_aead_key {
+            zeroize_secret_bytes(k);
+        }
+        crate::serial_write_str("CUTTLE-TE PANIC: RECURSIVE CPU FAULT\n");
+        crate::halt_forever();
+    }
+
+    // 2. Extract hardware `iretq` frame words (`[rip, cs, rflags, rsp, ss]`).
+    let (rip, cs, rsp) = if frame.is_null() {
+        (0u64, 0u64, 0u64)
+    } else {
+        // SAFETY: `ISR_CPU_EXC_BRIDGE` passes `lea rdx, [rsp + 16]` pointing directly to the
+        // 5-qword hardware exception frame pushed by the CPU on the current Ring-0 or IST stack.
+        unsafe {
+            (
+                core::ptr::read_volatile(frame.add(0)),
+                core::ptr::read_volatile(frame.add(1)),
+                core::ptr::read_volatile(frame.add(3)),
+            )
+        }
+    };
+
+    // 3. Format and print `CUTTLE-TE PANIC: CPU FAULT: vec=...` BEFORE touching AHCI MMIO.
+    let mut reason = [0u8; 160];
+    let mut p = 0usize;
+    let copy_s = |src: &[u8], dst: &mut [u8], pos: &mut usize| {
+        let n = src.len().min(dst.len().saturating_sub(*pos));
+        dst[*pos..*pos + n].copy_from_slice(&src[..n]);
+        *pos += n;
+    };
+    copy_s(b"CPU FAULT: vec=", &mut reason, &mut p);
+    p += dec_u64(vec, &mut reason[p..]);
+    copy_s(b" err=0x", &mut reason, &mut p);
+    let mut hex16 = [0u8; 16];
+    fmt_hex64(err_code, &mut hex16);
+    copy_s(&hex16, &mut reason, &mut p);
+    copy_s(b" rip=0x", &mut reason, &mut p);
+    fmt_hex64(rip, &mut hex16);
+    copy_s(&hex16, &mut reason, &mut p);
+    copy_s(b" cr2=0x", &mut reason, &mut p);
+    fmt_hex64(cr2, &mut hex16);
+    copy_s(&hex16, &mut reason, &mut p);
+    copy_s(b" cs=0x", &mut reason, &mut p);
+    let mut hex8 = [0u8; 8];
+    hex_u32(cs as u32, &mut hex8);
+    copy_s(&hex8[4..8], &mut reason, &mut p);
+    copy_s(b" rsp=0x", &mut reason, &mut p);
+    fmt_hex64(rsp, &mut hex16);
+    copy_s(&hex16, &mut reason, &mut p);
+
+    crate::serial_write_str("CUTTLE-TE PANIC: ");
+    serial_write_bytes(&reason[..p]);
+    crate::serial_write_str("\n");
+
+    // 4. Persist encrypted crash dump (`CTTLPENC`) via isolated AHCI Slot 1 (`LBA 1536..1568`).
+    if !target_enterprise::panic_dump::set_dumped() {
+        let mut regs = [0u64; cuttle_contracts::CRASH_REG_COUNT];
+        regs[0] = read_current_lapic_id_safe() as u64;
+        regs[1] = vec;
+        regs[2] = err_code;
+        regs[3] = cr2;
+        regs[4] = cs;
+        regs[7] = rsp;
+        regs[16] = rip;
+        let msg_str = core::str::from_utf8(&reason[..p]).unwrap_or("CPU FAULT");
+        crate::write_emergency_crash_dump_with_scratch(
+            "x86_64::cpu_exception",
+            msg_str,
+            &regs,
+            rip,
+            read_tsc(),
+            dump_aead_key.as_ref(),
+        );
+        crate::serial_write_str("CRASH_DUMP emergency slot=1 lba=1536..1568\n");
+    }
+    if let Some(ref mut k) = dump_aead_key {
+        zeroize_secret_bytes(k);
+    }
+    crate::halt_forever();
 }
 
 /// Best-effort broadcast of the Emergency Panic Halt IPI (`vector 0x43`, All-Excluding-Self)
@@ -543,7 +823,7 @@ pub(crate) fn read_current_lapic_id_safe() -> u32 {
 /// Restore `CPU 0`'s permanent guarded `RUNTIME_TSS` (`selector 0x28`) after a Ring-3 sandbox exit
 /// temporarily loaded a sandbox-local TSS into `TR`.
 pub(crate) fn restore_cpu0_runtime_tss_if_active() {
-    if !SMP_HW_INITIALIZED.load(Ordering::Acquire) {
+    if !is_bsp_idt_ready() {
         return;
     }
     let sel = cpu_tss_selector(0);
@@ -644,38 +924,42 @@ pub extern "C" fn cuttle_ap_entry(cpu_id: u64) -> ! {
     AP_BOOT_READY[idx].store(true, Ordering::SeqCst);
 
     loop {
-        if AP_CRYPTO_STATE[idx].load(Ordering::Acquire) == 1 {
-            let ptr = AP_CRYPTO_PTR[idx].load(Ordering::Acquire) as *const u8;
-            let len = AP_CRYPTO_LEN[idx].load(Ordering::Acquire);
-            if !ptr.is_null() {
-                // SAFETY: BSP published `(ptr, len)` and spins until `AP_CRYPTO_STATE[idx] == 2`.
-                let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
-                let mut dig = [0u8; 32];
-                target_enterprise::smp::exec_smp_crypto_digest(
-                    target_enterprise::smp::SmpCryptoOp::Sha256,
-                    slice,
-                    &mut dig,
-                );
-                let mut w = 0usize;
-                while w < 4 {
-                    let word = u64::from_le_bytes([
-                        dig[w * 8],
-                        dig[w * 8 + 1],
-                        dig[w * 8 + 2],
-                        dig[w * 8 + 3],
-                        dig[w * 8 + 4],
-                        dig[w * 8 + 5],
-                        dig[w * 8 + 6],
-                        dig[w * 8 + 7],
-                    ]);
-                    AP_CRYPTO_OUT[idx][w].store(word, Ordering::Relaxed);
-                    w += 1;
-                }
-                HW_CPU_TICKS[idx].fetch_add(1, Ordering::Relaxed);
-                HW_CPU_JOBS[idx].fetch_add(1, Ordering::Release);
-                HW_AP_CRYPTO_JOBS.fetch_add(1, Ordering::AcqRel);
+        let req_jid = AP_CRYPTO_REQ_JOB[idx].load(Ordering::Acquire);
+        if req_jid != 0 && req_jid != AP_CRYPTO_LAST_SEEN[idx].load(Ordering::Relaxed) {
+            AP_CRYPTO_LAST_SEEN[idx].store(req_jid, Ordering::Relaxed);
+            let len = AP_CRYPTO_LEN[idx].load(Ordering::Acquire).min(AP_CRYPTO_BUF_CAP);
+            let mut local_buf = [0u8; AP_CRYPTO_BUF_CAP];
+            let mut bi = 0usize;
+            while bi < len {
+                local_buf[bi] = AP_CRYPTO_BUF[idx].0[bi].load(Ordering::Relaxed);
+                bi += 1;
             }
-            AP_CRYPTO_STATE[idx].store(2, Ordering::Release);
+            let mut dig = [0u8; 32];
+            target_enterprise::smp::exec_smp_crypto_digest(
+                target_enterprise::smp::SmpCryptoOp::Sha256,
+                &local_buf[..len],
+                &mut dig,
+            );
+            let mut w = 0usize;
+            while w < 4 {
+                let word = u64::from_le_bytes([
+                    dig[w * 8],
+                    dig[w * 8 + 1],
+                    dig[w * 8 + 2],
+                    dig[w * 8 + 3],
+                    dig[w * 8 + 4],
+                    dig[w * 8 + 5],
+                    dig[w * 8 + 6],
+                    dig[w * 8 + 7],
+                ]);
+                AP_CRYPTO_OUT[idx][w].store(word, Ordering::Relaxed);
+                w += 1;
+            }
+            HW_CPU_TICKS[idx].fetch_add(1, Ordering::Relaxed);
+            HW_CPU_JOBS[idx].fetch_add(1, Ordering::Release);
+            HW_AP_CRYPTO_JOBS.fetch_add(1, Ordering::AcqRel);
+            AP_CRYPTO_DONE_JOB[idx].store(req_jid, Ordering::Release);
+            AP_CRYPTO_BUSY[idx].store(false, Ordering::Release);
         }
         while CPU_PENDING_JOBS[idx].load(Ordering::SeqCst) > 0 {
             CPU_PENDING_JOBS[idx].fetch_sub(1, Ordering::SeqCst);
@@ -715,25 +999,45 @@ pub(crate) fn smp_parallel_sha256_3way(
     }
 
     let inputs: [&[u8]; 3] = [b1, b2, b3];
+    let mut assigned_jid = [0u64; MAX_SMP_CPUS];
+    let mut any_dispatched = false;
     let mut ap = 1usize;
     while ap <= 3 {
         let slice = inputs[ap - 1];
-        AP_CRYPTO_PTR[ap].store(slice.as_ptr() as usize as u64, Ordering::Relaxed);
-        AP_CRYPTO_LEN[ap].store(slice.len(), Ordering::Relaxed);
-        AP_CRYPTO_STATE[ap].store(1, Ordering::Release);
+        if slice.len() <= AP_CRYPTO_BUF_CAP
+            && AP_CRYPTO_BUSY[ap]
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let mut bi = 0usize;
+            while bi < slice.len() {
+                AP_CRYPTO_BUF[ap].0[bi].store(slice[bi], Ordering::Relaxed);
+                bi += 1;
+            }
+            AP_CRYPTO_LEN[ap].store(slice.len(), Ordering::Relaxed);
+            let jid = NEXT_AP_CRYPTO_JOB_ID.fetch_add(1, Ordering::Relaxed).max(1);
+            assigned_jid[ap] = jid;
+            AP_CRYPTO_REQ_JOB[ap].store(jid, Ordering::Release);
+            any_dispatched = true;
+        }
         ap += 1;
     }
-    ring_smp_doorbell();
+    if any_dispatched {
+        ring_smp_doorbell();
+    }
 
     let mut spins = 0u32;
-    while spins < 200_000 {
-        if AP_CRYPTO_STATE[1].load(Ordering::Acquire) == 2
-            && AP_CRYPTO_STATE[2].load(Ordering::Acquire) == 2
-            && AP_CRYPTO_STATE[3].load(Ordering::Acquire) == 2
-        {
+    while any_dispatched && spins < 500_000 {
+        let done_1 = assigned_jid[1] == 0
+            || AP_CRYPTO_DONE_JOB[1].load(Ordering::Acquire) == assigned_jid[1];
+        let done_2 = assigned_jid[2] == 0
+            || AP_CRYPTO_DONE_JOB[2].load(Ordering::Acquire) == assigned_jid[2];
+        let done_3 = assigned_jid[3] == 0
+            || AP_CRYPTO_DONE_JOB[3].load(Ordering::Acquire) == assigned_jid[3];
+        if done_1 && done_2 && done_3 {
             break;
         }
-        if spins == 15_000 || spins == 50_000 {
+        if spins == 15_000 || spins == 50_000 || spins == 150_000 {
             ring_smp_doorbell();
         }
         core::hint::spin_loop();
@@ -743,16 +1047,15 @@ pub(crate) fn smp_parallel_sha256_3way(
     let mut outs = [[0u8; 32]; 3];
     let mut c = 1usize;
     while c <= 3 {
-        if AP_CRYPTO_STATE[c].load(Ordering::Acquire) == 2 {
+        let jid = assigned_jid[c];
+        if jid != 0 && AP_CRYPTO_DONE_JOB[c].load(Ordering::Acquire) == jid {
             let mut w = 0usize;
             while w < 4 {
                 let bytes = AP_CRYPTO_OUT[c][w].load(Ordering::Relaxed).to_le_bytes();
                 outs[c - 1][w * 8..w * 8 + 8].copy_from_slice(&bytes);
                 w += 1;
             }
-            AP_CRYPTO_STATE[c].store(0, Ordering::Release);
         } else {
-            AP_CRYPTO_STATE[c].store(0, Ordering::Release);
             seal_bytes(inputs[c - 1], &mut outs[c - 1]);
         }
         c += 1;
@@ -1100,6 +1403,10 @@ unsafe fn init_runtime_idt_and_isrs() {
         core::ptr::write_volatile(pa_to_va(TLB_ACKS_PTR_PHYS).cast::<u64>(), tlb_acks_va);
         core::ptr::write_volatile(pa_to_va(NMI_COUNT_PTR_PHYS).cast::<u64>(), nmi_count_va);
         core::ptr::write_volatile(pa_to_va(IO_IRQ_COUNT_PTR_PHYS).cast::<u64>(), io_irq_count_va);
+        core::ptr::write_volatile(
+            pa_to_va(CPU_EXC_HANDLER_PTR_PHYS).cast::<u64>(),
+            kernel_cpu_exception_handler as *const () as usize as u64,
+        );
     }
 
     // 3. Install `ISR_LAPIC_EOI` at `0x8300` (Local APIC Timer `0x40`):
@@ -1193,7 +1500,32 @@ unsafe fn init_runtime_idt_and_isrs() {
         0x48, 0xCF,                               // iretq
     ];
 
-    // SAFETY: All destination offsets (`0x8300..0x87D5`) lie within the mapped `0x8000` page (`PHYS_MAP_OFFSET`, `RW+NX`).
+    // 12c. Install 32 per-vector CPU exception stubs (`0x8800..0x8A00`) + `ISR_CPU_EXC_BRIDGE` (`0x8A00`):
+    //      Passes `(vec, err_code, iret_frame_ptr, cr2)` to `kernel_cpu_exception_handler` via `0x83E8`.
+    const ISR_CPU_EXC_BRIDGE: [u8; 35] = [
+        0xFA,                                     // +0x00: cli
+        0xFC,                                     // +0x01: cld
+        0x48, 0x8B, 0x3C, 0x24,                   // +0x02: mov rdi, [rsp] (vec)
+        0x48, 0x8B, 0x74, 0x24, 0x08,             // +0x06: mov rsi, [rsp + 8] (err_code)
+        0x48, 0x8D, 0x54, 0x24, 0x10,             // +0x0B: lea rdx, [rsp + 16] (iretq frame)
+        0x0F, 0x20, 0xD1,                         // +0x10: mov rcx, cr2
+        0x48, 0x83, 0xE4, 0xF0,                   // +0x13: and rsp, -16
+        0x48, 0x8B, 0x05, 0xCA, 0xF9, 0xFF, 0xFF, // +0x17: mov rax, [rip - 0x0636] -> 0x83E8
+        0xFF, 0xD0,                               // +0x1E: call rax
+        0xF4, 0xEB, 0xFD,                         // +0x20: hlt; jmp -3
+    ];
+    const EXC_ERR_CODE_MASK: u32 = (1 << 8)
+        | (1 << 10)
+        | (1 << 11)
+        | (1 << 12)
+        | (1 << 13)
+        | (1 << 14)
+        | (1 << 17)
+        | (1 << 21)
+        | (1 << 29)
+        | (1 << 30);
+
+    // SAFETY: All destination offsets (`0x8300..0x8A23`) lie within the mapped `0x8000` page (`PHYS_MAP_OFFSET`, `RW+NX`).
     unsafe {
         let copy_stub = |phys: u64, bytes: &[u8]| {
             let dst = pa_to_va(phys);
@@ -1214,6 +1546,35 @@ unsafe fn init_runtime_idt_and_isrs() {
         copy_stub(ISR_NMI_WATCHDOG_PHYS, &ISR_NMI_WATCHDOG);
         copy_stub(LOAD_GDT_IDT_TSS_PHYS, &LOAD_GDT_IDT_TSS_CODE);
         copy_stub(ISR_IO_WAKE_PHYS, &ISR_IO_WAKE);
+        copy_stub(ISR_CPU_EXC_BRIDGE_PHYS, &ISR_CPU_EXC_BRIDGE);
+
+        let mut ev = 0u32;
+        while ev < 32 {
+            let stub_phys = ISR_CPU_EXC_STUBS_PHYS + (ev as u64) * 16;
+            let dst = pa_to_va(stub_phys);
+            let mut z = 0usize;
+            while z < 16 {
+                core::ptr::write_volatile(dst.add(z), 0xCC);
+                z += 1;
+            }
+            let mut pos = 0usize;
+            if (EXC_ERR_CODE_MASK & (1u32 << ev)) == 0 {
+                core::ptr::write_volatile(dst.add(pos), 0x6A); // push 0
+                core::ptr::write_volatile(dst.add(pos + 1), 0x00);
+                pos += 2;
+            }
+            core::ptr::write_volatile(dst.add(pos), 0x6A); // push vec
+            core::ptr::write_volatile(dst.add(pos + 1), ev as u8);
+            pos += 2;
+            let next_off = (stub_phys as i32) + (pos as i32) + 5;
+            let rel32 = ((ISR_CPU_EXC_BRIDGE_PHYS as i32) - next_off).to_le_bytes();
+            core::ptr::write_volatile(dst.add(pos), 0xE9); // jmp ISR_CPU_EXC_BRIDGE
+            core::ptr::write_volatile(dst.add(pos + 1), rel32[0]);
+            core::ptr::write_volatile(dst.add(pos + 2), rel32[1]);
+            core::ptr::write_volatile(dst.add(pos + 3), rel32[2]);
+            core::ptr::write_volatile(dst.add(pos + 4), rel32[3]);
+            ev += 1;
+        }
     }
 
     // 13. Build the 104-byte Runtime GDT at `pa_to_va(0x8400)` (`5` code/data slots + `4` per-CPU 16B TSS slots)
@@ -1231,7 +1592,7 @@ unsafe fn init_runtime_idt_and_isrs() {
     let isr_doorbell_va = smp_rx_va(ISR_LAPIC_DOORBELL_PHYS);
     let isr_pic_va = smp_rx_va(ISR_PIC_EOI_PHYS);
     let isr_spurious_va = smp_rx_va(ISR_SPURIOUS_PHYS);
-    let isr_fault_diag_va = smp_rx_va(ISR_CPU_FAULT_DIAG_PHYS);
+    let isr_exc_stubs_base_va = smp_rx_va(ISR_CPU_EXC_STUBS_PHYS);
     let isr_tlb_va = smp_rx_va(ISR_TLB_SHOOTDOWN_PHYS);
     let isr_panic_va = smp_rx_va(ISR_PANIC_HALT_PHYS);
     let isr_nmi_va = smp_rx_va(ISR_NMI_WATCHDOG_PHYS);
@@ -1279,11 +1640,11 @@ unsafe fn init_runtime_idt_and_isrs() {
             } else if v == 3 {
                 (isr_spurious_va, 0u8)
             } else if v == 8 {
-                (isr_fault_diag_va, 1u8)
+                (isr_exc_stubs_base_va + (v as u64) * 16, 1u8)
             } else if v == 18 {
-                (isr_fault_diag_va, 2u8)
+                (isr_exc_stubs_base_va + (v as u64) * 16, 2u8)
             } else if v < 0x20 {
-                (isr_fault_diag_va, 0u8)
+                (isr_exc_stubs_base_va + (v as u64) * 16, 0u8)
             } else if v == 0xFF {
                 (isr_spurious_va, 0u8)
             } else if v < 0x30 {
@@ -1695,6 +2056,7 @@ pub(crate) fn smp_hw_enable_bsp_timer() {
         mmio_write32(LAPIC_PHYS_BASE + LAPIC_TIMER_DIV, 0x03); // Divide by 16
 
         let mut calibrated_hz: Option<u64> = None;
+        let mut calibrated_tsc_hz: Option<u64> = None;
         let hpet_pa = ACPI_HPET_PHYS.load(Ordering::Acquire);
         if hpet_pa != 0 {
             let _ = ensure_mmio_page(hpet_pa);
@@ -1706,6 +2068,7 @@ pub(crate) fn smp_hw_enable_bsp_timer() {
                 let conf = mmio_read64(hpet_pa + (HPET_REG_CONFIG as u64));
                 mmio_write64(hpet_pa + (HPET_REG_CONFIG as u64), conf | (HPET_CFG_ENABLE as u64));
                 let start_cnt = mmio_read64(hpet_pa + (HPET_REG_MAIN_COUNTER as u64));
+                let tsc_start = read_tsc();
                 mmio_write32(
                     LAPIC_PHYS_BASE + LAPIC_LVT_TIMER,
                     0x0001_0000 | LAPIC_TIMER_VECTOR,
@@ -1722,7 +2085,15 @@ pub(crate) fn smp_hw_enable_bsp_timer() {
                 }
                 let elapsed_hpet = mmio_read64(hpet_pa + (HPET_REG_MAIN_COUNTER as u64))
                     .wrapping_sub(start_cnt);
+                let tsc_elapsed = read_tsc().wrapping_sub(tsc_start);
                 if elapsed_hpet >= target_ticks / 2 {
+                    if tsc_elapsed > 0 {
+                        calibrated_tsc_hz = Some(
+                            tsc_elapsed
+                                .saturating_mul(100)
+                                .clamp(50_000_000, 20_000_000_000),
+                        );
+                    }
                     let ccr = mmio_read32(LAPIC_PHYS_BASE + LAPIC_TIMER_CCR);
                     let lapic_elapsed = 0xFFFF_FFFFu32.saturating_sub(ccr) as u64;
                     if lapic_elapsed > 0 {
@@ -1744,6 +2115,7 @@ pub(crate) fn smp_hw_enable_bsp_timer() {
                 outb(0x43, 0xB0);
                 outb(0x42, (PIT_CALIBRATION_TICKS_10MS & 0xFF) as u8);
                 outb(0x42, (PIT_CALIBRATION_TICKS_10MS >> 8) as u8);
+                let tsc_start = read_tsc();
                 mmio_write32(
                     LAPIC_PHYS_BASE + LAPIC_LVT_TIMER,
                     0x0001_0000 | LAPIC_TIMER_VECTOR,
@@ -1753,6 +2125,14 @@ pub(crate) fn smp_hw_enable_bsp_timer() {
                 while (inb(0x61) & 0x20) == 0 && spins < 200_000 {
                     core::hint::spin_loop();
                     spins += 1;
+                }
+                let tsc_elapsed = read_tsc().wrapping_sub(tsc_start);
+                if tsc_elapsed > 0 {
+                    calibrated_tsc_hz = Some(
+                        tsc_elapsed
+                            .saturating_mul(100)
+                            .clamp(50_000_000, 20_000_000_000),
+                    );
                 }
                 let ccr = mmio_read32(LAPIC_PHYS_BASE + LAPIC_TIMER_CCR);
                 let lapic_elapsed = 0xFFFF_FFFFu32.saturating_sub(ccr);
@@ -1764,6 +2144,13 @@ pub(crate) fn smp_hw_enable_bsp_timer() {
             }
         };
         CALIBRATED_IRQS_PER_COOLDOWN_TICK.store(irqs_per_sec, Ordering::Relaxed);
+        if let Some(tsc_hz) = calibrated_tsc_hz {
+            CALIBRATED_TSC_HZ.store(tsc_hz, Ordering::Release);
+        } else {
+            let _ = ensure_tsc_calibrated();
+        }
+        TSC_TIMER_ORIGIN.store(read_tsc(), Ordering::Release);
+        TSC_TIMER_ARMED.store(true, Ordering::Release);
 
         // Arm Periodic Local APIC Timer on vector `0x40` with `LAPIC_TIMER_PERIOD_COUNT` (`250,000`).
         mmio_write32(
@@ -1806,16 +2193,12 @@ pub(crate) fn smp_hw_init() -> usize {
         return HW_ONLINE_CPUS.load(Ordering::Acquire);
     }
 
-    // 1. Enable hardware `NXE + WP + SMEP + SMAP + UMIP + FSGSBASE` on the BSP (so APs inherit
-    //    identical protections via `read_bsp_control_regs()`), map the dedicated 4 KiB Supervisor `RX`
-    //    trampoline alias + `PD[1]` guarded stacks, initialize Runtime GDT/TSS/IDT/ISRs, and initialize
+    // 1. Ensure early BSP GDT/TSS/IDT + `RX` trampoline alias + `PD[1]` guarded stacks are active
+    //    (idempotent if `kernel_main` already called `init_early_bsp_gdt_idt_tss`), then initialize
     //    the 4 guarded hardware kernel thread stacks.
-    // SAFETY: Running at CPL=0 after `set_phys_offset` initialized the physical memory map.
+    init_early_bsp_gdt_idt_tss();
+    // SAFETY: Running at CPL=0 after `init_early_bsp_gdt_idt_tss` mapped `SMP_GUARDED_STACKS_VA`.
     unsafe {
-        let bsp_sec = crate::banners_arch_platform::enable_cpu_memory_protections();
-        HW_AP_SEC_BITS[0].store(bsp_sec, Ordering::Release);
-        let _ = map_smp_rx_trampoline_page();
-        init_runtime_idt_and_isrs();
         init_kthread_stacks();
     }
 
@@ -2063,7 +2446,7 @@ pub(crate) fn smp_hw_tick_and_sync(sh: &mut target_enterprise::OsShell) {
     }
 
     let irqs_per_cooldown_tick = CALIBRATED_IRQS_PER_COOLDOWN_TICK.load(Ordering::Relaxed).max(16);
-    let hw_irqs = read_hw_irq_wakeups();
+    let hw_irqs = read_monotonic_timer_ticks();
     let hw_ipis = HW_IPI_DOORBELLS.load(Ordering::Relaxed);
     if hw_irqs > sh.smp_irq_wakeups {
         let prev_epochs = sh.smp_irq_wakeups / irqs_per_cooldown_tick;
@@ -2564,6 +2947,8 @@ pub(crate) fn banner_smp_hw() {
     #[cfg(not(cuttle_prod))]
     {
         verify_vtd_slpt_confinement_live();
+        crate::banners_arch_platform::verify_ring3_under_latched_periodic_timer_live();
+        HW_IRQ_WAKEUP_COUNTER.store(0, Ordering::Release);
 
         // Exercise parallel FIPS 180-4 SHA-256 across AP cores `CPU 1..3` and verify exact bit-parity!
         {
