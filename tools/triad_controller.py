@@ -11,7 +11,7 @@ Features:
   1. Real post-link x86-64 binary diversification (`binmorph.exe`) per VM boot:
      rewrites ~15,350 instructions and permutes registers across 787 functions in ~250ms,
      splicing the morphed ELF directly into each VM's BIOS boot image.
-  2. Triple Modular Redundancy (TMR) 2-of-3 Majority Vote + 4 KiB RAID Parity verification
+  2. Triple Modular Redundancy (TMR) 2-of-3 Majority Vote + 8 KiB RAID Parity verification
      (D1 ^ D2 = P) across the persistent AHCI SQL partitions (`LBA 1077..1092`, `CTTLSQL1`).
   3. Zero-downtime Rolling MTD Morph: while 1 OS bounces into a freshly scrambled
      kernel binary, the other 2 OSes serve 100% of reads and writes; when the bounced
@@ -77,6 +77,28 @@ CONSOLE_HTML = ROOT / "tools" / "triad_console.html"
 SQL_PART_OFFSET = 1077 * 512
 SQL_PART_SIZE = 16 * 512
 
+# AHCI quarantine area layout (LBA 1216..1323 = 108 sectors = 55296 bytes)
+QUARANTINE_OFFSET = 1216 * 512
+QUARANTINE_SIZE = 108 * 512
+
+
+def needs_base_bios_rebuild(
+    base_elf: Path, base_bios: Path, elf_bytes: bytes | None = None
+) -> bool:
+    """
+    Return True when `base_bios` (`run_bios.img`) is missing, older than `base_elf`,
+    or does not contiguously contain the current `base_elf` bytes.
+    """
+    if not base_bios.exists():
+        return True
+    try:
+        if base_elf.stat().st_mtime_ns > base_bios.stat().st_mtime_ns:
+            return True
+        raw_elf = elf_bytes if elf_bytes is not None else base_elf.read_bytes()
+        return base_bios.read_bytes().find(raw_elf) < 0
+    except OSError:
+        return True
+
 
 @dataclass
 class TriadSpec:
@@ -137,6 +159,11 @@ ALERT_CODES = (
     "SCHEMA_MISMATCH",
     "NODE_HUNG",
     "SPLIT_BRAIN",
+    "DISK_SLOT_REPAIRED",
+    "DISK_QUARANTINE_RESTORED",
+    "DISK_SEAL_REJECTED",
+    "DISK_STORAGE_FAULT",
+    "DISK_ROLLBACK_DETECTED",
 )
 
 
@@ -700,6 +727,20 @@ class RealOsShellHarness:
             self.proc.stdin.flush()
             self.proc.stdout.readline()
 
+    def set_device_key(self, node_id: int, key_bytes: bytes) -> None:
+        with self._lock:
+            assert self.proc.stdin is not None and self.proc.stdout is not None
+            self.proc.stdin.write(f"{node_id}\t__set_device_key__:{key_bytes.hex()}\n")
+            self.proc.stdin.flush()
+            self.proc.stdout.readline()
+
+    def set_commit_seq(self, node_id: int, seq: int) -> None:
+        with self._lock:
+            assert self.proc.stdin is not None and self.proc.stdout is not None
+            self.proc.stdin.write(f"{node_id}\t__set_commit_seq__:{int(seq)}\n")
+            self.proc.stdin.flush()
+            self.proc.stdout.readline()
+
     def close(self) -> None:
         if self.proc.poll() is None:
             self.proc.terminate()
@@ -868,6 +909,12 @@ class TriadNode:
         self.last_morph_ms = 0
         self.tampered = False
         self.consecutive_heals = 0
+        self.commit_seq = 0
+        self.storage_faulted = False
+        self.last_disk_boot_status = "OK"
+        self.archived_quarantine_files: list[Path] = []
+        self.archived_fault_disks: list[Path] = []
+        self._storage_fault_lock = threading.Lock()
         # SHA-256 of the node's HTTPS certificate, from its `HTTPS UP ... cert_sha256=` serial line.
         self.tls_cert_sha256 = ""
         self.tls_entropy = ""
@@ -1113,7 +1160,7 @@ class TriadController:
                     f"Base kernel ELF not found at {BASE_ELF}; build target_enterprise_kernel first."
                 )
             self.base_elf_bytes = BASE_ELF.read_bytes()
-            if not BASE_BIOS.exists() or BASE_BIOS.read_bytes().find(self.base_elf_bytes) < 0:
+            if needs_base_bios_rebuild(BASE_ELF, BASE_BIOS, self.base_elf_bytes):
                 subprocess.run(
                     [
                         "cargo",
@@ -1258,6 +1305,7 @@ class TriadController:
         # Nodes whose applied tx_seq was restored from the WAL file (see `_load_wal_from_disk`).
         self.restored_tx_seq_nodes: set[int] = set()
         self.restored_node_digests: dict[int, str] = {}
+        self.node_commit_seq: dict[int, int] = {}
         self._after_wal_write_ahead_hook = None
         self._load_wal_from_disk()
         self.provision_sql_complete: bool = not bool(s.provision_sql) or (
@@ -1280,6 +1328,9 @@ class TriadController:
         self.auto_morph_interval = 45  # seconds
         self.next_rotate_idx = 0
         self.running = True
+        self._live_shutdown = False
+        self._stop_event = threading.Event()
+        self._scheduler_thread: threading.Thread | None = None
         self.morph_op_lock = threading.Lock()
 
     def _load_wal_from_disk(self):
@@ -1416,6 +1467,14 @@ class TriadController:
                         n.tx_seq = v
                         self.restored_tx_seq_nodes.add(n.node_id)
 
+            raw_cseqs = data.get("node_commit_seq", {})
+            if isinstance(raw_cseqs, dict):
+                for n in self.nodes:
+                    cv = raw_cseqs.get(str(n.node_id))
+                    if isinstance(cv, int) and not isinstance(cv, bool) and cv >= 0:
+                        self.node_commit_seq[n.node_id] = cv
+                        n.commit_seq = cv
+
             atomic_write_json(
                 self.epoch_file,
                 {"state_schema": CURRENT_STATE_SCHEMA, "coordinator_epoch": self.coordinator_epoch},
@@ -1459,6 +1518,11 @@ class TriadController:
             "wal_pending_pre_digest": self.wal_pending_pre_digest if self.wal_pending_tx is not None else "",
             "node_tx_seq": {str(n.node_id): n.tx_seq for n in self.nodes},
             "node_state_digest": {str(n.node_id): n.state_digest for n in self.nodes if n.state_digest},
+            "node_commit_seq": {
+                str(n.node_id): int(self.node_commit_seq.get(n.node_id, 0))
+                for n in self.nodes
+                if int(self.node_commit_seq.get(n.node_id, 0)) > 0
+            },
         }
         atomic_write_json(self.wal_file, payload)
 
@@ -1660,7 +1724,13 @@ class TriadController:
             for n in ready_nodes:
                 n.state_digest = digest
             self._save_wal_to_disk()
-            return True
+        for n in ready_nodes:
+            if not self.unit_test or n.device_key_path.exists():
+                self.verify_node_commit_seq(n)
+        with self.wal_lock:
+            if self.wal_file.exists():
+                self._save_wal_to_disk()
+        return True
 
     def _encrypt_wal_vault_cmd(self, cmd_str: str) -> str:
         """
@@ -1736,6 +1806,16 @@ class TriadController:
             return "QUORUM_LOST"
         if "consecutive heals" in low or "keeping node offline" in low or "isolated" in low:
             return "NODE_ISOLATED"
+        if "whole-disk rollback" in low or "commit_seq=" in low or "disk_rollback_detected" in low:
+            return "DISK_ROLLBACK_DETECTED"
+        if "storage fault" in low or "disk_storage_fault" in low:
+            return "DISK_STORAGE_FAULT"
+        if "primary slot failed verification" in low or "disk_slot_repaired" in low:
+            return "DISK_SLOT_REPAIRED"
+        if "quarantine" in low and ("restored" in low or "recovered" in low):
+            return "DISK_QUARANTINE_RESTORED"
+        if "seal verification failed" in low or "ephemeral" in low or "disk_seal_rejected" in low:
+            return "DISK_SEAL_REJECTED"
         if "rollback" in low or "ab_rollback" in low or "rolling back to slot" in low:
             return "AB_ROLLBACK"
         if "controller.lock" in low or "lock_conflict" in low:
@@ -1922,6 +2002,7 @@ class TriadController:
     def start_node_vm(self, node: TriadNode):
         node.ensure_disks(self.master_key_bytes)
         node.accel = self.accel
+        node.last_disk_boot_status = "OK"
         cmd = self.build_qemu_cmd(node)
 
         with node.line_cond:
@@ -1943,6 +2024,244 @@ class TriadController:
         node.job_handle = apply_host_resource_limits(node.proc, max_memory_mb=2048, cpu_rate_pct=85)
         t = threading.Thread(target=self._serial_reader_loop, args=(node,), daemon=True)
         t.start()
+
+    def archive_node_quarantine(self, node: TriadNode) -> Path | None:
+        """
+        Extract the 108-sector (`55,296` B) quarantine snapshot (`LBA 1216..1323`) from
+        `node.ahci_img` into a timestamped forensic archive file under `node.node_dir`.
+        """
+        if not node.ahci_img.exists():
+            return None
+        try:
+            with open(node.ahci_img, "rb") as f:
+                f.seek(QUARANTINE_OFFSET)
+                q_bytes = f.read(QUARANTINE_SIZE)
+            if not q_bytes:
+                return None
+            if len(q_bytes) < QUARANTINE_SIZE:
+                q_bytes += b"\x00" * (QUARANTINE_SIZE - len(q_bytes))
+            idx = len(node.archived_quarantine_files) + 1
+            out_path = node.node_dir / f"quarantine_node{node.node_id}_{int(time.time())}_{idx}.bin"
+            with open(out_path, "wb") as out_f:
+                out_f.write(q_bytes)
+                out_f.flush()
+                os.fsync(out_f.fileno())
+            node.archived_quarantine_files.append(out_path)
+            return out_path
+        except OSError as e:
+            self.log_event("WARN", f"{node.name}: Failed to archive quarantine sectors: {e}")
+            return None
+
+    def _handle_node_storage_fault(
+        self, node: TriadNode, line: str, async_heal: bool | None = None
+    ) -> Path | None:
+        """
+        Handle a guest `STORAGE FAULT:` halt: terminate the halted VM so any host file lock is
+        released, archive the faulted `ahci_node<id>.img` for forensics, provision a fresh zeroed
+        1 MiB replacement `ahci_node<id>.img`, emit `DISK_STORAGE_FAULT`, and rebuild the node
+        from the 2-of-3 majority + WAL via `heal_and_remorph_node`.
+        """
+        with node._storage_fault_lock:
+            if node.storage_faulted:
+                return node.archived_fault_disks[-1] if node.archived_fault_disks else None
+            node.storage_faulted = True
+            node.last_disk_boot_status = "STORAGE_FAULT"
+
+        if node.proc and node.proc.poll() is None:
+            try:
+                node.proc.kill()
+                node.proc.wait(timeout=3.0)
+            except Exception:
+                pass
+
+        fault_archive: Path | None = None
+        if node.ahci_img.exists():
+            idx = len(node.archived_fault_disks) + 1
+            candidate = node.node_dir / f"ahci_node{node.node_id}.fault_{int(time.time())}_{idx}.img"
+            try:
+                shutil.copyfile(node.ahci_img, candidate)
+                node.archived_fault_disks.append(candidate)
+                fault_archive = candidate
+            except OSError as e:
+                self.log_event("WARN", f"{node.name}: Failed to archive faulted AHCI disk: {e}")
+
+        node.node_dir.mkdir(parents=True, exist_ok=True)
+        with open(node.ahci_img, "wb") as f:
+            f.write(b"\x00" * (1024 * 1024))
+            f.flush()
+            os.fsync(f.fileno())
+
+        node.tampered = True
+        node.tx_seq = 0
+        node.state_digest = ""
+        node.commit_seq = 0
+        self.node_commit_seq[node.node_id] = 0
+        self.restored_tx_seq_nodes.discard(node.node_id)
+        self.heals_total[node.node_id] = self.heals_total.get(node.node_id, 0) + 1
+
+        arch_note = f" (archived faulted disk to {fault_archive.name})" if fault_archive else ""
+        self.log_event(
+            "ALERT",
+            f"{node.name}: Guest kernel halted on storage fault{arch_note}: {line.strip()}",
+            code="DISK_STORAGE_FAULT",
+        )
+        run_async = (not self.unit_test) if async_heal is None else bool(async_heal)
+        if run_async:
+            threading.Thread(
+                target=self.heal_and_remorph_node, args=(node,), daemon=True
+            ).start()
+        else:
+            self.heal_and_remorph_node(node)
+        return fault_archive
+
+    def handle_guest_serial_line(
+        self, node: TriadNode, line: str, async_heal: bool | None = None
+    ) -> None:
+        """
+        Inspect guest serial boot/runtime lines for storage recovery, seal rejection,
+        keyless fail-closed boot, and fail-closed `STORAGE FAULT:` halts.
+        """
+        s = line.strip()
+        if not s:
+            return
+        if "STORAGE FAULT:" in s:
+            self._handle_node_storage_fault(node, s, async_heal=async_heal)
+            return
+        if "SHELL resume REPAIRED" in s:
+            node.last_disk_boot_status = "REPAIRED"
+            self.log_event(
+                "ALERT",
+                f"{node.name}: Primary AHCI state slot failed verification and was repaired from shadow slot ({s}).",
+                code="DISK_SLOT_REPAIRED",
+            )
+            return
+        if "SHELL resume RECOVERED" in s:
+            node.last_disk_boot_status = "RECOVERED"
+            self.log_event(
+                "ALERT",
+                f"{node.name}: State set aside in quarantine by an earlier unverified boot was restored ({s}).",
+                code="DISK_QUARANTINE_RESTORED",
+            )
+            return
+        if "SHELL resume REJECTED" in s:
+            node.last_disk_boot_status = "REJECTED"
+            node.tampered = True
+            q_path = self.archive_node_quarantine(node)
+            q_note = f" (quarantine archived to {q_path.name})" if q_path else ""
+            self.log_event(
+                "ALERT",
+                f"{node.name}: AHCI disk seal verification failed; guest booted blank{q_note} ({s}).",
+                code="DISK_SEAL_REJECTED",
+            )
+            return
+        if (
+            "SHELL resume EPHEMERAL" in s
+            or "PROVISIONING WARNING:" in s
+            or "PROVISIONING ERROR:" in s
+        ):
+            if node.last_disk_boot_status != "EPHEMERAL":
+                node.last_disk_boot_status = "EPHEMERAL"
+                node.tampered = True
+                self.log_event(
+                    "ALERT",
+                    f"{node.name}: Unprovisioned or invalid device key; guest is fail-closed read-only ({s}).",
+                    code="DISK_SEAL_REJECTED",
+                )
+
+    def _derive_node_attest_key(self, node: TriadNode) -> bytes:
+        if node.device_key_path.exists():
+            node_key = node.device_key_path.read_bytes()
+        else:
+            node_key = hmac.new(
+                self.master_key_bytes,
+                f"{node.key_context}:{node.node_id}".encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+        return hmac.new(
+            node_key,
+            b"cuttle-remote-attest-v1:cuttle-quote-v1",
+            hashlib.sha256,
+        ).digest()
+
+    def verify_node_commit_seq(self, node: TriadNode, boot_phase: bool = False) -> bool:
+        """
+        Challenge `node` with a fresh random `attest <nonce>`, verify the `HMAC-SHA256` quote
+        under the node's derived `attest_key`, and enforce per-node `commit_seq` monotonicity
+        against `self.node_commit_seq` (`triad_wal.json`) to detect whole-disk rollback.
+        """
+        attest_key = self._derive_node_attest_key(node)
+        nonce = secrets.token_hex(8)
+        out = ""
+        for attempt in range(2):
+            out = self.send_shell_cmd(node, f"attest {nonce}", timeout=4.0)
+            if out and "attest: " in out and " hmac=" in out:
+                break
+            if attempt == 0:
+                time.sleep(0.05)
+
+        quote_line = ""
+        for ln in (out or "").splitlines():
+            s = ln.strip()
+            if s.startswith("attest: ") and " hmac=" in s:
+                quote_line = s
+                break
+
+        if not quote_line:
+            self.log_event(
+                "ALERT",
+                f"{node.name}: Missing or unreadable remote attestation quote during commit_seq check ({(out or '')[:100]})!",
+                code="DISK_SEAL_REJECTED",
+            )
+            node.tampered = True
+            return False
+
+        hmac_idx = quote_line.rfind(" hmac=")
+        body = quote_line[len("attest: ") : hmac_idx]
+        got_mac = quote_line[hmac_idx + len(" hmac=") :].strip().lower()
+        expected_mac = hmac.new(
+            attest_key, body.encode("ascii", errors="replace"), hashlib.sha256
+        ).hexdigest()
+        if (
+            len(got_mac) != 64
+            or f" nonce={nonce}" not in body
+            or not safe_token_eq(got_mac, expected_mac)
+        ):
+            self.log_event(
+                "ALERT",
+                f"{node.name}: Remote attestation HMAC verification failed during commit_seq check!",
+                code="DISK_SEAL_REJECTED",
+            )
+            node.tampered = True
+            return False
+
+        m_seq = re.search(r"\bcommit_seq=(\d+)\b", body)
+        if not m_seq:
+            self.log_event(
+                "ALERT",
+                f"{node.name}: Authenticated attest quote missing commit_seq field ({body[:100]})!",
+                code="DISK_SEAL_REJECTED",
+            )
+            node.tampered = True
+            return False
+
+        obs_seq = int(m_seq.group(1))
+        high_water = int(self.node_commit_seq.get(node.node_id, 0))
+        if obs_seq < high_water:
+            self.log_event(
+                "ALERT",
+                f"{node.name}: Whole-disk rollback detected via authenticated attest quote "
+                f"(commit_seq={obs_seq} < high-water {high_water})!",
+                code="DISK_ROLLBACK_DETECTED",
+            )
+            node.tampered = True
+            node.tx_seq = 0
+            node.state_digest = ""
+            self.restored_tx_seq_nodes.discard(node.node_id)
+            return False
+
+        node.commit_seq = obs_seq
+        self.node_commit_seq[node.node_id] = max(high_water, obs_seq)
+        return True
 
     def _serial_reader_loop(self, node: TriadNode):
         proc = node.proc
@@ -1979,6 +2298,7 @@ class TriadController:
 
                 node.response_lines.append(line)
                 node.line_cond.notify_all()
+            self.handle_guest_serial_line(node, line, async_heal=True)
 
     def _guest_started(self, node: TriadNode, timeout: float) -> bool:
         """True once the guest prints a recognized bootloader/kernel serial marker."""
@@ -2076,9 +2396,13 @@ class TriadController:
         missed heartbeats. Marks the node `HUNG`, logs a `NODE_HUNG` alert, kills its QEMU
         process, and triggers recovery once `node.missed_heartbeats >= MAX_HEARTBEAT_MISSES`.
         """
+        if getattr(self, "_live_shutdown", False):
+            return True
         if node.state not in ("ONLINE", "HUNG"):
             return True
         out = self.send_shell_cmd(node, "uname", timeout=timeout)
+        if getattr(self, "_live_shutdown", False):
+            return True
         low = (out or "").strip().lower()
         if low and not low.startswith("error:"):
             node.missed_heartbeats = 0
@@ -2103,7 +2427,11 @@ class TriadController:
         return False
 
     def poll_node_heartbeats(self) -> None:
+        if getattr(self, "_live_shutdown", False):
+            return
         for n in self.nodes:
+            if getattr(self, "_live_shutdown", False):
+                return
             if n.state == "ONLINE":
                 self.check_node_heartbeat(n)
 
@@ -2150,7 +2478,7 @@ class TriadController:
                         while ln.startswith("cuttle>"):
                             rest = ln[len("cuttle>") :].lstrip(" ")
                             if not rest:
-                                if collected or saw_cmd_or_output:
+                                if collected:
                                     saw_prompt_end = True
                                 ln = ""
                                 break
@@ -2192,7 +2520,9 @@ class TriadController:
         if c == "uname":
             return "CuttleOS" in joined or "error:" in joined
         if c.startswith("triad epoch"):
-            return "triad_min_epoch=" in joined or "error:" in joined
+            return "coordinator_epoch=" in joined or "triad_min_epoch=" in joined or "error:" in joined
+        if c.startswith("attest"):
+            return ("attest: " in joined and " hmac=" in joined) or "error:" in joined
         if c.startswith("sql "):
             if ".dump " in c.lower():
                 if "error:" in joined or "usage:" in joined:
@@ -2711,9 +3041,11 @@ class TriadController:
 
     def compute_and_verify_raid_parity(self):
         """
-        Compute 4 KiB RAID Parity P = D1 ^ D2 across OS-1 and OS-2 SQL partitions,
+        Compute 8 KiB RAID Parity P = D1 ^ D2 ^ D3 across the Triad SQL partitions,
         and verify Triple Modular Redundancy (TMR) 2-of-3 majority consistency across all online Triad members.
         """
+        if getattr(self, "_live_shutdown", False):
+            return
         n1, n2, n3 = self.nodes[0], self.nodes[1], self.nodes[2]
         online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
 
@@ -2723,6 +3055,8 @@ class TriadController:
             # Probe all online nodes in parallel (each node has its own `cmd_lock`),
             # retrying any None probe once before evaluating consensus.
             outputs = self._probe_nodes_in_parallel(online_nodes, retry_none=True, max_attempts=2)
+            if getattr(self, "_live_shutdown", False):
+                return
 
             # Check if any node diverges from the 2-of-3 majority!
             if len(online_nodes) == 3:
@@ -2893,7 +3227,7 @@ class TriadController:
         if not self.spec.has_sql:
             return  # no SQL partition to protect with parity on this role
 
-        # Only recompute 4 KiB bitwise XOR parity (P = D1 ^ D2 ^ D3) when all 3 nodes are ONLINE
+        # Only recompute 8 KiB bitwise XOR parity (P = D1 ^ D2 ^ D3) when all 3 nodes are ONLINE
         # and verified in consensus; in degraded 2/3 mode, preserve the last verified 3/3 parity
         # block so an offline/corrupted 3rd disk never poisons P!
         if len(online_nodes) == 3:
@@ -2923,14 +3257,14 @@ class TriadController:
 
     def reconstruct_sql_partition_from_xor_parity(self, failed_node_id: int) -> bytes:
         """
-        Reconstruct a corrupted or lost 4 KiB AHCI SQL partition on `failed_node_id` (1, 2, or 3)
+        Reconstruct a corrupted or lost 8 KiB AHCI SQL partition on `failed_node_id` (1, 2, or 3)
         using 3-node RAID-5 bitwise XOR parity `P = D1 ^ D2 ^ D3`:
           - `D1 = D2 ^ D3 ^ P` (when `failed_node_id == 1`)
           - `D2 = D1 ^ D3 ^ P` (when `failed_node_id == 2`)
           - `D3 = D1 ^ D2 ^ P` (when `failed_node_id == 3`)
-        Verifies both surviving peer AHCI images are present and >= 4 KiB (`strict=True`),
-        writes and fsyncs the reconstructed 4 KiB partition directly to the failed node's
-        AHCI image at `SQL_PART_OFFSET`, and returns the reconstructed 4 KiB payload.
+        Verifies both surviving peer AHCI images are present and >= 8 KiB (`strict=True`),
+        writes and fsyncs the reconstructed 8 KiB partition directly to the failed node's
+        AHCI image at `SQL_PART_OFFSET`, and returns the reconstructed 8 KiB payload.
         """
         if failed_node_id not in (1, 2, 3):
             raise ValueError("XOR data parity covers Triad nodes 1 (D1), 2 (D2), and 3 (D3)")
@@ -3613,6 +3947,7 @@ class TriadController:
         _lock_held: bool = False,
         _wipe_disks: bool = False,
         release_version: int | None = None,
+        _fresh_ahci: bool = False,
     ) -> bool:
         """
         Perform a live zero-downtime MTD Morph on a single node while the other 2 nodes
@@ -3621,11 +3956,15 @@ class TriadController:
         automatically falls back to the previous working slot (`AB_ROLLBACK`) if the new slot
         fails to reach `interactive shell ready`.
         """
+        if getattr(self, "_live_shutdown", False):
+            return False
         if not _lock_held and not self.morph_op_lock.acquire(blocking=False):
             self.log_event("WARN", "Another node is currently morphing; keeping 2/3 majority intact.")
             return False
 
         try:
+            if getattr(self, "_live_shutdown", False):
+                return False
             node = self.nodes[node_id - 1]
             peers = [n for n in self.nodes if n.node_id != node_id and n.state == "ONLINE"]
             if len(peers) < 2:
@@ -3657,8 +3996,13 @@ class TriadController:
                 "MTD",
                 f"{node.name}: Draining & sealing AHCI disk (peers {peers[0].name.split()[0]} + {peers[1].name.split()[0]} holding 2/3 majority)...",
             )
-            if not _wipe_disks:
+            if _wipe_disks or _fresh_ahci:
+                self.node_commit_seq[node.node_id] = 0
+                node.commit_seq = 0
+            else:
                 self.send_shell_cmd(node, "sync", timeout=3.0)
+                if not self.unit_test or node.device_key_path.exists():
+                    self.verify_node_commit_seq(node)
             if node.proc and node.proc.poll() is None:
                 try:
                     node.proc.stdin.write("\nhalt\n")
@@ -3722,7 +4066,7 @@ class TriadController:
                     node.state = "OFFLINE"
                     return False
 
-            if _wipe_disks and not self.spec.has_sql and peers:
+            if (_wipe_disks or _fresh_ahci) and not self.spec.has_sql and peers:
                 self._sync_files_from_peer(node, peers[0])
             if not self.apply_node_profile(node):
                 return False
@@ -3757,6 +4101,8 @@ class TriadController:
                     self._reset_sql_vote_tables(node)
                     self._replay_checkpoint_on_node(node, cp_stmts)
                     node.tx_seq = cp_seq
+                elif (_wipe_disks or _fresh_ahci) and self.spec.has_sql:
+                    self._reset_sql_vote_tables(node)
                 missed = [(tid, stmt) for (tid, stmt) in self.wal_entries if tid > node.tx_seq]
                 if missed or need_cp:
                     self.log_event(
@@ -3784,6 +4130,10 @@ class TriadController:
                 if fp:
                     node.state_digest = fp
                     self.triad_state_digest = fp
+                if not self.unit_test or node.device_key_path.exists():
+                    if not self.verify_node_commit_seq(node):
+                        node.state = "OFFLINE"
+                        return False
                 self._save_wal_to_disk()
                 node.tampered = False
                 node.missed_heartbeats = 0
@@ -3847,8 +4197,22 @@ class TriadController:
         node stuck in HEALING.
         """
         with self.morph_op_lock:
+            if getattr(self, "_live_shutdown", False):
+                return
             try:
                 node.state = "HEALING"
+                self.node_commit_seq[node.node_id] = 0
+                node.commit_seq = 0
+                if node.storage_faulted:
+                    node.storage_faulted = False
+                    self.log_event(
+                        "HEAL",
+                        f"{node.name}: Rebuilding storage-faulted node onto fresh replacement AHCI image from 2/3 majority + WAL...",
+                    )
+                    self.bounce_and_morph_node(
+                        node.node_id, _lock_held=True, _wipe_disks=False, _fresh_ahci=True
+                    )
+                    return
                 if not self.spec.has_sql:
                     # Non-SQL role (e.g. `wfe`): wipe the diverged persistent disk images, boot a
                     # freshly morphed kernel, sync served files from a healthy peer, and re-apply role.
@@ -3859,7 +4223,7 @@ class TriadController:
                     self.bounce_and_morph_node(node.node_id, _lock_held=True, _wipe_disks=True)
                     return
 
-                # Verify 4 KiB 3-node XOR block parity recovery (D_corrupted = D_peerA ^ D_peerB ^ P)
+                # Verify 8 KiB 3-node XOR block parity recovery (D_corrupted = D_peerA ^ D_peerB ^ P)
                 peers = [n for n in self.nodes if n.node_id != node.node_id]
                 peer_a_bytes = peers[0].read_sql_partition_bytes()
                 peer_b_bytes = peers[1].read_sql_partition_bytes()
@@ -3869,7 +4233,7 @@ class TriadController:
                 xor_tag = hashlib.sha256(xor_recovered).hexdigest()[:12]
                 self.log_event(
                     "HEAL",
-                    f"{node.name}: Isolating tampered node, verifying 4 KiB XOR parity block (D_peerA ⊕ D_peerB ⊕ P = {xor_tag}..), and reconstructing {list(self.spec.vote_tables)} from 2/3 RAID Majority + WAL...",
+                    f"{node.name}: Isolating tampered node, verifying 8 KiB XOR parity block (D_peerA ⊕ D_peerB ⊕ P = {xor_tag}..), and reconstructing {list(self.spec.vote_tables)} from 2/3 RAID Majority + WAL...",
                 )
 
                 # Reset all vote tables (`kv`, `idx`, etc.) and replay a WAL checkpoint + snapshot
@@ -4281,6 +4645,9 @@ class TriadController:
                         if fp:
                             n.state_digest = fp
                             self.triad_state_digest = fp
+                        n.tampered = False
+                        self.node_commit_seq[n.node_id] = 0
+                        n.commit_seq = 0
                         self.restored_tx_seq_nodes.add(n.node_id)
                     self.wal_probe_format_mismatch = False
                     self._save_wal_to_disk()
@@ -4326,6 +4693,8 @@ class TriadController:
                 if not self.apply_node_profile(n):
                     continue
                 n.state = "ONLINE"
+                if not self.unit_test or n.device_key_path.exists():
+                    self.verify_node_commit_seq(n, boot_phase=True)
                 self.refresh_node_telemetry(n)
                 self.log_event(
                     "READY",
@@ -4339,8 +4708,34 @@ class TriadController:
         self._verify_restored_tx_seq_at_boot()
         self._adopt_tx_seq_from_majority()
         self.compute_and_verify_raid_parity()
+        rolled_back_online = [n for n in self.nodes if n.tampered and n.state == "ONLINE"]
+        if rolled_back_online:
+            healthy_peers = [n for n in self.nodes if n.state == "ONLINE" and not n.tampered]
+            if len(rolled_back_online) == 1 and len(healthy_peers) >= 2:
+                rb = rolled_back_online[0]
+                rb.consecutive_heals += 1
+                self.heals_total[rb.node_id] = self.heals_total.get(rb.node_id, 0) + 1
+                rb.state = "HEALING"
+                threading.Thread(
+                    target=self.heal_and_remorph_node, args=(rb,), daemon=True
+                ).start()
+            else:
+                for rb in rolled_back_online:
+                    rb.state = "OFFLINE"
+                self.log_event(
+                    "ALERT",
+                    f"Refusing rolled-back/unverified nodes {[n.name.split()[0] for n in rolled_back_online]} without 2/3 untampered quorum!",
+                    code="QUORUM_LOST",
+                )
         self._provision_sql()
-        threading.Thread(target=self._background_scheduler, daemon=True).start()
+        for n in self.nodes:
+            if n.state == "ONLINE" and not n.tampered and (not self.unit_test or n.device_key_path.exists()):
+                self.verify_node_commit_seq(n)
+        with self.wal_lock:
+            if self.wal_file.exists():
+                self._save_wal_to_disk()
+        self._scheduler_thread = threading.Thread(target=self._background_scheduler, daemon=True)
+        self._scheduler_thread.start()
 
     def _provision_sql(self) -> bool:
         """
@@ -4365,6 +4760,8 @@ class TriadController:
         return all_ok
 
     def _scheduler_step(self, now_mono: float, last_rot: float) -> float:
+        if getattr(self, "_live_shutdown", False):
+            return last_rot
         online_count = sum(1 for n in self.nodes if n.state == "ONLINE")
         if not self.unit_test and online_count >= 1:
             self.poll_node_heartbeats()
@@ -4381,8 +4778,15 @@ class TriadController:
 
     def _background_scheduler(self):
         last_rot = time.monotonic()
+        stop_ev = getattr(self, "_stop_event", None)
         while self.running:
-            time.sleep(2.0)
+            if stop_ev is not None:
+                if stop_ev.wait(2.0):
+                    break
+            else:
+                time.sleep(2.0)
+            if not self.running:
+                break
             last_rot = self._scheduler_step(time.monotonic(), last_rot)
 
     def render_prometheus_metrics(self) -> str:
@@ -4440,16 +4844,59 @@ class TriadController:
         return "\n".join(lines) + "\n"
 
     def shutdown(self):
+        sched = getattr(self, "_scheduler_thread", None)
+        if not self.unit_test or sched is not None:
+            self._live_shutdown = True
         self.running = False
-        for n in self.nodes:
-            if n.proc and n.proc.poll() is None:
-                try:
-                    n.proc.kill()
-                except Exception:
-                    pass
-            close_host_resource_limits(n.job_handle)
-            n.job_handle = None
-        self._release_controller_lock()
+        stop_ev = getattr(self, "_stop_event", None)
+        if stop_ev is not None:
+            stop_ev.set()
+        if sched is not None and sched.is_alive() and threading.current_thread() is not sched:
+            sched.join(timeout=10.0)
+        morph_lock = getattr(self, "morph_op_lock", None)
+        acquired_morph = (
+            morph_lock.acquire(timeout=20.0)
+            if (morph_lock is not None and not self.unit_test)
+            else False
+        )
+        try:
+            if not self.unit_test and self.wal_file.exists():
+                updated_seq = False
+                for n in self.nodes:
+                    if (
+                        n.state == "ONLINE"
+                        and not n.tampered
+                        and n.proc is not None
+                        and n.proc.poll() is None
+                        and n.device_key_path.exists()
+                    ):
+                        try:
+                            self.send_shell_cmd(n, "sync", timeout=2.0)
+                            if self.verify_node_commit_seq(n):
+                                updated_seq = True
+                        except Exception:
+                            pass
+                if updated_seq:
+                    with self.wal_lock:
+                        try:
+                            self._save_wal_to_disk()
+                        except Exception:
+                            pass
+            for n in self.nodes:
+                if not self.unit_test:
+                    n.state = "OFFLINE"
+                if n.proc and n.proc.poll() is None:
+                    try:
+                        n.proc.kill()
+                        n.proc.wait(timeout=5.0)
+                    except Exception:
+                        pass
+                close_host_resource_limits(n.job_handle)
+                n.job_handle = None
+        finally:
+            if acquired_morph and morph_lock is not None:
+                morph_lock.release()
+            self._release_controller_lock()
 
 
 DASHBOARD_HTML = r"""<!doctype html>
@@ -7669,6 +8116,232 @@ def run_stage8_security_and_wal_unit_tests(tmp_dir: Path, sc_harness: RealOsShel
     assert any(e.get("code") == "WAL_CORRUPT" for e in v_ctrl.events), (
         f"Expected WAL_CORRUPT alert on unrecorded Vault row during checkpoint_wal: {v_ctrl.events}"
     )
+
+    # 3. Stale `run_bios.img` detection (`needs_base_bios_rebuild`):
+    bios_probe_dir = tmp_dir / "stage4_bios_freshness"
+    bios_probe_dir.mkdir(parents=True, exist_ok=True)
+    fake_elf = bios_probe_dir / "target_enterprise_kernel"
+    fake_bios = bios_probe_dir / "run_bios.img"
+    fake_elf.write_bytes(b"\x7fELF-kernel-v1")
+    assert needs_base_bios_rebuild(fake_elf, fake_bios) is True, "Missing run_bios.img must trigger rebuild"
+    fake_bios.write_bytes(b"\x00" * 32 + b"\x7fELF-kernel-v1" + b"\x00" * 32)
+    now_ns = time.time_ns()
+    os.utime(fake_elf, ns=(now_ns - 2_000_000_000, now_ns - 2_000_000_000))
+    os.utime(fake_bios, ns=(now_ns, now_ns))
+    assert needs_base_bios_rebuild(fake_elf, fake_bios) is False, "Fresh matching run_bios.img must not rebuild"
+    os.utime(fake_elf, ns=(now_ns + 2_000_000_000, now_ns + 2_000_000_000))
+    assert needs_base_bios_rebuild(fake_elf, fake_bios) is True, "Newer BASE_ELF mtime must trigger run_bios.img rebuild"
+    fake_elf.write_bytes(b"\x7fELF-kernel-v2")
+    os.utime(fake_bios, ns=(now_ns + 4_000_000_000, now_ns + 4_000_000_000))
+    assert needs_base_bios_rebuild(fake_elf, fake_bios) is True, "Mismatched ELF bytes must trigger run_bios.img rebuild"
+
+    # 4. Serial console framing (`High #2`): a stale `cuttle>` prompt arriving after command echo
+    #    must NOT terminate `send_shell_cmd` with an empty `""` response before real output arrives!
+    fr_dir = tmp_dir / "stage4_serial_framing"
+    fr_ctrl = TriadController(
+        show_gui=False,
+        spec=TriadSpec(name="s4-framing", state_dir=fr_dir, write_operator_token=False),
+        unit_test=True,
+    )
+    fr_ctrl.shutdown()
+    fr_node = fr_ctrl.nodes[0]
+    mock_guest_code = (
+        "import sys, time\n"
+        "cmd = sys.stdin.readline().rstrip('\\r\\n')\n"
+        "sys.stdout.write(cmd + '\\n')\n"
+        "sys.stdout.write('cuttle> \\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(0.05)\n"
+        "sys.stdout.write('k|v|rev\\ncluster.role|primary|1\\ncuttle> \\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.stdin.readline()\n"
+    )
+    fr_node.proc = subprocess.Popen(
+        [sys.executable, "-u", "-c", mock_guest_code],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        bufsize=1,
+    )
+    try:
+        threading.Thread(target=fr_ctrl._serial_reader_loop, args=(fr_node,), daemon=True).start()
+        fr_out = fr_ctrl.send_shell_cmd(fr_node, "sql /*triad*/ SELECT * FROM kv", timeout=3.0)
+        assert "cluster.role|primary|1" in fr_out, (
+            f"send_shell_cmd truncated prematurely on stale cuttle> prompt: {fr_out!r}"
+        )
+    finally:
+        if fr_node.proc and fr_node.proc.poll() is None:
+            fr_node.proc.kill()
+            fr_node.proc.wait(timeout=2.0)
+        fr_node.proc = None
+
+    # 5. Guest boot/fault serial banners (`High #1`): `REPAIRED`, `RECOVERED`, `REJECTED` (with
+    #    108-sector quarantine archive), `EPHEMERAL`, and `STORAGE FAULT:` (with faulted disk archive,
+    #    fresh 1 MiB AHCI provisioning, and automatic rebuild from 2/3 majority + WAL).
+    sf_dir = tmp_dir / "stage4_storage_events"
+    sf_ctrl = TriadController(
+        show_gui=False,
+        spec=TriadSpec(name="s4-storage", state_dir=sf_dir, write_operator_token=False),
+        unit_test=True,
+    )
+    sf_ctrl.shutdown()
+    for n in sf_ctrl.nodes:
+        sc_harness.reset_node(n.node_id)
+        n.ensure_disks(sf_ctrl.master_key_bytes)
+        sc_harness.set_device_key(n.node_id, n.device_key_path.read_bytes())
+        sc_harness.set_commit_seq(n.node_id, 5)
+        n.state = "ONLINE"
+    sf_ctrl.send_shell_cmd = sc_harness.exec
+    for n in sf_ctrl.nodes:
+        sf_ctrl._reset_sql_vote_tables(n)
+
+    sf_ctrl.handle_guest_serial_line(
+        sf_ctrl.nodes[0],
+        "SHELL resume REPAIRED: primary slot failed verification; state restored from shadow slot",
+    )
+    assert sf_ctrl.nodes[0].last_disk_boot_status == "REPAIRED"
+    assert any(e.get("code") == "DISK_SLOT_REPAIRED" for e in sf_ctrl.events)
+
+    sf_ctrl.handle_guest_serial_line(
+        sf_ctrl.nodes[1],
+        "SHELL resume RECOVERED: state set aside by an earlier unverified boot was restored",
+    )
+    assert sf_ctrl.nodes[1].last_disk_boot_status == "RECOVERED"
+    assert any(e.get("code") == "DISK_QUARANTINE_RESTORED" for e in sf_ctrl.events)
+
+    # Seed a recognizable 108-sector quarantine payload at LBA 1216..1323 on OS-2 and trigger REJECTED:
+    q_marker = (b"CTTLQ_FORENSIC_" + bytes(range(16))) * (QUARANTINE_SIZE // 31)
+    q_marker = (q_marker + b"\xaa" * QUARANTINE_SIZE)[:QUARANTINE_SIZE]
+    with open(sf_ctrl.nodes[1].ahci_img, "r+b") as qf:
+        qf.seek(QUARANTINE_OFFSET)
+        qf.write(q_marker)
+    sf_ctrl.handle_guest_serial_line(
+        sf_ctrl.nodes[1],
+        "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)",
+    )
+    assert sf_ctrl.nodes[1].last_disk_boot_status == "REJECTED"
+    assert len(sf_ctrl.nodes[1].archived_quarantine_files) == 1
+    q_arch = sf_ctrl.nodes[1].archived_quarantine_files[0]
+    assert q_arch.exists() and q_arch.read_bytes() == q_marker, "Quarantine archive bytes mismatch"
+    assert any(e.get("code") == "DISK_SEAL_REJECTED" and q_arch.name in e["msg"] for e in sf_ctrl.events)
+    sf_ctrl.nodes[1].tampered = False
+
+    # Ephemeral / unprovisioned warning deduplicates per boot:
+    ep_before = sum(1 for e in sf_ctrl.events if e.get("code") == "DISK_SEAL_REJECTED")
+    sf_ctrl.handle_guest_serial_line(sf_ctrl.nodes[0], "PROVISIONING WARNING: no fw_cfg key")
+    sf_ctrl.handle_guest_serial_line(sf_ctrl.nodes[0], "SHELL resume EPHEMERAL: durable writes disabled")
+    ep_after = sum(1 for e in sf_ctrl.events if e.get("code") == "DISK_SEAL_REJECTED")
+    assert ep_after == ep_before + 1, f"Expected 1 deduplicated DISK_SEAL_REJECTED per boot, got {ep_after - ep_before}"
+    sf_ctrl.nodes[0].tampered = False
+
+    # Commit a write across the Triad, then trigger `STORAGE FAULT:` on OS-3 and verify full disk replacement + WAL rebuild:
+    assert sf_ctrl.execute_triad_sql(
+        "INSERT OR REPLACE INTO kv VALUES ('sf.recover', 'rebuilt_on_fresh_disk', 7)"
+    )["ok"]
+    fault_marker = b"DAMAGED_AHCI_PLATTER_OS3"
+    with open(sf_ctrl.nodes[2].ahci_img, "r+b") as ff:
+        ff.seek(4096)
+        ff.write(fault_marker)
+
+    def _mock_start_fresh_vm(node: TriadNode):
+        node.last_disk_boot_status = "OK"
+        if node.node_id == 3:
+            # Fresh blank AHCI image boots at genesis SQL state with commit_seq=1
+            sc_harness.reset_node(3)
+            sc_harness.set_device_key(3, node.device_key_path.read_bytes())
+            sc_harness.set_commit_seq(3, 1)
+
+    sf_ctrl.start_node_vm = _mock_start_fresh_vm
+    sf_ctrl.await_boot = lambda node, timeout=35.0: True
+    sf_ctrl.handle_guest_serial_line(
+        sf_ctrl.nodes[2],
+        "CUTTLE-TE PANIC: STORAGE FAULT: device error writing the primary slot",
+        async_heal=False,
+    )
+    assert any(e.get("code") == "DISK_STORAGE_FAULT" for e in sf_ctrl.events), sf_ctrl.events
+    assert len(sf_ctrl.nodes[2].archived_fault_disks) == 1
+    archived_fault_img = sf_ctrl.nodes[2].archived_fault_disks[0]
+    assert archived_fault_img.exists() and fault_marker in archived_fault_img.read_bytes()
+    assert fault_marker not in sf_ctrl.nodes[2].ahci_img.read_bytes(), (
+        "Replacement ahci_node3.img must be a fresh zeroed 1 MiB image without the damaged bytes"
+    )
+    assert sf_ctrl.nodes[2].state == "ONLINE", f"OS-3 should be ONLINE after storage fault heal, got {sf_ctrl.nodes[2].state}"
+    os3_kv_after = sc_harness.exec(sf_ctrl.nodes[2], "sql /*triad*/ SELECT * FROM kv")
+    assert "sf.recover|rebuilt_on_fresh_disk|7" in os3_kv_after, (
+        f"OS-3 failed to replay committed WAL onto fresh replacement disk: {os3_kv_after}"
+    )
+
+    # 6. Per-node `commit_seq` anti-rollback via `HMAC-SHA256` `attest` quotes (`Medium #3`):
+    cs_dir = tmp_dir / "stage4_commit_seq"
+    cs_ctrl = TriadController(
+        show_gui=False,
+        spec=TriadSpec(name="s4-cseq", state_dir=cs_dir, write_operator_token=False),
+        unit_test=True,
+    )
+    cs_ctrl.shutdown()
+    cs_ctrl.send_shell_cmd = sc_harness.exec
+    for n in cs_ctrl.nodes:
+        sc_harness.reset_node(n.node_id)
+        n.ensure_disks(cs_ctrl.master_key_bytes)
+        sc_harness.set_device_key(n.node_id, n.device_key_path.read_bytes())
+        sc_harness.set_commit_seq(n.node_id, 9)
+        n.state = "ONLINE"
+        assert cs_ctrl.verify_node_commit_seq(n) is True
+        assert cs_ctrl.node_commit_seq[n.node_id] == 9 and n.commit_seq == 9
+    cs_ctrl._save_wal_to_disk()
+
+    cs_ctrl2 = TriadController(
+        show_gui=False,
+        spec=TriadSpec(name="s4-cseq", state_dir=cs_dir, write_operator_token=False),
+        unit_test=True,
+    )
+    cs_ctrl2.shutdown()
+    cs_ctrl2.send_shell_cmd = sc_harness.exec
+    assert cs_ctrl2.node_commit_seq == {1: 9, 2: 9, 3: 9}, (
+        f"triad_wal.json must persist and reload node_commit_seq, got {cs_ctrl2.node_commit_seq}"
+    )
+    # Monotonic advance on OS-1 (`9 -> 12`) succeeds:
+    sc_harness.set_commit_seq(1, 12)
+    assert cs_ctrl2.verify_node_commit_seq(cs_ctrl2.nodes[0]) is True
+    assert cs_ctrl2.node_commit_seq[1] == 12
+    # Whole-disk rollback on OS-2 (`9 -> 4`) is caught via authenticated quote and raises DISK_ROLLBACK_DETECTED:
+    cs_ctrl2.nodes[1].tx_seq = 5
+    sc_harness.set_commit_seq(2, 4)
+    assert cs_ctrl2.verify_node_commit_seq(cs_ctrl2.nodes[1]) is False
+    assert cs_ctrl2.nodes[1].tampered is True and cs_ctrl2.nodes[1].tx_seq == 0
+    assert any(e.get("code") == "DISK_ROLLBACK_DETECTED" and "OS-2" in e["msg"] for e in cs_ctrl2.events)
+    # Forged `attest` HMAC tag on OS-3 is rejected with DISK_SEAL_REJECTED:
+    cs_ctrl2.send_shell_cmd = lambda node, cmd, timeout=4.0: (
+        "attest: v=1 boots=2 pcr10=" + ("0" * 64) + " svc_pcr10=0000000000000000 role=full commit_seq=99 ima=2 seal="
+        + ("a" * 64)
+        + f" nonce={cmd.split()[-1]} hmac="
+        + ("f" * 64)
+    )
+    assert cs_ctrl2.verify_node_commit_seq(cs_ctrl2.nodes[2]) is False
+    assert cs_ctrl2.nodes[2].tampered is True
+    assert any(e.get("code") == "DISK_SEAL_REJECTED" and "OS-3" in e["msg"] for e in cs_ctrl2.events)
+
+    # 7. Clean `shutdown()` wakes `_background_scheduler` immediately via `_stop_event` and joins it
+    #    without firing a post-shutdown `_scheduler_step` or zombie `unreadable state probe` alert (`High #2`):
+    sd_dir = tmp_dir / "stage4_clean_shutdown"
+    sd_ctrl = TriadController(
+        show_gui=False,
+        spec=TriadSpec(name="s4-shutdown", state_dir=sd_dir, write_operator_token=False),
+        unit_test=True,
+    )
+    post_shutdown_steps = []
+    sd_ctrl._scheduler_step = lambda now_mono, last_rot: (post_shutdown_steps.append(now_mono) or last_rot)
+    sd_ctrl._scheduler_thread = threading.Thread(target=sd_ctrl._background_scheduler, daemon=True)
+    sd_ctrl._scheduler_thread.start()
+    time.sleep(0.05)  # scheduler thread is now asleep inside `_stop_event.wait(2.0)`
+    t_sd0 = time.monotonic()
+    sd_ctrl.shutdown()
+    sd_elapsed = time.monotonic() - t_sd0
+    assert not sd_ctrl._scheduler_thread.is_alive(), "shutdown() must wake and join _scheduler_thread"
+    assert sd_elapsed < 0.5, f"shutdown() should wake _stop_event immediately (<0.5s), took {sd_elapsed:.3f}s"
+    assert post_shutdown_steps == [], f"_background_scheduler must not invoke _scheduler_step after shutdown(): {post_shutdown_steps}"
 
 
 def main():

@@ -18,7 +18,25 @@ fn new_node_shell(node_id: usize) -> Box<OsShell> {
         2 => 0x22,
         _ => 0x33,
     };
-    Box::new(OsShell::with_seal_key([key_byte; 32]))
+    let master = [key_byte; 32];
+    let seal_key = target_enterprise::durable_seal::derive_seal_key(&master, b"cuttle-ahci-wal-seal-v1");
+    let mut sh = Box::new(OsShell::with_seal_key(seal_key));
+    sh.attest_key = target_enterprise::durable_seal::derive_attest_key(&master, b"cuttle-quote-v1");
+    sh
+}
+
+fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex.trim().as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = (bytes[2 * i] as char).to_digit(16)? as u8;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)? as u8;
+        *slot = (hi << 4) | lo;
+    }
+    Some(out)
 }
 
 fn main() {
@@ -40,6 +58,27 @@ fn main() {
         let idx = node_id - 1;
         if cmd == "__reset__" {
             shells[idx] = new_node_shell(node_id);
+            let _ = writeln!(stdout);
+            let _ = stdout.flush();
+            continue;
+        }
+        if let Some(hex_key) = cmd.strip_prefix("__set_device_key__:") {
+            if let Some(master) = decode_hex32(hex_key) {
+                shells[idx].seal_key = target_enterprise::durable_seal::derive_seal_key(
+                    &master,
+                    b"cuttle-ahci-wal-seal-v1",
+                );
+                shells[idx].attest_key =
+                    target_enterprise::durable_seal::derive_attest_key(&master, b"cuttle-quote-v1");
+            }
+            let _ = writeln!(stdout);
+            let _ = stdout.flush();
+            continue;
+        }
+        if let Some(seq_str) = cmd.strip_prefix("__set_commit_seq__:") {
+            if let Ok(seq) = seq_str.trim().parse::<u64>() {
+                shells[idx].commit_seq = seq;
+            }
             let _ = writeln!(stdout);
             let _ = stdout.flush();
             continue;

@@ -84,6 +84,47 @@ Every `ALERT` event emitted by the controller includes a machine-parseable `code
   2. Compare the committed `triad_wal.json` (`triad_tx_seq` and `triad_state_digest`) against each node's `node_state_digest`.
   3. Identify the node(s) whose on-disk state matches `triad_state_digest`, stop the controller, replace the diverged node's AHCI image or remove its stale disk image so 2/3 majority matches `triad_state_digest`, and restart the controller to heal the 3rd node from the verified majority + WAL.
 
+### `DISK_SLOT_REPAIRED` {#disk_slot_repaired}
+
+- **Symptom**: On boot, a guest emitted `SHELL resume REPAIRED: primary slot failed verification; state restored from shadow slot`. The primary AHCI state slot (`LBA 1040..=1092`) suffered bit-rot or torn damage at rest, and `ShellStore` automatically verified and healed it from the intact shadow slot (`LBA 1096..=1148`).
+- **Triage & Recovery**:
+  1. No data was lost; the node resumed online with intact `AB_FORMAT_V3` AEAD-authenticated state.
+  2. Check host storage health (SMART counters, filesystem errors on `node<id>/ahci_node<id>.img`) for recurring media degradation.
+  3. If the same node emits repeated `DISK_SLOT_REPAIRED` alerts, replace the backing storage volume and trigger `POST /api/morph/<id>`.
+
+### `DISK_QUARANTINE_RESTORED` {#disk_quarantine_restored}
+
+- **Symptom**: On boot, a guest emitted `SHELL resume RECOVERED: state set aside by an earlier unverified boot was restored`. State previously copied to the quarantine area (`LBA 1216..=1323`) was cryptographically authenticated under the active device key and restored.
+- **Triage & Recovery**:
+  1. Confirm the recovered node matches the 2-of-3 Triad majority (`GET /api/triad` shows `3/3 TMR MAJORITY LOCKED`).
+  2. Review `serial_node<id>.log` and deployment history to confirm why an earlier boot ran with a mismatched key or interrupted state.
+
+### `DISK_SEAL_REJECTED` {#disk_seal_rejected}
+
+- **Symptom**: Either:
+  1. A guest emitted `SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)` and preserved the unverifiable sectors in `LBA 1216..=1323` before booting blank,
+  2. A guest booted without an out-of-band `fw_cfg` device key (`PROVISIONING WARNING` / `SHELL resume EPHEMERAL`), failing closed on all durable writes (`EROFS`), or
+  3. Remote attestation quote HMAC verification (`attest <nonce>`) failed on the node.
+- **Forensics & Recovery**:
+  1. Inspect the automatically extracted forensic quarantine snapshot `node<id>/quarantine_node<id>_*.bin` (`108` sectors copied from `LBA 1216..=1323`) before taking destructive action.
+  2. Verify `node<id>/device_key_node<id>.bin` and `master_key_path` (`device_secret_key.bin`) have not been replaced or corrupted.
+  3. Once 2/3 peers hold a verified majority, the controller automatically outvotes and heals the rejected node from the majority + WAL.
+
+### `DISK_STORAGE_FAULT` {#disk_storage_fault}
+
+- **Symptom**: A guest kernel halted fail-closed with `STORAGE FAULT: ...` because an AHCI read, write, flush, or layout check failed during boot or runtime persistence.
+- **Automated Recovery & Forensics**:
+  1. The controller automatically terminates the halted VM, archives the faulted disk image to `node<id>/ahci_node<id>.fault_<ts>_<n>.img`, provisions a fresh zeroed 1 MiB `ahci_node<id>.img`, and runs `heal_and_remorph_node` to rebuild the node from the 2-of-3 majority + WAL.
+  2. Inspect host disk space (`df -h` / volume free space) and the archived `.fault_*.img` image (including any encrypted `CTTLPENC` panic record at `LBA 1536..=1567`).
+
+### `DISK_ROLLBACK_DETECTED` {#disk_rollback_detected}
+
+- **Symptom**: During boot or post-morph catch-up, a node's `HMAC-SHA256`-authenticated `attest <nonce>` quote reported a durable `commit_seq` lower than the per-node high-water mark recorded in `triad_wal.json` (`node_commit_seq`), indicating whole-disk snapshot rollback or an unrecorded disk wipe.
+- **Automated Recovery & Triage**:
+  1. Single-node rollback: the controller marks the node `tampered`, discards its stale `tx_seq`, and heals it from the 2-of-3 untampered majority + WAL onto a freshly morphed binary, establishing a new monotonic `commit_seq` baseline.
+  2. Multi-node rollback: SQL-backed Triads replay the committed `triad_wal.json` onto rolled-back nodes; if fewer than 2 untampered peers remain on non-SQL state, the controller fails closed with `QUORUM_LOST`.
+  3. Investigate hypervisor snapshot automation or storage-layer replication to determine why an older `ahci_node<id>.img` snapshot was presented.
+
 ---
 
 ## Key Ceremony Rotation & Revocation (`R3`)

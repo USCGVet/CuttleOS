@@ -37,6 +37,8 @@ if not exist "%BINMORPH_EXE%" (
 
 if not exist "%BASE_ELF%" goto :build_base
 if not exist "%BIOS_IMG%" goto :build_base
+powershell -NoProfile -Command "if ((Get-Item -LiteralPath '%BASE_ELF%').LastWriteTimeUtc -gt (Get-Item -LiteralPath '%BIOS_IMG%').LastWriteTimeUtc) { exit 1 } else { exit 0 }"
+if errorlevel 1 goto :build_base
 goto :launch_triad
 
 :build_base
