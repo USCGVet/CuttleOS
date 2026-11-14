@@ -469,6 +469,8 @@ const REQUIRED_BANNERS: &[&str] = &[
     "SMP_HW init OK cpus=4 threads=4 ctx_sw=4",
     "OS_ARMOR OK mmio_nx=1 guarded_stacks=16 tss_ltr=4",
     "PHYS_MM_SLAB OK pt_burst=128 scrub=zero leak=0 usable_frames=",
+    "RING3_ELF_MP OK procs=11 preempts=",
+    "faults_isolated=4 respawn=1 leak=0",
     "CUTTLE-TE HALT",
 ];
 

@@ -802,6 +802,45 @@ pub fn scrub_frame_bytes(buf: &mut [u8]) {
     compiler_fence(Ordering::SeqCst);
 }
 
+/// Abstract 4 KiB physical frame allocator and byte/word accessor used by
+/// [`crate::proc_vm::ProcessTable`] so multi-page ELF64 loading, KPTI page-table
+/// synthesis, `PROC_SYS_BRK` demand paging, and 100% fault frame reclamation are
+/// verified deterministically on the host as well as over `KERNEL_PHYS_MM` in Ring-0.
+pub trait PageFrameSource {
+    /// Allocate a zero-scrubbed 4 KiB physical frame (`>= 0x1000`, 4 KiB-aligned).
+    fn alloc_zeroed_frame(&mut self) -> Option<u64>;
+
+    /// Zero-scrub and release a previously allocated 4 KiB physical frame.
+    fn free_zeroed_frame(&mut self, pa: u64);
+
+    /// Read `out.len()` bytes starting at `offset` (`offset + out.len() <= 4096`) within `pa`.
+    fn read_frame_bytes(&self, pa: u64, offset: usize, out: &mut [u8]);
+
+    /// Write `data.len()` bytes starting at `offset` (`offset + data.len() <= 4096`) within `pa`.
+    fn write_frame_bytes(&mut self, pa: u64, offset: usize, data: &[u8]);
+
+    /// Populate all 512 little-endian `u64` entries (`4096` bytes) of a page-table frame `pa`.
+    fn write_frame_u64s(&mut self, pa: u64, words: &[u64; 512]) {
+        let mut i = 0usize;
+        while i < 512 {
+            self.write_frame_bytes(pa, i * 8, &words[i].to_le_bytes());
+            i += 1;
+        }
+    }
+
+    /// Write a single 64-bit page-table entry at `index` (`0..512`) inside frame `pa`.
+    fn write_frame_u64_at(&mut self, pa: u64, index: usize, word: u64) {
+        self.write_frame_bytes(pa, index * 8, &word.to_le_bytes());
+    }
+
+    /// Read a single 64-bit page-table entry at `index` (`0..512`) inside frame `pa`.
+    fn read_frame_u64_at(&self, pa: u64, index: usize) -> u64 {
+        let mut b = [0u8; 8];
+        self.read_frame_bytes(pa, index * 8, &mut b);
+        u64::from_le_bytes(b)
+    }
+}
+
 #[inline]
 const fn align_up_4k(addr: u64) -> Option<u64> {
     match addr.checked_add(PHYS_FRAME_BYTES - 1) {

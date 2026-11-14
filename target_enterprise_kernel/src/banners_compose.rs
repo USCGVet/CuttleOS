@@ -1082,7 +1082,7 @@ pub(crate) fn banner_shell_compose() {
     sh.svc
         .set_ring3_cap_hw_hook(crate::banners_arch_platform::exec_service_ring3_cap_live);
     sh.svc
-        .set_ring3_mailbox_hw_hook(crate::banners_arch_platform::exec_service_ring3_mailbox_live);
+        .set_ring3_mailbox_hw_hook(crate::proc_hw::exec_service_elf64_mailbox_live);
     if !resumed_ok && provisioned {
         let _ = sh.exec_line(b"seccomp clear 5", boots, 0, 0, &mut out);
         let _ = sh.exec_line(b"fw clear", boots, 0, 0, &mut out);
@@ -1135,7 +1135,7 @@ fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
     vsh.svc
         .set_ring3_cap_hw_hook(crate::banners_arch_platform::exec_service_ring3_cap_live);
     vsh.svc
-        .set_ring3_mailbox_hw_hook(crate::banners_arch_platform::exec_service_ring3_mailbox_live);
+        .set_ring3_mailbox_hw_hook(crate::proc_hw::exec_service_elf64_mailbox_live);
     let mut mb_out = [0u8; 64];
     if vsh
         .dispatch_mailbox_op(IpcOp::HttpGetStatus, true, false, 1, b"/status", b"", &mut mb_out)

@@ -820,15 +820,16 @@ pub(crate) fn read_current_lapic_id_safe() -> u32 {
     }
 }
 
-/// Restore `CPU 0`'s permanent guarded `RUNTIME_TSS` (`selector 0x28`) after a Ring-3 sandbox exit
-/// temporarily loaded a sandbox-local TSS into `TR`.
-pub(crate) fn restore_cpu0_runtime_tss_if_active() {
+/// Restore `cpu_idx`'s permanent guarded `RUNTIME_TSS` (`0x28 + cpu_idx * 0x10`) after a Ring-3
+/// quantum temporarily loaded a process-local TSS into `TR`.
+pub(crate) fn restore_cpu_runtime_tss_if_active(cpu_idx: usize) {
     if !is_bsp_idt_ready() {
         return;
     }
-    let sel = cpu_tss_selector(0);
+    let c = cpu_idx & (MAX_SMP_CPUS - 1);
+    let sel = cpu_tss_selector(c);
     // Clear the Busy bit (`0x02` in Type `0x8B -> 0x89`) in `RUNTIME_GDT` before `ltr`.
-    // SAFETY: `RUNTIME_GDT_PHYS + 0x28` is CPU 0's 16-byte 64-bit TSS descriptor in mapped RAM.
+    // SAFETY: `RUNTIME_GDT_PHYS + sel` is `cpu_idx`'s exclusive 16-byte 64-bit TSS descriptor in mapped RAM.
     unsafe {
         let access_ptr = pa_to_va(RUNTIME_GDT_PHYS + (sel as u64) + 5);
         let acc = core::ptr::read_volatile(access_ptr);
@@ -841,8 +842,14 @@ pub(crate) fn restore_cpu0_runtime_tss_if_active() {
             obs = out(reg) obs_tr,
             options(nomem, nostack, preserves_flags),
         );
-        HW_CPU_TR_SEL[0].store(obs_tr, Ordering::Release);
+        HW_CPU_TR_SEL[c].store(obs_tr, Ordering::Release);
     }
+}
+
+/// Restore `CPU 0`'s permanent guarded `RUNTIME_TSS` (`selector 0x28`) after a Ring-3 sandbox exit
+/// temporarily loaded a sandbox-local TSS into `TR`.
+pub(crate) fn restore_cpu0_runtime_tss_if_active() {
+    restore_cpu_runtime_tss_if_active(0);
 }
 
 /// Invoke the 33-byte `load_runtime_gdt_idt_tss` stub via its Supervisor `RX` alias (`smp_rx_va(0x8780)`),
@@ -968,6 +975,15 @@ pub extern "C" fn cuttle_ap_entry(cpu_id: u64) -> ! {
             let digest = execute_parallel_work_unit(seed ^ ticks, cpu_id);
             HW_CPU_DIGEST[idx].store(digest, Ordering::Relaxed);
             HW_CPU_JOBS[idx].fetch_add(1, Ordering::Release);
+        }
+        // Drain runnable Ring-3 ELF64 processes on this secondary SMP core (`CPU 1..3`)!
+        while crate::proc_hw::has_ready_processes() {
+            if crate::proc_hw::run_next_ready_process_quantum(idx as u8, 256).is_some() {
+                HW_CPU_TICKS[idx].fetch_add(1, Ordering::Relaxed);
+                HW_CPU_JOBS[idx].fetch_add(1, Ordering::Release);
+            } else {
+                break;
+            }
         }
         // Go silent in hardware HLT (0% host CPU) until woken by Doorbell IPI (vector 0x41).
         // SAFETY: Runtime GDT, per-CPU TSS, Runtime IDT, and Local APIC are active on this AP.

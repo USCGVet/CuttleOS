@@ -71,6 +71,7 @@ pub mod panic_dump;
 pub mod pci;
 pub mod phys_mm;
 pub mod power;
+pub mod proc_vm;
 pub mod quota;
 pub mod random;
 pub mod slab_alloc;

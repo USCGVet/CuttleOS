@@ -935,6 +935,7 @@ mod heap;
 mod hw_net_drivers;
 mod hw_storage_drivers;
 mod net_service;
+mod proc_hw;
 mod provisioning;
 mod smp_hw;
 
@@ -947,6 +948,7 @@ pub(crate) use fb_console::*;
 pub(crate) use hw_net_drivers::*;
 pub(crate) use hw_storage_drivers::*;
 pub(crate) use net_service::*;
+pub(crate) use proc_hw::*;
 pub(crate) use provisioning::*;
 pub(crate) use smp_hw::*;
 
@@ -1156,6 +1158,9 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Live physical frame manager (>128 PT frames exceeding legacy 40-frame limit) + size-class slab proof.
     #[cfg(not(cuttle_prod))]
     banner_phys_mm_slab();
+    // Live multi-segment Ring-3 ELF64 process runtime, SYSCALL/int 0x80, 0x50 preemption, SMP, IPC & fault isolation proof.
+    #[cfg(not(cuttle_prod))]
+    banner_ring3_elf_multiprocess();
 
     // ============================================================
     // RED-TEAM ATTACK HARNESS (deliberate, instrumented vulnerability)
@@ -1400,9 +1405,13 @@ pub(crate) fn live_os_console_loop() -> ! {
                 }
             }
         } else if !did_io {
-            // No network frames and no console input on this pass: put CPU 0 into
-            // low-power HLT state until the Local APIC timer (0x40) or IPI (0x41) wakes it.
-            smp_hw_idle_wait();
+            if has_ready_processes() {
+                let _ = run_next_ready_process_quantum(0, 50_000);
+            } else {
+                // No network frames, no console input, and no runnable Ring-3 processes:
+                // put CPU 0 into low-power HLT state until Local APIC timer (0x40) or IPI (0x41) wakes it.
+                smp_hw_idle_wait();
+            }
         }
     }
 }
