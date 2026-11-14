@@ -1221,13 +1221,16 @@ pub(crate) fn panic(info: &PanicInfo) -> ! {
     }
 
     // 2. One-shot atomic re-entry guard (`set_dumped()` returns `false` on first entry).
-    //    On first entry stop the other CPUs and wipe runtime secrets before
-    //    anything that can block.
+    //    On first entry stop the other CPUs and wipe runtime secrets in `.bss` before
+    //    anything that can block, keeping only a transient stack copy of the crash-dump
+    //    AEAD subkey (zeroized immediately after `dump_encrypted_to_sink`).
     let first_entry = !target_enterprise::panic_dump::set_dumped();
-    if first_entry {
+    let mut dump_aead_key = if first_entry {
         smp_broadcast_panic_halt();
-        scrub_all_runtime_keys_emergency();
-    }
+        take_emergency_dump_aead_key_and_scrub()
+    } else {
+        None
+    };
 
     // 3. Report. The dump below needs MMIO and the disk, either of which may
     //    be the reason for the panic; the message must not depend on them.
@@ -1316,7 +1319,19 @@ pub(crate) fn panic(info: &PanicInfo) -> ! {
         let mut sink = EmergencyAhciCrashSink;
         // SAFETY: `set_dumped()` guarantees single-winner exclusive access to `PANIC_DUMP_SCRATCH`.
         let dump_buf = unsafe { &mut *PANIC_DUMP_SCRATCH.0.get() };
-        let _ = PanicDumpImpl::dump_to_sink(&ctx, dump_buf, &mut sink);
+        let mut nonce = [0u8; 12];
+        nonce[0..8].copy_from_slice(&ctx.tsc.to_le_bytes());
+        nonce[8..12].copy_from_slice(&(regs[0] as u32).to_le_bytes());
+        let _ = PanicDumpImpl::dump_encrypted_to_sink(
+            &ctx,
+            dump_aead_key.as_ref(),
+            &nonce,
+            dump_buf,
+            &mut sink,
+        );
+        if let Some(ref mut key) = dump_aead_key {
+            target_enterprise::durable_seal::zeroize_secret_bytes(key);
+        }
     }
 
     halt_forever();

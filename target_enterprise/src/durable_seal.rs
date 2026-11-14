@@ -12,10 +12,18 @@
 //!   disk write access cannot forge a valid WAL/disk seal without the device
 //!   key.
 
-use crate::tls::{hmac_sha256, sha256_into};
+use crate::tls::{hkdf_expand, hkdf_extract, hmac_sha256, hmac_sha256_parts, sha256_into};
+use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, Tag};
 
 /// Digest / MAC length (SHA-256 / HMAC-SHA256 = 32 bytes).
 pub const DURABLE_DIGEST_LEN: usize = 32;
+/// Symmetric AEAD key length (`ChaCha20-Poly1305` = 32 bytes / 256 bits).
+pub const AEAD_KEY_LEN: usize = 32;
+/// Symmetric AEAD nonce length (`ChaCha20-Poly1305` = 12 bytes / 96 bits).
+pub const AEAD_NONCE_LEN: usize = 12;
+/// Symmetric AEAD authentication tag length (`Poly1305` = 16 bytes / 128 bits).
+pub const AEAD_TAG_LEN: usize = 16;
 
 /// Deterministic 256-bit seal key fixture used only by in-memory unit tests
 /// (`OsShell::new`). Limited to `#[cfg(test)]` so production and kernel code
@@ -181,18 +189,83 @@ pub fn zeroize_secret_bytes(buf: &mut [u8]) {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
+/// Derive a domain-separated 256-bit `ChaCha20-Poly1305` at-rest state-disk
+/// encryption key from `seal_key` via RFC 5869 `HKDF-SHA256`.
+pub fn derive_disk_aead_key(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> [u8; AEAD_KEY_LEN] {
+    let mut prk = [0u8; DURABLE_DIGEST_LEN];
+    hkdf_extract(b"cuttle-disk-aead-salt-v3", seal_key, &mut prk);
+    let mut out = [0u8; AEAD_KEY_LEN];
+    hkdf_expand(&prk, b"cuttle-disk-aead-key-v3", &mut out);
+    zeroize_secret_bytes(&mut prk);
+    out
+}
+
+/// Derive a domain-separated 256-bit `ChaCha20-Poly1305` crash-dump encryption
+/// key from `seal_key` via RFC 5869 `HKDF-SHA256`.
+pub fn derive_crash_dump_aead_key(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> [u8; AEAD_KEY_LEN] {
+    let mut prk = [0u8; DURABLE_DIGEST_LEN];
+    hkdf_extract(b"cuttle-crash-dump-salt-v1", seal_key, &mut prk);
+    let mut out = [0u8; AEAD_KEY_LEN];
+    hkdf_expand(&prk, b"cuttle-crash-dump-aead-v1", &mut out);
+    zeroize_secret_bytes(&mut prk);
+    out
+}
+
+/// Encrypt `buf` in place under RFC 8439 `ChaCha20-Poly1305` (`key`, `nonce`, `aad`)
+/// and return the 128-bit detached `Poly1305` authentication tag.
+pub fn chacha20_poly1305_encrypt_in_place(
+    key: &[u8; AEAD_KEY_LEN],
+    nonce: &[u8; AEAD_NONCE_LEN],
+    aad: &[u8],
+    buf: &mut [u8],
+) -> [u8; AEAD_TAG_LEN] {
+    let cipher = ChaCha20Poly1305::new(key.into());
+    let tag = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(nonce), aad, buf)
+        .expect("ChaCha20-Poly1305 detached encryption cannot fail on bounded slice");
+    let mut out = [0u8; AEAD_TAG_LEN];
+    out.copy_from_slice(&tag);
+    out
+}
+
+/// Verify `tag` in constant time and decrypt `buf` in place under RFC 8439
+/// `ChaCha20-Poly1305` (`key`, `nonce`, `aad`). On authentication failure,
+/// `buf` is zeroized and `false` is returned.
+pub fn chacha20_poly1305_decrypt_in_place(
+    key: &[u8; AEAD_KEY_LEN],
+    nonce: &[u8; AEAD_NONCE_LEN],
+    aad: &[u8],
+    buf: &mut [u8],
+    tag: &[u8; AEAD_TAG_LEN],
+) -> bool {
+    let cipher = ChaCha20Poly1305::new(key.into());
+    match cipher.decrypt_in_place_detached(Nonce::from_slice(nonce), aad, buf, Tag::from_slice(tag))
+    {
+        Ok(()) => true,
+        Err(_) => {
+            zeroize_secret_bytes(buf);
+            false
+        }
+    }
+}
+
 /// Two-phase write-ahead `Slot B -> Slot A` atomic commit journal (`CTTLAB01`)
 /// protecting multi-sector AHCI persistence (`WAL + FS + SQL`) against mid-write
 /// power loss while preserving strict at-rest tamper rejection.
 pub mod ab_journal {
-    use super::{is_seal_key_set, seal_bytes, seal_bytes_keyed, seal_matches_keyed, DURABLE_DIGEST_LEN};
+    use super::{
+        constant_time_eq, hmac_sha256_parts, is_seal_key_set, seal_bytes, seal_bytes_keyed,
+        seal_matches_keyed, AEAD_NONCE_LEN, AEAD_TAG_LEN, DURABLE_DIGEST_LEN,
+    };
 
-    /// 8-byte magic header for the atomic shadow-journal commit sector (`LBA 1149` in v2, `LBA 1098` in v1).
+    /// 8-byte magic header for the atomic shadow-journal commit sector (`LBA 1149` in v2/v3, `LBA 1098` in v1).
     pub const AB_JOURNAL_MAGIC: [u8; 8] = *b"CTTLAB01";
     /// Pre-upgrade v1 state-store layout (`26` sectors per slot: `2` WAL + `16` FS + `8` SQL).
     pub const AB_FORMAT_V1: u8 = 1;
-    /// Expanded v2 state-store layout (`53` sectors per slot: `5` WAL + `32` FS + `16` SQL).
+    /// Expanded v2 state-store layout (`53` sectors per slot: `5` WAL + `32` FS + `16` SQL, plaintext).
     pub const AB_FORMAT_V2: u8 = 2;
+    /// Encrypted v3 state-store layout (`53` sectors per slot encrypted at rest with `ChaCha20-Poly1305`).
+    pub const AB_FORMAT_V3: u8 = 3;
     /// Journal state `0x01`: `Slot B` is fully staged and sealed;
     /// `Slot A` installation is currently in flight.
     pub const AB_STATE_IN_FLIGHT: u8 = 0x01;
@@ -205,18 +278,53 @@ pub mod ab_journal {
     pub struct AbCommitHeader {
         /// Transaction phase (`AB_STATE_IN_FLIGHT` or `AB_STATE_QUIESCENT`).
         pub state: u8,
-        /// On-disk slot layout format version (`AB_FORMAT_V1` or `AB_FORMAT_V2`).
+        /// On-disk slot layout format version (`AB_FORMAT_V1`, `AB_FORMAT_V2`, or `AB_FORMAT_V3`).
         pub format_version: u8,
         /// Boot generation counter committed in this transaction.
         pub boots: u64,
         /// Monotonic journal commit sequence number.
         pub commit_seq: u64,
-        /// SHA-256 over the journal partition (`5` sectors in v2, `2` sectors in v1).
+        /// SHA-256 over the journal partition (`5` sectors in v2/v3, `2` sectors in v1).
         pub wal_sha: [u8; DURABLE_DIGEST_LEN],
-        /// SHA-256 over the FS partition (`32` sectors in v2, `16` sectors in v1).
+        /// SHA-256 over the FS partition (`32` sectors in v2/v3, `16` sectors in v1).
         pub fs_sha: [u8; DURABLE_DIGEST_LEN],
-        /// SHA-256 over the SQL partition (`16` sectors in v2, `8` sectors in v1).
+        /// SHA-256 over the SQL partition (`16` sectors in v2/v3, `8` sectors in v1).
         pub sql_sha: [u8; DURABLE_DIGEST_LEN],
+        /// 96-bit base nonce for `AB_FORMAT_V3` `ChaCha20-Poly1305` slot encryption (`[0; 12]` in v1/v2).
+        pub aead_nonce: [u8; AEAD_NONCE_LEN],
+        /// 128-bit `Poly1305` authentication tag over the encrypted WAL partition (`[0; 16]` in v1/v2).
+        pub wal_tag: [u8; AEAD_TAG_LEN],
+        /// 128-bit `Poly1305` authentication tag over the encrypted FS partition (`[0; 16]` in v1/v2).
+        pub fs_tag: [u8; AEAD_TAG_LEN],
+        /// 128-bit `Poly1305` authentication tag over the encrypted SQL partition (`[0; 16]` in v1/v2).
+        pub sql_tag: [u8; AEAD_TAG_LEN],
+    }
+
+    impl AbCommitHeader {
+        /// Construct a commit header without AEAD envelope metadata (`v1`/`v2` or unencrypted test fixtures).
+        pub const fn unencrypted(
+            state: u8,
+            format_version: u8,
+            boots: u64,
+            commit_seq: u64,
+            wal_sha: [u8; DURABLE_DIGEST_LEN],
+            fs_sha: [u8; DURABLE_DIGEST_LEN],
+            sql_sha: [u8; DURABLE_DIGEST_LEN],
+        ) -> Self {
+            Self {
+                state,
+                format_version,
+                boots,
+                commit_seq,
+                wal_sha,
+                fs_sha,
+                sql_sha,
+                aead_nonce: [0u8; AEAD_NONCE_LEN],
+                wal_tag: [0u8; AEAD_TAG_LEN],
+                fs_tag: [0u8; AEAD_TAG_LEN],
+                sql_tag: [0u8; AEAD_TAG_LEN],
+            }
+        }
     }
 
     /// Outcome of evaluating `Slot A` (`Primary`) and `Slot B` (`Journal`) at boot.
@@ -252,7 +360,9 @@ pub mod ab_journal {
     ) -> bool {
         if !is_seal_key_set(key)
             || (hdr.state != AB_STATE_IN_FLIGHT && hdr.state != AB_STATE_QUIESCENT)
-            || (hdr.format_version != AB_FORMAT_V1 && hdr.format_version != AB_FORMAT_V2)
+            || (hdr.format_version != AB_FORMAT_V1
+                && hdr.format_version != AB_FORMAT_V2
+                && hdr.format_version != AB_FORMAT_V3)
         {
             return false;
         }
@@ -260,7 +370,7 @@ pub mod ab_journal {
         out[0..8].copy_from_slice(&AB_JOURNAL_MAGIC);
         out[8] = hdr.state;
         // Pre-upgrade v1 commit sectors stored `0` at byte `9`; encoding `AB_FORMAT_V1`
-        // as `0` reproduces the exact legacy wire image while `AB_FORMAT_V2` writes `2`.
+        // as `0` reproduces the exact legacy wire image while `AB_FORMAT_V2`/`V3` write `2`/`3`.
         out[9] = if hdr.format_version == AB_FORMAT_V1 {
             0
         } else {
@@ -272,7 +382,15 @@ pub mod ab_journal {
         out[64..96].copy_from_slice(&hdr.fs_sha);
         out[96..128].copy_from_slice(&hdr.sql_sha);
         let mut mac = [0u8; DURABLE_DIGEST_LEN];
-        seal_bytes_keyed(key, &out[0..128], &mut mac);
+        if hdr.format_version == AB_FORMAT_V3 {
+            out[160..172].copy_from_slice(&hdr.aead_nonce);
+            out[172..188].copy_from_slice(&hdr.wal_tag);
+            out[188..204].copy_from_slice(&hdr.fs_tag);
+            out[204..220].copy_from_slice(&hdr.sql_tag);
+            hmac_sha256_parts(key, &[&out[0..128], &out[160..220]], &mut mac);
+        } else {
+            seal_bytes_keyed(key, &out[0..128], &mut mac);
+        }
         out[128..160].copy_from_slice(&mac);
         true
     }
@@ -292,11 +410,21 @@ pub mod ab_journal {
         let format_version = match sec[9] {
             0 | AB_FORMAT_V1 => AB_FORMAT_V1,
             AB_FORMAT_V2 => AB_FORMAT_V2,
+            AB_FORMAT_V3 => AB_FORMAT_V3,
             _ => return None,
         };
         let mut expected_mac = [0u8; DURABLE_DIGEST_LEN];
         expected_mac.copy_from_slice(&sec[128..160]);
-        if !seal_matches_keyed(key, &sec[0..128], &expected_mac) {
+        if format_version == AB_FORMAT_V3 {
+            if !sec[220..512].iter().all(|&b| b == 0) {
+                return None;
+            }
+            let mut actual_mac = [0u8; DURABLE_DIGEST_LEN];
+            hmac_sha256_parts(key, &[&sec[0..128], &sec[160..220]], &mut actual_mac);
+            if !constant_time_eq(&actual_mac, &expected_mac) {
+                return None;
+            }
+        } else if !seal_matches_keyed(key, &sec[0..128], &expected_mac) {
             return None;
         }
         let mut boots_b = [0u8; 8];
@@ -304,11 +432,21 @@ pub mod ab_journal {
         let mut wal_sha = [0u8; DURABLE_DIGEST_LEN];
         let mut fs_sha = [0u8; DURABLE_DIGEST_LEN];
         let mut sql_sha = [0u8; DURABLE_DIGEST_LEN];
+        let mut aead_nonce = [0u8; AEAD_NONCE_LEN];
+        let mut wal_tag = [0u8; AEAD_TAG_LEN];
+        let mut fs_tag = [0u8; AEAD_TAG_LEN];
+        let mut sql_tag = [0u8; AEAD_TAG_LEN];
         boots_b.copy_from_slice(&sec[16..24]);
         seq_b.copy_from_slice(&sec[24..32]);
         wal_sha.copy_from_slice(&sec[32..64]);
         fs_sha.copy_from_slice(&sec[64..96]);
         sql_sha.copy_from_slice(&sec[96..128]);
+        if format_version == AB_FORMAT_V3 {
+            aead_nonce.copy_from_slice(&sec[160..172]);
+            wal_tag.copy_from_slice(&sec[172..188]);
+            fs_tag.copy_from_slice(&sec[188..204]);
+            sql_tag.copy_from_slice(&sec[204..220]);
+        }
         Some(AbCommitHeader {
             state,
             format_version,
@@ -317,6 +455,10 @@ pub mod ab_journal {
             wal_sha,
             fs_sha,
             sql_sha,
+            aead_nonce,
+            wal_tag,
+            fs_tag,
+            sql_tag,
         })
     }
 
@@ -481,15 +623,7 @@ mod tests {
         let mut base_commit = [0u8; 512];
         assert!(pack_ab_commit_sector(
             &key,
-            &AbCommitHeader {
-                state: AB_STATE_QUIESCENT,
-                format_version: AB_FORMAT_V2,
-                boots: 1,
-                commit_seq: 1,
-                wal_sha: w1_sha,
-                fs_sha: f1_sha,
-                sql_sha: q1_sha,
-            },
+            &AbCommitHeader::unencrypted(AB_STATE_QUIESCENT, AB_FORMAT_V2, 1, 1, w1_sha, f1_sha, q1_sha),
             &mut base_commit,
         ));
         assert!(verify_ab_commit_sector(&wrong_key, &base_commit).is_none());
@@ -534,15 +668,15 @@ mod tests {
                 if step == cutoff {
                     break 'tx;
                 }
-                let in_flight = AbCommitHeader {
-                    state: AB_STATE_IN_FLIGHT,
-                    format_version: AB_FORMAT_V2,
-                    boots: 2,
-                    commit_seq: 2,
-                    wal_sha: w2_sha,
-                    fs_sha: f2_sha,
-                    sql_sha: q2_sha,
-                };
+                let in_flight = AbCommitHeader::unencrypted(
+                    AB_STATE_IN_FLIGHT,
+                    AB_FORMAT_V2,
+                    2,
+                    2,
+                    w2_sha,
+                    f2_sha,
+                    q2_sha,
+                );
                 assert!(pack_ab_commit_sector(&key, &in_flight, &mut commit_sec));
                 step += 1;
 
@@ -570,15 +704,15 @@ mod tests {
                 if step == cutoff {
                     break 'tx;
                 }
-                let quiescent = AbCommitHeader {
-                    state: AB_STATE_QUIESCENT,
-                    format_version: AB_FORMAT_V2,
-                    boots: 2,
-                    commit_seq: 2,
-                    wal_sha: w2_sha,
-                    fs_sha: f2_sha,
-                    sql_sha: q2_sha,
-                };
+                let quiescent = AbCommitHeader::unencrypted(
+                    AB_STATE_QUIESCENT,
+                    AB_FORMAT_V2,
+                    2,
+                    2,
+                    w2_sha,
+                    f2_sha,
+                    q2_sha,
+                );
                 assert!(pack_ab_commit_sector(&key, &quiescent, &mut commit_sec));
             }
 
@@ -634,15 +768,7 @@ mod tests {
         let mut v1_sec = [0u8; 512];
         assert!(pack_ab_commit_sector(
             &key,
-            &AbCommitHeader {
-                state: AB_STATE_QUIESCENT,
-                format_version: AB_FORMAT_V1,
-                boots: 1,
-                commit_seq: 9,
-                wal_sha: w1_sha,
-                fs_sha: f1_sha,
-                sql_sha: q1_sha,
-            },
+            &AbCommitHeader::unencrypted(AB_STATE_QUIESCENT, AB_FORMAT_V1, 1, 9, w1_sha, f1_sha, q1_sha),
             &mut v1_sec,
         ));
         assert_eq!(v1_sec[9], 0);
@@ -656,6 +782,118 @@ mod tests {
             verify_ab_commit_sector(&key, &downgraded).is_none(),
             "tampering format_version byte must invalidate commit HMAC"
         );
+    }
+
+    #[test]
+    fn rfc8439_section_2_8_2_chacha20_poly1305_kat_and_tamper_rejection() {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = 0x80u8 + (i as u8);
+        }
+        let nonce: [u8; 12] = [
+            0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+        ];
+        let aad: [u8; 12] = [
+            0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7,
+        ];
+        let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let expected_ciphertext: [u8; 114] = [
+            0xd3, 0x1a, 0x8d, 0x34, 0x64, 0x8e, 0x60, 0xdb, 0x7b, 0x86, 0xaf, 0xbc, 0x53, 0xef,
+            0x7e, 0xc2, 0xa4, 0xad, 0xed, 0x51, 0x29, 0x6e, 0x08, 0xfe, 0xa9, 0xe2, 0xb5, 0xa7,
+            0x36, 0xee, 0x62, 0xd6, 0x3d, 0xbe, 0xa4, 0x5e, 0x8c, 0xa9, 0x67, 0x12, 0x82, 0xfa,
+            0xfb, 0x69, 0xda, 0x92, 0x72, 0x8b, 0x1a, 0x71, 0xde, 0x0a, 0x9e, 0x06, 0x0b, 0x29,
+            0x05, 0xd6, 0xa5, 0xb6, 0x7e, 0xcd, 0x3b, 0x36, 0x92, 0xdd, 0xbd, 0x7f, 0x2d, 0x77,
+            0x8b, 0x8c, 0x98, 0x03, 0xae, 0xe3, 0x28, 0x09, 0x1b, 0x58, 0xfa, 0xb3, 0x24, 0xe4,
+            0xfa, 0xd6, 0x75, 0x94, 0x55, 0x85, 0x80, 0x8b, 0x48, 0x31, 0xd7, 0xbc, 0x3f, 0xf4,
+            0xde, 0xf0, 0x8e, 0x4b, 0x7a, 0x9d, 0xe5, 0x76, 0xd2, 0x65, 0x86, 0xce, 0xc6, 0x4b,
+            0x61, 0x16,
+        ];
+        let expected_tag: [u8; 16] = [
+            0x1a, 0xe1, 0x0b, 0x59, 0x4f, 0x09, 0xe2, 0x6a, 0x7e, 0x90, 0x2e, 0xcb, 0xd0, 0x60,
+            0x06, 0x91,
+        ];
+
+        let mut buf = *plaintext;
+        let tag = chacha20_poly1305_encrypt_in_place(&key, &nonce, &aad, &mut buf);
+        assert_eq!(buf, expected_ciphertext);
+        assert_eq!(tag, expected_tag);
+
+        // Tamper checks: flipping ciphertext, AAD, nonce, or tag fails and zeroizes `buf`.
+        let mut bad_ct = buf;
+        bad_ct[17] ^= 0x01;
+        assert!(!chacha20_poly1305_decrypt_in_place(
+            &key, &nonce, &aad, &mut bad_ct, &tag
+        ));
+        assert!(bad_ct.iter().all(|&b| b == 0));
+
+        let mut bad_aad_buf = buf;
+        let mut bad_aad = aad;
+        bad_aad[0] ^= 0x80;
+        assert!(!chacha20_poly1305_decrypt_in_place(
+            &key,
+            &nonce,
+            &bad_aad,
+            &mut bad_aad_buf,
+            &tag
+        ));
+        assert!(bad_aad_buf.iter().all(|&b| b == 0));
+
+        let mut bad_tag_buf = buf;
+        let mut bad_tag = tag;
+        bad_tag[15] ^= 0x01;
+        assert!(!chacha20_poly1305_decrypt_in_place(
+            &key,
+            &nonce,
+            &aad,
+            &mut bad_tag_buf,
+            &bad_tag
+        ));
+        assert!(bad_tag_buf.iter().all(|&b| b == 0));
+
+        // Exact recovery with valid key/nonce/AAD/tag:
+        assert!(chacha20_poly1305_decrypt_in_place(
+            &key, &nonce, &aad, &mut buf, &tag
+        ));
+        assert_eq!(&buf[..], &plaintext[..]);
+
+        // Domain separation between disk AEAD key and crash-dump AEAD key:
+        let disk_k = derive_disk_aead_key(&DEFAULT_DURABLE_SEAL_KEY);
+        let dump_k = derive_crash_dump_aead_key(&DEFAULT_DURABLE_SEAL_KEY);
+        assert_ne!(disk_k, dump_k);
+        assert_ne!(disk_k, DEFAULT_DURABLE_SEAL_KEY);
+        assert_ne!(dump_k, DEFAULT_DURABLE_SEAL_KEY);
+    }
+
+    #[test]
+    fn ab_format_v3_commit_sector_binds_aead_nonce_and_tags() {
+        use super::ab_journal::*;
+        let key = derive_seal_key(&DEFAULT_DURABLE_SEAL_KEY, b"v3-commit-sector");
+        let hdr = AbCommitHeader {
+            state: AB_STATE_QUIESCENT,
+            format_version: AB_FORMAT_V3,
+            boots: 4,
+            commit_seq: 11,
+            wal_sha: [0x11; 32],
+            fs_sha: [0x22; 32],
+            sql_sha: [0x33; 32],
+            aead_nonce: [0xA5; 12],
+            wal_tag: [0xB1; 16],
+            fs_tag: [0xB2; 16],
+            sql_tag: [0xB3; 16],
+        };
+        let mut sec = [0u8; 512];
+        assert!(pack_ab_commit_sector(&key, &hdr, &mut sec));
+        assert_eq!(sec[9], AB_FORMAT_V3);
+        assert_eq!(verify_ab_commit_sector(&key, &sec), Some(hdr));
+
+        for tamper_off in [9usize, 160, 171, 172, 188, 204, 219, 220] {
+            let mut bad = sec;
+            bad[tamper_off] ^= 0x01;
+            assert!(
+                verify_ab_commit_sector(&key, &bad).is_none(),
+                "tampering byte {tamper_off} must invalidate AB_FORMAT_V3 commit sector"
+            );
+        }
     }
 }
 

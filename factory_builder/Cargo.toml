@@ -25,3 +25,6 @@ path = "src/lib.rs"
 anyhow = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
+
+[dev-dependencies]
+target_enterprise = { path = "../target_enterprise" }

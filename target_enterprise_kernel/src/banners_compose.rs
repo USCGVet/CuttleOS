@@ -671,6 +671,9 @@ pub(crate) fn persist_shell_to_ahci(
 /// It returns only when the state is on disk. If the commit fails the node
 /// stops, so an acknowledgement is never sent for state that was not saved.
 pub(crate) fn persist_shell_if_changed(sh: &mut target_enterprise::OsShell, force: bool) {
+    if !sh.is_durable_provisioned() {
+        return;
+    }
     let fp = sh.durable_fingerprint();
     if !force && *LAST_DURABLE_FP.lock() == fp {
         return;
@@ -687,8 +690,9 @@ pub(crate) fn persist_shell_if_changed(sh: &mut target_enterprise::OsShell, forc
 /// known and before anything serves requests.
 pub(crate) fn shell_store_boot() {
     use target_enterprise::state_store::{
-        BootError, BootOutcome, RecoverySource, ShellKeys,
+        BootError, BootOutcome, BootReport, RecoverySource, ShellKeys,
     };
+    let provisioned = is_device_key_provisioned();
     let keys = ShellKeys {
         seal: derive_runtime_seal_key(),
         legacy_seal: derive_runtime_legacy_seal_key(),
@@ -697,6 +701,24 @@ pub(crate) fn shell_store_boot() {
     let counter = CONTINUITY_BOOT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
     let mut sh_guard = KERNEL_SHELL.lock();
     let sh: &mut target_enterprise::OsShell = &mut *sh_guard;
+
+    if !provisioned {
+        *sh = target_enterprise::OsShell::empty();
+        sh.seal_key = keys.seal;
+        sh.legacy_seal_key = keys.legacy_seal;
+        sh.attest_key = keys.attest;
+        sh.seed_defaults_for_boot(counter);
+        sh.set_durable_provisioned(false);
+        serial_write_str(
+            "SHELL resume EPHEMERAL: device key not provisioned; durable writes refused (EROFS)\n",
+        );
+        *LAST_DURABLE_FP.lock() = sh.durable_fingerprint();
+        *SHELL_BOOT_REPORT.lock() = Some(BootReport {
+            outcome: BootOutcome::Fresh,
+            boots: counter,
+        });
+        return;
+    }
 
     let booted = match AhciDisk::state_disk() {
         Ok(mut disk) => SHELL_STORE.lock().boot(&mut disk, sh, &keys, counter),
@@ -708,6 +730,9 @@ pub(crate) fn shell_store_boot() {
         Err(BootError::BadLayout) => storage_fault("state disk too small for the store"),
         Err(BootError::Io(_)) => storage_fault("state disk unusable at boot"),
         Err(BootError::Persist(e)) => storage_fault(persist_error_str(&e)),
+        Err(BootError::Rollback { .. }) => {
+            storage_fault("whole-disk rollback detected (commit_seq below floor)")
+        }
     };
 
     if report.boots != counter {
@@ -885,6 +910,7 @@ fn run_shell_compose_fixtures(
 pub(crate) fn banner_shell_compose() {
     use target_enterprise::state_store::{BootError, BootOutcome, Committed};
 
+    let provisioned = is_device_key_provisioned();
     let seal_key = derive_runtime_seal_key();
     let legacy_seal_key = derive_runtime_legacy_seal_key();
     let attest_key = derive_runtime_attest_key();
@@ -904,13 +930,14 @@ pub(crate) fn banner_shell_compose() {
 
     let mut out = [0u8; 256];
     if !resumed_ok {
-        // First boot (or a rejected disk, whose contents are in quarantine):
-        // start the fixture run from pristine defaults.
+        // First boot (or a rejected disk, whose contents are in quarantine),
+        // or an unprovisioned ephemeral boot: start from pristine defaults.
         *sh = target_enterprise::OsShell::empty();
         sh.seal_key = seal_key;
         sh.legacy_seal_key = legacy_seal_key;
         sh.attest_key = attest_key;
         sh.seed_defaults_for_boot(boots);
+        sh.set_durable_provisioned(provisioned);
     }
 
     static VERIFY_SHELL: spin::Mutex<target_enterprise::OsShell> =
@@ -923,7 +950,7 @@ pub(crate) fn banner_shell_compose() {
     vsh.attest_key = attest_key;
     vsh.seed_defaults_for_boot(boots);
 
-    if resumed_ok {
+    if resumed_ok || !provisioned {
         run_shell_compose_fixtures(vsh, boots, &mut out);
         let mut hdr_sec = [0u8; 512];
         let mut wal_sec = [0u8; 512];
@@ -998,7 +1025,7 @@ pub(crate) fn banner_shell_compose() {
         panic!("SHELL compose: AHCI restored /var/boot.ok drift");
     }
     serial_write_str("SECCOMP: OK engine=ebpf filter=enforced\n");
-    let mut attest_out = [0u8; 320];
+    let mut attest_out = [0u8; 448];
     let aq = vsh.exec_line(b"attest boot-quote", boots, 0, 0, &mut attest_out);
     let quote = &attest_out[..aq.bytes_written()];
     if !quote.starts_with(b"attest: v=1 boots=") {
@@ -1056,7 +1083,7 @@ pub(crate) fn banner_shell_compose() {
         .set_ring3_cap_hw_hook(crate::banners_arch_platform::exec_service_ring3_cap_live);
     sh.svc
         .set_ring3_mailbox_hw_hook(crate::banners_arch_platform::exec_service_ring3_mailbox_live);
-    if !resumed_ok {
+    if !resumed_ok && provisioned {
         let _ = sh.exec_line(b"seccomp clear 5", boots, 0, 0, &mut out);
         let _ = sh.exec_line(b"fw clear", boots, 0, 0, &mut out);
         sh.auth_seq = 0;

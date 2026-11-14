@@ -24,13 +24,20 @@ pub(crate) const FW_CFG_DEVICE_KEY_PATH: &str = "opt/cuttle_device_key";
 /// and scrubbed from `.bss` via [`scrub_cached_master_key`] before entering the live network loop.
 static PROVISIONED_MASTER_KEY: spin::Mutex<Option<([u8; 32], bool)>> = spin::Mutex::new(None);
 
+/// Sticky provisioning status (`0 = Uninit`, `1 = Unprovisioned`, `2 = Provisioned`)
+/// retained across [`scrub_cached_master_key`] so runtime paths know whether an
+/// out-of-band device secret was supplied after the root master key is wiped.
+static PROVISIONING_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 /// Domain-separated runtime subkeys derived from the master key during boot so durable AHCI
-/// persistence and remote attestation continue working after the root master key is zeroized.
+/// persistence, crash-dump encryption, and remote attestation continue working after the
+/// root master key is zeroized.
 #[derive(Clone, Copy)]
 struct DerivedRuntimeSubkeys {
     seal_key: [u8; 32],
     legacy_seal_key: [u8; 32],
     attest_key: [u8; 32],
+    dump_aead_key: [u8; 32],
 }
 
 static CACHED_SUBKEYS: spin::Mutex<Option<DerivedRuntimeSubkeys>> = spin::Mutex::new(None);
@@ -331,7 +338,12 @@ fn device_master_key_state() -> ([u8; 32], bool) {
     }
     let state = match read_fw_cfg_device_key_status() {
         FwCfgKeyStatus::Valid(provisioned) => (provisioned, true),
-        FwCfgKeyStatus::Absent => (generate_hw_entropy_master_key(), false),
+        FwCfgKeyStatus::Absent => {
+            serial_write_str(
+                "PROVISIONING WARNING: fw_cfg opt/cuttle_device_key absent; durable writes refused (ephemeral mode)\n",
+            );
+            (generate_hw_entropy_master_key(), false)
+        }
         FwCfgKeyStatus::Invalid { size } => {
             let mut line = [0u8; 112];
             let prefix = b"PROVISIONING ERROR: fw_cfg opt/cuttle_device_key invalid (size=";
@@ -345,20 +357,39 @@ fn device_master_key_state() -> ([u8; 32], bool) {
             (generate_hw_entropy_master_key(), false)
         }
     };
+    PROVISIONING_STATE.store(
+        if state.1 { 2 } else { 1 },
+        core::sync::atomic::Ordering::Release,
+    );
     *guard = Some(state);
     drop(guard);
     ensure_derived_subkeys(&state.0);
     state
 }
 
+/// Returns `true` iff a valid 32-byte out-of-band `fw_cfg` `opt/cuttle_device_key`
+/// was supplied on this boot (remains valid after [`scrub_cached_master_key`]).
+pub(crate) fn is_device_key_provisioned() -> bool {
+    use core::sync::atomic::Ordering;
+    let cur = PROVISIONING_STATE.load(Ordering::Acquire);
+    if cur != 0 {
+        return cur == 2;
+    }
+    let (mut master, prov) = device_master_key_state();
+    target_enterprise::durable_seal::zeroize_secret_bytes(&mut master);
+    prov
+}
+
 fn ensure_derived_subkeys(master: &[u8; 32]) {
     let mut sub = CACHED_SUBKEYS.lock();
     if sub.is_none() {
+        let seal_key = target_enterprise::durable_seal::derive_seal_key(
+            master,
+            b"cuttle-ahci-wal-seal-v1",
+        );
+        let dump_aead_key = target_enterprise::durable_seal::derive_crash_dump_aead_key(&seal_key);
         *sub = Some(DerivedRuntimeSubkeys {
-            seal_key: target_enterprise::durable_seal::derive_seal_key(
-                master,
-                b"cuttle-ahci-wal-seal-v1",
-            ),
+            seal_key,
             legacy_seal_key: target_enterprise::durable_seal::derive_legacy_seal_key(
                 master,
                 b"proteus-ahci-wal-seal-v1",
@@ -367,6 +398,7 @@ fn ensure_derived_subkeys(master: &[u8; 32]) {
                 master,
                 b"cuttle-quote-v1",
             ),
+            dump_aead_key,
         });
     }
 }
@@ -513,9 +545,12 @@ pub(crate) fn derive_runtime_attest_key() -> [u8; 32] {
 }
 
 /// Non-blocking (`try_lock`) emergency zeroization of all cached master and derived
-/// runtime keys in `.bss`, safe to invoke inside the hardware panic/fault path without
-/// risking spinlock deadlock if the faulting core held a provisioning lock.
-pub(crate) fn scrub_all_runtime_keys_emergency() {
+/// runtime keys in `.bss`, returning the one-shot crash-dump `ChaCha20-Poly1305`
+/// subkey (if initialized and provisioned) so the panic/fault handler can encrypt the
+/// `CTTLPENC` crash dump before zeroizing its local stack copy.
+pub(crate) fn take_emergency_dump_aead_key_and_scrub() -> Option<[u8; 32]> {
+    let provisioned = PROVISIONING_STATE.load(core::sync::atomic::Ordering::Acquire) == 2;
+    let mut dump_key: Option<[u8; 32]> = None;
     if let Some(mut guard) = PROVISIONED_MASTER_KEY.try_lock() {
         if let Some((ref mut master, ref mut prov)) = *guard {
             target_enterprise::durable_seal::zeroize_secret_bytes(master);
@@ -525,11 +560,16 @@ pub(crate) fn scrub_all_runtime_keys_emergency() {
     }
     if let Some(mut sub_guard) = CACHED_SUBKEYS.try_lock() {
         if let Some(ref mut sub) = *sub_guard {
+            if provisioned && target_enterprise::durable_seal::is_seal_key_set(&sub.dump_aead_key) {
+                dump_key = Some(sub.dump_aead_key);
+            }
             target_enterprise::durable_seal::zeroize_secret_bytes(&mut sub.seal_key);
             target_enterprise::durable_seal::zeroize_secret_bytes(&mut sub.legacy_seal_key);
             target_enterprise::durable_seal::zeroize_secret_bytes(&mut sub.attest_key);
+            target_enterprise::durable_seal::zeroize_secret_bytes(&mut sub.dump_aead_key);
         }
         *sub_guard = None;
     }
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    dump_key
 }

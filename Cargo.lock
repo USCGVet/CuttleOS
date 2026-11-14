@@ -566,6 +566,7 @@ dependencies = [
  "anyhow",
  "rand 0.8.6",
  "sha2",
+ "target_enterprise",
 ]
 
 [[package]]

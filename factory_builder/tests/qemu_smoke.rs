@@ -305,8 +305,8 @@ fn boots_under_qemu_and_emits_banner() {
         );
         assert_eq!(
             ahci_bytes[commit_off + 9],
-            0x02,
-            "QEMU smoke: expected AB_FORMAT_V2 (0x02) at LBA 1149 after clean commit"
+            0x03,
+            "QEMU smoke: expected AB_FORMAT_V3 (0x03) at LBA 1149 after clean AEAD commit"
         );
     }
     if log_contents.contains("CONTINUITY resume OK") {
@@ -593,21 +593,32 @@ impl SmokeVm<'_> {
         commands: &[&str],
         done: impl Fn(&str) -> bool,
     ) -> (String, bool) {
+        self.boot_interactive_opts(true, commands, done)
+    }
+
+    fn boot_interactive_opts(
+        &self,
+        provisioned: bool,
+        commands: &[&str],
+        done: impl Fn(&str) -> bool,
+    ) -> (String, bool) {
         use std::io::{Read, Write};
         use std::sync::{Arc, Mutex};
 
-        let mut qproc = Command::new(self.qemu)
-            .args(smoke_accel_args())
+        let mut cmd = Command::new(self.qemu);
+        cmd.args(smoke_accel_args())
             .arg("-cpu")
             .arg(PINNED_QEMU_CPU_MODEL)
             .arg("-smp")
-            .arg("4")
-            .arg("-fw_cfg")
-            .arg(format!(
+            .arg("4");
+        if provisioned {
+            cmd.arg("-fw_cfg").arg(format!(
                 "name={},file={}",
                 factory_builder::FW_CFG_DEVICE_KEY_NAME,
                 self.device_key.display()
-            ))
+            ));
+        }
+        let mut qproc = cmd
             .arg("-drive")
             .arg(format!("format=raw,file={},if=ide", self.bios.display()))
             .arg("-drive")
@@ -821,8 +832,8 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
     let healed = std::fs::read(&tampered_disk).expect("read ahci_tamper_test.img after boot 2");
     assert_eq!(
         &healed[1040 * 512..1040 * 512 + 8],
-        b"CTTLSHL1",
-        "boot 2 did not leave a sealed primary slot behind"
+        b"CTTLAE03",
+        "boot 2 did not leave an AEAD-encrypted CTTLAE03 primary slot behind"
     );
     assert_eq!(
         &healed[1040 * 512..1093 * 512],
@@ -844,9 +855,21 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
 
     let (log3, reached3) = vm.boot(&tamper_log, halted);
     let after3 = std::fs::read(&tampered_disk).expect("read ahci_tamper_test.img after boot 3");
+
+    // Case 3: unprovisioned keyless boot (`opt/cuttle_device_key` omitted).
+    // Must warn explicitly, enter ephemeral mode, refuse durable mutations with EROFS,
+    // and leave the AHCI state + quarantine regions (`LBA 1040..1324`) completely untouched.
+    let (log4, reached4) = vm.boot_interactive_opts(
+        false,
+        &["write /var/ephemeral.txt denied", "halt"],
+        |s| s.contains("system halting..."),
+    );
+    let after4 = std::fs::read(&tampered_disk).expect("read ahci_tamper_test.img after keyless boot");
     for disk in scratch_disks {
         let _ = std::fs::remove_file(disk);
     }
+    let _ = std::fs::remove_file(&bios);
+    let _ = std::fs::remove_file(&morphed_elf);
     assert!(
         reached3,
         "tamper test boot 3 did not reach CUTTLE-TE HALT within 45s!\nSerial log:\n{}",
@@ -877,6 +900,27 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
         after3[1216 * 512..1269 * 512] == rejected_primary[..]
             && after3[1269 * 512..1322 * 512] == rejected_shadow[..],
         "the quarantine area does not hold the rejected slots byte for byte"
+    );
+    assert!(
+        reached4,
+        "unprovisioned keyless boot did not respond to interactive halt!\nSerial log:\n{}",
+        log4
+    );
+    assert!(
+        log4.contains("PROVISIONING WARNING: fw_cfg opt/cuttle_device_key absent; durable writes refused (ephemeral mode)")
+            && log4.contains("SHELL resume EPHEMERAL: device key not provisioned; durable writes refused (EROFS)"),
+        "unprovisioned keyless boot did not emit expected warning + ephemeral banner!\nSerial log:\n{}",
+        log4
+    );
+    assert!(
+        log4.contains("EROFS (device key not provisioned; durable writes refused)"),
+        "unprovisioned keyless boot did not refuse `write` with EROFS!\nSerial log:\n{}",
+        log4
+    );
+    assert_eq!(
+        &after4[1040 * 512..1324 * 512],
+        &after3[1040 * 512..1324 * 512],
+        "unprovisioned keyless boot modified AHCI state or quarantine sectors!"
     );
     eprintln!("smoke: one tampered copy was repaired, two were rejected and preserved; TAMPER TEST PASSED");
 }
@@ -1010,27 +1054,66 @@ fn morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu() {
             !log.contains("SHELL resume REJECTED"),
             "morphed kernel seed={seed} (boot #{boot_num}) unexpectedly rejected sealed disk state!\nSerial log:\n{log}"
         );
-        // Inspect the persistent AHCI disk sectors for CTTLSHL1 header (LBA 1040),
-        // WAL backing (LBA 1041..1045), CTTLFS01 (LBA 1045), and CTTLSQL1 (LBA 1077) across boots 1 -> 2 -> 3 (Claude #13).
+        // Inspect the persistent AHCI disk sectors for AEAD-encrypted `CTTLAE03` envelope (LBA 1040..=1092),
+        // prove zero plaintext leakage on raw disk, then authenticate + decrypt with `device_secret_key.bin`
+        // and verify CTTLSHL1 header, WAL record, CTTLFS01, and CTTLSQL1 across boots 1 -> 2 -> 3 (Claude #13).
         let ahci_bytes = std::fs::read(&ahci_disk).expect("read persistent ahci_multiseed_test.img");
-        let shl_hdr = &ahci_bytes[1040 * 512..1041 * 512];
-        let shl_wal = &ahci_bytes[1041 * 512..1042 * 512];
-        let fs_slice = &ahci_bytes[1045 * 512..1045 * 512 + 8];
-        let sql_slice = &ahci_bytes[1077 * 512..1077 * 512 + 8];
+        let raw_slots = &ahci_bytes[1040 * 512..1149 * 512];
+        assert_eq!(
+            &raw_slots[..8],
+            b"CTTLAE03",
+            "boot #{boot_num} (seed={seed}): missing CTTLAE03 AEAD envelope magic at AHCI LBA 1040"
+        );
+        for forbidden in [
+            b"CTTLSHL1".as_slice(),
+            b"CTTLFS01".as_slice(),
+            b"CTTLSQL1".as_slice(),
+            b"/var/boot.ok".as_slice(),
+        ] {
+            assert!(
+                !raw_slots.windows(forbidden.len()).any(|w| w == forbidden),
+                "boot #{boot_num} (seed={seed}): plaintext {:?} leaked onto raw AHCI disk!",
+                core::str::from_utf8(forbidden).unwrap_or("bytes")
+            );
+        }
+        let master_key: [u8; 32] = std::fs::read(&device_key_path)
+            .expect("read device_secret_key.bin")
+            .try_into()
+            .expect("32-byte device_secret_key.bin");
+        let seal_key =
+            target_enterprise::durable_seal::derive_seal_key(&master_key, b"cuttle-ahci-wal-seal-v1");
+        let mut img = target_enterprise::state_store::StateImage::zeroed();
+        for s in 0..5 {
+            img.wal[s].copy_from_slice(&ahci_bytes[(1040 + s) * 512..(1041 + s) * 512]);
+        }
+        for s in 0..32 {
+            img.fs[s].copy_from_slice(&ahci_bytes[(1045 + s) * 512..(1046 + s) * 512]);
+        }
+        for s in 0..16 {
+            img.sql[s].copy_from_slice(&ahci_bytes[(1077 + s) * 512..(1078 + s) * 512]);
+        }
+        assert!(
+            img.decrypt_in_place(&seal_key),
+            "boot #{boot_num} (seed={seed}): Poly1305 AEAD decryption of primary slot failed"
+        );
+        let shl_hdr = &img.wal[0][..];
+        let shl_wal = &img.wal[1][..];
+        let fs_slice = &img.fs[0][..8];
+        let sql_slice = &img.sql[0][..8];
         assert_eq!(
             &shl_hdr[..8],
             b"CTTLSHL1",
-            "boot #{boot_num} (seed={seed}): missing CTTLSHL1 magic at AHCI LBA 1040"
+            "boot #{boot_num} (seed={seed}): missing decrypted CTTLSHL1 magic at wal[0]"
         );
         assert_eq!(
             fs_slice,
             b"CTTLFS01",
-            "boot #{boot_num} (seed={seed}): missing CTTLFS01 magic at AHCI LBA 1045"
+            "boot #{boot_num} (seed={seed}): missing decrypted CTTLFS01 magic at fs[0]"
         );
         assert_eq!(
             sql_slice,
             b"CTTLSQL1",
-            "boot #{boot_num} (seed={seed}): missing CTTLSQL1 magic at AHCI LBA 1077"
+            "boot #{boot_num} (seed={seed}): missing decrypted CTTLSQL1 magic at sql[0]"
         );
         let saved_boots = u64::from_le_bytes(shl_hdr[8..16].try_into().unwrap());
         assert_eq!(
@@ -1040,7 +1123,7 @@ fn morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu() {
         assert_eq!(
             &shl_wal[8..28],
             b"F\x0c/var/boot.okready\n",
-            "boot #{boot_num} (seed={seed}): missing /var/boot.ok WAL record in LBA 1041"
+            "boot #{boot_num} (seed={seed}): missing /var/boot.ok WAL record in decrypted wal[1]"
         );
         if boot_num == 1 {
             assert!(
@@ -1058,7 +1141,7 @@ fn morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu() {
             assert_eq!(
                 Some(&shl_wal[..28]),
                 boot_1_shell_sector.as_deref(),
-                "cross-seed boot #{boot_num} (seed={seed}) did not preserve sealed /var/boot.ok WAL record at LBA 1041 from boot #1"
+                "cross-seed boot #{boot_num} (seed={seed}) did not preserve sealed /var/boot.ok WAL record from boot #1"
             );
             assert_eq!(Some(fs_slice), boot_1_fs_magic.as_deref());
             assert_eq!(Some(sql_slice), boot_1_sql_magic.as_deref());

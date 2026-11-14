@@ -181,6 +181,9 @@ impl SectorSink for MemorySectorSink {
     }
 }
 
+/// 8-byte magic header for an at-rest `ChaCha20-Poly1305`-encrypted crash dump (`CTTLPENC`).
+pub const ENCRYPTED_CRASH_DUMP_MAGIC: [u8; 8] = *b"CTTLPENC";
+
 /// The locked [`CrashDump`] implementation. Stateless — the trait
 /// methods don't read or write any module-level state. Re-entry
 /// protection is the caller's responsibility via [`set_dumped`].
@@ -204,6 +207,33 @@ impl PanicDumpImpl {
         sink: &mut S,
     ) -> Result<(u64, u64), CrashDumpError> {
         <Self as CrashDump>::build_dump(ctx, buf)?;
+        Self::write_raw_sectors_to_sink(buf, sink)
+    }
+
+    /// Assemble a dump from `ctx` into `buf`, encrypt it in place under
+    /// `ChaCha20-Poly1305` when `aead_key` is `Some`, and ship the 32 sectors
+    /// to `sink`.
+    pub fn dump_encrypted_to_sink<S: SectorSink>(
+        ctx: &CrashContext<'_>,
+        aead_key: Option<&[u8; crate::durable_seal::AEAD_KEY_LEN]>,
+        nonce: &[u8; crate::durable_seal::AEAD_NONCE_LEN],
+        buf: &mut [u8],
+        sink: &mut S,
+    ) -> Result<(u64, u64), CrashDumpError> {
+        <Self as CrashDump>::build_dump(ctx, buf)?;
+        if let Some(key) = aead_key {
+            Self::encrypt_dump_in_place(key, nonce, buf)?;
+        }
+        Self::write_raw_sectors_to_sink(buf, sink)
+    }
+
+    fn write_raw_sectors_to_sink<S: SectorSink>(
+        buf: &[u8],
+        sink: &mut S,
+    ) -> Result<(u64, u64), CrashDumpError> {
+        if buf.len() < CRASH_DUMP_BYTES {
+            return Err(CrashDumpError::BufferTooSmall);
+        }
         let mut sec_buf = [0u8; SECTOR_BYTES];
         let mut sec = 0u64;
         while sec < cuttle_contracts::CRASH_DUMP_SECTORS {
@@ -214,6 +244,148 @@ impl PanicDumpImpl {
             sec += 1;
         }
         Ok((DUMP_START_LBA, DUMP_START_LBA + cuttle_contracts::CRASH_DUMP_SECTORS))
+    }
+
+    /// Encrypt a verified 16 KiB `CTTLPAN1` buffer in place into an authenticated
+    /// `CTTLPENC` `ChaCha20-Poly1305` envelope (hiding header metadata `16..448`,
+    /// registers, backtrace, and `kmsg` `512..16384` at rest).
+    pub fn encrypt_dump_in_place(
+        aead_key: &[u8; crate::durable_seal::AEAD_KEY_LEN],
+        nonce: &[u8; crate::durable_seal::AEAD_NONCE_LEN],
+        buf: &mut [u8],
+    ) -> Result<(), CrashDumpError> {
+        if buf.len() < CRASH_DUMP_BYTES {
+            return Err(CrashDumpError::BufferTooSmall);
+        }
+        if !crate::durable_seal::is_seal_key_set(aead_key) {
+            return Err(CrashDumpError::MagicMismatch);
+        }
+        <Self as CrashDump>::verify_crc(buf)?;
+
+        let mut nonce_base = *nonce;
+        nonce_base[11] &= 0x7F;
+        let nonce_hdr = nonce_base;
+        let mut nonce_bdy = nonce_base;
+        nonce_bdy[11] |= 0x80;
+
+        buf[0..8].copy_from_slice(&ENCRYPTED_CRASH_DUMP_MAGIC);
+
+        let mut aad_hdr = [0u8; 12 + 16 + 12];
+        aad_hdr[0..12].copy_from_slice(b"CTTLPENC-HDR");
+        aad_hdr[12..28].copy_from_slice(&buf[0..16]);
+        aad_hdr[28..40].copy_from_slice(&nonce_base);
+        let hdr_tag = crate::durable_seal::chacha20_poly1305_encrypt_in_place(
+            aead_key,
+            &nonce_hdr,
+            &aad_hdr,
+            &mut buf[16..448],
+        );
+
+        let mut aad_bdy = [0u8; 12 + 16 + 12 + 16];
+        aad_bdy[0..12].copy_from_slice(b"CTTLPENC-BDY");
+        aad_bdy[12..28].copy_from_slice(&buf[0..16]);
+        aad_bdy[28..40].copy_from_slice(&nonce_base);
+        aad_bdy[40..56].copy_from_slice(&hdr_tag);
+        let body_tag = crate::durable_seal::chacha20_poly1305_encrypt_in_place(
+            aead_key,
+            &nonce_bdy,
+            &aad_bdy,
+            &mut buf[SECTOR_BYTES..CRASH_DUMP_BYTES],
+        );
+
+        buf[448..460].copy_from_slice(&nonce_base);
+        buf[460..476].copy_from_slice(&hdr_tag);
+        buf[476..492].copy_from_slice(&body_tag);
+        let mut z = 492usize;
+        while z < SECTOR_BYTES {
+            buf[z] = 0;
+            z += 1;
+        }
+        Ok(())
+    }
+
+    /// Authenticate and decrypt a 16 KiB `CTTLPENC` buffer in place back into the
+    /// standard `CTTLPAN1` layout. On any authentication or integrity failure,
+    /// `buf[..CRASH_DUMP_BYTES]` is zeroized so unauthenticated plaintext never leaks.
+    pub fn decrypt_dump_in_place(
+        aead_key: &[u8; crate::durable_seal::AEAD_KEY_LEN],
+        buf: &mut [u8],
+    ) -> Result<(), CrashDumpError> {
+        if buf.len() < CRASH_DUMP_BYTES {
+            return Err(CrashDumpError::BufferTooSmall);
+        }
+        if !crate::durable_seal::is_seal_key_set(aead_key)
+            || buf[0..8] != ENCRYPTED_CRASH_DUMP_MAGIC
+        {
+            crate::durable_seal::zeroize_secret_bytes(&mut buf[..CRASH_DUMP_BYTES]);
+            return Err(CrashDumpError::MagicMismatch);
+        }
+        if read_u32_le(buf, crash_offsets::SCHEMA) != CRASH_DUMP_SCHEMA {
+            crate::durable_seal::zeroize_secret_bytes(&mut buf[..CRASH_DUMP_BYTES]);
+            return Err(CrashDumpError::SchemaMismatch);
+        }
+        if !buf[12..16].iter().all(|&b| b == 0) || !buf[492..SECTOR_BYTES].iter().all(|&b| b == 0)
+        {
+            crate::durable_seal::zeroize_secret_bytes(&mut buf[..CRASH_DUMP_BYTES]);
+            return Err(CrashDumpError::CrcMismatch);
+        }
+        let mut nonce_base = [0u8; 12];
+        let mut hdr_tag = [0u8; 16];
+        let mut body_tag = [0u8; 16];
+        nonce_base.copy_from_slice(&buf[448..460]);
+        hdr_tag.copy_from_slice(&buf[460..476]);
+        body_tag.copy_from_slice(&buf[476..492]);
+        if (nonce_base[11] & 0x80) != 0 {
+            crate::durable_seal::zeroize_secret_bytes(&mut buf[..CRASH_DUMP_BYTES]);
+            return Err(CrashDumpError::CrcMismatch);
+        }
+
+        let nonce_hdr = nonce_base;
+        let mut nonce_bdy = nonce_base;
+        nonce_bdy[11] |= 0x80;
+
+        let mut aad_bdy = [0u8; 12 + 16 + 12 + 16];
+        aad_bdy[0..12].copy_from_slice(b"CTTLPENC-BDY");
+        aad_bdy[12..28].copy_from_slice(&buf[0..16]);
+        aad_bdy[28..40].copy_from_slice(&nonce_base);
+        aad_bdy[40..56].copy_from_slice(&hdr_tag);
+        if !crate::durable_seal::chacha20_poly1305_decrypt_in_place(
+            aead_key,
+            &nonce_bdy,
+            &aad_bdy,
+            &mut buf[SECTOR_BYTES..CRASH_DUMP_BYTES],
+            &body_tag,
+        ) {
+            crate::durable_seal::zeroize_secret_bytes(&mut buf[..CRASH_DUMP_BYTES]);
+            return Err(CrashDumpError::CrcMismatch);
+        }
+
+        let mut aad_hdr = [0u8; 12 + 16 + 12];
+        aad_hdr[0..12].copy_from_slice(b"CTTLPENC-HDR");
+        aad_hdr[12..28].copy_from_slice(&buf[0..16]);
+        aad_hdr[28..40].copy_from_slice(&nonce_base);
+        if !crate::durable_seal::chacha20_poly1305_decrypt_in_place(
+            aead_key,
+            &nonce_hdr,
+            &aad_hdr,
+            &mut buf[16..448],
+            &hdr_tag,
+        ) {
+            crate::durable_seal::zeroize_secret_bytes(&mut buf[..CRASH_DUMP_BYTES]);
+            return Err(CrashDumpError::CrcMismatch);
+        }
+
+        buf[0..8].copy_from_slice(&CRASH_DUMP_MAGIC);
+        let mut z = 448usize;
+        while z < SECTOR_BYTES {
+            buf[z] = 0;
+            z += 1;
+        }
+        if let Err(e) = <Self as CrashDump>::verify_crc(buf) {
+            crate::durable_seal::zeroize_secret_bytes(&mut buf[..CRASH_DUMP_BYTES]);
+            return Err(e);
+        }
+        Ok(())
     }
 }
 
@@ -955,5 +1127,80 @@ mod tests {
         const _: () = assert!(crash_offsets::REGISTERS == 512);
         const _: () = assert!(crash_offsets::BACKTRACE == 1024);
         const _: () = assert!(crash_offsets::KMSG == 1536);
+    }
+
+    #[test]
+    fn encrypted_crash_dump_hides_plaintext_rejects_tamper_and_roundtrips() {
+        let key = crate::durable_seal::derive_crash_dump_aead_key(
+            &crate::durable_seal::DEFAULT_DURABLE_SEAL_KEY,
+        );
+        let wrong_key = crate::durable_seal::derive_crash_dump_aead_key(
+            &crate::durable_seal::DEFAULT_LEGACY_DURABLE_SEAL_KEY,
+        );
+        let nonce: [u8; 12] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xFF];
+
+        let mut regs = [0u64; CRASH_REG_COUNT];
+        for (i, r) in regs.iter_mut().enumerate() {
+            *r = 0xCAFE_BABE_0000_0000u64 + (i as u64);
+        }
+        let bt = [0xFFFF_8000_0010_2030u64, 0xFFFF_8000_0010_4050u64];
+        let kmsg = b"secret-kmsg-ring-buffer-customer-token-xyz";
+        let ctx = CrashContext {
+            wall_unix: 1_735_000_123,
+            tsc: 0x1234_5678_9ABC_DEF0,
+            panic_loc: "target_enterprise_kernel/src/secret_path.rs:42",
+            message: "sensitive panic payload: key_id=alpha-99",
+            registers: &regs,
+            backtrace: &bt,
+            kmsg,
+        };
+
+        let mut plain_ref = [0u8; CRASH_DUMP_BYTES];
+        PanicDumpImpl::build_dump(&ctx, &mut plain_ref).expect("reference dump");
+
+        let mut sink = MemorySectorSink::new();
+        let mut scratch = [0u8; CRASH_DUMP_BYTES];
+        PanicDumpImpl::dump_encrypted_to_sink(&ctx, Some(&key), &nonce, &mut scratch, &mut sink)
+            .expect("encrypted dump to sink");
+
+        assert_eq!(&sink.disk[0..8], &ENCRYPTED_CRASH_DUMP_MAGIC);
+        for needle in [
+            &b"CTTLPAN1"[..],
+            &b"secret_path"[..],
+            &b"sensitive panic"[..],
+            &b"customer-token"[..],
+            &0xCAFE_BABE_0000_0000u64.to_le_bytes()[..],
+        ] {
+            assert!(
+                !sink.disk.windows(needle.len()).any(|w| w == needle),
+                "encrypted crash dump leaked plaintext {:?}",
+                core::str::from_utf8(needle)
+            );
+        }
+
+        // Wrong key and bit-flips in header, body, or tag fail closed and wipe output buffer.
+        let mut bad_key_buf = sink.disk;
+        assert!(PanicDumpImpl::decrypt_dump_in_place(&wrong_key, &mut bad_key_buf).is_err());
+        assert!(bad_key_buf.iter().all(|&b| b == 0));
+
+        for tamper_off in [24usize, 64, 462, 480, 520, 1550] {
+            let mut bad = sink.disk;
+            bad[tamper_off] ^= 0x01;
+            assert!(
+                PanicDumpImpl::decrypt_dump_in_place(&key, &mut bad).is_err(),
+                "tamper at offset {tamper_off} must fail AEAD authentication"
+            );
+            assert!(bad.iter().all(|&b| b == 0));
+        }
+
+        // Valid key recovers the exact bit-for-bit `CTTLPAN1` image.
+        let mut recovered = sink.disk;
+        PanicDumpImpl::decrypt_dump_in_place(&key, &mut recovered).expect("decrypt valid dump");
+        assert_eq!(&recovered[..], &plain_ref[..]);
+        PanicDumpImpl::verify_crc(&recovered).expect("verify_crc");
+        let hdr = PanicDumpImpl::parse_header(&recovered).expect("parse_header");
+        assert_eq!(hdr.panic_loc, ctx.panic_loc);
+        assert_eq!(hdr.message, ctx.message);
+        assert_eq!(PanicDumpImpl::extract_kmsg(&recovered).unwrap(), kmsg);
     }
 }

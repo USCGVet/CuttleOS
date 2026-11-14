@@ -168,6 +168,9 @@ const FS_NO_SPACE_MSG: &[u8] =
 /// Reply for a command refused because its journal record would not fit.
 const JOURNAL_FULL_MSG: &[u8] =
     b"error: ENOSPC (durable state journal full; remove a task, firewall rule, IMA digest or cron job)\n";
+/// Reply for a durable state mutation refused because no out-of-band device key was provisioned.
+pub const DURABLE_UNPROVISIONED_MSG: &[u8] =
+    b"error: EROFS (device key not provisioned; durable writes refused)\n";
 
 /// Periodic scheduled task entry in CuttleChronos (`cron`).
 #[derive(Copy, Clone, Debug)]
@@ -358,6 +361,12 @@ pub struct OsShell {
     vault_entropy_pool: u64,
     /// Boot generation most recently passed to [`OsShell::seed_defaults_for_boot`].
     boot_gen: u64,
+    /// Whether an out-of-band device secret key was provisioned for durable persistence.
+    /// When `false`, all durable mutations (`write`, `rm`, mutating `sql`, `vault put/del`,
+    /// `cron add/del`, `fw` rules, `ima enroll`, `sync`) fail closed with `EROFS`.
+    pub durable_provisioned: bool,
+    /// Monotonic durable store commit sequence number anchored by [`crate::state_store::ShellStore`].
+    pub commit_seq: u64,
     /// Most recently validated HTTP session slot owner ID (`0` = console/unauthenticated, `1..=SHELL_MAX_SESSIONS` = session slot).
     pub last_session_owner: u64,
     /// Active SQL transaction owner override (`0` = console, `1..=4` = HTTP session, `SQL_OWNER_*` = internal subsystem).
@@ -431,6 +440,8 @@ impl OsShell {
             vault_nonce_default: 0,
             vault_entropy_pool: 0,
             boot_gen: 0,
+            durable_provisioned: false,
+            commit_seq: 0,
             last_session_owner: 0,
             sql_owner_override: 0,
             triad_node_id: 0,
@@ -550,6 +561,8 @@ impl OsShell {
         self.login_cooldown_ticks = 0;
         self.http_login_seq = 0;
         self.boot_gen = boot_gen;
+        self.durable_provisioned = is_seal_key_set(&self.seal_key);
+        self.commit_seq = 0;
         self.vault_nonce_seq = boot_gen.wrapping_mul(37) & 0x7FFF;
         self.vault_nonce_default = self.vault_nonce_seq;
         self.vault_entropy_pool = boot_gen.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xC077_1E05_5EED_0001;
@@ -580,6 +593,21 @@ impl OsShell {
             .rotate_left(13)
             .wrapping_add(0x9E37_79B9_7F4A_7C15)
             ^ sample;
+    }
+
+    /// Return the current rolling hardware/boot entropy accumulator word.
+    pub fn vault_entropy_snapshot(&self) -> u64 {
+        self.vault_entropy_pool
+    }
+
+    /// Whether durable state mutations are permitted (`true` when an out-of-band device key was provisioned).
+    pub const fn is_durable_provisioned(&self) -> bool {
+        self.durable_provisioned
+    }
+
+    /// Explicitly mark whether out-of-band device key provisioning succeeded for durable persistence.
+    pub fn set_durable_provisioned(&mut self, provisioned: bool) {
+        self.durable_provisioned = provisioned;
     }
 
     /// Advance all active CuttleChronos (`cron`) periodic jobs by one hardware timer tick,
@@ -1040,18 +1068,24 @@ impl OsShell {
                 (200u16, n)
             }
             IpcOp::SqlMutate => {
-                if via_http_gateway {
-                    self.record_net_audit(AuditVerdict::Allowed, b"net:http:sql-write");
-                }
-                let owner = if session_verified {
-                    self.last_session_owner.max(1)
-                } else if self.sql_owner_override == crate::sql::SQL_OWNER_CONSOLE {
-                    crate::sql::SQL_OWNER_HTTP_ANON
+                if !self.durable_provisioned {
+                    self.record_net_audit(AuditVerdict::Denied, b"shell:durable:unprovisioned");
+                    let n = copy_into(DURABLE_UNPROVISIONED_MSG, resp_out);
+                    (503u16, n)
                 } else {
-                    self.sql_owner_override
-                };
-                let n = self.db.exec_as(owner, mb_body, resp_out);
-                (200u16, n)
+                    if via_http_gateway {
+                        self.record_net_audit(AuditVerdict::Allowed, b"net:http:sql-write");
+                    }
+                    let owner = if session_verified {
+                        self.last_session_owner.max(1)
+                    } else if self.sql_owner_override == crate::sql::SQL_OWNER_CONSOLE {
+                        crate::sql::SQL_OWNER_HTTP_ANON
+                    } else {
+                        self.sql_owner_override
+                    };
+                    let n = self.db.exec_as(owner, mb_body, resp_out);
+                    (200u16, n)
+                }
             }
             IpcOp::VaultRead => {
                 let arg = if mb_body.is_empty() {
@@ -1063,11 +1097,17 @@ impl OsShell {
                 (200u16, n)
             }
             IpcOp::VaultWrite => {
-                if via_http_gateway {
-                    self.record_net_audit(AuditVerdict::Allowed, b"net:http:vault-write");
+                if !self.durable_provisioned {
+                    self.record_net_audit(AuditVerdict::Denied, b"shell:durable:unprovisioned");
+                    let n = copy_into(DURABLE_UNPROVISIONED_MSG, resp_out);
+                    (503u16, n)
+                } else {
+                    if via_http_gateway {
+                        self.record_net_audit(AuditVerdict::Allowed, b"net:http:vault-write");
+                    }
+                    let n = self.cmd_vault_inner(mb_body, resp_out);
+                    (200u16, n)
                 }
-                let n = self.cmd_vault_inner(mb_body, resp_out);
-                (200u16, n)
             }
             IpcOp::ShellExec => {
                 let prev_owner = self.sql_owner_override;
@@ -1080,7 +1120,15 @@ impl OsShell {
                     .exec_line(mb_body, boots, 0, 0, resp_out)
                     .bytes_written();
                 self.sql_owner_override = prev_owner;
-                (200u16, n)
+                let code = if !self.durable_provisioned
+                    && n == DURABLE_UNPROVISIONED_MSG.len()
+                    && bytes_eq(&resp_out[..n], DURABLE_UNPROVISIONED_MSG)
+                {
+                    503u16
+                } else {
+                    200u16
+                };
+                (code, n)
             }
             IpcOp::UserElfExec => {
                 let mut cmd_line = [0u8; 128];
@@ -1103,71 +1151,86 @@ impl OsShell {
                 }
             }
             IpcOp::VfsWrite => {
-                let mut norm_path = [0u8; cuttle_contracts::FS_PATH_MAX];
-                match check_writable_vfs_path(mb_path, &mut norm_path) {
-                    WritablePathPolicy::Protected => {
-                        self.record_net_audit(AuditVerdict::Denied, b"net:http:fs-protected");
-                        let n = copy_into(b"error: immutable system file\n", resp_out);
-                        (403u16, n)
-                    }
-                    WritablePathPolicy::Allowed(nlen) => {
-                        let cpath = &norm_path[..nlen];
-                        if !self.fs.can_replace(cpath, mb_body.len()) {
-                            // Refuse before truncating: the existing file stays as it was.
-                            self.record_net_audit(AuditVerdict::Error, b"net:http:fs-nospace");
-                            let n = copy_into(FS_NO_SPACE_MSG, resp_out);
-                            (507u16, n)
-                        } else if let Ok(fh) =
-                            self.fs.open(cpath, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC)
-                        {
-                            let wrote = self.fs.write(fh, 0, mb_body);
-                            let _ = self.fs.close(fh);
-                            let Ok(written) = wrote else {
-                                self.record_net_audit(AuditVerdict::Error, b"net:http:fs-io-err");
-                                let n = copy_into(b"error: write failed\n", resp_out);
-                                self.svc.complete_mailbox_response(target, 500, n);
-                                return Ok((500u16, n));
-                            };
-                            self.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-put");
-                            let mut mpos = 0usize;
-                            mpos += copy_into(b"wrote ", &mut resp_out[mpos..]);
-                            mpos += dec_u64(written as u64, &mut resp_out[mpos..]);
-                            mpos += copy_into(b" bytes to ", &mut resp_out[mpos..]);
-                            mpos += copy_into(cpath, &mut resp_out[mpos..]);
-                            mpos += copy_into(b"\n", &mut resp_out[mpos..]);
-                            (201u16, mpos)
-                        } else {
+                if !self.durable_provisioned {
+                    self.record_net_audit(AuditVerdict::Denied, b"shell:durable:unprovisioned");
+                    let n = copy_into(DURABLE_UNPROVISIONED_MSG, resp_out);
+                    (503u16, n)
+                } else {
+                    let mut norm_path = [0u8; cuttle_contracts::FS_PATH_MAX];
+                    match check_writable_vfs_path(mb_path, &mut norm_path) {
+                        WritablePathPolicy::Protected => {
+                            self.record_net_audit(AuditVerdict::Denied, b"net:http:fs-protected");
+                            let n = copy_into(b"error: immutable system file\n", resp_out);
+                            (403u16, n)
+                        }
+                        WritablePathPolicy::Allowed(nlen) => {
+                            let cpath = &norm_path[..nlen];
+                            if !self.fs.can_replace(cpath, mb_body.len()) {
+                                // Refuse before truncating: the existing file stays as it was.
+                                self.record_net_audit(AuditVerdict::Error, b"net:http:fs-nospace");
+                                let n = copy_into(FS_NO_SPACE_MSG, resp_out);
+                                (507u16, n)
+                            } else if let Ok(fh) =
+                                self.fs.open(cpath, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC)
+                            {
+                                let wrote = self.fs.write(fh, 0, mb_body);
+                                let _ = self.fs.close(fh);
+                                let Ok(written) = wrote else {
+                                    self.record_net_audit(
+                                        AuditVerdict::Error,
+                                        b"net:http:fs-io-err",
+                                    );
+                                    let n = copy_into(b"error: write failed\n", resp_out);
+                                    self.svc.complete_mailbox_response(target, 500, n);
+                                    return Ok((500u16, n));
+                                };
+                                self.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-put");
+                                let mut mpos = 0usize;
+                                mpos += copy_into(b"wrote ", &mut resp_out[mpos..]);
+                                mpos += dec_u64(written as u64, &mut resp_out[mpos..]);
+                                mpos += copy_into(b" bytes to ", &mut resp_out[mpos..]);
+                                mpos += copy_into(cpath, &mut resp_out[mpos..]);
+                                mpos += copy_into(b"\n", &mut resp_out[mpos..]);
+                                (201u16, mpos)
+                            } else {
+                                let n = copy_into(b"error: open failed\n", resp_out);
+                                (500u16, n)
+                            }
+                        }
+                        WritablePathPolicy::Invalid => {
                             let n = copy_into(b"error: open failed\n", resp_out);
                             (500u16, n)
                         }
                     }
-                    WritablePathPolicy::Invalid => {
-                        let n = copy_into(b"error: open failed\n", resp_out);
-                        (500u16, n)
-                    }
                 }
             }
             IpcOp::VfsDelete => {
-                let mut norm_path = [0u8; cuttle_contracts::FS_PATH_MAX];
-                match check_writable_vfs_path(mb_path, &mut norm_path) {
-                    WritablePathPolicy::Protected => {
-                        self.record_net_audit(AuditVerdict::Denied, b"net:http:fs-protected");
-                        let n = copy_into(b"error: immutable system file\n", resp_out);
-                        (403u16, n)
-                    }
-                    WritablePathPolicy::Allowed(nlen) => {
-                        if self.fs.unlink(&norm_path[..nlen]).is_ok() {
-                            self.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-del");
-                            let n = copy_into(b"removed\n", resp_out);
-                            (200u16, n)
-                        } else {
+                if !self.durable_provisioned {
+                    self.record_net_audit(AuditVerdict::Denied, b"shell:durable:unprovisioned");
+                    let n = copy_into(DURABLE_UNPROVISIONED_MSG, resp_out);
+                    (503u16, n)
+                } else {
+                    let mut norm_path = [0u8; cuttle_contracts::FS_PATH_MAX];
+                    match check_writable_vfs_path(mb_path, &mut norm_path) {
+                        WritablePathPolicy::Protected => {
+                            self.record_net_audit(AuditVerdict::Denied, b"net:http:fs-protected");
+                            let n = copy_into(b"error: immutable system file\n", resp_out);
+                            (403u16, n)
+                        }
+                        WritablePathPolicy::Allowed(nlen) => {
+                            if self.fs.unlink(&norm_path[..nlen]).is_ok() {
+                                self.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-del");
+                                let n = copy_into(b"removed\n", resp_out);
+                                (200u16, n)
+                            } else {
+                                let n = copy_into(b"not found\n", resp_out);
+                                (404u16, n)
+                            }
+                        }
+                        WritablePathPolicy::Invalid => {
                             let n = copy_into(b"not found\n", resp_out);
                             (404u16, n)
                         }
-                    }
-                    WritablePathPolicy::Invalid => {
-                        let n = copy_into(b"not found\n", resp_out);
-                        (404u16, n)
                     }
                 }
             }
@@ -1187,7 +1250,15 @@ impl OsShell {
                     mb_body
                 };
                 let n = self.cmd_cron_inner(arg, boots, resp_out);
-                (200u16, n)
+                let code = if !self.durable_provisioned
+                    && n == DURABLE_UNPROVISIONED_MSG.len()
+                    && bytes_eq(&resp_out[..n], DURABLE_UNPROVISIONED_MSG)
+                {
+                    503u16
+                } else {
+                    200u16
+                };
+                (code, n)
             }
         };
 
@@ -2859,6 +2930,11 @@ impl OsShell {
                 );
                 return ShellAction::Continue(n);
             }
+            if !self.durable_provisioned {
+                self.record_audit(5, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+                let n = copy_into(DURABLE_UNPROVISIONED_MSG, out);
+                return ShellAction::Continue(n);
+            }
             if !self.journal_admits(STATE_REC_TASK_LEN) {
                 self.record_audit(5, AuditVerdict::Error, b"shell:spawn:journal-full");
                 let n = copy_into(JOURNAL_FULL_MSG, out);
@@ -3309,6 +3385,10 @@ impl OsShell {
                 out,
             );
         }
+        if !self.durable_provisioned {
+            self.record_audit(6, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+            return copy_into(DURABLE_UNPROVISIONED_MSG, out);
+        }
         let target = trim_ascii(arg);
         let Some(pid) = parse_u32_ascii(target) else {
             self.record_audit(6, AuditVerdict::Error, b"shell:kill:bad-pid");
@@ -3371,6 +3451,10 @@ impl OsShell {
                 b"error: EACCES (svc-sh disabled by node role or policy)\n",
                 out,
             );
+        }
+        if !self.durable_provisioned {
+            self.record_audit(17, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+            return copy_into(DURABLE_UNPROVISIONED_MSG, out);
         }
         let (pid_str, cap_name) = split_first_word(trim_ascii(arg));
         let Some(pid) = parse_u32_ascii(pid_str) else {
@@ -3544,6 +3628,10 @@ impl OsShell {
                     b"error: EACCES (svc-sh disabled by node role or policy)\n",
                     out,
                 );
+            }
+            if !self.durable_provisioned {
+                self.record_audit(27, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+                return copy_into(DURABLE_UNPROVISIONED_MSG, out);
             }
         }
         if bytes_eq(sub, b"clear") {
@@ -3729,6 +3817,10 @@ impl OsShell {
                 out,
             );
         }
+        if !self.durable_provisioned {
+            self.record_audit(9, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+            return copy_into(DURABLE_UNPROVISIONED_MSG, out);
+        }
         let (path, off_tok, hex_tok) = split_writehex_args(arg);
         if path.is_empty() || off_tok.is_empty() {
             self.record_audit(9, AuditVerdict::Error, b"shell:writehex:bad-args");
@@ -3820,6 +3912,10 @@ impl OsShell {
                 out,
             );
         }
+        if !self.durable_provisioned {
+            self.record_audit(9, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+            return copy_into(DURABLE_UNPROVISIONED_MSG, out);
+        }
         let (path, content) = split_shell_path(arg);
         if path.is_empty() || content.is_empty() {
             self.record_audit(9, AuditVerdict::Error, b"shell:write:bad-args");
@@ -3893,6 +3989,10 @@ impl OsShell {
                 b"error: EACCES (svc-sh disabled by node role or policy)\n",
                 out,
             );
+        }
+        if !self.durable_provisioned {
+            self.record_audit(10, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+            return copy_into(DURABLE_UNPROVISIONED_MSG, out);
         }
         let path = strip_shell_quotes(arg);
         if path.is_empty() {
@@ -3986,6 +4086,10 @@ impl OsShell {
                 out,
             );
         }
+        if !self.durable_provisioned {
+            self.record_audit(29, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+            return copy_into(DURABLE_UNPROVISIONED_MSG, out);
+        }
         let proof = match durable_wal_proof(self.task_caps[4]) {
             Ok(p) => p,
             Err(_) => {
@@ -4046,6 +4150,10 @@ impl OsShell {
                 b"error: EACCES (svc-sql disabled by node role or policy)\n",
                 out,
             );
+        }
+        if !is_ro && !self.durable_provisioned {
+            self.record_audit(31, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+            return copy_into(DURABLE_UNPROVISIONED_MSG, out);
         }
         self.record_audit(31, AuditVerdict::Allowed, b"shell:sql");
         self.db.exec_as(self.sql_owner_override, q, out)
@@ -4134,6 +4242,10 @@ impl OsShell {
         }
 
         if bytes_eq(sub, b"put") {
+            if !self.durable_provisioned {
+                self.record_audit(35, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+                return copy_into(DURABLE_UNPROVISIONED_MSG, out);
+            }
             let (kname, secret) = split_first_word(trim_ascii(rest));
             let secret = trim_ascii(secret);
             if !is_valid_vault_key(kname) || !is_valid_vault_secret(secret) {
@@ -4390,6 +4502,10 @@ impl OsShell {
         }
 
         if bytes_eq(sub, b"del") || bytes_eq(sub, b"delete") {
+            if !self.durable_provisioned {
+                self.record_audit(35, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+                return copy_into(DURABLE_UNPROVISIONED_MSG, out);
+            }
             let kname = trim_ascii(rest);
             if !is_valid_vault_key(kname) {
                 return copy_into(b"usage: vault del <key>\n", out);
@@ -4668,6 +4784,10 @@ impl OsShell {
         }
 
         if bytes_eq(sub, b"add") {
+            if !self.durable_provisioned {
+                self.record_audit(37, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+                return copy_into(DURABLE_UNPROVISIONED_MSG, out);
+            }
             let (int_tok, cmd_raw) = split_first_word(trim_ascii(rest));
             let cmd_line = trim_ascii(cmd_raw);
             let Some(interval) = parse_u32_ascii(int_tok) else {
@@ -4725,6 +4845,10 @@ impl OsShell {
         }
 
         if bytes_eq(sub, b"del") || bytes_eq(sub, b"rm") {
+            if !self.durable_provisioned {
+                self.record_audit(37, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+                return copy_into(DURABLE_UNPROVISIONED_MSG, out);
+            }
             let Some(id_val) = parse_u32_ascii(trim_ascii(rest)) else {
                 return copy_into(b"usage: cron del <id:1..12>\n", out);
             };
@@ -5103,6 +5227,10 @@ impl OsShell {
                     b"error: EACCES (svc-sql disabled by node role or policy)\n",
                     out,
                 );
+            }
+            if !self.durable_provisioned {
+                self.record_audit(34, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+                return copy_into(DURABLE_UNPROVISIONED_MSG, out);
             }
             let mut sql_res = [0u8; 192];
             let slen = self.db.exec_as(SQL_OWNER_TRIAD, sql, &mut sql_res);
@@ -5525,6 +5653,10 @@ impl OsShell {
                     out,
                 );
             }
+            if !self.durable_provisioned {
+                self.record_audit(24, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+                return copy_into(DURABLE_UNPROVISIONED_MSG, out);
+            }
             let raw_path = trim_ascii(rest);
             if raw_path.is_empty() {
                 self.record_audit(24, AuditVerdict::Error, b"shell:ima:no-path");
@@ -5630,6 +5762,10 @@ impl OsShell {
                     out,
                 );
             }
+            if !self.durable_provisioned {
+                self.record_audit(25, AuditVerdict::Denied, b"shell:durable:unprovisioned");
+                return copy_into(DURABLE_UNPROVISIONED_MSG, out);
+            }
         }
         if bytes_eq(sub, b"clear") {
             self.fw.clear();
@@ -5709,7 +5845,7 @@ impl OsShell {
         pos
     }
 
-    /// Format the canonical remote attestation payload (`v=1 boots=<boots> pcr10=<hex64> svc_pcr10=<hex16> role=<role> ima=<count> seal=<hex64> nonce=<nonce>`)
+    /// Format the canonical remote attestation payload (`v=1 boots=<boots> pcr10=<hex64> svc_pcr10=<hex16> role=<role> commit_seq=<seq> ima=<count> seal=<hex64> nonce=<nonce>`)
     /// into `out` and return the byte length.
     fn format_attestation_body(&self, boots: u64, nonce: &[u8], out: &mut [u8]) -> usize {
         let mut state_seal = [0u8; DURABLE_DIGEST_LEN];
@@ -5724,6 +5860,8 @@ impl OsShell {
         pos += hex_bytes(&self.svc.svc_pcr10[..8], &mut out[pos..]);
         pos += copy_into(b" role=", &mut out[pos..]);
         pos += copy_into(self.svc.role.as_bytes(), &mut out[pos..]);
+        pos += copy_into(b" commit_seq=", &mut out[pos..]);
+        pos += dec_u64(self.commit_seq, &mut out[pos..]);
         pos += copy_into(b" ima=", &mut out[pos..]);
         pos += dec_u64(self.ima_measurements, &mut out[pos..]);
         pos += copy_into(b" seal=", &mut out[pos..]);
@@ -5734,7 +5872,7 @@ impl OsShell {
     }
 
     /// Compute the 32-byte `HMAC-SHA256` remote attestation signature over the
-    /// live kernel state (`boots`, `ima_pcr10`, `ima_measurements`, `state_seal`,
+    /// live kernel state (`boots`, `ima_pcr10`, `commit_seq`, `ima_measurements`, `state_seal`,
     /// and caller-supplied challenge `nonce`) using `self.attest_key`.
     /// Returns `false` and zeroes `mac_out` if `self.attest_key` is unset (`[0u8; 32]`).
     pub fn compute_attestation_mac(
@@ -5747,7 +5885,7 @@ impl OsShell {
             *mac_out = [0u8; DURABLE_DIGEST_LEN];
             return false;
         }
-        let mut body = [0u8; 320];
+        let mut body = [0u8; 384];
         let blen = self.format_attestation_body(boots, nonce, &mut body);
         seal_bytes_keyed(&self.attest_key, &body[..blen], mac_out);
         true
@@ -5755,7 +5893,7 @@ impl OsShell {
 
     /// Verify in constant time that `expected_mac` is a valid `HMAC-SHA256`
     /// remote attestation quote signature for the current live kernel state
-    /// (`boots`, `ima_pcr10`, `ima_measurements`, `state_seal`, and `nonce`).
+    /// (`boots`, `ima_pcr10`, `commit_seq`, `ima_measurements`, `state_seal`, and `nonce`).
     pub fn verify_attestation_mac(
         &self,
         boots: u64,
@@ -5765,7 +5903,7 @@ impl OsShell {
         if !is_seal_key_set(&self.attest_key) {
             return false;
         }
-        let mut body = [0u8; 320];
+        let mut body = [0u8; 384];
         let blen = self.format_attestation_body(boots, nonce, &mut body);
         seal_matches_keyed(&self.attest_key, &body[..blen], expected_mac)
     }
@@ -5781,7 +5919,7 @@ impl OsShell {
         }
         self.record_audit(26, AuditVerdict::Allowed, b"shell:attest");
         let nonce = trim_ascii(arg);
-        let mut body = [0u8; 320];
+        let mut body = [0u8; 384];
         let blen = self.format_attestation_body(boots, nonce, &mut body);
         let mut mac = [0u8; DURABLE_DIGEST_LEN];
         seal_bytes_keyed(&self.attest_key, &body[..blen], &mut mac);
@@ -8893,5 +9031,121 @@ mod tests {
         let act = victim.exec_line(b"cat /var/keep.txt", 2, 0, 0, &mut out);
         assert_eq!(&out[..act.bytes_written()], b"intact\n");
         assert!(victim.fs.stat(b"/var/timed.txt").is_err());
+    }
+
+    #[test]
+    fn unprovisioned_shell_refuses_all_durable_mutations_across_console_and_http_roles() {
+        use crate::svc_runtime::{IpcOp, NodeRole, ServiceError};
+
+        // Simulate a keyless boot where runtime subkeys exist in RAM for diagnostics/TLS,
+        // while `durable_provisioned == false` because `fw_cfg` had no device secret key.
+        let mut sh = Box::new(OsShell::new());
+        sh.set_durable_provisioned(false);
+        assert!(!sh.is_durable_provisioned());
+
+        let fp0 = sh.durable_fingerprint();
+        let mut out = [0u8; 512];
+
+        // 1. Every console durable-mutation command fails closed with `DURABLE_UNPROVISIONED_MSG`
+        //    and leaves `durable_fingerprint()` byte-identical.
+        let mutating_cmds: [&[u8]; 18] = [
+            b"spawn",
+            b"kill 5",
+            b"grant 1 fs",
+            b"revoke 1 fs",
+            b"seccomp deny 1 open",
+            b"seccomp clear 1",
+            b"write /var/ephem.txt nope",
+            b"writehex /var/ephem.txt 0 6162",
+            b"rm /var/ephem.txt",
+            b"sync",
+            b"sql INSERT INTO kv VALUES ('ephem', 'nope', 1)",
+            b"vault put ephem Secret1",
+            b"vault del ephem",
+            b"cron add 10 status",
+            b"cron del 1",
+            b"triad propose INSERT INTO kv VALUES ('ephem', 'nope', 1)",
+            b"ima enroll /bin/fib",
+            b"fw block 10.99.0.0/16",
+        ];
+        for cmd in mutating_cmds {
+            let act = sh.exec_line(cmd, 1, 0, 0, &mut out);
+            assert_eq!(
+                &out[..act.bytes_written()],
+                DURABLE_UNPROVISIONED_MSG,
+                "console command {:?} must fail closed when unprovisioned",
+                core::str::from_utf8(cmd)
+            );
+            assert_eq!(
+                sh.durable_fingerprint(),
+                fp0,
+                "durable_fingerprint moved on refused command {:?}",
+                core::str::from_utf8(cmd)
+            );
+        }
+
+        // 2. Read-only inspection commands continue to work in diagnostic mode.
+        let act_ro = sh.exec_line(b"sql SELECT COUNT(*) FROM kv", 1, 0, 0, &mut out);
+        assert!(!out[..act_ro.bytes_written()].starts_with(b"error:"));
+        let act_st = sh.exec_line(b"status", 1, 0, 0, &mut out);
+        assert!(out[..act_st.bytes_written()].starts_with(b"status: ok"));
+
+        // 3. Across all 4 node roles (`Full`, `Gateway`, `Data`, `Control`), unauthenticated HTTP
+        //    requests to mutating endpoints are refused (`Unauthenticated` or `RoleDisabled`), and
+        //    authenticated HTTP requests to enabled mutating endpoints return `503` + `EROFS`.
+        let ops: [(IpcOp, &[u8], &[u8]); 6] = [
+            (IpcOp::SqlMutate, b"/sql", b"INSERT INTO kv VALUES ('x','y',1)"),
+            (IpcOp::VaultWrite, b"/vault", b"put k1 Sec1"),
+            (IpcOp::ShellExec, b"/sh", b"write /var/x y"),
+            (IpcOp::VfsWrite, b"/var/x", b"payload"),
+            (IpcOp::VfsDelete, b"/var/x", b""),
+            (IpcOp::CronControl, b"/cron", b"add 5 status"),
+        ];
+        for role in [NodeRole::Full, NodeRole::Wfe, NodeRole::Sql, NodeRole::Shell] {
+            sh.svc.set_role(role, &mut sh.audit);
+            let fp_role = sh.durable_fingerprint();
+            for (op, path, body) in ops {
+                // Unauthenticated call must ALWAYS be refused (`RoleDisabled` or `Unauthenticated`).
+                let unauth = sh.dispatch_mailbox_op(op, true, false, 1, path, body, &mut out);
+                if role.allows(IpcOp::HttpGetStatus.target_service()) && role.allows(op.target_service()) {
+                    assert_eq!(unauth, Err(ServiceError::Unauthenticated));
+                } else {
+                    assert_eq!(unauth, Err(ServiceError::RoleDisabled));
+                }
+
+                // Authenticated call when role permits both gateway and target service must return 503 EROFS.
+                let auth = sh.dispatch_mailbox_op(op, true, true, 1, path, body, &mut out);
+                if role.allows(IpcOp::HttpGetStatus.target_service()) && role.allows(op.target_service()) {
+                    let (code, len) = auth.expect("role-permitted op reaches unprovisioned gate");
+                    assert_eq!(code, 503, "role={role:?} op={op:?}");
+                    assert_eq!(&out[..len], DURABLE_UNPROVISIONED_MSG);
+                } else {
+                    assert_eq!(auth, Err(ServiceError::RoleDisabled));
+                }
+                assert_eq!(sh.durable_fingerprint(), fp_role);
+            }
+        }
+    }
+
+    #[test]
+    fn attest_quote_binds_commit_seq_and_rejects_tampered_commit_seq() {
+        let mut sh = Box::new(OsShell::new());
+        sh.commit_seq = 42;
+        let mut out = [0u8; 512];
+        let n = sh.cmd_attest(7, b"anti-rollback-nonce", &mut out);
+        let line = core::str::from_utf8(&out[..n]).expect("utf8 attest");
+        assert!(line.starts_with("attest: v=1 boots=7 pcr10="));
+        assert!(
+            line.contains(" role=full commit_seq=42 ima="),
+            "attest line missing commit_seq: {line:?}"
+        );
+
+        let mut mac42 = [0u8; DURABLE_DIGEST_LEN];
+        assert!(sh.compute_attestation_mac(7, b"anti-rollback-nonce", &mut mac42));
+        assert!(sh.verify_attestation_mac(7, b"anti-rollback-nonce", &mac42));
+
+        // Any regression or change in `commit_seq` invalidates the quote MAC.
+        sh.commit_seq = 41;
+        assert!(!sh.verify_attestation_mac(7, b"anti-rollback-nonce", &mac42));
     }
 }

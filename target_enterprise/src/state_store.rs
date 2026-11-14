@@ -93,9 +93,13 @@
 
 use crate::durable_seal::ab_journal::{
     hash_sector_slice, pack_ab_commit_sector, verify_ab_commit_sector, AbCommitHeader,
-    AB_FORMAT_V1, AB_FORMAT_V2, AB_STATE_IN_FLIGHT, AB_STATE_QUIESCENT,
+    AB_FORMAT_V1, AB_FORMAT_V2, AB_FORMAT_V3, AB_STATE_IN_FLIGHT, AB_STATE_QUIESCENT,
 };
-use crate::durable_seal::{constant_time_eq, is_seal_key_set, DURABLE_DIGEST_LEN};
+use crate::durable_seal::{
+    chacha20_poly1305_decrypt_in_place, chacha20_poly1305_encrypt_in_place, constant_time_eq,
+    derive_disk_aead_key, is_seal_key_set, seal_bytes_keyed, zeroize_secret_bytes, AEAD_NONCE_LEN,
+    AEAD_TAG_LEN, DURABLE_DIGEST_LEN,
+};
 use crate::shell::{OsShell, StatePackError, StateRestore};
 use crate::wal::crc32_ieee;
 use sha2::{Digest, Sha256};
@@ -397,12 +401,154 @@ impl StateImage {
     }
 
     /// Boot generation recorded in the shell header sector (`CTTLSHL1`
-    /// bytes `8..16`). Only meaningful once the image has been authenticated.
+    /// bytes `8..16`). Only meaningful once the image has been authenticated
+    /// (and decrypted if it carried a [`STATE_AEAD_MAGIC`] envelope).
     pub fn saved_boots(&self) -> u64 {
         let mut b = [0u8; 8];
         b.copy_from_slice(&self.wal[0][8..16]);
         u64::from_le_bytes(b)
     }
+
+    /// Extract `(aead_nonce, wal_tag, fs_tag, sql_tag)` if `self.wal[0][0..68]`
+    /// begins with [`STATE_AEAD_MAGIC`] (`*b"CTTLAE03"`) and canonical top-2-bit zero
+    /// domain bits on `aead_nonce[11]`.
+    pub fn aead_envelope(
+        &self,
+    ) -> Option<(
+        [u8; AEAD_NONCE_LEN],
+        [u8; AEAD_TAG_LEN],
+        [u8; AEAD_TAG_LEN],
+        [u8; AEAD_TAG_LEN],
+    )> {
+        if self.wal[0][0..8] != STATE_AEAD_MAGIC {
+            return None;
+        }
+        let mut nonce = [0u8; AEAD_NONCE_LEN];
+        nonce.copy_from_slice(&self.wal[0][8..20]);
+        if (nonce[11] & 0xC0) != 0 {
+            return None;
+        }
+        let mut wal_tag = [0u8; AEAD_TAG_LEN];
+        let mut fs_tag = [0u8; AEAD_TAG_LEN];
+        let mut sql_tag = [0u8; AEAD_TAG_LEN];
+        wal_tag.copy_from_slice(&self.wal[0][20..36]);
+        fs_tag.copy_from_slice(&self.wal[0][36..52]);
+        sql_tag.copy_from_slice(&self.wal[0][52..68]);
+        Some((nonce, wal_tag, fs_tag, sql_tag))
+    }
+
+    /// Encrypt all three partitions (`wal`, `fs`, `sql`) in place under
+    /// `ChaCha20-Poly1305` (RFC 8439) using `derive_disk_aead_key(seal_key)` and
+    /// domain-separated per-partition 96-bit nonces (`top 2 bits of byte 11` = `0..=2`),
+    /// storing the 68-byte [`STATE_AEAD_MAGIC`] envelope in `self.wal[0][0..68]`.
+    pub fn encrypt_in_place(
+        &mut self,
+        seal_key: &[u8; DURABLE_DIGEST_LEN],
+        nonce_base: &[u8; AEAD_NONCE_LEN],
+    ) -> bool {
+        if !is_seal_key_set(seal_key) || self.wal[0][0..8] == STATE_AEAD_MAGIC {
+            return false;
+        }
+        // `CTTLSHL1` header occupies bytes `0..116`; bytes `116..184` must be unused zeros
+        // so shifting `0..116` to `68..184` is lossless.
+        if !self.wal[0][116..184].iter().all(|&b| b == 0) {
+            return false;
+        }
+        let mut canon = *nonce_base;
+        canon[11] &= 0x3F;
+        let mut aead_key = derive_disk_aead_key(seal_key);
+
+        let wal_flat = self.wal.as_flattened_mut();
+        wal_flat.copy_within(0..116, 68);
+        let (n_wal, aad_wal) = state_aead_nonce_and_aad(&canon, 0);
+        let wal_tag = chacha20_poly1305_encrypt_in_place(&aead_key, &n_wal, &aad_wal, &mut wal_flat[68..]);
+
+        let fs_flat = self.fs.as_flattened_mut();
+        let (n_fs, aad_fs) = state_aead_nonce_and_aad(&canon, 1);
+        let fs_tag = chacha20_poly1305_encrypt_in_place(&aead_key, &n_fs, &aad_fs, fs_flat);
+
+        let sql_flat = self.sql.as_flattened_mut();
+        let (n_sql, aad_sql) = state_aead_nonce_and_aad(&canon, 2);
+        let sql_tag = chacha20_poly1305_encrypt_in_place(&aead_key, &n_sql, &aad_sql, sql_flat);
+
+        zeroize_secret_bytes(&mut aead_key);
+
+        let wal_hdr = &mut self.wal[0];
+        wal_hdr[0..8].copy_from_slice(&STATE_AEAD_MAGIC);
+        wal_hdr[8..20].copy_from_slice(&canon);
+        wal_hdr[20..36].copy_from_slice(&wal_tag);
+        wal_hdr[36..52].copy_from_slice(&fs_tag);
+        wal_hdr[52..68].copy_from_slice(&sql_tag);
+        true
+    }
+
+    /// Authenticate and decrypt a [`STATE_AEAD_MAGIC`] (`CTTLAE03`) encrypted slot image
+    /// in place, zeroizing the entire [`StateImage`] and returning `false` on any tag or
+    /// format mismatch.
+    pub fn decrypt_in_place(&mut self, seal_key: &[u8; DURABLE_DIGEST_LEN]) -> bool {
+        let Some((canon, wal_tag, fs_tag, sql_tag)) = self.aead_envelope() else {
+            return false;
+        };
+        if !is_seal_key_set(seal_key) {
+            self.clear();
+            return false;
+        }
+        let mut aead_key = derive_disk_aead_key(seal_key);
+
+        let (n_wal, aad_wal) = state_aead_nonce_and_aad(&canon, 0);
+        let wal_ok = chacha20_poly1305_decrypt_in_place(
+            &aead_key,
+            &n_wal,
+            &aad_wal,
+            &mut self.wal.as_flattened_mut()[68..],
+            &wal_tag,
+        );
+
+        let (n_fs, aad_fs) = state_aead_nonce_and_aad(&canon, 1);
+        let fs_ok = chacha20_poly1305_decrypt_in_place(
+            &aead_key,
+            &n_fs,
+            &aad_fs,
+            self.fs.as_flattened_mut(),
+            &fs_tag,
+        );
+
+        let (n_sql, aad_sql) = state_aead_nonce_and_aad(&canon, 2);
+        let sql_ok = chacha20_poly1305_decrypt_in_place(
+            &aead_key,
+            &n_sql,
+            &aad_sql,
+            self.sql.as_flattened_mut(),
+            &sql_tag,
+        );
+
+        zeroize_secret_bytes(&mut aead_key);
+
+        if !(wal_ok & fs_ok & sql_ok) {
+            self.clear();
+            return false;
+        }
+        let wal_flat = self.wal.as_flattened_mut();
+        wal_flat.copy_within(68..184, 0);
+        wal_flat[116..184].fill(0);
+        true
+    }
+}
+
+/// 8-byte magic prefix of an `AB_FORMAT_V3` `ChaCha20-Poly1305` encrypted [`StateImage`] slot.
+pub const STATE_AEAD_MAGIC: [u8; 8] = *b"CTTLAE03";
+
+fn state_aead_nonce_and_aad(
+    canon_nonce: &[u8; AEAD_NONCE_LEN],
+    part_id: u8,
+) -> ([u8; AEAD_NONCE_LEN], [u8; 25]) {
+    let mut nonce = *canon_nonce;
+    nonce[11] = (nonce[11] & 0x3F) | ((part_id & 0x03) << 6);
+    let mut aad = [0u8; 25];
+    aad[0..12].copy_from_slice(b"CTTLAE03-AAD");
+    aad[12] = part_id;
+    aad[13..25].copy_from_slice(canon_nonce);
+    (nonce, aad)
 }
 
 /// The step of [`commit`] that failed.
@@ -613,14 +759,30 @@ pub fn commit<D: SectorIo>(
     }
 
     // 2. Point of no return: record that the shadow slot holds the new state.
-    let in_flight = AbCommitHeader {
-        state: AB_STATE_IN_FLIGHT,
-        format_version: AB_FORMAT_V2,
-        boots,
-        commit_seq,
-        wal_sha: digests.wal,
-        fs_sha: digests.fs,
-        sql_sha: digests.sql,
+    let in_flight = if let Some((aead_nonce, wal_tag, fs_tag, sql_tag)) = image.aead_envelope() {
+        AbCommitHeader {
+            state: AB_STATE_IN_FLIGHT,
+            format_version: AB_FORMAT_V3,
+            boots,
+            commit_seq,
+            wal_sha: digests.wal,
+            fs_sha: digests.fs,
+            sql_sha: digests.sql,
+            aead_nonce,
+            wal_tag,
+            fs_tag,
+            sql_tag,
+        }
+    } else {
+        AbCommitHeader::unencrypted(
+            AB_STATE_IN_FLIGHT,
+            AB_FORMAT_V2,
+            boots,
+            commit_seq,
+            digests.wal,
+            digests.fs,
+            digests.sql,
+        )
     };
     match write_commit_record(dev, key, layout, &in_flight).map_err(io(CommitStage::Journal))? {
         true => {}
@@ -712,7 +874,8 @@ pub fn recover<D: SectorIo>(
     let mut commit_sec = [0u8; SECTOR_BYTES];
     let commit_readable = dev.read_sector(layout.commit_lba, &mut commit_sec).is_ok();
     let commit = if commit_readable {
-        verify_ab_commit_sector(key, &commit_sec).filter(|h| h.format_version == AB_FORMAT_V2)
+        verify_ab_commit_sector(key, &commit_sec)
+            .filter(|h| h.format_version == AB_FORMAT_V2 || h.format_version == AB_FORMAT_V3)
     } else {
         None
     };
@@ -758,8 +921,14 @@ pub fn recover<D: SectorIo>(
         state: AB_STATE_QUIESCENT,
         ..hdr
     };
+    let slot_matches = |img: &StateImage| -> bool {
+        img.digests().matches(&hdr)
+            && (hdr.format_version != AB_FORMAT_V3
+                || img.aead_envelope()
+                    == Some((hdr.aead_nonce, hdr.wal_tag, hdr.fs_tag, hdr.sql_tag)))
+    };
 
-    if primary_read.is_ok() && out.digests().matches(&hdr) {
+    if primary_read.is_ok() && slot_matches(out) {
         // The primary slot is the committed state. Restore redundancy if the
         // shadow copy no longer matches (an interrupted later commit, or
         // damage at rest), then close the record if it was left IN_FLIGHT.
@@ -785,7 +954,7 @@ pub fn recover<D: SectorIo>(
     // The primary slot is not the committed state. Only the shadow slot can
     // still hold it.
     read_slot(dev, layout, Slot::Shadow, out).map_err(RecoverError::Io)?;
-    if !out.digests().matches(&hdr) {
+    if !slot_matches(out) {
         return Err(RecoverError::Unrecoverable(hdr));
     }
     result.source = if hdr.state == AB_STATE_IN_FLIGHT {
@@ -1014,6 +1183,14 @@ pub enum BootError {
     Io(IoFault),
     /// Restored state could not be committed back to the store.
     Persist(PersistError),
+    /// Whole-disk rollback detected: the recovered `commit_seq` (`found`) is strictly below
+    /// the externally anchored `min_commit_seq` floor (`min_expected`).
+    Rollback {
+        /// `commit_seq` found on the disk (`0` when wiped/unjournaled).
+        found: u64,
+        /// Minimum `commit_seq` required by the external high-water mark.
+        min_expected: u64,
+    },
 }
 
 /// What a successful [`ShellStore::commit`] did.
@@ -1031,15 +1208,16 @@ pub enum Committed {
 }
 
 /// The durable state of one node: the store layout, the commit sequence,
-/// and a scratch image.
+/// external anti-rollback floor, and a scratch image.
 ///
-/// 13 KiB. Kernel code keeps it in a `static`.
+/// 26.5 KiB. Kernel code keeps it in a `static`.
 pub struct ShellStore {
     layout: StoreLayout,
     quarantine_lba: u64,
     commit_seq: u64,
-    /// Digests of the image known to be in both slots, if any.
-    stored: Option<ImageDigests>,
+    min_commit_seq: u64,
+    /// Digests of the plaintext image known to be encrypted in both slots, if any.
+    stored_plain: Option<ImageDigests>,
     image: StateImage,
 }
 
@@ -1050,7 +1228,8 @@ impl ShellStore {
             layout,
             quarantine_lba,
             commit_seq: 0,
-            stored: None,
+            min_commit_seq: 0,
+            stored_plain: None,
             image: StateImage::zeroed(),
         }
     }
@@ -1060,10 +1239,23 @@ impl ShellStore {
         self.commit_seq
     }
 
-    /// Make the current state of `sh` durable, stamped with generation `boots`.
+    /// High-water `commit_seq` anti-rollback floor enforced on [`ShellStore::boot`].
+    pub const fn min_commit_seq(&self) -> u64 {
+        self.min_commit_seq
+    }
+
+    /// Anchor a minimum required `commit_seq` (from TPM NV or Triad coordinator).
+    /// [`ShellStore::boot`] refuses any disk state whose `commit_seq` is below `min_seq`
+    /// with [`BootError::Rollback`].
+    pub fn set_min_commit_seq(&mut self, min_seq: u64) {
+        self.min_commit_seq = min_seq;
+    }
+
+    /// Make the current state of `sh` durable, stamped with generation `boots`,
+    /// encrypted at rest under `ChaCha20-Poly1305` (`AB_FORMAT_V3` / [`STATE_AEAD_MAGIC`]).
     ///
     /// Returns [`Committed::Unchanged`] without touching the device when the
-    /// packed image equals the stored one. After `Err`, the state is **not**
+    /// packed plaintext image equals the stored one. After `Err`, the state is **not**
     /// known to be durable: the caller must not acknowledge the request that
     /// changed it, and must not carry on as if it were saved.
     pub fn commit<D: SectorIo>(
@@ -1075,16 +1267,25 @@ impl ShellStore {
         let records = sh
             .pack_state_image(boots, &mut self.image)
             .map_err(PersistError::Pack)?;
-        let digests = self.image.digests();
-        if self.stored == Some(digests) {
+        let plain_digests = self.image.digests();
+        if self.stored_plain == Some(plain_digests) {
             return Ok(Committed::Unchanged);
         }
         let seq = self.commit_seq.wrapping_add(1);
         let key = sh.seal_key;
+        let nonce_base = derive_commit_nonce(&key, boots, seq, &plain_digests, sh.vault_entropy_snapshot());
+        if !self.image.encrypt_in_place(&key, &nonce_base) {
+            self.stored_plain = None;
+            return Err(PersistError::Commit(CommitError::KeyUnset));
+        }
         match commit(dev, &key, &self.layout, boots, seq, &self.image) {
             Ok(hdr) => {
                 self.commit_seq = seq;
-                self.stored = Some(digests);
+                if seq > self.min_commit_seq {
+                    self.min_commit_seq = seq;
+                }
+                sh.commit_seq = seq;
+                self.stored_plain = Some(plain_digests);
                 Ok(Committed::Written {
                     commit: hdr,
                     records,
@@ -1093,8 +1294,52 @@ impl ShellStore {
             Err(e) => {
                 // The slots are in an unknown intermediate state until the
                 // next recovery; forget what we believed was stored.
-                self.stored = None;
+                self.stored_plain = None;
                 Err(PersistError::Commit(e))
+            }
+        }
+    }
+
+    /// Decrypt `self.image` in place when it carries a `CTTLAE03` AEAD envelope,
+    /// returning `Ok(true)` if the slot was pre-v3 legacy plaintext (needs upgrade).
+    fn decrypt_slot_if_needed(
+        &mut self,
+        seal_key: &[u8; DURABLE_DIGEST_LEN],
+        commit_hdr: Option<&AbCommitHeader>,
+    ) -> Result<bool, ()> {
+        match commit_hdr {
+            Some(hdr) if hdr.format_version == AB_FORMAT_V3 => {
+                if self.image.aead_envelope()
+                    != Some((hdr.aead_nonce, hdr.wal_tag, hdr.fs_tag, hdr.sql_tag))
+                {
+                    self.image.clear();
+                    return Err(());
+                }
+                if !self.image.decrypt_in_place(seal_key) {
+                    return Err(());
+                }
+                Ok(false)
+            }
+            Some(hdr) if hdr.format_version == AB_FORMAT_V2 => {
+                if self.image.aead_envelope().is_some() {
+                    self.image.clear();
+                    return Err(());
+                }
+                Ok(true)
+            }
+            Some(_) => {
+                self.image.clear();
+                Err(())
+            }
+            None => {
+                if self.image.aead_envelope().is_some() {
+                    if !self.image.decrypt_in_place(seal_key) {
+                        return Err(());
+                    }
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
             }
         }
     }
@@ -1109,9 +1354,17 @@ impl ShellStore {
     ) -> Result<StateRestore, BootError> {
         let key = sh.seal_key;
         match recover(dev, &key, &self.layout, &mut self.image) {
-            Ok(r) if r.source != RecoverySource::Empty => sh
-                .unpack_state_image(&self.image)
-                .map_err(|_| BootError::Io(IoFault::DeviceError)),
+            Ok(r) if r.source != RecoverySource::Empty => {
+                let legacy_plain = self
+                    .decrypt_slot_if_needed(&key, r.commit.as_ref())
+                    .map_err(|()| BootError::Io(IoFault::DeviceError))?;
+                let mut restore = sh
+                    .unpack_state_image(&self.image)
+                    .map_err(|_| BootError::Io(IoFault::DeviceError))?;
+                restore.migrated_legacy |= legacy_plain;
+                sh.commit_seq = r.commit.map(|h| h.commit_seq).unwrap_or(0);
+                Ok(restore)
+            }
             Ok(_) => Err(BootError::Io(IoFault::NotReady)),
             Err(RecoverError::KeyUnset) => Err(BootError::KeyUnset),
             Err(RecoverError::BadLayout) => Err(BootError::BadLayout),
@@ -1153,15 +1406,23 @@ impl ShellStore {
         if recovery.source == RecoverySource::Empty {
             return Ok(None);
         }
-        if let Some((restore, boots)) = self.try_load(sh, keys, counter_boots) {
-            return Ok(Some((recovery, restore, boots)));
+        if let Ok(legacy_plain) =
+            self.decrypt_slot_if_needed(&keys.seal, recovery.commit.as_ref())
+        {
+            if let Some((mut restore, boots)) = self.try_load(sh, keys, counter_boots) {
+                restore.migrated_legacy |= legacy_plain;
+                return Ok(Some((recovery, restore, boots)));
+            }
         }
         if recovery.source == RecoverySource::Unjournaled {
-            // No commit record vouches for either slot, so the per-partition
-            // seals decide. The primary failed them; give the shadow its turn.
+            // No commit record vouches for either slot, so the AEAD tags and
+            // per-partition seals decide. The primary failed them; give the shadow its turn.
             read_slot(dev, layout, Slot::Shadow, &mut self.image).map_err(BootError::Io)?;
-            if let Some((restore, boots)) = self.try_load(sh, keys, counter_boots) {
-                return Ok(Some((recovery, restore, boots)));
+            if let Ok(legacy_plain) = self.decrypt_slot_if_needed(&keys.seal, None) {
+                if let Some((mut restore, boots)) = self.try_load(sh, keys, counter_boots) {
+                    restore.migrated_legacy |= legacy_plain;
+                    return Ok(Some((recovery, restore, boots)));
+                }
             }
         }
         Ok(None)
@@ -1332,7 +1593,7 @@ impl ShellStore {
         counter_boots: u64,
     ) -> Result<BootReport, BootError> {
         self.commit_seq = 0;
-        self.stored = None;
+        self.stored_plain = None;
         if !is_seal_key_set(&keys.seal) {
             return Err(BootError::KeyUnset);
         }
@@ -1341,7 +1602,8 @@ impl ShellStore {
         }
         let layout = self.layout;
 
-        // A blank disk is the one case with nothing to restore or preserve.
+        // A blank disk is the one case with nothing to restore or preserve
+        // (unless an external high-water `min_commit_seq` proves the disk was wiped).
         // An unreadable sector is not blank.
         let mut commit_sec = [0u8; SECTOR_BYTES];
         let commit_blank = dev.read_sector(layout.commit_lba, &mut commit_sec).is_ok()
@@ -1352,6 +1614,12 @@ impl ShellStore {
             && self.image.is_all_zero();
         if primary_blank && shadow_blank && commit_blank {
             reset_shell(sh, keys, counter_boots);
+            if self.min_commit_seq > 0 {
+                return Err(BootError::Rollback {
+                    found: 0,
+                    min_expected: self.min_commit_seq,
+                });
+            }
             return Ok(BootReport {
                 outcome: BootOutcome::Fresh,
                 boots: counter_boots,
@@ -1363,15 +1631,27 @@ impl ShellStore {
             None => self.try_migrate_v1(dev, sh, keys, counter_boots)?,
         };
         if let Some((recovery, restore, boots)) = found {
-            self.commit_seq = recovery.commit.map(|h| h.commit_seq).unwrap_or(0);
+            let found_seq = recovery.commit.map(|h| h.commit_seq).unwrap_or(0);
+            if found_seq < self.min_commit_seq {
+                reset_shell(sh, keys, counter_boots);
+                return Err(BootError::Rollback {
+                    found: found_seq,
+                    min_expected: self.min_commit_seq,
+                });
+            }
+            self.commit_seq = found_seq;
+            sh.commit_seq = found_seq;
             let mut recommitted = false;
             if recovery.source == RecoverySource::Unjournaled || restore.migrated_legacy {
                 // Re-establish the commit record and both slots in the
-                // current format before anything else depends on them.
+                // current encrypted v3 format before anything else depends on them.
                 self.commit(dev, sh, boots).map_err(BootError::Persist)?;
                 recommitted = true;
             } else {
-                self.stored = Some(self.image.digests());
+                self.stored_plain = Some(self.image.digests());
+            }
+            if self.commit_seq > self.min_commit_seq {
+                self.min_commit_seq = self.commit_seq;
             }
             // Verified state is running again: an old quarantined copy is
             // superseded, so free the area for the next incident.
@@ -1398,9 +1678,17 @@ impl ShellStore {
             if let Some((recovery, restore, boots)) =
                 self.recover_and_load(dev, &q_layout, sh, keys, counter_boots)?
             {
+                let found_seq = recovery.commit.map(|h| h.commit_seq).unwrap_or(0);
+                if found_seq < self.min_commit_seq {
+                    reset_shell(sh, keys, counter_boots);
+                    return Err(BootError::Rollback {
+                        found: found_seq,
+                        min_expected: self.min_commit_seq,
+                    });
+                }
                 // An earlier boot set this state aside and this boot can
                 // verify it: put it back and release the quarantine area.
-                self.commit_seq = recovery.commit.map(|h| h.commit_seq).unwrap_or(0);
+                self.commit_seq = found_seq;
                 self.commit(dev, sh, boots).map_err(BootError::Persist)?;
                 clear_quarantine(dev, self.quarantine_lba).map_err(BootError::Io)?;
                 return Ok(BootReport {
@@ -1426,6 +1714,30 @@ impl ShellStore {
             boots: counter_boots,
         })
     }
+}
+
+fn derive_commit_nonce(
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+    boots: u64,
+    seq: u64,
+    plain: &ImageDigests,
+    entropy_sample: u64,
+) -> [u8; AEAD_NONCE_LEN] {
+    let mut msg = [0u8; 18 + 8 + 8 + 96 + 8];
+    msg[0..18].copy_from_slice(b"CTTLAE03-NONCE-v1:");
+    msg[18..26].copy_from_slice(&boots.to_le_bytes());
+    msg[26..34].copy_from_slice(&seq.to_le_bytes());
+    msg[34..66].copy_from_slice(&plain.wal);
+    msg[66..98].copy_from_slice(&plain.fs);
+    msg[98..130].copy_from_slice(&plain.sql);
+    msg[130..138].copy_from_slice(&entropy_sample.to_le_bytes());
+    let mut mac = [0u8; DURABLE_DIGEST_LEN];
+    seal_bytes_keyed(seal_key, &msg, &mut mac);
+    let mut nonce = [0u8; AEAD_NONCE_LEN];
+    nonce[0..8].copy_from_slice(&seq.to_le_bytes());
+    nonce[8..12].copy_from_slice(&mac[0..4]);
+    nonce[11] &= 0x3F;
+    nonce
 }
 
 /// In-memory [`SectorIo`] with a volatile write cache and fault injection.
@@ -3131,15 +3443,15 @@ mod node_tests {
                     .expect("write v1 slot");
             }
             if journaled {
-                let hdr = AbCommitHeader {
-                    state: AB_STATE_QUIESCENT,
-                    format_version: AB_FORMAT_V1,
-                    boots: 3,
-                    commit_seq: 5,
-                    wal_sha: hash_sector_slice(&wal_secs),
-                    fs_sha: hash_sector_slice(&fs_secs),
-                    sql_sha: hash_sector_slice(&sql_secs),
-                };
+                let hdr = AbCommitHeader::unencrypted(
+                    AB_STATE_QUIESCENT,
+                    AB_FORMAT_V1,
+                    3,
+                    5,
+                    hash_sector_slice(&wal_secs),
+                    hash_sector_slice(&fs_secs),
+                    hash_sector_slice(&sql_secs),
+                );
                 let mut csec = [0u8; SECTOR_BYTES];
                 assert!(pack_ab_commit_sector(&sh.seal_key, &hdr, &mut csec));
                 // Verify pre-upgrade wire format (`out[9] == 0`).
@@ -3179,12 +3491,13 @@ mod node_tests {
             }
             assert_eq!(report.boots, 4);
             assert_eq!(st.commit_seq(), expect_seq);
+            assert_eq!(sh.commit_seq, expect_seq);
             assert_eq!(generation(&mut sh), "v1-migrated");
             assert_eq!(sh.fw.as_slice().len(), 1);
             assert_eq!(sh.auth_seq, 42);
             let csec = disk.peek(AHCI_STATE_LAYOUT.commit_lba);
-            let hdr = verify_ab_commit_sector(&keys().seal, &csec).expect("v2 commit sector");
-            assert_eq!(hdr.format_version, AB_FORMAT_V2);
+            let hdr = verify_ab_commit_sector(&keys().seal, &csec).expect("v3 commit sector");
+            assert_eq!(hdr.format_version, AB_FORMAT_V3);
             assert_eq!(hdr.commit_seq, expect_seq);
         }
 
@@ -3287,6 +3600,162 @@ mod node_tests {
         assert_eq!(
             sql(&mut sh2, "SELECT v FROM extra WHERE k = 'ext_057_delta'"),
             "v\npayload_057_echo_foxtrot\n"
+        );
+    }
+
+    #[test]
+    fn v3_encrypted_store_leaves_zero_plaintext_on_disk_and_migrates_v2() {
+        let mut disk = MemDisk::new(DISK_SECTORS);
+        let mut sh = fresh_shell(1);
+        assert!(run(
+            &mut sh,
+            "write /var/topsecret_customer_ssn.txt SSN-987-65-4321-CONFIDENTIAL"
+        )
+        .starts_with("wrote "));
+        assert_eq!(
+            sql(
+                &mut sh,
+                "INSERT INTO kv VALUES ('customer_pii', 'ACME-PAYROLL-TOKEN-9999', 7)"
+            ),
+            "INSERT 1\n"
+        );
+        assert!(run(&mut sh, "cron add 15 echo-secret-cron-token").starts_with("cron: scheduled"));
+
+        let mut st = store();
+        st.commit(&mut disk, &mut sh, 1).expect("commit v3");
+        disk.reboot();
+
+        // 1. Inspect raw primary & shadow slots (`1040..=1148`): starts with `CTTLAE03`,
+        //    and ZERO plaintext partition magics, filenames, file contents, SQL strings,
+        //    or cron strings appear anywhere on disk!
+        let mut raw_slots = Vec::with_capacity(2 * STATE_IMAGE_SECTORS * SECTOR_BYTES);
+        for lba in AHCI_STATE_LAYOUT.primary_lba..AHCI_STATE_LAYOUT.primary_lba + STATE_IMAGE_SECTORS as u64 {
+            raw_slots.extend_from_slice(&disk.peek(lba));
+        }
+        for lba in AHCI_STATE_LAYOUT.shadow_lba..AHCI_STATE_LAYOUT.shadow_lba + STATE_IMAGE_SECTORS as u64 {
+            raw_slots.extend_from_slice(&disk.peek(lba));
+        }
+        assert_eq!(&disk.peek(AHCI_STATE_LAYOUT.primary_lba)[0..8], &STATE_AEAD_MAGIC);
+        assert_eq!(&disk.peek(AHCI_STATE_LAYOUT.shadow_lba)[0..8], &STATE_AEAD_MAGIC);
+        for needle in [
+            &b"CTTLSHL1"[..],
+            &b"CTTLFS01"[..],
+            &b"CTTLSQL1"[..],
+            &b"topsecret_customer_ssn"[..],
+            &b"SSN-987-65-4321"[..],
+            &b"customer_pii"[..],
+            &b"ACME-PAYROLL-TOKEN"[..],
+            &b"echo-secret-cron-token"[..],
+        ] {
+            assert!(
+                !raw_slots.windows(needle.len()).any(|w| w == needle),
+                "plaintext {:?} leaked onto raw disk sectors!",
+                core::str::from_utf8(needle)
+            );
+        }
+        let csec = disk.peek(AHCI_STATE_LAYOUT.commit_lba);
+        let chdr = verify_ab_commit_sector(&keys().seal, &csec).expect("v3 commit");
+        assert_eq!(chdr.format_version, AB_FORMAT_V3);
+
+        // 2. Clean reboot decrypts and restores every byte.
+        let (report, mut sh2, _) = boot(&mut disk, &keys(), 2);
+        assert!(matches!(report.outcome, BootOutcome::Restored { recommitted: false, .. }));
+        assert_eq!(
+            run(&mut sh2, "cat /var/topsecret_customer_ssn.txt"),
+            "SSN-987-65-4321-CONFIDENTIAL\n"
+        );
+        assert_eq!(
+            sql(&mut sh2, "SELECT v FROM kv WHERE k = 'customer_pii'"),
+            "v\nACME-PAYROLL-TOKEN-9999\n"
+        );
+
+        // 3. Pre-upgrade unencrypted `AB_FORMAT_V2` disk migrates cleanly to encrypted `AB_FORMAT_V3`.
+        let mut v2_disk = MemDisk::new(DISK_SECTORS);
+        let mut plain_img = Box::new(StateImage::zeroed());
+        sh2.pack_state_image(2, &mut plain_img).expect("pack plain v2");
+        assert_eq!(&plain_img.wal[0][0..8], b"CTTLSHL1");
+        commit(&mut v2_disk, &keys().seal, &AHCI_STATE_LAYOUT, 2, 9, &plain_img)
+            .expect("write unencrypted v2 store");
+        v2_disk.reboot();
+        assert_eq!(
+            verify_ab_commit_sector(&keys().seal, &v2_disk.peek(AHCI_STATE_LAYOUT.commit_lba))
+                .unwrap()
+                .format_version,
+            AB_FORMAT_V2
+        );
+
+        let (mig_rep, mut sh_mig, st_mig) = boot(&mut v2_disk, &keys(), 3);
+        assert!(matches!(mig_rep.outcome, BootOutcome::Restored { recommitted: true, .. }));
+        assert_eq!(st_mig.commit_seq(), 10);
+        assert_eq!(
+            &v2_disk.peek(AHCI_STATE_LAYOUT.primary_lba)[0..8],
+            &STATE_AEAD_MAGIC
+        );
+        assert_eq!(
+            verify_ab_commit_sector(&keys().seal, &v2_disk.peek(AHCI_STATE_LAYOUT.commit_lba))
+                .unwrap()
+                .format_version,
+            AB_FORMAT_V3
+        );
+        assert_eq!(
+            run(&mut sh_mig, "cat /var/topsecret_customer_ssn.txt"),
+            "SSN-987-65-4321-CONFIDENTIAL\n"
+        );
+    }
+
+    #[test]
+    fn anti_rollback_min_commit_seq_rejects_stale_disk_snapshot() {
+        let mut disk = MemDisk::new(DISK_SECTORS);
+        let mut sh = fresh_shell(1);
+        apply_generation(&mut sh, "gen-1");
+        let mut st = store();
+        st.commit(&mut disk, &mut sh, 1).expect("commit 1");
+        assert_eq!(st.commit_seq(), 1);
+
+        // Snapshot the entire validly-sealed disk at `commit_seq == 1`.
+        let mut stale_snapshot: Vec<[u8; SECTOR_BYTES]> =
+            (0..DISK_SECTORS).map(|lba| disk.peek(lba as u64)).collect();
+
+        // Advance live disk to `commit_seq == 3`.
+        apply_generation(&mut sh, "gen-2");
+        st.commit(&mut disk, &mut sh, 1).expect("commit 2");
+        apply_generation(&mut sh, "gen-3");
+        st.commit(&mut disk, &mut sh, 1).expect("commit 3");
+        assert_eq!(st.commit_seq(), 3);
+        assert_eq!(sh.commit_seq, 3);
+
+        // Replace every sector on disk with the older validly-sealed `seq == 1` snapshot.
+        for (lba, sec) in stale_snapshot.drain(..).enumerate() {
+            disk.write_sector(lba as u64, &sec).unwrap();
+        }
+        disk.flush().unwrap();
+        disk.reboot();
+
+        // With `min_commit_seq == 3` anchored from TPM/coordinator, booting the `seq == 1`
+        // snapshot fails closed with `BootError::Rollback { found: 1, min_expected: 3 }`
+        // and never leaves `gen-1` live in `sh_boot`.
+        let mut sh_boot = Box::new(OsShell::empty());
+        let mut st_boot = store();
+        st_boot.set_min_commit_seq(3);
+        assert_eq!(
+            st_boot.boot(&mut disk, &mut sh_boot, &keys(), 2),
+            Err(BootError::Rollback {
+                found: 1,
+                min_expected: 3,
+            })
+        );
+        assert!(sh_boot.fs.stat(b"/var/gen").is_err());
+
+        // Wiping the disk to all-zero when `min_commit_seq == 3` is also caught as rollback (`found: 0`).
+        let mut wiped = MemDisk::new(DISK_SECTORS);
+        let mut st_wiped = store();
+        st_wiped.set_min_commit_seq(3);
+        assert_eq!(
+            st_wiped.boot(&mut wiped, &mut sh_boot, &keys(), 2),
+            Err(BootError::Rollback {
+                found: 0,
+                min_expected: 3,
+            })
         );
     }
 }
