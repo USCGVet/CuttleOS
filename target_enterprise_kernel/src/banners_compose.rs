@@ -585,9 +585,9 @@ static FS_PART_SECTORS: spin::Mutex<[[u8; 512]; target_enterprise::shell::SHELL_
 static SQL_PART_SECTORS_BUF: spin::Mutex<[[u8; 512]; target_enterprise::SQL_PART_SECTORS]> =
     spin::Mutex::new([[0u8; 512]; target_enterprise::SQL_PART_SECTORS]);
 
-/// The node's durable state on the AHCI disk: primary slot `LBA 1040..=1065`,
-/// shadow slot `1072..=1097`, commit record `1098`, quarantine area
-/// `1152..=1205`. All ordering, verification and recovery decisions live in
+/// The node's durable state on the AHCI disk: primary slot `LBA 1040..=1092`,
+/// shadow slot `1096..=1148`, commit record `1149`, quarantine area
+/// `1216..=1323`. All ordering, verification and recovery decisions live in
 /// [`target_enterprise::state_store`], where they are tested against a
 /// fault-injecting disk; this file only supplies the device and reports.
 static SHELL_STORE: spin::Mutex<target_enterprise::state_store::ShellStore> =
@@ -768,7 +768,7 @@ pub(crate) fn shell_store_boot() {
                 "SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)\n",
             );
             serial_write_str(
-                "SHELL resume NOTICE: unverifiable state preserved in quarantine (LBA 1152..1205)\n",
+                "SHELL resume NOTICE: unverifiable state preserved in quarantine (LBA 1216..1323)\n",
             );
             sh.record_net_audit(
                 cuttle_contracts::AuditVerdict::Denied,
@@ -879,7 +879,7 @@ fn run_shell_compose_fixtures(
 /// reads back `/var/boot.ok`, spawns PID 5, verifies capability-gated
 /// `SYS_OPEN` (`EPERM` before `grant 5 fs`, `ret=0` after), executes user
 /// ELF64 `/bin/fib 10`, persists the keyed HMAC-SHA256-sealed WAL to physical AHCI
-/// sectors `1040..=1041`, and verifies round-trip restoration from AHCI while
+/// sectors `1040..=1044`, and verifies round-trip restoration from AHCI while
 /// preserving operator VFS, firewall, cron, SQL, and anti-replay state across reboots.
 #[inline(never)]
 pub(crate) fn banner_shell_compose() {
@@ -951,8 +951,8 @@ pub(crate) fn banner_shell_compose() {
         }
     } else {
         run_shell_compose_fixtures(sh, boots, &mut out);
-        // Commit the sealed journal (F + T + W + Q = 4 records), 16-sector FS partition and
-        // 8-sector SQL partition to the AHCI disk, then read the disk back into a second shell.
+        // Commit the sealed journal (F + T + W + Q = 4 records), 32-sector FS partition and
+        // 16-sector SQL partition to the AHCI disk, then read the disk back into a second shell.
         match persist_shell_to_ahci(sh, boots) {
             Ok(Committed::Written { records: 4, .. }) => {}
             Ok(_) => panic!("SHELL compose: AHCI persist expected 4 records"),
@@ -1021,7 +1021,7 @@ pub(crate) fn banner_shell_compose() {
     serial_write_str(" quote=verified\n");
     let av_df = vsh.exec_line(b"df", boots, 0, 0, &mut out);
     if &out[..av_df.bytes_written()]
-        != b"fs: magic=CTTLFS01 inodes=5/16 pool_bytes=704/4096 part_sectors=16\n"
+        != b"fs: magic=CTTLFS01 inodes=5/24 pool_bytes=704/10240 part_sectors=32\n"
     {
         panic!("SHELL compose: df output drift");
     }
@@ -1029,7 +1029,7 @@ pub(crate) fn banner_shell_compose() {
     if !out[..av_sync.bytes_written()].starts_with(b"sync: ok files=1 bytes=6 seal=") {
         panic!("SHELL compose: sync output drift");
     }
-    serial_write_str("FS partition OK lba=1042..1057 sectors=16 files=1 magic=CTTLFS01\n");
+    serial_write_str("FS partition OK lba=1045..1076 sectors=32 files=1 magic=CTTLFS01\n");
     #[cfg(not(cuttle_prod))]
     verify_https_and_concurrent_tcp_compose();
     verify_service_runtime_compose(vsh);

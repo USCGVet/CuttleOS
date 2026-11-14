@@ -545,6 +545,30 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         Some((&slot.path[..slot.path_len as usize], &self.pool[start..end]))
     }
 
+    /// Inspect the modification timestamp (`mtime`) of an occupied inode slot (`0..I`).
+    pub fn inode_mtime(&self, idx: usize) -> Option<u64> {
+        if idx >= I || !self.inodes[idx].used {
+            return None;
+        }
+        Some(self.inodes[idx].mtime)
+    }
+
+    /// Update the modification timestamp (`mtime`) of an existing regular file.
+    pub fn set_mtime(&mut self, path: &[u8], mtime: u64) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
+        let mut norm = [0u8; FS_PATH_MAX];
+        let n = normalise_path(path, &mut norm)?;
+        if &norm[..n] == b"/" {
+            return Err(FsError::IsADir);
+        }
+        let idx = self.find_inode(&norm[..n]).ok_or(FsError::NotFound)?;
+        self.inodes[idx].mtime = mtime;
+        self.mutation_seq = self.mutation_seq.wrapping_add(1);
+        Ok(())
+    }
+
     /// Remove a file by path. Returns [`FsError::ReadOnly`] if mounted read-only,
     /// [`FsError::NotFound`] if absent, or [`FsError::Busy`] if any open handle
     /// references the inode.

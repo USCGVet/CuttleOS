@@ -9,14 +9,15 @@
 //! - `UPDATE <name> SET <col> = <val> [WHERE <col> <op> <val>]`
 //! - `DELETE FROM <name> [WHERE <col> <op> <val>]`
 //! - `.tables` / `SHOW TABLES` and `.schema` / `DESCRIBE <name>`
-//! - Deterministic 8-sector (`4 KiB`) AHCI partition serialization (`CTTLSQL1`)
-//!   protected by a chained keyed `HMAC-SHA256` tag.
+//! - Deterministic 16-sector (`8 KiB`) AHCI partition serialization (`CTTLSQL1`)
+//!   protected by a keyed `HMAC-SHA256` tag (with automatic migration from legacy
+//!   8-sector `4 KiB` v1 images).
 
 #![allow(clippy::needless_range_loop)]
 
-use crate::durable_seal::{
-    is_seal_key_set, seal_bytes_keyed, seal_matches_keyed, DURABLE_DIGEST_LEN,
-};
+use crate::durable_seal::{is_seal_key_set, DURABLE_DIGEST_LEN};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 /// Maximum number of relational tables in a [`SqlDb`] instance.
 pub const SQL_MAX_TABLES: usize = 4;
@@ -28,8 +29,10 @@ pub const SQL_MAX_ROWS: usize = 64;
 pub const SQL_IDENT_LEN: usize = 16;
 /// Maximum byte length of a `TEXT` cell value.
 pub const SQL_TEXT_LEN: usize = 24;
-/// Number of 512-byte disk sectors used to persist [`SqlDb`] (`4 KiB`).
-pub const SQL_PART_SECTORS: usize = 8;
+/// Pre-upgrade v1 sector count for [`SqlDb`] (`4 KiB`).
+pub const SQL_PART_SECTORS_V1: usize = 8;
+/// Number of 512-byte disk sectors used to persist [`SqlDb`] (`8 KiB`).
+pub const SQL_PART_SECTORS: usize = 16;
 /// 8-byte superblock magic for the persistent SQL partition (`CTTLSQL1`).
 pub const SQL_PART_MAGIC: &[u8; 8] = b"CTTLSQL1";
 /// Sentinel value for [`SqlTable::indexed_col`] when no secondary index is defined.
@@ -206,6 +209,8 @@ impl SqlColumn {
 pub struct SqlRow {
     /// Whether this row slot is occupied.
     pub used: bool,
+    /// Optional 96-bit per-row AEAD nonce metadata (`[0u8; 12]` for ordinary SQL rows).
+    pub meta96: [u8; 12],
     /// Cell values indexed by column position.
     pub cells: [SqlVal; SQL_MAX_COLS],
 }
@@ -215,6 +220,7 @@ impl SqlRow {
     pub const fn empty() -> Self {
         Self {
             used: false,
+            meta96: [0u8; 12],
             cells: [SqlVal::zero_int(); SQL_MAX_COLS],
         }
     }
@@ -310,6 +316,7 @@ impl SqlTable {
         let mut r = 0usize;
         while r < SQL_MAX_ROWS {
             self.rows[r].used = false;
+            self.rows[r].meta96 = [0u8; 12];
             let mut k = 0usize;
             while k < SQL_MAX_COLS {
                 self.rows[r].cells[k] = SqlVal::zero_int();
@@ -701,6 +708,14 @@ impl SqlDb {
             while rk < rcount {
                 let row = self.committed_row(t_idx, row_order[rk]);
                 h = mix_byte(h, 0x5A);
+                if row.meta96 != [0u8; 12] {
+                    h = mix_byte(h, 4);
+                    let mut mi = 0usize;
+                    while mi < 12 {
+                        h = mix_byte(h, row.meta96[mi]);
+                        mi += 1;
+                    }
+                }
                 let mut c_idx = 0usize;
                 while c_idx < col_count {
                     match &row.cells[c_idx] {
@@ -754,6 +769,9 @@ impl SqlDb {
             while r < SQL_MAX_ROWS {
                 let row = &tbl.rows[r];
                 if row.used {
+                    if row.meta96 != [0u8; 12] {
+                        pos += 13;
+                    }
                     let mut c = 0usize;
                     while c < col_count {
                         pos += match row.cells[c] {
@@ -1381,7 +1399,7 @@ impl SqlDb {
         if self.serialized_partition_bytes() > SQL_PART_SECTORS * 512 - 8 {
             self.tables[t_idx].reset_in_place();
             return copy_str(
-                b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)\n",
+                b"error: SQL partition capacity full (8 KiB CTTLSQL1 limit)\n",
                 out,
             );
         }
@@ -1438,7 +1456,7 @@ impl SqlDb {
             > SQL_PART_SECTORS * 512 - 8
         {
             return copy_str(
-                b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)\n",
+                b"error: SQL partition capacity full (8 KiB CTTLSQL1 limit)\n",
                 out,
             );
         }
@@ -1604,7 +1622,7 @@ impl SqlDb {
                     if self.serialized_partition_bytes() > SQL_PART_SECTORS * 512 - 8 {
                         self.tables[t_idx].rows[r] = prev_row;
                         return copy_str(
-                            b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)\n",
+                            b"error: SQL partition capacity full (8 KiB CTTLSQL1 limit)\n",
                             out,
                         );
                     }
@@ -1644,7 +1662,7 @@ impl SqlDb {
         if self.serialized_partition_bytes() > SQL_PART_SECTORS * 512 - 8 {
             self.tables[t_idx].rows[r_idx] = SqlRow::empty();
             return copy_str(
-                b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)\n",
+                b"error: SQL partition capacity full (8 KiB CTTLSQL1 limit)\n",
                 out,
             );
         }
@@ -2032,7 +2050,7 @@ impl SqlDb {
                     > SQL_PART_SECTORS * 512 - 8
             {
                 return copy_str(
-                    b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)\n",
+                    b"error: SQL partition capacity full (8 KiB CTTLSQL1 limit)\n",
                     out,
                 );
             }
@@ -2196,6 +2214,9 @@ impl SqlDb {
             while r < SQL_MAX_ROWS {
                 let row = self.committed_row(t, r);
                 if row.used {
+                    if row.meta96 != [0u8; 12] {
+                        pos += 13;
+                    }
                     let mut c = 0usize;
                     while c < col_count {
                         pos += match row.cells[c] {
@@ -2232,34 +2253,42 @@ impl SqlDb {
         key: &[u8; DURABLE_DIGEST_LEN],
         sectors: &mut [[u8; 512]; SQL_PART_SECTORS],
     ) -> Result<(), SqlSaveError> {
+        self.try_save_partition_slices(key, &mut sectors[..])
+    }
+
+    fn try_save_partition_slices(
+        &self,
+        key: &[u8; DURABLE_DIGEST_LEN],
+        sectors: &mut [[u8; 512]],
+    ) -> Result<(), SqlSaveError> {
         let mut s = 0usize;
-        while s < SQL_PART_SECTORS {
+        while s < sectors.len() {
             sectors[s] = [0u8; 512];
             s += 1;
         }
         if !is_seal_key_set(key) {
             return Err(SqlSaveError::KeyUnset);
         }
-        if self.committed_partition_bytes() > SQL_PART_SECTORS * 512 {
+        let total_bytes = sectors.len() * 512;
+        if total_bytes < 512 || self.committed_partition_bytes() > total_bytes {
             return Err(SqlSaveError::TooLarge);
         }
-        let mut flat = [0u8; SQL_PART_SECTORS * 512];
-        flat[0..8].copy_from_slice(SQL_PART_MAGIC);
+        sec_write_slice(sectors, 0, SQL_PART_MAGIC);
         let committed_seq = self.committed_seq();
-        flat[8..16].copy_from_slice(&committed_seq.to_le_bytes());
+        sec_write_slice(sectors, 8, &committed_seq.to_le_bytes());
 
         // Header layout:
         //   0..8   : SQL_PART_MAGIC ("CTTLSQL1")
         //   8..16  : tx_seq (u64 LE)
         //   16..18 : payload_len (u16 LE)
         //   18..20 : reserved (0)
-        //   20..52 : 32-byte keyed HMAC-SHA256 tag over flat[0..20] || flat[52..4096]
+        //   20..52 : 32-byte keyed HMAC-SHA256 tag over [0..20] || [52..total_bytes]
         let mut pos = 52usize;
         let mut t = 0usize;
         while t < SQL_MAX_TABLES {
             let tbl = &self.tables[t];
             if !tbl.used {
-                flat[pos] = 0;
+                sec_set(sectors, pos, 0);
                 pos += 1;
                 t += 1;
                 continue;
@@ -2267,29 +2296,29 @@ impl SqlDb {
             let col_count = (tbl.col_count as usize).min(SQL_MAX_COLS);
             let has_idx = tbl.index_name_len > 0 && (tbl.indexed_col as usize) < col_count;
             let used_rows_hdr_pos = pos + 3;
-            flat[pos] = if has_idx { 2 } else { 1 };
-            flat[pos + 1] = tbl.name_len.min(SQL_IDENT_LEN as u8);
-            flat[pos + 2] = col_count as u8;
-            flat[pos + 3] = 0;
+            sec_set(sectors, pos, if has_idx { 2 } else { 1 });
+            sec_set(sectors, pos + 1, tbl.name_len.min(SQL_IDENT_LEN as u8));
+            sec_set(sectors, pos + 2, col_count as u8);
+            sec_set(sectors, pos + 3, 0);
             pos += 4;
-            flat[pos..pos + SQL_IDENT_LEN].copy_from_slice(&tbl.name);
+            sec_write_slice(sectors, pos, &tbl.name);
             pos += SQL_IDENT_LEN;
 
             let mut c = 0usize;
             while c < col_count {
-                flat[pos] = tbl.cols[c].name_len.min(SQL_IDENT_LEN as u8);
-                flat[pos + 1] = tbl.cols[c].col_type as u8;
+                sec_set(sectors, pos, tbl.cols[c].name_len.min(SQL_IDENT_LEN as u8));
+                sec_set(sectors, pos + 1, tbl.cols[c].col_type as u8);
                 pos += 2;
-                flat[pos..pos + SQL_IDENT_LEN].copy_from_slice(&tbl.cols[c].name);
+                sec_write_slice(sectors, pos, &tbl.cols[c].name);
                 pos += SQL_IDENT_LEN;
                 c += 1;
             }
 
             if has_idx {
                 let ilen = (tbl.index_name_len as usize).min(SQL_IDENT_LEN);
-                flat[pos] = tbl.indexed_col;
-                flat[pos + 1] = ilen as u8;
-                flat[pos + 2..pos + 2 + ilen].copy_from_slice(&tbl.index_name[..ilen]);
+                sec_set(sectors, pos, tbl.indexed_col);
+                sec_set(sectors, pos + 1, ilen as u8);
+                sec_write_slice(sectors, pos + 2, &tbl.index_name[..ilen]);
                 pos += 2 + ilen;
             }
 
@@ -2298,8 +2327,8 @@ impl SqlDb {
             while r2 < SQL_MAX_ROWS {
                 let row = self.committed_row(t, r2);
                 if row.used {
-                    // Compute exact serialized byte length of this row first.
-                    let mut row_bytes = 0usize;
+                    let has_meta = row.meta96 != [0u8; 12];
+                    let mut row_bytes = if has_meta { 13usize } else { 0usize };
                     let mut rc0 = 0usize;
                     while rc0 < col_count {
                         row_bytes += match row.cells[rc0] {
@@ -2314,31 +2343,38 @@ impl SqlDb {
                         };
                         rc0 += 1;
                     }
-                    // `committed_partition_bytes` was checked above, so every row fits.
-                    // Refuse outright if that ever stops holding; never drop a row.
-                    if pos + row_bytes > flat.len() {
+                    if pos + row_bytes > total_bytes {
+                        let mut z = 0usize;
+                        while z < sectors.len() {
+                            sectors[z] = [0u8; 512];
+                            z += 1;
+                        }
                         return Err(SqlSaveError::TooLarge);
+                    }
+                    if has_meta {
+                        sec_set(sectors, pos, 4);
+                        sec_write_slice(sectors, pos + 1, &row.meta96);
+                        pos += 13;
                     }
                     let mut rc = 0usize;
                     while rc < col_count {
                         match row.cells[rc] {
                             SqlVal::Int(v) => {
                                 if v >= (i16::MIN as i64) && v <= (i16::MAX as i64) {
-                                    flat[pos] = 3; // compact i16 cell tag
-                                    flat[pos + 1..pos + 3]
-                                        .copy_from_slice(&(v as i16).to_le_bytes());
+                                    sec_set(sectors, pos, 3);
+                                    sec_write_slice(sectors, pos + 1, &(v as i16).to_le_bytes());
                                     pos += 3;
                                 } else {
-                                    flat[pos] = SqlType::Int as u8;
-                                    flat[pos + 1..pos + 9].copy_from_slice(&v.to_le_bytes());
+                                    sec_set(sectors, pos, SqlType::Int as u8);
+                                    sec_write_slice(sectors, pos + 1, &v.to_le_bytes());
                                     pos += 9;
                                 }
                             }
                             SqlVal::Text(buf, len) => {
                                 let l = (len as usize).min(SQL_TEXT_LEN);
-                                flat[pos] = SqlType::Text as u8;
-                                flat[pos + 1] = l as u8;
-                                flat[pos + 2..pos + 2 + l].copy_from_slice(&buf[..l]);
+                                sec_set(sectors, pos, SqlType::Text as u8);
+                                sec_set(sectors, pos + 1, l as u8);
+                                sec_write_slice(sectors, pos + 2, &buf[..l]);
                                 pos += 2 + l;
                             }
                         }
@@ -2348,31 +2384,29 @@ impl SqlDb {
                 }
                 r2 += 1;
             }
-            flat[used_rows_hdr_pos] = written_rows;
+            sec_set(sectors, used_rows_hdr_pos, written_rows);
             t += 1;
         }
 
         let payload_len = pos - 52;
-        flat[16..18].copy_from_slice(&(payload_len as u16).to_le_bytes());
+        sec_write_slice(sectors, 16, &(payload_len as u16).to_le_bytes());
 
-        // Compute keyed HMAC-SHA256 over header metadata (0..20) and the full remaining partition (52..4096).
-        let rest_len = flat.len() - 52;
-        let mut mac_input = [0u8; SQL_PART_SECTORS * 512];
-        mac_input[0..20].copy_from_slice(&flat[0..20]);
-        mac_input[20..20 + rest_len].copy_from_slice(&flat[52..]);
         let mut tag = [0u8; DURABLE_DIGEST_LEN];
-        seal_bytes_keyed(key, &mac_input[..20 + rest_len], &mut tag);
-        flat[20..52].copy_from_slice(&tag);
-
-        let mut s = 0usize;
-        while s < SQL_PART_SECTORS {
-            sectors[s].copy_from_slice(&flat[s * 512..(s + 1) * 512]);
-            s += 1;
-        }
+        sql_part_hmac(key, sectors, &mut tag);
+        sectors[0][20..52].copy_from_slice(&tag);
         Ok(())
     }
 
-    /// Restore the database from an 8-sector (`4 KiB`) partition image after verifying
+    #[cfg(test)]
+    pub(crate) fn try_save_partition_v1(
+        &self,
+        key: &[u8; DURABLE_DIGEST_LEN],
+        sectors: &mut [[u8; 512]; SQL_PART_SECTORS_V1],
+    ) -> Result<(), SqlSaveError> {
+        self.try_save_partition_slices(key, &mut sectors[..])
+    }
+
+    /// Restore the database from a 16-sector (`8 KiB`) partition image after verifying
     /// the `CTTLSQL1` (or legacy `PRTSSQL1`) magic and constant-time keyed `HMAC-SHA256` tag.
     pub fn load_partition(
         &mut self,
@@ -2382,7 +2416,7 @@ impl SqlDb {
         self.load_partition_with_legacy(key, &[0u8; DURABLE_DIGEST_LEN], sectors)
     }
 
-    /// Restore the database from an 8-sector (`4 KiB`) partition image, verifying
+    /// Restore the database from a 16-sector (`8 KiB`) partition image, verifying
     /// `CTTLSQL1` with `key` or legacy `PRTSSQL1` with device-derived `key` / `legacy_key`.
     pub fn load_partition_with_legacy(
         &mut self,
@@ -2390,49 +2424,62 @@ impl SqlDb {
         legacy_key: &[u8; DURABLE_DIGEST_LEN],
         sectors: &[[u8; 512]; SQL_PART_SECTORS],
     ) -> bool {
-        let mut flat = [0u8; SQL_PART_SECTORS * 512];
-        let mut s = 0usize;
-        while s < SQL_PART_SECTORS {
-            flat[s * 512..(s + 1) * 512].copy_from_slice(&sectors[s]);
-            s += 1;
-        }
-        let is_legacy = &flat[0..8] == b"PRTSSQL1";
-        if &flat[0..8] != SQL_PART_MAGIC && !is_legacy {
+        self.load_partition_slices(key, legacy_key, &sectors[..])
+    }
+
+    /// Restore the database from a pre-upgrade 8-sector (`4 KiB`) v1 partition image.
+    pub fn load_partition_v1(
+        &mut self,
+        key: &[u8; DURABLE_DIGEST_LEN],
+        legacy_key: &[u8; DURABLE_DIGEST_LEN],
+        sectors: &[[u8; 512]; SQL_PART_SECTORS_V1],
+    ) -> bool {
+        self.load_partition_slices(key, legacy_key, &sectors[..])
+    }
+
+    /// Verify the magic, HMAC-SHA256 seal, and complete table/row framing of a
+    /// `CTTLSQL1` (or legacy `PRTSSQL1`) partition slice without mutating any [`SqlDb`].
+    pub fn validate_partition_slices(
+        key: &[u8; DURABLE_DIGEST_LEN],
+        legacy_key: &[u8; DURABLE_DIGEST_LEN],
+        sectors: &[[u8; 512]],
+    ) -> bool {
+        if sectors.is_empty() {
             return false;
         }
-        let payload_len = u16::from_le_bytes([flat[16], flat[17]]) as usize;
-        if 52 + payload_len > flat.len() {
+        let total_bytes = sectors.len() * 512;
+        let is_legacy = &sectors[0][0..8] == b"PRTSSQL1";
+        if &sectors[0][0..8] != SQL_PART_MAGIC && !is_legacy {
+            return false;
+        }
+        let payload_len = u16::from_le_bytes([sectors[0][16], sectors[0][17]]) as usize;
+        if 52 + payload_len > total_bytes {
             return false;
         }
         let total_pos = 52 + payload_len;
 
-        let rest_len = flat.len() - 52;
-        let mut mac_input = [0u8; SQL_PART_SECTORS * 512];
-        mac_input[0..20].copy_from_slice(&flat[0..20]);
-        mac_input[20..20 + rest_len].copy_from_slice(&flat[52..]);
         let mut tag_in = [0u8; DURABLE_DIGEST_LEN];
-        tag_in.copy_from_slice(&flat[20..52]);
-        let mac_slice = &mac_input[..20 + rest_len];
+        tag_in.copy_from_slice(&sectors[0][20..52]);
         let tag_ok = if is_legacy {
-            (is_seal_key_set(key) && seal_matches_keyed(key, mac_slice, &tag_in))
+            (is_seal_key_set(key) && sql_part_hmac_matches(key, sectors, &tag_in))
                 || (is_seal_key_set(legacy_key)
-                    && seal_matches_keyed(legacy_key, mac_slice, &tag_in))
+                    && sql_part_hmac_matches(legacy_key, sectors, &tag_in))
         } else {
-            is_seal_key_set(key) && seal_matches_keyed(key, mac_slice, &tag_in)
+            is_seal_key_set(key) && sql_part_hmac_matches(key, sectors, &tag_in)
         };
         if !tag_ok {
             return false;
         }
 
-        // Pass 1: validate the entire serialized payload structure without allocating
-        // multi-kilobyte `SqlTable` temporaries on the bare-metal kernel stack.
+        // Validate the entire serialized payload structure without allocating
+        // multi-kilobyte `SqlTable` or partition temporaries on the bare-metal kernel stack.
         let mut scan = 52usize;
         let mut st = 0usize;
         while st < SQL_MAX_TABLES {
             if scan >= total_pos {
                 return false;
             }
-            let marker = flat[scan];
+            let marker = sec_get(sectors, scan);
             if marker == 0 {
                 scan += 1;
                 st += 1;
@@ -2441,8 +2488,8 @@ impl SqlDb {
             if scan + 4 + SQL_IDENT_LEN > total_pos {
                 return false;
             }
-            let col_count = (flat[scan + 2].min(SQL_MAX_COLS as u8)) as usize;
-            let used_rows = (flat[scan + 3] as usize).min(SQL_MAX_ROWS);
+            let col_count = (sec_get(sectors, scan + 2).min(SQL_MAX_COLS as u8)) as usize;
+            let used_rows = (sec_get(sectors, scan + 3) as usize).min(SQL_MAX_ROWS);
             scan += 4 + SQL_IDENT_LEN;
 
             if scan + col_count * (2 + SQL_IDENT_LEN) > total_pos {
@@ -2454,8 +2501,8 @@ impl SqlDb {
                 if scan + 2 > total_pos {
                     return false;
                 }
-                let idx_col = flat[scan];
-                let ilen = (flat[scan + 1] as usize).min(SQL_IDENT_LEN);
+                let idx_col = sec_get(sectors, scan);
+                let ilen = (sec_get(sectors, scan + 1) as usize).min(SQL_IDENT_LEN);
                 if scan + 2 + ilen > total_pos || (idx_col as usize) >= col_count {
                     return false;
                 }
@@ -2464,17 +2511,23 @@ impl SqlDb {
 
             let mut sr = 0usize;
             while sr < used_rows {
+                if scan < total_pos && sec_get(sectors, scan) == 4 {
+                    if scan + 13 > total_pos {
+                        return false;
+                    }
+                    scan += 13;
+                }
                 let mut sc = 0usize;
                 while sc < col_count {
                     if scan >= total_pos {
                         return false;
                     }
-                    let tag_b = flat[scan];
+                    let tag_b = sec_get(sectors, scan);
                     if tag_b == SqlType::Text as u8 {
                         if scan + 2 > total_pos {
                             return false;
                         }
-                        let len = (flat[scan + 1] as usize).min(SQL_TEXT_LEN);
+                        let len = (sec_get(sectors, scan + 1) as usize).min(SQL_TEXT_LEN);
                         if scan + 2 + len > total_pos {
                             return false;
                         }
@@ -2484,11 +2537,13 @@ impl SqlDb {
                             return false;
                         }
                         scan += 3;
-                    } else {
+                    } else if tag_b == SqlType::Int as u8 {
                         if scan + 9 > total_pos {
                             return false;
                         }
                         scan += 9;
+                    } else {
+                        return false;
                     }
                     sc += 1;
                 }
@@ -2496,16 +2551,27 @@ impl SqlDb {
             }
             st += 1;
         }
-        if scan != total_pos {
+        scan == total_pos
+    }
+
+    fn load_partition_slices(
+        &mut self,
+        key: &[u8; DURABLE_DIGEST_LEN],
+        legacy_key: &[u8; DURABLE_DIGEST_LEN],
+        sectors: &[[u8; 512]],
+    ) -> bool {
+        if !Self::validate_partition_slices(key, legacy_key, sectors) {
             return false;
         }
+        let payload_len = u16::from_le_bytes([sectors[0][16], sectors[0][17]]) as usize;
+        let total_pos = 52 + payload_len;
 
-        // Pass 2: payload is verified valid; decode directly into `self.tables` in-place.
+        // Payload is verified valid; decode directly into `self.tables` in-place.
         let mut pos = 52usize;
         let mut t = 0usize;
         while t < SQL_MAX_TABLES {
             self.tables[t].reset_in_place();
-            let marker = flat[pos];
+            let marker = sec_get(sectors, pos);
             if marker == 0 {
                 pos += 1;
                 t += 1;
@@ -2513,56 +2579,63 @@ impl SqlDb {
             }
             let tbl = &mut self.tables[t];
             tbl.used = true;
-            tbl.name_len = flat[pos + 1].min(SQL_IDENT_LEN as u8);
-            tbl.col_count = flat[pos + 2].min(SQL_MAX_COLS as u8);
-            let used_rows = (flat[pos + 3] as usize).min(SQL_MAX_ROWS);
+            tbl.name_len = sec_get(sectors, pos + 1).min(SQL_IDENT_LEN as u8);
+            tbl.col_count = sec_get(sectors, pos + 2).min(SQL_MAX_COLS as u8);
+            let used_rows = (sec_get(sectors, pos + 3) as usize).min(SQL_MAX_ROWS);
             pos += 4;
-            tbl.name.copy_from_slice(&flat[pos..pos + SQL_IDENT_LEN]);
+            sec_copy_out(sectors, pos, &mut tbl.name);
             pos += SQL_IDENT_LEN;
 
             let col_count = tbl.col_count as usize;
             let mut c = 0usize;
             while c < col_count {
-                tbl.cols[c].name_len = flat[pos].min(SQL_IDENT_LEN as u8);
-                tbl.cols[c].col_type = if flat[pos + 1] == SqlType::Text as u8 {
+                tbl.cols[c].name_len = sec_get(sectors, pos).min(SQL_IDENT_LEN as u8);
+                tbl.cols[c].col_type = if sec_get(sectors, pos + 1) == SqlType::Text as u8 {
                     SqlType::Text
                 } else {
                     SqlType::Int
                 };
                 pos += 2;
-                tbl.cols[c].name.copy_from_slice(&flat[pos..pos + SQL_IDENT_LEN]);
+                sec_copy_out(sectors, pos, &mut tbl.cols[c].name);
                 pos += SQL_IDENT_LEN;
                 c += 1;
             }
 
             if marker == 2 {
-                let idx_col = flat[pos];
-                let ilen = (flat[pos + 1] as usize).min(SQL_IDENT_LEN);
+                let idx_col = sec_get(sectors, pos);
+                let ilen = (sec_get(sectors, pos + 1) as usize).min(SQL_IDENT_LEN);
                 tbl.indexed_col = idx_col;
                 tbl.index_name_len = ilen as u8;
-                tbl.index_name[..ilen].copy_from_slice(&flat[pos + 2..pos + 2 + ilen]);
+                sec_copy_out(sectors, pos + 2, &mut tbl.index_name[..ilen]);
                 pos += 2 + ilen;
             }
 
             let mut r = 0usize;
             while r < used_rows {
                 tbl.rows[r].used = true;
+                if pos < total_pos && sec_get(sectors, pos) == 4 {
+                    sec_copy_out(sectors, pos + 1, &mut tbl.rows[r].meta96);
+                    pos += 13;
+                } else {
+                    tbl.rows[r].meta96 = [0u8; 12];
+                }
                 let mut rc = 0usize;
                 while rc < col_count {
-                    let tag_b = flat[pos];
+                    let tag_b = sec_get(sectors, pos);
                     if tag_b == SqlType::Text as u8 {
-                        let len = (flat[pos + 1] as usize).min(SQL_TEXT_LEN);
+                        let len = (sec_get(sectors, pos + 1) as usize).min(SQL_TEXT_LEN);
                         let mut buf = [0u8; SQL_TEXT_LEN];
-                        buf[..len].copy_from_slice(&flat[pos + 2..pos + 2 + len]);
+                        sec_copy_out(sectors, pos + 2, &mut buf[..len]);
                         tbl.rows[r].cells[rc] = SqlVal::Text(buf, len as u8);
                         pos += 2 + len;
                     } else if tag_b == 3 {
-                        let v16 = i16::from_le_bytes([flat[pos + 1], flat[pos + 2]]);
+                        let v16 =
+                            i16::from_le_bytes([sec_get(sectors, pos + 1), sec_get(sectors, pos + 2)]);
                         tbl.rows[r].cells[rc] = SqlVal::Int(v16 as i64);
                         pos += 3;
                     } else {
                         let mut vb = [0u8; 8];
-                        vb.copy_from_slice(&flat[pos + 1..pos + 9]);
+                        sec_copy_out(sectors, pos + 1, &mut vb);
                         tbl.rows[r].cells[rc] = SqlVal::Int(i64::from_le_bytes(vb));
                         pos += 9;
                     }
@@ -2575,7 +2648,7 @@ impl SqlDb {
         }
 
         let mut tx_bytes = [0u8; 8];
-        tx_bytes.copy_from_slice(&flat[8..16]);
+        tx_bytes.copy_from_slice(&sectors[0][8..16]);
         self.tx_seq = u64::from_le_bytes(tx_bytes);
         self.tx_active = false;
         self.tx_owner = 0;
@@ -2585,6 +2658,133 @@ impl SqlDb {
         self.tx_aborted_owner = 0;
         true
     }
+
+    /// Read the 96-bit AEAD nonce metadata attached to row `key` in `kv` under
+    /// Read Committed visibility for `owner`.
+    pub fn kv_row_meta96(&self, owner: u64, key: &[u8]) -> Option<[u8; 12]> {
+        let t_idx = self.find_table(b"kv")?;
+        if self.tables[t_idx].col_count == 0 {
+            return None;
+        }
+        let target = SqlVal::try_from_text(key)?;
+        let use_committed = self.tx_active && self.tx_owner != owner;
+        let mut r = 0usize;
+        while r < SQL_MAX_ROWS {
+            let row = self.visible_row(t_idx, r, use_committed);
+            if row.used && row.cells[0].compare(CmpOp::Eq, &target) {
+                return Some(row.meta96);
+            }
+            r += 1;
+        }
+        None
+    }
+
+    /// Attach 96-bit AEAD nonce metadata to row `key` in `kv` on behalf of `owner`,
+    /// enforcing transaction ownership, undo logging, and the 8 KiB `CTTLSQL1` budget.
+    pub fn set_kv_row_meta96(&mut self, owner: u64, key: &[u8], meta96: [u8; 12]) -> bool {
+        if self.tx_active && self.tx_owner != owner {
+            return false;
+        }
+        if self.tx_aborted && self.tx_aborted_owner == owner {
+            return false;
+        }
+        let Some(t_idx) = self.find_table(b"kv") else {
+            return false;
+        };
+        if self.tables[t_idx].col_count == 0 {
+            return false;
+        }
+        let Some(target) = SqlVal::try_from_text(key) else {
+            return false;
+        };
+        let mut r = 0usize;
+        while r < SQL_MAX_ROWS {
+            if self.tables[t_idx].rows[r].used
+                && self.tables[t_idx].rows[r].cells[0].compare(CmpOp::Eq, &target)
+            {
+                if !self.can_record_row_undo(t_idx, r) {
+                    return false;
+                }
+                let prev_meta = self.tables[t_idx].rows[r].meta96;
+                let extra = if prev_meta == [0u8; 12] && meta96 != [0u8; 12] {
+                    13usize
+                } else {
+                    0usize
+                };
+                if extra > 0
+                    && self.serialized_partition_bytes().saturating_add(extra)
+                        > SQL_PART_SECTORS * 512 - 8
+                {
+                    return false;
+                }
+                self.record_row_undo(t_idx, r);
+                self.tables[t_idx].rows[r].meta96 = meta96;
+                return true;
+            }
+            r += 1;
+        }
+        false
+    }
+}
+
+#[inline]
+fn sec_get(sectors: &[[u8; 512]], pos: usize) -> u8 {
+    sectors[pos / 512][pos % 512]
+}
+
+#[inline]
+fn sec_set(sectors: &mut [[u8; 512]], pos: usize, val: u8) {
+    sectors[pos / 512][pos % 512] = val;
+}
+
+#[inline]
+fn sec_write_slice(sectors: &mut [[u8; 512]], pos: usize, src: &[u8]) {
+    let mut i = 0usize;
+    while i < src.len() {
+        sectors[(pos + i) / 512][(pos + i) % 512] = src[i];
+        i += 1;
+    }
+}
+
+#[inline]
+fn sec_copy_out(sectors: &[[u8; 512]], pos: usize, dst: &mut [u8]) {
+    let mut i = 0usize;
+    while i < dst.len() {
+        dst[i] = sectors[(pos + i) / 512][(pos + i) % 512];
+        i += 1;
+    }
+}
+
+fn sql_part_hmac(
+    key: &[u8; DURABLE_DIGEST_LEN],
+    sectors: &[[u8; 512]],
+    out: &mut [u8; DURABLE_DIGEST_LEN],
+) {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts 32-byte key");
+    mac.update(&sectors[0][0..20]);
+    mac.update(&sectors[0][52..512]);
+    let mut s = 1usize;
+    while s < sectors.len() {
+        mac.update(&sectors[s]);
+        s += 1;
+    }
+    out.copy_from_slice(&mac.finalize().into_bytes());
+}
+
+fn sql_part_hmac_matches(
+    key: &[u8; DURABLE_DIGEST_LEN],
+    sectors: &[[u8; 512]],
+    expected: &[u8; DURABLE_DIGEST_LEN],
+) -> bool {
+    let mut actual = [0u8; DURABLE_DIGEST_LEN];
+    sql_part_hmac(key, sectors, &mut actual);
+    let mut diff = 0u8;
+    let mut i = 0usize;
+    while i < DURABLE_DIGEST_LEN {
+        diff |= actual[i] ^ expected[i];
+        i += 1;
+    }
+    diff == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -3799,12 +3999,10 @@ mod tests {
                 "INSERT INTO big VALUES ('a-{bulk:04}-padpadpadpadpadpa', 'b-{bulk:04}-padpadpadpadpadpa', 'c-{bulk:04}-padpadpadpadpadpa', 'd-{bulk:04}-padpadpadpadpadpa')"
             );
             let n = db.exec(q.as_bytes(), &mut out);
-            if &out[..n] != b"INSERT 1
-" {
+            if &out[..n] != b"INSERT 1\n" {
                 assert_eq!(
                     &out[..n],
-                    b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)
-"
+                    b"error: SQL partition capacity full (8 KiB CTTLSQL1 limit)\n"
                 );
                 break;
             }
@@ -3834,7 +4032,7 @@ mod tests {
         let n = db.exec(b"CREATE INDEX idx_kv_key_name0 ON kv (k)", &mut out);
         assert_eq!(
             &out[..n],
-            b"error: SQL partition capacity full (4 KiB CTTLSQL1 limit)\n"
+            b"error: SQL partition capacity full (8 KiB CTTLSQL1 limit)\n"
         );
         assert_eq!(db.tx_seq, seq, "a refused statement must not change the database");
 

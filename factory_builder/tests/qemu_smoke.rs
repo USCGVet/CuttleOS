@@ -292,16 +292,21 @@ fn boots_under_qemu_and_emits_banner() {
     );
     {
         let ahci_bytes = std::fs::read(&ahci_disk).expect("read ahci_hw.img after boot 1");
-        let commit_off = 1098 * 512;
+        let commit_off = 1149 * 512;
         assert_eq!(
             &ahci_bytes[commit_off..commit_off + 8],
             b"CTTLAB01",
-            "QEMU smoke: expected CTTLAB01 atomic journal commit sector at LBA 1098"
+            "QEMU smoke: expected CTTLAB01 atomic journal commit sector at LBA 1149"
         );
         assert_eq!(
             ahci_bytes[commit_off + 8],
             0x02,
-            "QEMU smoke: expected AB_STATE_QUIESCENT (0x02) at LBA 1098 after clean commit"
+            "QEMU smoke: expected AB_STATE_QUIESCENT (0x02) at LBA 1149 after clean commit"
+        );
+        assert_eq!(
+            ahci_bytes[commit_off + 9],
+            0x02,
+            "QEMU smoke: expected AB_FORMAT_V2 (0x02) at LBA 1149 after clean commit"
         );
     }
     if log_contents.contains("CONTINUITY resume OK") {
@@ -457,7 +462,7 @@ const REQUIRED_BANNERS: &[&str] = &[
     "WEB+SQL+SESSION compose OK tables=2 rows=6 magic=CTTLSQL1",
     "SECCOMP: OK engine=ebpf filter=enforced",
     "ATTEST: OK seed=",
-    "FS partition OK lba=1042..1057 sectors=16 files=1 magic=CTTLFS01",
+    "FS partition OK lba=1045..1076 sectors=32 files=1 magic=CTTLFS01",
     "HTTPS compose OK slots=16 port=443 tls13=rustls bytes=882 sha=83e47624",
     "SVC_RUNTIME: OK role=full->wfe->full svcs=3 kpti=isolated seccomp=deny-default rot=1",
     "SHELL compose OK tasks=5 files=5 audit=5",
@@ -785,8 +790,8 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
         );
     }
 
-    // The store keeps two copies of the state (primary slot LBA 1040..=1065,
-    // shadow slot LBA 1072..=1097) under one HMAC-sealed commit record.
+    // The store keeps two copies of the state (primary slot LBA 1040..=1092,
+    // shadow slot LBA 1096..=1148) under one HMAC-sealed commit record at LBA 1149.
     //
     // Case 1: damage one copy. Flip a byte of the sealed journal sector in the
     // primary slot (LBA 1041, offset 8). The tampered bytes must never be
@@ -820,8 +825,8 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
         "boot 2 did not leave a sealed primary slot behind"
     );
     assert_eq!(
-        &healed[1040 * 512..1066 * 512],
-        &healed[1072 * 512..1098 * 512],
+        &healed[1040 * 512..1093 * 512],
+        &healed[1096 * 512..1149 * 512],
         "after the repair both slots must hold the same image"
     );
 
@@ -830,11 +835,11 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
     // reject it and must NOT resume, exactly as before. What changes is
     // that the rejected sectors are set aside instead of being overwritten.
     let mut disk_bytes = healed;
-    let shadow_wal = 1073 * 512 + 8;
+    let shadow_wal = 1097 * 512 + 8;
     disk_bytes[primary_wal] ^= 0xFF;
     disk_bytes[shadow_wal] ^= 0xFF;
-    let rejected_primary = disk_bytes[1040 * 512..1066 * 512].to_vec();
-    let rejected_shadow = disk_bytes[1072 * 512..1098 * 512].to_vec();
+    let rejected_primary = disk_bytes[1040 * 512..1093 * 512].to_vec();
+    let rejected_shadow = disk_bytes[1096 * 512..1149 * 512].to_vec();
     std::fs::write(&tampered_disk, &disk_bytes).expect("write doubly tampered ahci_tamper_test.img");
 
     let (log3, reached3) = vm.boot(&tamper_log, halted);
@@ -858,19 +863,19 @@ fn tampered_ahci_seal_is_rejected_under_qemu() {
         log3
     );
     assert!(
-        log3.contains("SHELL resume NOTICE: unverifiable state preserved in quarantine (LBA 1152..1205)"),
+        log3.contains("SHELL resume NOTICE: unverifiable state preserved in quarantine (LBA 1216..1323)"),
         "tamper test boot 3 did not report preserving the rejected state!\nSerial log:\n{}",
         log3
     );
-    // Quarantine area: primary copy at LBA 1152, shadow copy at 1178, marker at 1205.
+    // Quarantine area: primary copy at LBA 1216..1269, shadow copy at 1269..1322, marker at 1323.
     assert_eq!(
-        &after3[1205 * 512..1205 * 512 + 8],
+        &after3[1323 * 512..1323 * 512 + 8],
         b"CTTLQUA1",
-        "quarantine marker missing at LBA 1205"
+        "quarantine marker missing at LBA 1323"
     );
     assert!(
-        after3[1152 * 512..1178 * 512] == rejected_primary[..]
-            && after3[1178 * 512..1204 * 512] == rejected_shadow[..],
+        after3[1216 * 512..1269 * 512] == rejected_primary[..]
+            && after3[1269 * 512..1322 * 512] == rejected_shadow[..],
         "the quarantine area does not hold the rejected slots byte for byte"
     );
     eprintln!("smoke: one tampered copy was repaired, two were rejected and preserved; TAMPER TEST PASSED");
@@ -1006,12 +1011,12 @@ fn morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu() {
             "morphed kernel seed={seed} (boot #{boot_num}) unexpectedly rejected sealed disk state!\nSerial log:\n{log}"
         );
         // Inspect the persistent AHCI disk sectors for CTTLSHL1 header (LBA 1040),
-        // WAL backing (LBA 1041), CTTLFS01 (LBA 1042), and CTTLSQL1 (LBA 1058) across boots 1 -> 2 -> 3 (Claude #13).
+        // WAL backing (LBA 1041..1045), CTTLFS01 (LBA 1045), and CTTLSQL1 (LBA 1077) across boots 1 -> 2 -> 3 (Claude #13).
         let ahci_bytes = std::fs::read(&ahci_disk).expect("read persistent ahci_multiseed_test.img");
         let shl_hdr = &ahci_bytes[1040 * 512..1041 * 512];
         let shl_wal = &ahci_bytes[1041 * 512..1042 * 512];
-        let fs_slice = &ahci_bytes[1042 * 512..1042 * 512 + 8];
-        let sql_slice = &ahci_bytes[1058 * 512..1058 * 512 + 8];
+        let fs_slice = &ahci_bytes[1045 * 512..1045 * 512 + 8];
+        let sql_slice = &ahci_bytes[1077 * 512..1077 * 512 + 8];
         assert_eq!(
             &shl_hdr[..8],
             b"CTTLSHL1",
@@ -1020,12 +1025,12 @@ fn morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu() {
         assert_eq!(
             fs_slice,
             b"CTTLFS01",
-            "boot #{boot_num} (seed={seed}): missing CTTLFS01 magic at AHCI LBA 1042"
+            "boot #{boot_num} (seed={seed}): missing CTTLFS01 magic at AHCI LBA 1045"
         );
         assert_eq!(
             sql_slice,
             b"CTTLSQL1",
-            "boot #{boot_num} (seed={seed}): missing CTTLSQL1 magic at AHCI LBA 1058"
+            "boot #{boot_num} (seed={seed}): missing CTTLSQL1 magic at AHCI LBA 1077"
         );
         let saved_boots = u64::from_le_bytes(shl_hdr[8..16].try_into().unwrap());
         assert_eq!(

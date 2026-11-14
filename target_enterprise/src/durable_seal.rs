@@ -187,29 +187,35 @@ pub fn zeroize_secret_bytes(buf: &mut [u8]) {
 pub mod ab_journal {
     use super::{is_seal_key_set, seal_bytes, seal_bytes_keyed, seal_matches_keyed, DURABLE_DIGEST_LEN};
 
-    /// 8-byte magic header for the atomic shadow-journal commit sector (`LBA 1098`).
+    /// 8-byte magic header for the atomic shadow-journal commit sector (`LBA 1149` in v2, `LBA 1098` in v1).
     pub const AB_JOURNAL_MAGIC: [u8; 8] = *b"CTTLAB01";
-    /// Journal state `0x01`: `Slot B` (`LBA 1072..1097`) is fully staged and sealed;
-    /// `Slot A` (`LBA 1040..1065`) installation is currently in flight.
+    /// Pre-upgrade v1 state-store layout (`26` sectors per slot: `2` WAL + `16` FS + `8` SQL).
+    pub const AB_FORMAT_V1: u8 = 1;
+    /// Expanded v2 state-store layout (`53` sectors per slot: `5` WAL + `32` FS + `16` SQL).
+    pub const AB_FORMAT_V2: u8 = 2;
+    /// Journal state `0x01`: `Slot B` is fully staged and sealed;
+    /// `Slot A` installation is currently in flight.
     pub const AB_STATE_IN_FLIGHT: u8 = 0x01;
-    /// Journal state `0x02`: `Slot A` (`LBA 1040..1065`) installation completed and flushed;
+    /// Journal state `0x02`: `Slot A` installation completed and flushed;
     /// any subsequent seal mismatch in `Slot A` indicates at-rest tampering.
     pub const AB_STATE_QUIESCENT: u8 = 0x02;
 
-    /// Authenticated metadata stored in the 512-byte journal commit sector (`LBA 1098`).
+    /// Authenticated metadata stored in the 512-byte journal commit sector.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub struct AbCommitHeader {
         /// Transaction phase (`AB_STATE_IN_FLIGHT` or `AB_STATE_QUIESCENT`).
         pub state: u8,
+        /// On-disk slot layout format version (`AB_FORMAT_V1` or `AB_FORMAT_V2`).
+        pub format_version: u8,
         /// Boot generation counter committed in this transaction.
         pub boots: u64,
         /// Monotonic journal commit sequence number.
         pub commit_seq: u64,
-        /// SHA-256 over the 2-sector WAL bundle (`hdr_sec || wal_sec`, 1024 bytes).
+        /// SHA-256 over the journal partition (`5` sectors in v2, `2` sectors in v1).
         pub wal_sha: [u8; DURABLE_DIGEST_LEN],
-        /// SHA-256 over the 16-sector FS partition (`8192` bytes).
+        /// SHA-256 over the FS partition (`32` sectors in v2, `16` sectors in v1).
         pub fs_sha: [u8; DURABLE_DIGEST_LEN],
-        /// SHA-256 over the 8-sector SQL partition (`4096` bytes).
+        /// SHA-256 over the SQL partition (`16` sectors in v2, `8` sectors in v1).
         pub sql_sha: [u8; DURABLE_DIGEST_LEN],
     }
 
@@ -238,7 +244,7 @@ pub mod ab_journal {
         out
     }
 
-    /// Pack and HMAC-SHA256-authenticate a 512-byte journal commit sector (`LBA 1098`).
+    /// Pack and HMAC-SHA256-authenticate a 512-byte journal commit sector.
     pub fn pack_ab_commit_sector(
         key: &[u8; DURABLE_DIGEST_LEN],
         hdr: &AbCommitHeader,
@@ -246,12 +252,20 @@ pub mod ab_journal {
     ) -> bool {
         if !is_seal_key_set(key)
             || (hdr.state != AB_STATE_IN_FLIGHT && hdr.state != AB_STATE_QUIESCENT)
+            || (hdr.format_version != AB_FORMAT_V1 && hdr.format_version != AB_FORMAT_V2)
         {
             return false;
         }
         *out = [0u8; 512];
         out[0..8].copy_from_slice(&AB_JOURNAL_MAGIC);
         out[8] = hdr.state;
+        // Pre-upgrade v1 commit sectors stored `0` at byte `9`; encoding `AB_FORMAT_V1`
+        // as `0` reproduces the exact legacy wire image while `AB_FORMAT_V2` writes `2`.
+        out[9] = if hdr.format_version == AB_FORMAT_V1 {
+            0
+        } else {
+            hdr.format_version
+        };
         out[16..24].copy_from_slice(&hdr.boots.to_le_bytes());
         out[24..32].copy_from_slice(&hdr.commit_seq.to_le_bytes());
         out[32..64].copy_from_slice(&hdr.wal_sha);
@@ -263,7 +277,7 @@ pub mod ab_journal {
         true
     }
 
-    /// Verify a 512-byte journal commit sector (`LBA 1098`) in constant time and decode [`AbCommitHeader`].
+    /// Verify a 512-byte journal commit sector in constant time and decode [`AbCommitHeader`].
     pub fn verify_ab_commit_sector(
         key: &[u8; DURABLE_DIGEST_LEN],
         sec: &[u8; 512],
@@ -275,6 +289,11 @@ pub mod ab_journal {
         if state != AB_STATE_IN_FLIGHT && state != AB_STATE_QUIESCENT {
             return None;
         }
+        let format_version = match sec[9] {
+            0 | AB_FORMAT_V1 => AB_FORMAT_V1,
+            AB_FORMAT_V2 => AB_FORMAT_V2,
+            _ => return None,
+        };
         let mut expected_mac = [0u8; DURABLE_DIGEST_LEN];
         expected_mac.copy_from_slice(&sec[128..160]);
         if !seal_matches_keyed(key, &sec[0..128], &expected_mac) {
@@ -292,6 +311,7 @@ pub mod ab_journal {
         sql_sha.copy_from_slice(&sec[96..128]);
         Some(AbCommitHeader {
             state,
+            format_version,
             boots: u64::from_le_bytes(boots_b),
             commit_seq: u64::from_le_bytes(seq_b),
             wal_sha,
@@ -463,6 +483,7 @@ mod tests {
             &key,
             &AbCommitHeader {
                 state: AB_STATE_QUIESCENT,
+                format_version: AB_FORMAT_V2,
                 boots: 1,
                 commit_seq: 1,
                 wal_sha: w1_sha,
@@ -515,6 +536,7 @@ mod tests {
                 }
                 let in_flight = AbCommitHeader {
                     state: AB_STATE_IN_FLIGHT,
+                    format_version: AB_FORMAT_V2,
                     boots: 2,
                     commit_seq: 2,
                     wal_sha: w2_sha,
@@ -550,6 +572,7 @@ mod tests {
                 }
                 let quiescent = AbCommitHeader {
                     state: AB_STATE_QUIESCENT,
+                    format_version: AB_FORMAT_V2,
                     boots: 2,
                     commit_seq: 2,
                     wal_sha: w2_sha,
@@ -604,6 +627,34 @@ mod tests {
         assert_eq!(
             decide_ab_recovery(false, false, hdr_q, true),
             AbRecoveryDecision::TamperedPrimary
+        );
+
+        // Format version authentication: v1 (`sec[9] == 0`) decodes as `AB_FORMAT_V1`,
+        // v2 (`sec[9] == 2`) decodes as `AB_FORMAT_V2`, and downgrading `sec[9]` fails HMAC.
+        let mut v1_sec = [0u8; 512];
+        assert!(pack_ab_commit_sector(
+            &key,
+            &AbCommitHeader {
+                state: AB_STATE_QUIESCENT,
+                format_version: AB_FORMAT_V1,
+                boots: 1,
+                commit_seq: 9,
+                wal_sha: w1_sha,
+                fs_sha: f1_sha,
+                sql_sha: q1_sha,
+            },
+            &mut v1_sec,
+        ));
+        assert_eq!(v1_sec[9], 0);
+        assert_eq!(
+            verify_ab_commit_sector(&key, &v1_sec).map(|h| h.format_version),
+            Some(AB_FORMAT_V1)
+        );
+        let mut downgraded = base_commit;
+        downgraded[9] = 0;
+        assert!(
+            verify_ab_commit_sector(&key, &downgraded).is_none(),
+            "tampering format_version byte must invalidate commit HMAC"
         );
     }
 }

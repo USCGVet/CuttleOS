@@ -12,7 +12,7 @@ Features:
      rewrites ~15,350 instructions and permutes registers across 787 functions in ~250ms,
      splicing the morphed ELF directly into each VM's BIOS boot image.
   2. Triple Modular Redundancy (TMR) 2-of-3 Majority Vote + 4 KiB RAID Parity verification
-     (D1 ^ D2 = P) across the persistent AHCI SQL partitions (`LBA 1058..1065`, `CTTLSQL1`).
+     (D1 ^ D2 = P) across the persistent AHCI SQL partitions (`LBA 1077..1092`, `CTTLSQL1`).
   3. Zero-downtime Rolling MTD Morph: while 1 OS bounces into a freshly scrambled
      kernel binary, the other 2 OSes serve 100% of reads and writes; when the bounced
      OS wakes up (`SHELL resume OK`), it enters `CATCHING_UP` and automatically replays
@@ -73,9 +73,9 @@ DEVICE_KEY = ROOT / "device_secret_key.bin"
 # Tabbed live operations console served at /console (static page; actions use the operator token).
 CONSOLE_HTML = ROOT / "tools" / "triad_console.html"
 
-# AHCI SQL partition layout (LBA 1058..1065 = 8 sectors = 4096 bytes)
-SQL_PART_OFFSET = 1058 * 512
-SQL_PART_SIZE = 8 * 512
+# AHCI SQL partition layout (LBA 1077..1092 = 16 sectors = 8192 bytes)
+SQL_PART_OFFSET = 1077 * 512
+SQL_PART_SIZE = 16 * 512
 
 
 @dataclass

@@ -11,17 +11,19 @@
 //!
 //! ## On-disk layout
 //!
-//! A [`StateImage`] is 26 sectors: the 2-sector shell header + journal, the
-//! 16-sector filesystem partition and the 8-sector SQL partition. Each
-//! partition carries its own keyed seal. The store keeps two copies plus one
-//! commit sector:
+//! A [`StateImage`] is 53 sectors (`26.5 KiB`): the 5-sector shell header +
+//! `2 KiB` journal, the 32-sector (`16 KiB`, `10 KiB` pool) filesystem partition
+//! and the 16-sector (`8 KiB`) SQL partition. Each partition carries its own
+//! keyed seal. Pre-upgrade v1 disks (`26` sectors per slot: `2` WAL + `16` FS +
+//! `8` SQL at `LBA 1040..=1098`) are authenticated and migrated crash-atomically
+//! to v2 on boot. The store keeps two copies plus one commit sector:
 //!
 //! ```text
-//!   primary slot   layout.primary_lba .. +26   the copy boot normally reads
-//!   shadow slot    layout.shadow_lba  .. +26   a full second copy
+//!   primary slot   layout.primary_lba .. +53   the copy boot normally reads
+//!   shadow slot    layout.shadow_lba  .. +53   a full second copy
 //!   commit sector  layout.commit_lba           HMAC-sealed CTTLAB01 record:
-//!                                              state, boots, commit_seq and
-//!                                              the SHA-256 of each partition
+//!                                              state, format_version, boots,
+//!                                              commit_seq and partition SHA-256s
 //! ```
 //!
 //! ## Commit ([`commit`])
@@ -91,7 +93,7 @@
 
 use crate::durable_seal::ab_journal::{
     hash_sector_slice, pack_ab_commit_sector, verify_ab_commit_sector, AbCommitHeader,
-    AB_STATE_IN_FLIGHT, AB_STATE_QUIESCENT,
+    AB_FORMAT_V1, AB_FORMAT_V2, AB_STATE_IN_FLIGHT, AB_STATE_QUIESCENT,
 };
 use crate::durable_seal::{constant_time_eq, is_seal_key_set, DURABLE_DIGEST_LEN};
 use crate::shell::{OsShell, StatePackError, StateRestore};
@@ -100,14 +102,24 @@ use sha2::{Digest, Sha256};
 
 /// Size of one device sector in bytes.
 pub const SECTOR_BYTES: usize = 512;
-/// Sectors holding the sealed shell header (`CTTLSHL1`) and its journal.
-pub const STATE_WAL_SECTORS: usize = 2;
+/// Sectors holding the sealed shell header (`CTTLSHL1`) and its `2 KiB` journal.
+pub const STATE_WAL_SECTORS: usize = crate::shell::SHELL_JOURNAL_PART_SECTORS;
 /// Sectors holding the sealed filesystem partition (`CTTLFS01`).
 pub const STATE_FS_SECTORS: usize = crate::shell::SHELL_FS_PART_SECTORS;
 /// Sectors holding the sealed SQL partition (`CTTLSQL1`).
 pub const STATE_SQL_SECTORS: usize = crate::sql::SQL_PART_SECTORS;
-/// Total sectors in one [`StateImage`] (and therefore in each slot).
+/// Total sectors in one v2 [`StateImage`] (and therefore in each slot: `53` sectors).
 pub const STATE_IMAGE_SECTORS: usize = STATE_WAL_SECTORS + STATE_FS_SECTORS + STATE_SQL_SECTORS;
+
+/// Pre-upgrade v1 shell header + journal sector count (`2` sectors).
+pub const STATE_WAL_SECTORS_V1: usize = 2;
+/// Pre-upgrade v1 filesystem partition sector count (`16` sectors).
+pub const STATE_FS_SECTORS_V1: usize = crate::shell::SHELL_FS_PART_SECTORS_V1;
+/// Pre-upgrade v1 SQL partition sector count (`8` sectors).
+pub const STATE_SQL_SECTORS_V1: usize = crate::sql::SQL_PART_SECTORS_V1;
+/// Total sectors in a pre-upgrade v1 slot (`26` sectors).
+pub const STATE_IMAGE_SECTORS_V1: usize =
+    STATE_WAL_SECTORS_V1 + STATE_FS_SECTORS_V1 + STATE_SQL_SECTORS_V1;
 
 /// Image-relative index of the filesystem superblock sector.
 const IDX_FS_SUPER: usize = STATE_WAL_SECTORS;
@@ -228,19 +240,29 @@ pub struct StoreLayout {
     pub commit_lba: u64,
 }
 
-/// The layout Cuttle OS uses on its AHCI state disk: primary `1040..=1065`,
-/// shadow `1072..=1097`, commit record at `1098`.
+/// The v2 layout Cuttle OS uses on its AHCI state disk: primary `1040..=1092`
+/// (`53` sectors: `5` WAL + `32` FS + `16` SQL), shadow `1096..=1148`,
+/// commit record at `1149`.
 pub const AHCI_STATE_LAYOUT: StoreLayout = StoreLayout {
+    primary_lba: 1040,
+    shadow_lba: 1096,
+    commit_lba: 1149,
+};
+
+/// Pre-upgrade v1 layout on the AHCI state disk: primary `1040..=1065`
+/// (`26` sectors: `2` WAL + `16` FS + `8` SQL), shadow `1072..=1097`,
+/// commit record at `1098`.
+pub const AHCI_STATE_LAYOUT_V1: StoreLayout = StoreLayout {
     primary_lba: 1040,
     shadow_lba: 1072,
     commit_lba: 1098,
 };
 
 impl StoreLayout {
-    /// `true` iff both slots and the commit sector are pairwise disjoint and
-    /// lie inside a device of `capacity_sectors` sectors.
-    pub const fn is_valid_for(&self, capacity_sectors: u64) -> bool {
-        let n = STATE_IMAGE_SECTORS as u64;
+    /// `true` iff both `slot_sectors`-sized slots and the commit sector are
+    /// pairwise disjoint and lie inside a device of `capacity_sectors` sectors.
+    pub const fn is_valid_for_sectors(&self, capacity_sectors: u64, slot_sectors: usize) -> bool {
+        let n = slot_sectors as u64;
         let Some(p_end) = self.primary_lba.checked_add(n) else {
             return false;
         };
@@ -255,6 +277,12 @@ impl StoreLayout {
         let commit_in_primary = self.commit_lba >= self.primary_lba && self.commit_lba < p_end;
         let commit_in_shadow = self.commit_lba >= self.shadow_lba && self.commit_lba < s_end;
         !slots_overlap && !commit_in_primary && !commit_in_shadow
+    }
+
+    /// `true` iff both v2 slots (`STATE_IMAGE_SECTORS`) and the commit sector
+    /// are pairwise disjoint and lie inside `capacity_sectors`.
+    pub const fn is_valid_for(&self, capacity_sectors: u64) -> bool {
+        self.is_valid_for_sectors(capacity_sectors, STATE_IMAGE_SECTORS)
     }
 }
 
@@ -284,10 +312,10 @@ impl ImageDigests {
 /// One complete persisted node state: shell header + journal, filesystem
 /// partition and SQL partition.
 ///
-/// The struct is 13 KiB. Kernel code keeps it in a `static`; do not pass it
-/// by value on a small stack.
+/// The struct is 26.5 KiB (`53` sectors). Kernel code keeps it in a `static`;
+/// do not pass it by value on a small stack.
 pub struct StateImage {
-    /// Shell header sector followed by the shell journal sector.
+    /// Shell header sector followed by the 4-sector (`2 KiB`) shell journal.
     pub wal: [[u8; SECTOR_BYTES]; STATE_WAL_SECTORS],
     /// Filesystem partition.
     pub fs: [[u8; SECTOR_BYTES]; STATE_FS_SECTORS],
@@ -587,6 +615,7 @@ pub fn commit<D: SectorIo>(
     // 2. Point of no return: record that the shadow slot holds the new state.
     let in_flight = AbCommitHeader {
         state: AB_STATE_IN_FLIGHT,
+        format_version: AB_FORMAT_V2,
         boots,
         commit_seq,
         wal_sha: digests.wal,
@@ -683,7 +712,7 @@ pub fn recover<D: SectorIo>(
     let mut commit_sec = [0u8; SECTOR_BYTES];
     let commit_readable = dev.read_sector(layout.commit_lba, &mut commit_sec).is_ok();
     let commit = if commit_readable {
-        verify_ab_commit_sector(key, &commit_sec)
+        verify_ab_commit_sector(key, &commit_sec).filter(|h| h.format_version == AB_FORMAT_V2)
     } else {
         None
     };
@@ -786,15 +815,15 @@ pub fn recover<D: SectorIo>(
 pub const QUARANTINE_SECTORS: u64 = 2 * STATE_IMAGE_SECTORS as u64 + 2;
 
 /// First sector of the quarantine area on the Cuttle OS AHCI state disk
-/// (`1152..=1205`), clear of the store (`1040..=1098`) and the panic dump
-/// (`1536..=1567`).
-pub const AHCI_QUARANTINE_LBA: u64 = 1152;
+/// (`1216..=1323`, `108` sectors), clear of the v2 store (`1040..=1149`),
+/// pre-upgrade v1 store (`1040..=1098`) and the panic dump (`1536..=1567`).
+pub const AHCI_QUARANTINE_LBA: u64 = 1216;
 
 /// Magic of a quarantine marker sector.
 const QUARANTINE_MAGIC: [u8; 8] = *b"CTTLQUA1";
 
 /// The layout of the slot and commit copies inside a quarantine area that
-/// starts at `base`. The marker sector follows at `base + 53`.
+/// starts at `base`. The marker sector follows at `base + 107`.
 pub const fn quarantine_layout(base: u64) -> StoreLayout {
     StoreLayout {
         primary_lba: base,
@@ -1138,6 +1167,154 @@ impl ShellStore {
         Ok(None)
     }
 
+    /// Authenticate and migrate a pre-upgrade v1 state store (`AHCI_STATE_LAYOUT_V1`:
+    /// `26` sectors per slot at `1040..=1065` / `1072..=1097`, commit at `1098`)
+    /// into the current v2 layout, using `self.image` slices in place so zero
+    /// large buffers are allocated on the kernel stack.
+    ///
+    /// Crash-atomic across power cuts at any sector operation:
+    /// - v1 primary (`1040..=1065`) is disjoint from v2 shadow (`1096..=1148`)
+    ///   and v2 commit (`1149`), so Stage 1 of `self.commit` never overwrites
+    ///   v1 primary before the v2 `IN_FLIGHT` commit sector is durable.
+    /// - When v1 recovery comes from v1 shadow (`1072..=1097`, which overlaps
+    ///   `1096..=1097`), the verified 26-sector v1 image is first written to
+    ///   v1 primary (`1040..=1065`) and flushed before `self.commit` touches
+    ///   `1096..=1148`.
+    fn try_migrate_v1<D: SectorIo>(
+        &mut self,
+        dev: &mut D,
+        sh: &mut OsShell,
+        keys: &ShellKeys,
+        counter_boots: u64,
+    ) -> Result<Option<(Recovery, StateRestore, u64)>, BootError> {
+        let v1 = AHCI_STATE_LAYOUT_V1;
+        if self.layout != AHCI_STATE_LAYOUT
+            || !v1.is_valid_for_sectors(dev.capacity_sectors(), STATE_IMAGE_SECTORS_V1)
+        {
+            return Ok(None);
+        }
+
+        let mut commit_sec = [0u8; SECTOR_BYTES];
+        let v1_commit = if dev.read_sector(v1.commit_lba, &mut commit_sec).is_ok() {
+            verify_ab_commit_sector(&keys.seal, &commit_sec)
+                .filter(|h| h.format_version == AB_FORMAT_V1)
+        } else {
+            None
+        };
+
+        let read_v1_slot = |dev: &mut D, base: u64, img: &mut StateImage| -> Result<(), IoFault> {
+            let (wal_s, _) = img.wal.split_at_mut(STATE_WAL_SECTORS_V1);
+            let (fs_s, _) = img.fs.split_at_mut(STATE_FS_SECTORS_V1);
+            let (sql_s, _) = img.sql.split_at_mut(STATE_SQL_SECTORS_V1);
+            dev.read_sector_slices(base, &mut [wal_s, fs_s, sql_s])
+        };
+
+        let v1_digests = |img: &StateImage| -> ImageDigests {
+            ImageDigests {
+                wal: hash_sector_slice(&img.wal[..STATE_WAL_SECTORS_V1]),
+                fs: hash_sector_slice(&img.fs[..STATE_FS_SECTORS_V1]),
+                sql: hash_sector_slice(&img.sql[..STATE_SQL_SECTORS_V1]),
+            }
+        };
+
+        let try_unpack_v1 =
+            |img: &StateImage, sh: &mut OsShell| -> Option<(StateRestore, u64)> {
+                let wal_v1: &[[u8; SECTOR_BYTES]; STATE_WAL_SECTORS_V1] =
+                    (&img.wal[..STATE_WAL_SECTORS_V1]).try_into().ok()?;
+                let fs_v1: &[[u8; SECTOR_BYTES]; STATE_FS_SECTORS_V1] =
+                    (&img.fs[..STATE_FS_SECTORS_V1]).try_into().ok()?;
+                let sql_v1: &[[u8; SECTOR_BYTES]; STATE_SQL_SECTORS_V1] =
+                    (&img.sql[..STATE_SQL_SECTORS_V1]).try_into().ok()?;
+                let saved = u64::from_le_bytes(wal_v1[0][8..16].try_into().ok()?);
+                let boots = counter_boots.max(saved.saturating_add(1));
+                reset_shell(sh, keys, boots);
+                sh.unpack_state_image_v1(wal_v1, fs_v1, sql_v1)
+                    .ok()
+                    .map(|mut r| {
+                        r.migrated_legacy = true;
+                        (r, boots)
+                    })
+            };
+
+        let anchor_v1_primary = |dev: &mut D, img: &StateImage| -> Result<(), BootError> {
+            dev.write_sector_slices(
+                v1.primary_lba,
+                &[
+                    &img.wal[..STATE_WAL_SECTORS_V1],
+                    &img.fs[..STATE_FS_SECTORS_V1],
+                    &img.sql[..STATE_SQL_SECTORS_V1],
+                ],
+            )
+            .map_err(BootError::Io)?;
+            dev.flush().map_err(BootError::Io)
+        };
+
+        if let Some(hdr) = v1_commit {
+            if read_v1_slot(dev, v1.primary_lba, &mut self.image).is_ok()
+                && v1_digests(&self.image).matches(&hdr)
+            {
+                if let Some((restore, boots)) = try_unpack_v1(&self.image, sh) {
+                    let rec = Recovery {
+                        source: RecoverySource::Primary,
+                        commit: Some(hdr),
+                        repaired_primary: false,
+                        repaired_shadow: false,
+                        repair_fault: None,
+                    };
+                    return Ok(Some((rec, restore, boots)));
+                }
+            }
+            if read_v1_slot(dev, v1.shadow_lba, &mut self.image).is_ok()
+                && v1_digests(&self.image).matches(&hdr)
+            {
+                if let Some((restore, boots)) = try_unpack_v1(&self.image, sh) {
+                    anchor_v1_primary(dev, &self.image)?;
+                    let source = if hdr.state == AB_STATE_IN_FLIGHT {
+                        RecoverySource::JournalReplay
+                    } else {
+                        RecoverySource::ShadowHeal
+                    };
+                    let rec = Recovery {
+                        source,
+                        commit: Some(hdr),
+                        repaired_primary: true,
+                        repaired_shadow: false,
+                        repair_fault: None,
+                    };
+                    return Ok(Some((rec, restore, boots)));
+                }
+            }
+            return Ok(None);
+        }
+
+        if read_v1_slot(dev, v1.primary_lba, &mut self.image).is_ok() {
+            if let Some((restore, boots)) = try_unpack_v1(&self.image, sh) {
+                let rec = Recovery {
+                    source: RecoverySource::Unjournaled,
+                    commit: None,
+                    repaired_primary: false,
+                    repaired_shadow: false,
+                    repair_fault: None,
+                };
+                return Ok(Some((rec, restore, boots)));
+            }
+        }
+        if read_v1_slot(dev, v1.shadow_lba, &mut self.image).is_ok() {
+            if let Some((restore, boots)) = try_unpack_v1(&self.image, sh) {
+                anchor_v1_primary(dev, &self.image)?;
+                let rec = Recovery {
+                    source: RecoverySource::Unjournaled,
+                    commit: None,
+                    repaired_primary: true,
+                    repaired_shadow: false,
+                    repair_fault: None,
+                };
+                return Ok(Some((rec, restore, boots)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Decide what this boot starts from and bring `sh` to that state.
     ///
     /// `counter_boots` is the caller's own boot counter for this boot. `sh`
@@ -1181,9 +1358,11 @@ impl ShellStore {
             });
         }
 
-        if let Some((recovery, restore, boots)) =
-            self.recover_and_load(dev, &layout, sh, keys, counter_boots)?
-        {
+        let found = match self.recover_and_load(dev, &layout, sh, keys, counter_boots)? {
+            Some(v) => Some(v),
+            None => self.try_migrate_v1(dev, sh, keys, counter_boots)?,
+        };
+        if let Some((recovery, restore, boots)) = found {
             self.commit_seq = recovery.commit.map(|h| h.commit_seq).unwrap_or(0);
             let mut recommitted = false;
             if recovery.source == RecoverySource::Unjournaled || restore.migrated_legacy {
@@ -1483,9 +1662,9 @@ mod tests {
     #[test]
     fn layout_rejects_overlap_and_out_of_range() {
         assert!(LAYOUT.is_valid_for(2048));
-        // Commit sector is the last sector the layout touches.
-        assert!(LAYOUT.is_valid_for(1099));
-        assert!(!LAYOUT.is_valid_for(1098));
+        // Commit sector is the last sector the layout touches (`1149`).
+        assert!(LAYOUT.is_valid_for(1150));
+        assert!(!LAYOUT.is_valid_for(1149));
         let overlapping_slots = StoreLayout {
             primary_lba: 100,
             shadow_lba: 110,
@@ -2120,13 +2299,13 @@ mod tests {
         let img1 = image(7);
         commit(&mut batch_disk, &key(), &high_layout, 3, 1, &img1).expect("LBA48 batched commit");
 
-        // Unbatched single-sector commit needed 112 device commands (4*26 + 8).
+        // Unbatched single-sector commit needed 220 device commands (4*53 + 8).
         // With batched slot writes and chunked read-back, a full 4-barrier commit
-        // must take at most 18 device commands (2 slot writes + 8 read-back chunks
+        // must take at most 24 device commands (2 slot writes + 14 read-back chunks
         // + 2 commit writes + 2 commit reads + 4 flushes).
         assert!(
-            batch_disk.total_cmds() <= 18,
-            "expected batched commit <= 18 device commands, got {} (reads={} writes={} flushes={})",
+            batch_disk.total_cmds() <= 24,
+            "expected batched commit <= 24 device commands, got {} (reads={} writes={} flushes={})",
             batch_disk.total_cmds(),
             batch_disk.read_cmds,
             batch_disk.write_cmds,
@@ -2709,11 +2888,11 @@ mod node_tests {
             ..keys()
         };
         assert_eq!(store().boot(&mut disk, &mut sh, &unset, 1), Err(BootError::KeyUnset));
-        // Quarantine area past the end of the device.
-        let mut small = MemDisk::new(1180);
+        // Quarantine area (`1216..=1323`) past the end of the device.
+        let mut small = MemDisk::new(1300);
         assert_eq!(store().boot(&mut small, &mut sh, &keys(), 1), Err(BootError::BadLayout));
-        // Quarantine area overlapping the shadow slot.
-        let mut overlapping = Box::new(ShellStore::new(AHCI_STATE_LAYOUT, 1090));
+        // Quarantine area overlapping the shadow slot (`1096..=1148`).
+        let mut overlapping = Box::new(ShellStore::new(AHCI_STATE_LAYOUT, 1110));
         assert_eq!(
             overlapping.boot(&mut disk, &mut sh, &keys(), 1),
             Err(BootError::BadLayout)
@@ -2743,24 +2922,22 @@ mod node_tests {
         // Records the kernel raises on its own must always fit as well.
         sh.auth_seq = 77;
         sh.http_login_seq = 3;
-        for i in 0..12u32 {
+        for i in 0..20u32 {
             let r = run(&mut sh, "spawn");
             note(r, &mut sh, &mut image, "spawn");
             let line = std::format!("fw block 10.{i}.0.0/16");
             let r = run(&mut sh, &line);
             note(r, &mut sh, &mut image, &line);
-            let line = std::format!("cron add {} status", 5 + i);
+            let line = std::format!("cron add {} echo-periodic-health-sweep-{i:02}", 5 + i);
             let r = run(&mut sh, &line);
             note(r, &mut sh, &mut image, &line);
-            // A fresh file each round, small enough for the 16-inode table.
-            if i < 6 {
-                let line = std::format!("write /var/bin{i} payload-{i}");
-                let r = run(&mut sh, &line);
-                note(r, &mut sh, &mut image, &line);
-                let line = std::format!("ima enroll /var/bin{i}");
-                let r = run(&mut sh, &line);
-                note(r, &mut sh, &mut image, &line);
-            }
+            // A fresh file each round across the 20 user inode slots (`4` system + `20` user = `24`).
+            let line = std::format!("write /var/custom-service-plugin-{i:02} payload-{i}");
+            let r = run(&mut sh, &line);
+            note(r, &mut sh, &mut image, &line);
+            let line = std::format!("ima enroll /var/custom-service-plugin-{i:02}");
+            let r = run(&mut sh, &line);
+            note(r, &mut sh, &mut image, &line);
         }
         assert!(refused > 0, "the journal budget was never reached; the test proves nothing");
         assert!(accepted > 10, "accepted={accepted}");
@@ -2858,6 +3035,258 @@ mod node_tests {
         assert_eq!(
             fresh_shell(3).unpack_state_image(&mixed),
             Err(crate::shell::StateRestoreError::GenerationMismatch)
+        );
+    }
+
+    #[test]
+    fn ordinary_full_tables_fit_in_v2_journal_without_enospc() {
+        let mut disk = MemDisk::new(DISK_SECTORS);
+        let mut sh = fresh_shell(1);
+        sh.auth_seq = 12345;
+        sh.http_login_seq = 99;
+
+        // Fill all 12 worker tasks (`PID 5..=16`), 7 user firewall rules (+1 reserved for lockdown),
+        // 8 IMA digests, 8 cron jobs, and a vault secret: all must succeed with zero `ENOSPC`.
+        for i in 0..12u32 {
+            let r = run(&mut sh, "spawn");
+            assert!(r.starts_with("spawned pid="), "worker {i}: {r}");
+        }
+        for i in 0..7u32 {
+            let r = run(&mut sh, &std::format!("fw block 172.16.{i}.0/24"));
+            assert!(r.starts_with("fw: blocked"), "fw {i}: {r}");
+        }
+        for i in 0..8u32 {
+            let w = run(&mut sh, &std::format!("write /var/tool{i} binary-image-{i}"));
+            assert!(w.starts_with("wrote "), "write {i}: {w}");
+            let e = run(&mut sh, &std::format!("ima enroll /var/tool{i}"));
+            assert!(e.starts_with("ima enrolled "), "ima {i}: {e}");
+        }
+        for i in 0..8u32 {
+            let c = run(&mut sh, &std::format!("cron add {} status", 10 + i));
+            assert!(c.starts_with("cron: scheduled"), "cron {i}: {c}");
+        }
+        let v = run(&mut sh, "vault put cluster.token SecretTok99!");
+        assert!(v.starts_with("vault: sealed "), "{v}");
+        let g = run(&mut sh, "guard lockdown");
+        assert!(g.starts_with("guard: posture=LOCKDOWN"), "{g}");
+
+        let mut st = store();
+        assert!(matches!(
+            st.commit(&mut disk, &mut sh, 1).expect("commit full ordinary tables"),
+            Committed::Written { .. }
+        ));
+        disk.reboot();
+
+        let (report, mut sh2, _) = boot(&mut disk, &keys(), 2);
+        assert!(matches!(
+            report.outcome,
+            BootOutcome::Restored {
+                source: RecoverySource::Primary,
+                ..
+            }
+        ));
+        assert_eq!(sh2.fw.as_slice().len(), 8);
+        assert!(sh2.guard_lockdown);
+        assert_eq!(sh2.auth_seq, 12345);
+        assert_eq!(sh2.http_login_seq, 99);
+        assert_eq!(
+            run(&mut sh2, "vault get cluster.token"),
+            "error: EACCES (vault sealed by CuttleGuard lockdown)\n"
+        );
+        assert_eq!(
+            run(&mut sh2, "guard unlock"),
+            "guard: posture=NORMAL vault=ready lockdown=cleared\n"
+        );
+        assert_eq!(
+            run(&mut sh2, "vault get cluster.token"),
+            "vault: key=cluster.token value=SecretTok99! verified=true\n"
+        );
+    }
+
+    #[test]
+    fn v1_disk_migrates_cleanly_to_v2_and_survives_mid_migration_power_cut() {
+        let build_v1_disk = |journaled: bool, corrupt_v1_primary: bool| -> MemDisk {
+            let mut disk = MemDisk::new(DISK_SECTORS);
+            let mut sh = fresh_shell(3);
+            apply_generation(&mut sh, "v1-migrated");
+            assert!(run(&mut sh, "fw block 192.0.2.0/24").starts_with("fw: blocked"));
+            assert!(run(&mut sh, "cron add 15 status").starts_with("cron: scheduled"));
+            sh.auth_seq = 42;
+
+            let mut hdr_sec = [0u8; SECTOR_BYTES];
+            let mut wal_sec = [0u8; SECTOR_BYTES];
+            sh.pack_disk_image(3, &mut hdr_sec, &mut wal_sec)
+                .expect("pack v1 wal");
+            let mut fs_secs = [[0u8; SECTOR_BYTES]; STATE_FS_SECTORS_V1];
+            sh.pack_fs_partition_v1(3, &mut fs_secs)
+                .expect("pack v1 fs");
+            let mut sql_secs = [[0u8; SECTOR_BYTES]; STATE_SQL_SECTORS_V1];
+            sh.db
+                .try_save_partition_v1(&sh.seal_key, &mut sql_secs)
+                .expect("pack v1 sql");
+            let wal_secs = [hdr_sec, wal_sec];
+
+            for base in [AHCI_STATE_LAYOUT_V1.primary_lba, AHCI_STATE_LAYOUT_V1.shadow_lba] {
+                disk.write_sector_slices(base, &[&wal_secs, &fs_secs, &sql_secs])
+                    .expect("write v1 slot");
+            }
+            if journaled {
+                let hdr = AbCommitHeader {
+                    state: AB_STATE_QUIESCENT,
+                    format_version: AB_FORMAT_V1,
+                    boots: 3,
+                    commit_seq: 5,
+                    wal_sha: hash_sector_slice(&wal_secs),
+                    fs_sha: hash_sector_slice(&fs_secs),
+                    sql_sha: hash_sector_slice(&sql_secs),
+                };
+                let mut csec = [0u8; SECTOR_BYTES];
+                assert!(pack_ab_commit_sector(&sh.seal_key, &hdr, &mut csec));
+                // Verify pre-upgrade wire format (`out[9] == 0`).
+                assert_eq!(csec[9], 0);
+                disk.write_sector(AHCI_STATE_LAYOUT_V1.commit_lba, &csec)
+                    .expect("write v1 commit");
+            }
+            disk.flush().expect("flush v1 disk");
+            if corrupt_v1_primary {
+                disk.poke(AHCI_STATE_LAYOUT_V1.primary_lba + 1, |s| s[12] ^= 0xFF);
+            }
+            disk.reboot();
+            disk
+        };
+
+        // 1. Clean migration of journaled v1 primary, journaled v1 shadow-heal, and unjournaled v1.
+        for (journaled, corrupt_primary, expect_seq) in [
+            (true, false, 6u64),
+            (true, true, 6u64),
+            (false, false, 1u64),
+        ] {
+            let mut disk = build_v1_disk(journaled, corrupt_primary);
+            let (report, mut sh, st) = boot(&mut disk, &keys(), 4);
+            match report.outcome {
+                BootOutcome::Restored {
+                    restore,
+                    from_quarantine,
+                    recommitted,
+                    repaired_primary,
+                    ..
+                } => {
+                    assert!(!from_quarantine && recommitted);
+                    assert_eq!(repaired_primary, corrupt_primary);
+                    assert_eq!(restore.saved_boots, 3);
+                }
+                other => panic!("v1 migration failed ({journaled}, {corrupt_primary}): {other:?}"),
+            }
+            assert_eq!(report.boots, 4);
+            assert_eq!(st.commit_seq(), expect_seq);
+            assert_eq!(generation(&mut sh), "v1-migrated");
+            assert_eq!(sh.fw.as_slice().len(), 1);
+            assert_eq!(sh.auth_seq, 42);
+            let csec = disk.peek(AHCI_STATE_LAYOUT.commit_lba);
+            let hdr = verify_ab_commit_sector(&keys().seal, &csec).expect("v2 commit sector");
+            assert_eq!(hdr.format_version, AB_FORMAT_V2);
+            assert_eq!(hdr.commit_seq, expect_seq);
+        }
+
+        // 2. Power cut at EVERY device operation of v1 -> v2 migration (including v1 shadow-heal)
+        //    never loses state: the subsequent boot always completes migration cleanly.
+        for corrupt_primary in [false, true] {
+            let total_ops = {
+                let mut probe = build_v1_disk(true, corrupt_primary);
+                let _ = boot(&mut probe, &keys(), 4);
+                probe.ops
+            };
+            for policy in [CacheLoss::DropAll, CacheLoss::Random(0x517C_C1B7_2722_0A95)] {
+                for cut in 0..=total_ops {
+                    let mut disk = build_v1_disk(true, corrupt_primary);
+                    disk.cache_loss = policy;
+                    disk.power_cut_at = Some(cut);
+                    let mut sh_try = Box::new(OsShell::empty());
+                    let mut st_try = store();
+                    let _ = st_try.boot(&mut disk, &mut sh_try, &keys(), 4);
+
+                    disk.reboot();
+                    let (report, mut sh_ok, _) = boot(&mut disk, &keys(), 5);
+                    assert!(
+                        matches!(report.outcome, BootOutcome::Restored { .. }),
+                        "corrupt_primary={corrupt_primary} policy={policy:?} cut={cut}: {:?}",
+                        report.outcome
+                    );
+                    assert_eq!(
+                        generation(&mut sh_ok),
+                        "v1-migrated",
+                        "corrupt_primary={corrupt_primary} policy={policy:?} cut={cut}"
+                    );
+                    assert_eq!(sh_ok.auth_seq, 42);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_files_up_to_10kib_and_sql_up_to_8kib_persist_in_v2() {
+        let mut disk = MemDisk::new(DISK_SECTORS);
+        let mut sh = fresh_shell(1);
+
+        // Write an 8,500-byte file (exceeds the old 4 KiB v1 pool more than 2x).
+        let big: Vec<u8> = (0..8500u32).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+        let h = sh
+            .fs
+            .open(
+                b"/var/archive.bin",
+                cuttle_contracts::FS_O_RDWR | cuttle_contracts::FS_O_CREATE,
+            )
+            .expect("open /var/archive.bin");
+        for (idx, chunk) in big.chunks(500).enumerate() {
+            assert_eq!(sh.fs.write(h, (idx * 500) as u64, chunk), Ok(chunk.len()));
+        }
+        sh.fs.close(h).expect("close /var/archive.bin");
+
+        // Populate two SQL tables past the old 4,088-byte v1 SQL partition ceiling (~5.6 KiB).
+        assert_eq!(
+            sql(&mut sh, "CREATE TABLE extra (k TEXT, v TEXT, rev INT)"),
+            "CREATE TABLE extra OK\n"
+        );
+        for i in 0..58u32 {
+            assert_eq!(
+                sql(
+                    &mut sh,
+                    &std::format!("INSERT INTO kv VALUES ('key_{i:03}_alpha', 'val_{i:03}_bravo_charlie', {i})")
+                ),
+                "INSERT 1\n"
+            );
+            assert_eq!(
+                sql(
+                    &mut sh,
+                    &std::format!("INSERT INTO extra VALUES ('ext_{i:03}_delta', 'payload_{i:03}_echo_foxtrot', {i})")
+                ),
+                "INSERT 1\n"
+            );
+        }
+        assert!(
+            sh.db.committed_partition_bytes() > STATE_SQL_SECTORS_V1 * SECTOR_BYTES,
+            "expected SQL bytes > 4096, got {}",
+            sh.db.committed_partition_bytes()
+        );
+
+        let mut st = store();
+        st.commit(&mut disk, &mut sh, 1).expect("v2 large commit");
+        disk.reboot();
+
+        let (report, mut sh2, _) = boot(&mut disk, &keys(), 2);
+        assert!(matches!(report.outcome, BootOutcome::Restored { .. }));
+
+        let h2 = sh2
+            .fs
+            .open(b"/var/archive.bin", cuttle_contracts::FS_O_RDONLY)
+            .expect("reopen /var/archive.bin");
+        let mut got = std::vec![0u8; big.len() + 16];
+        let n = sh2.fs.read(h2, 0, &mut got).expect("read /var/archive.bin");
+        sh2.fs.close(h2).expect("close");
+        assert_eq!(&got[..n], &big[..]);
+        assert_eq!(
+            sql(&mut sh2, "SELECT v FROM extra WHERE k = 'ext_057_delta'"),
+            "v\npayload_057_echo_foxtrot\n"
         );
     }
 }

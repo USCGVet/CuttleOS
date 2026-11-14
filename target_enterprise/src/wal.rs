@@ -9,13 +9,14 @@
 //! ```text
 //!   record on disk:
 //!       0..4   u32 LE  payload length
-//!       4..8   u32 LE  CRC-32 over the payload bytes only
+//!       4..8   u32 LE  CRC-32 over ("CWAL" || lsn: u64 LE || len: u32 LE || payload)
 //!       8..    N bytes payload
 //! ```
 //!
-//! The CRC excludes the length and crc fields themselves so a torn
-//! write that clips the header is detected by short-read at replay
-//! time rather than by an internally-consistent corrupt frame.
+//! Binding `"CWAL"`, the monotonic 1-based LSN, and `len` into the frame CRC
+//! guarantees that zero-filled tail padding (`[0u8; 8]`) never parses as a
+//! valid empty record (whereas a genuine `append(b"")` carries a non-zero
+//! domain-tagged CRC), while also detecting header bit-flips and LSN splicing.
 //!
 //! ## Cursors
 //!
@@ -142,12 +143,19 @@ impl<const CAPACITY: usize> WalImpl<CAPACITY> {
     /// `durable_cursor` is clamped to `CAPACITY` defensively; a
     /// caller passing a stale cursor from a larger-buffer build
     /// can't escape the bounds of the new buffer.
-    pub fn from_backing(mut buf: [u8; CAPACITY], durable_cursor: usize) -> Self {
+    pub fn from_backing(buf: [u8; CAPACITY], durable_cursor: usize) -> Self {
+        Self::recover_from_backing(buf, durable_cursor).0
+    }
+
+    /// Reconstruct a WAL from an existing backing buffer and `durable_cursor`,
+    /// returning `(recovered_wal, dropped_bytes)`.
+    ///
+    /// Stops at the first zero-filled tail, truncated header/payload, or CRC
+    /// mismatch without overwriting or zeroing the unparsed bytes in `buf`
+    /// (preserving forensic evidence in place while rewinding `write_cursor`
+    /// and `durable_cursor` to the verified prefix `off`).
+    pub fn recover_from_backing(buf: [u8; CAPACITY], durable_cursor: usize) -> (Self, usize) {
         let dc = if durable_cursor > CAPACITY { CAPACITY } else { durable_cursor };
-        // Count valid records in the durable prefix to recover the
-        // next LSN, and truncate both `write_cursor` and `durable_cursor`
-        // to the end of the verified valid prefix (`off`) so a torn or
-        // corrupt tail frame never blocks replay of post-recovery commits.
         let mut lsn_counter: u64 = 0;
         let mut off = 0usize;
         while off + FRAME_HEADER_BYTES <= dc {
@@ -161,17 +169,49 @@ impl<const CAPACITY: usize> WalImpl<CAPACITY> {
             if payload_end > dc {
                 break;
             }
-            let got_crc = crc32_ieee(&buf[payload_start..payload_end]);
+            let next_lsn = lsn_counter + 1;
+            let got_crc = wal_frame_crc(next_lsn, &buf[payload_start..payload_end]);
             if got_crc != want_crc {
+                break;
+            }
+            lsn_counter = next_lsn;
+            off = payload_end;
+        }
+        let dropped = dc.saturating_sub(off);
+        (
+            Self {
+                buf,
+                write_cursor: off,
+                durable_cursor: off,
+                next_lsn: lsn_counter + 1,
+            },
+            dropped,
+        )
+    }
+
+    /// Legacy v1 frame decoder (`crc32_ieee(payload)` with `len > 0`) used
+    /// solely when migrating HMAC-SHA256-authenticated pre-v2 `CTTLSHL1`
+    /// sectors during boot upgrade.
+    pub(crate) fn from_backing_legacy_v1(buf: [u8; CAPACITY], durable_cursor: usize) -> Self {
+        let dc = if durable_cursor > CAPACITY { CAPACITY } else { durable_cursor };
+        let mut lsn_counter: u64 = 0;
+        let mut off = 0usize;
+        while off + FRAME_HEADER_BYTES <= dc {
+            let len = read_u32_le(&buf[off..off + 4]) as usize;
+            let want_crc = read_u32_le(&buf[off + 4..off + 8]);
+            if len == 0 || len > MAX_PAYLOAD_LEN {
+                break;
+            }
+            let payload_start = off + FRAME_HEADER_BYTES;
+            let payload_end = payload_start.saturating_add(len);
+            if payload_end > dc {
+                break;
+            }
+            if crc32_ieee(&buf[payload_start..payload_end]) != want_crc {
                 break;
             }
             lsn_counter += 1;
             off = payload_end;
-        }
-        let mut z = off;
-        while z < dc {
-            buf[z] = 0;
-            z += 1;
         }
         Self {
             buf,
@@ -233,14 +273,14 @@ impl<const CAPACITY: usize> WriteAheadLog for WalImpl<CAPACITY> {
         // Frame layout: [len: u32 LE][crc32: u32 LE][payload..]
         let off = self.write_cursor;
         let len_u32 = record.len() as u32;
-        let crc = crc32_ieee(record);
+        let lsn = self.next_lsn;
+        let crc = wal_frame_crc(lsn, record);
         write_u32_le(&mut self.buf[off..off + 4], len_u32);
         write_u32_le(&mut self.buf[off + 4..off + 8], crc);
         let payload_start = off + FRAME_HEADER_BYTES;
         let payload_end = payload_start + record.len();
         self.buf[payload_start..payload_end].copy_from_slice(record);
         self.write_cursor = new_cursor;
-        let lsn = self.next_lsn;
         self.next_lsn = lsn + 1;
         Ok(lsn)
     }
@@ -280,7 +320,7 @@ impl<const CAPACITY: usize> WriteAheadLog for WalImpl<CAPACITY> {
                 return;
             }
             let payload = &self.buf[payload_start..payload_end];
-            let got_crc = crc32_ieee(payload);
+            let got_crc = wal_frame_crc(lsn, payload);
             if got_crc != want_crc {
                 // CRC mismatch: data corruption / bit rot. Stop
                 // without delivering this or any later record.
@@ -295,15 +335,21 @@ impl<const CAPACITY: usize> WriteAheadLog for WalImpl<CAPACITY> {
 
 // ---------- internal helpers ----------
 
-/// CRC-32 / IEEE 802.3 polynomial `0xEDB88320`, computed byte-at-a-
-/// time. Not cryptographically secure; fits the on-disk frame-
-/// integrity role this WAL needs.
+/// Domain-separated IEEE CRC-32 over `"CWAL" || lsn_le || len_le || payload`.
 ///
-/// The algorithm is the canonical reflected variant: initial
-/// register `0xFFFF_FFFF`, final XOR `0xFFFF_FFFF`, reflected input
-/// and output. Matches `zlib::crc32` byte-for-byte on equal input.
-pub fn crc32_ieee(bytes: &[u8]) -> u32 {
+/// Guarantees that `[0u8; 8]` zero-filled tail space (`len == 0, crc == 0`)
+/// never matches `wal_frame_crc(lsn, b"")`, while genuine zero-length appends
+/// and normal payloads round-trip with LSN and length integrity.
+pub fn wal_frame_crc(lsn: u64, payload: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
+    crc = crc32_step(crc, b"CWAL");
+    crc = crc32_step(crc, &lsn.to_le_bytes());
+    crc = crc32_step(crc, &(payload.len() as u32).to_le_bytes());
+    crc = crc32_step(crc, payload);
+    !crc
+}
+
+fn crc32_step(mut crc: u32, bytes: &[u8]) -> u32 {
     let mut i = 0usize;
     while i < bytes.len() {
         crc ^= bytes[i] as u32;
@@ -315,7 +361,18 @@ pub fn crc32_ieee(bytes: &[u8]) -> u32 {
         }
         i += 1;
     }
-    !crc
+    crc
+}
+
+/// CRC-32 / IEEE 802.3 polynomial `0xEDB88320`, computed byte-at-a-
+/// time. Not cryptographically secure; fits the on-disk frame-
+/// integrity role this WAL needs.
+///
+/// The algorithm is the canonical reflected variant: initial
+/// register `0xFFFF_FFFF`, final XOR `0xFFFF_FFFF`, reflected input
+/// and output. Matches `zlib::crc32` byte-for-byte on equal input.
+pub fn crc32_ieee(bytes: &[u8]) -> u32 {
+    !crc32_step(0xFFFF_FFFF, bytes)
 }
 
 fn read_u32_le(b: &[u8]) -> u32 {
@@ -523,5 +580,56 @@ mod tests {
         assert_eq!(count, 2, "post-recovery commit after torn tail must be replayed");
         assert_eq!(&seen[0][..5], b"rec-1");
         assert_eq!(&seen[1][..5], b"rec-3");
+    }
+
+    #[test]
+    fn zero_filled_tail_and_corrupt_frame_preserve_bytes_and_report_dropped_len() {
+        // 1. A zero-filled tail inside `[0, durable_cursor)` must NEVER parse as
+        //    empty records (`len == 0, crc == 0`), while a genuine `append(b"")`
+        //    carries a non-zero domain-tagged CRC and replays cleanly.
+        let mut wal: WalImpl<128> = WalImpl::new();
+        wal.append(b"alpha").unwrap();
+        wal.append(b"").unwrap();
+        wal.flush(proof()).unwrap();
+        let valid_end = wal.durable_cursor();
+        let snap = *wal.backing();
+
+        // Inflate `durable_cursor` across 24 zero-filled bytes (`3 * 8` zero headers).
+        let (recovered_zero_tail, dropped_zero) =
+            WalImpl::<128>::recover_from_backing(snap, valid_end + 24);
+        assert_eq!(dropped_zero, 24, "zero-filled tail must be rejected and counted");
+        assert_eq!(recovered_zero_tail.durable_cursor(), valid_end);
+        let mut replayed = 0usize;
+        let mut saw_empty = false;
+        recovered_zero_tail.replay(&mut |lsn, payload| {
+            replayed += 1;
+            if lsn == 2 && payload.is_empty() {
+                saw_empty = true;
+            }
+        });
+        assert_eq!(replayed, 2, "zero tail must not fabricate phantom empty frames");
+        assert!(saw_empty, "genuine empty append must still replay");
+
+        // 2. Corrupting a trailing frame must NOT zero-erase the forensic bytes in
+        //    `backing()`, and must report the exact dropped byte count.
+        let mut wal2: WalImpl<128> = WalImpl::new();
+        wal2.append(b"keep-me").unwrap();
+        let prefix_end = wal2.write_cursor();
+        wal2.append(b"torn-record").unwrap();
+        wal2.flush(proof()).unwrap();
+        let dc2 = wal2.durable_cursor();
+        let mut snap2 = *wal2.backing();
+        snap2[dc2 - 2] ^= 0xA5;
+        let expected_forensic_tail = snap2[prefix_end..dc2].to_vec();
+
+        let (recovered_corrupt, dropped_corrupt) =
+            WalImpl::<128>::recover_from_backing(snap2, dc2);
+        assert_eq!(dropped_corrupt, dc2 - prefix_end);
+        assert_eq!(recovered_corrupt.durable_cursor(), prefix_end);
+        assert_eq!(
+            &recovered_corrupt.backing()[prefix_end..dc2],
+            expected_forensic_tail.as_slice(),
+            "recover_from_backing must leave dropped tail bytes untouched in buffer"
+        );
     }
 }

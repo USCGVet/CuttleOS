@@ -58,13 +58,26 @@ use crate::wal::{durable_wal_proof, WalError, WalImpl, FRAME_HEADER_BYTES};
 
 /// Maximum length of an interactive command line in bytes.
 pub const SHELL_LINE_MAX: usize = 256;
+/// Pre-upgrade v1 inode count in the live OS shell RamFs.
+pub const SHELL_FS_INODES_V1: usize = 16;
+/// Pre-upgrade v1 byte capacity of the live OS shell RamFs pool (`4 KiB`).
+pub const SHELL_FS_POOL_V1: usize = 4096;
+/// Pre-upgrade v1 sector count in the block-backed filesystem partition (`8 KiB`).
+pub const SHELL_FS_PART_SECTORS_V1: usize = 16;
+
 /// Maximum number of inodes in the live OS shell RamFs.
-pub const SHELL_FS_INODES: usize = 16;
-/// Byte capacity of the live OS shell RamFs pool.
-pub const SHELL_FS_POOL: usize = 4096;
-/// Number of 512-byte disk sectors in the block-backed filesystem partition (`8 KiB`).
-pub const SHELL_FS_PART_SECTORS: usize = 16;
-/// Total byte size of the 16-sector block-backed filesystem partition (`8192` bytes).
+pub const SHELL_FS_INODES: usize = 24;
+/// Byte capacity of the live OS shell RamFs pool (`10 KiB`).
+pub const SHELL_FS_POOL: usize = 10240;
+/// Number of directory sectors (`8` 64-byte directory entries per sector).
+const FS_DIR_SECTORS: usize = SHELL_FS_INODES / 8;
+/// First sector of the data pool inside [`SHELL_FS_PART_SECTORS`].
+const FS_POOL_START_SEC: usize = 1 + FS_DIR_SECTORS;
+/// First sector of the 160-byte-per-inode long-path extension table (`8` sectors).
+const FS_EXT_START_SEC: usize = FS_POOL_START_SEC + (SHELL_FS_POOL / 512);
+/// Number of 512-byte disk sectors in the block-backed filesystem partition (`16 KiB`).
+pub const SHELL_FS_PART_SECTORS: usize = 32;
+/// Total byte size of the 32-sector block-backed filesystem partition (`16384` bytes).
 pub const SHELL_FS_PART_BYTES: usize = SHELL_FS_PART_SECTORS * 512;
 /// 8-byte superblock magic for the block-backed filesystem partition (`CTTLFS01`).
 pub const SHELL_FS_MAGIC: &[u8; 8] = b"CTTLFS01";
@@ -72,12 +85,12 @@ pub const SHELL_FS_MAGIC: &[u8; 8] = b"CTTLFS01";
 pub const SHELL_MAX_TASKS: usize = 16;
 /// Number of audit events retained in the live OS shell audit ring.
 pub const SHELL_AUDIT_CAP: usize = 32;
-/// Maximum number of IMA trusted binary digests.
-pub const SHELL_IMA_CAP: usize = 8;
+/// Maximum number of IMA trusted binary digests (5 reserved for built-in `/bin/*` + `/sbin/svc-*`, 27 custom).
+pub const SHELL_IMA_CAP: usize = 32;
 /// Maximum number of concurrent authenticated web/control-plane sessions.
 pub const SHELL_MAX_SESSIONS: usize = 4;
 /// Maximum number of periodic scheduled jobs in CuttleChronos (`cron`).
-pub const SHELL_MAX_CRON_JOBS: usize = 4;
+pub const SHELL_MAX_CRON_JOBS: usize = 12;
 /// Interactive console prompt string.
 pub const SHELL_PROMPT: &[u8] = b"cuttle> ";
 
@@ -125,16 +138,22 @@ pub enum StateRestoreError {
     Sql,
 }
 
-/// Size of the shell journal that [`OsShell::pack_disk_image`] seals into one disk sector.
-pub const SHELL_JOURNAL_BYTES: usize = 512;
+/// Number of 512-byte WAL backing sectors in the v2 shell journal partition (`2 KiB`).
+pub const SHELL_JOURNAL_SECTORS: usize = 4;
+/// Total sectors in the v2 shell journal partition (`1` `CTTLSHL1` header + `4` WAL sectors).
+pub const SHELL_JOURNAL_PART_SECTORS: usize = 1 + SHELL_JOURNAL_SECTORS;
+/// Size of the shell journal that [`OsShell::pack_journal_sectors`] seals (`2048` bytes).
+pub const SHELL_JOURNAL_BYTES: usize = SHELL_JOURNAL_SECTORS * 512;
 /// Payload bytes of a worker-task (`T`) journal record.
 const STATE_REC_TASK_LEN: usize = 13;
 /// Payload bytes of a firewall-rule (`W`) journal record.
 const STATE_REC_FW_LEN: usize = 7;
 /// Payload bytes of the anti-replay watermark (`Q`) journal record.
 const STATE_REC_AUTH_LEN: usize = 9;
-/// Payload bytes of the security-watermark (`S`) journal record.
-const STATE_REC_SEC_LEN: usize = 28;
+/// Payload bytes of the v2 security-watermark (`S`) journal record (`64`-bit `vault_nonce_seq`).
+const STATE_REC_SEC_LEN: usize = 34;
+/// Payload bytes of the legacy v1 security-watermark (`S`) journal record (`16`-bit `vault_nonce_seq`).
+const STATE_REC_SEC_LEN_V1: usize = 28;
 /// Journal bytes kept free for records no operator command asks for: the
 /// anti-replay watermark (`Q`), the security watermarks (`S`), and the one
 /// firewall rule `guard lockdown` installs. Reserving them means an
@@ -331,10 +350,14 @@ pub struct OsShell {
     pub login_cooldown_ticks: u32,
     /// Exponential backoff shift (`0..=5`) doubling the cooldown window (`8 << level`) on repeated lockouts.
     pub login_backoff_level: u8,
-    /// Monotonic 15-bit per-write nonce counter (`1..=0x7FFF`) mixed into `CuttleVault` keystream and MAC derivation.
-    pub vault_nonce_seq: u16,
+    /// Monotonic 64-bit per-write nonce counter (`1..=u64::MAX`) paired with a 32-bit salt to form a 96-bit `CuttleVault` nonce.
+    pub vault_nonce_seq: u64,
     /// Boot-seeded baseline for `vault_nonce_seq` so `checkpoint_wal` emits `S` only when security state advances.
-    vault_nonce_default: u16,
+    vault_nonce_default: u64,
+    /// Rolling per-boot / hardware entropy accumulator mixed into the 32-bit salt half of `CuttleVault` 96-bit nonces.
+    vault_entropy_pool: u64,
+    /// Boot generation most recently passed to [`OsShell::seed_defaults_for_boot`].
+    boot_gen: u64,
     /// Most recently validated HTTP session slot owner ID (`0` = console/unauthenticated, `1..=SHELL_MAX_SESSIONS` = session slot).
     pub last_session_owner: u64,
     /// Active SQL transaction owner override (`0` = console, `1..=4` = HTTP session, `SQL_OWNER_*` = internal subsystem).
@@ -406,6 +429,8 @@ impl OsShell {
             login_backoff_level: 0,
             vault_nonce_seq: 0,
             vault_nonce_default: 0,
+            vault_entropy_pool: 0,
+            boot_gen: 0,
             last_session_owner: 0,
             sql_owner_override: 0,
             triad_node_id: 0,
@@ -524,8 +549,10 @@ impl OsShell {
         self.login_backoff_level = 0;
         self.login_cooldown_ticks = 0;
         self.http_login_seq = 0;
-        self.vault_nonce_seq = ((boot_gen as u16).wrapping_mul(37)) & 0x7FFF;
+        self.boot_gen = boot_gen;
+        self.vault_nonce_seq = boot_gen.wrapping_mul(37) & 0x7FFF;
         self.vault_nonce_default = self.vault_nonce_seq;
+        self.vault_entropy_pool = boot_gen.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xC077_1E05_5EED_0001;
         self.last_session_owner = 0;
         self.sql_owner_override = 0;
         self.triad_node_id = 0;
@@ -543,6 +570,16 @@ impl OsShell {
             crate::svc_runtime::derive_service_base_seed_for_boot(&self.seal_key, boot_gen.max(1));
         self.svc
             .init_role(crate::svc_runtime::NodeRole::Full, base_seed);
+    }
+
+    /// Mix external entropy (such as `rdtsc` jitter or hardware RNG words) into the
+    /// `CuttleVault` 32-bit salt accumulator used alongside the 64-bit monotonic counter.
+    pub fn mix_vault_entropy(&mut self, sample: u64) {
+        self.vault_entropy_pool = self
+            .vault_entropy_pool
+            .rotate_left(13)
+            .wrapping_add(0x9E37_79B9_7F4A_7C15)
+            ^ sample;
     }
 
     /// Advance all active CuttleChronos (`cron`) periodic jobs by one hardware timer tick,
@@ -594,6 +631,19 @@ impl OsShell {
         }
     }
 
+    fn custom_ima_count(&self) -> usize {
+        let mut n = 0usize;
+        let mut i = 0usize;
+        while i < self.ima_count {
+            let plen = self.ima_path_lens[i] as usize;
+            if !is_default_system_file(&self.ima_paths[i][..plen]) {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
+    }
+
     /// Register or update a trusted SHA-256 digest for `path` in the IMA table.
     pub fn enroll_ima_digest(&mut self, path: &[u8], digest: &[u8; DURABLE_DIGEST_LEN]) -> bool {
         let mut norm = [0u8; cuttle_contracts::FS_PATH_MAX];
@@ -612,6 +662,9 @@ impl OsShell {
                 return true;
             }
             i += 1;
+        }
+        if !is_default_system_file(cpath) && self.custom_ima_count() >= SHELL_IMA_CAP - 5 {
+            return false;
         }
         if self.ima_count >= SHELL_IMA_CAP {
             return false;
@@ -1171,9 +1224,8 @@ impl OsShell {
         boots: u64,
         image: &mut crate::state_store::StateImage,
     ) -> Result<usize, StatePackError> {
-        let (hdr, wal) = image.wal.split_at_mut(1);
         let records = self
-            .pack_disk_image(boots, &mut hdr[0], &mut wal[0])
+            .pack_journal_sectors(boots, &mut image.wal)
             .map_err(StatePackError::Journal)?;
         self.pack_fs_partition(boots, &mut image.fs)
             .map_err(StatePackError::Filesystem)?;
@@ -1183,47 +1235,66 @@ impl OsShell {
     }
 
     /// Verify and load a state image produced by [`OsShell::pack_state_image`]
-    /// into this shell, which must be freshly seeded.
+    /// into this shell.
     ///
     /// All three parts are required and each is checked against its own
     /// keyed seal; the filesystem partition must carry the same boot
-    /// generation as the shell header. A missing part is an error rather than
-    /// "nothing to restore": an image that lost its filesystem or SQL
-    /// partition must not be mistaken for an empty one. The one exception is
-    /// an image with the pre-rebrand `PRTS` header, which may have been
-    /// written before those partitions existed.
+    /// generation as the shell header.
     ///
-    /// On `Err` the shell may be partly restored and must be discarded.
+    /// Atomic on failure: all three partitions (`wal`, `fs` including generation
+    /// binding, and `sql`) are verified completely before any durable field of
+    /// `self` is mutated, so a failed call leaves the caller's `OsShell` intact
+    /// (recording only the denial audit event).
     pub fn unpack_state_image(
         &mut self,
         image: &crate::state_store::StateImage,
     ) -> Result<StateRestore, StateRestoreError> {
         let legacy_header = bytes_eq(&image.wal[0][0..4], b"PRTS");
-        let (saved_boots, applied) = self
-            .unpack_disk_image(&image.wal[0], &image.wal[1])
+        let (saved_boots, wal) = self
+            .validate_journal_sectors(&image.wal)
             .map_err(|_| StateRestoreError::Journal { legacy_header })?;
 
-        // Pre-rebrand (`PRTS`) images may predate the filesystem and SQL
-        // partitions. Only for those is an all-zero partition "not there
-        // yet"; in the current format it is damage.
         let blank = |part: &[[u8; 512]]| part.iter().all(|s| s.iter().all(|&b| b == 0));
-        let mut migrated = legacy_header;
-        let mut files = 0usize;
-        if !(legacy_header && blank(&image.fs)) {
-            let (generation, restored, _) = self
-                .unpack_fs_partition(&image.fs)
+        let check_fs = !(legacy_header && blank(&image.fs));
+        if check_fs {
+            let (generation, _, _) = self
+                .validate_fs_partition_generic(
+                    &image.fs,
+                    SHELL_FS_INODES,
+                    SHELL_FS_POOL,
+                    FS_EXT_START_SEC,
+                )
                 .map_err(|_| StateRestoreError::Filesystem)?;
             if generation != saved_boots {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:fs:generation-mismatch");
                 return Err(StateRestoreError::GenerationMismatch);
             }
+        }
+
+        let check_sql = !(legacy_header && blank(&image.sql));
+        if check_sql
+            && !crate::sql::SqlDb::validate_partition_slices(
+                &self.seal_key,
+                &self.legacy_seal_key,
+                &image.sql,
+            )
+        {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:sql:seal-mismatch");
+            return Err(StateRestoreError::Sql);
+        }
+
+        let applied = self.restore_wal(&wal);
+        let mut migrated = legacy_header;
+        let mut files = 0usize;
+        if check_fs {
+            let (_, restored, _) = self
+                .unpack_fs_partition(&image.fs)
+                .map_err(|_| StateRestoreError::Filesystem)?;
             files = restored;
             migrated |= bytes_eq(&image.fs[0][0..4], b"PRTS");
         }
-
-        if !(legacy_header && blank(&image.sql)) {
+        if check_sql {
             if !self.unpack_sql_partition(&image.sql) {
-                self.record_audit(21, AuditVerdict::Denied, b"shell:sql:seal-mismatch");
                 return Err(StateRestoreError::Sql);
             }
             migrated |= bytes_eq(&image.sql[0][0..4], b"PRTS");
@@ -1234,6 +1305,68 @@ impl OsShell {
             records: applied,
             files,
             migrated_legacy: migrated,
+        })
+    }
+
+    /// Verify and load a pre-upgrade v1 26-sector state slot (`2` WAL + `16` FS + `8` SQL)
+    /// during boot migration to v2, validating all three partitions before mutating `self`.
+    pub fn unpack_state_image_v1(
+        &mut self,
+        wal_secs: &[[u8; 512]; 2],
+        fs_secs: &[[u8; 512]; SHELL_FS_PART_SECTORS_V1],
+        sql_secs: &[[u8; 512]; crate::sql::SQL_PART_SECTORS_V1],
+    ) -> Result<StateRestore, StateRestoreError> {
+        let legacy_header = bytes_eq(&wal_secs[0][0..4], b"PRTS");
+        let (saved_boots, wal) = self
+            .validate_disk_image(&wal_secs[0], &wal_secs[1])
+            .map_err(|_| StateRestoreError::Journal { legacy_header })?;
+
+        let blank = |part: &[[u8; 512]]| part.iter().all(|s| s.iter().all(|&b| b == 0));
+        let check_fs = !(legacy_header && blank(&fs_secs[..]));
+        if check_fs {
+            let (generation, _, _) = self
+                .validate_fs_partition_generic(
+                    &fs_secs[..],
+                    SHELL_FS_INODES_V1,
+                    SHELL_FS_POOL_V1,
+                    11,
+                )
+                .map_err(|_| StateRestoreError::Filesystem)?;
+            if generation != saved_boots {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:fs:generation-mismatch");
+                return Err(StateRestoreError::GenerationMismatch);
+            }
+        }
+
+        let check_sql = !(legacy_header && blank(&sql_secs[..]));
+        if check_sql
+            && !crate::sql::SqlDb::validate_partition_slices(
+                &self.seal_key,
+                &self.legacy_seal_key,
+                &sql_secs[..],
+            )
+        {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:sql:seal-mismatch");
+            return Err(StateRestoreError::Sql);
+        }
+
+        let applied = self.restore_wal(&wal);
+        let mut files = 0usize;
+        if check_fs {
+            let (_, restored, _) = self
+                .unpack_fs_partition_v1(fs_secs)
+                .map_err(|_| StateRestoreError::Filesystem)?;
+            files = restored;
+        }
+        if check_sql && !self.db.load_partition_v1(&self.seal_key, &self.legacy_seal_key, sql_secs) {
+            return Err(StateRestoreError::Sql);
+        }
+
+        Ok(StateRestore {
+            saved_boots,
+            records: applied,
+            files,
+            migrated_legacy: true,
         })
     }
 
@@ -1366,7 +1499,7 @@ impl OsShell {
         while ima_i < self.ima_count {
             let plen = self.ima_path_lens[ima_i] as usize;
             let path = &self.ima_paths[ima_i][..plen];
-            if !bytes_eq(path, b"/bin/fib") && !bytes_eq(path, b"/bin/sum") && plen <= 32 {
+            if !is_default_system_file(path) && plen <= 32 {
                 let mut rec = [0u8; 2 + 32 + DURABLE_DIGEST_LEN];
                 rec[0] = b'I';
                 rec[1] = plen as u8;
@@ -1400,10 +1533,10 @@ impl OsShell {
             rec[0] = b'S';
             rec[1] = (if self.guard_lockdown { 1u8 } else { 0u8 })
                 | ((self.triad_node_id & 0x03) << 1);
-            rec[2..4].copy_from_slice(&self.vault_nonce_seq.to_le_bytes());
-            rec[4..12].copy_from_slice(&self.http_login_seq.to_le_bytes());
-            rec[12..20].copy_from_slice(&self.triad_tx_seq.to_le_bytes());
-            rec[20..28].copy_from_slice(&self.triad_min_epoch.to_le_bytes());
+            rec[2..10].copy_from_slice(&self.vault_nonce_seq.to_le_bytes());
+            rec[10..18].copy_from_slice(&self.http_login_seq.to_le_bytes());
+            rec[18..26].copy_from_slice(&self.triad_tx_seq.to_le_bytes());
+            rec[26..34].copy_from_slice(&self.triad_min_epoch.to_le_bytes());
             emit(&rec)?;
             count += 1;
         }
@@ -1675,7 +1808,9 @@ impl OsShell {
                     self.auth_seq = seq;
                 }
                 applied += 1;
-            } else if payload.len() == 28 && payload[0] == b'S' {
+            } else if (payload.len() == STATE_REC_SEC_LEN || payload.len() == STATE_REC_SEC_LEN_V1)
+                && payload[0] == b'S'
+            {
                 if (payload[1] & 1) != 0 {
                     self.guard_lockdown = true;
                 }
@@ -1684,45 +1819,53 @@ impl OsShell {
                     self.triad_node_id = nid;
                     self.sync_triad_local();
                 }
-                let vn = u16::from_le_bytes([payload[2], payload[3]]);
+                let (vn, off) = if payload.len() == STATE_REC_SEC_LEN {
+                    let vn64 = u64::from_le_bytes([
+                        payload[2], payload[3], payload[4], payload[5], payload[6], payload[7],
+                        payload[8], payload[9],
+                    ]);
+                    (vn64, 10usize)
+                } else {
+                    (u16::from_le_bytes([payload[2], payload[3]]) as u64, 4usize)
+                };
                 if vn > self.vault_nonce_seq {
                     self.vault_nonce_seq = vn;
                 }
                 let hls = u64::from_le_bytes([
-                    payload[4],
-                    payload[5],
-                    payload[6],
-                    payload[7],
-                    payload[8],
-                    payload[9],
-                    payload[10],
-                    payload[11],
+                    payload[off],
+                    payload[off + 1],
+                    payload[off + 2],
+                    payload[off + 3],
+                    payload[off + 4],
+                    payload[off + 5],
+                    payload[off + 6],
+                    payload[off + 7],
                 ]);
                 if hls > self.http_login_seq {
                     self.http_login_seq = hls;
                 }
                 let tts = u64::from_le_bytes([
-                    payload[12],
-                    payload[13],
-                    payload[14],
-                    payload[15],
-                    payload[16],
-                    payload[17],
-                    payload[18],
-                    payload[19],
+                    payload[off + 8],
+                    payload[off + 9],
+                    payload[off + 10],
+                    payload[off + 11],
+                    payload[off + 12],
+                    payload[off + 13],
+                    payload[off + 14],
+                    payload[off + 15],
                 ]);
                 if tts > self.triad_tx_seq {
                     self.triad_tx_seq = tts;
                 }
                 let tme = u64::from_le_bytes([
-                    payload[20],
-                    payload[21],
-                    payload[22],
-                    payload[23],
-                    payload[24],
-                    payload[25],
-                    payload[26],
-                    payload[27],
+                    payload[off + 16],
+                    payload[off + 17],
+                    payload[off + 18],
+                    payload[off + 19],
+                    payload[off + 20],
+                    payload[off + 21],
+                    payload[off + 22],
+                    payload[off + 23],
                 ]);
                 if tme > self.triad_min_epoch {
                     self.triad_min_epoch = tme;
@@ -1861,17 +2004,152 @@ impl OsShell {
         Ok(count)
     }
 
-    /// Unpack and verify a two-sector (`hdr_sector`, `wal_sector`) disk image
-    /// written by [`OsShell::pack_disk_image`], restoring files, worker tasks,
-    /// and capabilities only if the `CTTLSHL1` (or legacy `PRTSSHL1`) magic and
-    /// 32-byte SHA-256 seal match in constant time.
-    ///
-    /// Returns `Ok((saved_boots, applied_records))`.
-    pub fn unpack_disk_image(
+    /// Pack the v2 5-sector shell journal partition (`1` `CTTLSHL1` header sector +
+    /// `4` WAL backing sectors = `2 KiB` journal) authenticated across all 5 sectors.
+    pub fn pack_journal_sectors(
+        &mut self,
+        boots: u64,
+        sectors: &mut [[u8; 512]; SHELL_JOURNAL_PART_SECTORS],
+    ) -> Result<usize, WalError> {
+        let mut wal: WalImpl<SHELL_JOURNAL_BYTES> = WalImpl::new();
+        let mut seal = [0u8; DURABLE_DIGEST_LEN];
+        let count = self.checkpoint_sealed(&mut wal, &mut seal)?;
+
+        sectors[0] = [0u8; 512];
+        let backing = wal.backing();
+        let mut s = 0usize;
+        while s < SHELL_JOURNAL_SECTORS {
+            sectors[1 + s].copy_from_slice(&backing[s * 512..(s + 1) * 512]);
+            s += 1;
+        }
+        sectors[0][0..8].copy_from_slice(b"CTTLSHL1");
+        sectors[0][8..16].copy_from_slice(&boots.to_le_bytes());
+        sectors[0][16..20].copy_from_slice(&(wal.durable_cursor() as u32).to_le_bytes());
+        sectors[0][20..20 + DURABLE_DIGEST_LEN].copy_from_slice(&seal);
+
+        let mut hdr_msg = [0u8; 16 + 52];
+        hdr_msg[0..16].copy_from_slice(b"CTTLSHL1-HDR-v1:");
+        hdr_msg[16..68].copy_from_slice(&sectors[0][0..52]);
+        let mut hdr_seal = [0u8; DURABLE_DIGEST_LEN];
+        seal_bytes_keyed(&self.seal_key, &hdr_msg, &mut hdr_seal);
+        sectors[0][52..84].copy_from_slice(&hdr_seal);
+
+        let mut sec_mac = [0u8; DURABLE_DIGEST_LEN];
+        compute_journal_sectors_seal(&self.seal_key, sectors, &mut sec_mac);
+        sectors[0][84..84 + DURABLE_DIGEST_LEN].copy_from_slice(&sec_mac);
+        Ok(count)
+    }
+
+    fn validate_journal_sectors(
+        &mut self,
+        sectors: &[[u8; 512]; SHELL_JOURNAL_PART_SECTORS],
+    ) -> Result<(u64, WalImpl<SHELL_JOURNAL_BYTES>), WalError> {
+        let hdr_sector = &sectors[0];
+        let is_legacy = bytes_eq(&hdr_sector[0..8], b"PRTSSHL1");
+        if !bytes_eq(&hdr_sector[0..8], b"CTTLSHL1") && !is_legacy {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:wal:header-corrupt");
+            return Err(WalError::PayloadTooLarge);
+        }
+        let saved_boots = u64::from_le_bytes([
+            hdr_sector[8],
+            hdr_sector[9],
+            hdr_sector[10],
+            hdr_sector[11],
+            hdr_sector[12],
+            hdr_sector[13],
+            hdr_sector[14],
+            hdr_sector[15],
+        ]);
+        let cursor = u32::from_le_bytes([
+            hdr_sector[16],
+            hdr_sector[17],
+            hdr_sector[18],
+            hdr_sector[19],
+        ]) as usize;
+        if cursor > SHELL_JOURNAL_BYTES {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:wal:cursor-overflow");
+            return Err(WalError::OutOfCapacity);
+        }
+        let mut expected_seal = [0u8; DURABLE_DIGEST_LEN];
+        expected_seal.copy_from_slice(&hdr_sector[20..20 + DURABLE_DIGEST_LEN]);
+
+        let mut backing = [0u8; SHELL_JOURNAL_BYTES];
+        let mut s = 0usize;
+        while s < SHELL_JOURNAL_SECTORS {
+            backing[s * 512..(s + 1) * 512].copy_from_slice(&sectors[1 + s]);
+            s += 1;
+        }
+        let wal = WalImpl::<SHELL_JOURNAL_BYTES>::from_backing(backing, cursor);
+        if is_legacy {
+            let mut scratch = [0u8; 1024];
+            let len = serialize_wal_for_seal(&wal, &mut scratch);
+            let mut stream_primary = [0u8; DURABLE_DIGEST_LEN];
+            let mut stream_legacy = [0u8; DURABLE_DIGEST_LEN];
+            compute_wal_seal(&self.seal_key, &wal, &mut stream_primary);
+            compute_wal_seal(&self.legacy_seal_key, &wal, &mut stream_legacy);
+            let ok = (is_seal_key_set(&self.seal_key)
+                && (constant_time_eq(&stream_primary, &expected_seal)
+                    || seal_matches_keyed(&self.seal_key, &scratch[..len], &expected_seal)))
+                || (is_seal_key_set(&self.legacy_seal_key)
+                    && (constant_time_eq(&stream_legacy, &expected_seal)
+                        || seal_matches_keyed(&self.legacy_seal_key, &scratch[..len], &expected_seal)));
+            if !ok {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:wal:seal-mismatch");
+                return Err(WalError::PayloadTooLarge);
+            }
+            Ok((saved_boots, wal))
+        } else {
+            if !is_seal_key_set(&self.seal_key) {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:wal:key-unset");
+                return Err(WalError::PayloadTooLarge);
+            }
+            let mut hdr_msg = [0u8; 16 + 52];
+            hdr_msg[0..16].copy_from_slice(b"CTTLSHL1-HDR-v1:");
+            hdr_msg[16..68].copy_from_slice(&hdr_sector[0..52]);
+            let mut expected_hdr_seal = [0u8; DURABLE_DIGEST_LEN];
+            expected_hdr_seal.copy_from_slice(&hdr_sector[52..84]);
+            if !seal_matches_keyed(&self.seal_key, &hdr_msg, &expected_hdr_seal) {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:wal:hdr-seal-mismatch");
+                return Err(WalError::PayloadTooLarge);
+            }
+            let mut expected_sec_mac = [0u8; DURABLE_DIGEST_LEN];
+            expected_sec_mac.copy_from_slice(&hdr_sector[84..84 + DURABLE_DIGEST_LEN]);
+            let mut actual_sec_mac = [0u8; DURABLE_DIGEST_LEN];
+            compute_journal_sectors_seal(&self.seal_key, sectors, &mut actual_sec_mac);
+            if !constant_time_eq(&actual_sec_mac, &expected_sec_mac) {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:wal:sector-seal-mismatch");
+                return Err(WalError::PayloadTooLarge);
+            }
+            if wal.durable_cursor() != cursor {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:wal:frame-corrupt");
+                return Err(WalError::PayloadTooLarge);
+            }
+            let mut actual_seal = [0u8; DURABLE_DIGEST_LEN];
+            compute_wal_seal(&self.seal_key, &wal, &mut actual_seal);
+            if !constant_time_eq(&actual_seal, &expected_seal) {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:wal:seal-mismatch");
+                return Err(WalError::PayloadTooLarge);
+            }
+            Ok((saved_boots, wal))
+        }
+    }
+
+    /// Unpack and verify a v2 5-sector shell journal partition written by
+    /// [`OsShell::pack_journal_sectors`].
+    pub fn unpack_journal_sectors(
+        &mut self,
+        sectors: &[[u8; 512]; SHELL_JOURNAL_PART_SECTORS],
+    ) -> Result<(u64, usize), WalError> {
+        let (saved_boots, wal) = self.validate_journal_sectors(sectors)?;
+        let applied = self.restore_wal(&wal);
+        Ok((saved_boots, applied))
+    }
+
+    fn validate_disk_image(
         &mut self,
         hdr_sector: &[u8; 512],
         wal_sector: &[u8; 512],
-    ) -> Result<(u64, usize), WalError> {
+    ) -> Result<(u64, WalImpl<512>), WalError> {
         let is_legacy = bytes_eq(&hdr_sector[0..8], b"PRTSSHL1");
         if !bytes_eq(&hdr_sector[0..8], b"CTTLSHL1") && !is_legacy {
             self.record_audit(21, AuditVerdict::Denied, b"shell:wal:header-corrupt");
@@ -1903,7 +2181,13 @@ impl OsShell {
             expected_seal[s] = hdr_sector[20 + s];
             s += 1;
         }
-        let wal = WalImpl::<512>::from_backing(*wal_sector, cursor);
+        let mut wal = WalImpl::<512>::from_backing(*wal_sector, cursor);
+        if wal.durable_cursor() < cursor {
+            let v1_wal = WalImpl::<512>::from_backing_legacy_v1(*wal_sector, cursor);
+            if v1_wal.durable_cursor() == cursor {
+                wal = v1_wal;
+            }
+        }
         if is_legacy {
             let mut scratch = [0u8; 1024];
             let len = serialize_wal_for_seal(&wal, &mut scratch);
@@ -1921,8 +2205,7 @@ impl OsShell {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:wal:seal-mismatch");
                 return Err(WalError::PayloadTooLarge);
             }
-            let applied = self.restore_wal(&wal);
-            Ok((saved_boots, applied))
+            Ok((saved_boots, wal))
         } else {
             if !is_seal_key_set(&self.seal_key) {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:wal:key-unset");
@@ -1937,21 +2220,81 @@ impl OsShell {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:wal:hdr-seal-mismatch");
                 return Err(WalError::PayloadTooLarge);
             }
-            let applied = self.restore_sealed(&wal, &expected_seal)?;
-            Ok((saved_boots, applied))
+            if wal.durable_cursor() != cursor {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:wal:frame-corrupt");
+                return Err(WalError::PayloadTooLarge);
+            }
+            let mut actual_seal = [0u8; DURABLE_DIGEST_LEN];
+            compute_wal_seal(&self.seal_key, &wal, &mut actual_seal);
+            if !constant_time_eq(&actual_seal, &expected_seal) {
+                self.record_audit(21, AuditVerdict::Denied, b"shell:wal:seal-mismatch");
+                return Err(WalError::PayloadTooLarge);
+            }
+            Ok((saved_boots, wal))
         }
     }
 
+    /// Unpack and verify a two-sector (`hdr_sector`, `wal_sector`) disk image
+    /// written by [`OsShell::pack_disk_image`], restoring files, worker tasks,
+    /// and capabilities only if the `CTTLSHL1` (or legacy `PRTSSHL1`) magic and
+    /// 32-byte SHA-256 seal match in constant time.
+    ///
+    /// Returns `Ok((saved_boots, applied_records))`.
+    pub fn unpack_disk_image(
+        &mut self,
+        hdr_sector: &[u8; 512],
+        wal_sector: &[u8; 512],
+    ) -> Result<(u64, usize), WalError> {
+        let (saved_boots, wal) = self.validate_disk_image(hdr_sector, wal_sector)?;
+        let applied = self.restore_wal(&wal);
+        Ok((saved_boots, applied))
+    }
+
     /// Pack all mutable/user files (`!is_default_system_file`) from `self.fs`
-    /// into a 16-sector (`8 KiB`) block-backed filesystem partition image
-    /// (`CTTLFS01` magic + 2-sector inode directory + 8-sector `4 KiB` data pool +
-    /// 5 reserved sectors) sealed with a chained keyed `HMAC-SHA256` (`self.seal_key`).
+    /// into a 32-sector (`16 KiB`) block-backed filesystem partition image
+    /// (`CTTLFS01` magic + 3-sector inode directory + 20-sector `10 KiB` data pool +
+    /// 8 long-path extension sectors) sealed with a chained keyed `HMAC-SHA256` (`self.seal_key`).
     ///
     /// Returns `Ok((file_count, data_bytes))`.
     pub fn pack_fs_partition(
         &mut self,
         generation: u64,
         sectors: &mut [[u8; 512]; SHELL_FS_PART_SECTORS],
+    ) -> Result<(usize, usize), WalError> {
+        self.pack_fs_partition_generic(
+            generation,
+            &mut sectors[..],
+            SHELL_FS_INODES,
+            SHELL_FS_POOL,
+            FS_POOL_START_SEC,
+            FS_EXT_START_SEC,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pack_fs_partition_v1(
+        &mut self,
+        generation: u64,
+        sectors: &mut [[u8; 512]; SHELL_FS_PART_SECTORS_V1],
+    ) -> Result<(usize, usize), WalError> {
+        self.pack_fs_partition_generic(
+            generation,
+            &mut sectors[..],
+            SHELL_FS_INODES_V1,
+            SHELL_FS_POOL_V1,
+            3,
+            11,
+        )
+    }
+
+    fn pack_fs_partition_generic(
+        &mut self,
+        generation: u64,
+        sectors: &mut [[u8; 512]],
+        max_inodes: usize,
+        max_pool: usize,
+        pool_start_sec: usize,
+        ext_start_sec: usize,
     ) -> Result<(usize, usize), WalError> {
         if !is_seal_key_set(&self.seal_key) {
             self.record_audit(21, AuditVerdict::Denied, b"shell:fs:key-unset");
@@ -1967,7 +2310,7 @@ impl OsShell {
         proof.consume();
 
         let mut s = 0usize;
-        while s < SHELL_FS_PART_SECTORS {
+        while s < sectors.len() {
             sectors[s] = [0u8; 512];
             s += 1;
         }
@@ -1981,7 +2324,7 @@ impl OsShell {
                     if path.is_empty() || path.len() > SHELL_MAX_WRITABLE_PATH {
                         return Err(WalError::PayloadTooLarge);
                     }
-                    if data_cursor.saturating_add(data.len()) > SHELL_FS_POOL {
+                    if file_count >= max_inodes || data_cursor.saturating_add(data.len()) > max_pool {
                         return Err(WalError::OutOfCapacity);
                     }
                     let dir_sec = 1 + (file_count / 8);
@@ -1989,7 +2332,7 @@ impl OsShell {
                     let plen_b = (path.len() as u16).to_le_bytes();
                     let doff_b = (data_cursor as u16).to_le_bytes();
                     let dlen_b = (data.len() as u32).to_le_bytes();
-                    let mtime_b = 1u64.to_le_bytes();
+                    let mtime_b = self.fs.inode_mtime(i).unwrap_or(0).to_le_bytes();
                     sectors[dir_sec][dir_off] = plen_b[0];
                     sectors[dir_sec][dir_off + 1] = plen_b[1];
                     sectors[dir_sec][dir_off + 2] = doff_b[0];
@@ -2010,7 +2353,7 @@ impl OsShell {
                         let tail = &path[46..];
                         while k < tail.len() {
                             let abs_ext = ext_base + k;
-                            sectors[11 + (abs_ext / 512)][abs_ext % 512] = tail[k];
+                            sectors[ext_start_sec + (abs_ext / 512)][abs_ext % 512] = tail[k];
                             k += 1;
                         }
                     }
@@ -2023,7 +2366,7 @@ impl OsShell {
                     let mut b = 0usize;
                     while b < data.len() {
                         let abs = data_cursor + b;
-                        sectors[3 + (abs / 512)][abs % 512] = data[b];
+                        sectors[pool_start_sec + (abs / 512)][abs % 512] = data[b];
                         b += 1;
                     }
                     data_cursor += data.len();
@@ -2065,16 +2408,41 @@ impl OsShell {
         Ok((file_count, data_cursor))
     }
 
-    /// Verify and unpack a 16-sector (`8 KiB`) block-backed filesystem partition
+    /// Verify and unpack a 32-sector (`16 KiB`) block-backed filesystem partition
     /// written by [`OsShell::pack_fs_partition`].
-    ///
-    /// Verifies the `CTTLFS01` (or legacy `PRTSFS01`) superblock magic and the chained
-    /// keyed `HMAC-SHA256` seal over all 16 sectors in constant time before mounting/restoring
-    /// files (including multi-sector files up to `SHELL_FS_POOL = 4096` bytes).
-    /// Returns `Ok((generation, file_count, data_bytes))`.
     pub fn unpack_fs_partition(
         &mut self,
         sectors: &[[u8; 512]; SHELL_FS_PART_SECTORS],
+    ) -> Result<(u64, usize, usize), WalError> {
+        self.unpack_fs_partition_generic(
+            &sectors[..],
+            SHELL_FS_INODES,
+            SHELL_FS_POOL,
+            FS_POOL_START_SEC,
+            FS_EXT_START_SEC,
+        )
+    }
+
+    /// Verify and unpack a pre-upgrade 16-sector (`8 KiB`) v1 `CTTLFS01` partition.
+    pub fn unpack_fs_partition_v1(
+        &mut self,
+        sectors: &[[u8; 512]; SHELL_FS_PART_SECTORS_V1],
+    ) -> Result<(u64, usize, usize), WalError> {
+        self.unpack_fs_partition_generic(
+            &sectors[..],
+            SHELL_FS_INODES_V1,
+            SHELL_FS_POOL_V1,
+            3,
+            11,
+        )
+    }
+
+    fn validate_fs_partition_generic(
+        &mut self,
+        sectors: &[[u8; 512]],
+        max_inodes: usize,
+        max_pool: usize,
+        ext_start_sec: usize,
     ) -> Result<(u64, usize, usize), WalError> {
         let is_legacy = bytes_eq(&sectors[0][0..8], b"PRTSFS01");
         if !bytes_eq(&sectors[0][0..8], SHELL_FS_MAGIC) && !is_legacy {
@@ -2103,7 +2471,7 @@ impl OsShell {
             sectors[0][22],
             sectors[0][23],
         ]) as usize;
-        if file_count > SHELL_FS_INODES || data_bytes > SHELL_FS_POOL {
+        if file_count > max_inodes || data_bytes > max_pool {
             self.record_audit(21, AuditVerdict::Denied, b"shell:fs:bounds-overflow");
             return Err(WalError::OutOfCapacity);
         }
@@ -2128,25 +2496,49 @@ impl OsShell {
             return Err(WalError::PayloadTooLarge);
         }
 
-        // Pass 1: every directory entry must be well formed before anything
-        // in the live filesystem is touched.
         let mut norm_path_buf = [0u8; cuttle_contracts::FS_PATH_MAX];
         let mut exact_bytes = 0usize;
         let mut idx = 0usize;
         while idx < file_count {
-            let Some((_, _, dlen, _)) = parse_fs_dirent(sectors, idx, data_bytes, &mut norm_path_buf)
-            else {
+            let Some((_, _, dlen, _)) = parse_fs_dirent(
+                sectors,
+                max_inodes,
+                ext_start_sec,
+                idx,
+                data_bytes,
+                &mut norm_path_buf,
+            ) else {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:fs:dirent-corrupt");
                 return Err(WalError::PayloadTooLarge);
             };
             exact_bytes = exact_bytes.saturating_add(dlen);
             idx += 1;
         }
+        Ok((generation, file_count, exact_bytes))
+    }
 
-        // The partition is the complete set of user files. Remove whatever
-        // user files are present (for example the small-file copies replayed
-        // from the journal) so their pool reservations cannot crowd out a
-        // file that is about to be restored.
+    fn unpack_fs_partition_generic(
+        &mut self,
+        sectors: &[[u8; 512]],
+        max_inodes: usize,
+        max_pool: usize,
+        pool_start_sec: usize,
+        ext_start_sec: usize,
+    ) -> Result<(u64, usize, usize), WalError> {
+        let (generation, file_count, exact_bytes) = self.validate_fs_partition_generic(
+            sectors,
+            max_inodes,
+            max_pool,
+            ext_start_sec,
+        )?;
+        let data_bytes = u32::from_le_bytes([
+            sectors[0][20],
+            sectors[0][21],
+            sectors[0][22],
+            sectors[0][23],
+        ]) as usize;
+        let mut norm_path_buf = [0u8; cuttle_contracts::FS_PATH_MAX];
+
         let mut i = 0usize;
         while i < SHELL_FS_INODES {
             let mut stale = [0u8; cuttle_contracts::FS_PATH_MAX];
@@ -2164,17 +2556,18 @@ impl OsShell {
             i += 1;
         }
 
-        // Pass 2: restore. Each file reserves at least its own length, which
-        // always fits because the same bytes fitted when the image was
-        // written. A small file is given the usual 256-byte reservation only
-        // while that still leaves room for every file after it.
         let mut later_bytes = exact_bytes;
         let mut chunk = [0u8; 256];
         let mut idx = 0usize;
         while idx < file_count {
-            let Some((nlen, doff, dlen, mtime)) =
-                parse_fs_dirent(sectors, idx, data_bytes, &mut norm_path_buf)
-            else {
+            let Some((nlen, doff, dlen, mtime)) = parse_fs_dirent(
+                sectors,
+                max_inodes,
+                ext_start_sec,
+                idx,
+                data_bytes,
+                &mut norm_path_buf,
+            ) else {
                 self.record_audit(21, AuditVerdict::Denied, b"shell:fs:dirent-corrupt");
                 return Err(WalError::PayloadTooLarge);
             };
@@ -2200,7 +2593,7 @@ impl OsShell {
                             let mut b = 0usize;
                             while b < step {
                                 let abs = doff + rel + b;
-                                chunk[b] = sectors[3 + (abs / 512)][abs % 512];
+                                chunk[b] = sectors[pool_start_sec + (abs / 512)][abs % 512];
                                 b += 1;
                             }
                             if self.fs.write(fh, rel as u64, &chunk[..step]) != Ok(step) {
@@ -2217,8 +2610,6 @@ impl OsShell {
                 }
             }
             if !ok {
-                // A file from a verified image could not be recreated. Fail
-                // the restore: continuing would persist the state without it.
                 self.record_audit(21, AuditVerdict::Error, b"shell:fs:restore-failed");
                 return Err(WalError::OutOfCapacity);
             }
@@ -3752,32 +4143,59 @@ impl OsShell {
                     out,
                 );
             }
-            let mut prev_nonce = 0u16;
-            let mut prev_q = [0u8; 96];
-            let mut pqp = 0usize;
-            pqp += copy_into(b"SELECT rev FROM kv WHERE k = 'v:", &mut prev_q[pqp..]);
-            pqp += copy_into(kname, &mut prev_q[pqp..]);
-            pqp += copy_into(b"'", &mut prev_q[pqp..]);
-            let mut pq_out = [0u8; 64];
-            let pq_len = self
-                .db
-                .exec_as(SQL_OWNER_VAULT, &prev_q[..pqp], &mut pq_out);
-            if pq_len > 4 && &pq_out[..4] == b"rev\n" {
-                if let Some(prev_rev) = parse_u64_ascii(trim_ascii(&pq_out[4..pq_len])) {
-                    prev_nonce = ((prev_rev >> 47) & 0x7FFF) as u16;
+            let mut full_key = [0u8; 20];
+            let mut fkp = 0usize;
+            fkp += copy_into(b"v:", &mut full_key[fkp..]);
+            fkp += copy_into(kname, &mut full_key[fkp..]);
+            let full_key_slice = &full_key[..fkp];
+
+            let mut prev_seq = 0u64;
+            if let Some(m96) = self.db.kv_row_meta96(SQL_OWNER_VAULT, full_key_slice) {
+                if m96 != [0u8; 12] {
+                    let mut cb = [0u8; 8];
+                    cb.copy_from_slice(&m96[0..8]);
+                    prev_seq = u64::from_le_bytes(cb);
+                } else {
+                    let mut prev_q = [0u8; 96];
+                    let mut pqp = 0usize;
+                    pqp += copy_into(b"SELECT rev FROM kv WHERE k = 'v:", &mut prev_q[pqp..]);
+                    pqp += copy_into(kname, &mut prev_q[pqp..]);
+                    pqp += copy_into(b"'", &mut prev_q[pqp..]);
+                    let mut pq_out = [0u8; 64];
+                    let pq_len = self
+                        .db
+                        .exec_as(SQL_OWNER_VAULT, &prev_q[..pqp], &mut pq_out);
+                    if pq_len > 4 && &pq_out[..4] == b"rev\n" {
+                        if let Some(prev_rev) = parse_u64_ascii(trim_ascii(&pq_out[4..pq_len])) {
+                            prev_seq = (prev_rev >> 47) & 0x7FFF;
+                        }
+                    }
                 }
             }
-            let base_nonce = self.vault_nonce_seq.max(prev_nonce);
-            if base_nonce >= 0x7FFF {
+            let base_seq = self.vault_nonce_seq.max(prev_seq);
+            if base_seq == u64::MAX {
                 self.record_audit(35, AuditVerdict::Denied, b"shell:vault:nonce-exhausted");
                 return copy_into(
                     b"error: EOVERFLOW (vault key nonce exhausted; delete or rotate key)\n",
                     out,
                 );
             }
-            let nonce15 = base_nonce + 1;
+            let next_seq = base_seq + 1;
+            let salt32 = vault_derive_salt32(
+                &self.seal_key,
+                self.boot_gen,
+                self.vault_entropy_pool,
+                self.cmd_seq,
+                self.auth_seq,
+                self.http_login_seq,
+                next_seq,
+                kname,
+            );
+            let mut nonce96 = [0u8; 12];
+            nonce96[0..8].copy_from_slice(&next_seq.to_le_bytes());
+            nonce96[8..12].copy_from_slice(&salt32.to_le_bytes());
 
-            let (mut ks, _) = vault_derive_stream_and_mac(&self.seal_key, kname, nonce15, b"");
+            let mut ks = vault_derive_stream_v3(&self.seal_key, kname, &nonce96);
             let slen = secret.len();
             let mut ct = [0u8; 12];
             let mut i = 0usize;
@@ -3786,11 +4204,15 @@ impl OsShell {
                 i += 1;
             }
             zeroize_secret_bytes(&mut ks);
-            let (mut ks_mac, tag_u64) =
-                vault_derive_stream_and_mac(&self.seal_key, kname, nonce15, &ct[..slen]);
-            zeroize_secret_bytes(&mut ks_mac);
+            let tag_u64 = vault_compute_tag_v3(&self.seal_key, kname, &nonce96, &ct[..slen]);
             let mut ct_hex = [0u8; 24];
             let hex_len = hex_bytes(&ct[..slen], &mut ct_hex);
+
+            let mut tx_out = [0u8; 96];
+            let tn = self.db.exec_as(SQL_OWNER_VAULT, b"BEGIN", &mut tx_out);
+            if tx_out[..tn].starts_with(b"error:") {
+                return copy_into(&tx_out[..tn], out);
+            }
 
             let mut sql_q = [0u8; 128];
             let mut qp = 0usize;
@@ -3805,14 +4227,32 @@ impl OsShell {
             qp += dec_u64(tag_u64, &mut sql_q[qp..]);
             qp += copy_into(b")", &mut sql_q[qp..]);
 
-            let mut sql_out = [0u8; 64];
+            let mut sql_out = [0u8; 96];
             let sn = self
                 .db
                 .exec_as(SQL_OWNER_VAULT, &sql_q[..qp], &mut sql_out);
             if sql_out[..sn].starts_with(b"error:") {
+                let _ = self.db.exec_as(SQL_OWNER_VAULT, b"ROLLBACK", &mut tx_out);
                 return copy_into(&sql_out[..sn], out);
             }
-            self.vault_nonce_seq = nonce15;
+            if !self
+                .db
+                .set_kv_row_meta96(SQL_OWNER_VAULT, full_key_slice, nonce96)
+            {
+                let _ = self.db.exec_as(SQL_OWNER_VAULT, b"ROLLBACK", &mut tx_out);
+                return copy_into(
+                    b"error: SQL partition capacity full (8 KiB CTTLSQL1 limit)\n",
+                    out,
+                );
+            }
+            let cn = self.db.exec_as(SQL_OWNER_VAULT, b"COMMIT", &mut tx_out);
+            if tx_out[..cn].starts_with(b"error:") {
+                let _ = self.db.exec_as(SQL_OWNER_VAULT, b"ROLLBACK", &mut sql_out);
+                return copy_into(&tx_out[..cn], out);
+            }
+
+            self.vault_nonce_seq = next_seq;
+            self.mix_vault_entropy(next_seq ^ ((salt32 as u64) << 32));
             self.record_audit(35, AuditVerdict::Allowed, b"shell:vault:put");
             let tag_be = tag_u64.to_be_bytes();
             let mut pos = 0usize;
@@ -3832,6 +4272,12 @@ impl OsShell {
                 self.record_audit(35, AuditVerdict::Error, b"shell:vault:bad-key");
                 return copy_into(b"usage: vault get <key>\n", out);
             }
+            let mut full_key = [0u8; 20];
+            let mut fkp = 0usize;
+            fkp += copy_into(b"v:", &mut full_key[fkp..]);
+            fkp += copy_into(kname, &mut full_key[fkp..]);
+            let full_key_slice = &full_key[..fkp];
+
             let mut sql_q = [0u8; 96];
             let mut qp = 0usize;
             qp += copy_into(
@@ -3879,24 +4325,52 @@ impl OsShell {
                     out,
                 );
             };
-            let nonce15 = ((stored_tag >> 47) & 0x7FFF) as u16;
-            if nonce15 == 0 {
-                self.record_audit(35, AuditVerdict::Denied, b"shell:vault:tamper");
-                return copy_into(
-                    b"error: EBADMSG (vault AEAD authentication tag mismatch)\n",
-                    out,
-                );
-            }
-            let (mut ks, expected_tag) =
-                vault_derive_stream_and_mac(&self.seal_key, kname, nonce15, &ct[..ct_len]);
-            if (stored_tag ^ expected_tag) != 0 {
-                zeroize_secret_bytes(&mut ks);
-                self.record_audit(35, AuditVerdict::Denied, b"shell:vault:tamper");
-                return copy_into(
-                    b"error: EBADMSG (vault AEAD authentication tag mismatch)\n",
-                    out,
-                );
-            }
+            let row_meta = self
+                .db
+                .kv_row_meta96(SQL_OWNER_VAULT, full_key_slice)
+                .unwrap_or([0u8; 12]);
+            let mut ks = if row_meta != [0u8; 12] {
+                let mut cb = [0u8; 8];
+                cb.copy_from_slice(&row_meta[0..8]);
+                if u64::from_le_bytes(cb) == 0 || stored_tag == 0 {
+                    self.record_audit(35, AuditVerdict::Denied, b"shell:vault:tamper");
+                    return copy_into(
+                        b"error: EBADMSG (vault AEAD authentication tag mismatch)\n",
+                        out,
+                    );
+                }
+                let expected_tag =
+                    vault_compute_tag_v3(&self.seal_key, kname, &row_meta, &ct[..ct_len]);
+                if (stored_tag ^ expected_tag) != 0 {
+                    self.record_audit(35, AuditVerdict::Denied, b"shell:vault:tamper");
+                    return copy_into(
+                        b"error: EBADMSG (vault AEAD authentication tag mismatch)\n",
+                        out,
+                    );
+                }
+                vault_derive_stream_v3(&self.seal_key, kname, &row_meta)
+            } else {
+                let nonce15 = ((stored_tag >> 47) & 0x7FFF) as u16;
+                if nonce15 == 0 {
+                    self.record_audit(35, AuditVerdict::Denied, b"shell:vault:tamper");
+                    return copy_into(
+                        b"error: EBADMSG (vault AEAD authentication tag mismatch)\n",
+                        out,
+                    );
+                }
+                let (ks_v2, expected_tag) =
+                    vault_derive_stream_and_mac(&self.seal_key, kname, nonce15, &ct[..ct_len]);
+                if (stored_tag ^ expected_tag) != 0 {
+                    let mut z = ks_v2;
+                    zeroize_secret_bytes(&mut z);
+                    self.record_audit(35, AuditVerdict::Denied, b"shell:vault:tamper");
+                    return copy_into(
+                        b"error: EBADMSG (vault AEAD authentication tag mismatch)\n",
+                        out,
+                    );
+                }
+                ks_v2
+            };
             let mut pt = [0u8; 12];
             let mut i = 0usize;
             while i < ct_len {
@@ -4224,7 +4698,7 @@ impl OsShell {
                 i += 1;
             }
             let Some(slot) = free_slot else {
-                return copy_into(b"error: cron table full (max 4)\n", out);
+                return copy_into(b"error: cron table full (max 12)\n", out);
             };
             if !self.journal_admits(7 + cmd_line.len()) {
                 self.record_audit(37, AuditVerdict::Error, b"shell:cron:journal-full");
@@ -4252,7 +4726,7 @@ impl OsShell {
 
         if bytes_eq(sub, b"del") || bytes_eq(sub, b"rm") {
             let Some(id_val) = parse_u32_ascii(trim_ascii(rest)) else {
-                return copy_into(b"usage: cron del <id:1..4>\n", out);
+                return copy_into(b"usage: cron del <id:1..12>\n", out);
             };
             if id_val == 0 || id_val as usize > SHELL_MAX_CRON_JOBS {
                 return copy_into(b"error: cron job not found\n", out);
@@ -4272,7 +4746,7 @@ impl OsShell {
 
         if bytes_eq(sub, b"run") {
             let Some(id_val) = parse_u32_ascii(trim_ascii(rest)) else {
-                return copy_into(b"usage: cron run <id:1..4>\n", out);
+                return copy_into(b"usage: cron run <id:1..12>\n", out);
             };
             if id_val == 0 || id_val as usize > SHELL_MAX_CRON_JOBS {
                 return copy_into(b"error: cron job not found\n", out);
@@ -5347,12 +5821,14 @@ fn is_default_system_file(path: &[u8]) -> bool {
 /// malformed: an empty or over-long path, a path that does not normalise or
 /// that names a built-in system file, or data lying outside `data_bytes`.
 fn parse_fs_dirent(
-    sectors: &[[u8; 512]; SHELL_FS_PART_SECTORS],
+    sectors: &[[u8; 512]],
+    max_inodes: usize,
+    ext_start_sec: usize,
     idx: usize,
     data_bytes: usize,
     norm_out: &mut [u8; cuttle_contracts::FS_PATH_MAX],
 ) -> Option<(usize, usize, usize, u64)> {
-    if idx >= SHELL_FS_INODES {
+    if idx >= max_inodes {
         return None;
     }
     let dir_sec = 1 + (idx / 8);
@@ -5375,7 +5851,7 @@ fn parse_fs_dirent(
         let mut k = 0usize;
         while k < plen - 46 {
             let abs_ext = ext_base + k;
-            raw_path[46 + k] = sectors[11 + (abs_ext / 512)][abs_ext % 512];
+            raw_path[46 + k] = sectors[ext_start_sec + (abs_ext / 512)][abs_ext % 512];
             k += 1;
         }
     }
@@ -5384,6 +5860,22 @@ fn parse_fs_dirent(
         return None;
     }
     Some((nlen, doff, dlen, mtime))
+}
+
+fn compute_journal_sectors_seal(
+    key: &[u8; DURABLE_DIGEST_LEN],
+    sectors: &[[u8; 512]; SHELL_JOURNAL_PART_SECTORS],
+    seal_out: &mut [u8; DURABLE_DIGEST_LEN],
+) {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts 32-byte key");
+    mac.update(b"CTTLSHL1-JNL2-v1:");
+    mac.update(&sectors[0][0..84]);
+    let mut s = 1usize;
+    while s < SHELL_JOURNAL_PART_SECTORS {
+        mac.update(&sectors[s]);
+        s += 1;
+    }
+    seal_out.copy_from_slice(&mac.finalize().into_bytes());
 }
 
 fn serialize_wal_for_seal<const C: usize>(wal: &WalImpl<C>, out: &mut [u8]) -> usize {
@@ -5417,14 +5909,14 @@ fn compute_wal_seal<const C: usize>(
 
 fn compute_fs_partition_seal(
     key: &[u8; DURABLE_DIGEST_LEN],
-    sectors: &[[u8; 512]; SHELL_FS_PART_SECTORS],
+    sectors: &[[u8; 512]],
     seal_out: &mut [u8; DURABLE_DIGEST_LEN],
 ) {
     let mut chain = [0u8; DURABLE_DIGEST_LEN];
     seal_bytes_keyed(key, &sectors[0][0..24], &mut chain);
     let mut buf = [0u8; DURABLE_DIGEST_LEN + 512];
     let mut sec = 1usize;
-    while sec < SHELL_FS_PART_SECTORS {
+    while sec < sectors.len() {
         let mut i = 0usize;
         while i < DURABLE_DIGEST_LEN {
             buf[i] = chain[i];
@@ -5443,14 +5935,17 @@ fn compute_fs_partition_seal(
 
 fn verify_fs_partition_seal(
     key: &[u8; DURABLE_DIGEST_LEN],
-    sectors: &[[u8; 512]; SHELL_FS_PART_SECTORS],
+    sectors: &[[u8; 512]],
     expected_seal: &[u8; DURABLE_DIGEST_LEN],
 ) -> bool {
+    if sectors.len() < 2 {
+        return false;
+    }
     let mut chain = [0u8; DURABLE_DIGEST_LEN];
     seal_bytes_keyed(key, &sectors[0][0..24], &mut chain);
     let mut buf = [0u8; DURABLE_DIGEST_LEN + 512];
     let mut sec = 1usize;
-    while sec + 1 < SHELL_FS_PART_SECTORS {
+    while sec + 1 < sectors.len() {
         let mut i = 0usize;
         while i < DURABLE_DIGEST_LEN {
             buf[i] = chain[i];
@@ -5471,7 +5966,7 @@ fn verify_fs_partition_seal(
     }
     let mut j = 0usize;
     while j < 512 {
-        buf[DURABLE_DIGEST_LEN + j] = sectors[SHELL_FS_PART_SECTORS - 1][j];
+        buf[DURABLE_DIGEST_LEN + j] = sectors[sectors.len() - 1][j];
         j += 1;
     }
     seal_matches_keyed(key, &buf, expected_seal)
@@ -5680,6 +6175,73 @@ fn vault_derive_stream_and_mac(
     (ks, tag)
 }
 
+fn vault_derive_salt32(
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+    boot_gen: u64,
+    entropy_pool: u64,
+    cmd_seq: u64,
+    auth_seq: u64,
+    http_login_seq: u64,
+    next_seq: u64,
+    key_name: &[u8],
+) -> u32 {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(seal_key).expect("HMAC accepts 32-byte key");
+    mac.update(b"cuttle-vault-salt-v3:");
+    mac.update(&boot_gen.to_le_bytes());
+    mac.update(&entropy_pool.to_le_bytes());
+    mac.update(&cmd_seq.to_le_bytes());
+    mac.update(&auth_seq.to_le_bytes());
+    mac.update(&http_login_seq.to_le_bytes());
+    mac.update(&next_seq.to_le_bytes());
+    mac.update(key_name);
+    let mut digest = mac.finalize().into_bytes();
+    let salt = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    zeroize_secret_bytes(digest.as_mut_slice());
+    salt
+}
+
+fn vault_derive_stream_v3(
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+    key_name: &[u8],
+    nonce96: &[u8; 12],
+) -> [u8; DURABLE_DIGEST_LEN] {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(seal_key).expect("HMAC accepts 32-byte key");
+    mac.update(b"cuttle-vault-ks-v3:");
+    mac.update(nonce96);
+    mac.update(b":");
+    mac.update(key_name);
+    let mut bytes = mac.finalize().into_bytes();
+    let mut ks = [0u8; DURABLE_DIGEST_LEN];
+    ks.copy_from_slice(&bytes);
+    zeroize_secret_bytes(bytes.as_mut_slice());
+    ks
+}
+
+fn vault_compute_tag_v3(
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+    key_name: &[u8],
+    nonce96: &[u8; 12],
+    ct: &[u8],
+) -> u64 {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(seal_key).expect("HMAC accepts 32-byte key");
+    mac.update(b"cuttle-vault-mac-v3:");
+    mac.update(nonce96);
+    mac.update(b":");
+    mac.update(key_name);
+    mac.update(b":");
+    mac.update(ct);
+    let mut bytes = mac.finalize().into_bytes();
+    let tag63 = (u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]) & 0x7FFF_FFFF_FFFF_FFFF)
+        .max(1);
+    zeroize_secret_bytes(bytes.as_mut_slice());
+    tag63
+}
+
 fn trim_ascii(s: &[u8]) -> &[u8] {
     let mut start = 0usize;
     while start < s.len() && (s[start] == b' ' || s[start] == b'\t' || s[start] == b'\r' || s[start] == b'\n') {
@@ -5791,7 +6353,7 @@ fn check_writable_vfs_path(
         return WritablePathPolicy::Invalid;
     }
     let norm = &norm_out[..nlen];
-    if bytes_eq(norm, b"/etc/os-release") {
+    if is_default_system_file(norm) {
         return WritablePathPolicy::Protected;
     }
     WritablePathPolicy::Allowed(nlen)
@@ -6052,6 +6614,8 @@ fn fmt_seccomp_mask(mask: u8, out: &mut [u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate std;
+    use std::boxed::Box;
 
     #[test]
     fn help_and_uname_and_status_work() {
@@ -6544,7 +7108,7 @@ mod tests {
         let act_df = sh.exec_line(b"df", 1, 0, 0, &mut out);
         assert_eq!(
             &out[..act_df.bytes_written()],
-            b"fs: magic=CTTLFS01 inodes=5/16 pool_bytes=704/4096 part_sectors=16\n"
+            b"fs: magic=CTTLFS01 inodes=5/24 pool_bytes=704/10240 part_sectors=32\n"
         );
 
         let act_sync = sh.exec_line(b"sync", 1, 0, 0, &mut out);
@@ -7021,23 +7585,41 @@ mod tests {
         let mut sh = OsShell::new();
         let mut out = [0u8; 512];
 
-        // Advance `vault_nonce_seq` to `0x7FFE` (one below the 15-bit ceiling `0x7FFF`).
+        // 1. Crossing the legacy 15-bit ceiling (`0x7FFE -> 0x7FFF -> 0x8000`) now succeeds
+        //    with the 96-bit v3 nonce (`u64` counter + 32-bit keyed salt).
         sh.vault_nonce_seq = 0x7FFE;
+        let act_legacy_cap = sh.exec_line(b"vault put max.key Cross15Bit", 1, 0, 0, &mut out);
+        assert!(out[..act_legacy_cap.bytes_written()].starts_with(b"vault: sealed key=max.key"));
+        assert_eq!(sh.vault_nonce_seq, 0x7FFF);
+        let act_past_15 = sh.exec_line(b"vault put max.key Past15BitOk", 1, 0, 0, &mut out);
+        assert!(
+            out[..act_past_15.bytes_written()].starts_with(b"vault: sealed key=max.key"),
+            "96-bit v3 nonce must advance cleanly past 0x7FFF without premature EOVERFLOW"
+        );
+        assert_eq!(sh.vault_nonce_seq, 0x8000);
+        let act_get_past = sh.exec_line(b"vault get max.key", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act_get_past.bytes_written()],
+            b"vault: key=max.key value=Past15BitOk verified=true\n"
+        );
+
+        // 2. At the 64-bit ceiling (`u64::MAX - 1 -> u64::MAX`), `u64::MAX` succeeds and the
+        //    following write refuses wraparound with `EOVERFLOW`, preserving keystream uniqueness.
+        sh.vault_nonce_seq = u64::MAX - 1;
         let act1 = sh.exec_line(b"vault put max.key LastValid99", 1, 0, 0, &mut out);
         assert!(
             out[..act1.bytes_written()].starts_with(b"vault: sealed key=max.key"),
-            "nonce 0x7FFF must succeed"
+            "counter u64::MAX must succeed"
         );
-        assert_eq!(sh.vault_nonce_seq, 0x7FFF);
+        assert_eq!(sh.vault_nonce_seq, u64::MAX);
 
-        // Next write must refuse to wrap around to nonce 1 (`EOVERFLOW`), preserving keystream uniqueness.
         let act2 = sh.exec_line(b"vault put max.key ReuseAttempt", 1, 0, 0, &mut out);
         assert_eq!(
             &out[..act2.bytes_written()],
             b"error: EOVERFLOW (vault key nonce exhausted; delete or rotate key)\n"
         );
 
-        // Existing sealed value at `0x7FFF` remains intact and readable.
+        // Existing sealed value at `u64::MAX` remains intact and readable.
         let act_get = sh.exec_line(b"vault get max.key", 1, 0, 0, &mut out);
         assert_eq!(
             &out[..act_get.bytes_written()],
@@ -7537,7 +8119,7 @@ mod tests {
         // `free` is what is left beside four 256-byte reservations; 600 bytes
         // more than that only fits once those reservations are gone.
         let big_len = free + 600;
-        let mut big = [0u8; 4096];
+        let mut big = [0u8; SHELL_FS_POOL];
         for (i, b) in big.iter_mut().enumerate() {
             *b = (i % 253) as u8;
         }
@@ -7561,7 +8143,7 @@ mod tests {
             .expect("a verified partition must restore in full");
         assert_eq!((generation, restored), (2, 5));
         let h = boot.fs.open(b"/var/big", FS_O_RDONLY).expect("/var/big was dropped");
-        let mut got = [0u8; 4096];
+        let mut got = [0u8; SHELL_FS_POOL];
         let n = boot.fs.read(h, 0, &mut got).unwrap();
         boot.fs.close(h).unwrap();
         assert_eq!(&got[..n], &big[..big_len]);
@@ -7769,10 +8351,12 @@ mod tests {
         // its unkeyed WAL CRC32 so `wal.replay` yields the tampered record — `restore_sealed` MUST reject!
         let mut forged_backing = *wal.backing();
         let cursor = wal.durable_cursor();
-        // Flip the final payload byte at `cursor - 1` and recompute that record's CRC32:
+        // Flip the final payload byte at `cursor - 1` and recompute that record's domain-tagged CRC32:
         let mut scan = 0usize;
+        let mut lsn = 0u64;
         let mut last_hdr = 0usize;
         let mut last_len = 0usize;
+        let mut last_lsn = 0u64;
         while scan + 8 <= cursor {
             let rlen = u32::from_le_bytes([
                 forged_backing[scan],
@@ -7783,13 +8367,16 @@ mod tests {
             if scan + 8 + rlen > cursor {
                 break;
             }
+            lsn += 1;
             last_hdr = scan;
             last_len = rlen;
+            last_lsn = lsn;
             scan += 8 + rlen;
         }
         assert!(last_hdr > 1100);
         forged_backing[last_hdr + 8 + last_len - 1] ^= 0xFF;
-        let new_crc = crate::wal::crc32_ieee(
+        let new_crc = crate::wal::wal_frame_crc(
+            last_lsn,
             &forged_backing[last_hdr + 8..last_hdr + 8 + last_len],
         );
         forged_backing[last_hdr + 4..last_hdr + 8].copy_from_slice(&new_crc.to_le_bytes());
@@ -8004,5 +8591,307 @@ mod tests {
             "unprovisioned vault put must refuse zero-key sealing: {:?}",
             core::str::from_utf8(&out[..n_vp])
         );
+    }
+
+    #[test]
+    fn built_in_system_files_refuse_write_writehex_rm_and_http_mutation() {
+        let mut sh = OsShell::new();
+        sh.exec_line(b"exec /sbin/svc-http 1", 1, 0, 0, &mut [0u8; 256]);
+        sh.exec_line(b"exec /sbin/svc-sql 1", 1, 0, 0, &mut [0u8; 256]);
+        sh.exec_line(b"exec /sbin/svc-sh 1", 1, 0, 0, &mut [0u8; 256]);
+        let mut out = [0u8; 512];
+
+        let protected: [&[u8]; 11] = [
+            b"/etc/hostname",
+            b"/etc/motd",
+            b"/etc/os-release",
+            b"/bin/fib",
+            b"/bin/sum",
+            b"/sbin/svc-http",
+            b"/sbin/svc-sql",
+            b"/sbin/svc-sh",
+            b"//etc/hostname",
+            b"/var/../etc/motd",
+            b"/bin/./fib",
+        ];
+
+        for &path in &protected {
+            let mut norm_buf = [0u8; cuttle_contracts::FS_PATH_MAX];
+            assert_eq!(
+                check_writable_vfs_path(path, &mut norm_buf),
+                WritablePathPolicy::Protected,
+                "path {:?} must be protected as a built-in system file",
+                core::str::from_utf8(path)
+            );
+
+            let mut cmd_w = [0u8; 128];
+            let mut n = copy_into(b"write ", &mut cmd_w);
+            n += copy_into(path, &mut cmd_w[n..]);
+            n += copy_into(b" tampered", &mut cmd_w[n..]);
+            let act_w = sh.exec_line(&cmd_w[..n], 1, 0, 0, &mut out);
+            assert_eq!(
+                &out[..act_w.bytes_written()],
+                b"error: permission denied (immutable system file)\n"
+            );
+
+            let mut cmd_wh = [0u8; 128];
+            let mut n = copy_into(b"writehex ", &mut cmd_wh);
+            n += copy_into(path, &mut cmd_wh[n..]);
+            n += copy_into(b" 0 4142", &mut cmd_wh[n..]);
+            let act_wh = sh.exec_line(&cmd_wh[..n], 1, 0, 0, &mut out);
+            assert_eq!(
+                &out[..act_wh.bytes_written()],
+                b"error: permission denied (immutable system file)\n"
+            );
+
+            let mut cmd_rm = [0u8; 128];
+            let mut n = copy_into(b"rm ", &mut cmd_rm);
+            n += copy_into(path, &mut cmd_rm[n..]);
+            let act_rm = sh.exec_line(&cmd_rm[..n], 1, 0, 0, &mut out);
+            assert_eq!(
+                &out[..act_rm.bytes_written()],
+                b"error: permission denied (immutable system file)\n"
+            );
+
+            if !path.contains(&b'.') && !path.starts_with(b"//") {
+                let (st_put, n_put) = sh
+                    .dispatch_mailbox_op(
+                        crate::svc_runtime::IpcOp::VfsWrite,
+                        true,
+                        true,
+                        1,
+                        path,
+                        b"tampered",
+                        &mut out,
+                    )
+                    .unwrap();
+                assert_eq!(st_put, 403);
+                assert_eq!(&out[..n_put], b"error: immutable system file\n");
+
+                let (st_del, n_del) = sh
+                    .dispatch_mailbox_op(
+                        crate::svc_runtime::IpcOp::VfsDelete,
+                        true,
+                        true,
+                        1,
+                        path,
+                        b"",
+                        &mut out,
+                    )
+                    .unwrap();
+                assert_eq!(st_del, 403);
+                assert_eq!(&out[..n_del], b"error: immutable system file\n");
+            }
+        }
+    }
+
+    #[test]
+    fn exec_service_elf_when_journal_full_never_breaks_pack_state_image() {
+        let mut sh = Box::new(OsShell::new());
+        let mut out = [0u8; 512];
+
+        // Fill the 2 KiB durable journal right up to its admission limit using custom IMA paths + cron jobs.
+        for i in 0..24usize {
+            let path = std::format!("/var/long_ima_binary_name_{i:02}");
+            let w = std::format!("write {path} b{i}");
+            let a = sh.exec_line(w.as_bytes(), 1, 0, 0, &mut out);
+            assert!(out[..a.bytes_written()].starts_with(b"wrote "));
+            let e = std::format!("ima enroll {path}");
+            let ae = sh.exec_line(e.as_bytes(), 1, 0, 0, &mut out);
+            assert!(out[..ae.bytes_written()].starts_with(b"ima enrolled "));
+            // Remove the temporary file so VFS inodes stay free while the IMA table entry remains enrolled.
+            let r = std::format!("rm {path}");
+            let _ = sh.exec_line(r.as_bytes(), 1, 0, 0, &mut out);
+        }
+        let mut hit_enospc = false;
+        for i in 0..12usize {
+            let c = std::format!("cron add {} write /var/hb heartbeat_payload_{i:02}", 5 + i);
+            let a = sh.exec_line(c.as_bytes(), 1, 0, 0, &mut out);
+            if out[..a.bytes_written()].starts_with(b"error: ENOSPC") {
+                hit_enospc = true;
+                break;
+            }
+        }
+        assert!(hit_enospc, "test setup must saturate the 2 KiB state journal");
+
+        // Materializing and rotating `/sbin/svc-*` when the journal is full MUST NOT push
+        // unbudgeted IMA records or cause `pack_state_image` to fail with `StatePackError::Journal`!
+        for cmd in [
+            b"exec /sbin/svc-http 1".as_slice(),
+            b"exec /sbin/svc-sql 1".as_slice(),
+            b"exec /sbin/svc-sh 1".as_slice(),
+            b"service rotate svc-http 4242".as_slice(),
+        ] {
+            let a = sh.exec_line(cmd, 1, 0, 0, &mut out);
+            assert!(
+                !out[..a.bytes_written()].starts_with(b"error:"),
+                "{:?} failed: {:?}",
+                core::str::from_utf8(cmd),
+                core::str::from_utf8(&out[..a.bytes_written()])
+            );
+        }
+
+        let mut img = Box::new(crate::state_store::StateImage::zeroed());
+        sh.pack_state_image(1, &mut img)
+            .expect("pack_state_image must succeed after exec/rotate of built-in /sbin/svc-*");
+        let mut restored = Box::new(OsShell::new());
+        restored
+            .unpack_state_image(&img)
+            .expect("unpack_state_image must restore cleanly");
+    }
+
+    #[test]
+    fn vault_96bit_nonce_diversifies_across_reset_and_stays_tmr_invariant() {
+        let shared_key = [0x3Cu8; DURABLE_DIGEST_LEN];
+        let mut out1 = [0u8; 512];
+        let mut out2 = [0u8; 512];
+
+        // 1. Two shells sharing `shared_key` across a state reset (different boot generations or
+        //    hardware entropy samples, both starting with `vault_nonce_seq == 0` in SQL) must NOT
+        //    reuse the same 96-bit nonce or stream-cipher keystream!
+        let mut boot_a = OsShell::with_seal_key(shared_key);
+        boot_a.seed_defaults_for_boot(1);
+        boot_a.mix_vault_entropy(0x1111_2222_3333_4444);
+
+        let mut boot_b = OsShell::with_seal_key(shared_key);
+        boot_b.seed_defaults_for_boot(2);
+        boot_b.mix_vault_entropy(0x9999_AAAA_BBBB_CCCC);
+
+        let n1 = boot_a
+            .exec_line(b"vault put root.tok SameSecret1", 1, 0, 0, &mut out1)
+            .bytes_written();
+        let n2 = boot_b
+            .exec_line(b"vault put root.tok SameSecret1", 2, 0, 0, &mut out2)
+            .bytes_written();
+        assert_ne!(
+            &out1[..n1],
+            &out2[..n2],
+            "reset shell under same seal_key must diversify 96-bit vault nonce via boot_gen + entropy"
+        );
+        let m1 = boot_a
+            .db
+            .kv_row_meta96(SQL_OWNER_VAULT, b"v:root.tok")
+            .unwrap();
+        let m2 = boot_b
+            .db
+            .kv_row_meta96(SQL_OWNER_VAULT, b"v:root.tok")
+            .unwrap();
+        assert_ne!(m1, [0u8; 12]);
+        assert_ne!(m1, m2);
+
+        // 2. Round-trip across SQL 16-sector partition persistence and reject `meta96` bit-flips.
+        let mut sql_secs = [[0u8; 512]; crate::sql::SQL_PART_SECTORS];
+        boot_a.pack_sql_partition(&mut sql_secs);
+        let mut resumed = OsShell::with_seal_key(shared_key);
+        assert!(resumed.unpack_sql_partition(&sql_secs));
+        let ng = resumed
+            .exec_line(b"vault get root.tok", 3, 0, 0, &mut out1)
+            .bytes_written();
+        assert_eq!(
+            &out1[..ng],
+            b"vault: key=root.tok value=SameSecret1 verified=true\n"
+        );
+
+        let mut tampered_meta = m1;
+        tampered_meta[11] ^= 0x01;
+        assert!(resumed
+            .db
+            .set_kv_row_meta96(SQL_OWNER_VAULT, b"v:root.tok", tampered_meta));
+        let nt = resumed
+            .exec_line(b"vault get root.tok", 3, 0, 0, &mut out1)
+            .bytes_written();
+        assert_eq!(
+            &out1[..nt],
+            b"error: EBADMSG (vault AEAD authentication tag mismatch)\n"
+        );
+
+        // 3. Legacy v2 ciphertext (`meta96 == [0u8; 12]`) still decrypts transparently!
+        let (ks_v2, tag_v2) =
+            vault_derive_stream_and_mac(&shared_key, b"legacy.tok", 7, &[]);
+        let pt_v2 = b"OldSec77";
+        let mut ct_v2 = [0u8; 8];
+        for i in 0..8 {
+            ct_v2[i] = pt_v2[i] ^ ks_v2[i];
+        }
+        let (_, real_tag_v2) =
+            vault_derive_stream_and_mac(&shared_key, b"legacy.tok", 7, &ct_v2);
+        let _ = tag_v2;
+        let mut ct_hex = [0u8; 16];
+        hex_bytes(&ct_v2, &mut ct_hex);
+        let ins = std::format!(
+            "sql INSERT OR REPLACE INTO kv VALUES ('v:legacy.tok', '{}', {})",
+            core::str::from_utf8(&ct_hex).unwrap(),
+            real_tag_v2
+        );
+        let _ = resumed.exec_line(ins.as_bytes(), 3, 0, 0, &mut out1);
+        let nl = resumed
+            .exec_line(b"vault get legacy.tok", 3, 0, 0, &mut out1)
+            .bytes_written();
+        assert_eq!(
+            &out1[..nl],
+            b"vault: key=legacy.tok value=OldSec77 verified=true\n"
+        );
+
+        // 4. Three Triad nodes with distinct `seal_key`s and distinct `meta96` nonces produce
+        //    identical `.dump kv digest` outputs for 2-of-3 TMR consensus.
+        let mut d_a = [0u8; 256];
+        let mut d_b = [0u8; 256];
+        let mut node_c = OsShell::with_seal_key([0xA5u8; DURABLE_DIGEST_LEN]);
+        node_c.seed_defaults_for_boot(9);
+        node_c.mix_vault_entropy(0xDEAD_BEEF_CAFE_F00D);
+        let _ = node_c.exec_line(b"vault put root.tok SameSecret1", 9, 0, 0, &mut out1);
+        let mut d_c = [0u8; 256];
+        let na = boot_a.db.exec(b".dump kv digest", &mut d_a);
+        let nb = boot_b.db.exec(b".dump kv digest", &mut d_b);
+        let nc = node_c.db.exec(b".dump kv digest", &mut d_c);
+        assert_eq!(&d_a[..na], &d_b[..nb]);
+        assert_eq!(&d_b[..nb], &d_c[..nc]);
+    }
+
+    #[test]
+    fn fs_partition_preserves_inode_mtime_and_unpack_state_image_is_atomic_on_error() {
+        let mut sh = Box::new(OsShell::new());
+        let mut out = [0u8; 512];
+        let _ = sh.exec_line(b"write /var/timed.txt stamp", 1, 0, 0, &mut out);
+        sh.fs.set_mtime(b"/var/timed.txt", 1_700_000_123).unwrap();
+        assert_eq!(sh.fs.stat(b"/var/timed.txt").unwrap().mtime, 1_700_000_123);
+
+        let mut img = Box::new(crate::state_store::StateImage::zeroed());
+        sh.pack_state_image(4, &mut img).unwrap();
+
+        let mut clean = Box::new(OsShell::new());
+        clean.unpack_state_image(&img).unwrap();
+        assert_eq!(
+            clean.fs.stat(b"/var/timed.txt").unwrap().mtime,
+            1_700_000_123,
+            "pack_fs_partition + unpack_fs_partition must preserve real inode mtime"
+        );
+
+        // Atomicity check: start `victim` with known live state, then feed `unpack_state_image`
+        // an image whose `wal` and `fs` are valid but whose `sql` partition is corrupted.
+        // `victim` must roll back completely to its pre-call state!
+        let mut victim = Box::new(OsShell::new());
+        let _ = victim.exec_line(b"write /var/keep.txt intact", 2, 0, 0, &mut out);
+        let _ = victim.exec_line(b"fw block 10.77.0.0/16", 2, 0, 0, &mut out);
+        let fp_before = victim.durable_fingerprint();
+
+        let mut bad_sql_img = Box::new(crate::state_store::StateImage::zeroed());
+        bad_sql_img.wal = img.wal;
+        bad_sql_img.fs = img.fs;
+        bad_sql_img.sql = img.sql;
+        bad_sql_img.sql[0][60] ^= 0xFF;
+
+        assert_eq!(
+            victim.unpack_state_image(&bad_sql_img),
+            Err(StateRestoreError::Sql)
+        );
+        assert_eq!(
+            victim.durable_fingerprint(),
+            fp_before,
+            "failed unpack_state_image must leave caller's OsShell completely unchanged"
+        );
+        let act = victim.exec_line(b"cat /var/keep.txt", 2, 0, 0, &mut out);
+        assert_eq!(&out[..act.bytes_written()], b"intact\n");
+        assert!(victim.fs.stat(b"/var/timed.txt").is_err());
     }
 }

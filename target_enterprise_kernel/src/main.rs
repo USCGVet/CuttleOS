@@ -992,7 +992,7 @@ static CONSOLE_NET_SVC: spin::Mutex<target_enterprise::LivedNet> =
 /// Unified continuous OS event loop multiplexing:
 /// - VirtIO-Net (`VnetModern`) + [`target_enterprise::LivedNet`] (`HTTP :80`, `HTTPS :443` (rustls TLS 1.3), `UDP :8080`, `UDP :8081`, `ICMP`, `ARP`)
 /// - Serial console (`COM1` `0x3F8`) and PS/2 keyboard (`0x60`/`0x64`)
-/// - Live AHCI disk persistence (`LBA 1040..=1065`) on `sync`, SQL mutations, `halt`, and `reboot`
+/// - Live AHCI disk persistence (`LBA 1040..=1149`) on `sync`, SQL mutations, `halt`, and `reboot`
 pub(crate) fn live_os_console_loop() -> ! {
     use cuttle_contracts::{KeyCode, Keyboard};
     use target_enterprise::keyboard::KeyboardImpl;
