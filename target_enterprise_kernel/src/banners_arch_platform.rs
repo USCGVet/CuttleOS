@@ -2225,3 +2225,133 @@ pub(crate) fn banner_keyboard() {
     }
     serial_write_bytes(b"KBD decode OK keys=2 last=b\n");
 }
+
+/// Live hardware proof of `KERNEL_PHYS_MM` + `KernelSlabAllocator`:
+/// 1. Allocates 128 distinct 4 KiB page-table frames (`3.2x` the legacy 40-frame `PT_ALLOC_NEXT`
+///    panic ceiling), stamps unique 64-bit canary words into every frame via `pa_to_va`, verifies
+///    zero aliasing across all 128 frames, frees them, and verifies re-allocated frames are
+///    100% zero-scrubbed (`0x00` across all 4096 bytes).
+/// 2. Drives segregated size-class `Vec<u8>` allocations across all 8 slab classes (`32..=4096 B`)
+///    and multi-page contiguous spans (`16 KiB` and `32 KiB`), drops all buffers, reclaims warm
+///    empty slabs, and verifies exact zero-frame-leak conservation against `BootInfo` usable RAM.
+#[cfg(not(cuttle_prod))]
+#[inline(never)]
+pub(crate) fn banner_phys_mm_slab() {
+    crate::heap::reclaim_empty_slabs();
+    let baseline = crate::phys_mm_stats();
+    if baseline.total_usable_frames < 4096 {
+        panic!("PHYS_MM_SLAB: BootInfo usable RAM unexpectedly small");
+    }
+
+    // 1. Allocate 128 PT frames simultaneously (exceeding the legacy 40-frame pool by >3x).
+    const BURST: usize = 128;
+    let mut frames = [0u64; BURST];
+    let mut i = 0usize;
+    while i < BURST {
+        // SAFETY: Running at CPL=0 after `set_phys_offset` seeded `KERNEL_PHYS_MM`.
+        let pa = unsafe { crate::alloc_pt_frame() };
+        let mut prev = 0usize;
+        while prev < i {
+            if frames[prev] == pa {
+                panic!("PHYS_MM_SLAB: duplicate physical frame returned");
+            }
+            prev += 1;
+        }
+        frames[i] = pa;
+        let tag = 0xCAFE_B100_0000_0000u64 | (i as u64);
+        // SAFETY: `pa` is a newly allocated exclusive 4 KiB RAM frame mapped via `pa_to_va`.
+        unsafe {
+            let p = crate::pa_to_va(pa).cast::<u64>();
+            core::ptr::write_volatile(p, tag);
+            core::ptr::write_volatile(p.add(511), tag ^ 0x55AA_55AA_55AA_55AA);
+        }
+        i += 1;
+    }
+
+    // Verify all 128 frames retained independent data without aliasing, then free all 128.
+    let mut j = 0usize;
+    while j < BURST {
+        let expected = 0xCAFE_B100_0000_0000u64 | (j as u64);
+        // SAFETY: `frames[j]` is still exclusively owned before `free_pt_frame`.
+        let (head, tail) = unsafe {
+            let p = crate::pa_to_va(frames[j]).cast::<u64>();
+            (
+                core::ptr::read_volatile(p),
+                core::ptr::read_volatile(p.add(511)),
+            )
+        };
+        if head != expected || tail != (expected ^ 0x55AA_55AA_55AA_55AA) {
+            panic!("PHYS_MM_SLAB: physical frame aliasing detected");
+        }
+        // SAFETY: `frames[j]` is no longer referenced after reading `head` and `tail`.
+        unsafe {
+            crate::free_pt_frame(frames[j]);
+        }
+        j += 1;
+    }
+
+    // Re-allocate one frame and prove zero-scrubbing cleared all 4096 bytes.
+    // SAFETY: Running at CPL=0 with initialized `KERNEL_PHYS_MM`.
+    let scrubbed_pa = unsafe { crate::alloc_pt_frame() };
+    let mut b_idx = 0usize;
+    while b_idx < 4096 {
+        // SAFETY: `scrubbed_pa` is exclusively owned.
+        let v = unsafe { core::ptr::read_volatile(crate::pa_to_va(scrubbed_pa).add(b_idx)) };
+        if v != 0 {
+            panic!("PHYS_MM_SLAB: freed frame was not zero-scrubbed");
+        }
+        b_idx += 1;
+    }
+    // SAFETY: `scrubbed_pa` is unreferenced after the zero-scrub check.
+    unsafe {
+        crate::free_pt_frame(scrubbed_pa);
+    }
+
+    // 2. Exercise `GlobalAlloc` across all 8 slab classes + multi-page large spans (`16 KiB`, `32 KiB`).
+    {
+        let sizes: [usize; 10] = [24, 56, 120, 240, 500, 1000, 2000, 4000, 16_384, 32_768];
+        let mut bufs: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::with_capacity(40);
+        let mut round = 0usize;
+        while round < 4 {
+            let mut k = 0usize;
+            while k < sizes.len() {
+                let sz = sizes[k];
+                let mut v = alloc::vec![0u8; sz];
+                v[0] = (round as u8).wrapping_add(k as u8);
+                v[sz - 1] = v[0] ^ 0xA5;
+                bufs.push(v);
+                k += 1;
+            }
+            round += 1;
+        }
+        let slab_live = crate::heap::slab_stats();
+        if slab_live.active_slabs == 0 || slab_live.active_large_spans < 8 {
+            panic!("PHYS_MM_SLAB: GlobalAlloc did not route through slab + large-span caches");
+        }
+        let mut bi = 0usize;
+        while bi < bufs.len() {
+            let b = &bufs[bi];
+            if b[b.len() - 1] != (b[0] ^ 0xA5) {
+                panic!("PHYS_MM_SLAB: heap buffer corruption under multi-class churn");
+            }
+            bi += 1;
+        }
+        drop(bufs);
+    }
+
+    crate::heap::reclaim_empty_slabs();
+    let after = crate::phys_mm_stats();
+    if after.free_frames != baseline.free_frames {
+        panic!("PHYS_MM_SLAB: physical frame leak detected after burst + slab reclaim");
+    }
+
+    let mut line = [0u8; 96];
+    let mut pos = 0usize;
+    let p0 = b"PHYS_MM_SLAB OK pt_burst=128 scrub=zero leak=0 usable_frames=";
+    line[pos..pos + p0.len()].copy_from_slice(p0);
+    pos += p0.len();
+    pos += dec_u64(after.total_usable_frames as u64, &mut line[pos..]);
+    line[pos] = b'\n';
+    pos += 1;
+    serial_write_bytes(&line[..pos]);
+}

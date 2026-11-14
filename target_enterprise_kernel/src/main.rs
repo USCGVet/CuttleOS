@@ -92,6 +92,138 @@ pub(crate) static PT_ALLOC_NEXT: core::sync::atomic::AtomicU64 = core::sync::ato
 pub(crate) static BOOT_RSDP_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// IRQ-safe lock serializing shared kernel page-table frame allocation and PTE updates.
 static PT_MOD_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+/// Global physical 4 KiB page-frame manager seeded from `BootInfo.memory_regions` (`E820` / `UEFI`).
+static KERNEL_PHYS_MM: spin::Mutex<target_enterprise::phys_mm::KernelPhysFrameManager> =
+    spin::Mutex::new(target_enterprise::phys_mm::KernelPhysFrameManager::empty());
+/// Atomic flag indicating `KERNEL_PHYS_MM` has finished `BootInfo` memory-map ingestion.
+static PHYS_MM_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Execute `f` with local interrupts masked (`cli`) while holding `KERNEL_PHYS_MM`, restoring
+/// the caller's `RFLAGS.IF` state upon return.
+#[inline]
+pub(crate) fn with_phys_mm_lock<R>(
+    f: impl FnOnce(&mut target_enterprise::phys_mm::KernelPhysFrameManager) -> R,
+) -> R {
+    let saved_rflags: u64;
+    // SAFETY: Reading RFLAGS and executing `cli` in Ring-0 prevents IRQ re-entrancy on `KERNEL_PHYS_MM`.
+    unsafe {
+        asm!(
+            "pushfq",
+            "pop {}",
+            "cli",
+            out(reg) saved_rflags,
+            options(nomem, preserves_flags),
+        );
+    }
+    let mut guard = KERNEL_PHYS_MM.lock();
+    let res = f(&mut *guard);
+    drop(guard);
+    if (saved_rflags & (1 << 9)) != 0 {
+        // SAFETY: Restoring `IF = 1` only when interrupts were previously enabled.
+        unsafe {
+            asm!("sti", options(nomem, nostack, preserves_flags));
+        }
+    }
+    res
+}
+
+#[inline]
+pub(crate) fn phys_mm_is_initialized() -> bool {
+    PHYS_MM_READY.load(core::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn phys_mm_stats() -> target_enterprise::phys_mm::PhysMmStats {
+    if !phys_mm_is_initialized() {
+        return target_enterprise::phys_mm::PhysMmStats {
+            total_usable_frames: 0,
+            allocated_frames: 0,
+            free_frames: 0,
+            peak_allocated_frames: 0,
+            total_alloc_ops: 0,
+            total_free_ops: 0,
+            high_mem_usable_frames: 0,
+        };
+    }
+    with_phys_mm_lock(|pmm| pmm.stats())
+}
+
+/// Allocate one zero-scrubbed 4 KiB physical frame from `KERNEL_PHYS_MM`.
+pub(crate) fn alloc_phys_frame_zeroed() -> Option<u64> {
+    if !phys_mm_is_initialized() {
+        return None;
+    }
+    let pa = with_phys_mm_lock(|pmm| pmm.alloc_frame())?;
+    // SAFETY: `pa` is a freshly allocated usable 4 KiB RAM frame mapped at `pa_to_va(pa)`.
+    let slice = unsafe { core::slice::from_raw_parts_mut(pa_to_va(pa), 4096) };
+    target_enterprise::phys_mm::scrub_frame_bytes(slice);
+    Some(pa)
+}
+
+/// Allocate `count` contiguous zero-scrubbed 4 KiB physical frames aligned to `align_frames`.
+pub(crate) fn alloc_phys_contiguous_zeroed(count: usize, align_frames: usize) -> Option<u64> {
+    if !phys_mm_is_initialized() {
+        return None;
+    }
+    let pa = with_phys_mm_lock(|pmm| pmm.alloc_contiguous(count, align_frames).ok())?;
+    let total_bytes = count.checked_mul(4096)?;
+    // SAFETY: `[pa .. pa + count * 4096)` is a freshly allocated contiguous usable RAM span mapped at `pa_to_va(pa)`.
+    let slice = unsafe { core::slice::from_raw_parts_mut(pa_to_va(pa), total_bytes) };
+    target_enterprise::phys_mm::scrub_frame_bytes(slice);
+    Some(pa)
+}
+
+/// Zero-scrub and release one 4 KiB physical frame previously obtained from `KERNEL_PHYS_MM`.
+// SAFETY: Caller must guarantee `pa` is no longer referenced by any active page table, DMA ring, or slice.
+pub(crate) unsafe fn free_phys_frame_scrubbed(
+    pa: u64,
+) -> Result<(), target_enterprise::phys_mm::PhysMmError> {
+    with_phys_mm_lock(|pmm| {
+        if !pmm.is_usable(pa) {
+            return Err(target_enterprise::phys_mm::PhysMmError::ReservedOrInvalidFrame);
+        }
+        if !pmm.is_allocated(pa) {
+            return Err(target_enterprise::phys_mm::PhysMmError::DoubleFree);
+        }
+        // SAFETY: `pa` was verified usable + allocated under `KERNEL_PHYS_MM` and caller ended all references.
+        let slice = unsafe { core::slice::from_raw_parts_mut(pa_to_va(pa), 4096) };
+        target_enterprise::phys_mm::scrub_frame_bytes(slice);
+        pmm.free_frame(pa)
+    })
+}
+
+/// Zero-scrub and release `count` contiguous 4 KiB physical frames starting at `base_pa`.
+// SAFETY: Caller must guarantee none of the `count` frames are referenced by any active page table, DMA ring, or slice.
+pub(crate) unsafe fn free_phys_contiguous_scrubbed(
+    base_pa: u64,
+    count: usize,
+) -> Result<(), target_enterprise::phys_mm::PhysMmError> {
+    if count == 0 {
+        return Err(target_enterprise::phys_mm::PhysMmError::ZeroFrameCount);
+    }
+    let total_bytes = count
+        .checked_mul(4096)
+        .ok_or(target_enterprise::phys_mm::PhysMmError::ReservedOrInvalidFrame)?;
+    with_phys_mm_lock(|pmm| {
+        let mut k = 0usize;
+        while k < count {
+            let pa = base_pa
+                .checked_add((k as u64) * 4096)
+                .ok_or(target_enterprise::phys_mm::PhysMmError::ReservedOrInvalidFrame)?;
+            if !pmm.is_usable(pa) {
+                return Err(target_enterprise::phys_mm::PhysMmError::ReservedOrInvalidFrame);
+            }
+            if !pmm.is_allocated(pa) {
+                return Err(target_enterprise::phys_mm::PhysMmError::DoubleFree);
+            }
+            k += 1;
+        }
+        // SAFETY: Every frame in `[base_pa .. base_pa + total_bytes)` is usable + allocated and unreferenced.
+        let slice = unsafe { core::slice::from_raw_parts_mut(pa_to_va(base_pa), total_bytes) };
+        target_enterprise::phys_mm::scrub_frame_bytes(slice);
+        pmm.free_contiguous(base_pa, count)
+    })
+}
 
 /// Execute `f` with local interrupts masked (`cli`) while holding `PT_MOD_LOCK`, restoring
 /// the caller's `RFLAGS.IF` state upon return.
@@ -172,6 +304,33 @@ pub(crate) fn set_phys_offset(boot: &BootInfo) {
     if let Some(rsdp) = boot.rsdp_addr.into_option() {
         BOOT_RSDP_PHYS.store(rsdp, core::sync::atomic::Ordering::Relaxed);
     }
+
+    // Seed `KERNEL_PHYS_MM` dynamically from `boot.memory_regions` (BIOS E820 or UEFI GetMemoryMap),
+    // excluding `< 1 MiB`, all non-usable firmware regions, and the `384 KiB` `DMA_WINDOW_BYTES` aperture.
+    with_phys_mm_lock(|pmm| {
+        use bootloader_api::info::MemoryRegionKind;
+        pmm.begin_init();
+        for r in boot.memory_regions.iter() {
+            if r.kind == MemoryRegionKind::Usable && r.end > r.start {
+                pmm.mark_usable_region(r.start, r.end);
+            }
+        }
+        for r in boot.memory_regions.iter() {
+            if r.kind != MemoryRegionKind::Usable && r.end > r.start {
+                pmm.exclude_region(r.start, r.end);
+            }
+        }
+        if dma != 0 {
+            pmm.exclude_region(
+                dma,
+                dma.saturating_add(target_enterprise::memory::dma_layout::DMA_WINDOW_BYTES),
+            );
+        }
+        pmm.finish_init();
+    });
+    if map_off != 0 {
+        PHYS_MM_READY.store(true, core::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Virtual address for a guest-physical address in the physical memory map.
@@ -180,7 +339,7 @@ pub(crate) fn pa_to_va(phys: u64) -> *mut u8 {
     (phys.wrapping_add(off)) as *mut u8
 }
 
-// ---- Page-table helpers for PCI MMIO BARs (outside RAM E820) ----
+// ---- Page-table helpers for PCI MMIO BARs and dynamic Ring-3 / kernel mappings ----
 
 pub(crate) const PTE_P: u64 = 1;
 pub(crate) const PTE_W: u64 = 2;
@@ -200,6 +359,9 @@ pub(crate) unsafe fn read_cr3() -> u64 {
 
 // SAFETY: Caller must ensure DMA_PHYS_BASE and PHYS_MAP_OFFSET are initialized from BootInfo.
 pub(crate) unsafe fn alloc_pt_frame_locked() -> u64 {
+    if let Some(pa) = alloc_phys_frame_zeroed() {
+        return pa;
+    }
     let base = dma_phys_base();
     let next = PT_ALLOC_NEXT.load(core::sync::atomic::Ordering::Acquire);
     if base == 0
@@ -222,9 +384,32 @@ pub(crate) unsafe fn alloc_pt_frame_locked() -> u64 {
     frame
 }
 
+// SAFETY: Caller must ensure `frame` is an unreferenced 4 KiB page-table frame previously returned by `alloc_pt_frame*`.
+#[allow(dead_code)]
+pub(crate) unsafe fn free_pt_frame_locked(frame: u64) {
+    let base = dma_phys_base();
+    if base != 0
+        && frame >= base + target_enterprise::memory::dma_layout::PT_POOL_START_OFF
+        && frame < base + target_enterprise::memory::dma_layout::PT_POOL_END_OFF
+    {
+        // SAFETY: Static bootstrap PT pool frame mapped via `pa_to_va`; zero-scrub in place.
+        let slice = unsafe { core::slice::from_raw_parts_mut(pa_to_va(frame), 4096) };
+        target_enterprise::phys_mm::scrub_frame_bytes(slice);
+        return;
+    }
+    // SAFETY: Caller verified `frame` is unreferenced and came from `KERNEL_PHYS_MM`.
+    let _ = unsafe { free_phys_frame_scrubbed(frame) };
+}
+
 // SAFETY: Caller must ensure DMA_PHYS_BASE and PHYS_MAP_OFFSET are initialized from BootInfo.
 pub(crate) unsafe fn alloc_pt_frame() -> u64 {
     with_pt_lock(|| unsafe { alloc_pt_frame_locked() })
+}
+
+// SAFETY: Caller must ensure `frame` is an unreferenced 4 KiB page-table frame previously returned by `alloc_pt_frame*`.
+#[allow(dead_code)]
+pub(crate) unsafe fn free_pt_frame(frame: u64) {
+    with_pt_lock(|| unsafe { free_pt_frame_locked(frame) })
 }
 
 /// Walk the active 4-level `CR3` page table to resolve the guest-physical address backing
@@ -770,8 +955,8 @@ pub(crate) use smp_hw::*;
 // ============================================================
 
 pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
-    heap::init(); // before anything allocates (rustls on port 443)
-    set_phys_offset(boot_info);
+    set_phys_offset(boot_info); // seed PHYS_MAP_OFFSET + KERNEL_PHYS_MM from BootInfo first
+    heap::init(); // initialize slab + fallback heap before anything allocates (rustls on port 443)
     // Enforce hardware NXE + WP + SMEP + SMAP + UMIP + FSGSBASE and install the early BSP
     // GDT/TSS (`IST1` for `#DF`, `IST2` for `#MC`/`NMI`) + 256-vector `RUNTIME_IDT` BEFORE
     // touching device MMIO, serial I/O, or boot banners so no early CPU fault can triple-fault.
@@ -968,6 +1153,9 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     banner_shell_compose();
     // True hardware multi-core SMP AP bringup + multi-stack thread context switching.
     banner_smp_hw();
+    // Live physical frame manager (>128 PT frames exceeding legacy 40-frame limit) + size-class slab proof.
+    #[cfg(not(cuttle_prod))]
+    banner_phys_mm_slab();
 
     // ============================================================
     // RED-TEAM ATTACK HARNESS (deliberate, instrumented vulnerability)

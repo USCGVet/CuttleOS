@@ -1,42 +1,181 @@
-//! Kernel heap.
+//! Enterprise kernel allocator: segregated size-class slab + dynamic physical-page spans
+//! with an IRQ-safe spinlock and an `8 MiB` static `.bss` emergency fallback arena.
 //!
-//! `rustls` (TLS 1.3 `TlsSession` and `ServerIdentity` on port 443) and `LivedNet`
-//! per-slot TCP/HTTP/retransmit `Vec` buffers allocate from this fixed 8 MiB `.bss`
-//! region (adding nothing to the kernel ELF size), managed by `linked_list_allocator`
-//! behind an SMP-safe spin lock. Untrusted network and TLS session admissions check
-//! [`has_heap_headroom`] against [`KERNEL_HEAP_RESERVE_BYTES`] (`512 KiB`) before
-//! growing buffers, so connection floods are shed cleanly instead of exhausting the
-//! heap. Interrupt handlers never allocate, so the lock cannot be re-entered from an
-//! interrupt.
+//! - **Primary path**: [`target_enterprise::slab_alloc::KernelSlabAllocator`] (`32 B ..= 4096 B`
+//!   out-of-line bitmap slabs + multi-page contiguous spans `> 4096 B`) backed directly by
+//!   [`crate::alloc_phys_contiguous_zeroed`] / [`crate::free_phys_contiguous_scrubbed`] over
+//!   all usable physical RAM discovered in `BootInfo.memory_regions`.
+//! - **Zero-scrub on free**: every freed slab slot and reclaimed physical page is scrubbed
+//!   with `0x00` + compiler fence before reuse so TLS/session/user secrets never linger in free memory.
+//! - **Overflow / early-boot fallback**: an `8 MiB` `.bss` `linked_list_allocator::Heap` absorbs
+//!   any early pre-`BootInfo` allocation or descriptor-table overflow, identified in `O(1)`
+//!   by pointer range check `[fallback_start .. fallback_end)`.
+//! - **IRQ-safe locking**: `with_heap_lock` masks local interrupts (`cli`) before acquiring
+//!   `HEAP_LOCK`, maintaining the strict lock hierarchy `HEAP_LOCK -> PHYS_MM_LOCK`.
 
+use core::alloc::{GlobalAlloc, Layout};
+use core::arch::asm;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
-use linked_list_allocator::LockedHeap;
+use core::ptr;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use linked_list_allocator::Heap as FallbackHeap;
+use target_enterprise::phys_mm::scrub_frame_bytes;
+use target_enterprise::slab_alloc::{KernelSlabAllocator, PageBackend, SlabStats};
 
-/// 8 MiB. One TLS 1.3 connection needs tens of KiB, so this covers all 16 TCP
-/// slots with ample headroom inside a 128 MiB VM.
+/// `8 MiB` static `.bss` fallback arena (adds zero bytes to the on-disk kernel ELF).
 pub const HEAP_SIZE: usize = 8 * 1024 * 1024;
 
-/// 512 KiB emergency Ring-0 heap reserve withheld from untrusted network/TLS
-/// connection floods so core kernel paths never panic on heap exhaustion.
+/// `512 KiB` emergency Ring-0 reserve withheld from untrusted network/TLS connection floods.
 pub const KERNEL_HEAP_RESERVE_BYTES: usize = 512 * 1024;
 
 #[repr(C, align(4096))]
 struct HeapRegion([u8; HEAP_SIZE]);
 
 struct SyncHeapRegion(UnsafeCell<HeapRegion>);
-
-// SAFETY: Access to the backing `.bss` region is handed once to `ALLOCATOR` (a spinlock-Synchronized
-// `LockedHeap`) inside `init()` gated by `HEAP_INITIALIZED`.
+// SAFETY: Handed once to `HEAP_STATE` inside `init()` gated by `HEAP_INITIALIZED` under `HEAP_LOCK`.
 unsafe impl Sync for SyncHeapRegion {}
 
-static HEAP: SyncHeapRegion = SyncHeapRegion(UnsafeCell::new(HeapRegion([0; HEAP_SIZE])));
+static FALLBACK_REGION: SyncHeapRegion = SyncHeapRegion(UnsafeCell::new(HeapRegion([0; HEAP_SIZE])));
+static FALLBACK_START: AtomicUsize = AtomicUsize::new(0);
+static FALLBACK_END: AtomicUsize = AtomicUsize::new(0);
 static HEAP_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-#[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+struct HeapInner {
+    slab: KernelSlabAllocator,
+    fallback: FallbackHeap,
+}
 
-/// Snapshot of kernel heap utilization (`used`, `free`, `total` bytes).
+impl HeapInner {
+    const fn new() -> Self {
+        Self {
+            slab: KernelSlabAllocator::empty(),
+            fallback: FallbackHeap::empty(),
+        }
+    }
+}
+
+static HEAP_LOCK: spin::Mutex<HeapInner> = spin::Mutex::new(HeapInner::new());
+
+/// Execute `f` under `HEAP_LOCK` with local maskable interrupts disabled (`cli`),
+/// restoring the caller's `RFLAGS.IF` bit upon return.
+#[inline]
+fn with_heap_lock<R>(f: impl FnOnce(&mut HeapInner) -> R) -> R {
+    let saved_rflags: u64;
+    // SAFETY: Reading RFLAGS and executing `cli` in Ring-0 prevents IRQ re-entrancy on `HEAP_LOCK`.
+    unsafe {
+        asm!(
+            "pushfq",
+            "pop {}",
+            "cli",
+            out(reg) saved_rflags,
+            options(nomem, preserves_flags),
+        );
+    }
+    let mut guard = HEAP_LOCK.lock();
+    let res = f(&mut *guard);
+    drop(guard);
+    if (saved_rflags & (1 << 9)) != 0 {
+        // SAFETY: Restoring `IF = 1` only when interrupts were enabled prior to `with_heap_lock`.
+        unsafe {
+            asm!("sti", options(nomem, nostack, preserves_flags));
+        }
+    }
+    res
+}
+
+/// Physical-frame [`PageBackend`] bridging `KernelSlabAllocator` to `KERNEL_PHYS_MM`.
+struct KernelPhysBackend;
+
+impl PageBackend for KernelPhysBackend {
+    fn alloc_pages(&mut self, count: usize, align_pages: usize) -> Option<usize> {
+        let pa = crate::alloc_phys_contiguous_zeroed(count, align_pages)?;
+        Some(crate::pa_to_va(pa) as usize)
+    }
+
+    fn free_pages(&mut self, base_va: usize, count: usize) {
+        let off = crate::phys_map_offset() as usize;
+        if off == 0 || base_va < off {
+            return;
+        }
+        let base_pa = (base_va - off) as u64;
+        // SAFETY: `base_va` was allocated exclusively by `alloc_pages` for `KernelSlabAllocator`
+        // and all slots within the span have been freed prior to `free_pages`.
+        let _ = unsafe { crate::free_phys_contiguous_scrubbed(base_pa, count) };
+    }
+
+    fn free_page_count(&self) -> usize {
+        crate::phys_mm_stats().free_frames
+    }
+}
+
+struct EnterpriseGlobalAlloc;
+
+// SAFETY: `EnterpriseGlobalAlloc` serializes all mutations through IRQ-safe `with_heap_lock`,
+// hands out naturally aligned non-overlapping regions from `KernelSlabAllocator` (backed by
+// zeroed 4 KiB physical frames) or `FallbackHeap`, and zero-scrubs freed slots before reuse.
+unsafe impl GlobalAlloc for EnterpriseGlobalAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if !HEAP_INITIALIZED.load(Ordering::Acquire) {
+            return ptr::null_mut();
+        }
+        with_heap_lock(|inner| {
+            let mut backend = KernelPhysBackend;
+            if crate::phys_mm_is_initialized() {
+                if let Some(va) = inner.slab.alloc(layout.size(), layout.align(), &mut backend) {
+                    return va as *mut u8;
+                }
+            }
+            inner
+                .fallback
+                .allocate_first_fit(layout)
+                .map_or(ptr::null_mut(), |nn| nn.as_ptr())
+        })
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if ptr.is_null() {
+            return;
+        }
+        let addr = ptr as usize;
+        let fb_start = FALLBACK_START.load(Ordering::Relaxed);
+        let fb_end = FALLBACK_END.load(Ordering::Relaxed);
+
+        with_heap_lock(|inner| {
+            if addr >= fb_start && addr < fb_end {
+                // Scrub fallback allocation payload before returning to `linked_list_allocator`.
+                if layout.size() > 0 {
+                    // SAFETY: Caller guarantees `(ptr, layout)` is a live allocation inside `FALLBACK_REGION`.
+                    let slice = unsafe { core::slice::from_raw_parts_mut(ptr, layout.size()) };
+                    scrub_frame_bytes(slice);
+                }
+                if let Some(nn) = ptr::NonNull::new(ptr) {
+                    // SAFETY: `addr` lies in `[fb_start, fb_end)` and was allocated from `inner.fallback`.
+                    unsafe {
+                        inner.fallback.deallocate(nn, layout);
+                    }
+                }
+                return;
+            }
+
+            // Scrub small-slot bytes BEFORE releasing the slot bit (if `dealloc` reclaims the
+            // entire page, `KernelPhysBackend::free_pages` also scrubs the full 4 KiB frame).
+            if layout.size() > 0 {
+                // SAFETY: Caller guarantees `(ptr, layout)` is a live allocation owned by `inner.slab`.
+                let slice = unsafe { core::slice::from_raw_parts_mut(ptr, layout.size()) };
+                scrub_frame_bytes(slice);
+            }
+            let mut backend = KernelPhysBackend;
+            let _ = inner
+                .slab
+                .dealloc(addr, layout.size(), layout.align(), &mut backend);
+        });
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: EnterpriseGlobalAlloc = EnterpriseGlobalAlloc;
+
+/// Snapshot of kernel heap + dynamic physical pool utilization (`used`, `free`, `total` bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct HeapStats {
@@ -45,8 +184,7 @@ pub struct HeapStats {
     pub total: usize,
 }
 
-/// Hand the heap region to the allocator. Must run once, on the BSP, before
-/// anything allocates and before the application processors start.
+/// Initialize the kernel slab + fallback heap. Must run once on the BSP before allocations.
 pub fn init() {
     if HEAP_INITIALIZED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -54,27 +192,51 @@ pub fn init() {
     {
         return;
     }
-    // SAFETY: `compare_exchange` guarantees this runs at most once on the BSP before any APs start;
-    // `HEAP.0.get()` points to a 4 KiB-aligned `HEAP_SIZE` `.bss` block owned solely by `ALLOCATOR`.
-    unsafe {
-        let start = HEAP.0.get().cast::<u8>();
-        ALLOCATOR.lock().init(start, HEAP_SIZE);
-    }
+    let start = FALLBACK_REGION.0.get().cast::<u8>();
+    let start_addr = start as usize;
+    FALLBACK_START.store(start_addr, Ordering::Release);
+    FALLBACK_END.store(start_addr + HEAP_SIZE, Ordering::Release);
+    with_heap_lock(|inner| {
+        // SAFETY: `compare_exchange` ensures single initialization on the BSP; `FALLBACK_REGION`
+        // is a 4 KiB-aligned `HEAP_SIZE` `.bss` block owned exclusively by `inner.fallback`.
+        unsafe {
+            inner.fallback.init(start, HEAP_SIZE);
+        }
+    });
 }
 
-/// Read current kernel heap utilization under the allocator spinlock.
-#[allow(dead_code)]
+/// Read combined slab + dynamic physical pool + fallback heap utilization.
 pub fn stats() -> HeapStats {
-    let guard = ALLOCATOR.lock();
-    HeapStats {
-        used: guard.used(),
-        free: guard.free(),
-        total: HEAP_SIZE,
-    }
+    let pmm_free_bytes = crate::phys_mm_stats()
+        .free_frames
+        .saturating_mul(target_enterprise::slab_alloc::SLAB_PAGE_BYTES);
+    with_heap_lock(|inner| {
+        let st = inner.slab.stats();
+        let used = st.used_bytes.saturating_add(inner.fallback.used());
+        let free = pmm_free_bytes.saturating_add(inner.fallback.free());
+        HeapStats {
+            used,
+            free,
+            total: used.saturating_add(free),
+        }
+    })
+}
+
+/// Snapshot detailed segregated size-class slab metrics.
+pub fn slab_stats() -> SlabStats {
+    with_heap_lock(|inner| inner.slab.stats())
+}
+
+/// Reclaim warm cached empty 4 KiB slab pages back to `KERNEL_PHYS_MM`.
+pub fn reclaim_empty_slabs() -> usize {
+    with_heap_lock(|inner| {
+        let mut backend = KernelPhysBackend;
+        inner.slab.reclaim_empty_slabs(&mut backend)
+    })
 }
 
 /// Return `true` iff allocating `requested` bytes preserves at least
-/// [`KERNEL_HEAP_RESERVE_BYTES`] of free Ring-0 emergency heap headroom.
+/// [`KERNEL_HEAP_RESERVE_BYTES`] of free Ring-0 emergency headroom.
 pub fn has_headroom(requested: usize) -> bool {
     if !HEAP_INITIALIZED.load(Ordering::Acquire) {
         return false;
