@@ -470,6 +470,7 @@ fn reason_phrase(status: u16) -> Option<&'static [u8]> {
         404 => b"Not Found",
         405 => b"Method Not Allowed",
         408 => b"Request Timeout",
+        409 => b"Conflict",
         413 => b"Payload Too Large",
         414 => b"URI Too Long",
         429 => b"Too Many Requests",

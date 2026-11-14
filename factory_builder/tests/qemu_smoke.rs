@@ -355,6 +355,7 @@ const REQUIRED_BANNERS: &[&str] = &[
     "NVMe read_lba(7) OK first_byte=a5",
     "TCP handshake OK state=ESTABLISHED seq=",
     "TCP teardown OK state=CLOSED snd_nxt=",
+    "TCP_IPV6_TRIAD OK cwnd=grow fast_retx=1 ooo=8 ipv6=echo+ndp rpc=hmac",
     "HTTP parse OK method=GET path=/healthz",
     "HTTP build OK status=200 bytes=",
     "DNS query OK id=c0de qname=cuttle.local",

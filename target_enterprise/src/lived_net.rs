@@ -44,10 +44,20 @@ pub const TCP_MAX_SLOTS: usize = 16;
 pub const ETH_HEADER_LEN: usize = 14;
 /// IPv4 header length (no options).
 pub const IPV4_HEADER_LEN: usize = 20;
+/// IPv6 fixed header length (`40` bytes, RFC 8200).
+pub const IPV6_HEADER_LEN: usize = 40;
+/// Ethernet II EtherType for IPv6 (`0x86DD`).
+pub const ETHERTYPE_IPV6: u16 = 0x86DD;
+/// IPv6 Next Header protocol number for ICMPv6 (`58`, RFC 4443).
+pub const IP_PROTO_ICMPV6: u8 = 58;
+/// Deterministic Unique Local IPv6 Address (`fd00::10:2:0:15`) claimed alongside link-local EUI-64.
+pub const GUEST_IPV6_ULA: [u8; 16] = [
+    0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0x02, 0, 0, 0, 0x15,
+];
 /// Maximum Ethernet payload + header we emit (untagged, no FCS).
 pub const MAX_FRAME: usize = 1514;
-/// Max replies produced from one inbound frame.
-pub const MAX_REPLIES: usize = 3;
+/// Max replies produced from one inbound frame (`8` frames for multi-segment sliding-window bursts).
+pub const MAX_REPLIES: usize = 8;
 /// Maximum HTTP request size (headers + body) accepted on port 80 or 443
 /// before returning `413 Content Too Large`.
 pub const MAX_HTTP_REQUEST_BYTES: usize = 8 * 1024;
@@ -103,7 +113,11 @@ pub const fn ms_to_timer_ticks(ms: u32, irqs_per_sec: u64) -> u32 {
     }
 }
 /// Largest TCP payload emitted per segment.
-const TCP_SEGMENT_PAYLOAD: usize = 1380;
+pub const TCP_SEGMENT_PAYLOAD: usize = 1380;
+/// Initial RFC 3390 / RFC 5681 TCP congestion window (`4 * SMSS = 5,520` bytes).
+pub const TCP_INIT_CWND: u32 = (4 * TCP_SEGMENT_PAYLOAD) as u32;
+/// Initial TCP slow-start threshold (`65,535` bytes).
+pub const TCP_INIT_SSTHRESH: u32 = 65_535;
 /// Deterministic 256-bit HMAC-SHA256 fixture key used only by in-memory unit
 /// tests (`LivedNet::new`). Limited to `#[cfg(test)]` so production and kernel
 /// code can never fall back to a public constant.
@@ -111,20 +125,31 @@ const TCP_SEGMENT_PAYLOAD: usize = 1380;
 pub const DEFAULT_NET_AUTH_KEY: [u8; 32] = *b"Cuttle-Enterprise-NetAuth-Key001";
 
 /// Outgoing Ethernet frames produced by [`LivedNet::handle_frame`].
+///
+/// Uses lazily allocated `Box<[u8; MAX_FRAME]>` frame slots so `ReplySet` itself
+/// occupies only `136` bytes on the kernel stack while reusing warm slab buffers
+/// across frames via [`ReplySet::clear`].
 pub struct ReplySet {
-    frames: [[u8; MAX_FRAME]; MAX_REPLIES],
+    frames: [Option<Box<[u8; MAX_FRAME]>>; MAX_REPLIES],
     lens: [usize; MAX_REPLIES],
     count: u8,
 }
 
 impl ReplySet {
-    /// Empty set.
+    /// Empty set (zero heap allocations until a frame is pushed).
     pub const fn new() -> Self {
         Self {
-            frames: [[0u8; MAX_FRAME]; MAX_REPLIES],
+            frames: [const { None }; MAX_REPLIES],
             lens: [0; MAX_REPLIES],
             count: 0,
         }
+    }
+
+    /// Reset queued frame count to zero while retaining any already-allocated
+    /// `MAX_FRAME` backing buffers for zero-allocation steady-state reuse.
+    pub fn clear(&mut self) {
+        self.count = 0;
+        self.lens = [0; MAX_REPLIES];
     }
 
     /// Number of frames queued.
@@ -140,7 +165,9 @@ impl ReplySet {
     /// Frame bytes at `i`, if present.
     pub fn get(&self, i: usize) -> Option<&[u8]> {
         if i < self.count as usize {
-            Some(&self.frames[i][..self.lens[i]])
+            self.frames[i]
+                .as_ref()
+                .map(|buf| &buf[..self.lens[i]])
         } else {
             None
         }
@@ -151,7 +178,8 @@ impl ReplySet {
             return false;
         }
         let i = self.count as usize;
-        self.frames[i][..frame.len()].copy_from_slice(frame);
+        let slot = self.frames[i].get_or_insert_with(|| Box::new([0u8; MAX_FRAME]));
+        slot[..frame.len()].copy_from_slice(frame);
         self.lens[i] = frame.len();
         self.count += 1;
         true
@@ -159,11 +187,11 @@ impl ReplySet {
 }
 
 /// Maximum out-of-order TCP segments buffered per connection slot for WAN gap reassembly.
-const OOO_SLOTS_PER_CONN: usize = 2;
-/// Maximum forward sequence gap (`8 KiB`) accepted for out-of-order TCP reassembly.
-const OOO_MAX_GAP_BYTES: u32 = 8192;
-/// Maximum unacknowledged server payload bytes retained per slot for RTO retransmission.
-const MAX_TX_INFLIGHT_PER_SLOT: usize = 8192;
+pub const OOO_SLOTS_PER_CONN: usize = 8;
+/// Maximum forward sequence gap (`32 KiB`) accepted for out-of-order TCP reassembly.
+pub const OOO_MAX_GAP_BYTES: u32 = 32_768;
+/// Maximum unacknowledged server payload bytes (`36 KiB`) retained per slot for retransmission.
+pub const MAX_TX_INFLIGHT_PER_SLOT: usize = 36_864;
 
 struct OooSegment {
     present: bool,
@@ -202,12 +230,18 @@ pub struct LivedNet {
     pub last_auth_seq: u64,
     /// Highest accepted monotonic sequence number for anti-replay protection on HTTP `/session/login`.
     pub last_http_login_seq: u64,
-    /// Minimum accepted Triad coordinator fencing epoch (`R6`) on `TRIAD_PREPARE`.
+    /// Highest accepted monotonic sequence number for network-native HTTP/HTTPS `POST /triad/rpc`.
+    pub last_triad_rpc_seq: u64,
+    /// Minimum accepted Triad coordinator fencing epoch (`R6`) on `TRIAD_PREPARE` and `/triad/rpc`.
     pub triad_min_epoch: u64,
+    /// Total authenticated `POST /triad/rpc` commands accepted across HTTP/HTTPS.
+    pub triad_rpcs_accepted: u64,
     /// TLS connections started on port 443 since boot.
     pub tls_sessions_started: u64,
     /// Total TCP retransmission / half-open reclamation events triggered by RTO timers.
     pub rto_retransmits: u64,
+    /// Total RFC 5681 3-duplicate-ACK fast retransmissions triggered before RTO expiry.
+    pub fast_retransmits: u64,
     /// Total stateless HMAC-SHA256 SYN Cookie `SYN|ACK` challenges emitted under slot saturation.
     pub syn_cookies_sent: u64,
     /// Total stateless HMAC-SHA256 SYN Cookie handshakes verified and promoted to `Established`.
@@ -216,6 +250,10 @@ pub struct LivedNet {
     pub ooo_reassembled: u64,
     /// Total unacknowledged server TCP payload segments re-emitted on RTO timeout.
     pub payload_retransmits: u64,
+    /// Total valid IPv6 ICMPv6 Echo Requests (`type 128`) answered with Echo Replies (`type 129`).
+    pub ipv6_icmp_echos: u64,
+    /// Total valid IPv6 Neighbor Solicitations (`type 135`) answered with Neighbor Advertisements (`type 136`).
+    pub ipv6_ndp_replies: u64,
     syn_cookie_threshold: usize,
     active_http_peer_ip: [u8; 4],
     login_rl_ips: [[u8; 4]; 8],
@@ -223,6 +261,10 @@ pub struct LivedNet {
     login_rl_cooldowns: [u16; 8],
     login_rl_backoffs: [u8; 8],
     tcbs: [Tcb; TCP_MAX_SLOTS],
+    slot_cwnd: [u32; TCP_MAX_SLOTS],
+    slot_ssthresh: [u32; TCP_MAX_SLOTS],
+    slot_dup_acks: [u8; TCP_MAX_SLOTS],
+    peak_cwnd: u32,
     slot_last_tick: [u32; TCP_MAX_SLOTS],
     slot_rto_ticks: [u32; TCP_MAX_SLOTS],
     slot_rto_shift: [u8; TCP_MAX_SLOTS],
@@ -259,13 +301,18 @@ impl LivedNet {
             auth_enabled: false,
             last_auth_seq: 0,
             last_http_login_seq: 0,
+            last_triad_rpc_seq: 0,
             triad_min_epoch: 0,
+            triad_rpcs_accepted: 0,
             tls_sessions_started: 0,
             rto_retransmits: 0,
+            fast_retransmits: 0,
             syn_cookies_sent: 0,
             syn_cookies_accepted: 0,
             ooo_reassembled: 0,
             payload_retransmits: 0,
+            ipv6_icmp_echos: 0,
+            ipv6_ndp_replies: 0,
             syn_cookie_threshold: TCP_MAX_SLOTS,
             active_http_peer_ip: [0u8; 4],
             login_rl_ips: [[0u8; 4]; 8],
@@ -273,6 +320,10 @@ impl LivedNet {
             login_rl_cooldowns: [0u16; 8],
             login_rl_backoffs: [0u8; 8],
             tcbs: [Tcb::EMPTY; TCP_MAX_SLOTS],
+            slot_cwnd: [TCP_INIT_CWND; TCP_MAX_SLOTS],
+            slot_ssthresh: [TCP_INIT_SSTHRESH; TCP_MAX_SLOTS],
+            slot_dup_acks: [0u8; TCP_MAX_SLOTS],
+            peak_cwnd: TCP_INIT_CWND,
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
             slot_rto_shift: [0u8; TCP_MAX_SLOTS],
@@ -312,13 +363,18 @@ impl LivedNet {
             auth_enabled: true,
             last_auth_seq: 0,
             last_http_login_seq: 0,
+            last_triad_rpc_seq: 0,
             triad_min_epoch: 0,
+            triad_rpcs_accepted: 0,
             tls_sessions_started: 0,
             rto_retransmits: 0,
+            fast_retransmits: 0,
             syn_cookies_sent: 0,
             syn_cookies_accepted: 0,
             ooo_reassembled: 0,
             payload_retransmits: 0,
+            ipv6_icmp_echos: 0,
+            ipv6_ndp_replies: 0,
             syn_cookie_threshold: TCP_MAX_SLOTS,
             active_http_peer_ip: [0u8; 4],
             login_rl_ips: [[0u8; 4]; 8],
@@ -326,6 +382,10 @@ impl LivedNet {
             login_rl_cooldowns: [0u16; 8],
             login_rl_backoffs: [0u8; 8],
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
+            slot_cwnd: [TCP_INIT_CWND; TCP_MAX_SLOTS],
+            slot_ssthresh: [TCP_INIT_SSTHRESH; TCP_MAX_SLOTS],
+            slot_dup_acks: [0u8; TCP_MAX_SLOTS],
+            peak_cwnd: TCP_INIT_CWND,
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
             slot_rto_shift: [0u8; TCP_MAX_SLOTS],
@@ -360,13 +420,18 @@ impl LivedNet {
             auth_enabled: false,
             last_auth_seq: 0,
             last_http_login_seq: 0,
+            last_triad_rpc_seq: 0,
             triad_min_epoch: 0,
+            triad_rpcs_accepted: 0,
             tls_sessions_started: 0,
             rto_retransmits: 0,
+            fast_retransmits: 0,
             syn_cookies_sent: 0,
             syn_cookies_accepted: 0,
             ooo_reassembled: 0,
             payload_retransmits: 0,
+            ipv6_icmp_echos: 0,
+            ipv6_ndp_replies: 0,
             syn_cookie_threshold: TCP_MAX_SLOTS,
             active_http_peer_ip: [0u8; 4],
             login_rl_ips: [[0u8; 4]; 8],
@@ -374,6 +439,10 @@ impl LivedNet {
             login_rl_cooldowns: [0u16; 8],
             login_rl_backoffs: [0u8; 8],
             tcbs: [Tcb::listen(GUEST_IP, HTTP_PORT, 65535); TCP_MAX_SLOTS],
+            slot_cwnd: [TCP_INIT_CWND; TCP_MAX_SLOTS],
+            slot_ssthresh: [TCP_INIT_SSTHRESH; TCP_MAX_SLOTS],
+            slot_dup_acks: [0u8; TCP_MAX_SLOTS],
+            peak_cwnd: TCP_INIT_CWND,
             slot_last_tick: [0u32; TCP_MAX_SLOTS],
             slot_rto_ticks: [0u32; TCP_MAX_SLOTS],
             slot_rto_shift: [0u8; TCP_MAX_SLOTS],
@@ -598,6 +667,9 @@ impl LivedNet {
         self.http_input_closed[idx] = false;
         self.slot_rto_shift[idx] = 0;
         self.tx_inflight_seq[idx] = 0;
+        self.slot_cwnd[idx] = TCP_INIT_CWND;
+        self.slot_ssthresh[idx] = TCP_INIT_SSTHRESH;
+        self.slot_dup_acks[idx] = 0;
         crate::https::scrub_vec_all_bytes(&mut self.http_bufs[idx]);
         self.http_bufs[idx].shrink_to_fit();
         crate::https::scrub_vec_all_bytes(&mut self.http_tx[idx]);
@@ -726,6 +798,11 @@ impl LivedNet {
                 } else if !self.tx_inflight_buf[i].is_empty() {
                     let backoff_rto = rto_ticks << (self.slot_rto_shift[i].min(4) as u32);
                     if self.ticks.wrapping_sub(self.slot_rto_ticks[i]) >= backoff_rto {
+                        let flight = self.tcbs[i].snd_nxt.wrapping_sub(self.tcbs[i].snd_una);
+                        let mss = TCP_SEGMENT_PAYLOAD as u32;
+                        self.slot_ssthresh[i] = (flight / 2).max(2 * mss);
+                        self.slot_cwnd[i] = mss;
+                        self.slot_dup_acks[i] = 0;
                         if self.retransmit_inflight_chunk(i, out) {
                             self.payload_retransmits = self.payload_retransmits.wrapping_add(1);
                         }
@@ -854,6 +931,101 @@ impl LivedNet {
         );
     }
 
+    /// Compute the domain-separated 32-byte HMAC-SHA256 tag over
+    /// `"cuttle-triad-rpc-v1:<epoch>:<seq>:<cmd>"` for network-native `POST /triad/rpc`.
+    pub fn compute_triad_rpc_tag(
+        key: &[u8; 32],
+        epoch_ascii: &[u8],
+        seq_ascii: &[u8],
+        cmd: &[u8],
+        out: &mut [u8; 32],
+    ) {
+        crate::tls::hmac_sha256_parts(
+            key,
+            &[
+                b"cuttle-triad-rpc-v1:",
+                epoch_ascii,
+                b":",
+                seq_ascii,
+                b":",
+                cmd,
+            ],
+            out,
+        );
+    }
+
+    /// Return the current RFC 5681 congestion window (`cwnd`, in bytes) of TCP slot `idx`.
+    pub fn slot_cwnd(&self, idx: usize) -> u32 {
+        self.slot_cwnd[idx]
+    }
+
+    /// Return the current RFC 5681 slow-start threshold (`ssthresh`, in bytes) of TCP slot `idx`.
+    pub fn slot_ssthresh(&self, idx: usize) -> u32 {
+        self.slot_ssthresh[idx]
+    }
+
+    /// Return the peak RFC 5681 congestion window (`cwnd`, in bytes) observed across all connections.
+    pub fn max_observed_cwnd(&self) -> u32 {
+        self.peak_cwnd
+    }
+
+    /// Derive the guest's RFC 4291 Modified EUI-64 IPv6 link-local address (`fe80::/64`)
+    /// from its 48-bit Ethernet MAC address.
+    pub fn ipv6_link_local(&self) -> [u8; 16] {
+        [
+            0xfe,
+            0x80,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            self.mac[0] ^ 0x02,
+            self.mac[1],
+            self.mac[2],
+            0xff,
+            0xfe,
+            self.mac[3],
+            self.mac[4],
+            self.mac[5],
+        ]
+    }
+
+    /// Compute the RFC 8200 §8.1 16-bit one's-complement upper-layer checksum over the
+    /// 40-byte IPv6 pseudo-header (`src`, `dst`, 32-bit upper-layer length, `next_header`)
+    /// and `payload`.
+    pub fn ipv6_upper_layer_checksum(
+        src: &[u8; 16],
+        dst: &[u8; 16],
+        next_header: u8,
+        payload: &[u8],
+    ) -> u16 {
+        let mut sum: u32 = 0;
+        let mut i = 0usize;
+        while i < 16 {
+            sum += u16::from_be_bytes([src[i], src[i + 1]]) as u32;
+            sum += u16::from_be_bytes([dst[i], dst[i + 1]]) as u32;
+            i += 2;
+        }
+        let plen = payload.len() as u32;
+        sum += plen >> 16;
+        sum += plen & 0xFFFF;
+        sum += next_header as u32;
+        let mut p = 0usize;
+        while p + 1 < payload.len() {
+            sum += u16::from_be_bytes([payload[p], payload[p + 1]]) as u32;
+            p += 2;
+        }
+        if p < payload.len() {
+            sum += (payload[p] as u32) << 8;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
     /// Gratuitous ARP (broadcast who-has ourselves) so slirp/bridges
     /// learn the guest MAC. Emits one 42-byte frame.
     pub fn announce(&self, out: &mut ReplySet) {
@@ -914,6 +1086,10 @@ impl LivedNet {
         let etype = u16::from_be_bytes([frame[12], frame[13]]);
         if etype == 0x0806 {
             self.handle_arp(frame, out);
+            return;
+        }
+        if etype == ETHERTYPE_IPV6 {
+            self.handle_ipv6(frame, shell, out);
             return;
         }
         if etype != 0x0800 {
@@ -1076,6 +1252,199 @@ impl LivedNet {
             Err(_) => return,
         };
         self.emit_ipv4(dst_mac, reply_ip, IP_PROTO_ICMP, &body[..n], out);
+    }
+
+    #[inline(never)]
+    fn handle_ipv6(
+        &mut self,
+        frame: &[u8],
+        mut shell: Option<&mut crate::shell::OsShell>,
+        out: &mut ReplySet,
+    ) {
+        if frame.len() < ETH_HEADER_LEN + IPV6_HEADER_LEN {
+            return;
+        }
+        let sender_mac: [u8; 6] = match frame[6..12].try_into() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        if sender_mac == [0u8; 6] || (sender_mac[0] & 0x01) != 0 {
+            return;
+        }
+        let ip6 = &frame[ETH_HEADER_LEN..];
+        if (ip6[0] >> 4) != 6 {
+            return;
+        }
+        let payload_len = u16::from_be_bytes([ip6[4], ip6[5]]) as usize;
+        if payload_len < 8 || ETH_HEADER_LEN + IPV6_HEADER_LEN + payload_len > frame.len() {
+            return;
+        }
+        let next_hdr = ip6[6];
+        let hop_limit = ip6[7];
+        if hop_limit == 0 {
+            return;
+        }
+        let mut src_v6 = [0u8; 16];
+        src_v6.copy_from_slice(&ip6[8..24]);
+        let mut dst_v6 = [0u8; 16];
+        dst_v6.copy_from_slice(&ip6[24..40]);
+        let ll = self.ipv6_link_local();
+        let loopback_v6 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        if src_v6[0] == 0xff
+            || src_v6 == [0u8; 16]
+            || src_v6 == loopback_v6
+            || src_v6 == ll
+            || src_v6 == GUEST_IPV6_ULA
+        {
+            return;
+        }
+        if let Some(sh) = shell.as_deref_mut() {
+            if sh.guard_lockdown {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:fw6:lockdown");
+                return;
+            }
+        }
+        if next_hdr != IP_PROTO_ICMPV6 {
+            return;
+        }
+        let icmp6 = &ip6[IPV6_HEADER_LEN..IPV6_HEADER_LEN + payload_len];
+        let wire_ck = u16::from_be_bytes([icmp6[2], icmp6[3]]);
+        if wire_ck == 0 {
+            return;
+        }
+        let mut sum_payload = alloc::vec::Vec::from(icmp6);
+        sum_payload[2] = 0;
+        sum_payload[3] = 0;
+        let expected_ck =
+            Self::ipv6_upper_layer_checksum(&src_v6, &dst_v6, IP_PROTO_ICMPV6, &sum_payload);
+        if wire_ck != expected_ck {
+            return;
+        }
+
+        let icmp_type = icmp6[0];
+        let icmp_code = icmp6[1];
+        if icmp_type == 128 && icmp_code == 0 {
+            let all_nodes_mc = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+            if dst_v6 != ll && dst_v6 != GUEST_IPV6_ULA && dst_v6 != all_nodes_mc {
+                return;
+            }
+            if ETH_HEADER_LEN + IPV6_HEADER_LEN + icmp6.len() > MAX_FRAME {
+                return;
+            }
+            let reply_src = if dst_v6 == GUEST_IPV6_ULA {
+                GUEST_IPV6_ULA
+            } else {
+                ll
+            };
+            sum_payload[0] = 129;
+            sum_payload[1] = 0;
+            sum_payload[2] = 0;
+            sum_payload[3] = 0;
+            let ck =
+                Self::ipv6_upper_layer_checksum(&reply_src, &src_v6, IP_PROTO_ICMPV6, &sum_payload);
+            sum_payload[2..4].copy_from_slice(&ck.to_be_bytes());
+            self.emit_ipv6(
+                sender_mac,
+                reply_src,
+                src_v6,
+                IP_PROTO_ICMPV6,
+                64,
+                &sum_payload,
+                out,
+            );
+            self.ipv6_icmp_echos = self.ipv6_icmp_echos.wrapping_add(1);
+        } else if icmp_type == 135 && icmp_code == 0 {
+            // RFC 4861 §7.1.1 Neighbor Solicitation validation.
+            if hop_limit != 255 || icmp6.len() < 24 {
+                return;
+            }
+            let mut target = [0u8; 16];
+            target.copy_from_slice(&icmp6[8..24]);
+            if target[0] == 0xff || (target != ll && target != GUEST_IPV6_ULA) {
+                return;
+            }
+            let solicited_mc = [
+                0xff,
+                0x02,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0x01,
+                0xff,
+                target[13],
+                target[14],
+                target[15],
+            ];
+            if dst_v6 != target && dst_v6 != solicited_mc {
+                return;
+            }
+            let mut opt_pos = 24usize;
+            while opt_pos < icmp6.len() {
+                if opt_pos + 2 > icmp6.len() {
+                    return;
+                }
+                let opt_units = icmp6[opt_pos + 1] as usize;
+                if opt_units == 0 {
+                    return;
+                }
+                let opt_bytes = opt_units * 8;
+                if opt_pos + opt_bytes > icmp6.len() {
+                    return;
+                }
+                opt_pos += opt_bytes;
+            }
+            let mut na = [0u8; 32];
+            na[0] = 136; // Neighbor Advertisement
+            na[1] = 0;
+            na[4..8].copy_from_slice(&0x6000_0000u32.to_be_bytes()); // Solicited | Override
+            na[8..24].copy_from_slice(&target);
+            na[24] = 2; // Target Link-Layer Address option
+            na[25] = 1; // 1 * 8 octets
+            na[26..32].copy_from_slice(&self.mac);
+            let ck = Self::ipv6_upper_layer_checksum(&target, &src_v6, IP_PROTO_ICMPV6, &na);
+            na[2..4].copy_from_slice(&ck.to_be_bytes());
+            self.emit_ipv6(sender_mac, target, src_v6, IP_PROTO_ICMPV6, 255, &na, out);
+            self.ipv6_ndp_replies = self.ipv6_ndp_replies.wrapping_add(1);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_ipv6(
+        &mut self,
+        dst_mac: [u8; 6],
+        src_v6: [u8; 16],
+        dst_v6: [u8; 16],
+        next_header: u8,
+        hop_limit: u8,
+        payload: &[u8],
+        out: &mut ReplySet,
+    ) {
+        let eth_len = ETH_HEADER_LEN + IPV6_HEADER_LEN + payload.len();
+        if eth_len > MAX_FRAME || payload.len() > u16::MAX as usize {
+            return;
+        }
+        let mut eth = [0u8; MAX_FRAME];
+        eth[0..6].copy_from_slice(&dst_mac);
+        eth[6..12].copy_from_slice(&self.mac);
+        eth[12..14].copy_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
+        let ip6 = &mut eth[ETH_HEADER_LEN..ETH_HEADER_LEN + IPV6_HEADER_LEN];
+        ip6[0] = 0x60;
+        ip6[1] = 0;
+        ip6[2] = 0;
+        ip6[3] = 0;
+        ip6[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        ip6[6] = next_header;
+        ip6[7] = hop_limit;
+        ip6[8..24].copy_from_slice(&src_v6);
+        ip6[24..40].copy_from_slice(&dst_v6);
+        eth[ETH_HEADER_LEN + IPV6_HEADER_LEN..eth_len].copy_from_slice(payload);
+        out.push(&eth[..eth_len]);
     }
 
     #[inline(never)]
@@ -1723,6 +2092,22 @@ impl LivedNet {
                 self.tx_inflight_seq[idx] = base.wrapping_add(acked as u32);
                 self.slot_rto_shift[idx] = 0;
                 self.slot_rto_ticks[idx] = self.ticks;
+                let mss = TCP_SEGMENT_PAYLOAD as u32;
+                let cap = MAX_TX_INFLIGHT_PER_SLOT as u32;
+                if self.slot_dup_acks[idx] >= 3 {
+                    // RFC 5681 §3.2 Step 6: exit Fast Recovery by deflating cwnd to ssthresh.
+                    self.slot_cwnd[idx] = self.slot_ssthresh[idx].min(cap);
+                } else if self.slot_cwnd[idx] < self.slot_ssthresh[idx] {
+                    // RFC 5681 §3.1 / RFC 3465 Slow Start (`L = 2 * SMSS`).
+                    let inc = (acked as u32).min(2 * mss);
+                    self.slot_cwnd[idx] = self.slot_cwnd[idx].saturating_add(inc).min(cap);
+                } else {
+                    // RFC 5681 §3.1 Congestion Avoidance (`cwnd += SMSS*SMSS/cwnd`).
+                    let inc = ((mss * mss) / self.slot_cwnd[idx].max(1)).max(1);
+                    self.slot_cwnd[idx] = self.slot_cwnd[idx].saturating_add(inc).min(cap);
+                }
+                self.peak_cwnd = self.peak_cwnd.max(self.slot_cwnd[idx]);
+                self.slot_dup_acks[idx] = 0;
                 if self.tx_inflight_buf[idx].is_empty() && self.tx_inflight_buf[idx].capacity() > 4096
                 {
                     self.tx_inflight_buf[idx].shrink_to_fit();
@@ -1988,6 +2373,49 @@ impl LivedNet {
             return;
         }
 
+        // RFC 5681 §2 / §3.2: 3-Duplicate-ACK Fast Retransmit & Fast Recovery
+        // (including `FinWait1` / `LastAck` when server `FIN` was already queued behind in-flight data).
+        if matches!(
+            self.tcbs[idx].state,
+            TcpState::Established
+                | TcpState::CloseWait
+                | TcpState::FinWait1
+                | TcpState::LastAck
+        ) && (seg.flags & tcp_flags::ACK) != 0
+            && (seg.flags & (tcp_flags::SYN | tcp_flags::FIN | tcp_flags::RST)) == 0
+            && seg.payload.is_empty()
+            && seg.seq == self.tcbs[idx].rcv_nxt
+            && seg.ack == self.tcbs[idx].snd_una
+            && seg.window == self.tcbs[idx].snd_wnd
+            && !self.tx_inflight_buf[idx].is_empty()
+        {
+            self.slot_last_tick[idx] = self.ticks;
+            self.slot_dup_acks[idx] = self.slot_dup_acks[idx].saturating_add(1);
+            let mss = TCP_SEGMENT_PAYLOAD as u32;
+            let cap = MAX_TX_INFLIGHT_PER_SLOT as u32;
+            if self.slot_dup_acks[idx] == 3 {
+                let flight = self.tcbs[idx].snd_nxt.wrapping_sub(self.tcbs[idx].snd_una);
+                let ssthresh = (flight / 2).max(2 * mss);
+                self.slot_ssthresh[idx] = ssthresh;
+                self.slot_cwnd[idx] = ssthresh.saturating_add(3 * mss).min(cap);
+                self.peak_cwnd = self.peak_cwnd.max(self.slot_cwnd[idx]);
+                self.fast_retransmits = self.fast_retransmits.wrapping_add(1);
+                if self.retransmit_inflight_chunk(idx, out) {
+                    self.payload_retransmits = self.payload_retransmits.wrapping_add(1);
+                }
+                self.slot_rto_ticks[idx] = self.ticks;
+            } else if self.slot_dup_acks[idx] > 3 {
+                self.slot_cwnd[idx] = self.slot_cwnd[idx].saturating_add(mss).min(cap);
+                self.peak_cwnd = self.peak_cwnd.max(self.slot_cwnd[idx]);
+                if seg.dst_port == HTTPS_PORT {
+                    let _ = self.flush_https_tx(idx, dst_mac, reply_ip, out);
+                } else {
+                    let _ = self.flush_http_tx(idx, dst_mac, reply_ip, out);
+                }
+            }
+            return;
+        }
+
         let was_close_wait = matches!(
             self.tcbs[idx].state,
             TcpState::CloseWait | TcpState::FinWait1 | TcpState::FinWait2 | TcpState::LastAck
@@ -2001,6 +2429,9 @@ impl LivedNet {
         self.slot_rto_ticks[idx] = self.ticks;
         self.slot_remote_mac[idx] = dst_mac;
         self.tcbs[idx] = next;
+        if self.tcbs[idx].state == TcpState::CloseWait && (seg.flags & tcp_flags::ACK) != 0 {
+            self.tcbs[idx].snd_wnd = seg.window;
+        }
         if self.tcbs[idx].remote_ip == [0, 0, 0, 0] {
             self.tcbs[idx].remote_ip = src_ip;
         }
@@ -2086,7 +2517,7 @@ impl LivedNet {
         } else if !self.http_input_closed[idx] {
             let mut responses = 0usize;
             while responses < 8 && self.http_tx[idx].len() < HTTPS_TX_HIGH_WATER {
-                let mut single = [0u8; 4096];
+                let mut single = alloc::vec![0u8; 34_816];
                 let close_after;
                 let n = match frame_next_http_request(&mut self.http_bufs[idx]) {
                     HttpFrameOutcome::Incomplete => {
@@ -2200,7 +2631,16 @@ impl LivedNet {
         let remote_port = self.tcbs[idx].remote_port;
         let mut chunk = [0u8; TCP_SEGMENT_PAYLOAD];
         while out.len() + 1 < MAX_REPLIES {
-            let n = self.http_tx[idx].len().min(TCP_SEGMENT_PAYLOAD);
+            let in_flight = self.tcbs[idx].snd_nxt.wrapping_sub(self.tcbs[idx].snd_una);
+            let eff_wnd = self.slot_cwnd[idx].min(self.tcbs[idx].snd_wnd as u32);
+            if in_flight >= eff_wnd {
+                break;
+            }
+            let wnd_room = (eff_wnd - in_flight) as usize;
+            let n = self.http_tx[idx]
+                .len()
+                .min(TCP_SEGMENT_PAYLOAD)
+                .min(wnd_room);
             if n == 0 {
                 break;
             }
@@ -2371,7 +2811,7 @@ impl LivedNet {
                 && responses < 8
                 && session.pending_tx().len() < HTTPS_TX_HIGH_WATER
             {
-                let mut response = [0u8; 4096];
+                let mut response = alloc::vec![0u8; 34_816];
                 let close_after;
                 let n = match frame_next_http_request(session.plaintext()) {
                     HttpFrameOutcome::Incomplete => {
@@ -2419,12 +2859,18 @@ impl LivedNet {
                         written
                     }
                 };
-                if n > 0 && session.send(&response[..n]).is_err() {
-                    crate::durable_seal::zeroize_secret_bytes(&mut response[..n]);
-                    break;
-                }
                 if n > 0 {
+                    let mut send_failed = false;
+                    for rec in response[..n].chunks(16_384) {
+                        if session.send(rec).is_err() {
+                            send_failed = true;
+                            break;
+                        }
+                    }
                     crate::durable_seal::zeroize_secret_bytes(&mut response[..n]);
+                    if send_failed {
+                        break;
+                    }
                 }
                 responses += 1;
                 // `Connection: close`, malformed, or oversized request: end
@@ -2515,9 +2961,19 @@ impl LivedNet {
         let remote_port = self.tcbs[idx].remote_port;
         let mut chunk = [0u8; TCP_SEGMENT_PAYLOAD];
         while out.len() + 1 < MAX_REPLIES {
+            let in_flight = self.tcbs[idx].snd_nxt.wrapping_sub(self.tcbs[idx].snd_una);
+            let eff_wnd = self.slot_cwnd[idx].min(self.tcbs[idx].snd_wnd as u32);
+            if in_flight >= eff_wnd {
+                break;
+            }
+            let wnd_room = (eff_wnd - in_flight) as usize;
             let n = match &self.tls[idx] {
                 Some(session) => {
-                    let n = session.pending_tx().len().min(TCP_SEGMENT_PAYLOAD);
+                    let n = session
+                        .pending_tx()
+                        .len()
+                        .min(TCP_SEGMENT_PAYLOAD)
+                        .min(wnd_room);
                     chunk[..n].copy_from_slice(&session.pending_tx()[..n]);
                     n
                 }
@@ -3309,6 +3765,148 @@ impl LivedNet {
                     Err(e) => build_service_error_response(e, out),
                 };
             }
+        }
+
+        // 10. Authenticated Network-Native Triad Coordinator RPC (`POST /triad/rpc`).
+        //     Body format: `<epoch> <seq> <hmac_hex64> <cmd>`
+        //     Domain-separated HMAC-SHA256: `"cuttle-triad-rpc-v1:<epoch>:<seq>:<cmd>"`.
+        if view.path == b"/triad/rpc" {
+            if view.method != HttpMethod::Post {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:rpc-method");
+                return HttpImpl::build_response(
+                    405,
+                    b"text/plain",
+                    b"error: method not allowed (use POST /triad/rpc)\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            if !self.auth_enabled {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:rpc-unprovisioned");
+                return HttpImpl::build_response(
+                    403,
+                    b"text/plain",
+                    b"error: EACCES (device key not provisioned; TRIAD RPC disabled)\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            let (epoch_tok, after_ep) = split_ws(view.body);
+            let (seq_tok, after_seq) = split_ws(after_ep);
+            let (hmac_tok, cmd_raw) = split_ws(after_seq);
+            let cmd = trim_ws(cmd_raw);
+            let has_ctrl = cmd.iter().any(|&b| b < 0x20 || b == 0x7f);
+            let (Some(epoch), Some(seq)) = (parse_u64_dec(epoch_tok), parse_u64_dec(seq_tok))
+            else {
+                sh.record_net_audit(AuditVerdict::Error, b"net:triad:rpc-syntax");
+                return HttpImpl::build_response(
+                    400,
+                    b"text/plain",
+                    b"usage: <epoch> <seq> <hmac_hex64> <cmd>\n",
+                    out,
+                )
+                .unwrap_or(0);
+            };
+            if hmac_tok.len() != 64 || cmd.is_empty() || has_ctrl {
+                sh.record_net_audit(AuditVerdict::Error, b"net:triad:rpc-syntax");
+                return HttpImpl::build_response(
+                    400,
+                    b"text/plain",
+                    b"usage: <epoch> <seq> <hmac_hex64> <cmd>\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            if cmd.len() > 512 {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:rpc-oversize");
+                return HttpImpl::build_response(
+                    413,
+                    b"text/plain",
+                    b"error: E2BIG (triad RPC command exceeds 512 bytes)\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            let mut provided_mac = [0u8; 32];
+            if !decode_hex_32(hmac_tok, &mut provided_mac) {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:rpc-hex");
+                return HttpImpl::build_response(
+                    401,
+                    b"text/plain",
+                    b"error: EACCES (invalid triad RPC HMAC hex)\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            let mut expected_mac = [0u8; 32];
+            Self::compute_triad_rpc_tag(
+                &self.auth_key,
+                epoch_tok,
+                seq_tok,
+                cmd,
+                &mut expected_mac,
+            );
+            let mut diff = 0u8;
+            let mut i = 0usize;
+            while i < 32 {
+                diff |= provided_mac[i] ^ expected_mac[i];
+                i += 1;
+            }
+            if diff != 0 {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:rpc-hmac");
+                return HttpImpl::build_response(
+                    401,
+                    b"text/plain",
+                    b"error: EACCES (triad RPC HMAC-SHA256 verification failed)\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            let min_epoch = self.triad_min_epoch.max(sh.triad_min_epoch);
+            if epoch == 0 || epoch < min_epoch {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:rpc-stale-epoch");
+                return HttpImpl::build_response(
+                    409,
+                    b"text/plain",
+                    b"error: EACCES (stale triad coordinator epoch)\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            let watermark = self.last_triad_rpc_seq.max(sh.triad_rpc_seq);
+            if seq <= watermark {
+                sh.record_net_audit(AuditVerdict::Denied, b"net:triad:rpc-replay");
+                return HttpImpl::build_response(
+                    401,
+                    b"text/plain",
+                    b"error: EACCES (triad RPC replay detected)\n",
+                    out,
+                )
+                .unwrap_or(0);
+            }
+            self.triad_min_epoch = epoch;
+            sh.triad_min_epoch = epoch;
+            self.last_triad_rpc_seq = seq;
+            sh.triad_rpc_seq = seq;
+            self.triad_rpcs_accepted = self.triad_rpcs_accepted.wrapping_add(1);
+            sh.record_net_audit(AuditVerdict::Allowed, b"net:triad:rpc-ok");
+
+            let mut rpc_out = alloc::vec![0u8; 8192];
+            let prev_owner = sh.sql_owner_override;
+            sh.sql_owner_override = crate::sql::SQL_OWNER_TRIAD;
+            let n = sh.exec_line(cmd, boots, 0, 0, &mut rpc_out).bytes_written();
+            sh.sql_owner_override = prev_owner;
+            let status = if rpc_out[..n].starts_with(b"error: EACCES (")
+                && rpc_out[..n]
+                    .windows(21)
+                    .any(|w| w == b"disabled by node role")
+            {
+                503u16
+            } else {
+                200u16
+            };
+            return HttpImpl::build_response(status, b"text/plain", &rpc_out[..n], out)
+                .unwrap_or(0);
         }
 
         HttpImpl::build_response(404, b"text/plain", b"not found\n", out).unwrap_or(0)
@@ -4193,7 +4791,7 @@ fn serve_vfs_get_response(
     vfs_path: &[u8],
     out: &mut [u8],
 ) -> usize {
-    let mut fbuf = [0u8; 2048];
+    let mut fbuf = alloc::vec![0u8; crate::vfs::PAGED_VFS_MAX_FILE_BYTES];
     match sh.dispatch_mailbox_op(
         crate::svc_runtime::IpcOp::VfsRead,
         true,
@@ -7997,7 +8595,7 @@ mod tests {
                     &mut replies,
                 );
                 assert_eq!(replies.count, 1);
-                let frame = &replies.frames[0][..replies.lens[0]];
+                let frame = replies.get(0).unwrap();
                 let udp_body = &frame[42..];
                 assert!(
                     udp_body.starts_with(b"error: EACCES"),
@@ -8452,5 +9050,663 @@ mod tests {
             s2.contains("INSERT 1"),
             "recycled session slot must not inherit previous session's aborted SQL state: {s2}"
         );
+    }
+
+    #[test]
+    fn triad_rpc_refuses_unauthenticated_unprovisioned_replay_and_stale_epoch_across_all_roles() {
+        use crate::svc_runtime::NodeRole;
+
+        let roles = [
+            NodeRole::Full,
+            NodeRole::Wfe,
+            NodeRole::Sql,
+            NodeRole::Shell,
+        ];
+        let auth_key = [0x5Au8; 32];
+
+        for role in roles {
+            // 1. Unprovisioned node refuses POST /triad/rpc with 403 in every role.
+            let mut unprov = LivedNet::new_unprovisioned(MAC);
+            let mut sh_u = crate::shell::OsShell::new();
+            sh_u.svc.set_role(role, &mut sh_u.audit);
+            let mut resp = alloc::vec![0u8; 4096];
+            let req_unprov =
+                b"POST /triad/rpc HTTP/1.1\r\nHost: cuttle\r\nContent-Length: 5\r\n\r\nuname";
+            let n = unprov.handle_http_request(req_unprov, 1, Some(&mut sh_u), &mut resp);
+            let s = core::str::from_utf8(&resp[..n]).unwrap();
+            assert!(
+                s.starts_with("HTTP/1.1 403"),
+                "role {role:?} unprovisioned must return 403, got: {s}"
+            );
+
+            // 2. Provisioned node refuses GET /triad/rpc (405), empty body (400),
+            //    credential-free command (400), control-char smuggling (400),
+            //    oversized command >512B (413), invalid hex (401), and wrong HMAC (401)
+            //    across EVERY node role.
+            let mut net = LivedNet::with_auth_key(MAC, auth_key);
+            let mut sh = crate::shell::OsShell::new();
+            sh.svc.set_role(role, &mut sh.audit);
+
+            let get_req = b"GET /triad/rpc HTTP/1.1\r\nHost: cuttle\r\n\r\n";
+            let ng = net.handle_http_request(get_req, 1, Some(&mut sh), &mut resp);
+            assert!(
+                core::str::from_utf8(&resp[..ng])
+                    .unwrap()
+                    .starts_with("HTTP/1.1 405"),
+                "role {role:?} GET /triad/rpc must return 405"
+            );
+
+            for bad_body in [
+                &b""[..],
+                &b"uname"[..],
+                &b"0 1 "
+                    [..],
+                &b"1 1 0000000000000000000000000000000000000000000000000000000000000000 uname\x07"[..],
+            ] {
+                let req = alloc::format!(
+                    "POST /triad/rpc HTTP/1.1\r\nHost: cuttle\r\nContent-Length: {}\r\n\r\n",
+                    bad_body.len()
+                );
+                let mut raw = req.into_bytes();
+                raw.extend_from_slice(bad_body);
+                let nb = net.handle_http_request(&raw, 1, Some(&mut sh), &mut resp);
+                let sb = core::str::from_utf8(&resp[..nb]).unwrap();
+                assert!(
+                    sb.starts_with("HTTP/1.1 400"),
+                    "role {role:?} malformed body must return 400, got: {sb}"
+                );
+            }
+
+            let over_cmd = alloc::vec![b'a'; 513];
+            let over_hdr = alloc::format!(
+                "1 1 {} ",
+                "aa".repeat(32)
+            );
+            let mut over_body = over_hdr.into_bytes();
+            over_body.extend_from_slice(&over_cmd);
+            let over_req_hdr = alloc::format!(
+                "POST /triad/rpc HTTP/1.1\r\nHost: cuttle\r\nContent-Length: {}\r\n\r\n",
+                over_body.len()
+            );
+            let mut over_raw = over_req_hdr.into_bytes();
+            over_raw.extend_from_slice(&over_body);
+            let no = net.handle_http_request(&over_raw, 1, Some(&mut sh), &mut resp);
+            assert!(
+                core::str::from_utf8(&resp[..no])
+                    .unwrap()
+                    .starts_with("HTTP/1.1 413"),
+                "role {role:?} >512B RPC command must be rejected with 413, never truncated"
+            );
+
+            let bad_hex_body = alloc::format!("1 1 {} uname", "zz".repeat(32));
+            let bad_hex_req = alloc::format!(
+                "POST /triad/rpc HTTP/1.1\r\nHost: cuttle\r\nContent-Length: {}\r\n\r\n{}",
+                bad_hex_body.len(),
+                bad_hex_body
+            );
+            let nh = net.handle_http_request(bad_hex_req.as_bytes(), 1, Some(&mut sh), &mut resp);
+            assert!(
+                core::str::from_utf8(&resp[..nh])
+                    .unwrap()
+                    .starts_with("HTTP/1.1 401"),
+                "role {role:?} bad HMAC hex must return 401"
+            );
+
+            let wrong_hmac_body = alloc::format!("1 1 {} uname", "11".repeat(32));
+            let wrong_hmac_req = alloc::format!(
+                "POST /triad/rpc HTTP/1.1\r\nHost: cuttle\r\nContent-Length: {}\r\n\r\n{}",
+                wrong_hmac_body.len(),
+                wrong_hmac_body
+            );
+            let nw =
+                net.handle_http_request(wrong_hmac_req.as_bytes(), 1, Some(&mut sh), &mut resp);
+            assert!(
+                core::str::from_utf8(&resp[..nw])
+                    .unwrap()
+                    .starts_with("HTTP/1.1 401"),
+                "role {role:?} wrong HMAC must return 401"
+            );
+            assert_eq!(net.triad_rpcs_accepted, 0);
+
+            // 3. Authenticated SQL command succeeds on Full & Sql (200) and is refused by
+            //    service role mediation (503) on Wfe & Shell.
+            let cmd = b"sql INSERT INTO kv VALUES ('rpc.k', 'ok', 7)";
+            let mut tag = [0u8; 32];
+            LivedNet::compute_triad_rpc_tag(&auth_key, b"2", b"1", cmd, &mut tag);
+            let mut hex = [0u8; 64];
+            hex_encode_bytes(&tag, &mut hex);
+            let valid_body = alloc::format!(
+                "2 1 {} {}",
+                core::str::from_utf8(&hex).unwrap(),
+                core::str::from_utf8(cmd).unwrap()
+            );
+            let valid_req = alloc::format!(
+                "POST /triad/rpc HTTP/1.1\r\nHost: cuttle\r\nContent-Length: {}\r\n\r\n{}",
+                valid_body.len(),
+                valid_body
+            );
+            let nv = net.handle_http_request(valid_req.as_bytes(), 1, Some(&mut sh), &mut resp);
+            let sv = core::str::from_utf8(&resp[..nv]).unwrap();
+            match role {
+                NodeRole::Full | NodeRole::Sql => {
+                    assert!(
+                        sv.starts_with("HTTP/1.1 200") && sv.contains("INSERT 1"),
+                        "role {role:?} must execute authenticated SQL RPC: {sv}"
+                    );
+                }
+                NodeRole::Wfe | NodeRole::Shell => {
+                    assert!(
+                        sv.starts_with("HTTP/1.1 503") && sv.contains("disabled by node role"),
+                        "role {role:?} must return 503 when svc-sql is disabled: {sv}"
+                    );
+                }
+            }
+        }
+
+        // 4. Epoch fencing (409), sequence replay rejection (401), and WAL S-record persistence.
+        let mut net = LivedNet::with_auth_key(MAC, auth_key);
+        let mut sh = crate::shell::OsShell::new();
+        let mut resp = alloc::vec![0u8; 4096];
+
+        let send_rpc = |net: &mut LivedNet,
+                        sh: &mut crate::shell::OsShell,
+                        ep: &str,
+                        sq: &str,
+                        cmd: &str,
+                        out: &mut [u8]|
+         -> alloc::string::String {
+            let mut tag = [0u8; 32];
+            LivedNet::compute_triad_rpc_tag(
+                &auth_key,
+                ep.as_bytes(),
+                sq.as_bytes(),
+                cmd.as_bytes(),
+                &mut tag,
+            );
+            let mut hex = [0u8; 64];
+            hex_encode_bytes(&tag, &mut hex);
+            let body = alloc::format!(
+                "{} {} {} {}",
+                ep,
+                sq,
+                core::str::from_utf8(&hex).unwrap(),
+                cmd
+            );
+            let req = alloc::format!(
+                "POST /triad/rpc HTTP/1.1\r\nHost: cuttle\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let n = net.handle_http_request(req.as_bytes(), 1, Some(sh), out);
+            alloc::string::String::from(core::str::from_utf8(&out[..n]).unwrap())
+        };
+
+        let r1 = send_rpc(&mut net, &mut sh, "2", "10", "uname", &mut resp);
+        assert!(r1.starts_with("HTTP/1.1 200"));
+        assert_eq!(sh.triad_rpc_seq, 10);
+        assert_eq!(sh.triad_min_epoch, 2);
+
+        // Replay seq=10 -> 401.
+        let r_rep = send_rpc(&mut net, &mut sh, "2", "10", "uname", &mut resp);
+        assert!(r_rep.starts_with("HTTP/1.1 401"));
+
+        // Stale epoch=1 (< 2) with higher seq=11 -> 409 Conflict!
+        let r_stale = send_rpc(&mut net, &mut sh, "1", "11", "uname", &mut resp);
+        assert!(r_stale.starts_with("HTTP/1.1 409 Conflict"));
+
+        // Standby coordinator promotes to epoch=3, seq=11 -> 200 OK and fences epoch=2!
+        let r_prom = send_rpc(&mut net, &mut sh, "3", "11", "uname", &mut resp);
+        assert!(r_prom.starts_with("HTTP/1.1 200"));
+        let r_fenced = send_rpc(&mut net, &mut sh, "2", "12", "uname", &mut resp);
+        assert!(r_fenced.starts_with("HTTP/1.1 409 Conflict"));
+
+        // Persist across simulated reboot and verify seq<=11 and epoch<3 remain fenced!
+        let mut wal_secs = [[0u8; 512]; crate::shell::SHELL_JOURNAL_PART_SECTORS];
+        sh.pack_journal_sectors(2, &mut wal_secs).unwrap();
+        let mut sh2 = crate::shell::OsShell::new();
+        sh2.unpack_journal_sectors(&wal_secs).unwrap();
+        assert_eq!(sh2.triad_rpc_seq, 11);
+        assert_eq!(sh2.triad_min_epoch, 3);
+        let mut net2 = LivedNet::with_auth_key(MAC, auth_key);
+        let r_after_reboot_replay = send_rpc(&mut net2, &mut sh2, "3", "11", "uname", &mut resp);
+        assert!(r_after_reboot_replay.starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
+    fn ipv6_icmpv6_echo_and_ndp_kat_and_edge_case_parsers() {
+        let mut net = LivedNet::new(MAC);
+        let mut sh = crate::shell::OsShell::new();
+        let ll = net.ipv6_link_local();
+        assert_eq!(
+            ll,
+            [
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x56
+            ]
+        );
+        let peer_v6 = [
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0xaa, 0xbb, 0xcc,
+        ];
+        let peer_ula = [0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x02, 0, 0, 0, 0x02];
+
+        // 1. RFC 8200 §8.1 checksum Known-Answer Test: Echo Request [128, 0, 0, 0, 0x12, 0x34, 0, 1, b'A', b'B']
+        let mut echo = [128u8, 0, 0, 0, 0x12, 0x34, 0x00, 0x01, b'A', b'B'];
+        let ck = LivedNet::ipv6_upper_layer_checksum(&peer_v6, &ll, IP_PROTO_ICMPV6, &echo);
+        echo[2..4].copy_from_slice(&ck.to_be_bytes());
+        assert_eq!(
+            LivedNet::ipv6_upper_layer_checksum(&peer_v6, &ll, IP_PROTO_ICMPV6, &echo),
+            0,
+            "RFC 8200 ones-complement verification of signed ICMPv6 packet must fold to 0"
+        );
+
+        let build_v6_frame =
+            |src_mac: [u8; 6], src: [u8; 16], dst: [u8; 16], hop: u8, payload: &[u8]| {
+                let mut f = alloc::vec![0u8; ETH_HEADER_LEN + IPV6_HEADER_LEN + payload.len()];
+                f[0..6].copy_from_slice(&MAC);
+                f[6..12].copy_from_slice(&src_mac);
+                f[12..14].copy_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
+                let ip6 = &mut f[ETH_HEADER_LEN..ETH_HEADER_LEN + IPV6_HEADER_LEN];
+                ip6[0] = 0x60;
+                ip6[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+                ip6[6] = IP_PROTO_ICMPV6;
+                ip6[7] = hop;
+                ip6[8..24].copy_from_slice(&src);
+                ip6[24..40].copy_from_slice(&dst);
+                f[ETH_HEADER_LEN + IPV6_HEADER_LEN..].copy_from_slice(payload);
+                f
+            };
+
+        // 2. Link-local Echo Request -> Echo Reply (type=129, hop_limit=64).
+        let frame_echo = build_v6_frame(PEER_MAC, peer_v6, ll, 64, &echo);
+        let mut out = ReplySet::new();
+        net.handle_frame_with_shell(&frame_echo, 1, &mut sh, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(net.ipv6_icmp_echos, 1);
+        let rep = out.get(0).unwrap();
+        assert_eq!(u16::from_be_bytes([rep[12], rep[13]]), ETHERTYPE_IPV6);
+        assert_eq!(&rep[22..38], &ll);
+        assert_eq!(&rep[38..54], &peer_v6);
+        assert_eq!(rep[54], 129);
+        assert_eq!(&rep[62..64], b"AB");
+
+        // 3. ULA Echo Request -> Echo Reply sourced from GUEST_IPV6_ULA.
+        let mut echo_ula = [128u8, 0, 0, 0, 0xbe, 0xef, 0x00, 0x02, b'U', b'L', b'A'];
+        let ck_u = LivedNet::ipv6_upper_layer_checksum(
+            &peer_ula,
+            &GUEST_IPV6_ULA,
+            IP_PROTO_ICMPV6,
+            &echo_ula,
+        );
+        echo_ula[2..4].copy_from_slice(&ck_u.to_be_bytes());
+        out.clear();
+        net.handle_frame_with_shell(
+            &build_v6_frame(PEER_MAC, peer_ula, GUEST_IPV6_ULA, 64, &echo_ula),
+            1,
+            &mut sh,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(&out.get(0).unwrap()[22..38], &GUEST_IPV6_ULA);
+
+        // 4. RFC 4861 Neighbor Solicitation on Solicited-Node Multicast -> Neighbor Advertisement.
+        let sol_mc = [
+            0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, ll[13], ll[14], ll[15],
+        ];
+        let mut ns = [0u8; 32];
+        ns[0] = 135;
+        ns[8..24].copy_from_slice(&ll);
+        ns[24] = 1; // Source Link-Layer Address option
+        ns[25] = 1;
+        ns[26..32].copy_from_slice(&PEER_MAC);
+        let ck_ns = LivedNet::ipv6_upper_layer_checksum(&peer_v6, &sol_mc, IP_PROTO_ICMPV6, &ns);
+        ns[2..4].copy_from_slice(&ck_ns.to_be_bytes());
+        out.clear();
+        net.handle_frame_with_shell(
+            &build_v6_frame(PEER_MAC, peer_v6, sol_mc, 255, &ns),
+            1,
+            &mut sh,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(net.ipv6_ndp_replies, 1);
+        let na_frame = out.get(0).unwrap();
+        assert_eq!(na_frame[21], 255); // hop_limit = 255
+        let na_icmp = &na_frame[54..86];
+        assert_eq!(na_icmp[0], 136);
+        assert_eq!(&na_icmp[4..8], &[0x60, 0x00, 0x00, 0x00]); // Solicited | Override
+        assert_eq!(&na_icmp[8..24], &ll);
+        assert_eq!(na_icmp[24], 2); // Target Link-Layer Address
+        assert_eq!(na_icmp[25], 1);
+        assert_eq!(&na_icmp[26..32], &MAC);
+
+        // 5. Edge cases: empty, truncated, hop_limit=0, bad checksum, multicast source,
+        //    NS hop_limit!=255, zero-length NDP option, oversized Echo >MAX_FRAME, and guard lockdown.
+        out.clear();
+        net.handle_frame_with_shell(&[], 1, &mut sh, &mut out);
+        net.handle_frame_with_shell(&frame_echo[..30], 1, &mut sh, &mut out);
+        let mut trunc_plen = frame_echo.clone();
+        trunc_plen[18..20].copy_from_slice(&500u16.to_be_bytes());
+        net.handle_frame_with_shell(&trunc_plen, 1, &mut sh, &mut out);
+        net.handle_frame_with_shell(
+            &build_v6_frame(PEER_MAC, peer_v6, ll, 0, &echo),
+            1,
+            &mut sh,
+            &mut out,
+        );
+        let mut bad_ck = echo;
+        bad_ck[3] ^= 0x01;
+        net.handle_frame_with_shell(
+            &build_v6_frame(PEER_MAC, peer_v6, ll, 64, &bad_ck),
+            1,
+            &mut sh,
+            &mut out,
+        );
+        // Multicast source spoof
+        let mc_src = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        net.handle_frame_with_shell(
+            &build_v6_frame(PEER_MAC, mc_src, ll, 64, &echo),
+            1,
+            &mut sh,
+            &mut out,
+        );
+        // NS with hop_limit = 64 != 255 MUST be discarded per RFC 4861 §7.1.1
+        net.handle_frame_with_shell(
+            &build_v6_frame(PEER_MAC, peer_v6, sol_mc, 64, &ns),
+            1,
+            &mut sh,
+            &mut out,
+        );
+        // NS with zero-length option MUST be discarded per RFC 4861 §7.1.1
+        let mut ns_zero_opt = ns;
+        ns_zero_opt[25] = 0;
+        ns_zero_opt[2..4].copy_from_slice(&[0, 0]);
+        let ck_z =
+            LivedNet::ipv6_upper_layer_checksum(&peer_v6, &sol_mc, IP_PROTO_ICMPV6, &ns_zero_opt);
+        ns_zero_opt[2..4].copy_from_slice(&ck_z.to_be_bytes());
+        net.handle_frame_with_shell(
+            &build_v6_frame(PEER_MAC, peer_v6, sol_mc, 255, &ns_zero_opt),
+            1,
+            &mut sh,
+            &mut out,
+        );
+        // Oversized Echo exceeding MAX_FRAME (1514 B) MUST be dropped, never truncated
+        let mut huge_echo = alloc::vec![0u8; 1500];
+        huge_echo[0] = 128;
+        let ck_h =
+            LivedNet::ipv6_upper_layer_checksum(&peer_v6, &ll, IP_PROTO_ICMPV6, &huge_echo);
+        huge_echo[2..4].copy_from_slice(&ck_h.to_be_bytes());
+        net.handle_frame_with_shell(
+            &build_v6_frame(PEER_MAC, peer_v6, ll, 64, &huge_echo),
+            1,
+            &mut sh,
+            &mut out,
+        );
+        assert_eq!(out.len(), 0, "all malformed/hostile IPv6 inputs must be dropped");
+
+        // Guard lockdown drops valid IPv6 traffic too!
+        let mut lock_buf = [0u8; 256];
+        let _ = sh.exec_line(b"guard lockdown", 1, 0, 0, &mut lock_buf);
+        assert!(sh.guard_lockdown);
+        net.handle_frame_with_shell(&frame_echo, 1, &mut sh, &mut out);
+        assert_eq!(out.len(), 0, "guard lockdown must block IPv6 frames");
+    }
+
+    #[test]
+    fn sliding_window_multi_segment_http_8slot_ooo_and_3dupack_fast_retransmit() {
+        let mut net = LivedNet::new(MAC);
+        let mut sh = crate::shell::OsShell::new();
+        sh.set_paged_mode(true);
+
+        // 1. Seed a 12 KiB file in `/www/big.txt` (~9 TCP segments) and fetch over HTTP/1.1.
+        let mut big_payload = alloc::vec![0u8; 12_288];
+        for (i, b) in big_payload.iter_mut().enumerate() {
+            *b = b'A' + ((i * 7 + 3) % 26) as u8;
+        }
+        sh.fs
+            .seed_file(b"/www/big.txt", &big_payload, big_payload.len(), 1)
+            .expect("seed 12 KiB VFS file");
+
+        let client_isn = 0x4100_0000u32;
+        let client_port = 51200u16;
+        let mut syn = [0u8; 40];
+        let n = TcpImpl::build_segment(
+            client_port,
+            HTTP_PORT,
+            client_isn,
+            0,
+            tcp_flags::SYN,
+            65535,
+            b"",
+            PEER_IP,
+            GUEST_IP,
+            &mut syn,
+        )
+        .unwrap();
+        let (fsyn, flsyn) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn[..n]);
+        let mut out = ReplySet::new();
+        net.handle_frame_with_shell(&fsyn[..flsyn], 1, &mut sh, &mut out);
+        let sa = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        let server_isn = sa.seq;
+
+        let req = b"GET /fs/www/big.txt HTTP/1.1\r\nHost: cuttle\r\nConnection: close\r\n\r\n";
+        let mut pkt = [0u8; 256];
+        let n = TcpImpl::build_segment(
+            client_port,
+            HTTP_PORT,
+            client_isn.wrapping_add(1),
+            server_isn.wrapping_add(1),
+            tcp_flags::ACK | tcp_flags::PSH,
+            65535,
+            req,
+            PEER_IP,
+            GUEST_IP,
+            &mut pkt,
+        )
+        .unwrap();
+        let (freq, flreq) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &pkt[..n]);
+        out.clear();
+        net.handle_frame_with_shell(&freq[..flreq], 1, &mut sh, &mut out);
+
+        // Initial flight MUST respect TCP_INIT_CWND = 4 * SMSS (4 data segments = 5520 bytes).
+        assert_eq!(
+            out.len(),
+            4,
+            "initial burst must be bounded by TCP_INIT_CWND = 4 * SMSS"
+        );
+        let mut assembled = alloc::vec::Vec::new();
+        let mut rcv_next = server_isn.wrapping_add(1);
+        // Simulate receiving first 3 segments, dropping segment #4 (`drop_seq`), then sending 3 dup ACKs!
+        for seg_i in 0..3 {
+            let f = out.get(seg_i).unwrap();
+            let s = TcpImpl::parse_segment(&f[34..], GUEST_IP, PEER_IP).unwrap();
+            assert_eq!(s.seq, rcv_next);
+            assembled.extend_from_slice(s.payload);
+            rcv_next = rcv_next.wrapping_add(s.payload.len() as u32);
+        }
+        let dropped_seg_seq = rcv_next;
+        let c_seq = client_isn.wrapping_add(1 + req.len() as u32);
+
+        // First cumulative ACK advances `snd_una` to `dropped_seg_seq`, growing `cwnd` and emitting next segments.
+        let mut ack_buf = [0u8; 64];
+        let na = TcpImpl::build_segment(
+            client_port,
+            HTTP_PORT,
+            c_seq,
+            dropped_seg_seq,
+            tcp_flags::ACK,
+            65535,
+            b"",
+            PEER_IP,
+            GUEST_IP,
+            &mut ack_buf,
+        )
+        .unwrap();
+        let (fack, flack) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &ack_buf[..na]);
+        let mut later_segs: alloc::vec::Vec<(u32, alloc::vec::Vec<u8>, bool)> =
+            alloc::vec::Vec::new();
+        out.clear();
+        net.handle_frame_with_shell(&fack[..flack], 1, &mut sh, &mut out);
+        assert!(
+            net.max_observed_cwnd() > TCP_INIT_CWND,
+            "Slow Start must grow cwnd above TCP_INIT_CWND upon cumulative ACK"
+        );
+        for i in 0..out.len() {
+            let s = TcpImpl::parse_segment(&out.get(i).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+            later_segs.push((
+                s.seq,
+                alloc::vec::Vec::from(s.payload),
+                (s.flags & tcp_flags::FIN) != 0,
+            ));
+        }
+
+        // Now send 3 duplicate ACKs for `dropped_seg_seq`: the 3rd dup ACK MUST trigger Fast Retransmit!
+        for dup in 1..=3 {
+            out.clear();
+            net.handle_frame_with_shell(&fack[..flack], 1, &mut sh, &mut out);
+            if dup < 3 {
+                assert_eq!(net.fast_retransmits, 0);
+            } else {
+                assert_eq!(net.fast_retransmits, 1, "3rd dup ACK must trigger Fast Retransmit");
+                assert_eq!(net.rto_retransmits, 0, "Fast Retransmit must not wait for RTO");
+                assert!(out.len() >= 1);
+                let retx =
+                    TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+                assert_eq!(retx.seq, dropped_seg_seq);
+                assembled.extend_from_slice(retx.payload);
+                rcv_next = rcv_next.wrapping_add(retx.payload.len() as u32);
+            }
+        }
+
+        // Coalesce any segments already received above `dropped_seg_seq` and ACK until FIN!
+        let mut saw_fin = false;
+        for _round in 0..8 {
+            later_segs.sort_by_key(|e| e.0);
+            for (sq, data, fin) in later_segs.iter() {
+                if *sq == rcv_next {
+                    assembled.extend_from_slice(data);
+                    rcv_next = rcv_next.wrapping_add(data.len() as u32);
+                    if *fin {
+                        rcv_next = rcv_next.wrapping_add(1);
+                        saw_fin = true;
+                    }
+                }
+            }
+            let na2 = TcpImpl::build_segment(
+                client_port,
+                HTTP_PORT,
+                c_seq,
+                rcv_next,
+                tcp_flags::ACK,
+                65535,
+                b"",
+                PEER_IP,
+                GUEST_IP,
+                &mut ack_buf,
+            )
+            .unwrap();
+            let (fa2, fla2) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &ack_buf[..na2]);
+            out.clear();
+            net.handle_frame_with_shell(&fa2[..fla2], 1, &mut sh, &mut out);
+            for i in 0..out.len() {
+                let s =
+                    TcpImpl::parse_segment(&out.get(i).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+                later_segs.push((
+                    s.seq,
+                    alloc::vec::Vec::from(s.payload),
+                    (s.flags & tcp_flags::FIN) != 0,
+                ));
+            }
+            if saw_fin && out.len() == 0 {
+                break;
+            }
+        }
+        let hdr_end = find_double_crlf(&assembled).expect("HTTP response headers") + 4;
+        assert!(core::str::from_utf8(&assembled[..hdr_end])
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(&assembled[hdr_end..], big_payload.as_slice());
+
+        // 2. 8-slot Out-of-Order TCP segment reassembly: deliver 8 segments in reverse order (8..=1)!
+        let c2_isn = 0x5200_0000u32;
+        let c2_port = 51201u16;
+        let n = TcpImpl::build_segment(
+            c2_port,
+            HTTP_PORT,
+            c2_isn,
+            0,
+            tcp_flags::SYN,
+            65535,
+            b"",
+            PEER_IP,
+            GUEST_IP,
+            &mut syn,
+        )
+        .unwrap();
+        let (fs2, fls2) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &syn[..n]);
+        out.clear();
+        net.handle_frame_with_shell(&fs2[..fls2], 1, &mut sh, &mut out);
+        let sa2_seq =
+            TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap().seq;
+        // Complete handshake first.
+        let n = TcpImpl::build_segment(
+            c2_port,
+            HTTP_PORT,
+            c2_isn.wrapping_add(1),
+            sa2_seq.wrapping_add(1),
+            tcp_flags::ACK,
+            65535,
+            b"",
+            PEER_IP,
+            GUEST_IP,
+            &mut ack_buf,
+        )
+        .unwrap();
+        let (fa_hs, fla_hs) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &ack_buf[..n]);
+        out.clear();
+        net.handle_frame_with_shell(&fa_hs[..fla_hs], 1, &mut sh, &mut out);
+
+        // Split a request across 8 segments (segments 1..=7 sit in the 8 OOO slots while segment 0 arrives last).
+        let padded_req = alloc::format!(
+            "GET /uname HTTP/1.1\r\nHost: cuttle\r\nX-Pad: {}\r\n\r\n",
+            "P".repeat(160)
+        );
+        let req_bytes = padded_req.as_bytes();
+        let chunk_sz = req_bytes.len().div_ceil(8);
+        let chunks: alloc::vec::Vec<&[u8]> = req_bytes.chunks(chunk_sz).collect();
+        assert_eq!(chunks.len(), 8);
+        let before_ooo = net.ooo_reassembled;
+        for idx_rev in (0..8).rev() {
+            let mut offset = 0usize;
+            for c in chunks.iter().take(idx_rev) {
+                offset += c.len();
+            }
+            let seg_seq = c2_isn.wrapping_add(1 + offset as u32);
+            let mut seg_buf = [0u8; 256];
+            let ns = TcpImpl::build_segment(
+                c2_port,
+                HTTP_PORT,
+                seg_seq,
+                sa2_seq.wrapping_add(1),
+                tcp_flags::ACK | tcp_flags::PSH,
+                65535,
+                chunks[idx_rev],
+                PEER_IP,
+                GUEST_IP,
+                &mut seg_buf,
+            )
+            .unwrap();
+            let (fseg, flseg) = eth_ip(IP_PROTO_TCP, PEER_IP, GUEST_IP, &seg_buf[..ns]);
+            out.clear();
+            net.handle_frame_with_shell(&fseg[..flseg], 1, &mut sh, &mut out);
+        }
+        assert!(
+            net.ooo_reassembled >= before_ooo + 7,
+            "all 7 future OOO segments must coalesce when segment 0 fills the gap (got {})",
+            net.ooo_reassembled - before_ooo
+        );
+        assert!(out.len() >= 1);
+        let ooo_resp =
+            TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        let ooo_str = core::str::from_utf8(ooo_resp.payload).unwrap();
+        assert!(ooo_str.starts_with("HTTP/1.1 200 OK") && ooo_str.contains("Cuttle-TE"));
     }
 }

@@ -154,8 +154,10 @@ const STATE_REC_TASK_LEN: usize = 13;
 const STATE_REC_FW_LEN: usize = 7;
 /// Payload bytes of the anti-replay watermark (`Q`) journal record.
 const STATE_REC_AUTH_LEN: usize = 9;
+/// Payload bytes of the v3 security-watermark (`S`) journal record (`64`-bit `vault_nonce_seq` + `triad_rpc_seq`).
+const STATE_REC_SEC_LEN: usize = 42;
 /// Payload bytes of the v2 security-watermark (`S`) journal record (`64`-bit `vault_nonce_seq`).
-const STATE_REC_SEC_LEN: usize = 34;
+const STATE_REC_SEC_LEN_V2: usize = 34;
 /// Payload bytes of the legacy v1 security-watermark (`S`) journal record (`16`-bit `vault_nonce_seq`).
 const STATE_REC_SEC_LEN_V1: usize = 28;
 /// Journal bytes kept free for records no operator command asks for: the
@@ -383,6 +385,8 @@ pub struct OsShell {
     pub triad_tx_seq: u64,
     /// Minimum accepted Triad coordinator fencing epoch (`R6`); stale epochs are rejected.
     pub triad_min_epoch: u64,
+    /// Highest accepted monotonic sequence number for network-native HTTP/HTTPS `POST /triad/rpc`.
+    pub triad_rpc_seq: u64,
     /// Latest reported SQL transaction sequence per Triad peer (`0..3`).
     pub triad_peer_seq: [u64; 3],
     /// Latest reported 64-bit FNV-1a SQL state hash per Triad peer (`0..3`).
@@ -458,6 +462,7 @@ impl OsShell {
             triad_node_id: 0,
             triad_tx_seq: 0,
             triad_min_epoch: 0,
+            triad_rpc_seq: 0,
             triad_peer_seq: [0u64; 3],
             triad_peer_hash: [0u64; 3],
             triad_quorum_commits: 0,
@@ -1519,10 +1524,21 @@ impl OsShell {
                 (200u16, n)
             }
             IpcOp::VfsRead => {
-                if let Ok(fh) = self.fs.open(mb_path, FS_O_RDONLY) {
-                    let flen = self.fs.read(fh, 0, resp_out).unwrap_or(0);
-                    let _ = self.fs.close(fh);
-                    (200u16, flen)
+                if let Ok(st) = self.fs.stat(mb_path) {
+                    if (st.size as usize) > resp_out.len() {
+                        let n = copy_into(
+                            b"error: EFBIG (file exceeds HTTP response buffer)\n",
+                            resp_out,
+                        );
+                        (413u16, n)
+                    } else if let Ok(fh) = self.fs.open(mb_path, FS_O_RDONLY) {
+                        let flen = self.fs.read(fh, 0, resp_out).unwrap_or(0);
+                        let _ = self.fs.close(fh);
+                        (200u16, flen)
+                    } else {
+                        let n = copy_into(b"not found\n", resp_out);
+                        (404u16, n)
+                    }
                 } else {
                     let n = copy_into(b"not found\n", resp_out);
                     (404u16, n)
@@ -1988,6 +2004,7 @@ impl OsShell {
             || self.http_login_seq > 0
             || self.triad_tx_seq > 0
             || self.triad_min_epoch > 0
+            || self.triad_rpc_seq > 0
             || self.triad_node_id != 0
             || (self.vault_nonce_seq != 0 && self.vault_nonce_seq != self.vault_nonce_default)
         {
@@ -1999,6 +2016,7 @@ impl OsShell {
             rec[10..18].copy_from_slice(&self.http_login_seq.to_le_bytes());
             rec[18..26].copy_from_slice(&self.triad_tx_seq.to_le_bytes());
             rec[26..34].copy_from_slice(&self.triad_min_epoch.to_le_bytes());
+            rec[34..42].copy_from_slice(&self.triad_rpc_seq.to_le_bytes());
             emit(&rec)?;
             count += 1;
         }
@@ -2271,7 +2289,9 @@ impl OsShell {
                     self.auth_seq = seq;
                 }
                 applied += 1;
-            } else if (payload.len() == STATE_REC_SEC_LEN || payload.len() == STATE_REC_SEC_LEN_V1)
+            } else if (payload.len() == STATE_REC_SEC_LEN
+                || payload.len() == STATE_REC_SEC_LEN_V2
+                || payload.len() == STATE_REC_SEC_LEN_V1)
                 && payload[0] == b'S'
             {
                 if (payload[1] & 1) != 0 {
@@ -2282,7 +2302,7 @@ impl OsShell {
                     self.triad_node_id = nid;
                     self.sync_triad_local();
                 }
-                let (vn, off) = if payload.len() == STATE_REC_SEC_LEN {
+                let (vn, off) = if payload.len() >= STATE_REC_SEC_LEN_V2 {
                     let vn64 = u64::from_le_bytes([
                         payload[2], payload[3], payload[4], payload[5], payload[6], payload[7],
                         payload[8], payload[9],
@@ -2332,6 +2352,21 @@ impl OsShell {
                 ]);
                 if tme > self.triad_min_epoch {
                     self.triad_min_epoch = tme;
+                }
+                if payload.len() == STATE_REC_SEC_LEN {
+                    let trs = u64::from_le_bytes([
+                        payload[off + 24],
+                        payload[off + 25],
+                        payload[off + 26],
+                        payload[off + 27],
+                        payload[off + 28],
+                        payload[off + 29],
+                        payload[off + 30],
+                        payload[off + 31],
+                    ]);
+                    if trs > self.triad_rpc_seq {
+                        self.triad_rpc_seq = trs;
+                    }
                 }
                 applied += 1;
             } else if payload.len() >= 7 && payload[0] == b'C' {

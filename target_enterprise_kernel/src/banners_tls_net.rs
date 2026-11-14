@@ -1901,3 +1901,315 @@ pub(crate) fn banner_dns_name() {
     }
     serial_write_bytes(b"DNS name OK labels=2\n");
 }
+
+// Stage B5: Sliding-Window TCP (cwnd + 3-dup-ACK Fast Retransmit + 8-slot OOO),
+// Dual-Stack IPv6 (ICMPv6 Echo + NDP NA), and HMAC-authenticated POST /triad/rpc.
+#[cfg(not(cuttle_prod))]
+#[inline(never)]
+pub(crate) fn banner_tcp_ipv6_triad() {
+    use cuttle_contracts::{tcp_flags, Tcp};
+    use target_enterprise::lived_net::{
+        LivedNet, ReplySet, ETHERTYPE_IPV6, HTTP_PORT, IPV6_HEADER_LEN, IP_PROTO_ICMPV6,
+        TCP_INIT_CWND,
+    };
+    use target_enterprise::shell::OsShell;
+    use target_enterprise::tcp::TcpImpl;
+
+    const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+    const PEER_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc];
+    const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
+    const PEER_IP: [u8; 4] = [10, 0, 2, 2];
+    const AUTH_KEY: [u8; 32] = [0x7Bu8; 32];
+
+    fn wrap_ipv4_tcp(src_ip: [u8; 4], dst_ip: [u8; 4], tcp: &[u8]) -> alloc::vec::Vec<u8> {
+        let ip_len = 20 + tcp.len();
+        let mut f = alloc::vec![0u8; 14 + ip_len];
+        f[0..6].copy_from_slice(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+        f[6..12].copy_from_slice(&[0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc]);
+        f[12] = 0x08;
+        f[13] = 0x00;
+        let ip = &mut f[14..34];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+        ip[6] = 0x40;
+        ip[8] = 64;
+        ip[9] = 6;
+        ip[12..16].copy_from_slice(&src_ip);
+        ip[16..20].copy_from_slice(&dst_ip);
+        let mut sum: u32 = 0;
+        let mut i = 0usize;
+        while i < 20 {
+            sum += u16::from_be_bytes([ip[i], ip[i + 1]]) as u32;
+            i += 2;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        let ck = !(sum as u16);
+        ip[10..12].copy_from_slice(&ck.to_be_bytes());
+        f[34..].copy_from_slice(tcp);
+        f
+    }
+
+    let mut net = alloc::boxed::Box::new(LivedNet::with_auth_key(GUEST_MAC, AUTH_KEY));
+    let mut sh = alloc::boxed::Box::new(OsShell::with_seal_key(AUTH_KEY));
+    sh.set_paged_mode(true);
+    let mut blob = alloc::vec![0u8; 10_240];
+    let mut bi = 0usize;
+    while bi < blob.len() {
+        blob[bi] = b'a' + ((bi * 5) % 26) as u8;
+        bi += 1;
+    }
+    if sh.fs.seed_file(b"/www/b5.bin", &blob, blob.len(), 1).is_err() {
+        panic!("TCP_IPV6_TRIAD: seed_file failed");
+    }
+
+    let mut out = ReplySet::new();
+    let mut seg = [0u8; 256];
+    let c_isn = 0x6100_0000u32;
+    let c_port = 52100u16;
+    let ns = TcpImpl::build_segment(
+        c_port,
+        HTTP_PORT,
+        c_isn,
+        0,
+        tcp_flags::SYN,
+        65535,
+        b"",
+        PEER_IP,
+        GUEST_IP,
+        &mut seg,
+    )
+    .unwrap();
+    net.handle_frame_with_shell(&wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..ns]), 1, &mut sh, &mut out);
+    let s_isn = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP)
+        .unwrap()
+        .seq;
+
+    let get_req = b"GET /fs/www/b5.bin HTTP/1.1\r\nHost: cuttle\r\nConnection: close\r\n\r\n";
+    let ng = TcpImpl::build_segment(
+        c_port,
+        HTTP_PORT,
+        c_isn.wrapping_add(1),
+        s_isn.wrapping_add(1),
+        tcp_flags::ACK | tcp_flags::PSH,
+        65535,
+        get_req,
+        PEER_IP,
+        GUEST_IP,
+        &mut seg,
+    )
+    .unwrap();
+    out.clear();
+    net.handle_frame_with_shell(&wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..ng]), 1, &mut sh, &mut out);
+    if out.len() != 4 {
+        panic!("TCP_IPV6_TRIAD: initial cwnd flight expected 4 segments");
+    }
+    let mut ack_upto = s_isn.wrapping_add(1);
+    for idx in 0..3 {
+        let p = TcpImpl::parse_segment(&out.get(idx).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        ack_upto = ack_upto.wrapping_add(p.payload.len() as u32);
+    }
+    let c_seq = c_isn.wrapping_add(1 + get_req.len() as u32);
+    let na = TcpImpl::build_segment(
+        c_port,
+        HTTP_PORT,
+        c_seq,
+        ack_upto,
+        tcp_flags::ACK,
+        65535,
+        b"",
+        PEER_IP,
+        GUEST_IP,
+        &mut seg,
+    )
+    .unwrap();
+    let ack_frame = wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..na]);
+    out.clear();
+    net.handle_frame_with_shell(&ack_frame, 1, &mut sh, &mut out);
+    if net.max_observed_cwnd() <= TCP_INIT_CWND {
+        panic!("TCP_IPV6_TRIAD: cwnd did not grow in Slow Start");
+    }
+    for _ in 0..3 {
+        out.clear();
+        net.handle_frame_with_shell(&ack_frame, 1, &mut sh, &mut out);
+    }
+    if net.fast_retransmits != 1 || net.rto_retransmits != 0 || out.len() == 0 {
+        panic!("TCP_IPV6_TRIAD: 3-dup-ACK Fast Retransmit failed");
+    }
+
+    // 8-slot OOO reassembly on connection #2
+    let c2_isn = 0x7200_0000u32;
+    let c2_port = 52101u16;
+    let ns2 = TcpImpl::build_segment(
+        c2_port,
+        HTTP_PORT,
+        c2_isn,
+        0,
+        tcp_flags::SYN,
+        65535,
+        b"",
+        PEER_IP,
+        GUEST_IP,
+        &mut seg,
+    )
+    .unwrap();
+    out.clear();
+    net.handle_frame_with_shell(&wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..ns2]), 1, &mut sh, &mut out);
+    let s2_isn = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP)
+        .unwrap()
+        .seq;
+    let nhs = TcpImpl::build_segment(
+        c2_port,
+        HTTP_PORT,
+        c2_isn.wrapping_add(1),
+        s2_isn.wrapping_add(1),
+        tcp_flags::ACK,
+        65535,
+        b"",
+        PEER_IP,
+        GUEST_IP,
+        &mut seg,
+    )
+    .unwrap();
+    out.clear();
+    net.handle_frame_with_shell(&wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..nhs]), 1, &mut sh, &mut out);
+    let ooo_req = b"GET /uname HTTP/1.1\r\nHost: cuttle\r\nX-Pad: 0123456789abcdef0123456789abcdef0123456789abcdef\r\n\r\n";
+    let step = ooo_req.len().div_ceil(8);
+    let parts: alloc::vec::Vec<&[u8]> = ooo_req.chunks(step).collect();
+    for rev_i in (0..parts.len()).rev() {
+        let mut off = 0usize;
+        for c in parts.iter().take(rev_i) {
+            off += c.len();
+        }
+        let np = TcpImpl::build_segment(
+            c2_port,
+            HTTP_PORT,
+            c2_isn.wrapping_add(1 + off as u32),
+            s2_isn.wrapping_add(1),
+            tcp_flags::ACK | tcp_flags::PSH,
+            65535,
+            parts[rev_i],
+            PEER_IP,
+            GUEST_IP,
+            &mut seg,
+        )
+        .unwrap();
+        out.clear();
+        net.handle_frame_with_shell(&wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..np]), 1, &mut sh, &mut out);
+    }
+    if net.ooo_reassembled < 7 || out.len() == 0 {
+        panic!("TCP_IPV6_TRIAD: 8-slot OOO reassembly failed");
+    }
+
+    // Dual-Stack IPv6 Echo + NDP Neighbor Solicitation
+    let ll = net.ipv6_link_local();
+    let peer_v6 = [
+        0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0xaa, 0xbb, 0xcc,
+    ];
+    let mut echo6 = [128u8, 0, 0, 0, 0x11, 0x22, 0, 1, b'O', b'K'];
+    let ck_e = LivedNet::ipv6_upper_layer_checksum(&peer_v6, &ll, IP_PROTO_ICMPV6, &echo6);
+    echo6[2..4].copy_from_slice(&ck_e.to_be_bytes());
+    let mut f6 = alloc::vec![0u8; 14 + IPV6_HEADER_LEN + echo6.len()];
+    f6[0..6].copy_from_slice(&GUEST_MAC);
+    f6[6..12].copy_from_slice(&PEER_MAC);
+    f6[12..14].copy_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
+    f6[14] = 0x60;
+    f6[18..20].copy_from_slice(&(echo6.len() as u16).to_be_bytes());
+    f6[20] = IP_PROTO_ICMPV6;
+    f6[21] = 64;
+    f6[22..38].copy_from_slice(&peer_v6);
+    f6[38..54].copy_from_slice(&ll);
+    f6[54..].copy_from_slice(&echo6);
+    out.clear();
+    net.handle_frame_with_shell(&f6, 1, &mut sh, &mut out);
+
+    let mut ns6 = [0u8; 32];
+    ns6[0] = 135;
+    ns6[8..24].copy_from_slice(&ll);
+    ns6[24] = 1;
+    ns6[25] = 1;
+    ns6[26..32].copy_from_slice(&PEER_MAC);
+    let ck_n = LivedNet::ipv6_upper_layer_checksum(&peer_v6, &ll, IP_PROTO_ICMPV6, &ns6);
+    ns6[2..4].copy_from_slice(&ck_n.to_be_bytes());
+    let mut fns = alloc::vec![0u8; 14 + IPV6_HEADER_LEN + ns6.len()];
+    fns[0..6].copy_from_slice(&GUEST_MAC);
+    fns[6..12].copy_from_slice(&PEER_MAC);
+    fns[12..14].copy_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
+    fns[14] = 0x60;
+    fns[18..20].copy_from_slice(&(ns6.len() as u16).to_be_bytes());
+    fns[20] = IP_PROTO_ICMPV6;
+    fns[21] = 255;
+    fns[22..38].copy_from_slice(&peer_v6);
+    fns[38..54].copy_from_slice(&ll);
+    fns[54..].copy_from_slice(&ns6);
+    out.clear();
+    net.handle_frame_with_shell(&fns, 1, &mut sh, &mut out);
+    if net.ipv6_icmp_echos != 1 || net.ipv6_ndp_replies != 1 {
+        panic!("TCP_IPV6_TRIAD: IPv6 Echo/NDP failed");
+    }
+
+    // Authenticated POST /triad/rpc over TCP/80
+    let mut tag = [0u8; 32];
+    LivedNet::compute_triad_rpc_tag(&AUTH_KEY, b"1", b"1", b"uname", &mut tag);
+    let mut hex = [0u8; 64];
+    for (i, &b) in tag.iter().enumerate() {
+        const LUT: &[u8; 16] = b"0123456789abcdef";
+        hex[i * 2] = LUT[(b >> 4) as usize];
+        hex[i * 2 + 1] = LUT[(b & 0x0f) as usize];
+    }
+    let rpc_body = alloc::format!("1 1 {} uname", core::str::from_utf8(&hex).unwrap());
+    let rpc_req = alloc::format!(
+        "POST /triad/rpc HTTP/1.1\r\nHost: cuttle\r\nContent-Length: {}\r\n\r\n{}",
+        rpc_body.len(),
+        rpc_body
+    );
+    let c3_isn = 0x8300_0000u32;
+    let c3_port = 52102u16;
+    let ns3 = TcpImpl::build_segment(
+        c3_port,
+        HTTP_PORT,
+        c3_isn,
+        0,
+        tcp_flags::SYN,
+        65535,
+        b"",
+        PEER_IP,
+        GUEST_IP,
+        &mut seg,
+    )
+    .unwrap();
+    out.clear();
+    net.handle_frame_with_shell(&wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..ns3]), 1, &mut sh, &mut out);
+    let s3_isn = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP)
+        .unwrap()
+        .seq;
+    let mut rpc_seg = [0u8; 384];
+    let nr = TcpImpl::build_segment(
+        c3_port,
+        HTTP_PORT,
+        c3_isn.wrapping_add(1),
+        s3_isn.wrapping_add(1),
+        tcp_flags::ACK | tcp_flags::PSH,
+        65535,
+        rpc_req.as_bytes(),
+        PEER_IP,
+        GUEST_IP,
+        &mut rpc_seg,
+    )
+    .unwrap();
+    out.clear();
+    net.handle_frame_with_shell(
+        &wrap_ipv4_tcp(PEER_IP, GUEST_IP, &rpc_seg[..nr]),
+        1,
+        &mut sh,
+        &mut out,
+    );
+    if net.triad_rpcs_accepted != 1 || sh.triad_rpc_seq != 1 {
+        panic!("TCP_IPV6_TRIAD: POST /triad/rpc failed");
+    }
+
+    serial_write_bytes(
+        b"TCP_IPV6_TRIAD OK cwnd=grow fast_retx=1 ooo=8 ipv6=echo+ndp rpc=hmac\n",
+    );
+}

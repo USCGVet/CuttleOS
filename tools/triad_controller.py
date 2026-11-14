@@ -919,6 +919,8 @@ class TriadNode:
         self.tls_cert_sha256 = ""
         self.tls_entropy = ""
         self.tls_provisioned = False
+        self.rpc_seq: int = 0
+        self.rpc_lock = threading.Lock()
 
     def ensure_disks(self, master_key_bytes: bytes):
         for img in (self.ahci_img, self.virtio_img, self.nvme_img):
@@ -984,6 +986,8 @@ class TriadController:
         state_dir.mkdir(parents=True, exist_ok=True)
         self.events: list[dict] = []
         self.coordinator_epoch: int = 1
+        self.rpc_http_ok_total: int = 0
+        self.rpc_uart_fallback_total: int = 0
         self.write_latencies_sec: list[float] = []
         self.heals_total: dict[int, int] = {1: 0, 2: 0, 3: 0}
         self.vote_skipped_total: dict[str, int] = {
@@ -2183,6 +2187,146 @@ class TriadController:
             hashlib.sha256,
         ).digest()
 
+    def _derive_node_net_auth_key(self, node: TriadNode) -> bytes:
+        """
+        Derive the 256-bit per-NIC `HMAC-SHA256` network control-plane key matching
+        `LivedNet::derive_node_key(&master, mac)` (`52:54:00:12:34:{0x50 + node_id:02x}`).
+        """
+        if node.device_key_path.exists():
+            node_key = node.device_key_path.read_bytes()
+        else:
+            node_key = hmac.new(
+                self.master_key_bytes,
+                f"{node.key_context}:{node.node_id}".encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+        mac_bytes = bytes.fromhex(f"5254001234{0x50 + int(node.node_id):02x}")
+        return hmac.new(
+            node_key,
+            b"cuttle-net-auth-v1:" + mac_bytes,
+            hashlib.sha256,
+        ).digest()
+
+    @staticmethod
+    def compute_triad_rpc_payload(auth_key: bytes, epoch: int, seq: int, cmd: str) -> str:
+        """
+        Format and authenticate `<epoch> <seq> <hmac_hex64> <cmd>` for `POST /triad/rpc`
+        using domain-separated `HMAC-SHA256(auth_key, "cuttle-triad-rpc-v1:<epoch>:<seq>:<cmd>")`.
+        """
+        ep = int(epoch)
+        sq = int(seq)
+        clean_cmd = cmd.strip()
+        if ep <= 0 or sq <= 0 or not clean_cmd:
+            raise ValueError("epoch, seq must be > 0 and cmd must be non-empty")
+        if any(not (0x20 <= ord(ch) <= 0x7E) for ch in clean_cmd):
+            raise ValueError("command contains non-printable or control characters")
+        if len(clean_cmd) > 512:
+            raise ValueError("triad RPC command exceeds 512 bytes")
+        msg = f"cuttle-triad-rpc-v1:{ep}:{sq}:{clean_cmd}".encode("ascii")
+        tag = hmac.new(auth_key, msg, hashlib.sha256).hexdigest()
+        return f"{ep} {sq} {tag} {clean_cmd}"
+
+    def promote_standby_epoch(self, new_epoch: int | None = None) -> int:
+        """
+        Atomically promote this coordinator to a strictly higher monotonic `coordinator_epoch`
+        (standby failover), persist `coordinator_epoch.json` (+ `triad_wal.json` if present),
+        and fence all online nodes so any stale primary coordinator at a lower epoch is
+        refused with HTTP 409 Conflict / `EACCES (stale triad coordinator epoch)`.
+        """
+        with self.wal_lock:
+            cur = max(1, int(self.coordinator_epoch))
+            target = cur + 1 if new_epoch is None else int(new_epoch)
+            if target <= cur:
+                raise ValueError(
+                    f"standby promotion epoch {target} must exceed current coordinator_epoch {cur}"
+                )
+            self.coordinator_epoch = target
+            atomic_write_json(
+                self.epoch_file,
+                {"state_schema": CURRENT_STATE_SCHEMA, "coordinator_epoch": self.coordinator_epoch},
+            )
+            if self.wal_file.exists():
+                self._save_wal_to_disk()
+        for n in self.nodes:
+            if n.state == "ONLINE":
+                self.send_node_rpc(n, f"triad epoch {self.coordinator_epoch}", timeout=3.0)
+        self.log_event(
+            "RESYNC",
+            f"Promoted standby coordinator to monotonic coordinator_epoch={self.coordinator_epoch} and fenced online nodes.",
+        )
+        return self.coordinator_epoch
+
+    def _try_http_node_rpc(self, node: TriadNode, clean_cmd: str, timeout: float) -> str | None:
+        """
+        Attempt authenticated network-native `POST /triad/rpc` over TCP (`http_port`).
+        Returns the response string on HTTP 200/409/503, or `None` if the HTTP transport
+        is disabled, exceeds 512B command cap, or is currently unreachable (so the caller
+        transparently falls back to the out-of-band 16550 UART serial console).
+        """
+        if (
+            self.unit_test
+            or not self.spec.forward_node_ports
+            or self.desired_guard_lockdown
+            or len(clean_cmd) > 512
+            or node.state != "ONLINE"
+            or not node.proc
+            or node.proc.poll() is not None
+        ):
+            return None
+        auth_key = self._derive_node_net_auth_key(node)
+        ep = max(1, int(self.coordinator_epoch))
+        with node.rpc_lock:
+            base_seq = max(node.rpc_seq + 1, int(time.time() * 1000))
+            node.rpc_seq = base_seq
+            payload = self.compute_triad_rpc_payload(auth_key, ep, base_seq, clean_cmd).encode("ascii")
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{node.http_port}/triad/rpc",
+                data=payload,
+                headers={"Content-Type": "text/plain", "Connection": "close"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=min(max(0.5, timeout), 2.5)) as resp:
+                    text = resp.read().decode("utf-8", errors="replace").strip()
+                    self.rpc_http_ok_total += 1
+                    return text
+            except urllib.error.HTTPError as e:
+                err_body = ""
+                try:
+                    err_body = e.read().decode("utf-8", errors="replace").strip()
+                except Exception:
+                    pass
+                if e.code == 409:
+                    self.log_event(
+                        "ALERT",
+                        f"{node.name}: Coordinator fenced by higher node epoch on /triad/rpc (epoch={ep}): {err_body}",
+                        code="SPLIT_BRAIN",
+                    )
+                    return err_body or "error: EACCES (stale triad coordinator epoch)"
+                if e.code == 503 and err_body:
+                    return err_body
+                return None
+            except Exception:
+                return None
+
+    def send_node_rpc(self, node: TriadNode, cmd_str: str, timeout: float = 5.0) -> str:
+        """
+        Execute `cmd_str` on `node` over authenticated `POST /triad/rpc` when node HTTP
+        ports are forwarded and reachable, falling back cleanly to `send_shell_cmd` (UART).
+        """
+        if any(not (0x20 <= ord(ch) <= 0x7E) for ch in cmd_str):
+            raise ValueError("command contains non-printable or control characters")
+        clean_cmd = cmd_str.strip()
+        if not clean_cmd:
+            return ""
+        if len(clean_cmd) > 512:
+            raise ValueError("triad RPC command exceeds 512 bytes")
+        http_res = self._try_http_node_rpc(node, clean_cmd, timeout)
+        if http_res is not None:
+            return http_res
+        self.rpc_uart_fallback_total += 1
+        return self.send_shell_cmd(node, clean_cmd, timeout=timeout)
+
     def verify_node_commit_seq(self, node: TriadNode, boot_phase: bool = False) -> bool:
         """
         Challenge `node` with a fresh random `attest <nonce>`, verify the `HMAC-SHA256` quote
@@ -2446,6 +2590,9 @@ class TriadController:
         clean_cmd = cmd_str.strip()
         if not clean_cmd:
             return ""
+        http_rpc = self._try_http_node_rpc(node, clean_cmd, timeout)
+        if http_rpc is not None:
+            return http_rpc
         with node.cmd_lock:
             if not node.proc or node.proc.poll() is not None:
                 return "error: node offline"
@@ -5523,6 +5670,8 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
             c = self.ctrl
             data = {
                 "quorum_status": c.quorum_status,
+                "coordinator_epoch": c.coordinator_epoch,
+                "rpc_http_ok_total": c.rpc_http_ok_total,
                 "triad_tx_seq": c.triad_tx_seq,
                 "parity_sha256": c.parity_sha256,
                 "parity_syndrome_ok": c.parity_syndrome_ok,
@@ -5611,6 +5760,21 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
         if self.path == "/api/whoami":
             # Side-effect-free token check for the /console page's Connect dialog.
             return self._send_json(200, {"ok": True, "role": "operator"})
+
+        if self.path == "/api/failover":
+            target_ep = None
+            if body:
+                if not body.isdigit():
+                    return self._send_json(
+                        400,
+                        {"ok": False, "error": "rejected: failover body must be empty or a positive integer epoch"},
+                    )
+                target_ep = int(body)
+            try:
+                promoted = self.ctrl.promote_standby_epoch(target_ep)
+            except ValueError as e:
+                return self._send_json(409, {"ok": False, "error": str(e)})
+            return self._send_json(200, {"ok": True, "coordinator_epoch": promoted})
 
         if self.path in ("/api/sql", "/sql"):
             if not is_printable_ascii_command(body):
@@ -8342,6 +8506,192 @@ def run_stage8_security_and_wal_unit_tests(tmp_dir: Path, sc_harness: RealOsShel
     assert not sd_ctrl._scheduler_thread.is_alive(), "shutdown() must wake and join _scheduler_thread"
     assert sd_elapsed < 0.5, f"shutdown() should wake _stop_event immediately (<0.5s), took {sd_elapsed:.3f}s"
     assert post_shutdown_steps == [], f"_background_scheduler must not invoke _scheduler_step after shutdown(): {post_shutdown_steps}"
+
+    # 8. Stage B5 network-native POST /triad/rpc HMAC KAT, send_node_rpc HTTP/UART failover,
+    #    and POST /api/failover unauthenticated refusal across all 4 node roles:
+    kat_key = bytes([0x5A] * 32)
+    kat_expected_mac = hmac.new(kat_key, b"cuttle-triad-rpc-v1:2:10:uname", hashlib.sha256).hexdigest()
+    assert (
+        TriadController.compute_triad_rpc_payload(kat_key, 2, 10, "uname")
+        == f"2 10 {kat_expected_mac} uname"
+    )
+    assert TriadController.compute_triad_rpc_payload(kat_key, 1, 1, "a" * 512).endswith(" " + ("a" * 512))
+    for bad_ep, bad_sq, bad_cmd in (
+        (0, 1, "uname"),
+        (1, 0, "uname"),
+        (1, 1, ""),
+        (1, 1, "   "),
+        (1, 1, "uname\x08"),
+        (1, 1, "a" * 513),
+    ):
+        try:
+            TriadController.compute_triad_rpc_payload(kat_key, bad_ep, bad_sq, bad_cmd)
+            raise AssertionError(f"compute_triad_rpc_payload must reject ({bad_ep}, {bad_sq}, len={len(bad_cmd)})")
+        except ValueError:
+            pass
+
+    for role_name in ("full", "wfe", "sql", "shell"):
+        fo_dir = tmp_dir / f"stage_b5_failover_{role_name}"
+        fo_ctrl = TriadController(
+            show_gui=False,
+            spec=TriadSpec(name=f"sb5-{role_name}", role=role_name, state_dir=fo_dir, write_operator_token=False),
+            unit_test=True,
+        )
+        fo_ctrl.shutdown()
+        prev_ctrl = getattr(TriadHttpHandler, "ctrl", None)
+        TriadHttpHandler.ctrl = fo_ctrl
+        fo_srv = ThreadingHTTPServer(("127.0.0.1", 0), TriadHttpHandler)
+        fo_port = fo_srv.server_address[1]
+        fo_t = threading.Thread(target=fo_srv.serve_forever, daemon=True)
+        fo_t.start()
+        try:
+            unauth_fo = urllib.request.Request(
+                f"http://127.0.0.1:{fo_port}/api/failover",
+                data=b"",
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(unauth_fo, timeout=5.0)
+                raise AssertionError(f"role={role_name}: unauthenticated POST /api/failover must return 401!")
+            except urllib.error.HTTPError as e:
+                assert e.code == 401, f"role={role_name}: expected 401 on unauthenticated /api/failover, got {e.code}"
+
+            bad_fo = urllib.request.Request(
+                f"http://127.0.0.1:{fo_port}/api/failover",
+                data=b"not-an-epoch",
+                headers={"X-Cuttle-Session": fo_ctrl.coordinator_token},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(bad_fo, timeout=5.0)
+                raise AssertionError("invalid non-integer failover body must return 400")
+            except urllib.error.HTTPError as e:
+                assert e.code == 400, f"expected 400 on malformed /api/failover body, got {e.code}"
+
+            ok_fo = urllib.request.Request(
+                f"http://127.0.0.1:{fo_port}/api/failover",
+                data=b"",
+                headers={"X-Cuttle-Session": fo_ctrl.coordinator_token},
+                method="POST",
+            )
+            with urllib.request.urlopen(ok_fo, timeout=5.0) as resp:
+                assert resp.status == 200
+                fo_payload = json.loads(resp.read().decode("utf-8"))
+                assert fo_payload.get("ok") is True and fo_payload.get("coordinator_epoch") == 2
+            assert fo_ctrl.coordinator_epoch == 2
+            assert json.loads(fo_ctrl.epoch_file.read_text(encoding="utf-8"))["coordinator_epoch"] == 2
+
+            stale_fo = urllib.request.Request(
+                f"http://127.0.0.1:{fo_port}/api/failover",
+                data=b"2",
+                headers={"X-Cuttle-Session": fo_ctrl.coordinator_token},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(stale_fo, timeout=5.0)
+                raise AssertionError("non-advancing /api/failover epoch must return 409 Conflict")
+            except urllib.error.HTTPError as e:
+                assert e.code == 409, f"expected 409 on stale /api/failover epoch, got {e.code}"
+
+            jump_fo = urllib.request.Request(
+                f"http://127.0.0.1:{fo_port}/api/failover",
+                data=b"5",
+                headers={"X-Cuttle-Session": fo_ctrl.coordinator_token},
+                method="POST",
+            )
+            with urllib.request.urlopen(jump_fo, timeout=5.0) as resp:
+                assert resp.status == 200
+                assert json.loads(resp.read().decode("utf-8")).get("coordinator_epoch") == 5
+        finally:
+            fo_srv.shutdown()
+            fo_srv.server_close()
+            TriadHttpHandler.ctrl = prev_ctrl
+
+    rpc_dir = tmp_dir / "stage_b5_node_rpc"
+    rpc_ctrl = TriadController(
+        show_gui=False,
+        spec=TriadSpec(name="sb5-rpc", state_dir=rpc_dir, forward_node_ports=True, write_operator_token=False),
+        unit_test=True,
+    )
+    rpc_ctrl.shutdown()
+    node0 = rpc_ctrl.nodes[0]
+    node0_key = rpc_ctrl._derive_node_net_auth_key(node0)
+    mock_rpc_state = {"min_epoch": 1, "last_seq": 0, "calls": []}
+
+    class _MockNodeRpcHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return
+
+        def do_POST(self):
+            ln = int(self.headers.get("Content-Length") or "0")
+            raw = self.rfile.read(ln).decode("ascii", errors="replace")
+            if self.path != "/triad/rpc":
+                self.send_response(404)
+                self.end_headers()
+                return
+            parts = raw.split(" ", 3)
+            if len(parts) != 4:
+                self.send_response(400)
+                self.end_headers()
+                return
+            ep_i, seq_i, mac_hex, cmd_s = int(parts[0]), int(parts[1]), parts[2], parts[3]
+            exp = hmac.new(
+                node0_key,
+                f"cuttle-triad-rpc-v1:{ep_i}:{seq_i}:{cmd_s}".encode("ascii"),
+                hashlib.sha256,
+            ).hexdigest()
+            if not safe_token_eq(mac_hex, exp) or seq_i <= mock_rpc_state["last_seq"]:
+                self.send_response(401)
+                self.end_headers()
+                self.wfile.write(b"error: EACCES (invalid triad RPC HMAC or replay)\n")
+                return
+            if ep_i < mock_rpc_state["min_epoch"]:
+                self.send_response(409)
+                self.end_headers()
+                self.wfile.write(b"error: EACCES (stale triad coordinator epoch)\n")
+                return
+            mock_rpc_state["last_seq"] = seq_i
+            mock_rpc_state["calls"].append((ep_i, seq_i, cmd_s))
+            body_out = f"rpc-ok:{cmd_s}\n".encode("ascii")
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body_out)))
+            self.end_headers()
+            self.wfile.write(body_out)
+
+    mock_node_srv = ThreadingHTTPServer(("127.0.0.1", 0), _MockNodeRpcHandler)
+    node0.http_port = mock_node_srv.server_address[1]
+    node0.state = "ONLINE"
+    node0.proc = type("_AliveProc", (), {"poll": staticmethod(lambda: None)})()
+    rpc_ctrl.unit_test = False
+    rpc_ctrl.send_shell_cmd = lambda node, cmd, timeout=5.0: f"uart:{cmd}"
+    mock_node_t = threading.Thread(target=mock_node_srv.serve_forever, daemon=True)
+    mock_node_t.start()
+    try:
+        for bad_rpc_cmd in ("uname\x07", "x" * 513):
+            try:
+                rpc_ctrl.send_node_rpc(node0, bad_rpc_cmd)
+                raise AssertionError("send_node_rpc must reject control-char and >512B commands")
+            except ValueError:
+                pass
+
+        out_ok = rpc_ctrl.send_node_rpc(node0, "uname")
+        assert out_ok == "rpc-ok:uname", f"expected HTTP /triad/rpc output, got {out_ok!r}"
+        assert rpc_ctrl.rpc_http_ok_total == 1 and rpc_ctrl.rpc_uart_fallback_total == 0
+        assert len(mock_rpc_state["calls"]) == 1 and mock_rpc_state["calls"][0][2] == "uname"
+
+        mock_rpc_state["min_epoch"] = 9
+        out_fenced = rpc_ctrl.send_node_rpc(node0, "uname")
+        assert "stale triad coordinator epoch" in out_fenced, out_fenced
+        assert any(e.get("code") == "SPLIT_BRAIN" for e in rpc_ctrl.events)
+        assert rpc_ctrl.rpc_uart_fallback_total == 0, "HTTP 409 epoch fencing must not fall back to UART"
+    finally:
+        mock_node_srv.shutdown()
+        mock_node_srv.server_close()
+
+    # With HTTP /triad/rpc unreachable, send_node_rpc must fall back cleanly to UART:
+    out_fb = rpc_ctrl.send_node_rpc(node0, "uname", timeout=0.6)
+    assert out_fb == "uart:uname", f"expected UART fallback when HTTP RPC port is closed, got {out_fb!r}"
+    assert rpc_ctrl.rpc_uart_fallback_total == 1
 
 
 def main():

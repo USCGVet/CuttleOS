@@ -1007,6 +1007,8 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(not(cuttle_prod))]
     banner_tcp();
     #[cfg(not(cuttle_prod))]
+    banner_tcp_ipv6_triad();
+    #[cfg(not(cuttle_prod))]
     banner_http();
     #[cfg(not(cuttle_prod))]
     banner_dns();
@@ -1243,6 +1245,7 @@ pub(crate) fn live_os_console_loop() -> ! {
         };
         svc.last_auth_seq = sh.auth_seq;
         svc.last_http_login_seq = sh.http_login_seq;
+        svc.last_triad_rpc_seq = sh.triad_rpc_seq;
         svc.triad_min_epoch = sh.triad_min_epoch;
         enable_https(svc, vn.mac);
     }
@@ -1281,7 +1284,7 @@ pub(crate) fn live_os_console_loop() -> ! {
                 let mut step = 0u64;
                 while step < elapsed_irqs {
                     let mut rto_rep = CONSOLE_NET_REPLIES.lock();
-                    *rto_rep = target_enterprise::ReplySet::new();
+                    rto_rep.clear();
                     let _ = svc.tick_tcp_rto_with_replies(&mut *rto_rep);
                     let mut ri = 0usize;
                     while ri < rto_rep.len() {
@@ -1309,7 +1312,7 @@ pub(crate) fn live_os_console_loop() -> ! {
                 if flen >= 14 {
                     smp_hw_tick_and_sync(sh);
                     let mut rep_guard = CONSOLE_NET_REPLIES.lock();
-                    *rep_guard = target_enterprise::ReplySet::new();
+                    rep_guard.clear();
                     svc.handle_frame_with_shell(&f_guard[..flen], boots, sh, &mut *rep_guard);
                     // Durable first, then acknowledged: whatever this frame
                     // changed is on disk before any reply leaves the node.
