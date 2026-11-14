@@ -487,6 +487,10 @@ fn build_trampoline_page(out: &mut [u8; 4096]) {
 
     // 7. `+0x720`: Spurious APIC interrupt vector `0xFF` (`iretq`)
     out[0x720..0x722].copy_from_slice(&[0x48, 0xCF]);
+
+    // 8. `+0x730`: Legacy 8259 PIC `ExtINT` vectors `0x20..0x2F` (`push rax; EOI slave+master; pop rax; iretq`)
+    out[0x730..0x73A]
+        .copy_from_slice(&[0x50, 0xB0, 0x20, 0xE6, 0xA0, 0xE6, 0x20, 0x58, 0x48, 0xCF]);
 }
 
 /// Outcome of executing a single hardware Ring-3 quantum on `cpu_id`.
@@ -578,24 +582,44 @@ pub(crate) fn run_next_ready_process_quantum(
                 );
                 exc_v += 1;
             }
-            core::ptr::write_unaligned(
-                entries_ptr.add(PREEMPT_TIMER_VEC as usize),
-                IdtEntry::new(
-                    tramp_va + 0x300,
-                    KERNEL_CODE_SEL,
-                    TYPE_INTERRUPT_GATE_DPL0,
-                    0,
-                ),
-            );
-            core::ptr::write_unaligned(
-                entries_ptr.add(0x80),
-                IdtEntry::new(
-                    tramp_va + 0x100,
-                    KERNEL_CODE_SEL,
-                    TYPE_INTERRUPT_GATE_DPL3,
-                    0,
-                ),
-            );
+            let mut pic_v = 0x20usize;
+            while pic_v < 0x30 {
+                core::ptr::write_unaligned(
+                    entries_ptr.add(pic_v),
+                    IdtEntry::new(
+                        tramp_va + 0x730,
+                        KERNEL_CODE_SEL,
+                        TYPE_INTERRUPT_GATE_DPL0,
+                        0,
+                    ),
+                );
+                pic_v += 1;
+            }
+            let mut ext_v = 0x30usize;
+            while ext_v < 0xFF {
+                if ext_v == 0x80 {
+                    core::ptr::write_unaligned(
+                        entries_ptr.add(0x80),
+                        IdtEntry::new(
+                            tramp_va + 0x100,
+                            KERNEL_CODE_SEL,
+                            TYPE_INTERRUPT_GATE_DPL3,
+                            0,
+                        ),
+                    );
+                } else {
+                    core::ptr::write_unaligned(
+                        entries_ptr.add(ext_v),
+                        IdtEntry::new(
+                            tramp_va + 0x300,
+                            KERNEL_CODE_SEL,
+                            TYPE_INTERRUPT_GATE_DPL0,
+                            0,
+                        ),
+                    );
+                }
+                ext_v += 1;
+            }
             core::ptr::write_unaligned(
                 entries_ptr.add(0xFF),
                 IdtEntry::new(
@@ -782,15 +806,26 @@ pub(crate) fn run_next_ready_process_quantum(
             clobber_abi("C"),
         );
 
-        // Disarm/EOI `0x50` preemption timer and restore Local APIC + per-CPU runtime TSS + MSRs!
+        // Disarm `0x50` preemption timer, drain/EOI any in-service APIC ISR vector (`0x20..=0xFF`),
+        // and restore Local APIC + per-CPU runtime TSS + MSRs!
         crate::mmio_write32(
             LAPIC_BASE + LAPIC_LVT_TIMER_OFF,
             0x0001_0000 | (PREEMPT_TIMER_VEC as u32),
         );
         crate::mmio_write32(LAPIC_BASE + LAPIC_TIMER_INIT_OFF, 0);
-        if (crate::mmio_read32(LAPIC_BASE + LAPIC_ISR_PREEMPT_OFF) & LAPIC_ISR_PREEMPT_BIT) != 0 {
-            crate::mmio_write32(LAPIC_BASE + LAPIC_EOI_OFF, 0);
+        let mut isr_idx = 7usize;
+        while isr_idx >= 1 {
+            let mut isr_word = crate::mmio_read32(LAPIC_BASE + 0x0100 + (isr_idx as u64) * 0x10);
+            while isr_word != 0 {
+                let bit = 31 - isr_word.leading_zeros();
+                let vec = (isr_idx as u32) * 32 + bit;
+                crate::smp_hw::account_ring3_intercepted_apic_irq(vec);
+                crate::mmio_write32(LAPIC_BASE + LAPIC_EOI_OFF, 0);
+                isr_word &= !(1u32 << bit);
+            }
+            isr_idx -= 1;
         }
+        let _ = (LAPIC_ISR_PREEMPT_OFF, LAPIC_ISR_PREEMPT_BIT);
         crate::mmio_write32(LAPIC_BASE + LAPIC_TPR_OFF, saved_tpr);
         if (saved_lvt_timer & 0x0002_0000) != 0 && saved_timer_init != 0 {
             crate::mmio_write32(LAPIC_BASE + LAPIC_LVT_TIMER_OFF, saved_lvt_timer);
@@ -1152,7 +1187,8 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
     // Wake AP cores `CPU 1..3` via Doorbell IPI while `CPU 0` also drains quanta with tight `0x50` timer (`256` ticks)!
     crate::smp_hw::ring_smp_doorbell();
     let mut safety_loops = 0u32;
-    while safety_loops < 500_000 {
+    let mut idle_spins = 0u32;
+    while safety_loops < 5_000_000 {
         let all_done = with_proc_table_lock(|t| {
             worker_slots
                 .iter()
@@ -1162,7 +1198,10 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
             break;
         }
         if run_next_ready_process_quantum(0, 256).is_none() {
-            crate::smp_hw::ring_smp_doorbell();
+            if (idle_spins & 0xFF) == 0 {
+                crate::smp_hw::ring_smp_doorbell();
+            }
+            idle_spins = idle_spins.wrapping_add(1);
             core::hint::spin_loop();
         }
         safety_loops += 1;
@@ -1207,8 +1246,10 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
     let (_tx_pid, tx_slot) =
         spawn_kernel_elf64_process(&elf_tx[..n_tx], u64::MAX, 2, None).unwrap();
 
+    crate::smp_hw::ring_smp_doorbell();
     let mut ipc_loops = 0u32;
-    while ipc_loops < 10_000 {
+    let mut ipc_idle = 0u32;
+    while ipc_loops < 2_000_000 {
         let done = with_proc_table_lock(|t| {
             t.procs[rx_slot].state == ProcState::Exited
                 && t.procs[tx_slot].state == ProcState::Exited
@@ -1216,11 +1257,21 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
         if done {
             break;
         }
-        let _ = run_next_ready_process_quantum(0, 50_000);
+        if run_next_ready_process_quantum(0, 50_000).is_none() {
+            if (ipc_idle & 0xFF) == 0 {
+                crate::smp_hw::ring_smp_doorbell();
+            }
+            ipc_idle = ipc_idle.wrapping_add(1);
+            core::hint::spin_loop();
+        }
         ipc_loops += 1;
     }
     with_proc_table_lock(|t| {
-        if t.procs[tx_slot].exit_code != 6 || t.procs[rx_slot].exit_code != 77 {
+        if t.procs[tx_slot].state != ProcState::Exited
+            || t.procs[rx_slot].state != ProcState::Exited
+            || t.procs[tx_slot].exit_code != 6
+            || t.procs[rx_slot].exit_code != 77
+        {
             panic!("RING3_ELF_MP: Ring-3 ELF64 IPC ping-pong verification failed");
         }
         t.free_reaped_slot(tx_slot);

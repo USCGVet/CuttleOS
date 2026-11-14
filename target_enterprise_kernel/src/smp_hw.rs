@@ -66,6 +66,10 @@ const SMP_TLB_SHOOTDOWN_VECTOR: u32 = 0x42;
 const SMP_PANIC_HALT_VECTOR: u32 = 0x43;
 /// Interrupt vector for Hardware IOAPIC `COM1` Serial Wakeup IRQ (`0x44`).
 const IOAPIC_IO_WAKE_VECTOR: u32 = 0x44;
+/// Interrupt vector for PCI MSI / MSI-X Block-Storage DMA Completion (`0x45`).
+const MSI_BLOCK_VECTOR: u32 = target_enterprise::async_io::MSI_VECTOR_BLOCK as u32;
+/// Interrupt vector for PCI MSI / MSI-X Network TX/RX DMA Completion (`0x46`).
+const MSI_NET_VECTOR: u32 = target_enterprise::async_io::MSI_VECTOR_NET as u32;
 
 /// Physical and identity-mapped virtual address of the AP startup trampoline page.
 const TRAMPOLINE_PAGE_PHYS: u64 = 0x8000;
@@ -83,6 +87,8 @@ const ISR_PIC_EOI_PHYS: u64 = 0x8320;
 const ISR_SPURIOUS_PHYS: u64 = 0x8340;
 /// Physical address of `SLEEP_HLT_CODE` (4 bytes: `sti; hlt; cli; ret`).
 const SLEEP_HLT_PHYS: u64 = 0x8370;
+/// Physical address of `PULSE_IRQ_CODE` (5 bytes: `pushfq; sti; nop; popfq; ret`).
+const PULSE_IRQ_PHYS: u64 = 0x8378;
 /// Physical address storing `&HW_IRQ_WAKEUP_COUNTER` (`.bss` `RW+NX` atomic pointer).
 const IRQ_WAKEUPS_PTR_PHYS: u64 = 0x8380;
 /// Physical address storing `pa_to_va(LAPIC_PHYS_BASE + LAPIC_EOI) as u64`.
@@ -99,6 +105,10 @@ const NMI_COUNT_PTR_PHYS: u64 = 0x83D8;
 const IO_IRQ_COUNT_PTR_PHYS: u64 = 0x83E0;
 /// Physical address storing `kernel_cpu_exception_handler as *const () as usize as u64`.
 const CPU_EXC_HANDLER_PTR_PHYS: u64 = 0x83E8;
+/// Physical address storing `&HW_MSI_BLK_IRQS` (`.bss` `RW+NX` atomic pointer).
+const MSI_BLK_IRQ_COUNT_PTR_PHYS: u64 = 0x83F0;
+/// Physical address storing `&HW_MSI_NET_IRQS` (`.bss` `RW+NX` atomic pointer).
+const MSI_NET_IRQ_COUNT_PTR_PHYS: u64 = 0x83F8;
 /// Physical address of the Runtime 64-bit GDT (`5 * 8 + 4 * 16 = 104` bytes: `0x08..0x20` + 4 per-CPU TSS).
 const RUNTIME_GDT_PHYS: u64 = 0x8400;
 /// Physical base of the 4 per-CPU 104-byte `Tss64` structures (`0x80` byte stride -> `0x8500..0x8700`).
@@ -117,6 +127,10 @@ const ISR_IO_WAKE_PHYS: u64 = 0x87B0;
 const ISR_CPU_EXC_STUBS_PHYS: u64 = 0x8800;
 /// Physical address of the 35-byte System V AMD64 CPU exception bridge (`0x8A00..0x8A23`).
 const ISR_CPU_EXC_BRIDGE_PHYS: u64 = 0x8A00;
+/// Physical address of `ISR_MSI_BLK` (28 bytes, PCI MSI/MSI-X block vector `0x45`, `0x8A30..0x8A4C`).
+const ISR_MSI_BLK_PHYS: u64 = 0x8A30;
+/// Physical address of `ISR_MSI_NET` (28 bytes, PCI MSI/MSI-X network vector `0x46`, `0x8A50..0x8A6C`).
+const ISR_MSI_NET_PHYS: u64 = 0x8A50;
 /// Physical page holding the 256-entry Runtime 64-bit IDT (`4096` bytes).
 const RUNTIME_IDT_PHYS: u64 = 0x9000;
 
@@ -294,6 +308,13 @@ static ACPI_COM1_GSI: AtomicU32 = AtomicU32::new(4);
 static IOAPIC_COM1_READY: AtomicBool = AtomicBool::new(false);
 /// Hardware IOAPIC `COM1` (`vector 0x44`) wakeup counter in `.bss` (`RW+NX`).
 static HW_IO_IRQS: AtomicU64 = AtomicU64::new(0);
+/// Hardware PCI MSI / MSI-X block-storage (`vector 0x45`) interrupt counter in `.bss` (`RW+NX`).
+static HW_MSI_BLK_IRQS: AtomicU64 = AtomicU64::new(0);
+/// Hardware PCI MSI / MSI-X network (`vector 0x46`) interrupt counter in `.bss` (`RW+NX`).
+static HW_MSI_NET_IRQS: AtomicU64 = AtomicU64::new(0);
+/// Global asynchronous DMA completion ring tracking pipelined block and network operations.
+pub(crate) static GLOBAL_IO_RING: spin::Mutex<target_enterprise::async_io::IoCompletionRing<16>> =
+    spin::Mutex::new(target_enterprise::async_io::IoCompletionRing::new());
 /// Maximum payload bytes copied into per-AP static crypto scratch (`AP_CRYPTO_BUF`).
 const AP_CRYPTO_BUF_CAP: usize = 4096;
 
@@ -539,6 +560,30 @@ fn guarded_ist2_bounds_va(cpu_idx: usize) -> (u64, u64, u64) {
 #[inline(always)]
 const fn cpu_tss_selector(cpu_idx: usize) -> u16 {
     (0x28 + (cpu_idx & (MAX_SMP_CPUS - 1)) * 0x10) as u16
+}
+
+/// Account for any Local APIC interrupt vector (`0x30..0xFE`) that entered the Ring-3 KPTI
+/// supervisor preemption bridge (`sup_idt_pa`) prior to issuing `LAPIC_EOI` in Ring-0.
+#[inline]
+pub(crate) fn account_ring3_intercepted_apic_irq(vec: u32) {
+    match vec {
+        LAPIC_TIMER_VECTOR => {
+            HW_IRQ_WAKEUP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        }
+        SMP_TLB_SHOOTDOWN_VECTOR => {
+            HW_TLB_SHOOTDOWN_ACKS.fetch_add(1, Ordering::Release);
+        }
+        IOAPIC_IO_WAKE_VECTOR => {
+            HW_IO_IRQS.fetch_add(1, Ordering::Relaxed);
+        }
+        MSI_BLOCK_VECTOR => {
+            HW_MSI_BLK_IRQS.fetch_add(1, Ordering::Relaxed);
+        }
+        MSI_NET_VECTOR => {
+            HW_MSI_NET_IRQS.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
 }
 
 /// Broadcast a Cross-CPU TLB Shootdown IPI (`vector 0x42`, All-Excluding-Self) and wait
@@ -894,6 +939,189 @@ unsafe fn invoke_cpu_sleep_hlt() {
         unsafe { core::mem::transmute(code_va) };
     // SAFETY: Wakes via `ISR_LAPIC_EOI` / `ISR_LAPIC_DOORBELL` (`iretq`) and returns with interrupts masked (`cli`).
     unsafe { fn_ptr() };
+}
+
+/// Invoke the 5-byte `pushfq; sti; nop; popfq; ret` IRQ-drain stub via `smp_rx_va(0x8378)`.
+///
+/// Opens a 1-instruction maskable interrupt window (`nop` after `sti`) so any pending
+/// PCI MSI / MSI-X vectors (`0x45`, `0x46`) latched in the Local APIC `IRR` are immediately
+/// delivered through `RUNTIME_IDT` while preserving the caller's exact `RFLAGS.IF`.
+#[inline(never)]
+// SAFETY: Caller must execute at CPL=0 after `init_runtime_idt_and_isrs` initialized `RUNTIME_IDT` and Local APIC.
+unsafe fn invoke_cpu_irq_window() {
+    let code_va = smp_rx_va(PULSE_IRQ_PHYS) as usize;
+    let fn_ptr: unsafe extern "C" fn() =
+        // SAFETY: `smp_rx_va(0x8378)` is mapped Supervisor Read+Execute (`W^X`) and contains `[0x9C, 0xFB, 0x90, 0x9D, 0xC3]`.
+        unsafe { core::mem::transmute(code_va) };
+    // SAFETY: Pure-assembly ISRs (`0x40..0x46`) only `lock inc` `.bss` atomics + write `LAPIC_EOI` and `iretq`.
+    unsafe { fn_ptr() };
+}
+
+/// Read monotonic count of hardware PCI MSI/MSI-X block-storage interrupts (`vector 0x45`).
+#[inline]
+pub(crate) fn read_hw_msi_blk_irqs() -> u64 {
+    HW_MSI_BLK_IRQS.load(Ordering::Acquire)
+}
+
+/// Read monotonic count of hardware PCI MSI/MSI-X network interrupts (`vector 0x46`).
+#[inline]
+pub(crate) fn read_hw_msi_net_irqs() -> u64 {
+    HW_MSI_NET_IRQS.load(Ordering::Acquire)
+}
+
+/// Drain any pending PCI MSI / MSI-X edges (`0x45`, `0x46`) latched in Local APIC `IRR`.
+#[inline]
+pub(crate) fn drain_pending_device_irqs() {
+    if !BSP_EARLY_IDT_READY.load(Ordering::Acquire) || !LAPIC_MMIO_READY.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: `BSP_EARLY_IDT_READY` and `LAPIC_MMIO_READY` confirm `RUNTIME_IDT` and `PULSE_IRQ_CODE` are active at CPL=0.
+    unsafe {
+        invoke_cpu_irq_window();
+    }
+}
+
+/// Program PCI MSI-X (`cap_id = 0x11`, preferred) or PCI MSI (`cap_id = 0x05`, fallback)
+/// on `addr` to deliver edge-triggered `vector` (`0x45` or `0x46`) to the BSP Local APIC.
+///
+/// Returns `Some(true)` if MSI-X was enabled, `Some(false)` if MSI was enabled, or `None`
+/// if the PCI function exposes neither MSI-X nor MSI.
+pub(crate) fn enable_pci_device_msi_or_msix(
+    addr: cuttle_contracts::PciAddress,
+    vector: u8,
+    max_msix_vecs: u16,
+) -> Option<bool> {
+    use target_enterprise::async_io::{
+        discover_pci_msix, enable_pci_msi, encode_msix_entry, set_pci_msix_ctrl,
+    };
+
+    let bsp_apic_id = (read_current_lapic_id_safe() & 0xFF) as u8;
+    let mut bus = crate::RealPciBus;
+    if let Ok(loc) = discover_pci_msix(&mut bus, addr) {
+        let n_vecs = loc.table_size.min(max_msix_vecs.max(1));
+        set_pci_msix_ctrl(&mut bus, addr, loc.cap_offset, true, true);
+        let entry_words = encode_msix_entry(bsp_apic_id, vector, false);
+        let mut idx = 0u16;
+        while idx < n_vecs {
+            let ent_pa = loc.table_phys_base.wrapping_add((idx as u64) * 16);
+            // SAFETY: `ent_pa` is a 16-byte MSI-X Table entry inside the PCI-discovered BAR MMIO region mapped uncached via `ensure_mmio_page`.
+            unsafe {
+                let _ = ensure_mmio_page(ent_pa);
+                mmio_write32(ent_pa, entry_words[0]);
+                mmio_write32(ent_pa + 4, entry_words[1]);
+                mmio_write32(ent_pa + 8, entry_words[2]);
+                mmio_write32(ent_pa + 12, entry_words[3]);
+            }
+            idx += 1;
+        }
+        set_pci_msix_ctrl(&mut bus, addr, loc.cap_offset, true, false);
+        return Some(true);
+    }
+    if enable_pci_msi(&mut bus, addr, bsp_apic_id, vector).is_ok() {
+        return Some(false);
+    }
+    None
+}
+
+/// Submit an asynchronous DMA operation into [`GLOBAL_IO_RING`], wait for `poll_done()`
+/// using interrupt-driven `IRR` draining and hardware `HLT` sleep (once the periodic
+/// Local APIC safety timer is armed), and reap the ring slot upon completion or timeout.
+pub(crate) fn wait_for_dma_completion(
+    kind: target_enterprise::async_io::AsyncIoKind,
+    hw_slot: u16,
+    is_net: bool,
+    max_spins: u32,
+    mut poll_done: impl FnMut() -> Result<bool, ()>,
+) -> Result<bool, ()> {
+    let tag = GLOBAL_IO_RING
+        .try_lock()
+        .and_then(|mut r| r.submit(kind, hw_slot).ok());
+    let irqs_before = if is_net {
+        read_hw_msi_net_irqs()
+    } else {
+        read_hw_msi_blk_irqs()
+    };
+    crate::serial_rx_pump();
+
+    let mut spins = 0u32;
+    loop {
+        match poll_done() {
+            Ok(true) => {
+                drain_pending_device_irqs();
+                let irqs_after = if is_net {
+                    read_hw_msi_net_irqs()
+                } else {
+                    read_hw_msi_blk_irqs()
+                };
+                let irq_seen = irqs_after > irqs_before;
+                if let Some(t) = tag {
+                    if let Some(mut r) = GLOBAL_IO_RING.try_lock() {
+                        let _ = r.complete(t, 0, irq_seen);
+                        let _ = r.reap(t);
+                    }
+                }
+                return Ok(irq_seen);
+            }
+            Err(()) => {
+                drain_pending_device_irqs();
+                if let Some(t) = tag {
+                    if let Some(mut r) = GLOBAL_IO_RING.try_lock() {
+                        let _ = r.cancel_timed_out(t);
+                    }
+                }
+                return Err(());
+            }
+            Ok(false) => {}
+        }
+
+        spins = spins.wrapping_add(1);
+        if spins > max_spins {
+            if let Some(t) = tag {
+                if let Some(mut r) = GLOBAL_IO_RING.try_lock() {
+                    let _ = r.cancel_timed_out(t);
+                }
+            }
+            return Err(());
+        }
+        if (spins & 0xFF) == 0 {
+            crate::serial_rx_pump();
+        }
+        if spins >= 64
+            && TSC_TIMER_ARMED.load(Ordering::Acquire)
+            && SMP_HW_INITIALIZED.load(Ordering::Acquire)
+        {
+            // Periodic Local APIC Timer (`vector 0x40`) + MSI/MSI-X (`0x45`/`0x46`) are both active:
+            // sleep in hardware `C1` (`sti; hlt; cli; ret`) instead of burning host CPU cycles!
+            if let Some(mut r) = GLOBAL_IO_RING.try_lock() {
+                r.record_hlt_sleep();
+            }
+            // SAFETY: Running at CPL=0 with `RUNTIME_IDT`, Local APIC MSI/MSI-X, and periodic `0x40` timer active.
+            unsafe {
+                invoke_cpu_sleep_hlt();
+            }
+        } else if (spins & 0x3F) == 0 {
+            drain_pending_device_irqs();
+            core::hint::spin_loop();
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Encode a 28-byte x86-64 Local APIC MSI/MSI-X ISR stub at `stub_phys` that atomically
+/// increments the `.bss` `u64` counter pointed to by `counter_ptr_phys` and writes `0` to `LAPIC_EOI`.
+const fn encode_msi_isr_stub(stub_phys: u64, counter_ptr_phys: u64, eoi_ptr_phys: u64) -> [u8; 28] {
+    let d_cnt = ((counter_ptr_phys as i32) - ((stub_phys as i32) + 8)).to_le_bytes();
+    let d_eoi = ((eoi_ptr_phys as i32) - ((stub_phys as i32) + 19)).to_le_bytes();
+    [
+        0x50, // push rax
+        0x48, 0x8B, 0x05, d_cnt[0], d_cnt[1], d_cnt[2], d_cnt[3], // mov rax, [rip + d_cnt]
+        0xF0, 0x48, 0xFF, 0x00, // lock inc qword ptr [rax]
+        0x48, 0x8B, 0x05, d_eoi[0], d_eoi[1], d_eoi[2], d_eoi[3], // mov rax, [rip + d_eoi]
+        0xC7, 0x00, 0x00, 0x00, 0x00, 0x00, // mov dword ptr [rax], 0 (LAPIC_EOI)
+        0x58, // pop rax
+        0x48, 0xCF, // iretq
+    ]
 }
 
 /// Entry point invoked in 64-bit Long Mode by each secondary hardware processor
@@ -1403,14 +1631,18 @@ unsafe fn init_runtime_idt_and_isrs() {
     let tlb_acks_va = HW_TLB_SHOOTDOWN_ACKS.as_ptr() as usize as u64;
     let nmi_count_va = HW_NMI_COUNT.as_ptr() as usize as u64;
     let io_irq_count_va = HW_IO_IRQS.as_ptr() as usize as u64;
+    let msi_blk_count_va = HW_MSI_BLK_IRQS.as_ptr() as usize as u64;
+    let msi_net_count_va = HW_MSI_NET_IRQS.as_ptr() as usize as u64;
 
-    // 2. Store `.bss` (`RW+NX`) atomic pointers at `0x8380`, `0x8388`, `0x83D0`, `0x83D8`, `0x83E0`.
+    // 2. Store `.bss` (`RW+NX`) atomic pointers at `0x8380..0x83F8`.
     // SAFETY: All pointer slots are 8-byte-aligned inside the mapped `0x8000` frame (`PHYS_MAP_OFFSET`, `RW+NX`).
     unsafe {
         HW_IRQ_WAKEUP_COUNTER.store(0, Ordering::Release);
         HW_TLB_SHOOTDOWN_ACKS.store(0, Ordering::Release);
         HW_NMI_COUNT.store(0, Ordering::Release);
         HW_IO_IRQS.store(0, Ordering::Release);
+        HW_MSI_BLK_IRQS.store(0, Ordering::Release);
+        HW_MSI_NET_IRQS.store(0, Ordering::Release);
         core::ptr::write_volatile(
             pa_to_va(IRQ_WAKEUPS_PTR_PHYS).cast::<u64>(),
             wakeup_counter_va,
@@ -1422,6 +1654,14 @@ unsafe fn init_runtime_idt_and_isrs() {
         core::ptr::write_volatile(
             pa_to_va(CPU_EXC_HANDLER_PTR_PHYS).cast::<u64>(),
             kernel_cpu_exception_handler as *const () as usize as u64,
+        );
+        core::ptr::write_volatile(
+            pa_to_va(MSI_BLK_IRQ_COUNT_PTR_PHYS).cast::<u64>(),
+            msi_blk_count_va,
+        );
+        core::ptr::write_volatile(
+            pa_to_va(MSI_NET_IRQ_COUNT_PTR_PHYS).cast::<u64>(),
+            msi_net_count_va,
         );
     }
 
@@ -1441,8 +1681,13 @@ unsafe fn init_runtime_idt_and_isrs() {
     ];
     // 5. Install `ISR_SPURIOUS` at `0x8340` (`iretq`):
     const ISR_SPURIOUS: [u8; 2] = [0x48, 0xCF];
-    // 6. Install `SLEEP_HLT_CODE` at `0x8370` (`sti; hlt; cli; ret`):
+    // 6. Install `SLEEP_HLT_CODE` at `0x8370` (`sti; hlt; cli; ret`) and `PULSE_IRQ_CODE` at `0x8378` (`pushfq; sti; nop; popfq; ret`):
     const SLEEP_HLT_CODE: [u8; 4] = [0xFB, 0xF4, 0xFA, 0xC3];
+    const PULSE_IRQ_CODE: [u8; 5] = [0x9C, 0xFB, 0x90, 0x9D, 0xC3];
+    const ISR_MSI_BLK: [u8; 28] =
+        encode_msi_isr_stub(ISR_MSI_BLK_PHYS, MSI_BLK_IRQ_COUNT_PTR_PHYS, LAPIC_EOI_PTR_PHYS);
+    const ISR_MSI_NET: [u8; 28] =
+        encode_msi_isr_stub(ISR_MSI_NET_PHYS, MSI_NET_IRQ_COUNT_PTR_PHYS, LAPIC_EOI_PTR_PHYS);
     // 7. Install `ISR_LAPIC_DOORBELL` at `0x8390` (Doorbell IPI `0x41`):
     const ISR_LAPIC_DOORBELL: [u8; 17] = [
         0x50,
@@ -1557,12 +1802,15 @@ unsafe fn init_runtime_idt_and_isrs() {
         copy_stub(ISR_PIC_EOI_PHYS, &ISR_PIC_EOI);
         copy_stub(ISR_SPURIOUS_PHYS, &ISR_SPURIOUS);
         copy_stub(SLEEP_HLT_PHYS, &SLEEP_HLT_CODE);
+        copy_stub(PULSE_IRQ_PHYS, &PULSE_IRQ_CODE);
         copy_stub(ISR_TLB_SHOOTDOWN_PHYS, &ISR_TLB_SHOOTDOWN);
         copy_stub(ISR_PANIC_HALT_PHYS, &ISR_PANIC_HALT);
         copy_stub(ISR_NMI_WATCHDOG_PHYS, &ISR_NMI_WATCHDOG);
         copy_stub(LOAD_GDT_IDT_TSS_PHYS, &LOAD_GDT_IDT_TSS_CODE);
         copy_stub(ISR_IO_WAKE_PHYS, &ISR_IO_WAKE);
         copy_stub(ISR_CPU_EXC_BRIDGE_PHYS, &ISR_CPU_EXC_BRIDGE);
+        copy_stub(ISR_MSI_BLK_PHYS, &ISR_MSI_BLK);
+        copy_stub(ISR_MSI_NET_PHYS, &ISR_MSI_NET);
 
         let mut ev = 0u32;
         while ev < 32 {
@@ -1613,6 +1861,8 @@ unsafe fn init_runtime_idt_and_isrs() {
     let isr_panic_va = smp_rx_va(ISR_PANIC_HALT_PHYS);
     let isr_nmi_va = smp_rx_va(ISR_NMI_WATCHDOG_PHYS);
     let isr_io_wake_va = smp_rx_va(ISR_IO_WAKE_PHYS);
+    let isr_msi_blk_va = smp_rx_va(ISR_MSI_BLK_PHYS);
+    let isr_msi_net_va = smp_rx_va(ISR_MSI_NET_PHYS);
 
     // SAFETY: `RUNTIME_GDT_PHYS` (`0x8400`), `RUNTIME_TSS_BASE_PHYS` (`0x8500`), and `RUNTIME_IDT_PHYS` (`0x9000`) are mapped RAM.
     unsafe {
@@ -1673,6 +1923,10 @@ unsafe fn init_runtime_idt_and_isrs() {
                 (isr_panic_va, 0u8)
             } else if v == (IOAPIC_IO_WAKE_VECTOR as usize) {
                 (isr_io_wake_va, 0u8)
+            } else if v == (MSI_BLOCK_VECTOR as usize) {
+                (isr_msi_blk_va, 0u8)
+            } else if v == (MSI_NET_VECTOR as usize) {
+                (isr_msi_net_va, 0u8)
             } else {
                 (isr_doorbell_va, 0u8)
             };
@@ -1716,8 +1970,19 @@ unsafe fn init_runtime_idt_and_isrs() {
         outb(0x21, 0xFF);
         outb(0xA1, 0xFF);
 
-        // Load `RUNTIME_GDTR` (`CS=0x08, SS=0x10`), `RUNTIME_IDTR`, and CPU 0 TSS (`0x28`) on the BSP.
+        // Load `RUNTIME_GDTR` (`CS=0x08, SS=0x10`), `RUNTIME_IDTR`, and CPU 0 TSS (`0x28`) on the BSP,
+        // and software-enable the BSP Local APIC (`SVR |= 0x1FF`, `TPR = 0`, `LVT_TIMER` masked) so
+        // PCI MSI / MSI-X interrupts (`0x45`/`0x46`) are accepted from the earliest boot drivers.
         invoke_load_runtime_gdt_idt_tss(0);
+        let bsp_id = mmio_read32(LAPIC_PHYS_BASE + LAPIC_ID) >> 24;
+        HW_APIC_IDS[0].store(bsp_id, Ordering::Release);
+        mmio_write32(
+            LAPIC_PHYS_BASE + LAPIC_LVT_TIMER,
+            0x0001_0000 | LAPIC_TIMER_VECTOR,
+        );
+        mmio_write32(LAPIC_PHYS_BASE + LAPIC_TPR, 0);
+        let svr = mmio_read32(LAPIC_PHYS_BASE + LAPIC_SVR);
+        mmio_write32(LAPIC_PHYS_BASE + LAPIC_SVR, svr | 0x1FF);
     }
 }
 

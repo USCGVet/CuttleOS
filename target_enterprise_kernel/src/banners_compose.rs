@@ -654,7 +654,7 @@ pub(crate) fn persist_shell_to_ahci(
 ) -> Result<target_enterprise::state_store::Committed, target_enterprise::state_store::PersistError>
 {
     use target_enterprise::state_store::{CommitError, CommitStage, PersistError};
-    let mut disk = AhciDisk::state_disk().map_err(|fault| {
+    let mut disk = StorageDisk::state_disk().map_err(|fault| {
         PersistError::Commit(CommitError::Io {
             stage: CommitStage::Stage,
             fault,
@@ -720,7 +720,7 @@ pub(crate) fn shell_store_boot() {
         return;
     }
 
-    let booted = match AhciDisk::state_disk() {
+    let booted = match StorageDisk::state_disk() {
         Ok(mut disk) => SHELL_STORE.lock().boot(&mut disk, sh, &keys, counter),
         Err(fault) => Err(BootError::Io(fault)),
     };
@@ -985,7 +985,7 @@ pub(crate) fn banner_shell_compose() {
             Ok(_) => panic!("SHELL compose: AHCI persist expected 4 records"),
             Err(e) => storage_fault(persist_error_str(&e)),
         }
-        let loaded = match AhciDisk::state_disk() {
+        let loaded = match StorageDisk::state_disk() {
             Ok(mut disk) => SHELL_STORE.lock().load_into(&mut disk, vsh),
             Err(fault) => Err(BootError::Io(fault)),
         };

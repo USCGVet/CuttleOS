@@ -1161,6 +1161,9 @@ pub(crate) fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Live multi-segment Ring-3 ELF64 process runtime, SYSCALL/int 0x80, 0x50 preemption, SMP, IPC & fault isolation proof.
     #[cfg(not(cuttle_prod))]
     banner_ring3_elf_multiprocess();
+    // Live PCI MSI/MSI-X (0x45 block, 0x46 net) + IoCompletionRing + 8-slot pipelined TX proof.
+    #[cfg(not(cuttle_prod))]
+    banner_async_dma_irq();
 
     // ============================================================
     // RED-TEAM ATTACK HARNESS (deliberate, instrumented vulnerability)
@@ -1293,6 +1296,7 @@ pub(crate) fn live_os_console_loop() -> ! {
             let mut rx_pass = 0usize;
             let mut f_guard = CONSOLE_NET_FRAME.lock();
             while rx_pass < MAX_RX_FRAMES_PER_PASS {
+                serial_rx_pump();
                 let Some((flen, head_id)) = vnet_rx(vn, &mut *f_guard) else {
                     break;
                 };
@@ -1321,36 +1325,47 @@ pub(crate) fn live_os_console_loop() -> ! {
             }
         }
 
-        let mut maybe_byte: Option<u8> = None;
+        // Drain up to 64 ready console bytes per outer pass so multi-character
+        // commands on COM1 or PS/2 are never starved or dropped by a 16-byte
+        // 16550A UART FIFO overflow during continuous inbound network floods.
+        const MAX_CONSOLE_BYTES_PER_PASS: usize = 64;
+        let mut con_pass = 0usize;
+        while con_pass < MAX_CONSOLE_BYTES_PER_PASS {
+            let mut maybe_byte: Option<u8> = None;
 
-        // 1. COM1: bytes buffered during a commit first, then whatever the
-        //    UART holds now.
-        if let Some(b) = serial_rx_take() {
-            maybe_byte = Some(b);
-        } else {
-            // 2. Poll PS/2 8042 status port (bit 0 = output buffer full; bit 5 = AUXB mouse; bits 6..7 = error).
-            // SAFETY: Running at CPL=0; port 0x64 is the read-only i8042 PS/2 controller status register and reading it has no memory side effects.
-            let status = unsafe { inb(0x64) };
-            if (status & 0x01) != 0 {
-                // SAFETY: 8042 status bit 0 confirmed an output byte is waiting at port 0x60 (drain even if AUXB/error).
-                let sc = unsafe { inb(0x60) };
-                if target_enterprise::memory::kernel_guards::ps2_kbd_byte_ready(status) {
-                    if let Some(ev) = kbd.feed(sc) {
-                        if ev.pressed {
-                            if ev.ascii != 0 {
-                                maybe_byte = Some(ev.ascii);
-                            } else if ev.code == KeyCode::Enter {
-                                maybe_byte = Some(b'\n');
-                            } else if ev.code == KeyCode::Backspace {
-                                maybe_byte = Some(0x08);
+            // 1. COM1: bytes buffered during a commit or network RX pass first,
+            //    then whatever the UART holds now.
+            if let Some(b) = serial_rx_take() {
+                maybe_byte = Some(b);
+            } else {
+                // 2. Poll PS/2 8042 status port (bit 0 = output buffer full; bit 5 = AUXB mouse; bits 6..7 = error).
+                // SAFETY: Running at CPL=0; port 0x64 is the read-only i8042 PS/2 controller status register and reading it has no memory side effects.
+                let status = unsafe { inb(0x64) };
+                if (status & 0x01) != 0 {
+                    // SAFETY: 8042 status bit 0 confirmed an output byte is waiting at port 0x60 (drain even if AUXB/error).
+                    let sc = unsafe { inb(0x60) };
+                    if target_enterprise::memory::kernel_guards::ps2_kbd_byte_ready(status) {
+                        if let Some(ev) = kbd.feed(sc) {
+                            if ev.pressed {
+                                if ev.ascii != 0 {
+                                    maybe_byte = Some(ev.ascii);
+                                } else if ev.code == KeyCode::Enter {
+                                    maybe_byte = Some(b'\n');
+                                } else if ev.code == KeyCode::Backspace {
+                                    maybe_byte = Some(0x08);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        if let Some(b) = maybe_byte {
+            let Some(b) = maybe_byte else {
+                break;
+            };
+            did_io = true;
+            con_pass += 1;
+
             #[cfg(not(cuttle_prod))]
             {
                 if b == b'\n' || b == b'\r' {
@@ -1404,12 +1419,14 @@ pub(crate) fn live_os_console_loop() -> ! {
                     halt_forever();
                 }
             }
-        } else if !did_io {
+        }
+
+        if !did_io {
             if has_ready_processes() {
                 let _ = run_next_ready_process_quantum(0, 50_000);
             } else {
                 // No network frames, no console input, and no runnable Ring-3 processes:
-                // put CPU 0 into low-power HLT state until Local APIC timer (0x40) or IPI (0x41) wakes it.
+                // put CPU 0 into low-power HLT state until Local APIC timer (0x40), MSI/MSI-X (0x45/0x46), or IPI wakes it.
                 smp_hw_idle_wait();
             }
         }
@@ -1442,7 +1459,9 @@ impl target_enterprise::panic_dump::SectorSink for EmergencyAhciCrashSink {
         if rel >= 32 {
             return Err(cuttle_contracts::CrashDumpError::LayoutOverflow);
         }
-        if try_write_ahci_sector_emergency(AHCI_PANIC_DUMP_LBA + rel, data) {
+        if try_write_ahci_sector_emergency(AHCI_PANIC_DUMP_LBA + rel, data)
+            || try_write_nvme_sector_emergency(AHCI_PANIC_DUMP_LBA + rel, data)
+        {
             Ok(())
         } else {
             Err(cuttle_contracts::CrashDumpError::LayoutOverflow)

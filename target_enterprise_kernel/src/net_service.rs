@@ -16,9 +16,11 @@ pub(crate) const VN_CC_FEATURE_SEL: usize = 0x00;
 pub(crate) const VN_CC_FEATURE: usize = 0x04;
 pub(crate) const VN_CC_DRV_FEATURE_SEL: usize = 0x08;
 pub(crate) const VN_CC_DRV_FEATURE: usize = 0x0C;
+pub(crate) const VN_CC_MSIX_CONFIG: usize = 0x10;
 pub(crate) const VN_CC_STATUS: usize = 0x14;
 pub(crate) const VN_CC_QUEUE_SELECT: usize = 0x16;
 pub(crate) const VN_CC_QUEUE_SIZE: usize = 0x18;
+pub(crate) const VN_CC_QUEUE_MSIX_VECTOR: usize = 0x1A;
 pub(crate) const VN_CC_QUEUE_ENABLE: usize = 0x1C;
 pub(crate) const VN_CC_QUEUE_NOTIFY_OFF: usize = 0x1E;
 pub(crate) const VN_CC_QUEUE_DESC: usize = 0x20;
@@ -26,11 +28,15 @@ pub(crate) const VN_CC_QUEUE_DRIVER: usize = 0x28;
 pub(crate) const VN_CC_QUEUE_DEVICE: usize = 0x30;
 pub(crate) const VN_QSIZE: u16 = 64;
 pub(crate) const VN_RX_BUFFERS: usize = 8;
+pub(crate) const VN_TX_SLOTS: usize = 8;
 pub(crate) const VN_HDR: usize = 12;
 pub(crate) const VN_RX_BUF: usize = 2048;
 pub(crate) const VN_DESC_OFF: u64 = 0x000;
 pub(crate) const VN_AVAIL_OFF: u64 = 0x400;
 pub(crate) const VN_USED_OFF: u64 = 0x800;
+
+static VNET_TX_RING_BUFS_PA: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 #[allow(dead_code)]
 pub(crate) struct VnetModern {
@@ -41,6 +47,7 @@ pub(crate) struct VnetModern {
     pub(crate) rx_q_virt: u64,
     pub(crate) tx_q_phys: u64,
     pub(crate) tx_q_virt: u64,
+    pub(crate) tx_bufs_phys: u64,
     pub(crate) rx_notify_off: u16,
     pub(crate) tx_notify_off: u16,
     pub(crate) rx_avail_next: u16,
@@ -258,11 +265,29 @@ pub(crate) fn vnet_modern_init(dma: u64) -> Option<VnetModern> {
         mac[i] = vn_rd8(devcfg_virt, i);
     }
 
-    // Queue pages from the DMA window.
+    // Enable PCI MSI-X (`vector 0x46`) on VirtIO-net so RX/TX completions raise hardware interrupts.
+    let msix_enabled = crate::smp_hw::enable_pci_device_msi_or_msix(
+        addr,
+        target_enterprise::async_io::MSI_VECTOR_NET,
+        4,
+    ) == Some(true);
+    if msix_enabled {
+        vn_wr16(common_virt, VN_CC_MSIX_CONFIG, 0);
+    }
+
+    // Queue pages from the DMA window + 8-slot (`16 KiB`) pipelined TX buffer pool from `KERNEL_PHYS_MM`.
     let rx_q_phys = dma;
     let tx_q_phys = dma + 0x1000;
     let rx_bufs_phys = dma + 0x2000;
-    let _tx_buf_phys = dma + 0xA000;
+    let cached_tx_pa = VNET_TX_RING_BUFS_PA.load(core::sync::atomic::Ordering::Acquire);
+    let tx_bufs_phys = if cached_tx_pa != 0 {
+        cached_tx_pa
+    } else if let Some(pa) = crate::alloc_phys_contiguous_zeroed(4, 1) {
+        VNET_TX_RING_BUFS_PA.store(pa, core::sync::atomic::Ordering::Release);
+        pa
+    } else {
+        dma + 0xA000
+    };
     // SAFETY: `dma..dma+0xC000` (48 KiB) fits within the 128 KiB physical DMA pool mapped via `pa_to_va` and is zeroed before enabling the device queues.
     unsafe {
         let b = pa_to_va(dma);
@@ -271,9 +296,17 @@ pub(crate) fn vnet_modern_init(dma: u64) -> Option<VnetModern> {
             core::ptr::write_volatile(b.add(i), 0);
             i += 1;
         }
+        if tx_bufs_phys != dma + 0xA000 {
+            let tb = pa_to_va(tx_bufs_phys);
+            let mut j = 0usize;
+            while j < VN_TX_SLOTS * 2048 {
+                core::ptr::write_volatile(tb.add(j), 0);
+                j += 1;
+            }
+        }
     }
 
-    // Program queues.
+    // Program queues (VirtIO 1.0 §4.1.4.3.2: bind `queue_msix_vector` BEFORE `queue_enable = 1`).
     vn_wr16(common_virt, VN_CC_QUEUE_SELECT, 0);
     if vn_rd16(common_virt, VN_CC_QUEUE_SIZE) < VN_QSIZE {
         return None;
@@ -282,6 +315,12 @@ pub(crate) fn vnet_modern_init(dma: u64) -> Option<VnetModern> {
     vn_wr64(common_virt, VN_CC_QUEUE_DESC, rx_q_phys + VN_DESC_OFF);
     vn_wr64(common_virt, VN_CC_QUEUE_DRIVER, rx_q_phys + VN_AVAIL_OFF);
     vn_wr64(common_virt, VN_CC_QUEUE_DEVICE, rx_q_phys + VN_USED_OFF);
+    if msix_enabled {
+        vn_wr16(common_virt, VN_CC_QUEUE_MSIX_VECTOR, 1);
+        if vn_rd16(common_virt, VN_CC_QUEUE_MSIX_VECTOR) == 0xFFFF {
+            vn_wr16(common_virt, VN_CC_QUEUE_MSIX_VECTOR, 0);
+        }
+    }
     let rx_notify_off = vn_rd16(common_virt, VN_CC_QUEUE_NOTIFY_OFF);
     vn_wr16(common_virt, VN_CC_QUEUE_ENABLE, 1);
 
@@ -293,6 +332,15 @@ pub(crate) fn vnet_modern_init(dma: u64) -> Option<VnetModern> {
     vn_wr64(common_virt, VN_CC_QUEUE_DESC, tx_q_phys + VN_DESC_OFF);
     vn_wr64(common_virt, VN_CC_QUEUE_DRIVER, tx_q_phys + VN_AVAIL_OFF);
     vn_wr64(common_virt, VN_CC_QUEUE_DEVICE, tx_q_phys + VN_USED_OFF);
+    if msix_enabled {
+        vn_wr16(common_virt, VN_CC_QUEUE_MSIX_VECTOR, 2);
+        if vn_rd16(common_virt, VN_CC_QUEUE_MSIX_VECTOR) == 0xFFFF {
+            vn_wr16(common_virt, VN_CC_QUEUE_MSIX_VECTOR, 1);
+            if vn_rd16(common_virt, VN_CC_QUEUE_MSIX_VECTOR) == 0xFFFF {
+                vn_wr16(common_virt, VN_CC_QUEUE_MSIX_VECTOR, 0);
+            }
+        }
+    }
     let tx_notify_off = vn_rd16(common_virt, VN_CC_QUEUE_NOTIFY_OFF);
     let rx_notify_pa = target_enterprise::memory::kernel_guards::vnet_notify_mmio_pa(
         notify_bar,
@@ -370,6 +418,7 @@ pub(crate) fn vnet_modern_init(dma: u64) -> Option<VnetModern> {
         rx_q_virt,
         tx_q_phys,
         tx_q_virt,
+        tx_bufs_phys,
         rx_notify_off,
         tx_notify_off,
         rx_avail_next: VN_RX_BUFFERS as u16,
@@ -398,44 +447,69 @@ pub(crate) fn vnet_notify(n: &VnetModern, queue: u16) {
 pub(crate) static VNET_TX_DROPS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-/// TX one Ethernet frame (2-desc chain, waiting for any prior in-flight TX
-/// to complete before reusing `tx_buf_phys`). Returns false if `frame` is
-/// empty/oversized or if the ring bookkeeping misbehaves.
+/// TX one Ethernet frame across the 8-slot (`VN_TX_SLOTS`) pipelined TX descriptor ring,
+/// stalling ONLY when all 8 pipeline slots are simultaneously in flight (using
+/// interrupt-driven `wait_for_dma_completion` on MSI-X vector `0x46`).
 pub(crate) fn vnet_tx(n: &mut VnetModern, frame: &[u8]) -> bool {
     use core::sync::atomic::{fence, Ordering};
+    use target_enterprise::async_io::AsyncIoKind;
+
     if frame.is_empty() || VN_HDR.saturating_add(frame.len()) > 2048 {
         return false;
     }
-    // Wait for any previous in-flight TX descriptor chain to complete before mutating `tx_buf_phys`.
-    if n.tx_used_seen != n.tx_avail_next {
+    let active_slots = if n.tx_bufs_phys == n.tx_q_phys + 0x8000 {
+        1usize
+    } else {
+        VN_TX_SLOTS
+    };
+    // Reap already-completed TX descriptors without blocking.
+    // SAFETY: `n.tx_q_virt + VN_USED_OFF + 2` is 2-byte aligned inside the mapped TX virtqueue page.
+    n.tx_used_seen =
+        unsafe { core::ptr::read_volatile((n.tx_q_virt + VN_USED_OFF + 2) as *const u16) };
+    crate::smp_hw::drain_pending_device_irqs();
+
+    if (n.tx_avail_next.wrapping_sub(n.tx_used_seen) as usize) >= active_slots {
+        let tx_q_virt = n.tx_q_virt;
+        let tx_avail_next = n.tx_avail_next;
+        let mut latest_used = n.tx_used_seen;
         let tsc_budget = (crate::smp_hw::ensure_tsc_calibrated() / 40).max(1_000_000);
         let deadline_tsc = crate::smp_hw::read_tsc().wrapping_add(tsc_budget);
-        let mut spins = 0u32;
-        loop {
-            // SAFETY: `n.tx_q_virt + VN_USED_OFF + 2` is 2-byte aligned inside the mapped TX virtqueue page.
-            let used = unsafe {
-                core::ptr::read_volatile((n.tx_q_virt + VN_USED_OFF + 2) as *const u16)
-            };
-            if used == n.tx_avail_next {
-                n.tx_used_seen = used;
-                break;
-            }
-            spins = spins.wrapping_add(1);
-            if spins > 4_000_000
-                || ((spins & 0x3FF) == 0
-                    && crate::smp_hw::read_tsc().wrapping_sub(deadline_tsc) < (1u64 << 63))
-            {
-                VNET_TX_DROPS.fetch_add(1, Ordering::Relaxed);
-                return false;
-            }
-            core::hint::spin_loop();
+        let mut checks = 0u32;
+        let ok = crate::smp_hw::wait_for_dma_completion(
+            AsyncIoKind::NetTx,
+            (tx_avail_next as usize & (active_slots - 1)) as u16,
+            true,
+            4_000_000,
+            || {
+                // SAFETY: `tx_q_virt + VN_USED_OFF + 2` is 2-byte aligned inside the mapped TX virtqueue page.
+                let used =
+                    unsafe { core::ptr::read_volatile((tx_q_virt + VN_USED_OFF + 2) as *const u16) };
+                latest_used = used;
+                if (tx_avail_next.wrapping_sub(used) as usize) < active_slots {
+                    return Ok(true);
+                }
+                checks = checks.wrapping_add(1);
+                if (checks & 0x3FF) == 0
+                    && crate::smp_hw::read_tsc().wrapping_sub(deadline_tsc) < (1u64 << 63)
+                {
+                    return Err(());
+                }
+                Ok(false)
+            },
+        );
+        n.tx_used_seen = latest_used;
+        if ok.is_err() {
+            VNET_TX_DROPS.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
     }
-    let tx_buf_phys = n.tx_q_phys + 0x8000; // tx scratch: dma+0xA000
+
+    let pipe_slot = (n.tx_avail_next as usize) & (active_slots - 1);
+    let head_desc = (2 * pipe_slot) as u16;
+    let tx_buf_phys = n.tx_bufs_phys + (pipe_slot as u64) * 2048;
     let tx_buf_virt = pa_to_va(tx_buf_phys) as u64;
-    // SAFETY: `tx_buf_virt` and `n.tx_q_virt` lie within the reserved 48 KiB VirtIO DMA window (`VN_HDR + frame.len() <= 2048`), and completion polling above prevents ring races.
+    // SAFETY: `tx_buf_virt` points to this pipeline slot's exclusive 2 KiB DMA buffer (`VN_HDR + frame.len() <= 2048`), and `head_desc..head_desc+1` (`< 16 < VN_QSIZE`) are idle.
     unsafe {
-        // hdr (12 zero bytes) + frame
         let mut i = 0usize;
         while i < VN_HDR {
             core::ptr::write_volatile((tx_buf_virt + i as u64) as *mut u8, 0);
@@ -446,12 +520,12 @@ pub(crate) fn vnet_tx(n: &mut VnetModern, frame: &[u8]) -> bool {
             (tx_buf_virt + VN_HDR as u64) as *mut u8,
             frame.len(),
         );
-        let d0 = n.tx_q_virt + VN_DESC_OFF;
+        let d0 = n.tx_q_virt + VN_DESC_OFF + (head_desc as u64) * 16;
         vn_wr64(d0, 0, tx_buf_phys);
         vn_wr32(d0, 8, VN_HDR as u32);
         vn_wr16(d0, 12, 1); // NEXT
-        vn_wr16(d0, 14, 1);
-        let d1 = n.tx_q_virt + VN_DESC_OFF + 16;
+        vn_wr16(d0, 14, head_desc + 1);
+        let d1 = d0 + 16;
         vn_wr64(d1, 0, tx_buf_phys + VN_HDR as u64);
         vn_wr32(d1, 8, frame.len() as u32);
         vn_wr16(d1, 12, 0);
@@ -459,20 +533,30 @@ pub(crate) fn vnet_tx(n: &mut VnetModern, frame: &[u8]) -> bool {
         let slot = (n.tx_avail_next as u64) & (VN_QSIZE as u64 - 1);
         core::ptr::write_volatile(
             (n.tx_q_virt + VN_AVAIL_OFF + 4 + slot * 2) as *mut u16,
-            0u16, // head desc 0
+            head_desc,
         );
         fence(Ordering::SeqCst);
         let next = n.tx_avail_next.wrapping_add(1);
         core::ptr::write_volatile((n.tx_q_virt + VN_AVAIL_OFF + 2) as *mut u16, next);
         n.tx_avail_next = next;
     }
+    let irqs_before = crate::smp_hw::read_hw_msi_net_irqs();
     vnet_notify(n, 1);
+    crate::smp_hw::drain_pending_device_irqs();
+    let irq_seen = crate::smp_hw::read_hw_msi_net_irqs() > irqs_before;
+    if let Some(mut r) = crate::smp_hw::GLOBAL_IO_RING.try_lock() {
+        if let Ok(tag) = r.submit(AsyncIoKind::NetTx, pipe_slot as u16) {
+            let _ = r.complete(tag, 0, irq_seen);
+            let _ = r.reap(tag);
+        }
+    }
     true
 }
 
 /// Poll one RX frame into `out`; returns (frame_len, hdr_buf_index) —
 /// the caller recycles by calling vnet_rx_recycle(idx).
 pub(crate) fn vnet_rx(n: &mut VnetModern, out: &mut [u8]) -> Option<(usize, u16)> {
+    crate::smp_hw::drain_pending_device_irqs();
     let mut skipped = 0usize;
     while skipped < VN_QSIZE as usize {
         // SAFETY: `n.rx_q_virt + VN_USED_OFF + 2` is 2-byte aligned inside the mapped RX virtqueue page; volatile load prevents compiler caching across poll iterations.

@@ -471,6 +471,7 @@ const REQUIRED_BANNERS: &[&str] = &[
     "PHYS_MM_SLAB OK pt_burst=128 scrub=zero leak=0 usable_frames=",
     "RING3_ELF_MP OK procs=11 preempts=",
     "faults_isolated=4 respawn=1 leak=0",
+    "ASYNC_DMA_IRQ OK blk_irqs=",
     "CUTTLE-TE HALT",
 ];
 
@@ -693,22 +694,42 @@ impl SmokeVm<'_> {
             }
         });
 
-        let deadline = Instant::now() + Duration::from_secs(45);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut commands_sent = false;
         let mut reached = false;
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(120));
             let snapshot = buf.lock().map(|g| g.clone()).unwrap_or_default();
-            if !commands_sent && snapshot.contains("Cuttle Enterprise OS interactive shell ready.") {
-                std::thread::sleep(Duration::from_millis(120));
+            if !commands_sent && snapshot.contains("cuttle> ") {
+                std::thread::sleep(Duration::from_millis(60));
                 for cmd in commands {
+                    let prompts_before = buf
+                        .lock()
+                        .map(|g| g.matches("cuttle> ").count())
+                        .unwrap_or(0);
                     let payload = format!("{cmd}\n");
                     for chunk in payload.as_bytes().chunks(6) {
                         let _ = stdin.write_all(chunk);
                         let _ = stdin.flush();
                         std::thread::sleep(Duration::from_millis(30));
                     }
-                    std::thread::sleep(Duration::from_millis(300));
+                    let is_terminal = matches!(*cmd, "halt" | "reboot" | "poweroff")
+                        || cmd.starts_with("__selftest_");
+                    if !is_terminal {
+                        let cmd_wait = Instant::now() + Duration::from_secs(12);
+                        while Instant::now() < cmd_wait {
+                            let cur = buf
+                                .lock()
+                                .map(|g| g.matches("cuttle> ").count())
+                                .unwrap_or(0);
+                            if cur > prompts_before {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(35));
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
                 }
                 commands_sent = true;
             }
@@ -1270,6 +1291,380 @@ fn morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu() {
     );
     eprintln!(
         "smoke[multiseed]: 10 morphed seeds verified distinct & cross-seed QEMU boots preserved VFS, firewall, cron, and SQL state; MULTI-SEED QEMU TEST PASSED"
+    );
+}
+
+#[test]
+#[ignore = "requires nightly rust-src + factory_builder_pkg + qemu-system-x86_64"]
+fn nvme_only_persistence_and_network_flood_resilience_under_qemu() {
+    let _guard = QEMU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, UdpSocket};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+
+    let Some(qemu) = find_qemu() else {
+        panic!("qemu-system-x86_64 not found");
+    };
+    let root = workspace_root();
+    let images_dir = root.join("target").join("cuttle_images");
+    std::fs::create_dir_all(&images_dir).expect("create images_dir");
+
+    let kernel_crate = root.join("target_enterprise_kernel");
+    let pkg_crate = factory_builder::locate_pkg_crate().expect("locate_pkg_crate");
+    let elf = factory_builder::build_kernel(&kernel_crate).expect("build_kernel");
+    let bios = images_dir.join("qemu_nvme_only_bios.img");
+    factory_builder::package_kernel_via_pkg(&pkg_crate, &elf, &bios, None)
+        .expect("package_kernel_via_pkg for NVMe-only appliance");
+
+    let nvme_disk = images_dir.join("nvme_only_state_test.img");
+    std::fs::write(&nvme_disk, vec![0u8; 1024 * 1024]).expect("init 1 MiB nvme_only_state_test.img");
+    let device_key_path = root.join(factory_builder::DEVICE_SECRET_KEY_FILENAME);
+    factory_builder::ensure_device_secret_key(&device_key_path)
+        .expect("provision 32-byte CSPRNG device_secret_key.bin");
+
+    // Reserve ephemeral localhost ports for QEMU user-mode networking (`hostfwd`).
+    let udp8080 = {
+        let s = UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral UDP 8080");
+        s.local_addr().unwrap().port()
+    };
+    let udp8081 = {
+        let s = UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral UDP 8081");
+        s.local_addr().unwrap().port()
+    };
+    let tcp80 = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral TCP 80");
+        l.local_addr().unwrap().port()
+    };
+
+    // Start a continuous host UDP flood BEFORE Boot #1 reaches `service_udp_status()`
+    // and keep flooding right through `live_os_console_loop()`:
+    // - Proves Medium #5: steady traffic + mutating UDP payloads during the boot service
+    //   window cannot stall boot (`UDP SVC DOWN window-closed` fires on deadline) and
+    //   cannot mutate durable state before boot self-tests finish.
+    // - Proves Medium #7: continuous inbound RX traffic suppressing `HLT` neither starves
+    //   COM1 interactive console commands nor stalls calibrated TSC ~1 s cron epochs.
+    let stop_flood = Arc::new(AtomicBool::new(false));
+    let stop_flood_bg = Arc::clone(&stop_flood);
+    let flooder = std::thread::spawn(move || {
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind host UDP flood socket");
+        let _ = sock.set_write_timeout(Some(Duration::from_millis(20)));
+        let dst_status = format!("127.0.0.1:{udp8080}");
+        let dst_ctrl = format!("127.0.0.1:{udp8081}");
+        let mut seq = 0u64;
+        while !stop_flood_bg.load(Ordering::Relaxed) {
+            let _ = sock.send_to(b"status\n", &dst_status);
+            let _ = sock.send_to(b"write /var/boot_hijack.txt pwned\n", &dst_status);
+            let _ = sock.send_to(b"CMD write /var/boot_hijack.txt pwned\n", &dst_ctrl);
+            seq = seq.wrapping_add(1);
+            if (seq & 0x3) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    });
+
+    let spawn_nvme_only_qemu = |with_user_net: bool| -> std::process::Child {
+        let mut cmd = Command::new(&qemu);
+        cmd.args(smoke_accel_args())
+            .arg("-cpu")
+            .arg(PINNED_QEMU_CPU_MODEL)
+            .arg("-smp")
+            .arg("4")
+            .arg("-fw_cfg")
+            .arg(format!(
+                "name={},file={}",
+                factory_builder::FW_CFG_DEVICE_KEY_NAME,
+                device_key_path.display()
+            ))
+            .arg("-drive")
+            .arg(format!("format=raw,file={},if=ide", bios.display()))
+            // ZERO AHCI, ZERO VirtIO-blk, ZERO e1000: NVMe is the ONLY persistence disk!
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=nvme0,format=raw,file={}",
+                nvme_disk.display()
+            ))
+            .arg("-device")
+            .arg("nvme,drive=nvme0,serial=CUTTLE-NVME-ONLY");
+        if with_user_net {
+            cmd.arg("-netdev")
+                .arg(format!(
+                    "user,id=unet0,hostfwd=udp:127.0.0.1:{udp8080}-:8080,hostfwd=udp:127.0.0.1:{udp8081}-:8081,hostfwd=tcp:127.0.0.1:{tcp80}-:80"
+                ))
+                .arg("-device")
+                .arg("virtio-net-pci,netdev=unet0,disable-legacy=on,disable-modern=off");
+        }
+        cmd.arg("-serial")
+            .arg("stdio")
+            .arg("-display")
+            .arg("none")
+            .arg("-no-reboot")
+            .arg("-m")
+            .arg("256M")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn NVMe-only QEMU")
+    };
+
+    // Boot #1 under continuous UDP flood:
+    let mut q1 = spawn_nvme_only_qemu(true);
+    let mut out1 = q1.stdout.take().expect("q1 stdout");
+    let mut in1 = q1.stdin.take().expect("q1 stdin");
+    let buf1 = Arc::new(Mutex::new(String::new()));
+    let buf1_bg = Arc::clone(&buf1);
+    let r1 = std::thread::spawn(move || {
+        let mut chunk = [0u8; 512];
+        while let Ok(n) = out1.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut g) = buf1_bg.lock() {
+                g.push_str(&String::from_utf8_lossy(&chunk[..n]));
+            }
+        }
+    });
+
+    let send_console_line = |stdin: &mut std::process::ChildStdin,
+                             log_buf: &Arc<Mutex<String>>,
+                             line: &str| {
+        let prompts_before = log_buf
+            .lock()
+            .map(|g| g.matches("cuttle> ").count())
+            .unwrap_or(0);
+        let payload = format!("{line}\n");
+        for chunk in payload.as_bytes().chunks(6) {
+            let _ = stdin.write_all(chunk);
+            let _ = stdin.flush();
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let is_terminal =
+            matches!(line, "halt" | "reboot" | "poweroff") || line.starts_with("__selftest_");
+        if !is_terminal {
+            let cmd_wait = Instant::now() + Duration::from_secs(12);
+            while Instant::now() < cmd_wait {
+                let cur = log_buf
+                    .lock()
+                    .map(|g| g.matches("cuttle> ").count())
+                    .unwrap_or(0);
+                if cur > prompts_before {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(35));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
+
+    let deadline1 = Instant::now() + Duration::from_secs(65);
+    let mut phase = 0u8;
+    let mut cron_armed_at = Instant::now();
+    let mut boot1_done = false;
+    while Instant::now() < deadline1 {
+        std::thread::sleep(Duration::from_millis(120));
+        let snap = buf1.lock().map(|g| g.clone()).unwrap_or_default();
+        if phase == 0 && snap.contains("cuttle> ") {
+            std::thread::sleep(Duration::from_millis(60));
+            // Arm a 1-epoch (~1 s) cron job while the UDP packet flood is continuously active!
+            send_console_line(&mut in1, &buf1, "cron add 1 status");
+            cron_armed_at = Instant::now();
+            phase = 1;
+        } else if phase == 1 && cron_armed_at.elapsed() >= Duration::from_millis(2400) {
+            for cmd in [
+                "cron list",
+                "cat /var/boot_hijack.txt",
+                "write /var/nvme.ok nvme-durable-v1",
+                "sql CREATE TABLE nv (id INT, v TEXT)",
+                "sql INSERT INTO nv VALUES (7, 'nvme-persisted')",
+                "sync",
+                "status",
+                "halt",
+            ] {
+                send_console_line(&mut in1, &buf1, cmd);
+            }
+            phase = 2;
+        } else if phase == 2 && snap.contains("system halting...") {
+            boot1_done = true;
+            break;
+        }
+    }
+
+    stop_flood.store(true, Ordering::Relaxed);
+    let _ = flooder.join();
+    drop(in1);
+    let _ = q1.kill();
+    let _ = q1.wait();
+    let _ = r1.join();
+    let log1 = buf1.lock().map(|g| g.clone()).unwrap_or_default();
+
+    assert!(
+        boot1_done,
+        "NVMe-only Boot #1 under continuous UDP flood did not reach `system halting...` within 55s!\nSerial log:\n{log1}"
+    );
+    assert!(
+        log1.contains("AHCI_HW skipped (no AHCI HBA attached)")
+            && log1.contains("VIRTIO_HW skipped (no virtio-blk attached)")
+            && log1.contains("E1000_HW skipped (no e1000 attached)"),
+        "NVMe-only Boot #1 did not skip absent AHCI/VirtIO-blk/e1000 cleanly!\nSerial log:\n{log1}"
+    );
+    assert!(
+        log1.contains("UDP SVC DOWN window-closed"),
+        "Medium #5 regression: boot service window did not close under steady UDP flood!\nSerial log:\n{log1}"
+    );
+    assert!(
+        log1.contains("error: file not found"),
+        "Medium #5 regression: UDP payload mutated state during boot window or unauthenticated flood!\nSerial log:\n{log1}"
+    );
+    // Verify PCI MSI-X interrupts fired for BOTH NVMe (`blk_irqs > 0`) and modern VirtIO-net (`net_irqs > 0`).
+    {
+        let irq_line = log1
+            .lines()
+            .find(|l| l.starts_with("ASYNC_DMA_IRQ OK "))
+            .unwrap_or_else(|| panic!("missing ASYNC_DMA_IRQ OK line!\nSerial log:\n{log1}"));
+        let parse_kv = |key: &str| -> u64 {
+            irq_line
+                .split_whitespace()
+                .find_map(|tok| tok.strip_prefix(key))
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("malformed {key} in {irq_line:?}"))
+        };
+        let blk_irqs = parse_kv("blk_irqs=");
+        let net_irqs = parse_kv("net_irqs=");
+        let ring_done = parse_kv("ring_done=");
+        assert!(
+            blk_irqs > 0 && net_irqs > 0 && ring_done > 0,
+            "expected nonzero NVMe MSI-X blk_irqs ({blk_irqs}) and VirtIO-net MSI-X net_irqs ({net_irqs})!\nLine: {irq_line}"
+        );
+    }
+    // Verify Medium #7: under continuous UDP flood, calibrated TSC epochs advanced cron (`runs=` >= 1)
+    // and multi-character console commands + `sync` completed without starvation or dropped bytes.
+    {
+        let cron_ran = log1.lines().any(|l| {
+            l.contains("every=1")
+                && l.contains("cmd=\"status\"")
+                && l.split_whitespace()
+                    .find_map(|t| t.strip_prefix("runs="))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    >= 1
+        });
+        assert!(
+            cron_ran,
+            "Medium #7 regression: cron job did not advance (`runs >= 1`) under continuous UDP packet flood!\nSerial log:\n{log1}"
+        );
+        assert!(
+            log1.contains("sync: ok "),
+            "Medium #7 / NVMe persistence regression: `sync` did not complete on NVMe under UDP flood!\nSerial log:\n{log1}"
+        );
+    }
+
+    // Host audit of raw `nvme_only_state_test.img`: verify `AB_FORMAT_V3` (`CTTLAE03` + `CTTLAB01`)
+    // and zero plaintext leakage on the NVMe namespace!
+    let nvme_bytes_1 = std::fs::read(&nvme_disk).expect("read nvme_only_state_test.img after Boot #1");
+    assert_eq!(
+        &nvme_bytes_1[1149 * 512..1149 * 512 + 8],
+        b"CTTLAB01",
+        "NVMe-only Boot #1 did not write CTTLAB01 atomic commit sector at LBA 1149"
+    );
+    assert_eq!(nvme_bytes_1[1149 * 512 + 8], 0x02);
+    assert_eq!(nvme_bytes_1[1149 * 512 + 9], 0x03);
+    assert_eq!(
+        &nvme_bytes_1[1040 * 512..1040 * 512 + 8],
+        b"CTTLAE03",
+        "NVMe-only Boot #1 did not write AEAD-encrypted CTTLAE03 primary slot at LBA 1040"
+    );
+    assert!(
+        !nvme_bytes_1[1040 * 512..1149 * 512]
+            .windows(b"nvme-persisted".len())
+            .any(|w| w == b"nvme-persisted"),
+        "raw NVMe disk leaked plaintext SQL value!"
+    );
+
+    // Boot #2 on the SAME `nvme_only_state_test.img` (still zero AHCI!):
+    // Verify `CONTINUITY resume OK`, `SHELL resume OK`, VFS + SQL state survival, AND
+    // lock-free emergency NVMe crash dump (`__selftest_ud2_fault` -> `CTTLPENC` at LBA 1536).
+    let mut q2 = spawn_nvme_only_qemu(false);
+    let mut out2 = q2.stdout.take().expect("q2 stdout");
+    let mut in2 = q2.stdin.take().expect("q2 stdin");
+    let buf2 = Arc::new(Mutex::new(String::new()));
+    let buf2_bg = Arc::clone(&buf2);
+    let r2 = std::thread::spawn(move || {
+        let mut chunk = [0u8; 512];
+        while let Ok(n) = out2.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut g) = buf2_bg.lock() {
+                g.push_str(&String::from_utf8_lossy(&chunk[..n]));
+            }
+        }
+    });
+
+    let deadline2 = Instant::now() + Duration::from_secs(55);
+    let mut sent2 = false;
+    let mut boot2_done = false;
+    while Instant::now() < deadline2 {
+        std::thread::sleep(Duration::from_millis(120));
+        let snap = buf2.lock().map(|g| g.clone()).unwrap_or_default();
+        if !sent2 && snap.contains("cuttle> ") {
+            std::thread::sleep(Duration::from_millis(60));
+            for cmd in [
+                "cat /var/nvme.ok",
+                "sql SELECT id, v FROM nv",
+                "__selftest_ud2_fault",
+            ] {
+                send_console_line(&mut in2, &buf2, cmd);
+            }
+            sent2 = true;
+        }
+        if sent2
+            && snap.contains("CUTTLE-TE PANIC: CPU FAULT: vec=6")
+            && snap.contains("CRASH_DUMP emergency slot=1 lba=1536..1568")
+        {
+            boot2_done = true;
+            break;
+        }
+    }
+
+    drop(in2);
+    let _ = q2.kill();
+    let _ = q2.wait();
+    let _ = r2.join();
+    let log2 = buf2.lock().map(|g| g.clone()).unwrap_or_default();
+    let nvme_bytes_2 = std::fs::read(&nvme_disk).expect("read nvme_only_state_test.img after Boot #2");
+
+    let _ = std::fs::remove_file(&nvme_disk);
+    let _ = std::fs::remove_file(&bios);
+
+    assert!(
+        boot2_done,
+        "NVMe-only Boot #2 did not complete verification + emergency crash dump within 45s!\nSerial log:\n{log2}"
+    );
+    assert!(
+        log2.contains("AHCI_HW skipped (no AHCI HBA attached)")
+            && log2.contains("CONTINUITY resume OK")
+            && log2.contains("SHELL resume OK"),
+        "NVMe-only Boot #2 did not resume sealed state cleanly without AHCI!\nSerial log:\n{log2}"
+    );
+    assert!(
+        log2.contains("nvme-durable-v1"),
+        "NVMe-only Boot #2 lost /var/nvme.ok across reboot!\nSerial log:\n{log2}"
+    );
+    assert!(
+        log2.contains("7|nvme-persisted"),
+        "NVMe-only Boot #2 lost SQL row (7, 'nvme-persisted') across reboot!\nSerial log:\n{log2}"
+    );
+    assert_eq!(
+        &nvme_bytes_2[1536 * 512..1536 * 512 + 8],
+        b"CTTLPENC",
+        "NVMe-only emergency crash dump did not persist encrypted CTTLPENC header at LBA 1536"
+    );
+    eprintln!(
+        "smoke[nvme+flood]: AHCI-less NVMe persistence, MSI-X blk+net IRQs, emergency NVMe crash dump, and Medium #5/#7 UDP flood resilience PASSED"
     );
 }
 

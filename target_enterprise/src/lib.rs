@@ -37,6 +37,7 @@ pub mod acpi_rsdp;
 pub mod ahci_cmd;
 pub mod ahci_fis;
 pub mod arp;
+pub mod async_io;
 pub mod attest_tlv;
 pub mod audit;
 pub mod base64;

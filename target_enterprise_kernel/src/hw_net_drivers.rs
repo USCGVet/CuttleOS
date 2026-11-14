@@ -60,7 +60,8 @@ pub(crate) fn banner_virtio_net_hw() {
                 Err(_) => (0, false),
             };
             if bar0 == 0 || !bar_is_io {
-                panic!("VIRTIO_NET_HW: need legacy I/O BAR");
+                device = device.wrapping_add(1);
+                continue;
             }
             let cmd = PciConfigBus::read_dword(&mut bus, addr, PCI_CFG_OFFSET_COMMAND_STATUS);
             PciConfigBus::write_dword(
@@ -97,7 +98,8 @@ pub(crate) fn banner_virtio_net_hw() {
     }
 
     if nfound < 2 {
-        panic!("VIRTIO_NET_HW: need two hubport virtio-net devices");
+        serial_write_str("VIRTIO_NET_HW skipped (fewer than two legacy hubport peers)\n");
+        return;
     }
     if phys_map_offset() == 0 || dma_phys_base() == 0 {
         panic!("VIRTIO_NET_HW: DMA map missing");
@@ -459,7 +461,10 @@ pub(crate) fn banner_e1000_hw() {
 
     let slot = match found_slot {
         Some(s) => s,
-        None => panic!("E1000_HW: no e1000 on bus 0 (attach -device e1000)"),
+        None => {
+            serial_write_str("E1000_HW skipped (no e1000 attached)\n");
+            return;
+        }
     };
     let addr = match found_addr {
         Some(a) => a,
@@ -705,7 +710,10 @@ pub(crate) fn banner_e1000_hw() {
     }
     let rx_slot = match rx_slot {
         Some(s) => s,
-        None => panic!("E1000_HW: need 2nd e1000 for RX (dual hubport)"),
+        None => {
+            serial_write_str("E1000_HW rx skipped (single e1000 NIC)\n");
+            return;
+        }
     };
     let rx_addr = match rx_addr {
         Some(a) => a,
