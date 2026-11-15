@@ -217,19 +217,21 @@ static RUNTIME_CAP_TABLE: [AtomicU64; CAP_TABLE_TASKS] = {
 
 /// Assign the runtime capability mask for `task_id` (`0..CAP_TABLE_TASKS`).
 pub fn set_task_cap_mask(task_id: u64, mask: u64) -> Result<(), Errno> {
-    if (task_id as usize) >= CAP_TABLE_TASKS {
+    let idx = usize::try_from(task_id).map_err(|_| Errno::EPERM)?;
+    if idx >= CAP_TABLE_TASKS {
         return Err(Errno::EPERM);
     }
-    RUNTIME_CAP_TABLE[task_id as usize].store(mask, Ordering::Release);
+    RUNTIME_CAP_TABLE[idx].store(mask, Ordering::Release);
     Ok(())
 }
 
 /// Read the runtime capability mask for `task_id` (`0..CAP_TABLE_TASKS`).
 pub fn get_task_cap_mask(task_id: u64) -> Result<u64, Errno> {
-    if (task_id as usize) >= CAP_TABLE_TASKS {
+    let idx = usize::try_from(task_id).map_err(|_| Errno::EPERM)?;
+    if idx >= CAP_TABLE_TASKS {
         return Err(Errno::EPERM);
     }
-    Ok(RUNTIME_CAP_TABLE[task_id as usize].load(Ordering::Acquire))
+    Ok(RUNTIME_CAP_TABLE[idx].load(Ordering::Acquire))
 }
 
 /// Reset all per-task capability masks back to [`PERMISSIVE_CAP_TABLE`].
@@ -255,15 +257,19 @@ impl cuttle_contracts::SyscallCapTable for CapTableImpl {
         cap: u64,
         syscall_nr: u32,
     ) -> Result<(), cuttle_contracts::CapError> {
-        if (task_id as usize) >= CAP_TABLE_TASKS {
+        let Ok(idx) = usize::try_from(task_id) else {
+            DENIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return Err(cuttle_contracts::CapError::EPERM);
+        };
+        if idx >= CAP_TABLE_TASKS {
             DENIED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return Err(cuttle_contracts::CapError::EPERM);
         }
         if (syscall_nr as u64) >= SYS_MAX {
             return Err(cuttle_contracts::CapError::ENOSYS);
         }
-        let task_mask = RUNTIME_CAP_TABLE[task_id as usize].load(Ordering::Acquire)
-            & PERMISSIVE_CAP_TABLE[task_id as usize];
+        let task_mask = RUNTIME_CAP_TABLE[idx].load(Ordering::Acquire)
+            & PERMISSIVE_CAP_TABLE[idx];
         let effective = task_mask & cap;
         let required = SYSCALL_REQUIRED_CAPS[syscall_nr as usize];
         if (effective & required) == required {
@@ -677,10 +683,14 @@ fn sys_write_with_sink<S: WriteSink>(
     if len == 0 {
         return Ok(0);
     }
-    // SAFETY: the seed's caller (test code) guarantees `buf` points at
-    // `len` bytes of valid memory. The donor's validate_user_buf walks
-    // the page tables; the seed cannot.
-    let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
+    let addr = usize::try_from(buf).map_err(|_| Errno::EFAULT)?;
+    let n = usize::try_from(len).map_err(|_| Errno::EINVAL)?;
+    if addr == 0 || n > (isize::MAX as usize) || addr.checked_add(n).is_none() {
+        return Err(Errno::EFAULT);
+    }
+    // SAFETY: `addr != 0`, `n <= 65536 <= isize::MAX`, and `addr + n` does not wrap;
+    // the seed's caller (test code) guarantees `buf` points at `len` bytes of valid memory.
+    let slice = unsafe { core::slice::from_raw_parts(addr as *const u8, n) };
     let written = sink.write(slice);
     SYS_WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
     Ok(written as u64)
@@ -1293,6 +1303,16 @@ mod tests {
                 0b11,
             ),
             Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn sys_write_with_sink_rejects_null_or_wrapping_pointer_with_efault() {
+        let mut sink = NullSink;
+        assert_eq!(sys_write_with_sink(&mut sink, 1, 0, 16), Err(Errno::EFAULT));
+        assert_eq!(
+            sys_write_with_sink(&mut sink, 1, u64::MAX - 4, 16),
+            Err(Errno::EFAULT)
         );
     }
 }

@@ -299,7 +299,10 @@ impl QuotaTable {
 
     /// Serialize live records into `out`. Returns bytes written.
     pub fn encode_all(&self, out: &mut [u8]) -> Result<usize, QuotaError> {
-        let need = self.len * QUOTA_RECORD_LEN;
+        let need = self
+            .len
+            .checked_mul(QUOTA_RECORD_LEN)
+            .ok_or(QuotaError::Truncated)?;
         if out.len() < need {
             return Err(QuotaError::Truncated);
         }

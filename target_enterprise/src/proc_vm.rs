@@ -492,6 +492,9 @@ impl ProcAddressSpace {
         pt_out.fill(0);
 
         let pml4_idx = self.pml4_slot();
+        if pml4_idx >= 256 {
+            return;
+        }
         pml4_out[pml4_idx] = self.pdpt_pa | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
         pdpt_out[0] = self.pd_pa | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
         pd_out[0] = self.pt_pa | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
@@ -542,6 +545,9 @@ impl ProcAddressSpace {
         }
 
         let pml4_idx = self.pml4_slot();
+        if pml4_idx >= 256 {
+            return;
+        }
         source.write_frame_u64_at(
             self.user_pml4_pa,
             pml4_idx,
@@ -1306,21 +1312,13 @@ impl ProcessTable {
         Ok(())
     }
 
-    /// Write validated writable user memory `[user_va .. user_va + data.len())` across page boundaries.
-    pub fn write_user_bytes<S: PageFrameSource>(
-        &self,
-        slot: usize,
-        user_va: u64,
-        data: &[u8],
-        source: &mut S,
-    ) -> Result<(), ProcError> {
+    fn validate_user_writable(&self, slot: usize, user_va: u64, len: usize) -> Result<(), ProcError> {
         if slot >= MAX_PROCS {
             return Err(ProcError::InvalidPid);
         }
         let vm = &self.procs[slot].vm;
-        // Pre-validate every touched page is mapped `PTE_USER | PTE_WRITABLE` before writing!
         let mut chk = 0usize;
-        while chk < data.len() {
+        while chk < len {
             let cur_va = user_va
                 .checked_add(chk as u64)
                 .ok_or(ProcError::BadUserPointer)?;
@@ -1329,12 +1327,28 @@ impl ProcessTable {
             if !writable {
                 return Err(ProcError::BadUserPointer);
             }
-            chk += (4096 - page_off).min(data.len() - chk);
+            chk += (4096 - page_off).min(len - chk);
         }
+        Ok(())
+    }
+
+    /// Write validated writable user memory `[user_va .. user_va + data.len())` across page boundaries.
+    pub fn write_user_bytes<S: PageFrameSource>(
+        &self,
+        slot: usize,
+        user_va: u64,
+        data: &[u8],
+        source: &mut S,
+    ) -> Result<(), ProcError> {
+        self.validate_user_writable(slot, user_va, data.len())?;
+        let vm = &self.procs[slot].vm;
         let mut done = 0usize;
         while done < data.len() {
-            let cur_va = user_va + (done as u64);
-            let (pa, page_off, _) = vm.translate_user_va(cur_va).unwrap();
+            let cur_va = user_va
+                .checked_add(done as u64)
+                .ok_or(ProcError::BadUserPointer)?;
+            let (pa, page_off, _) =
+                vm.translate_user_va(cur_va).ok_or(ProcError::BadUserPointer)?;
             let chunk = (4096 - page_off).min(data.len() - done);
             source.write_frame_bytes(pa, page_off, &data[done..done + chunk]);
             done += chunk;
@@ -1353,6 +1367,9 @@ impl ProcessTable {
         monotonic_ns: u64,
         source: &mut S,
     ) -> SyscallStepOutcome {
+        if slot >= MAX_PROCS || self.procs[slot].state == ProcState::Unused {
+            return SyscallStepOutcome::Continue;
+        }
         let nr = tf.rax;
         let a0 = tf.rdi;
         let a1 = tf.rsi;
@@ -1418,6 +1435,22 @@ impl ProcessTable {
                                 );
                                 self.procs[slot].vm.heap_pages_mapped = p + 1;
                             } else {
+                                // Roll back every page mapped during this failed `PROC_SYS_BRK` call!
+                                let mut r = cur_pages;
+                                while r < p {
+                                    let r_pa = self.procs[slot].vm.heap_page_pa[r];
+                                    self.procs[slot].vm.heap_page_pa[r] = 0;
+                                    source.write_frame_u64_at(
+                                        self.procs[slot].vm.pt_pa,
+                                        PROC_HEAP_FIRST_PT + r,
+                                        0,
+                                    );
+                                    if r_pa != 0 {
+                                        source.free_zeroed_frame(r_pa);
+                                    }
+                                    r += 1;
+                                }
+                                self.procs[slot].vm.heap_pages_mapped = cur_pages;
                                 oom = true;
                                 break;
                             }
@@ -1495,27 +1528,43 @@ impl ProcessTable {
                     if max_len < msg.len {
                         tf.rax = (-90i64) as u64; // -EMSGSIZE (leave inbox[0] intact!)
                     } else {
-                        let body_ok = self
-                            .write_user_bytes(slot, ptr_va, &msg.data[..msg.len], source)
-                            .is_ok();
-                        let tag_meta =
-                            ((msg.sender_pid as u64) << 32) | (msg.tag as u64);
-                        let tag_ok = if tag_out_va == 0 {
+                        // Validate BOTH `ptr_va` and `tag_out_va` writable BEFORE writing either!
+                        let body_valid = self.validate_user_writable(slot, ptr_va, msg.len).is_ok();
+                        let tag_valid = if tag_out_va == 0 {
                             true
                         } else {
-                            self.write_user_bytes(slot, tag_out_va, &tag_meta.to_le_bytes(), source)
-                                .is_ok()
+                            self.validate_user_writable(slot, tag_out_va, 8).is_ok()
                         };
-                        if body_ok && tag_ok {
-                            let rem = self.procs[slot].inbox_len - 1;
-                            let mut m = 0usize;
-                            while m < rem {
-                                self.procs[slot].inbox[m] = self.procs[slot].inbox[m + 1];
-                                m += 1;
+                        if body_valid && tag_valid {
+                            let body_ok = self
+                                .write_user_bytes(slot, ptr_va, &msg.data[..msg.len], source)
+                                .is_ok();
+                            let tag_meta =
+                                ((msg.sender_pid as u64) << 32) | (msg.tag as u64);
+                            let tag_ok = if tag_out_va == 0 {
+                                true
+                            } else {
+                                self.write_user_bytes(
+                                    slot,
+                                    tag_out_va,
+                                    &tag_meta.to_le_bytes(),
+                                    source,
+                                )
+                                .is_ok()
+                            };
+                            if body_ok && tag_ok {
+                                let rem = self.procs[slot].inbox_len - 1;
+                                let mut m = 0usize;
+                                while m < rem {
+                                    self.procs[slot].inbox[m] = self.procs[slot].inbox[m + 1];
+                                    m += 1;
+                                }
+                                self.procs[slot].inbox[rem] = ProcIpcMsg::empty();
+                                self.procs[slot].inbox_len = rem;
+                                tf.rax = msg.len as u64;
+                            } else {
+                                tf.rax = (-14i64) as u64; // -EFAULT
                             }
-                            self.procs[slot].inbox[rem] = ProcIpcMsg::empty();
-                            self.procs[slot].inbox_len = rem;
-                            tf.rax = msg.len as u64;
                         } else {
                             tf.rax = (-14i64) as u64; // -EFAULT
                         }
@@ -2705,6 +2754,97 @@ mod tests {
             .read_user_bytes(slot_b, rx_va_b, &mut got, &mut arena)
             .unwrap();
         assert_eq!(got, msg32);
+    }
+
+    #[test]
+    fn brk_oom_rolls_back_partial_frames_and_ipc_recv_bad_tag_leaves_body_untouched() {
+        let mut arena = HostFrameArena::new(64);
+        let mut table = ProcessTable::new();
+        let mut elf = [0u8; 2048];
+        let n = build_elf64_program(
+            ElfProgramKind::CpuBoundWorker { iterations: 2 },
+            3,
+            &mut elf,
+        );
+        let (_pid_a, slot_a) = table
+            .spawn_elf64(&elf[..n], SVC_CAP_IPC, 3, None, &mut arena)
+            .unwrap();
+        let (pid_b, slot_b) = table
+            .spawn_elf64(&elf[..n], SVC_CAP_IPC, 4, None, &mut arena)
+            .unwrap();
+
+        // 1. Leave only 2 free frames in `arena`, then request a 3-page `PROC_SYS_BRK` growth:
+        //    must return `-PROC_ENOMEM` and roll back the 2 partially allocated frames!
+        let mut parked = alloc::vec::Vec::new();
+        while arena.allocated_count() + 2 < 64 {
+            parked.push(arena.alloc_zeroed_frame().unwrap());
+        }
+        let used_before_brk = arena.allocated_count();
+        let heap_base = table.procs[slot_a].vm.heap_base_va();
+        let mut tf_brk = table.procs[slot_a].trap_frame;
+        tf_brk.rax = PROC_SYS_BRK;
+        tf_brk.rdi = heap_base + 3 * 4096;
+        let _ = table.handle_syscall(slot_a, tf_brk, 0, 2_000, &mut arena);
+        assert_eq!(table.procs[slot_a].trap_frame.rax, (-PROC_ENOMEM) as u64);
+        assert_eq!(
+            table.procs[slot_a].vm.heap_pages_mapped, 0,
+            "failed PROC_SYS_BRK left partial heap_pages_mapped > 0"
+        );
+        assert_eq!(
+            arena.allocated_count(),
+            used_before_brk,
+            "failed PROC_SYS_BRK leaked physical frames"
+        );
+        assert_eq!(table.procs[slot_a].vm.heap_page_pa[0], 0);
+        assert_eq!(
+            arena.read_frame_u64_at(table.procs[slot_a].vm.pt_pa, PROC_HEAP_FIRST_PT),
+            0,
+            "failed PROC_SYS_BRK left dangling user PTE"
+        );
+        for pa in parked {
+            arena.free_zeroed_frame(pa);
+        }
+
+        // 2. `PROC_SYS_IPC_RECV` with valid `ptr_va` and invalid `tag_out_va` must return `-EFAULT`
+        //    WITHOUT overwriting the user buffer at `ptr_va`!
+        let tx_va_a = table.procs[slot_a].vm.base_va + 0x3000;
+        let rx_va_b = table.procs[slot_b].vm.base_va + 0x3040;
+        table
+            .write_user_bytes(slot_a, tx_va_a, &[0x7Au8; 16], &mut arena)
+            .unwrap();
+        table
+            .write_user_bytes(slot_b, rx_va_b, &[0xC3u8; 16], &mut arena)
+            .unwrap();
+
+        let mut tf_send = table.procs[slot_a].trap_frame;
+        tf_send.rax = PROC_SYS_IPC_SEND;
+        tf_send.rdi = pid_b as u64;
+        tf_send.rsi = 0x55;
+        tf_send.rdx = tx_va_a;
+        tf_send.r10 = 16;
+        let _ = table.handle_syscall(slot_a, tf_send, 0, 2_001, &mut arena);
+        assert_eq!(table.procs[slot_a].trap_frame.rax, 16);
+
+        let mut tf_recv = table.procs[slot_b].trap_frame;
+        tf_recv.rax = PROC_SYS_IPC_RECV;
+        tf_recv.rdi = rx_va_b;
+        tf_recv.rsi = 16;
+        tf_recv.rdx = 0xDEAD_0000_0000; // unmapped `tag_out_va`!
+        let _ = table.handle_syscall(slot_b, tf_recv, 0, 2_002, &mut arena);
+        assert_eq!(table.procs[slot_b].trap_frame.rax, (-14i64) as u64);
+        assert_eq!(table.procs[slot_b].inbox_len, 1);
+        let mut rx_after = [0u8; 16];
+        table
+            .read_user_bytes(slot_b, rx_va_b, &mut rx_after, &mut arena)
+            .unwrap();
+        assert_eq!(
+            rx_after,
+            [0xC3u8; 16],
+            "PROC_SYS_IPC_RECV overwrote ptr_va before validating tag_out_va"
+        );
+
+        // 3. Out-of-bounds `slot` passed to `handle_syscall` must not panic.
+        let _ = table.handle_syscall(999, tf_recv, 0, 2_003, &mut arena);
     }
 }
 

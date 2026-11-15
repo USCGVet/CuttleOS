@@ -231,6 +231,9 @@ impl cuttle_contracts::Hash for HashImpl {
     const OUTPUT_LEN: usize = 32;
 
     fn hash(input: &[u8], out: &mut [u8]) {
+        let Some(dst) = out.get_mut(..Self::OUTPUT_LEN) else {
+            return;
+        };
         // 8 chained windows × 4 bytes each = 32 bytes.
         let state = fletcher32(input);
         let mut i: u8 = 0;
@@ -238,10 +241,7 @@ impl cuttle_contracts::Hash for HashImpl {
             let salt: [u8; 2] = [i, (state ^ (i as u32)) as u8];
             let h = fletcher32_three(input, &salt, &[]);
             let base = (i as usize) * 4;
-            out[base] = (h >> 24) as u8;
-            out[base + 1] = (h >> 16) as u8;
-            out[base + 2] = (h >> 8) as u8;
-            out[base + 3] = h as u8;
+            dst[base..base + 4].copy_from_slice(&h.to_be_bytes());
             i += 1;
         }
     }
@@ -311,7 +311,9 @@ impl cuttle_contracts::Aead for AeadImpl {
         out: &mut [u8],
     ) -> usize {
         use aes_gcm::aead::AeadInPlace;
-        let total = plaintext.len() + Self::TAG_LEN;
+        let Some(total) = plaintext.len().checked_add(Self::TAG_LEN) else {
+            return 0;
+        };
         let Some(cipher) = aes128_gcm(key) else {
             return 0;
         };

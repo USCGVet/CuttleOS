@@ -59,7 +59,7 @@ impl<'a> BitmapAllocator<'a> {
     /// calling `mark_used(idx)` for any frame that should not be handed
     /// out (e.g. the kernel image, MMIO holes).
     pub fn new(buf: &'a mut [u8]) -> Self {
-        let capacity = buf.len() * 8;
+        let capacity = buf.len().saturating_mul(8);
         // Zero every byte. We do this deliberately instead of trusting the
         // caller's buffer to already be zeroed — a fresh stack buffer is
         // commonly initialised with garbage in debug builds.
@@ -203,7 +203,7 @@ pub fn with_mm<R, F: FnOnce(&mut BitmapAllocator<'_>) -> R>(
 /// Convenience: convert a frame index to its physical base address.
 #[inline]
 pub const fn frame_idx_to_pa(idx: usize) -> u64 {
-    (idx as u64) * FRAME_SIZE
+    (idx as u64).saturating_mul(FRAME_SIZE)
 }
 
 /// Convenience: convert a physical address to its frame index (truncates).
@@ -652,16 +652,12 @@ pub mod kernel_guards {
             return Err("guarded stacks exceed single L1 page table");
         }
 
-        let mut i = 0usize;
-        while i < 512 {
-            pt_out[i] = 0;
-            i += 1;
-        }
+        let mut staged = [0u64; 512];
 
         let mut cursor = 0usize;
         let mut s = 0usize;
         while s < stacks_16k.len() {
-            pt_out[cursor] = 0; // Unmapped 4 KiB bottom guard page
+            staged[cursor] = 0; // Unmapped 4 KiB bottom guard page
             cursor += 1;
             let mut p = 0usize;
             while p < 4 {
@@ -669,7 +665,7 @@ pub mod kernel_guards {
                 if pa == 0 || (pa & 0xFFF) != 0 || (pa & !PTE_PHYS_MASK) != 0 {
                     return Err("unaligned or invalid 16k stack physical frame");
                 }
-                pt_out[cursor] = pa | PTE_P_BIT | PTE_W_BIT | PTE_NX_BIT;
+                staged[cursor] = pa | PTE_P_BIT | PTE_W_BIT | PTE_NX_BIT;
                 cursor += 1;
                 p += 1;
             }
@@ -678,23 +674,23 @@ pub mod kernel_guards {
 
         let mut k = 0usize;
         while k < ists_4k.len() {
-            pt_out[cursor] = 0; // Unmapped 4 KiB bottom guard page
+            staged[cursor] = 0; // Unmapped 4 KiB bottom guard page
             cursor += 1;
             let pa = ists_4k[k];
             if pa == 0 || (pa & 0xFFF) != 0 || (pa & !PTE_PHYS_MASK) != 0 {
                 return Err("unaligned or invalid 4k IST physical frame");
             }
-            pt_out[cursor] = pa | PTE_P_BIT | PTE_W_BIT | PTE_NX_BIT;
+            staged[cursor] = pa | PTE_P_BIT | PTE_W_BIT | PTE_NX_BIT;
             cursor += 1;
             k += 1;
         }
 
-        pt_out[cursor] = 0; // Trailing unmapped 4 KiB top guard page
+        staged[cursor] = 0; // Trailing unmapped 4 KiB top guard page
 
         // Verify pairwise disjointness of all mapped physical frames and zero RWX.
         let mut a = 0usize;
         while a < cursor {
-            let ea = pt_out[a];
+            let ea = staged[a];
             if (ea & PTE_P_BIT) != 0 {
                 if (ea & PTE_NX_BIT) == 0 {
                     return Err("executable stack PTE forbidden");
@@ -702,7 +698,7 @@ pub mod kernel_guards {
                 let pa_a = ea & PTE_PHYS_MASK;
                 let mut b = a + 1;
                 while b < cursor {
-                    let eb = pt_out[b];
+                    let eb = staged[b];
                     if (eb & PTE_P_BIT) != 0 && (eb & PTE_PHYS_MASK) == pa_a {
                         return Err("duplicate physical frame in guarded stack table");
                     }
@@ -712,6 +708,7 @@ pub mod kernel_guards {
             a += 1;
         }
 
+        *pt_out = staged;
         Ok(total_entries)
     }
 
@@ -930,5 +927,19 @@ mod tests {
         assert!(!heap_has_headroom(0, total, usize::MAX, reserve));
         assert!(!heap_has_headroom(total + 1, total, 0, reserve));
         assert_eq!(super::dma_layout::validate_ahci_subregions(), Ok(()));
+    }
+
+    #[test]
+    fn build_guarded_stacks_pt_leaves_output_unmodified_on_invalid_tail_frame() {
+        use super::kernel_guards::build_guarded_stacks_pt;
+        let stacks_16k = [[0x0040_0000u64, 0x0040_1000, 0x0040_2000, 0x0040_3000]];
+        let ists_4k_bad = [0x0040_4000u64, 0x0040_5100]; // second IST frame unaligned!
+        let mut sentinel_pt = [0xDEAD_BEEF_CAFE_BABEu64; 512];
+        assert!(build_guarded_stacks_pt(&stacks_16k, &ists_4k_bad, &mut sentinel_pt).is_err());
+        assert_eq!(
+            sentinel_pt,
+            [0xDEAD_BEEF_CAFE_BABEu64; 512],
+            "build_guarded_stacks_pt clobbered pt_out before rejecting invalid tail frame"
+        );
     }
 }

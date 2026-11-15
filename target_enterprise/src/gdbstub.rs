@@ -45,8 +45,11 @@ pub fn hex_nibble(c: u8) -> Option<u8> {
 #[inline]
 pub fn put_hex_byte(out: &mut [u8], b: u8) {
     const LUT: &[u8; 16] = b"0123456789abcdef";
-    out[0] = LUT[(b >> 4) as usize];
-    out[1] = LUT[(b & 0x0f) as usize];
+    let Some(dst) = out.get_mut(..2) else {
+        return;
+    };
+    dst[0] = LUT[(b >> 4) as usize];
+    dst[1] = LUT[(b & 0x0f) as usize];
 }
 
 /// Parse an unsigned hex integer (1..=16 digits). Empty → `None`.
@@ -133,7 +136,10 @@ pub fn build_frame_impl(body: &[u8], out: &mut [u8]) -> Result<usize, GdbError> 
     if body.len() > GDB_MAX_BODY {
         return Err(GdbError::BodyTooLong);
     }
-    let need = 1 + body.len() + 1 + 2;
+    let need = body
+        .len()
+        .checked_add(4)
+        .ok_or(GdbError::BufferTooSmall)?;
     if out.len() < need {
         return Err(GdbError::BufferTooSmall);
     }

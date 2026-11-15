@@ -685,6 +685,7 @@ pub fn derive_service_base_seed_for_boot(
     let raw = u64::from_le_bytes([
         dig[0], dig[1], dig[2], dig[3], dig[4], dig[5], dig[6], dig[7],
     ]);
+    crate::durable_seal::zeroize_secret_bytes(&mut dig);
     if raw == 0 {
         1
     } else {

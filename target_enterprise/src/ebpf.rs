@@ -621,6 +621,9 @@ pub const REFERENCE_PROGRAM_INSNS: usize = 6;
 ///   - `mov64 r0, r1`       — `opcode = 0xbf` (ALU64|MOV|X)
 ///   - `exit`               — `opcode = 0x95` (JMP|EXIT)
 pub fn build_reference_program(out: &mut [BpfInstr]) -> usize {
+    if out.len() < REFERENCE_PROGRAM_INSNS {
+        return 0;
+    }
     out[0] = BpfInstr::new(0x71, 0, 1, 0, 0);
     out[1] = BpfInstr::new(0x57, 0, 0, 0, 1);
     out[2] = BpfInstr::new(0xb7, 1, 0, 0, 1);
@@ -1354,6 +1357,14 @@ mod tests {
             exit(),
         ];
         assert_eq!(EBpfImpl::run(&valid_fp_stack, &mut ctx), Ok(99));
+    }
+
+    #[test]
+    fn build_reference_program_short_slice_returns_zero_without_panicking() {
+        let sentinel = BpfInstr::new(0xAA, 7, 7, 12, 34);
+        let mut short = [sentinel; 3];
+        assert_eq!(build_reference_program(&mut short), 0);
+        assert_eq!(short, [sentinel; 3]);
     }
 }
 

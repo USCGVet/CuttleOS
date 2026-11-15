@@ -197,7 +197,14 @@ impl<const N: usize> AuditLog for AuditLogImpl<N> {
     }
 
     fn snapshot(&self, out: &mut [u8]) -> Result<usize, AuditError> {
-        let need = AUDIT_SNAPSHOT_HEADER_LEN + self.len * AUDIT_EVENT_WIRE_LEN;
+        let count_u32 = u32::try_from(self.len).map_err(|_| AuditError::BufferTooSmall)?;
+        let body_bytes = self
+            .len
+            .checked_mul(AUDIT_EVENT_WIRE_LEN)
+            .ok_or(AuditError::BufferTooSmall)?;
+        let need = AUDIT_SNAPSHOT_HEADER_LEN
+            .checked_add(body_bytes)
+            .ok_or(AuditError::BufferTooSmall)?;
         if out.len() < need {
             return Err(AuditError::BufferTooSmall);
         }
@@ -205,7 +212,7 @@ impl<const N: usize> AuditLog for AuditLogImpl<N> {
         // Header.
         let magic = AUDIT_SNAPSHOT_MAGIC.to_be_bytes();
         out[0..4].copy_from_slice(&magic);
-        let count = (self.len as u32).to_be_bytes();
+        let count = count_u32.to_be_bytes();
         out[4..8].copy_from_slice(&count);
         let rec_size = (AUDIT_EVENT_WIRE_LEN as u32).to_be_bytes();
         out[8..12].copy_from_slice(&rec_size);

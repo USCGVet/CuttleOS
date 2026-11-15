@@ -99,7 +99,17 @@ pub fn load_phdrs_impl(
     hdr: &ElfHeader,
     out: &mut [ElfPhdr; ELF_MAX_PHDRS],
 ) -> Result<usize, ElfError> {
+    const EMPTY_PHDR: ElfPhdr = ElfPhdr {
+        ptype: 0,
+        flags: 0,
+        offset: 0,
+        vaddr: 0,
+        filesz: 0,
+        memsz: 0,
+        align: 0,
+    };
     let phoff = usize::try_from(hdr.phoff).map_err(|_| ElfError::Truncated)?;
+    let mut staged = [EMPTY_PHDR; ELF_MAX_PHDRS];
     let mut count = 0usize;
     let mut i = 0u16;
     while i < hdr.phnum {
@@ -134,14 +144,14 @@ pub fn load_phdrs_impl(
             let new_end = vaddr + memsz;
             let mut prev = 0usize;
             while prev < count {
-                let p_start = out[prev].vaddr;
-                let p_end = p_start + out[prev].memsz;
-                if memsz > 0 && out[prev].memsz > 0 && vaddr < p_end && p_start < new_end {
+                let p_start = staged[prev].vaddr;
+                let p_end = p_start + staged[prev].memsz;
+                if memsz > 0 && staged[prev].memsz > 0 && vaddr < p_end && p_start < new_end {
                     return Err(ElfError::BadPhdrs);
                 }
                 prev += 1;
             }
-            out[count] = ElfPhdr {
+            staged[count] = ElfPhdr {
                 ptype,
                 flags,
                 offset: seg_off,
@@ -154,6 +164,7 @@ pub fn load_phdrs_impl(
         }
         i += 1;
     }
+    out[..count].copy_from_slice(&staged[..count]);
     Ok(count)
 }
 
@@ -571,7 +582,24 @@ mod tests {
         put32(&mut overlap[p2_off..], 4, 6); // PF_R | PF_W
         put64(&mut overlap[p2_off..], 16, ELF_BANNER_ENTRY + 0x80); // overlaps [0x401000, 0x401100)!
         let h_ovl = Elf64Impl::parse_header(&overlap).unwrap();
-        assert_eq!(Elf64Impl::load_phdrs(&overlap, &h_ovl, &mut out), Err(ElfError::BadPhdrs));
+        let sentinel = ElfPhdr {
+            ptype: 0xDEAD_BEEF,
+            flags: 0xAA,
+            offset: 0x11,
+            vaddr: 0x22,
+            filesz: 0x33,
+            memsz: 0x44,
+            align: 0x55,
+        };
+        let mut out_all_or_nothing = [sentinel; ELF_MAX_PHDRS];
+        assert_eq!(
+            Elf64Impl::load_phdrs(&overlap, &h_ovl, &mut out_all_or_nothing),
+            Err(ElfError::BadPhdrs)
+        );
+        assert_eq!(
+            out_all_or_nothing[0], sentinel,
+            "load_phdrs wrote partial phdr[0] before rejecting overlapping phdr[1]"
+        );
     }
 }
 

@@ -185,7 +185,11 @@ pub fn format_resolved(
             v >>= 4;
         }
     }
-    let need = name_bytes.len() + 3 + hex_digits;
+    let need = name_bytes
+        .len()
+        .checked_add(3)
+        .and_then(|v| v.checked_add(hex_digits))
+        .ok_or(usize::MAX)?;
     if out.len() < need {
         return Err(need);
     }
@@ -255,39 +259,24 @@ pub mod elf {
 
     /// Read a u16 little-endian at `off`, bounds-checked.
     fn read_u16(bytes: &[u8], off: usize) -> Result<u16, ElfParseError> {
-        if off + 2 > bytes.len() {
-            return Err(ElfParseError::SectionOob);
-        }
-        Ok(u16::from_le_bytes([bytes[off], bytes[off + 1]]))
+        let end = off.checked_add(2).ok_or(ElfParseError::SectionOob)?;
+        let s = bytes.get(off..end).ok_or(ElfParseError::SectionOob)?;
+        Ok(u16::from_le_bytes([s[0], s[1]]))
     }
 
     /// Read a u32 little-endian at `off`, bounds-checked.
     fn read_u32(bytes: &[u8], off: usize) -> Result<u32, ElfParseError> {
-        if off + 4 > bytes.len() {
-            return Err(ElfParseError::SectionOob);
-        }
-        Ok(u32::from_le_bytes([
-            bytes[off],
-            bytes[off + 1],
-            bytes[off + 2],
-            bytes[off + 3],
-        ]))
+        let end = off.checked_add(4).ok_or(ElfParseError::SectionOob)?;
+        let s = bytes.get(off..end).ok_or(ElfParseError::SectionOob)?;
+        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     }
 
     /// Read a u64 little-endian at `off`, bounds-checked.
     fn read_u64(bytes: &[u8], off: usize) -> Result<u64, ElfParseError> {
-        if off + 8 > bytes.len() {
-            return Err(ElfParseError::SectionOob);
-        }
+        let end = off.checked_add(8).ok_or(ElfParseError::SectionOob)?;
+        let s = bytes.get(off..end).ok_or(ElfParseError::SectionOob)?;
         Ok(u64::from_le_bytes([
-            bytes[off],
-            bytes[off + 1],
-            bytes[off + 2],
-            bytes[off + 3],
-            bytes[off + 4],
-            bytes[off + 5],
-            bytes[off + 6],
-            bytes[off + 7],
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
         ]))
     }
 
@@ -330,7 +319,9 @@ pub mod elf {
         let sh_table_end = e_shoff
             .checked_add(e_shnum.checked_mul(e_shentsize).ok_or(ElfParseError::SectionTableOob)?)
             .ok_or(ElfParseError::SectionTableOob)?;
-        if (sh_table_end as usize) > bytes.len() {
+        let sh_table_end_usize =
+            usize::try_from(sh_table_end).map_err(|_| ElfParseError::SectionTableOob)?;
+        if sh_table_end_usize > bytes.len() {
             return Err(ElfParseError::SectionTableOob);
         }
 
@@ -338,7 +329,8 @@ pub mod elf {
         let mut symtab_idx: Option<u64> = None;
         let mut i = 0u64;
         while i < e_shnum {
-            let off = (e_shoff + i * e_shentsize) as usize;
+            let off_u64 = e_shoff + i * e_shentsize;
+            let off = usize::try_from(off_u64).map_err(|_| ElfParseError::SectionTableOob)?;
             let sh_type = read_u32(bytes, off + 4)?;
             if sh_type == SHT_SYMTAB {
                 symtab_idx = Some(i);
@@ -347,11 +339,15 @@ pub mod elf {
             i += 1;
         }
         let symtab_idx = symtab_idx.ok_or(ElfParseError::NoSymtab)?;
-        let symtab_off = (e_shoff + symtab_idx * e_shentsize) as usize;
-        let sym_file_off = read_u64(bytes, symtab_off + 0x18)? as usize;
-        let sym_size = read_u64(bytes, symtab_off + 0x20)? as usize;
+        let symtab_off = usize::try_from(e_shoff + symtab_idx * e_shentsize)
+            .map_err(|_| ElfParseError::SectionTableOob)?;
+        let sym_file_off = usize::try_from(read_u64(bytes, symtab_off + 0x18)?)
+            .map_err(|_| ElfParseError::SectionOob)?;
+        let sym_size = usize::try_from(read_u64(bytes, symtab_off + 0x20)?)
+            .map_err(|_| ElfParseError::SectionOob)?;
         let sym_link = read_u32(bytes, symtab_off + 0x28)? as u64;
-        let sym_entsize = read_u64(bytes, symtab_off + 0x38)? as usize;
+        let sym_entsize = usize::try_from(read_u64(bytes, symtab_off + 0x38)?)
+            .map_err(|_| ElfParseError::SectionOob)?;
         if sym_entsize < 24 {
             return Err(ElfParseError::SymtabEntsizeTooSmall);
         }
@@ -365,9 +361,12 @@ pub mod elf {
         if sym_link >= e_shnum {
             return Err(ElfParseError::SymtabLinkOob);
         }
-        let str_hdr_off = (e_shoff + sym_link * e_shentsize) as usize;
-        let str_file_off = read_u64(bytes, str_hdr_off + 0x18)? as usize;
-        let str_size = read_u64(bytes, str_hdr_off + 0x20)? as usize;
+        let str_hdr_off = usize::try_from(e_shoff + sym_link * e_shentsize)
+            .map_err(|_| ElfParseError::SectionTableOob)?;
+        let str_file_off = usize::try_from(read_u64(bytes, str_hdr_off + 0x18)?)
+            .map_err(|_| ElfParseError::SectionOob)?;
+        let str_size = usize::try_from(read_u64(bytes, str_hdr_off + 0x20)?)
+            .map_err(|_| ElfParseError::SectionOob)?;
         let str_end = str_file_off
             .checked_add(str_size)
             .ok_or(ElfParseError::SectionOob)?;
@@ -377,6 +376,33 @@ pub mod elf {
         let strtab = &bytes[str_file_off..str_end];
 
         let entry_count = sym_size / sym_entsize;
+        // Pass 1: count valid `STT_FUNC` entries and verify `needed <= out.len()` before mutating `out`.
+        let mut needed = 0usize;
+        let mut k0 = 0usize;
+        while k0 < entry_count {
+            let off = sym_file_off + k0 * sym_entsize;
+            let _ = off.checked_add(24).ok_or(ElfParseError::SectionOob)?;
+            let st_name = read_u32(bytes, off)? as usize;
+            let st_info = *bytes.get(off + 4).ok_or(ElfParseError::SectionOob)?;
+            let st_value = read_u64(bytes, off + 8)?;
+            let _ = read_u64(bytes, off + 16)?;
+            let stt = st_info & 0x0F;
+            if stt == STT_FUNC && st_value != 0 && st_name < strtab.len() {
+                let mut end = st_name;
+                while end < strtab.len() && strtab[end] != 0 {
+                    end += 1;
+                }
+                if end > st_name && core::str::from_utf8(&strtab[st_name..end]).is_ok() {
+                    if needed >= out.len() {
+                        return Err(ElfParseError::BufferOverflow);
+                    }
+                    needed += 1;
+                }
+            }
+            k0 += 1;
+        }
+
+        // Pass 2: emit verified `STT_FUNC` entries (`needed <= out.len()`).
         let mut written = 0usize;
         let mut k = 0usize;
         while k < entry_count {
@@ -386,11 +412,7 @@ pub mod elf {
             let st_value = read_u64(bytes, off + 8)?;
             let st_size = read_u64(bytes, off + 16)?;
             let stt = st_info & 0x0F;
-            if stt != STT_FUNC || st_value == 0 {
-                k += 1;
-                continue;
-            }
-            if st_name >= strtab.len() {
+            if stt != STT_FUNC || st_value == 0 || st_name >= strtab.len() {
                 k += 1;
                 continue;
             }
@@ -402,16 +424,10 @@ pub mod elf {
                 k += 1;
                 continue;
             }
-            let name = match core::str::from_utf8(&strtab[st_name..end]) {
-                Ok(s) => s,
-                Err(_) => {
-                    k += 1;
-                    continue;
-                }
+            let Ok(name) = core::str::from_utf8(&strtab[st_name..end]) else {
+                k += 1;
+                continue;
             };
-            if written >= out.len() {
-                return Err(ElfParseError::BufferOverflow);
-            }
             out[written] = RawSymbolEntry {
                 addr: st_value,
                 size: if st_size > u32::MAX as u64 {
@@ -849,6 +865,26 @@ mod tests {
             elf::parse_symtab_into(&img, &mut out),
             Err(ElfParseError::BufferOverflow)
         );
+    }
+
+    #[test]
+    fn parse_symtab_into_leaves_output_unmodified_on_buffer_overflow() {
+        let img = build_minimal_elf64_with_symtab();
+        let sentinel = RawSymbolEntry {
+            addr: 0xDEAD_BEEF,
+            size: 7,
+            name: "keep",
+        };
+        let mut out = [sentinel; 2];
+        assert_eq!(
+            elf::parse_symtab_into(&img, &mut out),
+            Err(ElfParseError::BufferOverflow)
+        );
+        assert_eq!(
+            out[0].addr, 0xDEAD_BEEF,
+            "parse_symtab_into overwrote out[0] before returning BufferOverflow"
+        );
+        assert_eq!(out[1].addr, 0xDEAD_BEEF);
     }
 
     #[test]

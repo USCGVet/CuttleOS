@@ -381,11 +381,7 @@ impl<const N: usize> RoundRobin<N> {
 
     /// Currently-running task id, or `None` if no task is running.
     pub fn current(&self) -> Option<TaskId> {
-        if self.running == usize::MAX {
-            None
-        } else {
-            Some(self.tasks[self.running].id)
-        }
+        self.tasks.get(self.running).map(|t| t.id)
     }
 
     /// Read-only snapshot of a task by id.

@@ -564,19 +564,16 @@ pub mod x86_pml4 {
     /// the lower levels to the bare-metal kernel's existing builder.
     /// That's a documented partial port — see the module-level docs.
     pub fn serialize_into<const N: usize>(table: &PageTable<N>, out: &mut [u8]) -> usize {
-        debug_assert!(out.len() >= PML4_BYTES, "buffer too small for PML4");
-        // Zero the buffer first.
-        for byte in out.iter_mut().take(PML4_BYTES) {
-            *byte = 0;
+        if out.len() < PML4_BYTES {
+            return 0;
         }
+        // Zero the buffer first.
+        out[..PML4_BYTES].fill(0);
         let max = core::cmp::min(table.count, 512);
         for i in 0..max {
             let (_va, pte) = table.entries[i];
             let off = i * 8;
-            let bytes = pte.to_le_bytes();
-            for b in 0..8 {
-                out[off + b] = bytes[b];
-            }
+            out[off..off + 8].copy_from_slice(&pte.to_le_bytes());
         }
         max
     }
@@ -1223,5 +1220,13 @@ mod tests {
             ),
             Err(x86_pml4::IsolatedUserLayoutError::InvalidUserVa)
         );
+    }
+
+    #[test]
+    fn serialize_into_short_buffer_returns_zero_without_panicking_or_writing() {
+        let t = build_synthetic_kernel_l4();
+        let mut short = [0xAAu8; 64];
+        assert_eq!(x86_pml4::serialize_into(&t, &mut short), 0);
+        assert_eq!(short, [0xAAu8; 64]);
     }
 }
