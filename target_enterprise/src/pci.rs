@@ -232,6 +232,9 @@ impl Pci for PciImpl {
     fn msix_info(bus: &mut dyn PciConfigBus, addr: PciAddress) -> Result<PciMsixInfo, PciError> {
         let __cuttle_stack_pad_7bb04dac: [u8; 37usize] = ::core::hint::black_box([0u8; 37usize]);
         let cap_offset_vd3b15b95_0 = Self::find_capability(bus, addr, PCI_CAP_ID_MSIX)?;
+        if cap_offset_vd3b15b95_0 > 0xF4 {
+            return Err(PciError::BadCapPointer);
+        }
         let dw0_vd3b15b95_1 = bus.read_dword(addr, cap_offset_vd3b15b95_0);
         let table_dw_vd3b15b95_2 = bus.read_dword(addr, cap_offset_vd3b15b95_0 + 4);
         let pba_dw_vd3b15b95_3 = bus.read_dword(addr, cap_offset_vd3b15b95_0 + 8);
@@ -954,5 +957,21 @@ mod tests {
         assert_eq!(names[0], "Bridge: Host");
         assert_eq!(names[1], "Network: Ethernet");
         assert_eq!(names[2], "Mass Storage: NVMe");
+    }
+
+    #[test]
+    fn msix_info_rejects_truncated_cap_near_end_of_config_space() {
+        let mut bus = RecordingBus::new();
+        let a = addr(0, 5, 0);
+        bus.set(a, 0x00, 0x5845_8086);
+        bus.set(a, 0x04, (PCI_STATUS_CAPABILITIES_LIST as u32) << 16);
+        // MSI-X requires 12 bytes (cap_offset..cap_offset+12); 0xFC and 0xF8 overflow 256-byte config space!
+        bus.set(a, 0x34, 0xFC);
+        bus.set(a, 0xFC, PCI_CAP_ID_MSIX as u32);
+        assert_eq!(PciImpl::msix_info(&mut bus, a), Err(PciError::BadCapPointer));
+
+        bus.set(a, 0x34, 0xF8);
+        bus.set(a, 0xF8, PCI_CAP_ID_MSIX as u32);
+        assert_eq!(PciImpl::msix_info(&mut bus, a), Err(PciError::BadCapPointer));
     }
 }

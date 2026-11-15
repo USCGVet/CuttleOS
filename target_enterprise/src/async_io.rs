@@ -321,6 +321,14 @@ pub fn enable_pci_msi(
     let ctrl = (dw0 >> 16) as u16;
     let is_64 = (ctrl & MSI_CTRL_64BIT) != 0;
     let has_pvm = (ctrl & MSI_CTRL_PVM) != 0;
+    let needed_bytes: usize = match (is_64, has_pvm) {
+        (true, true) => 20,
+        (true, false) | (false, true) => 16,
+        (false, false) => 12,
+    };
+    if (cap as usize) + needed_bytes > 256 {
+        return Err(PciError::BadCapPointer);
+    }
 
     // Disable MSI while updating Message Address / Data registers.
     let disabled_ctrl = (ctrl & !MSI_CTRL_MME_MASK) & !MSI_CTRL_ENABLE;
@@ -372,10 +380,13 @@ pub fn discover_pci_msix(
     if bar_phys == 0 {
         return Err(PciError::EmptyBar);
     }
+    let table_phys_base = bar_phys
+        .checked_add(info.table_offset as u64)
+        .ok_or(PciError::BadCapPointer)?;
     Ok(MsixTableLoc {
         cap_offset: info.cap_offset,
         table_size: info.table_size,
-        table_phys_base: bar_phys.wrapping_add(info.table_offset as u64),
+        table_phys_base,
     })
 }
 
@@ -613,5 +624,26 @@ mod tests {
         ring.cancel_timed_out(tags[1]).expect("cancel tag 1");
         assert_eq!(ring.timeouts, 1);
         assert_eq!(ring.inflight_count(), 5);
+    }
+
+    #[test]
+    fn enable_pci_msi_rejects_truncated_cap_without_writing_config_space() {
+        let mut bus = MockPciConfig::new();
+        bus.set_dw(0x00, 0x2922_8086);
+        bus.set_dw(0x04, (PCI_STATUS_CAPABILITIES_LIST as u32) << 16);
+        // 64-bit + PVM MSI requires 20 bytes; at 0xF0, 0xF0 + 20 = 260 > 256!
+        bus.set_dw(0x34, 0xF0);
+        let ctrl: u16 = MSI_CTRL_64BIT | MSI_CTRL_PVM;
+        bus.set_dw(0xF0, (PCI_CAP_ID_MSI as u32) | ((ctrl as u32) << 16));
+        let before = bus.regs;
+
+        assert_eq!(
+            enable_pci_msi(&mut bus, DEV, 2, MSI_VECTOR_BLOCK),
+            Err(PciError::BadCapPointer)
+        );
+        assert_eq!(
+            bus.regs, before,
+            "enable_pci_msi must not wrap or mutate PCI config space on truncated MSI capability"
+        );
     }
 }

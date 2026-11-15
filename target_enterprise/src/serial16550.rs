@@ -27,13 +27,13 @@ impl Serial16550 for Serial16550Impl {
 
 /// Locked init sequence matching kernel `serial_init`.
 pub fn init_impl(port: &mut dyn IoPort, base: u16) -> usize {
-    port.write_u8(base + SERIAL_IER_OFF, 0x00);
-    port.write_u8(base + SERIAL_LCR_OFF, SERIAL_LCR_DLAB);
-    port.write_u8(base + 0, SERIAL_DIVISOR_LO_38400);
-    port.write_u8(base + SERIAL_IER_OFF, SERIAL_DIVISOR_HI_38400);
-    port.write_u8(base + SERIAL_LCR_OFF, SERIAL_LCR_8N1);
-    port.write_u8(base + SERIAL_FCR_OFF, SERIAL_FCR_INIT);
-    port.write_u8(base + SERIAL_MCR_OFF, SERIAL_MCR_INIT);
+    port.write_u8(base.wrapping_add(SERIAL_IER_OFF), 0x00);
+    port.write_u8(base.wrapping_add(SERIAL_LCR_OFF), SERIAL_LCR_DLAB);
+    port.write_u8(base, SERIAL_DIVISOR_LO_38400);
+    port.write_u8(base.wrapping_add(SERIAL_IER_OFF), SERIAL_DIVISOR_HI_38400);
+    port.write_u8(base.wrapping_add(SERIAL_LCR_OFF), SERIAL_LCR_8N1);
+    port.write_u8(base.wrapping_add(SERIAL_FCR_OFF), SERIAL_FCR_INIT);
+    port.write_u8(base.wrapping_add(SERIAL_MCR_OFF), SERIAL_MCR_INIT);
     SERIAL_INIT_WRITES
 }
 
@@ -41,7 +41,7 @@ pub fn write_byte_impl(port: &mut dyn IoPort, base: u16, byte: u8) {
     // Spin until THRE (tests script LSR with THRE set).
     let mut spins = 0u32;
     loop {
-        let lsr = port.read_u8(base + SERIAL_LSR_OFF);
+        let lsr = port.read_u8(base.wrapping_add(SERIAL_LSR_OFF));
         if lsr & SERIAL_LSR_THRE != 0 {
             break;
         }
@@ -58,13 +58,13 @@ pub fn write_byte_impl(port: &mut dyn IoPort, base: u16, byte: u8) {
 pub fn expected_com1_init() -> [(u16, u8); SERIAL_INIT_WRITES] {
     let b = SERIAL_COM1;
     [
-        (b + SERIAL_IER_OFF, 0x00),
-        (b + SERIAL_LCR_OFF, SERIAL_LCR_DLAB),
+        (b.wrapping_add(SERIAL_IER_OFF), 0x00),
+        (b.wrapping_add(SERIAL_LCR_OFF), SERIAL_LCR_DLAB),
         (b, SERIAL_DIVISOR_LO_38400),
-        (b + SERIAL_IER_OFF, SERIAL_DIVISOR_HI_38400),
-        (b + SERIAL_LCR_OFF, SERIAL_LCR_8N1),
-        (b + SERIAL_FCR_OFF, SERIAL_FCR_INIT),
-        (b + SERIAL_MCR_OFF, SERIAL_MCR_INIT),
+        (b.wrapping_add(SERIAL_IER_OFF), SERIAL_DIVISOR_HI_38400),
+        (b.wrapping_add(SERIAL_LCR_OFF), SERIAL_LCR_8N1),
+        (b.wrapping_add(SERIAL_FCR_OFF), SERIAL_FCR_INIT),
+        (b.wrapping_add(SERIAL_MCR_OFF), SERIAL_MCR_INIT),
     ]
 }
 

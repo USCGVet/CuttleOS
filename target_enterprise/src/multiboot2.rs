@@ -35,12 +35,23 @@ pub fn walk_impl(info: &[u8], out: &mut [Mb2Tag; MB2_MAX_TAGS]) -> Result<usize,
     if total < MB2_HEADER_LEN || total > info.len() {
         return Err(Mb2Error::BadSize);
     }
+    let mut staged = [Mb2Tag {
+        typ: 0,
+        size: 0,
+        offset: 0,
+    }; MB2_MAX_TAGS];
     let mut off = MB2_HEADER_LEN;
     let mut count = 0usize;
-    while off + MB2_TAG_HDR_LEN <= total {
+    while off
+        .checked_add(MB2_TAG_HDR_LEN)
+        .is_some_and(|end| end <= total)
+    {
         let typ = le32(info, off);
         let size = le32(info, off + 4) as usize;
-        if size < MB2_TAG_HDR_LEN || off + size > total {
+        let Some(tag_end) = off.checked_add(size) else {
+            return Err(Mb2Error::BadSize);
+        };
+        if size < MB2_TAG_HDR_LEN || tag_end > total {
             return Err(Mb2Error::BadSize);
         }
         if typ == MB2_TAG_END {
@@ -49,19 +60,19 @@ pub fn walk_impl(info: &[u8], out: &mut [Mb2Tag; MB2_MAX_TAGS]) -> Result<usize,
         if count >= MB2_MAX_TAGS {
             return Err(Mb2Error::TooMany);
         }
-        out[count] = Mb2Tag {
+        staged[count] = Mb2Tag {
             typ,
             size: size as u32,
             offset: off,
         };
         count += 1;
-        // 8-byte align next tag
-        let mut next = off + size;
-        while next % 8 != 0 {
-            next += 1;
-        }
+        // 8-byte align next tag without overflow.
+        let Some(next) = tag_end.checked_add(7).map(|n| n & !7usize) else {
+            return Err(Mb2Error::BadSize);
+        };
         off = next;
     }
+    out[..count].copy_from_slice(&staged[..count]);
     Ok(count)
 }
 
@@ -334,5 +345,30 @@ mod tests {
     #[test]
     fn det2() {
         assert_eq!(fix(), fix());
+    }
+
+    #[test]
+    fn walk_leaves_output_unmodified_on_bad_tail_tag_or_too_many() {
+        let mut img = [0u8; 48];
+        put32(&mut img, 0, 48);
+        put32(&mut img, 4, 0);
+        // Tag 0 at offset 8: valid meminfo tag (size=16)
+        put32(&mut img, 8, MB2_TAG_BASIC_MEMINFO);
+        put32(&mut img, 12, 16);
+        // Tag 1 at offset 24: invalid size=4 (< MB2_TAG_HDR_LEN)
+        put32(&mut img, 24, MB2_TAG_MMAP);
+        put32(&mut img, 28, 4);
+
+        let sentinel = [Mb2Tag {
+            typ: 0xDEAD,
+            size: 0xBEEF,
+            offset: 0xCAFE,
+        }; MB2_MAX_TAGS];
+        let mut out = sentinel;
+        assert_eq!(Multiboot2Impl::walk(&img, &mut out), Err(Mb2Error::BadSize));
+        assert_eq!(
+            out, sentinel,
+            "walk must not leave partial tags in out when a subsequent tag fails validation"
+        );
     }
 }

@@ -508,13 +508,12 @@ impl BlockDeviceVirtio for VirtioBlk {
         }
         // Remember the read-only bit even though it's not in the
         // seed mask — write_block needs to reject preemptively.
-        self.read_only = offered & feat::RO != 0;
+        let read_only = offered & feat::RO != 0;
 
         // Accept the intersection of what we want + what's offered,
         // plus the required bits.
         let accepted = (offered & feat::SEED_FEATURE_MASK) | feat::SEED_REQUIRED_MASK;
         Self::write_driver_features(bus, accepted);
-        self.negotiated_features = accepted;
 
         // Step 5: write FEATURES_OK, read back to confirm.
         let with_features_ok =
@@ -530,13 +529,15 @@ impl BlockDeviceVirtio for VirtioBlk {
 
         // Step 6: read capacity (always present) and blk_size if
         // negotiated.
-        self.capacity_sectors = Self::read_device_capacity(bus);
-        if accepted & feat::BLK_SIZE != 0 {
-            self.preferred_block_size = Self::read_device_blk_size(bus);
-        }
+        let capacity_sectors = Self::read_device_capacity(bus);
+        let preferred_block_size = if accepted & feat::BLK_SIZE != 0 {
+            Self::read_device_blk_size(bus)
+        } else {
+            0
+        };
 
         // Step 7: configure the single request queue.
-        self.notify_off = Self::configure_queue(
+        let notify_off = Self::configure_queue(
             bus,
             VIRTIO_BLK_QUEUE_REQUESTQ,
             PHYS_REQ_DESC,
@@ -561,6 +562,11 @@ impl BlockDeviceVirtio for VirtioBlk {
         let idx = 0u16.to_le_bytes();
         bus.dma_write(PHYS_REQ_AVAIL + 2, &idx);
 
+        self.read_only = read_only;
+        self.negotiated_features = accepted;
+        self.capacity_sectors = capacity_sectors;
+        self.preferred_block_size = preferred_block_size;
+        self.notify_off = notify_off;
         self.initialised = true;
         Ok(())
     }
@@ -836,13 +842,21 @@ impl MemVirtioBlkBus {
         &self.observations[..self.observations_len]
     }
 
+    fn checked_sector_range(sector: u64) -> Option<(usize, usize)> {
+        let sec = usize::try_from(sector).ok()?;
+        let off = sec.checked_mul(VIRTIO_BLK_SECTOR_SIZE)?;
+        let end = off.checked_add(VIRTIO_BLK_SECTOR_SIZE)?;
+        if end > Self::DISK_BYTES {
+            return None;
+        }
+        Some((off, end))
+    }
+
     /// Borrow the backing-disk bytes for sector `sector`.
     pub fn disk_sector(&self, sector: u64) -> &[u8] {
-        let off = (sector as usize) * VIRTIO_BLK_SECTOR_SIZE;
-        let end = off + VIRTIO_BLK_SECTOR_SIZE;
-        if end > Self::DISK_BYTES {
+        let Some((off, end)) = Self::checked_sector_range(sector) else {
             return &self.disk[0..0];
-        }
+        };
         &self.disk[off..end]
     }
 
@@ -852,11 +866,9 @@ impl MemVirtioBlkBus {
         if data.len() != VIRTIO_BLK_SECTOR_SIZE {
             return false;
         }
-        let off = (sector as usize) * VIRTIO_BLK_SECTOR_SIZE;
-        let end = off + VIRTIO_BLK_SECTOR_SIZE;
-        if end > Self::DISK_BYTES {
+        let Some((off, end)) = Self::checked_sector_range(sector) else {
             return false;
-        }
+        };
         self.disk[off..end].copy_from_slice(data);
         true
     }
@@ -929,30 +941,26 @@ impl MemVirtioBlkBus {
             match header.req_type {
                 req_type::IN => {
                     // Bounds-check the sector against the disk.
-                    let off = (header.sector as usize) * VIRTIO_BLK_SECTOR_SIZE;
-                    let end = off + VIRTIO_BLK_SECTOR_SIZE;
-                    if end > Self::DISK_BYTES {
-                        st::IOERR
-                    } else {
+                    if let Some((off, end)) = Self::checked_sector_range(header.sector) {
                         let mut buf = [0u8; VIRTIO_BLK_SECTOR_SIZE];
                         buf.copy_from_slice(&self.disk[off..end]);
                         // Honour data descriptor's len cap (clamped at 512).
                         let take = core::cmp::min(data_desc.len as usize, VIRTIO_BLK_SECTOR_SIZE);
                         self.write_shadow(data_desc.addr, &buf[..take]);
                         st::OK
+                    } else {
+                        st::IOERR
                     }
                 }
                 req_type::OUT => {
-                    let off = (header.sector as usize) * VIRTIO_BLK_SECTOR_SIZE;
-                    let end = off + VIRTIO_BLK_SECTOR_SIZE;
-                    if end > Self::DISK_BYTES {
-                        st::IOERR
-                    } else {
+                    if let Some((off, end)) = Self::checked_sector_range(header.sector) {
                         let mut buf = [0u8; VIRTIO_BLK_SECTOR_SIZE];
                         let take = core::cmp::min(data_desc.len as usize, VIRTIO_BLK_SECTOR_SIZE);
                         self.read_shadow(data_desc.addr, &mut buf[..take]);
                         self.disk[off..end].copy_from_slice(&buf);
                         st::OK
+                    } else {
+                        st::IOERR
                     }
                 }
                 req_type::FLUSH => st::OK,
@@ -997,20 +1005,27 @@ impl MemVirtioBlkBus {
     }
 
     fn read_shadow(&self, phys: u64, out: &mut [u8]) {
-        let start = phys as usize;
-        let end = start.saturating_add(out.len());
+        let Some((start, end)) = usize::try_from(phys)
+            .ok()
+            .and_then(|s| s.checked_add(out.len()).map(|e| (s, e)))
+        else {
+            out.fill(0);
+            return;
+        };
         if end > MEM_BUS_BYTES {
-            for b in out.iter_mut() {
-                *b = 0;
-            }
+            out.fill(0);
             return;
         }
         out.copy_from_slice(&self.shadow[start..end]);
     }
 
     fn write_shadow(&mut self, phys: u64, data: &[u8]) {
-        let start = phys as usize;
-        let end = start.saturating_add(data.len());
+        let Some((start, end)) = usize::try_from(phys)
+            .ok()
+            .and_then(|s| s.checked_add(data.len()).map(|e| (s, e)))
+        else {
+            return;
+        };
         if end > MEM_BUS_BYTES {
             return;
         }
@@ -1759,6 +1774,21 @@ mod tests {
         drv.read_block(&mut bus, 1, &mut buf)
             .expect("VirtioBlk must advance used_seen and recover on next request");
         assert_eq!(buf, sector_data);
+    }
+
+    #[test]
+    fn failed_init_leaves_driver_unmutated_and_overflow_sector_fails_cleanly() {
+        let (mut drv, mut bus) = fresh();
+        bus.set_device_features(feat::VERSION_1 | feat::RO | feat::BLK_SIZE);
+        bus.set_queue_size(1); // < QUEUE_SIZE -> QueueTooSmall at Step 7!
+        assert_eq!(drv.init(&mut bus), Err(VirtBlkError::QueueTooSmall));
+        assert!(!drv.is_initialised());
+        assert_eq!(drv.negotiated_features(), 0);
+        assert_eq!(drv.preferred_block_size(), 0);
+        assert!(!drv.read_only());
+
+        assert!(!bus.plant_sector(u64::MAX, &[0u8; VIRTIO_BLK_SECTOR_SIZE]));
+        assert_eq!(bus.disk_sector(u64::MAX).len(), 0);
     }
 }
 

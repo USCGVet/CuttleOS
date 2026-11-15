@@ -465,7 +465,6 @@ impl NetDevice for VirtioNet {
         // plus the required bits.
         let accepted = (offered & feat::SEED_FEATURE_MASK) | feat::SEED_REQUIRED_MASK;
         Self::write_driver_features(bus, accepted);
-        self.negotiated_features = accepted;
 
         // Step 5: write FEATURES_OK, read back to confirm.
         let with_features_ok = virtio_status::ACK | virtio_status::DRIVER | virtio_status::FEATURES_OK;
@@ -483,21 +482,22 @@ impl NetDevice for VirtioNet {
         for i in 0..6 {
             mac[i] = bus.read_device_u8(i);
         }
-        self.mac = mac;
-        if accepted & feat::STATUS != 0 {
+        let link_up = if accepted & feat::STATUS != 0 {
             let status_word = bus.read_device_u16(6);
-            self.link_up = status_word & virtio_net_status::LINK_UP != 0;
-        }
+            status_word & virtio_net_status::LINK_UP != 0
+        } else {
+            false
+        };
 
         // Step 7: configure queues. RX = 0, TX = 1.
-        self.rx_notify_off = Self::configure_queue(
+        let rx_notify_off = Self::configure_queue(
             bus,
             VIRTIO_NET_QUEUE_RX,
             PHYS_RX_DESC,
             PHYS_RX_AVAIL,
             PHYS_RX_USED,
         )?;
-        self.tx_notify_off = Self::configure_queue(
+        let tx_notify_off = Self::configure_queue(
             bus,
             VIRTIO_NET_QUEUE_TX,
             PHYS_TX_DESC,
@@ -525,6 +525,11 @@ impl NetDevice for VirtioNet {
         let tx_idx = 0u16.to_le_bytes();
         bus.dma_write(PHYS_TX_AVAIL + 2, &tx_idx);
 
+        self.negotiated_features = accepted;
+        self.mac = mac;
+        self.link_up = link_up;
+        self.rx_notify_off = rx_notify_off;
+        self.tx_notify_off = tx_notify_off;
         self.initialised = true;
         Ok(())
     }
@@ -1055,21 +1060,27 @@ impl MemVirtioBus {
     }
 
     fn read_shadow(&self, phys: u64, out: &mut [u8]) {
-        let start = phys as usize;
-        let end = start.saturating_add(out.len());
+        let Some((start, end)) = usize::try_from(phys)
+            .ok()
+            .and_then(|s| s.checked_add(out.len()).map(|e| (s, e)))
+        else {
+            out.fill(0);
+            return;
+        };
         if end > MEM_BUS_BYTES {
-            // Out-of-range read — fill with zeros. Tests will catch.
-            for b in out.iter_mut() {
-                *b = 0;
-            }
+            out.fill(0);
             return;
         }
         out.copy_from_slice(&self.shadow[start..end]);
     }
 
     fn write_shadow(&mut self, phys: u64, data: &[u8]) {
-        let start = phys as usize;
-        let end = start.saturating_add(data.len());
+        let Some((start, end)) = usize::try_from(phys)
+            .ok()
+            .and_then(|s| s.checked_add(data.len()).map(|e| (s, e)))
+        else {
+            return;
+        };
         if end > MEM_BUS_BYTES {
             return;
         }
@@ -1818,5 +1829,16 @@ mod tests {
         let n = drv.receive(&mut bus, &mut out).expect("recover after malformed RX entries");
         assert_eq!(n, 64);
         assert_eq!(&out[..64], &valid_payload[..]);
+    }
+
+    #[test]
+    fn failed_init_leaves_driver_unmutated() {
+        let mut bus = MemVirtioBus::new();
+        bus.set_queue_size(1); // < QUEUE_SIZE -> QueueTooSmall at Step 7!
+        let mut drv = VirtioNet::new();
+        assert_eq!(drv.init(&mut bus), Err(NetDeviceError::QueueTooSmall));
+        assert!(!drv.is_initialised());
+        assert_eq!(drv.negotiated_features(), 0);
+        assert!(!drv.link_up());
     }
 }

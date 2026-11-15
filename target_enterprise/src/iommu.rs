@@ -442,7 +442,9 @@ impl<const D: usize, const V: usize, const E: usize> Iommu for IommuImpl<D, V, E
             .resolve_domain(domain)
             .ok_or(IommuError::UnknownDomain)?;
         // Map dma_addr into the flat entry table by page-frame index.
-        let pfn = (dma_addr >> PAGE_SHIFT) as usize;
+        let Ok(pfn) = usize::try_from(dma_addr >> PAGE_SHIFT) else {
+            return Err(IommuError::BadAddress);
+        };
         if pfn >= E {
             return Err(IommuError::BadAddress);
         }
@@ -465,7 +467,9 @@ impl<const D: usize, const V: usize, const E: usize> Iommu for IommuImpl<D, V, E
         let slot = self
             .resolve_domain(domain)
             .ok_or(IommuError::UnknownDomain)?;
-        let pfn = (dma_addr >> PAGE_SHIFT) as usize;
+        let Ok(pfn) = usize::try_from(dma_addr >> PAGE_SHIFT) else {
+            return Err(IommuError::BadAddress);
+        };
         if pfn >= E {
             return Err(IommuError::BadAddress);
         }
@@ -498,7 +502,9 @@ impl<const D: usize, const V: usize, const E: usize> Iommu for IommuImpl<D, V, E
         // Step 2: page-table walk. For the flat single-level model
         // the "walk" is one indexed lookup; the contract is the same
         // for a future multi-level morph candidate.
-        let pfn = (dma_addr >> PAGE_SHIFT) as usize;
+        let Ok(pfn) = usize::try_from(dma_addr >> PAGE_SHIFT) else {
+            return Err(IommuError::Unmapped);
+        };
         if pfn >= E {
             return Err(IommuError::Unmapped);
         }
@@ -662,7 +668,10 @@ pub mod dmar {
         };
 
         let mut cursor = DMAR_OFF_FIRST_STRUCT;
-        while cursor + STRUCT_HDR_LEN <= table.len() {
+        while cursor
+            .checked_add(STRUCT_HDR_LEN)
+            .is_some_and(|end| end <= table.len())
+        {
             // u16 LE reads â€” we use safe slice indexing here because
             // the structural walker doesn't need raw pointer reads
             // once the buffer is a `&[u8]`.
@@ -950,6 +959,9 @@ pub mod vtd_hw {
             || ((ctx_hi >> 8) & 0xFFFF) == 0
         {
             return Err(IommuError::DeviceNotBound);
+        }
+        if (iova >> 48) != 0 {
+            return Err(IommuError::Unmapped);
         }
 
         let req_bit = match access {
@@ -1872,6 +1884,81 @@ mod tests {
         assert_eq!(
             enable_drhd_translation_hw(&mut s_te, 0x4000, 8),
             Err(VtdDrhdError::TranslationEnableTimeout)
+        );
+    }
+
+    #[test]
+    fn verify_vtd_dma_access_rejects_non_canonical_high_iova_above_48_bits() {
+        use super::vtd_hw::*;
+        let mut root_4k = [0u8; 4096];
+        let mut ctx_4k = [0u8; 4096];
+        let ctx_pa = 0x50_1000u64;
+        let pml4_pa = 0x50_2000u64;
+        let pdpt_pa = 0x50_3000u64;
+        let pd_pa = 0x50_4000u64;
+        let pt_pa = 0x50_5000u64;
+        root_4k[0..16].copy_from_slice(&encode_root_entry(ctx_pa).unwrap());
+        let dev = DeviceId::from_bdf(0, 0, 1, 0);
+        ctx_4k[8 * 16..8 * 16 + 16]
+            .copy_from_slice(&encode_context_entry(pml4_pa, 1).unwrap());
+
+        let mut pml4 = [0u64; 512];
+        let mut pdpt = [0u64; 512];
+        let mut pd = [0u64; 512];
+        let mut pt = [0u64; 512];
+        let rw = PagePerms(PagePerms::READ.0 | PagePerms::WRITE.0);
+        build_confined_slpt_4level(
+            &mut pml4,
+            &mut pdpt,
+            &mut pd,
+            &mut pt,
+            pdpt_pa,
+            pd_pa,
+            pt_pa,
+            0x20_0000,
+            0x4000,
+            rw,
+        )
+        .unwrap();
+
+        // Low 48-bit IOVA succeeds, whereas setting bit 48 (outside 48-bit 4-level AGAW) must NOT alias 0x20_0000!
+        assert_eq!(
+            verify_vtd_dma_access(
+                &root_4k,
+                &ctx_4k,
+                ctx_pa,
+                pml4_pa,
+                &pml4,
+                &pdpt,
+                &pd,
+                &pt,
+                pdpt_pa,
+                pd_pa,
+                pt_pa,
+                dev,
+                0x20_0000,
+                AccessKind::Read,
+            ),
+            Ok(0x20_0000)
+        );
+        assert_eq!(
+            verify_vtd_dma_access(
+                &root_4k,
+                &ctx_4k,
+                ctx_pa,
+                pml4_pa,
+                &pml4,
+                &pdpt,
+                &pd,
+                &pt,
+                pdpt_pa,
+                pd_pa,
+                pt_pa,
+                dev,
+                (1u64 << 48) | 0x20_0000,
+                AccessKind::Read,
+            ),
+            Err(IommuError::Unmapped)
         );
     }
 }

@@ -120,10 +120,10 @@ pub fn parse_rsdp_any(bytes: &[u8]) -> Result<RsdpAny, RsdpError> {
 /// and return the byte offset of the first checksum-valid `RSDP`.
 pub fn scan_bios_rsdp_offset(window: &[u8]) -> Option<usize> {
     let mut off = 0usize;
-    while off + RSDP_V1_LEN <= window.len() {
+    while off.checked_add(RSDP_V1_LEN).is_some_and(|end| end <= window.len()) {
         if &window[off..off + 8] == RSDP_SIG.as_slice() {
             let rev = window[off + 15];
-            let ok = if rev >= 2 && off + RSDP_V2_LEN <= window.len() {
+            let ok = if rev >= 2 && off.checked_add(RSDP_V2_LEN).is_some_and(|end| end <= window.len()) {
                 parse_rsdp_any(&window[off..]).is_ok()
             } else if rev < 2 {
                 parse_v1_impl(&window[off..off + RSDP_V1_LEN]).is_ok()
@@ -134,7 +134,10 @@ pub fn scan_bios_rsdp_offset(window: &[u8]) -> Option<usize> {
                 return Some(off);
             }
         }
-        off += 16;
+        off = match off.checked_add(16) {
+            Some(next) => next,
+            None => break,
+        };
     }
     None
 }

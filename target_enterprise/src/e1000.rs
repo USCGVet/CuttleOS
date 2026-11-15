@@ -276,12 +276,12 @@ impl E1000Impl {
 
     /// Physical address of the TX buffer at slot `idx`.
     pub fn tx_buf_addr(&self, idx: usize) -> u64 {
-        self.tx_bufs[idx].as_ptr() as u64
+        self.tx_bufs.get(idx).map_or(0, |b| b.as_ptr() as u64)
     }
 
     /// Physical address of the RX buffer at slot `idx`.
     pub fn rx_buf_addr(&self, idx: usize) -> u64 {
-        self.rx_bufs[idx].as_ptr() as u64
+        self.rx_bufs.get(idx).map_or(0, |b| b.as_ptr() as u64)
     }
 
     /// Cached MAC address from the most recent `init`.
@@ -481,6 +481,8 @@ impl EthernetController for E1000Impl {
         bus: &mut dyn MmioRegBus,
         mac_out: &mut [u8; 6],
     ) -> Result<(), E1000Error> {
+        self.initialised = false;
+        self.link = LinkState::Down;
         Self::reset(bus)?;
         let mac = Self::read_mac_from_eeprom(bus)?;
         // Bring the link up by setting CTRL.SLU.
@@ -494,12 +496,13 @@ impl EthernetController for E1000Impl {
         if status == MMIO_FAULT_SENTINEL {
             return Err(E1000Error::MmioFault);
         }
-        self.link = Self::decode_link(status);
+        let link = Self::decode_link(status);
         // Program descriptor rings.
         self.program_rings(bus);
         // Confirm IMS is masked. We don't take device interrupts in
         // the seed driver — polling is the contract.
         bus.write_u32(E1000_REG_IMS, 0);
+        self.link = link;
         self.mac = mac;
         *mac_out = mac;
         self.initialised = true;
@@ -943,19 +946,25 @@ impl MemMmioBus {
     }
 
     fn shadow_u32_write(&mut self, off: usize, v: u32) {
-        if off + 4 > MEM_MMIO_BYTES {
+        let Some(end) = off.checked_add(4) else {
+            return;
+        };
+        if end > MEM_MMIO_BYTES {
             return;
         }
         let bytes = v.to_le_bytes();
-        self.shadow[off..off + 4].copy_from_slice(&bytes);
+        self.shadow[off..end].copy_from_slice(&bytes);
     }
 
     fn shadow_u32_read(&self, off: usize) -> u32 {
-        if off + 4 > MEM_MMIO_BYTES {
+        let Some(end) = off.checked_add(4) else {
+            return 0;
+        };
+        if end > MEM_MMIO_BYTES {
             return 0;
         }
         let mut b = [0u8; 4];
-        b.copy_from_slice(&self.shadow[off..off + 4]);
+        b.copy_from_slice(&self.shadow[off..end]);
         u32::from_le_bytes(b)
     }
 }
@@ -1097,61 +1106,46 @@ pub fn build_banner_frame() -> [u8; 64] {
 /// ring wraparound, length field, EOP flag) the assertions panic
 /// inside this fn — surfacing the failure in the QEMU log as a
 /// `PANIC` banner instead of the expected `E1000 ...` lines.
-pub fn run_banner_round_trip() -> ([u8; 6], usize) {
+/// Fallible version of [`run_banner_round_trip`] returning an explicit [`E1000Error`]
+/// on any EEPROM, link, TX, or RX round-trip mismatch.
+pub fn try_run_banner_round_trip() -> Result<([u8; 6], usize), E1000Error> {
     let mut driver = E1000Impl::new();
     let mut bus = MemMmioBus::new(BANNER_MAC);
     let mut mac = [0u8; 6];
-    match driver.init(&mut bus, &mut mac) {
-        Ok(()) => {}
-        Err(_) => panic!("e1000: init failed"),
-    }
-    if mac != BANNER_MAC {
-        panic!("e1000: MAC drift");
-    }
-    if driver.mac_address() != BANNER_MAC {
-        panic!("e1000: cached MAC drift");
+    driver.init(&mut bus, &mut mac)?;
+    if mac != BANNER_MAC || driver.mac_address() != BANNER_MAC {
+        return Err(E1000Error::MacReadFailed);
     }
     if driver.link_state() != LinkState::Up1000 {
-        panic!("e1000: link state drift");
+        return Err(E1000Error::NoLink);
     }
     let frame = build_banner_frame();
-    match driver.transmit(&mut bus, &frame) {
-        Ok(()) => {}
-        Err(_) => panic!("e1000: transmit failed"),
-    }
-    // The bus captured the frame — assert byte-equivalence.
+    driver.transmit(&mut bus, &frame)?;
     let caps = bus.tx_captures();
-    if caps.len() != 1 || caps[0].len != frame.len() {
-        panic!("e1000: TX capture count or length drift");
+    if caps.len() != 1 || caps[0].len != frame.len() || caps[0].bytes[..frame.len()] != frame[..] {
+        return Err(E1000Error::BadDescriptor);
     }
-    let mut tx_ok = true;
-    for i in 0..frame.len() {
-        if caps[0].bytes[i] != frame[i] {
-            tx_ok = false;
-            break;
-        }
-    }
-    if !tx_ok {
-        panic!("e1000: TX capture byte drift");
-    }
-    // Inject the same frame into RX and round-trip.
     if bus.inject_rx_frame(&frame).is_err() {
-        panic!("e1000: RX inject failed");
+        return Err(E1000Error::RingFull);
     }
     let mut rx_buf = [0u8; 64];
-    let rx_len = match driver.receive(&mut bus, &mut rx_buf) {
-        Ok(Some(n)) => n,
-        _ => panic!("e1000: receive failed"),
+    let Some(rx_len) = driver.receive(&mut bus, &mut rx_buf)? else {
+        return Err(E1000Error::BadDescriptor);
     };
-    if rx_len != frame.len() {
-        panic!("e1000: RX length drift");
+    if rx_len != frame.len() || rx_buf[..rx_len] != frame[..] {
+        return Err(E1000Error::BadDescriptor);
     }
-    for i in 0..rx_len {
-        if rx_buf[i] != frame[i] {
-            panic!("e1000: RX byte drift");
-        }
+    Ok((mac, rx_len))
+}
+
+/// Run the locked TASK-056 banner sequence and assert success.
+pub fn run_banner_round_trip() -> ([u8; 6], usize) {
+    let res = try_run_banner_round_trip();
+    assert!(res.is_ok(), "e1000: banner round-trip failed");
+    match res {
+        Ok(v) => v,
+        Err(_) => ([0u8; 6], 0),
     }
-    (mac, rx_len)
 }
 
 // ============================================================
@@ -1683,5 +1677,26 @@ mod tests {
         assert_eq!(f[13], 0x00);
         assert_eq!(f[14], 0xC0);
         assert_eq!(f[63], 0xC0u8.wrapping_add(49));
+    }
+
+    #[test]
+    fn failed_reinit_fails_closed_and_oob_buf_addr_returns_zero() {
+        let mut driver = E1000Impl::new();
+        let mut bus = MemMmioBus::new(fixture_mac());
+        let mut mac = [0u8; 6];
+        driver.init(&mut bus, &mut mac).unwrap();
+        assert_eq!(driver.link_state(), LinkState::Up1000);
+
+        bus.fault_mode = true;
+        assert_eq!(driver.init(&mut bus, &mut mac), Err(E1000Error::MmioFault));
+        bus.fault_mode = false;
+        assert_eq!(driver.link_state(), LinkState::Down);
+        assert_eq!(
+            driver.transmit(&mut bus, &[0xAAu8; 64]),
+            Err(E1000Error::NoLink),
+            "failed re-init must leave E1000 fail-closed"
+        );
+        assert_eq!(driver.tx_buf_addr(999), 0);
+        assert_eq!(driver.rx_buf_addr(999), 0);
     }
 }

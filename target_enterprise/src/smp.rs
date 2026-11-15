@@ -98,11 +98,16 @@ impl Smp for SmpImpl {
         let mut aps_v73aa22a7_3 = [0u8; MAX_CPUS];
         let mut ap_count_v73aa22a7_4 = 0usize;
         let mut cursor_v73aa22a7_1 = madt::HEADER_LEN;
-        while cursor_v73aa22a7_1 + 2 <= table_len_v73aa22a7_0 {
+        while cursor_v73aa22a7_1
+            .checked_add(2)
+            .is_some_and(|end| end <= table_len_v73aa22a7_0)
+        {
             let entry_len_v73aa22a7_6 = madt_bytes[cursor_v73aa22a7_1 + 1] as usize;
             let entry_type_v73aa22a7_5 = madt_bytes[cursor_v73aa22a7_1];
             if entry_len_v73aa22a7_6 < 2
-                || cursor_v73aa22a7_1 + entry_len_v73aa22a7_6 > table_len_v73aa22a7_0
+                || cursor_v73aa22a7_1
+                    .checked_add(entry_len_v73aa22a7_6)
+                    .is_none_or(|end| end > table_len_v73aa22a7_0)
             {
                 return Err(SmpError::BadMadtEntry);
             }
@@ -148,12 +153,15 @@ impl Smp for SmpImpl {
         delay_us: &mut dyn FnMut(u32),
     ) -> Result<usize, SmpError> {
         let __cuttle_stack_pad_a818e611: [u8; 171usize] = ::core::hint::black_box([0u8; 171usize]);
-        if trampoline_pa & 0xFFF != 0 {
+        if (trampoline_pa & 0xFFF) != 0 || trampoline_pa >= 0x10_0000 {
             return Err(SmpError::BadIpiVector);
         }
         let vector_v73aa22a7_0 = (trampoline_pa >> 12) as u32 & smp_consts::ICR_VECTOR_MASK;
         if vector_v73aa22a7_0 == 0 || vector_v73aa22a7_0 == 0xFF {
             return Err(SmpError::BadIpiVector);
+        }
+        if topology.ap_count > MAX_CPUS {
+            return Err(SmpError::TooManyCpus);
         }
         let init_low_v73aa22a7_2 = smp_consts::ICR_DELIVERY_INIT
             | smp_consts::ICR_LEVEL_ASSERT
@@ -197,8 +205,11 @@ pub struct SmpImpl;
 #[inline(always)]
 pub fn build_madt_fixture(cpu_count: usize, out: &mut [u8]) -> Result<usize, SmpError> {
     let __cuttle_stack_pad_2daf2d32: [u8; 140usize] = ::core::hint::black_box([0u8; 140usize]);
+    if cpu_count == 0 || cpu_count > MAX_CPUS {
+        return Err(SmpError::BadMadtEntry);
+    }
     let total_v73aa22a7_0 = madt::HEADER_LEN + cpu_count * madt::LOCAL_APIC_ENTRY_LEN;
-    if out.len() < total_v73aa22a7_0 || cpu_count == 0 || cpu_count > MAX_CPUS {
+    if out.len() < total_v73aa22a7_0 {
         return Err(SmpError::BadMadtEntry);
     }
     for i_v73aa22a7_1 in 0..total_v73aa22a7_0 {
@@ -256,10 +267,10 @@ pub fn resolve_ap_apic_targets<const N: usize>(
             if tlen >= madt::HEADER_LEN && tlen <= madt_bytes.len() {
                 let mut cur = madt::HEADER_LEN;
                 let mut malformed = false;
-                while cur + 2 <= tlen {
+                while cur.checked_add(2).is_some_and(|end| end <= tlen) {
                     let etype = madt_bytes[cur];
                     let elen = madt_bytes[cur + 1] as usize;
-                    if elen < 2 || cur + elen > tlen {
+                    if elen < 2 || cur.checked_add(elen).is_none_or(|end| end > tlen) {
                         malformed = true;
                         break;
                     }
@@ -405,10 +416,10 @@ pub fn extract_madt_ioapic_phys(madt_bytes: &[u8]) -> Option<(u8, u64, u32)> {
     }
     let mut cur = madt::HEADER_LEN;
     let mut found: Option<(u8, u64, u32)> = None;
-    while cur + 2 <= tlen {
+    while cur.checked_add(2).is_some_and(|end| end <= tlen) {
         let etype = madt_bytes[cur];
         let elen = madt_bytes[cur + 1] as usize;
-        if elen < 2 || cur + elen > tlen {
+        if elen < 2 || cur.checked_add(elen).is_none_or(|end| end > tlen) {
             return None;
         }
         if etype == MADT_ENTRY_IOAPIC && elen >= MADT_IOAPIC_LEN && found.is_none() {
@@ -448,10 +459,10 @@ pub fn resolve_isa_irq_to_gsi(madt_opt: Option<&[u8]>, isa_irq: u8) -> u32 {
             ]) as usize;
             if tlen >= madt::HEADER_LEN && tlen <= madt_bytes.len() {
                 let mut cur = madt::HEADER_LEN;
-                while cur + 2 <= tlen {
+                while cur.checked_add(2).is_some_and(|end| end <= tlen) {
                     let etype = madt_bytes[cur];
                     let elen = madt_bytes[cur + 1] as usize;
-                    if elen < 2 || cur + elen > tlen {
+                    if elen < 2 || cur.checked_add(elen).is_none_or(|end| end > tlen) {
                         break;
                     }
                     if etype == MADT_ENTRY_ISO
@@ -1009,5 +1020,37 @@ mod tests {
         exec_smp_xor_parity_512(&left, &right, &mut parity);
         exec_smp_xor_parity_512(&parity, &right, &mut recovered);
         assert_eq!(recovered, left);
+    }
+
+    #[test]
+    fn wake_aps_rejects_high_trampoline_pa_and_oversized_ap_count() {
+        let mut buf = [0u8; 128];
+        let n = build_madt_fixture(2, &mut buf).unwrap();
+        let topo = SmpImpl::discover(&buf[..n]).unwrap();
+        let mut apic = RecordingApic::new();
+        let mut delay_us = |_us: u32| {};
+
+        // 0x10_8000 exceeds the 1 MiB real-mode SIPI addressable ceiling; must not mask down to vector 0x08!
+        assert_eq!(
+            SmpImpl::wake_aps(&topo, 0x10_8000, &mut apic, &mut delay_us),
+            Err(SmpError::BadIpiVector)
+        );
+        assert_eq!(apic.count, 0);
+
+        let bogus_topo = CpuTopology {
+            bsp: 0,
+            aps: [1; MAX_CPUS],
+            ap_count: MAX_CPUS + 1,
+        };
+        assert_eq!(
+            SmpImpl::wake_aps(&bogus_topo, 0x8000, &mut apic, &mut delay_us),
+            Err(SmpError::TooManyCpus)
+        );
+
+        let mut small = [0u8; 64];
+        assert_eq!(
+            build_madt_fixture(usize::MAX, &mut small),
+            Err(SmpError::BadMadtEntry)
+        );
     }
 }

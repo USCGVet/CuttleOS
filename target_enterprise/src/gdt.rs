@@ -358,7 +358,9 @@ impl Gdt {
 
     /// Return the raw 8-byte little-endian encoding of slot `i`.
     pub fn raw_bytes(&self, i: usize) -> [u8; 8] {
-        let e = self.entries[i];
+        let Some(&e) = self.entries.get(i) else {
+            return [0u8; 8];
+        };
         let limit_low = e.limit_low;
         let base_low = e.base_low;
         [

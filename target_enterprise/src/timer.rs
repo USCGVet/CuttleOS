@@ -110,19 +110,22 @@ pub fn ymdhms_to_unix(y: u32, m: u32, d: u32, h: u32, mi: u32, s: u32) -> u64 {
     let mut days: u64 = 0;
     let mut year = 1970u32;
     while year < y {
-        days += if is_leap(year) { 366 } else { 365 };
+        days = days.saturating_add(if is_leap(year) { 366 } else { 365 });
         year += 1;
     }
     let mut month = 1u32;
-    while month < m {
-        days += DAYS_IN_MONTH[month as usize] as u64;
+    while month < m && (month as usize) < DAYS_IN_MONTH.len() {
+        days = days.saturating_add(DAYS_IN_MONTH[month as usize] as u64);
         if month == 2 && is_leap(y) {
-            days += 1;
+            days = days.saturating_add(1);
         }
         month += 1;
     }
-    days += (d.saturating_sub(1)) as u64;
-    days * 86_400 + (h as u64) * 3600 + (mi as u64) * 60 + (s as u64)
+    days = days.saturating_add((d.saturating_sub(1)) as u64);
+    days.saturating_mul(86_400)
+        .saturating_add((h as u64).saturating_mul(3600))
+        .saturating_add((mi as u64).saturating_mul(60))
+        .saturating_add(s as u64)
 }
 
 /// Inverse of [`ymdhms_to_unix`]: split Unix epoch seconds into
@@ -330,9 +333,18 @@ pub fn read_time_impl(port: &mut dyn IoPort) -> Result<RtcTimeView, TimerError> 
         let cur = read_raw(port);
         if cur == prev {
             let status_b = cmos_read(port, RTC_REG_STATUS_B);
-            return Ok(decode_raw(
+            let view = decode_raw(
                 cur.sec, cur.min, cur.hour, cur.day, cur.mon, cur.year, status_b,
-            ));
+            );
+            if !(1..=12).contains(&view.month)
+                || !(1..=31).contains(&view.day)
+                || view.hour > 23
+                || view.minute > 59
+                || view.second > 59
+            {
+                return Err(TimerError::InconsistentRead);
+            }
+            return Ok(view);
         }
         prev = cur;
         pass += 1;
@@ -990,5 +1002,18 @@ mod tests {
             calibrate_apic_irqs_per_sec(50_000_000, pit_10ms, period),
             4096
         );
+    }
+
+    #[test]
+    fn open_bus_cmos_0xff_and_invalid_month_fail_closed_without_panic() {
+        let mut port = RecordingIoPort::new();
+        // Status A UIP=0 so spin terminates, while all other CMOS registers float to 0xFF (binary mode, mon=0xFF).
+        port.set_cmos(RTC_REG_STATUS_A, 0x00);
+        assert_eq!(
+            read_time_impl(&mut port),
+            Err(TimerError::InconsistentRead)
+        );
+        // Out-of-range calendar fields passed directly to ymdhms_to_unix must never panic OOB.
+        let _ = ymdhms_to_unix(2026, 255, 99, 99, 99, 99);
     }
 }

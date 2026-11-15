@@ -157,9 +157,13 @@ pub fn read_dma_impl(lba: u64, count: u16, pm_port: u8) -> Result<H2dFisParams, 
 
 /// Banner helper: encode IDENTIFY and return the command byte from the FIS.
 pub fn banner_identify_cmd() -> u8 {
-    let p = AhciFisImpl::identify(0).expect("identify params");
+    let Ok(p) = AhciFisImpl::identify(0) else {
+        return 0;
+    };
     let mut fis = [0u8; AHCI_FIS_H2D_LEN];
-    AhciFisImpl::encode_h2d(&p, &mut fis).expect("encode");
+    if AhciFisImpl::encode_h2d(&p, &mut fis).is_err() {
+        return 0;
+    }
     fis[2]
 }
 

@@ -41,6 +41,13 @@ pub fn walk_impl(
     if ptr == 0 {
         return Err(VirtioPciCapError::NotFound);
     }
+    let mut staged = [VirtioPciCap {
+        offset: 0,
+        cfg_type: 0,
+        bar: 0,
+        bar_offset: 0,
+        length: 0,
+    }; VIRTIO_PCI_CAP_MAX];
     let mut count = 0usize;
     let mut hops = 0u8;
     while ptr != 0 {
@@ -53,14 +60,17 @@ pub fn walk_impl(
         let next = ((d0 >> 8) & 0xFF) as u8;
         let cfg_type = ((d0 >> 24) & 0xFF) as u8;
         if id == VIRTIO_PCI_CAP_ID {
+            if (ptr as usize) + 16 > 256 {
+                return Err(VirtioPciCapError::Truncated);
+            }
             if count >= VIRTIO_PCI_CAP_MAX {
                 return Err(VirtioPciCapError::TooMany);
             }
-            let d1 = read_dword(ptr.wrapping_add(4));
+            let d1 = read_dword(ptr + 4);
             let bar = (d1 & 0xFF) as u8;
-            let bar_offset = read_dword(ptr.wrapping_add(8));
-            let length = read_dword(ptr.wrapping_add(12));
-            out[count] = VirtioPciCap {
+            let bar_offset = read_dword(ptr + 8);
+            let length = read_dword(ptr + 12);
+            staged[count] = VirtioPciCap {
                 offset: ptr,
                 cfg_type,
                 bar,
@@ -77,6 +87,7 @@ pub fn walk_impl(
     if count == 0 {
         return Err(VirtioPciCapError::NotFound);
     }
+    out[..count].copy_from_slice(&staged[..count]);
     Ok(count)
 }
 
@@ -387,6 +398,36 @@ mod tests {
         assert_eq!(
             VirtioPciCapsImpl::walk(0x40, &mut banner_read_dword, &mut out).unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn walk_rejects_truncated_high_offset_cap_and_leaves_output_untouched() {
+        let sentinel = [VirtioPciCap {
+            offset: 0xAA,
+            cfg_type: 0xBB,
+            bar: 0xCC,
+            bar_offset: 0x1122_3344,
+            length: 0x5566_7788,
+        }; VIRTIO_PCI_CAP_MAX];
+        let mut out = sentinel;
+        // Valid cap at 0x40 chaining to 0xF8, where 16-byte VirtIO vendor cap overflows 256-byte config space!
+        let res = VirtioPciCapsImpl::walk(
+            0x40,
+            &mut |off| match off {
+                0x40 => 0x01_10_F8_09,
+                0x44 => 0,
+                0x48 => 0,
+                0x4C => 0x1000,
+                0xF8 => 0x02_10_00_09,
+                _ => 0,
+            },
+            &mut out,
+        );
+        assert_eq!(res, Err(VirtioPciCapError::Truncated));
+        assert_eq!(
+            out, sentinel,
+            "VirtioPciCaps::walk must not partially populate out when a chained cap fails"
         );
     }
 }

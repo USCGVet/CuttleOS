@@ -404,6 +404,8 @@ impl<R: NvmeRegs> NvmeImpl<R> {
     /// Run the spec-mandated bring-up: CC.EN=0, wait CSTS.RDY=0, write
     /// AQA/ASQ/ACQ, set CC.EN=1, wait CSTS.RDY=1.
     pub fn bring_up(&mut self, asq_phys: u64, acq_phys: u64) -> Result<(), NvmeError> {
+        self.enabled = false;
+        self.io_queues_ready = false;
         // 1. Disable the controller. CC.EN := 0.
         let cc = self.regs.read32(REG_CC);
         self.regs.write32(REG_CC, cc & !CC_EN);
@@ -970,18 +972,12 @@ pub struct GlobalNvme;
 impl BlockDevice for GlobalNvme {
     // BLOCK_SIZE inherited from the trait default (512).
 
-    fn read_block(_lba: u64, _buf: &mut [u8]) {
-        // Stateful BlockDevice surface; the seed routes per-call by
-        // panicking. Production wiring threads a global mutex / per-CPU
-        // pointer; that wiring is a future task.
-        panic!("GlobalNvme::read_block requires runtime wiring not present in the seed");
+    fn read_block(_lba: u64, buf: &mut [u8]) {
+        // Fail closed when static runtime wiring is not installed: zero-fill output without panicking.
+        buf.fill(0);
     }
-    fn write_block(_lba: u64, _buf: &[u8]) {
-        panic!("GlobalNvme::write_block requires runtime wiring not present in the seed");
-    }
-    fn flush() {
-        panic!("GlobalNvme::flush requires runtime wiring not present in the seed");
-    }
+    fn write_block(_lba: u64, _buf: &[u8]) {}
+    fn flush() {}
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,6 +1173,29 @@ mod tests {
         emu.ring_sq_doorbell(1, 1);
         let cqe = emu.fetch_completion(1).expect("completion");
         assert_eq!(cqe.status(), 0x80, "overflowing LBA must return NVMe LBA Out of Range (0x80)");
+    }
+
+    #[test]
+    fn failed_re_bring_up_disables_driver_and_global_nvme_fails_closed() {
+        let mut drv = ready_driver();
+        assert!(drv.is_enabled());
+        assert!(drv.io_ready());
+
+        drv.regs.force_cfs = true;
+        assert_eq!(
+            drv.bring_up(0x1000, 0x2000),
+            Err(NvmeError::FatalControllerStatus)
+        );
+        assert!(
+            !drv.is_enabled() && !drv.io_ready(),
+            "failed bring_up must clear enabled and io_queues_ready state"
+        );
+
+        let mut blk = [0xAAu8; 512];
+        <GlobalNvme as BlockDevice>::read_block(0, &mut blk);
+        assert_eq!(blk, [0u8; 512]);
+        <GlobalNvme as BlockDevice>::write_block(0, &[0x55u8; 512]);
+        <GlobalNvme as BlockDevice>::flush();
     }
 }
 

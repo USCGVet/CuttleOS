@@ -138,8 +138,10 @@ pub fn identify_slot_impl(
 }
 
 pub fn banner_prdtl() -> u16 {
-    let (h, _) = AhciCmdImpl::identify_slot(0x1000, 0x2000).expect("slot");
-    h.prdtl
+    match AhciCmdImpl::identify_slot(0x1000, 0x2000) {
+        Ok((h, _)) => h.prdtl,
+        Err(_) => 0,
+    }
 }
 
 #[cfg(test)]
