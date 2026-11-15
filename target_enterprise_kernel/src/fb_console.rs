@@ -157,6 +157,7 @@ fn fill_rect(x0: usize, y0: usize, rw: usize, rh: usize, rgb: (u8, u8, u8)) {
     let x_end = x0.saturating_add(rw).min(w);
     let mut y = y0;
     while y < y_end {
+        crate::serial_rx_pump();
         let mut x = x0;
         while x < x_end {
             if let Some(off) = fb_checked_pixel_offset(x, y, w, h, stride, bpp, len) {
@@ -185,6 +186,7 @@ fn draw_str_at(x0: usize, y0: usize, s: &[u8], fg: (u8, u8, u8), bg: (u8, u8, u8
 /// with 3px vertical line spacing = 14x19 cell) so horizontal and vertical
 /// strokes have uniform 2px thickness and natural monospace proportions.
 fn draw_glyph_at(x0: usize, y0: usize, ch: u8, fg: (u8, u8, u8), bg: (u8, u8, u8)) {
+    crate::serial_rx_pump();
     use target_enterprise::memory::kernel_guards::{fb_checked_pixel_offset, fb_pack_rgb};
     let ptr = FB_PTR.load(Ordering::Relaxed) as *mut u8;
     let len = FB_LEN.load(Ordering::Relaxed);

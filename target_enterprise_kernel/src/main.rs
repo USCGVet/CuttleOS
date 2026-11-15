@@ -771,10 +771,18 @@ pub(crate) fn serial_init() {
 }
 
 pub(crate) fn serial_write_byte(b: u8) {
+    if CONSOLE_LOOP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+        serial_rx_pump();
+    }
     // SAFETY: Running at CPL=0 after `serial_init`; port 0x3FD is COM1 LSR and port 0x3F8 is COM1 THR once LSR.THRE confirms FIFO space (bounded so a wedged UART never hangs Ring-0).
     unsafe {
         let mut spins = 0u32;
         while inb(COM1 + 5) & LSR_THRE == 0 && spins < 1_000_000 {
+            if (spins & 0x3F) == 0
+                && CONSOLE_LOOP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
+            {
+                serial_rx_pump();
+            }
             core::hint::spin_loop();
             spins += 1;
         }
@@ -791,7 +799,7 @@ pub(crate) fn serial_write_byte(b: u8) {
 /// arrive, so without this buffer everything typed or pasted during a commit
 /// was dropped.
 pub(crate) struct SerialRxRing {
-    buf: [u8; 512],
+    buf: [u8; 2048],
     head: usize,
     len: usize,
     /// Bytes discarded because the ring was full.
@@ -801,7 +809,7 @@ pub(crate) struct SerialRxRing {
 impl SerialRxRing {
     const fn new() -> Self {
         Self {
-            buf: [0u8; 512],
+            buf: [0u8; 2048],
             head: 0,
             len: 0,
             overruns: 0,
@@ -830,11 +838,17 @@ impl SerialRxRing {
 }
 
 static SERIAL_RX_RING: spin::Mutex<SerialRxRing> = spin::Mutex::new(SerialRxRing::new());
+/// Set to `true` once `live_os_console_loop` begins servicing the interactive console.
+pub(crate) static CONSOLE_LOOP_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Move every byte waiting in the COM1 receive FIFO into [`SERIAL_RX_RING`].
 /// Cheap when nothing is waiting; called from the main loop and from inside
 /// long device waits. Only the boot CPU reads the console.
 pub(crate) fn serial_rx_pump() {
+    if !CONSOLE_LOOP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let Some(mut ring) = SERIAL_RX_RING.try_lock() else {
         return;
     };
@@ -847,6 +861,12 @@ pub(crate) fn serial_rx_pump() {
             budget -= 1;
         }
     }
+}
+
+/// True if [`SERIAL_RX_RING`] or the hardware `COM1` receive buffer holds unread bytes.
+pub(crate) fn serial_rx_has_pending() -> bool {
+    serial_rx_pump();
+    SERIAL_RX_RING.try_lock().is_some_and(|r| r.len > 0)
 }
 
 /// Next console byte, if one has arrived.
@@ -1260,6 +1280,22 @@ pub(crate) fn live_os_console_loop() -> ! {
     smp_hw_enable_bsp_timer();
     let mut last_rto_irq: u64 = read_monotonic_timer_ticks();
     svc.set_timer_hz(read_calibrated_irqs_per_sec());
+    // Switch COM1 to 115,200 baud (`divisor = 1`) before activating interactive console polling
+    // (after all boot banners and `attack_iface_pilot` have completed) so 16550A THR/RBR shift
+    // 3x faster without disturbing any boot-banner timing or FIFO state.
+    // SAFETY: Running at CPL=0; ports `0x3F8..=0x3FD` are the architectural COM1 16550A registers.
+    unsafe {
+        let mut spins = 0u32;
+        while (inb(COM1 + 5) & 0x40) == 0 && spins < 500_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        outb(COM1 + 3, 0x80);
+        outb(COM1 + 0, 0x01);
+        outb(COM1 + 1, 0x00);
+        outb(COM1 + 3, 0x03);
+    }
+    CONSOLE_LOOP_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
     fb_console_start();
     serial_write_str("Cuttle Enterprise OS interactive shell ready.\n");
     serial_write_str("Web UI: http://127.0.0.1:18080/app | SQL: http://127.0.0.1:18080/sql\n");
@@ -1267,6 +1303,7 @@ pub(crate) fn live_os_console_loop() -> ! {
 
     let mut echo = [0u8; 32];
     let mut reply = [0u8; 1024];
+    let mut console_grace_tsc: u64 = crate::smp_hw::tsc_deadline_ms(2_000);
     #[cfg(not(cuttle_prod))]
     let mut selftest_line = [0u8; 32];
     #[cfg(not(cuttle_prod))]
@@ -1285,6 +1322,7 @@ pub(crate) fn live_os_console_loop() -> ! {
                 last_rto_irq = now_irq;
                 let mut step = 0u64;
                 while step < elapsed_irqs {
+                    serial_rx_pump();
                     let mut rto_rep = CONSOLE_NET_REPLIES.lock();
                     rto_rep.clear();
                     let _ = svc.tick_tcp_rto_with_replies(&mut *rto_rep);
@@ -1373,6 +1411,7 @@ pub(crate) fn live_os_console_loop() -> ! {
             };
             did_io = true;
             con_pass += 1;
+            console_grace_tsc = crate::smp_hw::tsc_deadline_ms(2_000);
 
             #[cfg(not(cuttle_prod))]
             {
@@ -1409,6 +1448,7 @@ pub(crate) fn live_os_console_loop() -> ! {
                 // printed once the state is known to be saved.
                 persist_shell_if_changed(sh, reply[..rlen].starts_with(b"sync: ok "));
                 serial_write_bytes(&reply[..rlen]);
+                console_grace_tsc = crate::smp_hw::tsc_deadline_ms(2_000);
             }
             match act {
                 ShellAction::Continue(_) => {}
@@ -1432,7 +1472,13 @@ pub(crate) fn live_os_console_loop() -> ! {
         if !did_io {
             if has_ready_processes() {
                 let _ = run_next_ready_process_quantum(0, 50_000);
+            } else if console_grace_tsc != 0 && !crate::smp_hw::tsc_past_deadline(console_grace_tsc) {
+                // Keep polling COM1 at sub-microsecond latency while an interactive/pasted
+                // command stream is actively arriving so 16550A's 16-byte RX FIFO never overruns.
+                serial_rx_pump();
+                core::hint::spin_loop();
             } else {
+                console_grace_tsc = 0;
                 // No network frames, no console input, and no runnable Ring-3 processes:
                 // put CPU 0 into low-power HLT state until Local APIC timer (0x40), MSI/MSI-X (0x45/0x46), or IPI wakes it.
                 smp_hw_idle_wait();

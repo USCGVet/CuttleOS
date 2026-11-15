@@ -239,13 +239,22 @@ fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
-/// Return `true` if `path` (normalized) names a built-in Cuttle system file that is
-/// recreated on every boot and excluded from `PageDomain::VfsDir` / `PageDomain::VfsData`.
-pub fn is_builtin_system_file(path: &[u8]) -> bool {
+/// Return `true` if `path` (normalized) names one of the 4 read-only system files
+/// unconditionally created during `seed_defaults_for_boot` (`0..4`).
+pub fn is_boot_seeded_system_file(path: &[u8]) -> bool {
     bytes_eq(path, b"/etc/hostname")
         || bytes_eq(path, b"/etc/os-release")
         || bytes_eq(path, b"/etc/motd")
         || bytes_eq(path, b"/proc/net")
+}
+
+/// Maximum normalized path length permitted in `paged_mode` (`200` bytes, matching `SHELL_MAX_WRITABLE_PATH`).
+pub const PAGED_VFS_MAX_PATH: usize = 200;
+
+/// Return `true` if `path` (normalized) names a built-in Cuttle system file that is
+/// recreated on every boot and excluded from `PageDomain::VfsDir` / `PageDomain::VfsData`.
+pub fn is_builtin_system_file(path: &[u8]) -> bool {
+    is_boot_seeded_system_file(path)
         || bytes_eq(path, b"/bin/fib")
         || bytes_eq(path, b"/bin/sum")
         || bytes_eq(path, b"/sbin/svc-http")
@@ -510,6 +519,59 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
             self.paged_mode = true;
             self.dir_dirty = true;
         } else if !enabled && self.paged_mode {
+            // Refuse to exit `paged_mode` if any overflow inode (`I..`) or overflow handle is active,
+            // or if total inline capacities do not fit inside the fixed `P`-byte inline pool.
+            if self.overflow_inodes.iter().any(|ino| ino.used)
+                || self.overflow_open.iter().any(|op| op.used)
+            {
+                return;
+            }
+            let mut needed_pool = 0usize;
+            let mut i = 0usize;
+            while i < I {
+                if self.inodes[i].used {
+                    let ext_len = self
+                        .paged_extents
+                        .get(i)
+                        .map(|v| v.len())
+                        .unwrap_or(self.inodes[i].data_len as usize);
+                    let cap = (self.inodes[i].capacity as usize).max(ext_len);
+                    let Some(next_total) = needed_pool.checked_add(cap) else {
+                        return;
+                    };
+                    if next_total > P {
+                        return;
+                    }
+                    needed_pool = next_total;
+                }
+                i += 1;
+            }
+            self.pool = [0u8; P];
+            let mut cursor = 0usize;
+            let mut slot = 0usize;
+            while slot < I {
+                if self.inodes[slot].used {
+                    let ext_slice = self
+                        .paged_extents
+                        .get(slot)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    let copy_len = ext_slice.len().min(self.inodes[slot].data_len as usize);
+                    let cap = (self.inodes[slot].capacity as usize).max(copy_len);
+                    self.pool[cursor..cursor + copy_len].copy_from_slice(&ext_slice[..copy_len]);
+                    self.inodes[slot].data_off = cursor as u32;
+                    self.inodes[slot].data_len = copy_len as u32;
+                    self.inodes[slot].capacity = cap as u32;
+                    cursor += cap;
+                }
+                slot += 1;
+            }
+            self.pool_used = cursor as u32;
+            self.paged_pool_used = 0;
+            self.paged_extents.clear();
+            self.overflow_inodes.clear();
+            self.overflow_open.clear();
+            self.paged_page_budget = None;
             self.paged_mode = false;
         }
     }
@@ -706,6 +768,9 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         validate_path(path)?;
         let mut norm = [0u8; FS_PATH_MAX];
         let n = normalise_path(path, &mut norm)?;
+        if self.paged_mode && n > PAGED_VFS_MAX_PATH {
+            return Err(FsError::NameTooLong);
+        }
         let max_ino = self.max_inodes();
         let mut free_idx: Option<usize> = None;
         let mut i = 0usize;
@@ -807,6 +872,9 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         }
         let mut norm = [0u8; FS_PATH_MAX];
         let n = normalise_path(path, &mut norm)?;
+        if n > PAGED_VFS_MAX_PATH {
+            return Err(FsError::NameTooLong);
+        }
         if &norm[..n] == b"/" {
             return Err(FsError::IsADir);
         }
@@ -861,6 +929,9 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         let Ok(n) = normalise_path(path, &mut norm) else {
             return false;
         };
+        if self.paged_mode && n > PAGED_VFS_MAX_PATH {
+            return false;
+        }
         if &norm[..n] == b"/" {
             return false;
         }
@@ -1127,6 +1198,9 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
         }
         let wants_write = access == FS_O_WRONLY || access == FS_O_RDWR;
         let create = (flags & FS_O_CREATE) != 0;
+        if self.paged_mode && create && n > PAGED_VFS_MAX_PATH {
+            return Err(FsError::NameTooLong);
+        }
         let excl = (flags & FS_O_EXCL) != 0;
         let trunc = (flags & FS_O_TRUNC) != 0;
 
@@ -2459,5 +2533,44 @@ mod tests {
         assert!(fs.is_dir_dirty());
         assert!(fs.is_inode_dirty(1));
         assert!(!fs.is_inode_dirty(2));
+    }
+
+    #[test]
+    fn set_paged_mode_false_repacks_inline_files_and_paged_path_cap_enforced() {
+        let mut fs: MemRamFs<24, 10240> = MemRamFs::new();
+        fs.seed_file(b"/etc/hostname", b"cuttle-te\n", 64, 1).unwrap();
+        fs.seed_file(b"/var/note", b"important\n", 64, 7).unwrap();
+
+        fs.set_paged_mode(true);
+        // Paged mode must reject paths > 200 bytes so `MemRamFs` and `sync_vfs_to_paged_store` agree.
+        let path_220 = b"/a".repeat(110);
+        assert_eq!(
+            fs.open(&path_220, FS_O_CREATE | FS_O_RDWR),
+            Err(FsError::NameTooLong)
+        );
+
+        // Toggling back to inline mode must losslessly repack files back into `pool`.
+        fs.set_paged_mode(false);
+        assert!(!fs.is_paged_mode());
+        let mut buf = [0u8; 32];
+        let h1 = fs.open(b"/etc/hostname", FS_O_RDONLY).unwrap();
+        let n1 = fs.read(h1, 0, &mut buf).unwrap();
+        fs.close(h1).unwrap();
+        assert_eq!(&buf[..n1], b"cuttle-te\n");
+
+        // Writing a new file in inline mode must not alias or overwrite `/etc/hostname`.
+        let h_new = fs.open(b"/var/second", FS_O_CREATE | FS_O_RDWR).unwrap();
+        assert_eq!(fs.write(h_new, 0, b"abc").unwrap(), 3);
+        fs.close(h_new).unwrap();
+
+        let h1_re = fs.open(b"/etc/hostname", FS_O_RDONLY).unwrap();
+        let n1_re = fs.read(h1_re, 0, &mut buf).unwrap();
+        fs.close(h1_re).unwrap();
+        assert_eq!(&buf[..n1_re], b"cuttle-te\n");
+
+        let h2 = fs.open(b"/var/note", FS_O_RDONLY).unwrap();
+        let n2 = fs.read(h2, 0, &mut buf).unwrap();
+        fs.close(h2).unwrap();
+        assert_eq!(&buf[..n2], b"important\n");
     }
 }

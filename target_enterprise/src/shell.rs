@@ -628,13 +628,45 @@ impl OsShell {
 
     /// Enable or disable enterprise page-granular mode across `OsShell`, `SqlDb`, and `MemRamFs`.
     pub fn set_paged_mode(&mut self, enabled: bool) {
-        self.paged_mode = enabled;
-        self.db.set_paged_mode(enabled);
-        self.fs.set_paged_mode(enabled);
-        if !enabled {
-            self.paged_anchor = crate::paged_store::PagedAnchor::zero();
+        if enabled {
+            self.paged_mode = true;
+            self.db.set_paged_mode(true);
+            self.fs.set_paged_mode(true);
+        } else {
+            self.db.set_paged_mode(false);
+            self.fs.set_paged_mode(false);
+            if self.db.is_paged_mode() || self.fs.is_paged_mode() {
+                self.db.set_paged_mode(true);
+                self.fs.set_paged_mode(true);
+                self.paged_mode = true;
+            } else {
+                self.paged_mode = false;
+                self.paged_anchor = crate::paged_store::PagedAnchor::zero();
+            }
         }
         self.sync_paged_budgets();
+    }
+
+    /// Re-initialize `self` to pristine boot defaults while preserving any active
+    /// `paged_mode` and device-specific `paged_max_logical` budget configured by `ShellStore::boot`.
+    pub fn reset_preserving_paged_config(
+        &mut self,
+        seal_key: [u8; DURABLE_DIGEST_LEN],
+        legacy_seal_key: [u8; DURABLE_DIGEST_LEN],
+        attest_key: [u8; DURABLE_DIGEST_LEN],
+        boot_gen: u64,
+        provisioned: bool,
+    ) {
+        let was_paged = self.is_paged_mode();
+        let prev_max_logical = self.paged_max_logical();
+        *self = Self::empty();
+        self.seal_key = seal_key;
+        self.legacy_seal_key = legacy_seal_key;
+        self.attest_key = attest_key;
+        self.set_paged_mode(was_paged);
+        self.seed_defaults_for_boot(boot_gen);
+        self.set_paged_max_logical(prev_max_logical);
+        self.set_durable_provisioned(provisioned);
     }
 
     /// Return the active device logical-page cap enforced across `SqlDb` and `MemRamFs`.
@@ -928,28 +960,10 @@ impl OsShell {
         const VFS_DIR_PAGE_MAGIC: &[u8; 8] = b"CTTLVFD1";
         const VFS_DATA_PAGE_MAGIC: &[u8; 8] = b"CTTLVDT1";
 
-        let max_ino = self.fs.max_inodes();
-        let mut stale = [0u8; cuttle_contracts::FS_PATH_MAX];
-        let mut idx = 0usize;
-        while idx < max_ino {
-            let stale_len = match self.fs.inode_entry(idx) {
-                Some((path, _)) if !is_default_system_file(path) => {
-                    stale[..path.len()].copy_from_slice(path);
-                    path.len()
-                }
-                _ => 0,
-            };
-            if stale_len > 0 {
-                self.fs
-                    .unlink(&stale[..stale_len])
-                    .map_err(|_| PagedStoreError::CorruptOrTampered)?;
-            }
-            idx += 1;
-        }
-
         let mut dir_buf = alloc::vec![0u8; PAGED_PAGE_PAYLOAD_BYTES];
         let mut chunk_buf = alloc::vec![0u8; PAGED_PAGE_PAYLOAD_BYTES];
-        let mut file_data = alloc::vec::Vec::new();
+        let mut staged: alloc::vec::Vec<(usize, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, u64)> =
+            alloc::vec::Vec::new();
         let mut norm_buf = [0u8; cuttle_contracts::FS_PATH_MAX];
         let mut total_files = 0usize;
         let mut total_bytes = 0usize;
@@ -1005,8 +1019,10 @@ impl OsShell {
                     dir_buf[pos + 14],
                     dir_buf[pos + 15],
                 ]);
-                if slot_idx < base_slot
+                if slot_idx < 4
+                    || slot_idx < base_slot
                     || slot_idx >= base_slot + VFS_INODES_PER_DIR_PAGE
+                    || slot_idx >= self.fs.max_inodes()
                     || prev_slot.is_some_and(|p| slot_idx <= p)
                     || plen == 0
                     || plen > SHELL_MAX_WRITABLE_PATH
@@ -1023,11 +1039,14 @@ impl OsShell {
                 else {
                     return Err(PagedStoreError::CorruptOrTampered);
                 };
-                if nlen != plen || &norm_buf[..nlen] != raw_path {
+                if nlen != plen
+                    || &norm_buf[..nlen] != raw_path
+                    || staged.iter().any(|(_, p, _, _)| p.as_slice() == &norm_buf[..nlen])
+                {
                     return Err(PagedStoreError::CorruptOrTampered);
                 }
 
-                file_data.clear();
+                let mut file_data = alloc::vec::Vec::with_capacity(flen);
                 let needed_chunks = if flen == 0 {
                     0
                 } else {
@@ -1065,11 +1084,11 @@ impl OsShell {
                         return Err(PagedStoreError::CorruptOrTampered);
                     }
                 }
-                self.fs
-                    .seed_file_at_slot(slot_idx, &norm_buf[..nlen], &file_data, mtime)
-                    .map_err(|_| PagedStoreError::CorruptOrTampered)?;
                 total_files += 1;
-                total_bytes = total_bytes.saturating_add(flen);
+                total_bytes = total_bytes
+                    .checked_add(flen)
+                    .ok_or(PagedStoreError::CorruptOrTampered)?;
+                staged.push((slot_idx, norm_buf[..nlen].to_vec(), file_data, mtime));
                 e += 1;
             }
             if pos != dlen {
@@ -1082,6 +1101,49 @@ impl OsShell {
             || store.count_domain_pages(PageDomain::VfsData) != consumed_data_pages
         {
             return Err(PagedStoreError::CorruptOrTampered);
+        }
+
+        // Check total pool byte capacity including the 4 boot-seeded system files before mutating `self.fs`.
+        let mut boot_pool_bytes = 0usize;
+        let max_ino = self.fs.max_inodes();
+        let mut s_idx = 0usize;
+        while s_idx < max_ino {
+            if let Some((path, _)) = self.fs.inode_entry(s_idx) {
+                if crate::vfs::is_boot_seeded_system_file(path) {
+                    let cap = if path == b"/etc/hostname" { 64 } else { 128 };
+                    boot_pool_bytes = boot_pool_bytes.saturating_add(cap);
+                }
+            }
+            s_idx += 1;
+        }
+        if boot_pool_bytes.saturating_add(total_bytes) > self.fs.pool_capacity() {
+            return Err(PagedStoreError::CorruptOrTampered);
+        }
+
+        // Validation succeeded completely: clear non-boot-seeded inodes (including any lazily
+        // materialized `/bin/*` or `/sbin/*` ELFs in slots `4..`) and install staged files.
+        let mut stale = [0u8; cuttle_contracts::FS_PATH_MAX];
+        let mut idx = 0usize;
+        while idx < max_ino {
+            let stale_len = match self.fs.inode_entry(idx) {
+                Some((path, _)) if !crate::vfs::is_boot_seeded_system_file(path) => {
+                    stale[..path.len()].copy_from_slice(path);
+                    path.len()
+                }
+                _ => 0,
+            };
+            if stale_len > 0 {
+                self.fs
+                    .unlink(&stale[..stale_len])
+                    .map_err(|_| PagedStoreError::CorruptOrTampered)?;
+            }
+            idx += 1;
+        }
+
+        for (slot_idx, path_vec, data_vec, mtime) in &staged {
+            self.fs
+                .seed_file_at_slot(*slot_idx, path_vec, data_vec, *mtime)
+                .map_err(|_| PagedStoreError::CorruptOrTampered)?;
         }
 
         self.fs.clear_paged_dirty();
@@ -1118,7 +1180,9 @@ impl OsShell {
     /// Also advances the SQL open-transaction idle timeout (`tick_transaction_timeout`).
     /// Returns the number of jobs that fired on this tick.
     pub fn tick_cron_jobs(&mut self, boots: u64) -> usize {
-        let _ = self.db.tick_transaction_timeout();
+        if self.db.tick_transaction_timeout() {
+            self.sync_paged_budgets();
+        }
         let mut fired = 0usize;
         let mut scratch = [0u8; 192];
         let mut i = 0usize;
@@ -3409,7 +3473,7 @@ impl OsShell {
         while i < max_ino {
             let mut stale = [0u8; cuttle_contracts::FS_PATH_MAX];
             let stale_len = match self.fs.inode_entry(i) {
-                Some((path, _)) if !is_default_system_file(path) => {
+                Some((path, _)) if !crate::vfs::is_boot_seeded_system_file(path) => {
                     stale[..path.len()].copy_from_slice(path);
                     path.len()
                 }
@@ -4682,7 +4746,6 @@ impl OsShell {
                 self.record_audit(9, AuditVerdict::Error, b"shell:writehex:nospace");
                 return copy_into(FS_NO_SPACE_MSG, out);
             }
-            let _ = self.fs.unlink(cpath);
         } else {
             let new_end = (offset as usize).saturating_add(plen);
             if self.paged_mode && new_end > crate::vfs::PAGED_VFS_MAX_FILE_BYTES {
@@ -10388,5 +10451,152 @@ mod tests {
                 assert_eq!(sh.durable_fingerprint(), fp_before);
             }
         }
+    }
+
+    #[test]
+    fn writehex_offset_zero_preserves_existing_file_on_enospc_and_keeps_mtime() {
+        let mut sh = OsShell::new();
+        sh.set_paged_mode(true);
+        sh.set_durable_provisioned(true);
+        let mut out = [0u8; 256];
+
+        // Fill group 0 user slots (4..=11) with temporary files, place `/keep` and `/target`
+        // in group 1 (slots 12..=13), then remove the group 0 temporary files so slot 4 is free.
+        for idx in 4..=11 {
+            let cmd = alloc::format!("write /tmp_{idx} x");
+            sh.exec_line(cmd.as_bytes(), 1, 0, 0, &mut out);
+        }
+        sh.exec_line(b"writehex /keep 0 ", 1, 0, 0, &mut out);
+        sh.exec_line(b"write /target important", 1, 0, 0, &mut out);
+        sh.fs.set_mtime(b"/target", 42).unwrap();
+        for idx in 4..=11 {
+            let cmd = alloc::format!("rm /tmp_{idx}");
+            sh.exec_line(cmd.as_bytes(), 1, 0, 0, &mut out);
+        }
+
+        // Constrain VFS budget to 2 pages (1 VfsDir(1) + 1 VfsData(/target) == 2).
+        sh.set_paged_max_logical(sh.db.paged_pages_needed() + 2);
+        // Wait: make sure replacement payload requires 2 VfsData chunks (> 4,000 B) OR
+        // with unlink bug: even a 4-byte writehex allocates slot 4 (group 0 -> +1 VfsDir(0)) + 1 VfsData = 3 > 2!
+        //Wait: without the unlink bug, 4-byte writehex in-place at slot 13 uses 2 pages (succeeds AND preserves mtime=42)!
+        // Let's test BOTH: first an oversized replacement that hits ENOSPC, AND then a 4-byte replacement with budget=2!
+        let big_hex = "ab".repeat(4001); // 2 chunks -> 1 VfsDir + 2 VfsData = 3 pages > 2 -> ENOSPC
+        let big_cmd = alloc::format!("writehex /target 0 {big_hex}");
+        // Use mailbox VfsWrite or exec_line? `exec_line` caps at 256B, so test the exact group-0/group-1 4-byte writehex with budget=2 AND budget=1!
+        // With budget = 1 (already below current 2 pages, or let `/keep` hold 1 VfsData so current = 3, budget = 2):
+        // Even better: with `/keep` (0B, slot 12) and `/target` (0B, slot 13), current VFS pages = 1 (`VfsDir(1)`).
+        // Set VFS budget = 1 page! Then `writehex /target 0 deadbeef` needs 1 VfsDir + 1 VfsData = 2 > 1 -> ENOSPC!
+        // Wait: if `/target` currently has `"important"` (9B, 1 VfsData) and VFS budget = 2:
+        // BEFORE fix: `can_replace("/target", 4)` sees slot 13 in group 1 -> 1 VfsDir(1) + 1 VfsData = 2 <= 2 (`true`!),
+        // then `unlink` deletes `/target`, `open` creates `/target` at slot 4 (`VfsDir(0)` + `VfsDir(1)` = 2), and `write` fails with `NoSpace`, WIPING `/target` to 0 bytes!
+        // AFTER fix: `writehex /target 0 deadbeef` truncates slot 13 in place (staying in `VfsDir(1)`), SUCCEEDS within the 2-page budget, AND preserves `mtime == 42`!
+        let _ = big_cmd;
+        let act = sh.exec_line(b"writehex /target 0 deadbeef", 1, 0, 0, &mut out);
+        assert_eq!(
+            &out[..act.bytes_written()],
+            b"wrote 4 bytes to /target at offset 0\n",
+            "in-place writehex within 2-page budget must succeed instead of unlinking into group 0 and wiping /target"
+        );
+        let st = sh.fs.stat(b"/target").unwrap();
+        assert_eq!(st.size, 4);
+        assert_eq!(st.mtime, 42, "writehex offset 0 must preserve existing mtime");
+
+        // Now tighten VFS budget to 1 page and attempt to grow a 0-byte `/keep` via `writehex /keep 0 deadbeef`:
+        // `/target` is still 4 bytes; tighten max_logical to `sql + 2` and test `writehex` ENOSPC on `/keep`!
+        let act2 = sh.exec_line(b"writehex /keep 0 deadbeef", 1, 0, 0, &mut out);
+        assert_eq!(&out[..act2.bytes_written()], FS_NO_SPACE_MSG);
+        assert_eq!(sh.fs.stat(b"/keep").unwrap().size, 0);
+        assert_eq!(sh.fs.stat(b"/target").unwrap().size, 4);
+    }
+
+    #[test]
+    fn vfs_restore_succeeds_after_lazy_builtin_elf_materialization_and_preserves_state_on_error() {
+        let mut out = [0u8; 256];
+
+        // 1. Paged VFS restore after `/bin/fib` was lazily materialized into slot 4.
+        let mut sh1 = OsShell::new();
+        sh1.set_paged_mode(true);
+        sh1.set_durable_provisioned(true);
+        sh1.exec_line(b"write /u0 hello", 1, 0, 0, &mut out);
+        let mut store = crate::paged_store::PagedBlockStore::new();
+        sh1.sync_vfs_to_paged_store(&mut store, 118).unwrap();
+
+        let mut sh2 = OsShell::new();
+        sh2.set_paged_mode(true);
+        sh2.set_durable_provisioned(true);
+        sh2.exec_line(b"exec /bin/fib 5", 1, 0, 0, &mut out);
+        sh2.exec_line(b"write /keep_on_err intact", 1, 0, 0, &mut out);
+
+        // Corrupt store check: a failed restore must NOT wipe `/keep_on_err`!
+        let mut bad_store = crate::paged_store::PagedBlockStore::new();
+        bad_store
+            .put_page(0, crate::paged_store::PageDomain::VfsDir, 0, 0, b"BAD_MAGIC")
+            .unwrap();
+        assert!(sh2.load_vfs_from_paged_store(&bad_store).is_err());
+        assert_eq!(sh2.fs.stat(b"/keep_on_err").unwrap().size, 7);
+
+        // Valid store restore onto `sh2` (which has `/bin/fib` in slot 4) must succeed!
+        let (files, bytes) = sh2.load_vfs_from_paged_store(&store).unwrap();
+        assert_eq!((files, bytes), (1, 6));
+        assert_eq!(sh2.fs.stat(b"/u0").unwrap().size, 6);
+        assert!(sh2.fs.stat(b"/keep_on_err").is_err());
+
+        // 2. Inline `unpack_fs_partition` with 18 user files after all 5 lazy ELFs materialized.
+        let mut sh3 = OsShell::new();
+        sh3.set_durable_provisioned(true);
+        for i in 0..18 {
+            let cmd = alloc::format!("write /f{i} data{i}");
+            sh3.exec_line(cmd.as_bytes(), 1, 0, 0, &mut out);
+        }
+        let mut sectors = [[0u8; 512]; SHELL_FS_PART_SECTORS];
+        sh3.pack_fs_partition(1, &mut sectors).unwrap();
+
+        let mut sh4 = OsShell::new();
+        sh4.set_durable_provisioned(true);
+        sh4.install_user_bins();
+        sh4.exec_line(b"exec /sbin/svc-http", 1, 0, 0, &mut out);
+        sh4.exec_line(b"exec /sbin/svc-sql", 1, 0, 0, &mut out);
+        sh4.exec_line(b"exec /sbin/svc-sh", 1, 0, 0, &mut out);
+        let (_, fcount, _) = sh4.unpack_fs_partition(&sectors).unwrap();
+        assert_eq!(fcount, 18);
+    }
+
+    #[test]
+    fn tick_cron_jobs_resyncs_vfs_paged_budget_on_idle_tx_timeout() {
+        let mut sh = OsShell::new();
+        sh.set_paged_mode(true);
+        sh.set_durable_provisioned(true);
+        sh.set_paged_max_logical(64);
+        let mut out = [0u8; 256];
+
+        let baseline_vfs_budget = sh.fs.paged_page_budget();
+        sh.exec_line(b"sql BEGIN", 1, 0, 0, &mut out);
+        // Transaction undo log holds up to 8 mutations: delete the 4 seeded rows in `kv`,
+        // or create a fresh empty table `t_tx`, then BEGIN + INSERT 1 row into `t_tx` (+1 SqlLeaf page!).
+        sh.exec_line(b"sql COMMIT", 1, 0, 0, &mut out);
+        sh.exec_line(b"sql CREATE TABLE t_tx (id INT)", 1, 0, 0, &mut out);
+        let baseline_after_ddl = sh.fs.paged_page_budget();
+        let _ = baseline_vfs_budget;
+        sh.exec_line(b"sql BEGIN", 1, 0, 0, &mut out);
+        sh.exec_line(b"sql INSERT INTO t_tx VALUES (1)", 1, 0, 0, &mut out);
+        assert_eq!(
+            sh.fs.paged_page_budget().unwrap(),
+            baseline_after_ddl.unwrap() - 1
+        );
+
+        for _ in 0..crate::sql::SQL_TX_MAX_IDLE_TICKS {
+            sh.tick_cron_jobs(1);
+        }
+        assert_eq!(
+            sh.fs.paged_page_budget(),
+            baseline_after_ddl,
+            "idle SQL transaction auto-rollback during tick_cron_jobs must resync VFS paged budget"
+        );
+
+        // Fresh-boot shell reset (`reset_preserving_paged_config`) must preserve `paged_max_logical = 118`.
+        sh.set_paged_max_logical(118);
+        sh.reset_preserving_paged_config([0x11; 32], [0x22; 32], [0x33; 32], 1, true);
+        assert!(sh.is_paged_mode());
+        assert_eq!(sh.paged_max_logical(), 118);
     }
 }

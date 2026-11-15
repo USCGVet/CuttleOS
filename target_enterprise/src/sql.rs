@@ -769,7 +769,36 @@ impl SqlDb {
                 }
                 t += 1;
             }
-        } else if !enabled {
+        } else if !enabled && self.paged_mode {
+            if self.overflow_tables.iter().any(|t| t.used) {
+                return;
+            }
+            let mut t = 0usize;
+            while t < SQL_MAX_TABLES {
+                if self.tables[t].used
+                    && self.tables[t]
+                        .overflow_rows
+                        .iter()
+                        .any(|r| r.used)
+                {
+                    return;
+                }
+                t += 1;
+            }
+            if self.serialized_partition_bytes() > SQL_PART_SECTORS * 512 - 8 {
+                return;
+            }
+            self.overflow_tables.clear();
+            let mut ti = 0usize;
+            while ti < SQL_MAX_TABLES {
+                self.tables[ti].overflow_rows.clear();
+                self.tables[ti].overflow_hashes.clear();
+                if self.tables[ti].used {
+                    self.tables[ti].rebuild_index();
+                }
+                ti += 1;
+            }
+            self.paged_page_budget = None;
             self.paged_mode = false;
         }
     }
@@ -1148,6 +1177,19 @@ impl SqlDb {
                 h = mix_byte(h, tbl.cols[col_i].col_type as u8);
                 col_i += 1;
             }
+            if (tbl.indexed_col as usize) < col_count && tbl.index_name_len > 0 {
+                h = mix_byte(h, 1);
+                h = mix_byte(h, tbl.indexed_col);
+                let iname = tbl.index_name_bytes();
+                h = mix_byte(h, iname.len() as u8);
+                let mut ii = 0usize;
+                while ii < iname.len() {
+                    h = mix_byte(h, iname[ii].to_ascii_lowercase());
+                    ii += 1;
+                }
+            } else {
+                h = mix_byte(h, 0);
+            }
 
             // Collect and canonically sort occupied rows on the heap so bare-metal stack frames stay tiny!
             row_order.clear();
@@ -1175,6 +1217,33 @@ impl SqlDb {
             let mut rk = 0usize;
             while rk < row_order.len() {
                 let row = self.committed_row(t_idx, row_order[rk]);
+                let vault_key = if is_kv && col_count > 0 {
+                    match &row.cells[0] {
+                        SqlVal::Text(tb, tl) if *tl >= 2 && tb[0] == b'v' && tb[1] == b':' => {
+                            Some(&tb[..*tl as usize])
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(vk) = vault_key {
+                    h = mix_byte(h, 0x5B);
+                    h = mix_byte(h, vk.len() as u8);
+                    let mut vi = 0usize;
+                    while vi < vk.len() {
+                        h = mix_byte(h, vk[vi]);
+                        vi += 1;
+                    }
+                    let tag = b"<HW_SEALED>";
+                    let mut si = 0usize;
+                    while si < tag.len() {
+                        h = mix_byte(h, tag[si]);
+                        si += 1;
+                    }
+                    rk += 1;
+                    continue;
+                }
                 h = mix_byte(h, 0x5A);
                 if row.meta96 != [0u8; 12] {
                     h = mix_byte(h, 4);
@@ -2134,9 +2203,7 @@ impl SqlDb {
         let after_tname = trim_sql(after_tname);
         let (kw_values, after_values) = if starts_with_ignore_case(after_tname, b"VALUES")
             && (after_tname.len() == 6
-                || after_tname[6] == b' '
-                || after_tname[6] == b'\t'
-                || after_tname[6] == b'(')
+                || matches!(after_tname[6], b' ' | b'\t' | b'\r' | b'\n' | b'('))
         {
             (&after_tname[..6], trim_sql(&after_tname[6..]))
         } else {
@@ -3412,6 +3479,7 @@ impl SqlDb {
         store: &mut PagedBlockStore,
         max_logical: usize,
     ) -> Result<u32, PagedStoreError> {
+        store.configure_max_logical(max_logical);
         let mut total_rows = 0u32;
         let mut leaf_masks = [0u64; SQL_PAGED_MAX_TABLES];
         let mut leaf_buf: Vec<u8> = Vec::with_capacity(3800);
@@ -3664,6 +3732,7 @@ impl SqlDb {
 
         let mut next_db = SqlDb::empty();
         next_db.paged_mode = true;
+        next_db.paged_page_budget = self.paged_page_budget;
         next_db.tx_seq = committed_seq;
 
         let mut pos = 20usize;
@@ -3873,7 +3942,7 @@ impl SqlDb {
 
         // Reject any unreferenced orphan `SqlLeaf` or duplicate `SqlCatalog` page in `store`.
         let mut lid = 0u16;
-        while (lid as usize) < crate::paged_store::PAGED_MAX_LOGICAL_PAGES {
+        while (lid as usize) < crate::paged_store::PAGED_V2_MAX_LOGICAL_PAGES {
             if let Some((dom, _, owner_id, _)) = store.get_page(lid) {
                 match dom {
                     PageDomain::SqlCatalog if owner_id != 0 || lid != cat_lid => {
@@ -4125,9 +4194,9 @@ fn split_keyword_ignore_case<'a>(s: &'a [u8], kw: &[u8]) -> Option<(&'a [u8], &'
                 i += 1;
                 continue;
             }
-            let left_ok = i == 0 || s[i - 1] == b' ' || s[i - 1] == b'\t';
-            let right_ok =
-                i + kw.len() == s.len() || s[i + kw.len()] == b' ' || s[i + kw.len()] == b'\t';
+            let left_ok = i == 0 || matches!(s[i - 1], b' ' | b'\t' | b'\r' | b'\n');
+            let right_ok = i + kw.len() == s.len()
+                || matches!(s[i + kw.len()], b' ' | b'\t' | b'\r' | b'\n');
             if left_ok && right_ok && eq_ignore_ascii_case(&s[i..i + kw.len()], kw) {
                 return Some((&s[..i], &s[i + kw.len()..]));
             }
@@ -5767,5 +5836,79 @@ mod tests {
         assert!(out[..n_over].starts_with(b"error: transaction undo log full"));
         assert_eq!(db.total_rows(), pre_rows, "atomic batch must not leave partial rows");
         let _ = db.exec(b"ROLLBACK", &mut out);
+    }
+
+    #[test]
+    fn state_hash_commits_secondary_indexes_and_normalizes_vault_rows() {
+        let db0 = SqlDb::new();
+        let mut db1 = SqlDb::new();
+        let mut out = [0u8; 256];
+        let n = db1.exec(b"CREATE INDEX idx_kv_k ON kv (k)", &mut out);
+        assert_eq!(&out[..n], b"CREATE INDEX idx_kv_k OK\n");
+        assert_ne!(
+            db0.state_hash(),
+            db1.state_hash(),
+            "secondary index DDL must change SqlDb::state_hash()"
+        );
+
+        let mut sh0 = crate::shell::OsShell::with_seal_key([0x11; 32]);
+        let mut sh1 = crate::shell::OsShell::with_seal_key([0x22; 32]);
+        let mut s_out0 = [0u8; 256];
+        let mut s_out1 = [0u8; 256];
+        sh0.exec_line(b"vault set api_key secret1", 1, 0, 0, &mut s_out0);
+        sh1.exec_line(b"vault set api_key secret1", 1, 0, 0, &mut s_out1);
+        assert_eq!(
+            sh0.db.state_hash(),
+            sh1.db.state_hash(),
+            "per-node hardware-sealed vault rows must hash canonically across Triad nodes"
+        );
+    }
+
+    #[test]
+    fn load_from_paged_store_preserves_budget_and_set_paged_mode_false_guards_overflow() {
+        let mut db = SqlDb::new();
+        db.set_paged_mode(true);
+        db.set_paged_page_budget(Some(5));
+        let mut store = crate::paged_store::PagedBlockStore::new();
+        db.sync_to_paged_store(&mut store, 10).unwrap();
+        db.load_from_paged_store(&store).unwrap();
+        assert_eq!(
+            db.paged_page_budget(),
+            Some(5),
+            "load_from_paged_store must preserve configured paged_page_budget"
+        );
+
+        let mut out = [0u8; 128];
+        for t in 0..3 {
+            let ddl = alloc::format!("CREATE TABLE extra_{t} (id INT)");
+            let n = db.exec(ddl.as_bytes(), &mut out);
+            assert!(out[..n].ends_with(b" OK\n"));
+        }
+        // 5 active tables (> inline cap of 4): set_paged_mode(false) must refuse to drop overflow state.
+        db.set_paged_mode(false);
+        assert!(db.is_paged_mode());
+    }
+
+    #[test]
+    fn multiline_sql_queries_and_insert_values_newline_succeed() {
+        let mut db = SqlDb::new();
+        let mut out = [0u8; 256];
+        let n_ins = db.exec(
+            b"INSERT INTO kv VALUES\n('nl_key', 'nl_val', 7)",
+            &mut out,
+        );
+        assert_eq!(&out[..n_ins], b"INSERT 1\n");
+
+        let n_upd = db.exec(
+            b"UPDATE kv\nSET v = 'nl_val2'\r\nWHERE k = 'nl_key'",
+            &mut out,
+        );
+        assert_eq!(&out[..n_upd], b"UPDATE 1\n");
+
+        let n_sel = db.exec(
+            b"SELECT v, rev\nFROM kv\nWHERE k = 'nl_key'\nLIMIT 1",
+            &mut out,
+        );
+        assert_eq!(&out[..n_sel], b"v|rev\nnl_val2|7\n");
     }
 }

@@ -991,15 +991,9 @@ pub(crate) fn banner_shell_compose() {
     if !resumed_ok {
         // First boot (or a rejected disk, whose contents are in quarantine),
         // or an unprovisioned ephemeral boot: start from pristine defaults,
-        // preserving enterprise paged_mode if `shell_store_boot` enabled it.
-        let was_paged = sh.is_paged_mode();
-        *sh = target_enterprise::OsShell::empty();
-        sh.seal_key = seal_key;
-        sh.legacy_seal_key = legacy_seal_key;
-        sh.attest_key = attest_key;
-        sh.set_paged_mode(was_paged);
-        sh.seed_defaults_for_boot(boots);
-        sh.set_durable_provisioned(provisioned);
+        // preserving enterprise paged_mode and device `paged_max_logical` if
+        // `shell_store_boot` enabled it.
+        sh.reset_preserving_paged_config(seal_key, legacy_seal_key, attest_key, boots, provisioned);
     }
 
     static VERIFY_SHELL: spin::Mutex<target_enterprise::OsShell> =

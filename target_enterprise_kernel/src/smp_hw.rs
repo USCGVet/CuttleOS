@@ -650,7 +650,7 @@ pub(crate) fn ensure_tsc_calibrated() -> u64 {
         outb(0x42, (PIT_CALIBRATION_TICKS_10MS >> 8) as u8);
         let t0 = read_tsc();
         let mut spins = 0u32;
-        while (inb(0x61) & 0x20) == 0 && spins < 500_000 {
+        while (inb(0x61) & 0x20) == 0 && spins < 50_000_000 {
             core::hint::spin_loop();
             spins += 1;
         }
@@ -1121,19 +1121,28 @@ pub(crate) fn wait_for_dma_completion(
             }
             return Err(());
         }
-        if (spins & 0xFF) == 0 {
+        if (spins & 0x3F) == 0 {
             crate::serial_rx_pump();
         }
         if hlt_eligible {
+            crate::serial_rx_pump();
             // Periodic Local APIC Timer (`vector 0x40`) + MSI/MSI-X (`0x45`/`0x46`) are both active:
             // sleep in hardware `C1` (`sti; hlt; cli; ret`) instead of burning host CPU cycles!
             if let Some(mut r) = GLOBAL_IO_RING.try_lock() {
                 r.record_hlt_sleep();
             }
+            let ioapic_ready = IOAPIC_COM1_READY.load(Ordering::Acquire);
             // SAFETY: Running at CPL=0 with `RUNTIME_IDT`, Local APIC MSI/MSI-X, and periodic `0x40` timer active.
             unsafe {
+                if ioapic_ready {
+                    outb(0x3F9, 0x01);
+                }
                 invoke_cpu_sleep_hlt();
+                if ioapic_ready {
+                    outb(0x3F9, 0x00);
+                }
             }
+            crate::serial_rx_pump();
         } else if (spins & 0x3F) == 0 {
             drain_pending_device_irqs();
             core::hint::spin_loop();
@@ -2489,6 +2498,9 @@ pub(crate) fn smp_hw_idle_wait() {
         core::hint::spin_loop();
         return;
     }
+    if crate::serial_rx_has_pending() {
+        return;
+    }
     let ioapic_ready = IOAPIC_COM1_READY.load(Ordering::Acquire);
     // SAFETY: `smp_hw_enable_bsp_timer` armed the periodic Local APIC timer on vector `0x40`,
     // and when `ioapic_ready` is true, `ISR_IO_WAKE` is bound to IOAPIC GSI 4 (`vector 0x44`).
@@ -2496,11 +2508,14 @@ pub(crate) fn smp_hw_idle_wait() {
         if ioapic_ready {
             outb(0x3F9, 0x01);
         }
-        invoke_cpu_sleep_hlt();
+        if (inb(0x3FD) & 0x01) == 0 {
+            invoke_cpu_sleep_hlt();
+        }
         if ioapic_ready {
             outb(0x3F9, 0x00);
         }
     }
+    crate::serial_rx_pump();
     HW_CPU_TICKS[0].fetch_add(1, Ordering::Relaxed);
 }
 
@@ -2736,10 +2751,12 @@ unsafe fn walk_va_effective_wx(va: u64) -> (bool, bool, bool) {
 /// Synchronize live hardware SMP and multi-stack thread telemetry into `OsShell`,
 /// performing one hardware thread stack context switch and waking sleeping AP cores via Doorbell IPI.
 pub(crate) fn smp_hw_tick_and_sync(sh: &mut target_enterprise::OsShell) {
+    crate::serial_rx_pump();
     if !SMP_HW_INITIALIZED.load(Ordering::Acquire) {
         let _ = smp_hw_init();
     }
     let _ = kthread_switch_next();
+    crate::serial_rx_pump();
 
     let online = HW_ONLINE_CPUS.load(Ordering::Relaxed).clamp(1, MAX_SMP_CPUS);
     sh.smp_cpus_online = online as u8;

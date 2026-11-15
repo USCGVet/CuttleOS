@@ -71,12 +71,25 @@ pub const PAGED_PAGE_HEADER_BYTES: usize = 64;
 /// Usable encrypted payload bytes per 4 KiB page (`4032` B).
 pub const PAGED_PAGE_PAYLOAD_BYTES: usize = PAGED_PAGE_BYTES - PAGED_PAGE_HEADER_BYTES;
 
-/// Maximum logical 4 KiB pages addressable in the page directory (`256` pages = `1,032,192` payload bytes).
+/// Maximum logical 4 KiB pages addressable in the v1 page directory (`256` pages = `1,032,192` payload bytes).
 pub const PAGED_MAX_LOGICAL_PAGES: usize = 256;
-/// Maximum physical 4 KiB page slots managed in the CoW pool (`512` pages = `2 MiB`).
+/// Maximum physical 4 KiB page slots managed in the v1 CoW pool (`512` pages = `2 MiB`).
 pub const PAGED_MAX_PHYS_PAGES: usize = 512;
 /// Binary Merkle tree height over [`PAGED_MAX_LOGICAL_PAGES`] (`2^8 = 256`).
 pub const PAGED_MERKLE_DEPTH: usize = 8;
+
+/// Minimum device capacity in 512-byte sectors that activates `CTTLPGS1` format v2 (`8 MiB` = `16,384` sectors).
+pub const PAGED_V2_MIN_DISK_SECTORS: u64 = 16_384;
+/// Recommended large-scale enterprise state disk size (`12 MiB` = `24,576` sectors, full `1,024` logical / `2,048` physical pages).
+pub const PAGED_STORE_LARGE_DISK_SECTORS: u64 = 24_576;
+/// Sectors per directory copy (`DIR_A` / `DIR_B`) in `CTTLPGS1` format v2 (`32` sectors = `16 KiB`).
+pub const PAGED_V2_DIR_SECTORS: usize = 32;
+/// Maximum logical 4 KiB pages addressable in `CTTLPGS1` format v2 (`1,024` pages = `4,128,768` payload bytes).
+pub const PAGED_V2_MAX_LOGICAL_PAGES: usize = 1024;
+/// Maximum physical 4 KiB page slots managed in the v2 CoW pool (`2,048` pages = `8 MiB`).
+pub const PAGED_V2_MAX_PHYS_PAGES: usize = 2048;
+/// Binary Merkle tree height over [`PAGED_V2_MAX_LOGICAL_PAGES`] (`2^10 = 1024`).
+pub const PAGED_V2_MERKLE_DEPTH: usize = 10;
 
 /// LBA of Superblock A (`2048`).
 pub const SUPERBLOCK_A_LBA: u64 = PAGED_STORE_BASE_LBA;
@@ -252,12 +265,14 @@ impl PageDirEntry {
 /// Binary SHA-256 Merkle inclusion proof for a single logical page entry.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PageMerkleProof {
-    /// Logical page index (`0..256`).
+    /// Logical page index (`0..256` on v1, `0..1024` on v2).
     pub logical_id: u16,
     /// Directory entry proven by this path.
     pub entry: PageDirEntry,
-    /// Sibling hashes from level 0 (leaf sibling) up to level 7.
-    pub siblings: [[u8; DURABLE_DIGEST_LEN]; PAGED_MERKLE_DEPTH],
+    /// Active Merkle tree height (`8` for v1 `256`-slot directories, `10` for v2 `1,024`-slot directories).
+    pub depth: u8,
+    /// Sibling hashes from level 0 (leaf sibling) up to `depth - 1`.
+    pub siblings: [[u8; DURABLE_DIGEST_LEN]; PAGED_V2_MERKLE_DEPTH],
 }
 
 /// Error returned by [`PagedBlockStore`] operations.
@@ -406,15 +421,65 @@ fn merkle_parent_hash(
     out
 }
 
-/// Compute the 32-byte binary SHA-256 Merkle root over all 256 [`PageDirEntry`] slots.
-pub fn compute_dir_merkle_root(entries: &[PageDirEntry; PAGED_MAX_LOGICAL_PAGES]) -> [u8; DURABLE_DIGEST_LEN] {
-    let mut level: Vec<[u8; DURABLE_DIGEST_LEN]> = Vec::with_capacity(PAGED_MAX_LOGICAL_PAGES);
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PagedLayoutSpec {
+    ver: u16,
+    dir_sectors: usize,
+    dir_slots: usize,
+    max_phys_cap: usize,
+    merkle_depth: u8,
+    dir_a_lba: u64,
+    dir_b_lba: u64,
+    cwal_base_lba: u64,
+    page_pool_base_lba: u64,
+}
+
+impl PagedLayoutSpec {
+    const fn for_sectors(capacity_sectors: u64) -> Self {
+        if capacity_sectors >= PAGED_V2_MIN_DISK_SECTORS {
+            let dir_b_lba = DIR_A_LBA + PAGED_V2_DIR_SECTORS as u64;
+            let cwal_base_lba = dir_b_lba + PAGED_V2_DIR_SECTORS as u64;
+            let page_pool_base_lba = cwal_base_lba + CWAL_TOTAL_SECTORS;
+            Self {
+                ver: 2,
+                dir_sectors: PAGED_V2_DIR_SECTORS,
+                dir_slots: PAGED_V2_MAX_LOGICAL_PAGES,
+                max_phys_cap: PAGED_V2_MAX_PHYS_PAGES,
+                merkle_depth: PAGED_V2_MERKLE_DEPTH as u8,
+                dir_a_lba: DIR_A_LBA,
+                dir_b_lba,
+                cwal_base_lba,
+                page_pool_base_lba,
+            }
+        } else {
+            Self {
+                ver: 1,
+                dir_sectors: SECTORS_PER_PAGE,
+                dir_slots: PAGED_MAX_LOGICAL_PAGES,
+                max_phys_cap: PAGED_MAX_PHYS_PAGES,
+                merkle_depth: PAGED_MERKLE_DEPTH as u8,
+                dir_a_lba: DIR_A_LBA,
+                dir_b_lba: DIR_B_LBA,
+                cwal_base_lba: CWAL_BASE_LBA,
+                page_pool_base_lba: PAGE_POOL_BASE_LBA,
+            }
+        }
+    }
+}
+
+/// Compute the 32-byte binary SHA-256 Merkle root over a power-of-two [`PageDirEntry`] slice (`256` or `1,024` slots).
+pub fn compute_dir_merkle_root(entries: &[PageDirEntry]) -> [u8; DURABLE_DIGEST_LEN] {
+    let n = entries.len();
+    if n == 0 || !n.is_power_of_two() {
+        return [0u8; DURABLE_DIGEST_LEN];
+    }
+    let mut level: Vec<[u8; DURABLE_DIGEST_LEN]> = Vec::with_capacity(n);
     let mut i = 0usize;
-    while i < PAGED_MAX_LOGICAL_PAGES {
+    while i < n {
         level.push(merkle_leaf_hash(i as u16, &entries[i]));
         i += 1;
     }
-    let mut width = PAGED_MAX_LOGICAL_PAGES;
+    let mut width = n;
     while width > 1 {
         let mut p = 0usize;
         while p < width / 2 {
@@ -426,26 +491,31 @@ pub fn compute_dir_merkle_root(entries: &[PageDirEntry; PAGED_MAX_LOGICAL_PAGES]
     level[0]
 }
 
-/// Construct a cryptographic Merkle inclusion proof for `logical_id` (`0..256`).
+/// Construct a cryptographic Merkle inclusion proof for `logical_id` across `entries` (`256` or `1,024` slots).
 pub fn build_dir_merkle_proof(
-    entries: &[PageDirEntry; PAGED_MAX_LOGICAL_PAGES],
+    entries: &[PageDirEntry],
     logical_id: u16,
 ) -> Option<PageMerkleProof> {
-    let idx0 = logical_id as usize;
-    if idx0 >= PAGED_MAX_LOGICAL_PAGES {
+    let n = entries.len();
+    if (n != PAGED_MAX_LOGICAL_PAGES && n != PAGED_V2_MAX_LOGICAL_PAGES) || !n.is_power_of_two() {
         return None;
     }
-    let mut level: Vec<[u8; DURABLE_DIGEST_LEN]> = Vec::with_capacity(PAGED_MAX_LOGICAL_PAGES);
+    let idx0 = logical_id as usize;
+    if idx0 >= n {
+        return None;
+    }
+    let target_depth = n.trailing_zeros() as usize;
+    let mut level: Vec<[u8; DURABLE_DIGEST_LEN]> = Vec::with_capacity(n);
     let mut i = 0usize;
-    while i < PAGED_MAX_LOGICAL_PAGES {
+    while i < n {
         level.push(merkle_leaf_hash(i as u16, &entries[i]));
         i += 1;
     }
-    let mut siblings = [[0u8; DURABLE_DIGEST_LEN]; PAGED_MERKLE_DEPTH];
+    let mut siblings = [[0u8; DURABLE_DIGEST_LEN]; PAGED_V2_MERKLE_DEPTH];
     let mut cur = idx0;
-    let mut width = PAGED_MAX_LOGICAL_PAGES;
+    let mut width = n;
     let mut depth = 0usize;
-    while width > 1 && depth < PAGED_MERKLE_DEPTH {
+    while width > 1 && depth < target_depth {
         siblings[depth] = level[cur ^ 1];
         let mut p = 0usize;
         while p < width / 2 {
@@ -459,6 +529,7 @@ pub fn build_dir_merkle_proof(
     Some(PageMerkleProof {
         logical_id,
         entry: entries[idx0],
+        depth: target_depth as u8,
         siblings,
     })
 }
@@ -468,13 +539,18 @@ pub fn verify_dir_merkle_proof(
     proof: &PageMerkleProof,
     expected_root: &[u8; DURABLE_DIGEST_LEN],
 ) -> bool {
-    if (proof.logical_id as usize) >= PAGED_MAX_LOGICAL_PAGES {
+    let pdepth = proof.depth as usize;
+    if pdepth != PAGED_MERKLE_DEPTH && pdepth != PAGED_V2_MERKLE_DEPTH {
+        return false;
+    }
+    let n = 1usize << pdepth;
+    if (proof.logical_id as usize) >= n {
         return false;
     }
     let mut acc = merkle_leaf_hash(proof.logical_id, &proof.entry);
     let mut idx = proof.logical_id as usize;
     let mut depth = 0usize;
-    while depth < PAGED_MERKLE_DEPTH {
+    while depth < pdepth {
         if (idx & 1) == 0 {
             acc = merkle_parent_hash(&acc, &proof.siblings[depth]);
         } else {
@@ -488,12 +564,13 @@ pub fn verify_dir_merkle_proof(
 
 fn pack_superblock(
     mac_key: &[u8; DURABLE_DIGEST_LEN],
+    layout: &PagedLayoutSpec,
     sb: &PagedSuperblock,
     out: &mut [u8; SECTOR_BYTES],
 ) {
     *out = [0u8; SECTOR_BYTES];
     out[0..8].copy_from_slice(&PAGED_SUPER_MAGIC);
-    out[8..10].copy_from_slice(&1u16.to_le_bytes());
+    out[8..10].copy_from_slice(&layout.ver.to_le_bytes());
     out[10] = sb.state;
     out[11] = sb.slot_idx;
     out[12..14].copy_from_slice(&sb.allocated_pages.to_le_bytes());
@@ -504,6 +581,11 @@ fn pack_superblock(
     out[40..44].copy_from_slice(&sb.sql_rows.to_le_bytes());
     out[44..48].copy_from_slice(&sb.vfs_files.to_le_bytes());
     out[48..52].copy_from_slice(&sb.vfs_bytes.to_le_bytes());
+    if layout.ver == 2 {
+        out[52..54].copy_from_slice(&(layout.dir_sectors as u16).to_le_bytes());
+        out[54] = layout.merkle_depth;
+        out[55] = 0;
+    }
     out[56..88].copy_from_slice(&sb.dir_sha256);
     out[88..120].copy_from_slice(&sb.cwal_sha256);
     out[120..152].copy_from_slice(&sb.merkle_root);
@@ -514,6 +596,7 @@ fn pack_superblock(
 
 fn verify_superblock(
     mac_key: &[u8; DURABLE_DIGEST_LEN],
+    layout: &PagedLayoutSpec,
     expected_slot_idx: u8,
     sec: &[u8; SECTOR_BYTES],
 ) -> Option<PagedSuperblock> {
@@ -521,7 +604,7 @@ fn verify_superblock(
         return None;
     }
     let ver = u16::from_le_bytes([sec[8], sec[9]]);
-    if ver != 1 {
+    if ver != layout.ver {
         return None;
     }
     let state = sec[10];
@@ -537,9 +620,19 @@ fn verify_superblock(
     if !seal_matches_keyed(mac_key, &sec[0..152], &expected_tag) {
         return None;
     }
+    if ver == 1 {
+        if sec[52..56] != [0u8; 4] {
+            return None;
+        }
+    } else {
+        let ds = u16::from_le_bytes([sec[52], sec[53]]) as usize;
+        if ds != layout.dir_sectors || sec[54] != layout.merkle_depth || sec[55] != 0 {
+            return None;
+        }
+    }
     let allocated_pages = u16::from_le_bytes([sec[12], sec[13]]);
     let cwal_redo_count = u16::from_le_bytes([sec[14], sec[15]]);
-    if (allocated_pages as usize) > PAGED_MAX_LOGICAL_PAGES
+    if (allocated_pages as usize) > layout.dir_slots
         || (cwal_redo_count as usize) > CWAL_MAX_REDO_PAGES
     {
         return None;
@@ -707,12 +800,13 @@ fn decrypt_page_sectors(
 }
 
 fn encode_dir_sectors(
-    entries: &[PageDirEntry; PAGED_MAX_LOGICAL_PAGES],
-    out: &mut [[u8; SECTOR_BYTES]; SECTORS_PER_PAGE],
+    entries: &[PageDirEntry],
+    out: &mut [[u8; SECTOR_BYTES]],
 ) -> [u8; DURABLE_DIGEST_LEN] {
     let flat = out.as_flattened_mut();
+    flat.fill(0);
     let mut i = 0usize;
-    while i < PAGED_MAX_LOGICAL_PAGES {
+    while i < entries.len() {
         let mut raw = [0u8; 16];
         entries[i].encode(&mut raw);
         flat[i * 16..(i + 1) * 16].copy_from_slice(&raw);
@@ -726,11 +820,15 @@ fn encode_dir_sectors(
 }
 
 fn decode_dir_sectors(
-    sectors: &[[u8; SECTOR_BYTES]; SECTORS_PER_PAGE],
+    sectors: &[[u8; SECTOR_BYTES]],
+    layout: &PagedLayoutSpec,
     expected_sha256: &[u8; DURABLE_DIGEST_LEN],
     expected_merkle: &[u8; DURABLE_DIGEST_LEN],
     avail_phys: usize,
-) -> Option<Box<[PageDirEntry; PAGED_MAX_LOGICAL_PAGES]>> {
+) -> Option<Vec<PageDirEntry>> {
+    if sectors.len() != layout.dir_sectors {
+        return None;
+    }
     let flat = sectors.as_flattened();
     let mut h = Sha256::new();
     h.update(flat);
@@ -739,14 +837,14 @@ fn decode_dir_sectors(
     if !constant_time_eq(&actual_sha, expected_sha256) {
         return None;
     }
-    let mut entries = Box::new([PageDirEntry::empty(); PAGED_MAX_LOGICAL_PAGES]);
-    let mut seen_phys = [0u64; 8]; // 512 bits
+    let mut entries = alloc::vec![PageDirEntry::empty(); layout.dir_slots];
+    let mut seen_phys = [0u64; 32]; // 2,048 bits
     let mut i = 0usize;
-    while i < PAGED_MAX_LOGICAL_PAGES {
+    while i < layout.dir_slots {
         let e = PageDirEntry::decode(&flat[i * 16..(i + 1) * 16])?;
         if e.is_mapped() {
             let p = e.phys_slot as usize;
-            if p >= avail_phys || p >= PAGED_MAX_PHYS_PAGES {
+            if p >= avail_phys || p >= layout.max_phys_cap {
                 return None;
             }
             let w = p / 64;
@@ -852,6 +950,7 @@ pub struct PagedBlockStore {
     last_recovery_rolled_forward: bool,
     /// Whether a standalone `recover_latest` call fell back to an older superblock epoch.
     last_recovery_fell_back_epoch: bool,
+    dir_slots: usize,
     merkle_root: [u8; DURABLE_DIGEST_LEN],
     dir: Vec<PageDirEntry>,
     pages: Vec<CachedLogicalPage>,
@@ -879,6 +978,7 @@ impl PagedBlockStore {
             last_recovery_healed: 0,
             last_recovery_rolled_forward: false,
             last_recovery_fell_back_epoch: false,
+            dir_slots: 0,
             merkle_root: [0u8; DURABLE_DIGEST_LEN],
             dir: Vec::new(),
             pages: Vec::new(),
@@ -901,6 +1001,7 @@ impl PagedBlockStore {
         self.vfs_files = 0;
         self.vfs_bytes = 0;
         self.last_dirty_pages_written = 0;
+        self.dir_slots = 0;
         self.merkle_root = [0u8; DURABLE_DIGEST_LEN];
         self.dir.clear();
         self.pages.clear();
@@ -916,29 +1017,33 @@ impl PagedBlockStore {
         if capacity_sectors < PAGED_STORE_MIN_DISK_SECTORS {
             return (0, 0);
         }
-        let raw_phys = ((capacity_sectors - PAGE_POOL_BASE_LBA) / SECTORS_PER_PAGE as u64) as usize;
-        let avail_phys = if raw_phys > PAGED_MAX_PHYS_PAGES {
-            PAGED_MAX_PHYS_PAGES
+        let layout = PagedLayoutSpec::for_sectors(capacity_sectors);
+        if capacity_sectors <= layout.page_pool_base_lba {
+            return (0, 0);
+        }
+        let raw_phys =
+            ((capacity_sectors - layout.page_pool_base_lba) / SECTORS_PER_PAGE as u64) as usize;
+        let avail_phys = if raw_phys > layout.max_phys_cap {
+            layout.max_phys_cap
         } else {
             raw_phys
         };
         let half = avail_phys / 2;
-        let max_logical = if half > PAGED_MAX_LOGICAL_PAGES {
-            PAGED_MAX_LOGICAL_PAGES
+        let max_logical = if half > layout.dir_slots {
+            layout.dir_slots
         } else {
             half
         };
         (avail_phys, max_logical)
     }
 
-    fn ensure_tables(&mut self) {
-        if self.dir.len() < PAGED_MAX_LOGICAL_PAGES {
-            self.dir
-                .resize(PAGED_MAX_LOGICAL_PAGES, PageDirEntry::empty());
+    fn ensure_tables_for(&mut self, min_slots: usize) {
+        let target = min_slots.max(PAGED_MAX_LOGICAL_PAGES);
+        if self.dir.len() < target {
+            self.dir.resize(target, PageDirEntry::empty());
         }
-        if self.pages.len() < PAGED_MAX_LOGICAL_PAGES {
-            self.pages
-                .resize_with(PAGED_MAX_LOGICAL_PAGES, CachedLogicalPage::empty);
+        if self.pages.len() < target {
+            self.pages.resize_with(target, CachedLogicalPage::empty);
         }
     }
 
@@ -1021,7 +1126,30 @@ impl PagedBlockStore {
         self.pages.iter().filter(|p| p.dirty).count()
     }
 
-    /// Stage or update a logical 4 KiB page (`0..PAGED_MAX_LOGICAL_PAGES`) in memory.
+    /// Configure this store's active directory slot ceiling (`256` for v1 `< 16,384` sectors,
+    /// `1024` for v2 `>= 16,384` sectors) for a target block device of `capacity_sectors`.
+    pub fn configure_for_sectors(&mut self, capacity_sectors: u64) {
+        if capacity_sectors >= PAGED_STORE_MIN_DISK_SECTORS {
+            self.dir_slots = PagedLayoutSpec::for_sectors(capacity_sectors).dir_slots;
+        }
+    }
+
+    /// Ensure this store's active directory ceiling accommodates `max_logical` logical pages.
+    pub fn configure_max_logical(&mut self, max_logical: usize) {
+        if max_logical > PAGED_MAX_LOGICAL_PAGES && self.dir_slots < PAGED_V2_MAX_LOGICAL_PAGES {
+            self.dir_slots = PAGED_V2_MAX_LOGICAL_PAGES;
+        }
+    }
+
+    fn active_logical_slot_cap(&self) -> usize {
+        if self.dir_slots > PAGED_MAX_LOGICAL_PAGES {
+            PAGED_V2_MAX_LOGICAL_PAGES
+        } else {
+            PAGED_MAX_LOGICAL_PAGES
+        }
+    }
+
+    /// Stage or update a logical 4 KiB page (`0..PAGED_MAX_LOGICAL_PAGES` in v1, `0..PAGED_V2_MAX_LOGICAL_PAGES` in v2) in memory.
     ///
     /// If the page is already allocated with byte-identical `(domain, flags, owner_id, payload)`,
     /// it is **not** marked dirty, avoiding redundant disk writes.
@@ -1034,13 +1162,14 @@ impl PagedBlockStore {
         payload: &[u8],
     ) -> Result<(), PagedStoreError> {
         let idx = logical_id as usize;
-        if idx >= PAGED_MAX_LOGICAL_PAGES || matches!(domain, PageDomain::Free) {
+        let active_cap = self.active_logical_slot_cap();
+        if idx >= active_cap || matches!(domain, PageDomain::Free) {
             return Err(PagedStoreError::InvalidPageId);
         }
         if payload.len() > PAGED_PAGE_PAYLOAD_BYTES {
             return Err(PagedStoreError::PayloadTooLarge);
         }
-        self.ensure_tables();
+        self.ensure_tables_for(active_cap);
         let slot = &mut self.pages[idx];
         if slot.allocated
             && slot.domain == domain
@@ -1065,10 +1194,11 @@ impl PagedBlockStore {
     /// Free an allocated logical 4 KiB page so its physical slot is reclaimed on commit.
     pub fn free_page(&mut self, logical_id: u16) -> Result<(), PagedStoreError> {
         let idx = logical_id as usize;
-        if idx >= PAGED_MAX_LOGICAL_PAGES {
+        let active_cap = self.active_logical_slot_cap();
+        if idx >= active_cap {
             return Err(PagedStoreError::InvalidPageId);
         }
-        self.ensure_tables();
+        self.ensure_tables_for(active_cap);
         let slot = &mut self.pages[idx];
         if !slot.allocated {
             return Ok(());
@@ -1133,6 +1263,9 @@ impl PagedBlockStore {
         payload: &[u8],
         max_logical: usize,
     ) -> Result<u16, PagedStoreError> {
+        if max_logical > PAGED_MAX_LOGICAL_PAGES && self.dir_slots < PAGED_V2_MAX_LOGICAL_PAGES {
+            self.dir_slots = PAGED_V2_MAX_LOGICAL_PAGES;
+        }
         let lid = match self.find_page(domain, owner_id) {
             Some(id) => id,
             None => self
@@ -1179,7 +1312,7 @@ impl PagedBlockStore {
 
     /// Allocate the lowest free logical page ID within `0..max_logical`.
     pub fn alloc_logical_id(&self, max_logical: usize) -> Option<u16> {
-        let cap = max_logical.min(PAGED_MAX_LOGICAL_PAGES);
+        let cap = max_logical.min(PAGED_V2_MAX_LOGICAL_PAGES);
         let mut i = 0usize;
         while i < cap {
             let used = self.pages.get(i).map(|p| p.allocated).unwrap_or(false);
@@ -1195,17 +1328,28 @@ impl PagedBlockStore {
     /// under which LSN it was sealed. `None` before the first commit or
     /// recovery, or when `logical_id` is out of range.
     pub fn dir_entry(&self, logical_id: u16) -> Option<PageDirEntry> {
+        let bound = if self.dir_slots > 0 {
+            self.dir_slots
+        } else {
+            self.dir.len()
+        };
+        if (logical_id as usize) >= bound {
+            return None;
+        }
         self.dir.get(logical_id as usize).copied()
     }
 
     /// Construct a Merkle inclusion proof for `logical_id` from the current committed directory.
     pub fn merkle_proof(&self, logical_id: u16) -> Option<PageMerkleProof> {
-        if self.dir.len() < PAGED_MAX_LOGICAL_PAGES {
+        let slots = if self.dir_slots > 0 {
+            self.dir_slots
+        } else {
+            return None;
+        };
+        if self.dir.len() < slots {
             return None;
         }
-        let mut arr = Box::new([PageDirEntry::empty(); PAGED_MAX_LOGICAL_PAGES]);
-        arr.copy_from_slice(&self.dir[..PAGED_MAX_LOGICAL_PAGES]);
-        build_dir_merkle_proof(&arr, logical_id)
+        build_dir_merkle_proof(&self.dir[..slots], logical_id)
     }
 
     /// Incrementally commit only dirty 4 KiB pages to `dev` using Dual-Epoch Copy-on-Write
@@ -1222,28 +1366,32 @@ impl PagedBlockStore {
         if !is_seal_key_set(seal_key) {
             return Err(PagedStoreError::KeyUnset);
         }
-        let (avail_phys, max_logical) = Self::geometry_for_sectors(dev.capacity_sectors());
+        let cap_secs = dev.capacity_sectors();
+        let (avail_phys, max_logical) = Self::geometry_for_sectors(cap_secs);
         if max_logical == 0 {
             return Err(PagedStoreError::DiskTooSmall);
         }
-        self.ensure_tables();
+        let layout = PagedLayoutSpec::for_sectors(cap_secs);
+        self.ensure_tables_for(layout.dir_slots);
 
         let mut dirty_allocated = Vec::new();
         let mut any_dirty = false;
         let mut allocated_total = 0u16;
+        let scan_len = self.pages.len().max(layout.dir_slots);
         let mut i = 0usize;
-        while i < PAGED_MAX_LOGICAL_PAGES {
-            let p = &self.pages[i];
-            if p.allocated {
-                if i >= max_logical {
-                    return Err(PagedStoreError::OutOfPages);
-                }
-                allocated_total += 1;
-            }
-            if p.dirty {
-                any_dirty = true;
+        while i < scan_len {
+            if let Some(p) = self.pages.get(i) {
                 if p.allocated {
-                    dirty_allocated.push(i as u16);
+                    if i >= max_logical {
+                        return Err(PagedStoreError::OutOfPages);
+                    }
+                    allocated_total += 1;
+                }
+                if p.dirty {
+                    any_dirty = true;
+                    if p.allocated {
+                        dirty_allocated.push(i as u16);
+                    }
                 }
             }
             i += 1;
@@ -1257,9 +1405,9 @@ impl PagedBlockStore {
         let keys = PagedKeys::derive(seal_key);
 
         // An unmounted store is about to write its first epoch over whatever
-        // the region holds. Learn which LSNs that content already used.
+        // the region holds. Learn which LSNs that region already used.
         if !self.initialized {
-            self.observe_lsn_floor(dev, &keys);
+            self.observe_lsn_floor(dev, &layout, &keys);
         }
         let prev_lsn = self.tx_lsn;
         let next_lsn = prev_lsn
@@ -1275,14 +1423,14 @@ impl PagedBlockStore {
         // Build physical-slot exclusion bitmap: reserve every physical slot held by `self.dir`
         // (previous committed epoch `S0`) AND every physical slot retained by clean pages in `S1`,
         // so staging `S1` NEVER overwrites any physical page of `S0`!
-        let mut reserved_phys = [0u64; 8];
-        let mut new_dir = Box::new([PageDirEntry::empty(); PAGED_MAX_LOGICAL_PAGES]);
+        let mut reserved_phys = [0u64; 32]; // 2,048 bits
+        let mut new_dir = alloc::vec![PageDirEntry::empty(); layout.dir_slots];
         let mut l = 0usize;
-        while l < PAGED_MAX_LOGICAL_PAGES {
+        while l < layout.dir_slots {
             let old_e = self.dir[l];
             if old_e.is_mapped() {
                 let ps = old_e.phys_slot as usize;
-                if ps < PAGED_MAX_PHYS_PAGES {
+                if ps < layout.max_phys_cap {
                     reserved_phys[ps / 64] |= 1u64 << (ps % 64);
                 }
             }
@@ -1318,7 +1466,7 @@ impl PagedBlockStore {
             };
         }
 
-        let mut dir_secs = Box::new([[0u8; SECTOR_BYTES]; SECTORS_PER_PAGE]);
+        let mut dir_secs = alloc::vec![[0u8; SECTOR_BYTES]; layout.dir_sectors];
         let dir_sha256 = encode_dir_sectors(&new_dir, &mut dir_secs);
         let merkle_root = compute_dir_merkle_root(&new_dir);
 
@@ -1335,14 +1483,18 @@ impl PagedBlockStore {
             0u16
         };
 
-        let dir_lba = if target_slot == 0 { DIR_A_LBA } else { DIR_B_LBA };
+        let dir_lba = if target_slot == 0 {
+            layout.dir_a_lba
+        } else {
+            layout.dir_b_lba
+        };
         let sb_lba = if target_slot == 0 {
             SUPERBLOCK_A_LBA
         } else {
             SUPERBLOCK_B_LBA
         };
         let home_lba = |entry: &PageDirEntry| -> u64 {
-            PAGE_POOL_BASE_LBA + (entry.phys_slot as u64) * (SECTORS_PER_PAGE as u64)
+            layout.page_pool_base_lba + (entry.phys_slot as u64) * (SECTORS_PER_PAGE as u64)
         };
         let io = PagedStoreError::Io;
 
@@ -1387,7 +1539,8 @@ impl PagedBlockStore {
                 cwal_hasher.update(&desc_sec[0..34]);
                 cwal_hasher.update(page_buf.as_flattened());
 
-                let frame_lba = CWAL_BASE_LBA + 1 + (r_idx as u64) * CWAL_REDO_FRAME_SECTORS;
+                let frame_lba =
+                    layout.cwal_base_lba + 1 + (r_idx as u64) * CWAL_REDO_FRAME_SECTORS;
                 dev.write_sector(frame_lba, &desc_sec).map_err(io)?;
                 dev.write_sectors(frame_lba + 1, &page_buf[..]).map_err(io)?;
             }
@@ -1402,7 +1555,8 @@ impl PagedBlockStore {
 
         if use_cwal_redo {
             // Redo frames, their header and the inactive directory become durable together.
-            dev.write_sector(CWAL_BASE_LBA, &cwal_hdr).map_err(io)?;
+            dev.write_sector(layout.cwal_base_lba, &cwal_hdr)
+                .map_err(io)?;
             dev.write_sectors(dir_lba, &dir_secs[..]).map_err(io)?;
             dev.flush().map_err(io)?;
 
@@ -1424,7 +1578,7 @@ impl PagedBlockStore {
                     cwal_sha256,
                     merkle_root,
                 };
-                pack_superblock(&keys.mac, &sb_inflight, &mut sb_sec);
+                pack_superblock(&keys.mac, &layout, &sb_inflight, &mut sb_sec);
                 dev.write_sector(sb_lba, &sb_sec).map_err(io)?;
                 dev.flush().map_err(io)?;
 
@@ -1455,7 +1609,8 @@ impl PagedBlockStore {
             // page: it carries `next_lsn`, and it is the only record that this LSN
             // was used if power is cut before the superblock. Recovery raises
             // `lsn_floor` from it.
-            dev.write_sector(CWAL_BASE_LBA, &cwal_hdr).map_err(io)?;
+            dev.write_sector(layout.cwal_base_lba, &cwal_hdr)
+                .map_err(io)?;
             dev.flush().map_err(io)?;
             for &lid in &dirty_allocated {
                 let entry = new_dir[lid as usize];
@@ -1489,8 +1644,11 @@ impl PagedBlockStore {
                 return Err(PagedStoreError::VerifyFailed);
             }
         }
-        dev.read_sectors(dir_lba, &mut page_buf[..]).map_err(io)?;
-        if sha256_of(page_buf.as_flattened()) != dir_sha256 {
+        for s in &mut dir_secs {
+            *s = [0u8; SECTOR_BYTES];
+        }
+        dev.read_sectors(dir_lba, &mut dir_secs[..]).map_err(io)?;
+        if sha256_of(dir_secs.as_flattened()) != dir_sha256 {
             return Err(PagedStoreError::VerifyFailed);
         }
 
@@ -1510,7 +1668,7 @@ impl PagedBlockStore {
             cwal_sha256,
             merkle_root,
         };
-        pack_superblock(&keys.mac, &sb_quiescent, &mut sb_sec);
+        pack_superblock(&keys.mac, &layout, &sb_quiescent, &mut sb_sec);
         dev.write_sector(sb_lba, &sb_sec).map_err(io)?;
         dev.flush().map_err(io)?;
         let mut sb_back = [0u8; SECTOR_BYTES];
@@ -1520,7 +1678,8 @@ impl PagedBlockStore {
         }
 
         // Commit succeeded: advance in-memory directory & clear dirty flags.
-        self.dir.copy_from_slice(&new_dir[..]);
+        self.dir[..layout.dir_slots].copy_from_slice(&new_dir[..]);
+        self.dir_slots = layout.dir_slots;
         for slot in &mut self.pages {
             slot.dirty = false;
         }
@@ -1536,20 +1695,27 @@ impl PagedBlockStore {
     /// Raise [`Self::lsn_floor`] to the highest LSN the device shows was used:
     /// in either authenticated superblock, or in an authenticated redo-journal
     /// header. Sectors that cannot be read or authenticated contribute nothing.
-    fn observe_lsn_floor<D: SectorIo>(&mut self, dev: &mut D, keys: &PagedKeys) {
+    fn observe_lsn_floor<D: SectorIo>(
+        &mut self,
+        dev: &mut D,
+        layout: &PagedLayoutSpec,
+        keys: &PagedKeys,
+    ) {
         let mut seen = 0u64;
         let mut sec = [0u8; SECTOR_BYTES];
         if dev.read_sector(SUPERBLOCK_A_LBA, &mut sec).is_ok() {
-            if let Some(sb) = verify_superblock(&keys.mac, 0, &sec) {
+            if let Some(sb) = verify_superblock(&keys.mac, layout, 0, &sec) {
                 seen = seen.max(sb.tx_lsn);
             }
         }
         if dev.read_sector(SUPERBLOCK_B_LBA, &mut sec).is_ok() {
-            if let Some(sb) = verify_superblock(&keys.mac, 1, &sec) {
+            if let Some(sb) = verify_superblock(&keys.mac, layout, 1, &sec) {
                 seen = seen.max(sb.tx_lsn);
             }
         }
-        if dev.read_sector(CWAL_BASE_LBA, &mut sec).is_ok() && sec[0..8] == PAGED_CWAL_MAGIC {
+        if dev.read_sector(layout.cwal_base_lba, &mut sec).is_ok()
+            && sec[0..8] == PAGED_CWAL_MAGIC
+        {
             let mut tag = [0u8; DURABLE_DIGEST_LEN];
             tag.copy_from_slice(&sec[52..84]);
             if seal_matches_keyed(&keys.mac, &sec[0..52], &tag) {
@@ -1600,10 +1766,12 @@ impl PagedBlockStore {
         if !is_seal_key_set(seal_key) {
             return Err(PagedStoreError::KeyUnset);
         }
-        let (avail_phys, max_logical) = Self::geometry_for_sectors(dev.capacity_sectors());
+        let cap_secs = dev.capacity_sectors();
+        let (avail_phys, max_logical) = Self::geometry_for_sectors(cap_secs);
         if max_logical == 0 {
             return Err(PagedStoreError::DiskTooSmall);
         }
+        let layout = PagedLayoutSpec::for_sectors(cap_secs);
 
         let mut sec_a = [0u8; SECTOR_BYTES];
         let mut sec_b = [0u8; SECTOR_BYTES];
@@ -1619,21 +1787,22 @@ impl PagedBlockStore {
                 return Err(PagedStoreError::RollbackOrAnchorMismatch);
             }
             self.reset();
+            self.dir_slots = layout.dir_slots;
             return Ok(None);
         }
 
         let keys = PagedKeys::derive(seal_key);
         // Every LSN the region shows was used counts, including an epoch this
         // recovery is about to pass over because the anchor names another one.
-        self.observe_lsn_floor(dev, &keys);
+        self.observe_lsn_floor(dev, &layout, &keys);
 
         let sb_a = if a_ok {
-            verify_superblock(&keys.mac, 0, &sec_a)
+            verify_superblock(&keys.mac, &layout, 0, &sec_a)
         } else {
             None
         };
         let sb_b = if b_ok {
-            verify_superblock(&keys.mac, 1, &sec_b)
+            verify_superblock(&keys.mac, &layout, 1, &sec_b)
         } else {
             None
         };
@@ -1678,7 +1847,7 @@ impl PagedBlockStore {
                 c_idx += 1;
                 continue;
             };
-            match self.try_load_superblock(dev, &keys, avail_phys, max_logical, &sb) {
+            match self.try_load_superblock(dev, &layout, &keys, avail_phys, max_logical, &sb) {
                 Ok(anchor) => {
                     if expected_anchor.is_none() {
                         self.last_recovery_fell_back_epoch =
@@ -1698,22 +1867,27 @@ impl PagedBlockStore {
     fn try_load_superblock<D: SectorIo>(
         &mut self,
         dev: &mut D,
+        layout: &PagedLayoutSpec,
         keys: &PagedKeys,
         avail_phys: usize,
         max_logical: usize,
         sb: &PagedSuperblock,
     ) -> Result<PagedAnchor, PagedStoreError> {
         let dir_lba = if sb.slot_idx == 0 {
-            DIR_A_LBA
+            layout.dir_a_lba
         } else {
-            DIR_B_LBA
+            layout.dir_b_lba
         };
-        let mut dir_secs = Box::new([[0u8; SECTOR_BYTES]; SECTORS_PER_PAGE]);
+        let mut dir_secs = alloc::vec![[0u8; SECTOR_BYTES]; layout.dir_sectors];
         dev.read_sectors(dir_lba, &mut dir_secs[..])
             .map_err(PagedStoreError::Io)?;
-        let Some(entries) =
-            decode_dir_sectors(&dir_secs, &sb.dir_sha256, &sb.merkle_root, avail_phys)
-        else {
+        let Some(entries) = decode_dir_sectors(
+            &dir_secs,
+            layout,
+            &sb.dir_sha256,
+            &sb.merkle_root,
+            avail_phys,
+        ) else {
             return Err(PagedStoreError::CorruptOrTampered);
         };
 
@@ -1722,7 +1896,7 @@ impl PagedBlockStore {
             Vec::new();
         if sb.cwal_redo_count > 0 {
             let mut cwal_hdr = [0u8; SECTOR_BYTES];
-            if dev.read_sector(CWAL_BASE_LBA, &mut cwal_hdr).is_ok()
+            if dev.read_sector(layout.cwal_base_lba, &mut cwal_hdr).is_ok()
                 && cwal_hdr[0..8] == PAGED_CWAL_MAGIC
             {
                 let cwal_lsn = u64::from_le_bytes([
@@ -1751,7 +1925,8 @@ impl PagedBlockStore {
                     let mut temp_frames = Vec::with_capacity(sb.cwal_redo_count as usize);
                     let mut r = 0usize;
                     while r < sb.cwal_redo_count as usize {
-                        let frame_lba = CWAL_BASE_LBA + 1 + (r as u64) * CWAL_REDO_FRAME_SECTORS;
+                        let frame_lba =
+                            layout.cwal_base_lba + 1 + (r as u64) * CWAL_REDO_FRAME_SECTORS;
                         let mut desc = [0u8; SECTOR_BYTES];
                         let mut pbuf = Box::new([[0u8; SECTOR_BYTES]; SECTORS_PER_PAGE]);
                         if dev.read_sector(frame_lba, &mut desc).is_err()
@@ -1771,7 +1946,7 @@ impl PagedBlockStore {
                             break;
                         };
                         if flsn != sb.tx_lsn
-                            || (lid as usize) >= PAGED_MAX_LOGICAL_PAGES
+                            || (lid as usize) >= layout.dir_slots
                             || entries[lid as usize] != fe
                         {
                             frames_ok = false;
@@ -1800,21 +1975,21 @@ impl PagedBlockStore {
         // Verify and decrypt every mapped logical page; if a home page fails verification
         // (always possible while `sb.state == IN_FLIGHT`), restore it from the authenticated
         // CWAL redo frame when there is one.
-        let mut loaded_pages = Vec::with_capacity(PAGED_MAX_LOGICAL_PAGES);
-        loaded_pages.resize_with(PAGED_MAX_LOGICAL_PAGES, CachedLogicalPage::empty);
+        let mut loaded_pages = Vec::with_capacity(layout.dir_slots);
+        loaded_pages.resize_with(layout.dir_slots, CachedLogicalPage::empty);
         let mut page_buf = Box::new([[0u8; SECTOR_BYTES]; SECTORS_PER_PAGE]);
         // Home pages rewritten from the redo journal: where, and what they must read back as.
         let mut healed: Vec<(u64, [u8; DURABLE_DIGEST_LEN])> = Vec::new();
 
         let mut lid = 0usize;
-        while lid < PAGED_MAX_LOGICAL_PAGES {
+        while lid < layout.dir_slots {
             let e = entries[lid];
             if e.is_mapped() {
                 if lid >= max_logical {
                     return Err(PagedStoreError::CorruptOrTampered);
                 }
-                let phys_lba =
-                    PAGE_POOL_BASE_LBA + (e.phys_slot as u64) * (SECTORS_PER_PAGE as u64);
+                let phys_lba = layout.page_pool_base_lba
+                    + (e.phys_slot as u64) * (SECTORS_PER_PAGE as u64);
                 let home_read = dev.read_sectors(phys_lba, &mut page_buf[..]);
                 let home_ok = if home_read.is_ok() {
                     decrypt_page_sectors(&keys.aead, lid as u16, &e, &mut page_buf)
@@ -1896,7 +2071,7 @@ impl PagedBlockStore {
                 ..*sb
             };
             let mut sb_sec = [0u8; SECTOR_BYTES];
-            pack_superblock(&keys.mac, &sb_quiescent, &mut sb_sec);
+            pack_superblock(&keys.mac, layout, &sb_quiescent, &mut sb_sec);
             dev.write_sector(sb_lba, &sb_sec)
                 .map_err(PagedStoreError::Io)?;
             dev.flush().map_err(PagedStoreError::Io)?;
@@ -1908,8 +2083,8 @@ impl PagedBlockStore {
             }
         }
 
-        self.ensure_tables();
-        self.dir.copy_from_slice(&entries[..]);
+        self.dir = entries;
+        self.dir_slots = layout.dir_slots;
         self.pages = loaded_pages;
         self.initialized = true;
         self.active_slot = sb.slot_idx;
@@ -2844,5 +3019,106 @@ mod fault_tests {
             .unwrap();
         assert_eq!(got_sb_bad.tx_lsn, a1.tx_lsn);
         assert!(r_sb_bad.last_recovery_fell_back_epoch());
+    }
+
+    #[test]
+    fn paged_store_v2_scales_to_1024_pages_and_persists_all_16384_sql_rows_plus_vfs() {
+        use crate::shell::OsShell;
+        use crate::state_store::{
+            BootOutcome, ShellKeys, ShellStore, AHCI_QUARANTINE_LBA, AHCI_STATE_LAYOUT,
+        };
+        use cuttle_contracts::{Filesystem, FS_O_CREATE, FS_O_RDWR};
+
+        // v1 disks (< 8 MiB / 16,384 sectors) remain unchanged at 118 and 256 logical pages.
+        assert_eq!(PagedBlockStore::max_logical_pages_for_sectors(4096), 118);
+        assert_eq!(PagedBlockStore::max_logical_pages_for_sectors(8192), 256);
+
+        // v2 disks (>= 8 MiB / 16,384 sectors) lift the directory ceiling to support >= 880..1,024 pages!
+        assert!(PagedBlockStore::max_logical_pages_for_sectors(16_384) >= 880);
+        assert_eq!(PagedBlockStore::max_logical_pages_for_sectors(24_576), 1024);
+
+        // Verify v2 `configure_for_sectors` enforces `0..1024` and rejects `1024`.
+        let mut raw_v2 = PagedBlockStore::new();
+        assert_eq!(
+            raw_v2.put_page(256, PageDomain::VfsData, 0, 0, b"v1-reject"),
+            Err(PagedStoreError::InvalidPageId)
+        );
+        raw_v2.configure_for_sectors(24_576);
+        assert!(raw_v2.put_page(1023, PageDomain::VfsData, 0, 0, b"v2-ok").is_ok());
+        assert_eq!(
+            raw_v2.put_page(1024, PageDomain::VfsData, 0, 0, b"v2-reject"),
+            Err(PagedStoreError::InvalidPageId)
+        );
+
+        // Full scale proof on a 12 MiB (24,576-sector) disk: all 8 SQL tables x 2,048 rows
+        // (16,384 rows = 513 SQL pages) + 8 x 32 KiB VFS files (256 KiB = 65 VFS pages) fit together!
+        let mut disk = MemDisk::new(24_576);
+        let keys = ShellKeys {
+            seal: key(),
+            legacy_seal: [0x22; 32],
+            attest: [0x33; 32],
+        };
+        let mut store = ShellStore::new(AHCI_STATE_LAYOUT, AHCI_QUARANTINE_LBA);
+        let mut sh = OsShell::empty();
+        let boot = store.boot(&mut disk, &mut sh, &keys, 1).unwrap();
+        assert_eq!(boot.outcome, BootOutcome::Fresh);
+        assert_eq!(sh.paged_max_logical(), 1024);
+
+        let mut out = [0u8; 256];
+        // Create 6 more tables so all 8 SQL table slots (`services`, `kv`, `t2..t7`) exist.
+        for t in 2..8 {
+            let ddl = alloc::format!("sql CREATE TABLE t{t} (id INT, tag TEXT)");
+            let act = sh.exec_line(ddl.as_bytes(), 1, 0, 0, &mut out);
+            assert!(out[..act.bytes_written()].ends_with(b" OK\n"));
+        }
+        // Fill all 8 tables to their full 2,048-row maximum (16,384 total rows).
+        let svc_existing = sh.db.table_at(0).row_count();
+        for i in svc_existing..2048 {
+            let ins = alloc::format!("INSERT INTO services VALUES ({i}, 'svc_{i}', 8000, 'TCP')");
+            let n = sh.db.exec(ins.as_bytes(), &mut out);
+            assert_eq!(&out[..n], b"INSERT 1\n");
+        }
+        let kv_existing = sh.db.table_at(1).row_count();
+        for i in kv_existing..2048 {
+            let ins = alloc::format!("INSERT INTO kv VALUES ('k_{i}', 'v_{i}', {i})");
+            let n = sh.db.exec(ins.as_bytes(), &mut out);
+            assert_eq!(&out[..n], b"INSERT 1\n");
+        }
+        for t in 2..8 {
+            for i in 0..2048 {
+                let ins = alloc::format!("INSERT INTO t{t} VALUES ({i}, 'row_{t}_{i}')");
+                let n = sh.db.exec(ins.as_bytes(), &mut out);
+                assert_eq!(&out[..n], b"INSERT 1\n");
+            }
+        }
+        assert_eq!(sh.db.total_rows(), 16_384);
+        sh.sync_paged_budgets();
+
+        // Also write 255 KiB of user VFS files alongside the 16,384 SQL rows.
+        let blob = alloc::vec![0x5Au8; 32 * 1024];
+        for f in 0..7 {
+            let p = alloc::format!("/data/vol_{f}.bin");
+            let h = sh.fs.open(p.as_bytes(), FS_O_CREATE | FS_O_RDWR).unwrap();
+            assert_eq!(sh.fs.write(h, 0, &blob).unwrap(), blob.len());
+            sh.fs.close(h).unwrap();
+        }
+        sh.sync_paged_budgets();
+
+        store.commit(&mut disk, &mut sh, 1).unwrap();
+        let expected_hash = sh.db.state_hash();
+        assert!(store.paged_store().allocated_page_count() > 550);
+
+        // Verify Merkle proof at a logical page index >= 256 (`lid = 550`).
+        let proof = store.paged_store().merkle_proof(550).expect("v2 merkle proof >= 256");
+        assert!(verify_dir_merkle_proof(&proof, &store.paged_store().merkle_root()));
+
+        // Reboot into a clean shell and verify every single row and VFS file survived!
+        let mut store2 = ShellStore::new(AHCI_STATE_LAYOUT, AHCI_QUARANTINE_LBA);
+        let mut sh2 = OsShell::empty();
+        let boot2 = store2.boot(&mut disk, &mut sh2, &keys, 2).unwrap();
+        assert!(matches!(boot2.outcome, BootOutcome::Restored { .. }));
+        assert_eq!(sh2.db.total_rows(), 16_384);
+        assert_eq!(sh2.db.state_hash(), expected_hash);
+        assert_eq!(sh2.fs.stat(b"/data/vol_6.bin").unwrap().size, 32 * 1024);
     }
 }
