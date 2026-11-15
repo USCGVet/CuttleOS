@@ -139,13 +139,16 @@ fn read_tlv(buf: &[u8]) -> Result<Tlv<'_>, X509Error> {
         }
         (len, 2 + n)
     };
-    if buf.len() < header_len + value_len {
+    let end = header_len
+        .checked_add(value_len)
+        .ok_or(X509Error::LengthTooLarge)?;
+    if buf.len() < end {
         return Err(X509Error::TruncatedBody);
     }
     Ok(Tlv {
         tag,
         header_len,
-        value: &buf[header_len..header_len + value_len],
+        value: &buf[header_len..end],
     })
 }
 
@@ -197,7 +200,7 @@ impl<'a> SeqWalker<'a> {
 /// no scanning).
 fn subslice_offset(outer: &[u8], inner: &[u8]) -> Option<usize> {
     let outer_start = outer.as_ptr() as usize;
-    let outer_end = outer_start + outer.len();
+    let outer_end = outer_start.checked_add(outer.len())?;
     let inner_start = inner.as_ptr() as usize;
     if inner_start < outer_start || inner_start > outer_end {
         return None;
@@ -665,10 +668,9 @@ impl X509Impl {
             .checked_sub(inner_tlv.header_len)
             .ok_or(X509Error::TrailingData)?;
         let total = inner_tlv.encoded_len();
-        if off + total > outer.len() {
-            return Err(X509Error::TruncatedBody);
-        }
-        Ok(&outer[off..off + total])
+        let end = off.checked_add(total).ok_or(X509Error::TruncatedBody)?;
+        let slice = outer.get(off..end).ok_or(X509Error::TruncatedBody)?;
+        Ok(slice)
     }
 }
 

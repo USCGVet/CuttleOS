@@ -403,7 +403,10 @@ impl DhcpClient {
             return Err(DhcpError::EmptyYiaddr);
         }
         let server_id = view.server_id.ok_or(DhcpError::MissingMessageType)?;
-        // Cache for later.
+        // Build the outgoing DHCPREQUEST before mutating client state so an
+        // undersized caller buffer leaves `self` untouched in `Selecting`.
+        let n = DhcpImpl::build_request(self.mac, self.xid, view.yiaddr, server_id, out)?;
+
         self.offered_ip = view.yiaddr;
         self.server_id = server_id;
         // Pre-populate lease fields the OFFER already disclosed; ACK
@@ -420,8 +423,6 @@ impl DhcpClient {
         if let Some(lt) = view.lease_secs {
             self.lease.lease_secs = lt;
         }
-
-        let n = DhcpImpl::build_request(self.mac, self.xid, view.yiaddr, server_id, out)?;
         self.state = DhcpClientState::Requesting;
         Ok(n)
     }
@@ -1341,5 +1342,26 @@ mod tests {
             .expect("Renewing client must accept renewal ACK from bound server");
         assert_eq!(cli.state(), DhcpClientState::Bound);
         assert_eq!(renewed.bound_at_secs, 100 + (TEST_LEASE_SECS as u64) / 2 + 5);
+    }
+
+    #[test]
+    fn on_offer_leaves_client_state_unmodified_when_request_buffer_is_too_small() {
+        let mut cli = DhcpClient::new(TEST_MAC);
+        let mut disc = [0u8; DHCP_MAX_MESSAGE_LEN];
+        cli.start_discover(TEST_XID, &mut disc).unwrap();
+
+        let mut offer = [0u8; DHCP_MAX_MESSAGE_LEN];
+        let n_offer = build_offer_fixture(&mut offer);
+
+        let mut short_out = [0xAAu8; 16];
+        assert_eq!(
+            cli.on_offer(&offer[..n_offer], &mut short_out),
+            Err(DhcpError::OutputBufferTooSmall)
+        );
+        assert_eq!(cli.state(), DhcpClientState::Selecting);
+        assert_eq!(cli.offered_ip(), [0u8; 4]);
+        assert_eq!(cli.server_id(), [0u8; 4]);
+        assert_eq!(cli.lease().subnet_mask, [0u8; 4]);
+        assert_eq!(short_out, [0xAAu8; 16]);
     }
 }

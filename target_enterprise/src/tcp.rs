@@ -61,7 +61,12 @@ impl Tcp for TcpImpl {
         dst_ip: [u8; 4],
         out: &mut [u8],
     ) -> Result<usize, TcpError> {
-        let total = TCP_MIN_HEADER_LEN + payload.len();
+        let total = TCP_MIN_HEADER_LEN
+            .checked_add(payload.len())
+            .ok_or(TcpError::OutputBufferTooSmall)?;
+        if total > u16::MAX as usize {
+            return Err(TcpError::BadHeaderLength);
+        }
         if out.len() < total {
             return Err(TcpError::OutputBufferTooSmall);
         }
@@ -79,9 +84,7 @@ impl Tcp for TcpImpl {
         out[18] = 0; // urgent pointer = 0
         out[19] = 0;
         // Payload.
-        for i in 0..payload.len() {
-            out[TCP_MIN_HEADER_LEN + i] = payload[i];
-        }
+        out[TCP_MIN_HEADER_LEN..total].copy_from_slice(payload);
         // Checksum over pseudo-header + segment (with checksum field zero).
         let sum = Self::tcp_checksum(src_ip, dst_ip, &out[..total]);
         out[16..18].copy_from_slice(&sum.to_be_bytes());
@@ -95,6 +98,9 @@ impl Tcp for TcpImpl {
     ) -> Result<TcpSegmentView<'a>, TcpError> {
         if bytes.len() < TCP_MIN_HEADER_LEN {
             return Err(TcpError::Truncated);
+        }
+        if bytes.len() > u16::MAX as usize {
+            return Err(TcpError::BadHeaderLength);
         }
         let data_off_words = (bytes[12] >> 4) & 0x0F;
         // Reserved bits are bits 12..16 of the (data_offset|reserved) word.
@@ -142,17 +148,17 @@ impl Tcp for TcpImpl {
         //
         // Pseudo-header: src_ip(4) + dst_ip(4) + zero(1) + protocol(1)
         // + tcp_length(2) = 12 bytes.
-        let tcp_len = segment.len() as u32;
-        let mut sum: u32 = 0;
+        let tcp_len = (segment.len() as u64) & 0xFFFF;
+        let mut sum: u64 = 0;
         // src/dst ip
-        sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u32;
-        sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u32;
-        sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u32;
-        sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u32;
+        sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u64;
+        sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u64;
+        sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u64;
+        sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u64;
         // zero + protocol byte → one 16-bit word
-        sum += IP_PROTO_TCP as u32;
+        sum += IP_PROTO_TCP as u64;
         // tcp_length (16-bit)
-        sum += tcp_len & 0xFFFF;
+        sum += tcp_len;
         // segment, treating bytes 16..18 (the checksum field) as zero.
         let mut i = 0;
         while i + 1 < segment.len() {
@@ -161,12 +167,12 @@ impl Tcp for TcpImpl {
             } else {
                 u16::from_be_bytes([segment[i], segment[i + 1]])
             };
-            sum += word as u32;
+            sum += word as u64;
             i += 2;
         }
         if i < segment.len() {
             // Odd-byte tail: pad with zero in the low byte.
-            sum += (segment[i] as u32) << 8;
+            sum += (segment[i] as u64) << 8;
         }
         // Fold carries.
         while (sum >> 16) != 0 {
@@ -181,21 +187,21 @@ impl TcpImpl {
     /// field non-zero) and returns the one's-complement folded sum.
     /// A valid segment yields zero. Used by `parse_segment` to verify.
     fn tcp_checksum_verify(src_ip: [u8; 4], dst_ip: [u8; 4], segment: &[u8]) -> u16 {
-        let tcp_len = segment.len() as u32;
-        let mut sum: u32 = 0;
-        sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u32;
-        sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u32;
-        sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u32;
-        sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u32;
-        sum += IP_PROTO_TCP as u32;
-        sum += tcp_len & 0xFFFF;
+        let tcp_len = (segment.len() as u64) & 0xFFFF;
+        let mut sum: u64 = 0;
+        sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u64;
+        sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u64;
+        sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u64;
+        sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u64;
+        sum += IP_PROTO_TCP as u64;
+        sum += tcp_len;
         let mut i = 0;
         while i + 1 < segment.len() {
-            sum += u16::from_be_bytes([segment[i], segment[i + 1]]) as u32;
+            sum += u16::from_be_bytes([segment[i], segment[i + 1]]) as u64;
             i += 2;
         }
         if i < segment.len() {
-            sum += (segment[i] as u32) << 8;
+            sum += (segment[i] as u64) << 8;
         }
         while (sum >> 16) != 0 {
             sum = (sum & 0xFFFF) + (sum >> 16);
@@ -393,7 +399,7 @@ pub fn process_segment_with_isn(
     }
 
     match tcb.state {
-        TcpState::Closed => unreachable!(), // handled above
+        TcpState::Closed => Err(TcpProcessError::ClosedReceived),
 
         TcpState::Listen => {
             // Expect pure SYN (no ACK, RST, or FIN).
@@ -1395,5 +1401,28 @@ mod tests {
             process_segment(syn_rcvd, &seg_synack, 0),
             Err(TcpProcessError::MalformedFlags)
         );
+    }
+
+    #[test]
+    fn build_segment_rejects_oversized_ip_segment_beyond_u16_max() {
+        let big_payload = alloc::vec![0x5Au8; 65_520];
+        let mut out = alloc::vec![0xAAu8; 65_560];
+        let res = TcpImpl::build_segment(
+            1234,
+            80,
+            1,
+            1,
+            tcp_flags::ACK,
+            1024,
+            &big_payload,
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            &mut out,
+        );
+        assert!(
+            res.is_err(),
+            "TCP segment exceeding 65535 octets cannot have a valid IPv4 16-bit pseudo-header length"
+        );
+        assert_eq!(out[0], 0xAA);
     }
 }

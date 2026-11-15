@@ -44,11 +44,14 @@ pub fn walk_oack_options<F: FnMut(&[u8], &[u8])>(
     mut visitor: F,
 ) -> Result<(), TftpError> {
     let __cuttle_stack_pad_9a042a18: [u8; 183usize] = ::core::hint::black_box([0u8; 183usize]);
+    validate_oack_options_m62b101be(options)?;
     let mut cursor_ve86a6732_0 = 0usize;
     while cursor_ve86a6732_0 < options.len() {
         let name_end_ve86a6732_1 = scan_nul_m62b101be(options, cursor_ve86a6732_0)?;
         let name_ve86a6732_2 = &options[cursor_ve86a6732_0..name_end_ve86a6732_1];
-        let value_start_ve86a6732_3 = name_end_ve86a6732_1 + 1;
+        let value_start_ve86a6732_3 = name_end_ve86a6732_1
+            .checked_add(1)
+            .ok_or(TftpError::BadOption)?;
         if value_start_ve86a6732_3 >= options.len() {
             return Err(TftpError::BadOption);
         }
@@ -58,7 +61,9 @@ pub fn walk_oack_options<F: FnMut(&[u8], &[u8])>(
             return Err(TftpError::BadOption);
         }
         visitor(name_ve86a6732_2, value_ve86a6732_5);
-        cursor_ve86a6732_0 = value_end_ve86a6732_4 + 1;
+        cursor_ve86a6732_0 = value_end_ve86a6732_4
+            .checked_add(1)
+            .ok_or(TftpError::BadOption)?;
     }
     Ok(())
 }
@@ -118,15 +123,16 @@ impl Tftp for TftpImpl {
             }
             i_ve86a6732_0 += 1;
         }
-        let total_ve86a6732_1 = TFTP_OPCODE_LEN + 2 + msg.len() + 1;
+        let total_ve86a6732_1 = (TFTP_OPCODE_LEN + 2)
+            .checked_add(msg.len())
+            .and_then(|n| n.checked_add(1))
+            .ok_or(TftpError::OutputBufferTooSmall)?;
         if out.len() < total_ve86a6732_1 {
             return Err(TftpError::OutputBufferTooSmall);
         }
         write_u16_be_m62b101be(&mut out[0..2], tftp_op::ERROR);
         write_u16_be_m62b101be(&mut out[2..4], code as u16);
-        for j_ve86a6732_2 in 0..msg.len() {
-            out[4 + j_ve86a6732_2] = msg[j_ve86a6732_2];
-        }
+        out[4..4 + msg.len()].copy_from_slice(msg);
         out[4 + msg.len()] = 0;
         Ok(total_ve86a6732_1)
     }
@@ -468,5 +474,18 @@ mod tests {
         let mut ack2 = [0u8; 4];
         TftpImpl::build_ack(1, &mut ack2).unwrap();
         assert_eq!(&ack2, &[0x00, 0x04, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn walk_oack_options_does_not_invoke_visitor_when_trailing_option_is_malformed() {
+        let mut visited = 0usize;
+        let res = walk_oack_options(b"blksize\0512\0tsize\0unterminated", |_, _| {
+            visited += 1;
+        });
+        assert_eq!(res, Err(TftpError::BadOption));
+        assert_eq!(
+            visited, 0,
+            "walk_oack_options must pre-validate the full option block before invoking visitor"
+        );
     }
 }

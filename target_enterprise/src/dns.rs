@@ -46,7 +46,13 @@ pub struct DnsImpl;
 
 impl Dns for DnsImpl {
     fn build_a_query(id: u16, name: &[u8], out: &mut [u8]) -> Result<usize, DnsError> {
-        if out.len() < DNS_HEADER_LEN {
+        let mut qname_wire = [0u8; MAX_NAME_LEN];
+        let qname_len = encode_name_ascii(name, &mut qname_wire)?;
+        let total = DNS_HEADER_LEN
+            .checked_add(qname_len)
+            .and_then(|n| n.checked_add(4))
+            .ok_or(DnsError::OutputBufferTooSmall)?;
+        if out.len() < total {
             return Err(DnsError::OutputBufferTooSmall);
         }
 
@@ -60,13 +66,10 @@ impl Dns for DnsImpl {
         write_u16_be(&mut out[10..12], 0); // arcount
         let mut pos = DNS_HEADER_LEN;
 
-        // QNAME (encode the ASCII dotted name as length-prefixed labels).
-        pos += encode_name_ascii(name, &mut out[pos..])?;
+        out[pos..pos + qname_len].copy_from_slice(&qname_wire[..qname_len]);
+        pos += qname_len;
 
         // QTYPE = A, QCLASS = IN.
-        if pos + 4 > out.len() {
-            return Err(DnsError::OutputBufferTooSmall);
-        }
         write_u16_be(&mut out[pos..pos + 2], DnsRecordType::A as u16);
         write_u16_be(&mut out[pos + 2..pos + 4], dns_class::IN);
         pos += 4;
@@ -104,7 +107,8 @@ impl Dns for DnsImpl {
         // section, so the slice equals what was on the wire.)
         let name_start = DNS_HEADER_LEN;
         let name_end = scan_name(bytes, name_start)?;
-        if name_end + 4 > bytes.len() {
+        let q_tail = name_end.checked_add(4).ok_or(DnsError::Truncated)?;
+        if q_tail > bytes.len() {
             return Err(DnsError::Truncated);
         }
         let q_name = &bytes[name_start..name_end];
@@ -131,7 +135,7 @@ impl Dns for DnsImpl {
         if question_wire_name.is_empty() || question_wire_name.len() > MAX_NAME_LEN {
             return Err(DnsError::InvalidLabel);
         }
-        if *question_wire_name.last().unwrap() != 0 {
+        if question_wire_name.last().copied() != Some(0) {
             return Err(DnsError::InvalidLabel);
         }
         // Walk labels to verify each length octet is in bounds.
@@ -674,6 +678,31 @@ mod tests {
         assert!(
             matches!(DnsImpl::parse_message(&msg), Err(DnsError::NameTooLong)),
             "256-octet wire QNAME including root label must fail with NameTooLong"
+        );
+    }
+
+    #[test]
+    fn build_a_query_is_all_or_nothing_on_invalid_name_or_short_buffer() {
+        let mut short = [0xCCu8; 18];
+        assert_eq!(
+            DnsImpl::build_a_query(0x1234, b"a.b", &mut short),
+            Err(DnsError::OutputBufferTooSmall)
+        );
+        assert_eq!(
+            short,
+            [0xCCu8; 18],
+            "short buffer in build_a_query must not leave a half-written DNS header/qname"
+        );
+
+        let mut bad = [0xDDu8; 64];
+        assert_eq!(
+            DnsImpl::build_a_query(0x1234, b"ok..bad", &mut bad),
+            Err(DnsError::InvalidLabel)
+        );
+        assert_eq!(
+            bad,
+            [0xDDu8; 64],
+            "invalid label in build_a_query must leave output buffer untouched"
         );
     }
 }

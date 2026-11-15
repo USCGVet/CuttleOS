@@ -417,21 +417,24 @@ impl hmac::Key for HmacSha256Key {
 
 const AEAD_TAG_LEN: usize = 16;
 
-/// The two RustCrypto AEADs behind one in-place interface.
+/// The two RustCrypto AEADs behind one in-place interface, plus a fail-closed
+/// invalid-key sentinel so malformed key lengths never panic in kernel context.
 enum AeadCipher {
     Aes128Gcm(Box<Aes128Gcm>),
     ChaCha20Poly1305(Box<ChaCha20Poly1305>),
+    InvalidKeyLength,
 }
 
 impl Drop for AeadCipher {
     fn drop(&mut self) {
         match self {
             Self::Aes128Gcm(c) => {
-                **c = Aes128Gcm::new_from_slice(&[0u8; 16]).expect("16-byte zero key");
+                **c = Aes128Gcm::new(&GenericArray::from([0u8; 16]));
             }
             Self::ChaCha20Poly1305(c) => {
-                **c = ChaCha20Poly1305::new_from_slice(&[0u8; 32]).expect("32-byte zero key");
+                **c = ChaCha20Poly1305::new(&GenericArray::from([0u8; 32]));
             }
+            Self::InvalidKeyLength => {}
         }
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
     }
@@ -443,6 +446,7 @@ impl AeadCipher {
         let tag = match self {
             Self::Aes128Gcm(c) => c.encrypt_in_place_detached(nonce, aad, buf),
             Self::ChaCha20Poly1305(c) => c.encrypt_in_place_detached(nonce, aad, buf),
+            Self::InvalidKeyLength => return Err(Error::EncryptError),
         }
         .map_err(|_| Error::EncryptError)?;
         Ok(tag.into())
@@ -454,6 +458,7 @@ impl AeadCipher {
         match self {
             Self::Aes128Gcm(c) => c.decrypt_in_place_detached(nonce, aad, buf, tag),
             Self::ChaCha20Poly1305(c) => c.decrypt_in_place_detached(nonce, aad, buf, tag),
+            Self::InvalidKeyLength => return Err(Error::DecryptError),
         }
         .map_err(|_| Error::DecryptError)
     }
@@ -467,14 +472,23 @@ enum AeadKind {
 
 impl AeadKind {
     fn cipher(self, key: &[u8]) -> AeadCipher {
-        // rustls hands exactly `key_len()` bytes, so `new_from_slice` cannot fail.
         match self {
-            Self::Aes128Gcm => AeadCipher::Aes128Gcm(Box::new(
-                Aes128Gcm::new_from_slice(key).expect("16-byte AES-128 key"),
-            )),
-            Self::ChaCha20Poly1305 => AeadCipher::ChaCha20Poly1305(Box::new(
-                ChaCha20Poly1305::new_from_slice(key).expect("32-byte ChaCha20 key"),
-            )),
+            Self::Aes128Gcm => match <[u8; 16]>::try_from(key) {
+                Ok(mut k) => {
+                    let c = Aes128Gcm::new(&GenericArray::from(k));
+                    k.zeroize();
+                    AeadCipher::Aes128Gcm(Box::new(c))
+                }
+                Err(_) => AeadCipher::InvalidKeyLength,
+            },
+            Self::ChaCha20Poly1305 => match <[u8; 32]>::try_from(key) {
+                Ok(mut k) => {
+                    let c = ChaCha20Poly1305::new(&GenericArray::from(k));
+                    k.zeroize();
+                    AeadCipher::ChaCha20Poly1305(Box::new(c))
+                }
+                Err(_) => AeadCipher::InvalidKeyLength,
+            },
         }
     }
 }
@@ -551,7 +565,7 @@ impl MessageEncrypter for Tls13Encrypter {
     }
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
-        payload_len + 1 + AEAD_TAG_LEN
+        payload_len.saturating_add(1 + AEAD_TAG_LEN)
     }
 }
 
@@ -1337,5 +1351,22 @@ mod tests {
         assert_ne!(s_rdrand, s_mac2);
         assert_ne!(s_rdrand, s_boot2);
         assert_ne!(s_rdrand, s_key2);
+    }
+
+    #[test]
+    fn aead_cipher_invalid_key_length_fails_closed_without_panicking() {
+        let bad_aes = AeadKind::Aes128Gcm.cipher(&[0x11u8; 15]);
+        let bad_chacha = AeadKind::ChaCha20Poly1305.cipher(&[0x22u8; 31]);
+        let mut buf = [0x42u8; 8];
+        assert_eq!(bad_aes.seal(&[0u8; 12], b"aad", &mut buf), Err(Error::EncryptError));
+        assert_eq!(
+            bad_aes.open(&[0u8; 12], b"aad", &mut buf, &[0u8; 16]),
+            Err(Error::DecryptError)
+        );
+        assert_eq!(bad_chacha.seal(&[0u8; 12], b"aad", &mut buf), Err(Error::EncryptError));
+        assert_eq!(
+            bad_chacha.open(&[0u8; 12], b"aad", &mut buf, &[0u8; 16]),
+            Err(Error::DecryptError)
+        );
     }
 }

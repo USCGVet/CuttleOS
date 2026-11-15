@@ -61,7 +61,18 @@ impl ServerIdentity {
     /// provisioned node). The same secret always yields the same key and
     /// certificate, so a pinned certificate survives reboots and morph cycles.
     pub fn derive(secret: &[u8; 32], mac: [u8; 6]) -> Self {
-        Self::try_derive(secret, mac).expect("ECDSA P-256 certificate self-signing failed")
+        let res = Self::try_derive(secret, mac);
+        assert!(res.is_ok(), "ECDSA P-256 certificate self-signing failed");
+        match res {
+            Ok(id) => id,
+            Err(_) => {
+                let key = derive_p256_key(secret);
+                let cert_der = build_self_signed_cert_infallible(&key, mac);
+                let mut fingerprint = [0u8; 32];
+                fingerprint.copy_from_slice(&Sha256::digest(&cert_der));
+                Self { key, cert_der, fingerprint }
+            }
+        }
     }
 
     /// DER certificate.
@@ -173,14 +184,7 @@ fn extension(oid: &[u8], value: &[u8]) -> Vec<u8> {
     der_vec(0x30, &body)
 }
 
-/// Self-signed X.509 v3 certificate, ecdsa-with-SHA256, `CN=cuttle-<mac>`,
-/// valid 2025-01-01 through 2099-12-31, SAN `localhost` / `127.0.0.1` /
-/// `10.0.2.15`, EKU serverAuth, SKID = AKID. No basicConstraints and no
-/// keyUsage: it is an end-entity certificate that clients pin directly.
-fn build_self_signed_cert(
-    key: &p256::ecdsa::SigningKey,
-    mac: [u8; 6],
-) -> Result<Vec<u8>, &'static str> {
+fn build_tbs_and_sig_alg(key: &p256::ecdsa::SigningKey, mac: [u8; 6]) -> (Vec<u8>, Vec<u8>) {
     let signer = EcdsaP256SigningKey::new(key.clone());
     let public = signer.public_key_sec1();
     let spki = public_key_to_spki(&alg_id::ECDSA_P256, public);
@@ -228,6 +232,19 @@ fn build_self_signed_cert(
     tbs_body.extend_from_slice(spki.as_ref());
     der(0xa3, &der_vec(0x30, &exts), &mut tbs_body);
     let tbs = der_vec(0x30, &tbs_body);
+    (tbs, sig_alg)
+}
+
+/// Self-signed X.509 v3 certificate, ecdsa-with-SHA256, `CN=cuttle-<mac>`,
+/// valid 2025-01-01 through 2099-12-31, SAN `localhost` / `127.0.0.1` /
+/// `10.0.2.15`, EKU serverAuth, SKID = AKID. No basicConstraints and no
+/// keyUsage: it is an end-entity certificate that clients pin directly.
+fn build_self_signed_cert(
+    key: &p256::ecdsa::SigningKey,
+    mac: [u8; 6],
+) -> Result<Vec<u8>, &'static str> {
+    let signer = EcdsaP256SigningKey::new(key.clone());
+    let (tbs, sig_alg) = build_tbs_and_sig_alg(key, mac);
 
     let mut sig_bits = alloc::vec![0u8]; // BIT STRING: no unused bits
     sig_bits.extend_from_slice(&signer.sign_der(&tbs)?);
@@ -236,6 +253,21 @@ fn build_self_signed_cert(
     cert_body.extend_from_slice(&sig_alg);
     der(0x03, &sig_bits, &mut cert_body);
     Ok(der_vec(0x30, &cert_body))
+}
+
+fn build_self_signed_cert_infallible(
+    key: &p256::ecdsa::SigningKey,
+    mac: [u8; 6],
+) -> Vec<u8> {
+    use p256::ecdsa::signature::Signer as _;
+    let (tbs, sig_alg) = build_tbs_and_sig_alg(key, mac);
+    let sig: p256::ecdsa::Signature = key.sign(&tbs);
+    let mut sig_bits = alloc::vec![0u8];
+    sig_bits.extend_from_slice(sig.to_der().as_bytes());
+    let mut cert_body = tbs;
+    cert_body.extend_from_slice(&sig_alg);
+    der(0x03, &sig_bits, &mut cert_body);
+    der_vec(0x30, &cert_body)
 }
 
 // ------------------------------------------------------------------
@@ -334,8 +366,8 @@ impl TlsSession {
         if self.failed {
             return Err(SessionError::Failed);
         }
-        if self.rx.len() + data.len() > MAX_RX_BYTES {
-            self.failed = true;
+        if self.rx.len().saturating_add(data.len()) > MAX_RX_BYTES {
+            self.fail_and_scrub();
             return Err(SessionError::Overflow);
         }
         self.rx.extend_from_slice(data);
@@ -434,7 +466,9 @@ impl TlsSession {
                         match record {
                             Ok(record) => {
                                 discard += record.discard;
-                                if self.plaintext.len() + record.payload.len() > MAX_PLAINTEXT_BYTES {
+                                if self.plaintext.len().saturating_add(record.payload.len())
+                                    > MAX_PLAINTEXT_BYTES
+                                {
                                     plaintext_overflow = true;
                                     break;
                                 }
@@ -508,7 +542,7 @@ impl TlsSession {
             }
             drain_prefix_and_scrub(&mut self.rx, discard);
             if plaintext_overflow {
-                self.clear_plaintext_and_scrub();
+                self.fail_and_scrub();
                 return Err(SessionError::Overflow);
             }
             if overflow {
@@ -882,7 +916,7 @@ pub mod golden {
 #[cfg(any(test, not(cuttle_prod)))]
 pub fn golden_server() -> Result<Box<LivedNet>, &'static str> {
     crate::tls_provider::reset_golden_rng(golden::RNG_SEED);
-    let identity = ServerIdentity::derive(&golden::IDENTITY_SECRET, golden::MAC);
+    let identity = ServerIdentity::try_derive(&golden::IDENTITY_SECRET, golden::MAC)?;
     let config = server_config(&identity, crate::tls_provider::golden_provider())
         .map_err(|_| "golden: server config")?;
     let mut net = Box::new(LivedNet::with_auth_key(golden::MAC, golden::AUTH_KEY));
@@ -1160,5 +1194,33 @@ mod tests {
         let inspected = corrupted_app.len().min(rx_cap);
         let rx_spare = unsafe { core::slice::from_raw_parts(rx_ptr, inspected) };
         assert!(rx_spare.iter().all(|&b| b == 0), "corrupted post-handshake rx spare bytes must be zeroed");
+    }
+
+    #[test]
+    fn plaintext_overflow_marks_session_failed_and_scrubs_buffers() {
+        let _guard = crate::tls_provider::GOLDEN_LOCK.lock();
+        crate::tls_provider::reset_golden_rng(golden::RNG_SEED);
+        let id = ServerIdentity::derive(&golden::IDENTITY_SECRET, golden::MAC);
+        let config = server_config(&id, crate::tls_provider::golden_provider()).unwrap();
+        let mut session = TlsSession::new(config).unwrap();
+
+        session.receive(kf::HTTPS_GOLDEN_CLIENT_FLIGHTS[0]).unwrap();
+        let tx0 = session.pending_tx().len();
+        session.consume_tx(tx0);
+        session.receive(kf::HTTPS_GOLDEN_CLIENT_FLIGHTS[1]).unwrap();
+        let tx1 = session.pending_tx().len();
+        session.consume_tx(tx1);
+
+        session.plaintext().resize(MAX_PLAINTEXT_BYTES, b'S');
+        assert_eq!(
+            session.receive(kf::HTTPS_GOLDEN_CLIENT_FLIGHTS[2]),
+            Err(SessionError::Overflow)
+        );
+        assert!(
+            session.is_failed(),
+            "plaintext_overflow must permanently mark the TLS session failed"
+        );
+        assert_eq!(session.plaintext().len(), 0);
+        assert_eq!(session.receive(b"more"), Err(SessionError::Failed));
     }
 }

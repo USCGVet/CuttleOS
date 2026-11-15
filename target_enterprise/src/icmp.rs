@@ -93,7 +93,9 @@ fn build_echo(
     payload: &[u8],
     out: &mut [u8],
 ) -> Result<usize, IcmpError> {
-    let total = ICMP_HEADER_LEN + payload.len();
+    let total = ICMP_HEADER_LEN
+        .checked_add(payload.len())
+        .ok_or(IcmpError::OutputBufferTooSmall)?;
     if out.len() < total {
         return Err(IcmpError::OutputBufferTooSmall);
     }
@@ -103,9 +105,7 @@ fn build_echo(
     out[3] = 0; // checksum lo
     write_u16_be(&mut out[4..6], identifier);
     write_u16_be(&mut out[6..8], sequence_number);
-    for i in 0..payload.len() {
-        out[ICMP_HEADER_LEN + i] = payload[i];
-    }
+    out[ICMP_HEADER_LEN..total].copy_from_slice(payload);
     // Compute checksum over the message with checksum field zeroed.
     let cksum = icmp_checksum_inplace(&out[..total]);
     write_u16_be(&mut out[2..4], cksum);

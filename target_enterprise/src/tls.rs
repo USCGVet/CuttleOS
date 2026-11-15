@@ -12,12 +12,12 @@
 //! keeps its original signature and output bytes; the KATs below pin them to the
 //! published RFC vectors.
 
-use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 /// SHA-256 output length in bytes.
 pub const HASH_LEN: usize = 32;
+/// SHA-256 compression block length in bytes (RFC 2104).
+const BLOCK_LEN: usize = 64;
 
 /// All-zero 32-byte buffer: the PSK IKM in the TLS 1.3 early-secret step
 /// (RFC 8446 §7.1, "a string of Hash.length bytes set to zeros").
@@ -31,28 +31,124 @@ pub const SHA256_EMPTY: [u8; HASH_LEN] = [
 
 /// HMAC-SHA-256 (RFC 2104) of `data` under `key`. Writes 32 bytes to `out`.
 pub fn hmac_sha256(key: &[u8], data: &[u8], out: &mut [u8; HASH_LEN]) {
-    // `new_from_slice` accepts keys of any length (long keys are pre-hashed).
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    out.copy_from_slice(&mac.finalize().into_bytes());
+    hmac_sha256_parts(key, &[data], out);
 }
 
 /// Streaming multi-part HMAC-SHA-256 (RFC 2104) over the concatenation of `parts` under `key`,
-/// without intermediate fixed-size buffer copies or truncation. Writes 32 bytes to `out`.
+/// without intermediate fixed-size buffer copies, `.expect(...)`, or truncation. Writes 32 bytes to `out`.
 pub fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]], out: &mut [u8; HASH_LEN]) {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
-    for part in parts {
-        mac.update(part);
+    let mut k_block = [0u8; BLOCK_LEN];
+    if key.len() > BLOCK_LEN {
+        let mut hashed: [u8; HASH_LEN] = Sha256::digest(key).into();
+        k_block[..HASH_LEN].copy_from_slice(&hashed);
+        crate::durable_seal::zeroize_secret_bytes(&mut hashed);
+    } else {
+        k_block[..key.len()].copy_from_slice(key);
     }
-    out.copy_from_slice(&mac.finalize().into_bytes());
+    let mut ipad = [0x36u8; BLOCK_LEN];
+    let mut opad = [0x5cu8; BLOCK_LEN];
+    let mut i = 0usize;
+    while i < BLOCK_LEN {
+        ipad[i] ^= k_block[i];
+        opad[i] ^= k_block[i];
+        i += 1;
+    }
+    crate::durable_seal::zeroize_secret_bytes(&mut k_block);
+
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    for part in parts {
+        inner.update(part);
+    }
+    let mut inner_digest: [u8; HASH_LEN] = inner.finalize().into();
+    crate::durable_seal::zeroize_secret_bytes(&mut ipad);
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    out.copy_from_slice(&outer.finalize());
+    crate::durable_seal::zeroize_secret_bytes(&mut opad);
+    crate::durable_seal::zeroize_secret_bytes(&mut inner_digest);
 }
 
 /// HKDF-Extract over SHA-256 (RFC 5869 §2.2): PRK = HMAC(salt, IKM). An empty
 /// `salt` means 32 zero bytes, per the RFC.
 pub fn hkdf_extract(salt: &[u8], ikm: &[u8], out: &mut [u8; HASH_LEN]) {
-    let salt = if salt.is_empty() { None } else { Some(salt) };
-    let (prk, _) = Hkdf::<Sha256>::extract(salt, ikm);
-    out.copy_from_slice(&prk);
+    if salt.is_empty() {
+        hmac_sha256(&ZERO_HASH, ikm, out);
+    } else {
+        hmac_sha256(salt, ikm, out);
+    }
+}
+
+fn hkdf_expand_multi_step(
+    prk: &[u8; HASH_LEN],
+    prev: &[u8],
+    info_parts: &[&[u8]],
+    counter: u8,
+    out: &mut [u8; HASH_LEN],
+) {
+    let mut ipad = [0x36u8; BLOCK_LEN];
+    let mut opad = [0x5cu8; BLOCK_LEN];
+    let mut i = 0usize;
+    while i < HASH_LEN {
+        ipad[i] ^= prk[i];
+        opad[i] ^= prk[i];
+        i += 1;
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(prev);
+    for part in info_parts {
+        inner.update(part);
+    }
+    inner.update([counter]);
+    let mut inner_digest: [u8; HASH_LEN] = inner.finalize().into();
+    crate::durable_seal::zeroize_secret_bytes(&mut ipad);
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    out.copy_from_slice(&outer.finalize());
+    crate::durable_seal::zeroize_secret_bytes(&mut opad);
+    crate::durable_seal::zeroize_secret_bytes(&mut inner_digest);
+}
+
+/// Fallible HKDF-Expand over multi-part `info_parts` (RFC 5869 §2.3).
+/// Returns `Err` without modifying `out` if `out.len() > 255 * HASH_LEN`.
+pub fn try_hkdf_expand_multi(
+    prk: &[u8; HASH_LEN],
+    info_parts: &[&[u8]],
+    out: &mut [u8],
+) -> Result<(), &'static str> {
+    if out.len() > 255 * HASH_LEN {
+        return Err("hkdf_expand: output too long");
+    }
+    let mut t_block = [0u8; HASH_LEN];
+    let mut written = 0usize;
+    let mut counter = 1u8;
+    while written < out.len() {
+        let mut next_block = [0u8; HASH_LEN];
+        let prev = if counter == 1 { &[][..] } else { &t_block[..] };
+        hkdf_expand_multi_step(prk, prev, info_parts, counter, &mut next_block);
+        t_block = next_block;
+        crate::durable_seal::zeroize_secret_bytes(&mut next_block);
+        let take = (out.len() - written).min(HASH_LEN);
+        out[written..written + take].copy_from_slice(&t_block[..take]);
+        written += take;
+        counter = counter.wrapping_add(1);
+    }
+    crate::durable_seal::zeroize_secret_bytes(&mut t_block);
+    Ok(())
+}
+
+/// Fallible HKDF-Expand over SHA-256 (RFC 5869 §2.3).
+pub fn try_hkdf_expand(
+    prk: &[u8; HASH_LEN],
+    info: &[u8],
+    out: &mut [u8],
+) -> Result<(), &'static str> {
+    try_hkdf_expand_multi(prk, &[info], out)
 }
 
 /// HKDF-Expand over SHA-256 (RFC 5869 §2.3). Writes `out.len()` bytes.
@@ -61,8 +157,39 @@ pub fn hkdf_extract(salt: &[u8], ikm: &[u8], out: &mut [u8; HASH_LEN]) {
 /// If `out.len() > 255 * HASH_LEN` (8160), the RFC's limit.
 pub fn hkdf_expand(prk: &[u8; HASH_LEN], info: &[u8], out: &mut [u8]) {
     assert!(out.len() <= 255 * HASH_LEN, "hkdf_expand: output too long");
-    let hk = Hkdf::<Sha256>::from_prk(prk).expect("a 32-byte PRK is valid for SHA-256");
-    hk.expand(info, out).expect("output length checked above");
+    let _ = try_hkdf_expand(prk, info, out);
+}
+
+/// Fallible HKDF-Expand-Label (RFC 8446 §7.1).
+pub fn try_hkdf_expand_label(
+    secret: &[u8; HASH_LEN],
+    label: &[u8],
+    context: &[u8],
+    out: &mut [u8],
+) -> Result<(), &'static str> {
+    const PREFIX: &[u8] = b"tls13 ";
+    let total_label_len = PREFIX
+        .len()
+        .checked_add(label.len())
+        .filter(|&n| n <= 255)
+        .ok_or("hkdf_expand_label: label too long")?;
+    if context.len() > 255 {
+        return Err("hkdf_expand_label: context too long");
+    }
+    let out_u16 = u16::try_from(out.len()).map_err(|_| "hkdf_expand_label: output too long")?;
+    let len_be = out_u16.to_be_bytes();
+    try_hkdf_expand_multi(
+        secret,
+        &[
+            &len_be,
+            &[total_label_len as u8],
+            PREFIX,
+            label,
+            &[context.len() as u8],
+            context,
+        ],
+        out,
+    )
 }
 
 /// HKDF-Expand-Label (RFC 8446 §7.1). The `HkdfLabel` info is
@@ -72,16 +199,11 @@ pub fn hkdf_expand(prk: &[u8; HASH_LEN], info: &[u8], out: &mut [u8]) {
 /// If `"tls13 " + label` or `context` is longer than 255 bytes.
 pub fn hkdf_expand_label(secret: &[u8; HASH_LEN], label: &[u8], context: &[u8], out: &mut [u8]) {
     const PREFIX: &[u8] = b"tls13 ";
-    let total_label_len = PREFIX.len() + label.len();
+    let total_label_len = PREFIX.len().saturating_add(label.len());
     assert!(total_label_len <= 255, "hkdf_expand_label: label too long");
     assert!(context.len() <= 255, "hkdf_expand_label: context too long");
-    let len_be = (out.len() as u16).to_be_bytes();
-    let hk = Hkdf::<Sha256>::from_prk(secret).expect("a 32-byte secret is valid for SHA-256");
-    hk.expand_multi_info(
-        &[&len_be, &[total_label_len as u8], PREFIX, label, &[context.len() as u8], context],
-        out,
-    )
-    .expect("TLS 1.3 labels never exceed the HKDF output limit");
+    assert!(out.len() <= 255 * HASH_LEN, "hkdf_expand_label: output too long");
+    let _ = try_hkdf_expand_label(secret, label, context, out);
 }
 
 /// Derive-Secret(secret, label, messages) (RFC 8446 §7.1): HKDF-Expand-Label
@@ -199,5 +321,17 @@ mod tests {
     fn hkdf_expand_label_rejects_oversized_label() {
         let mut out = [0u8; 16];
         hkdf_expand_label(&[0u8; 32], &[b'a'; 250], b"", &mut out);
+    }
+
+    #[test]
+    fn try_hkdf_expand_and_label_return_err_without_modifying_output() {
+        let mut oversized = [0xAAu8; 255 * 32 + 1];
+        assert!(try_hkdf_expand(&[0u8; 32], b"info", &mut oversized).is_err());
+        assert!(oversized.iter().all(|&b| b == 0xAA));
+
+        let mut out = [0xBBu8; 16];
+        assert!(try_hkdf_expand_label(&[0u8; 32], &[b'x'; 250], b"", &mut out).is_err());
+        assert!(try_hkdf_expand_label(&[0u8; 32], b"key", &[b'y'; 256], &mut out).is_err());
+        assert_eq!(out, [0xBBu8; 16]);
     }
 }

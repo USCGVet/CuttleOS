@@ -192,6 +192,13 @@ impl Http for HttpImpl {
         out: &mut [u8],
     ) -> Result<usize, HttpError> {
         let reason = reason_phrase(status).ok_or(HttpError::BadStatus)?;
+        if content_type.is_empty()
+            || content_type
+                .iter()
+                .any(|&b| b == b'\r' || b == b'\n' || b == 0)
+        {
+            return Err(HttpError::MalformedRequestLine);
+        }
 
         // Compose status line into a small stack buffer first so we
         // know the length before copying into `out`.
@@ -233,15 +240,29 @@ impl Http for HttpImpl {
         p += 2;
         let status_line = &sl[..p];
 
-        // Now emit: status_line + Content-Type: ct\r\n +
-        // Content-Length: <body.len()>\r\n + \r\n + body.
+        let mut dec_buf = [0u8; 20];
+        let dec_len = format_decimal_buf(&mut dec_buf, body.len());
+        let total = status_line
+            .len()
+            .checked_add(b"Content-Type: ".len())
+            .and_then(|n| n.checked_add(content_type.len()))
+            .and_then(|n| n.checked_add(b"\r\nContent-Length: ".len()))
+            .and_then(|n| n.checked_add(dec_len))
+            .and_then(|n| n.checked_add(b"\r\n\r\n".len()))
+            .and_then(|n| n.checked_add(body.len()))
+            .ok_or(HttpError::OutputBufferTooSmall)?;
+        if out.len() < total {
+            return Err(HttpError::OutputBufferTooSmall);
+        }
+
+        // Emit all-or-nothing once total output capacity has been proven.
         let mut out_pos = 0usize;
         out_pos += copy(out, out_pos, status_line)?;
         out_pos += copy(out, out_pos, b"Content-Type: ")?;
         out_pos += copy(out, out_pos, content_type)?;
         out_pos += copy(out, out_pos, b"\r\n")?;
         out_pos += copy(out, out_pos, b"Content-Length: ")?;
-        out_pos += copy_decimal(out, out_pos, body.len())?;
+        out_pos += copy(out, out_pos, &dec_buf[..dec_len])?;
         out_pos += copy(out, out_pos, b"\r\n\r\n")?;
         out_pos += copy(out, out_pos, body)?;
         Ok(out_pos)
@@ -411,27 +432,23 @@ fn to_ascii_lower(b: u8) -> u8 {
 }
 
 fn copy(out: &mut [u8], pos: usize, src: &[u8]) -> Result<usize, HttpError> {
-    if pos + src.len() > out.len() {
-        return Err(HttpError::OutputBufferTooSmall);
-    }
-    for i in 0..src.len() {
-        out[pos + i] = src[i];
-    }
+    let end = pos
+        .checked_add(src.len())
+        .ok_or(HttpError::OutputBufferTooSmall)?;
+    let dst = out
+        .get_mut(pos..end)
+        .ok_or(HttpError::OutputBufferTooSmall)?;
+    dst.copy_from_slice(src);
     Ok(src.len())
 }
 
-/// Write `n` as ASCII decimal (no leading zeros, no sign) into
-/// `out[pos..]`. Returns number of bytes written.
-fn copy_decimal(out: &mut [u8], pos: usize, n: usize) -> Result<usize, HttpError> {
+/// Format `n` as ASCII decimal (no leading zeros) into `out` and return digit count.
+fn format_decimal_buf(out: &mut [u8; 20], n: usize) -> usize {
     if n == 0 {
-        if pos >= out.len() {
-            return Err(HttpError::OutputBufferTooSmall);
-        }
-        out[pos] = b'0';
-        return Ok(1);
+        out[0] = b'0';
+        return 1;
     }
-    // Build digits in reverse, then copy forward.
-    let mut tmp = [0u8; 20]; // 2^64 → 20 digits max
+    let mut tmp = [0u8; 20];
     let mut len = 0usize;
     let mut v = n;
     while v > 0 {
@@ -439,13 +456,10 @@ fn copy_decimal(out: &mut [u8], pos: usize, n: usize) -> Result<usize, HttpError
         v /= 10;
         len += 1;
     }
-    if pos + len > out.len() {
-        return Err(HttpError::OutputBufferTooSmall);
-    }
     for i in 0..len {
-        out[pos + i] = tmp[len - 1 - i];
+        out[i] = tmp[len - 1 - i];
     }
-    Ok(len)
+    len
 }
 
 /// Map a status code to its RFC 7231 / 9110 reason phrase. Returns
@@ -730,6 +744,32 @@ mod tests {
         )
         .expect("exact Content-Length slice");
         assert_eq!(view.body, b"hello");
+    }
+
+    #[test]
+    fn build_response_rejects_crlf_header_injection_and_is_all_or_nothing() {
+        let mut injected = [0xBBu8; 128];
+        assert_eq!(
+            HttpImpl::build_response(
+                200,
+                b"text/plain\r\nX-Injected: pwned",
+                b"ok",
+                &mut injected
+            ),
+            Err(HttpError::MalformedRequestLine)
+        );
+        assert_eq!(injected, [0xBBu8; 128]);
+
+        let mut short = [0xEEu8; 32];
+        assert_eq!(
+            HttpImpl::build_response(200, b"text/plain", b"hello world", &mut short),
+            Err(HttpError::OutputBufferTooSmall)
+        );
+        assert_eq!(
+            short,
+            [0xEEu8; 32],
+            "failed build_response must leave caller output untouched"
+        );
     }
 
     // Tiny `contains_subseq` extension for the assertion above.

@@ -127,10 +127,9 @@ pub const UDP_CHECKSUM_OFFSET: usize = 6;
 /// This is the canonical fast path described in RFC 1071 §4.
 #[derive(Default)]
 struct OnesComplement {
-    /// 32-bit running sum with deferred carry-fold. The high 16 bits
-    /// hold the accumulated carry; they get folded into the low 16
-    /// bits exactly once during [`OnesComplement::finalize`].
-    acc: u32,
+    /// 64-bit running sum with deferred carry-fold so arbitrarily large slices
+    /// never wrap before [`OnesComplement::finalize`] folds carries into 16 bits.
+    acc: u64,
 }
 
 impl OnesComplement {
@@ -141,7 +140,7 @@ impl OnesComplement {
 
     /// Add a 16-bit big-endian word (network byte order) to the sum.
     fn add_be16(&mut self, w: u16) {
-        self.acc = self.acc.wrapping_add(w as u32);
+        self.acc = self.acc.wrapping_add(w as u64);
     }
 
     /// Add an entire byte slice in network order. If `bytes.len()` is

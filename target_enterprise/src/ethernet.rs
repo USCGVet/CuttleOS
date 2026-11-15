@@ -79,16 +79,16 @@ impl Eth for EthImpl {
         payload: &[u8],
         out: &mut [u8],
     ) -> Result<usize, EthError> {
-        let total = ETH_HEADER_LEN + payload.len();
+        let total = ETH_HEADER_LEN
+            .checked_add(payload.len())
+            .ok_or(EthError::OutputBufferTooSmall)?;
         if out.len() < total {
             return Err(EthError::OutputBufferTooSmall);
         }
         write_mac(&mut out[0..6], &dst);
         write_mac(&mut out[6..12], &src);
         write_u16_be(&mut out[12..14], ether_type);
-        for i in 0..payload.len() {
-            out[ETH_HEADER_LEN + i] = payload[i];
-        }
+        out[ETH_HEADER_LEN..total].copy_from_slice(payload);
         Ok(total)
     }
 
@@ -100,7 +100,9 @@ impl Eth for EthImpl {
         payload: &[u8],
         out: &mut [u8],
     ) -> Result<usize, EthError> {
-        let total = ETH_HEADER_LEN_VLAN + payload.len();
+        let total = ETH_HEADER_LEN_VLAN
+            .checked_add(payload.len())
+            .ok_or(EthError::OutputBufferTooSmall)?;
         if out.len() < total {
             return Err(EthError::OutputBufferTooSmall);
         }
@@ -109,9 +111,7 @@ impl Eth for EthImpl {
         write_u16_be(&mut out[12..14], VLAN_TPID);
         write_u16_be(&mut out[14..16], vlan_tci);
         write_u16_be(&mut out[16..18], inner_ether_type);
-        for i in 0..payload.len() {
-            out[ETH_HEADER_LEN_VLAN + i] = payload[i];
-        }
+        out[ETH_HEADER_LEN_VLAN..total].copy_from_slice(payload);
         Ok(total)
     }
 
