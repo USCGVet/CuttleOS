@@ -142,6 +142,14 @@ Every `ALERT` event emitted by the controller includes a machine-parseable `code
   2. Multi-node rollback: SQL-backed Triads replay the committed `triad_wal.json` onto rolled-back nodes; if fewer than 2 untampered peers remain on non-SQL state, the controller fails closed with `QUORUM_LOST`.
   3. Investigate hypervisor snapshot automation or storage-layer replication to determine why an older `ahci_node<id>.img` snapshot was presented.
 
+### `RPC_REPLY_TAMPER` {#rpc_reply_tamper}
+
+- **Symptom**: `triad_controller.py` rejected an HTTP `POST /triad/rpc` `200` or `409` response because the `X-Cuttle-Rpc-Mac` header (`HMAC-SHA256` over `"cuttle-triad-rpc-reply-v1:<epoch>:<seq>:<status>:" || body`) was missing or did not verify under the node's per-NIC authentication key, and automatically fell back to the local 16550 UART serial pipe.
+- **Triage & Recovery**:
+  1. Check host loopback port-forwarding (`127.0.0.1:<http_port>`) and local proxy/firewall processes to confirm nothing is intercepting or rewriting HTTP headers or response bodies on the node's forwarded port.
+  2. Verify `node<id>/device_key_node<id>.bin` matches the key provisioned into the guest VM (`-fw_cfg name=opt/cuttle_device_key`).
+  3. Trigger `POST /api/morph/<id>` if the guest binary is suspected of running an outdated image without signed RPC replies.
+
 ---
 
 ## Key Ceremony Rotation & Revocation (`R3`)

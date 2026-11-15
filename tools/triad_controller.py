@@ -164,6 +164,7 @@ ALERT_CODES = (
     "DISK_SEAL_REJECTED",
     "DISK_STORAGE_FAULT",
     "DISK_ROLLBACK_DETECTED",
+    "RPC_REPLY_TAMPER",
 )
 
 
@@ -1830,6 +1831,8 @@ class TriadController:
             return "SCHEMA_MISMATCH"
         if "heartbeat" in low or "hung" in low:
             return "NODE_HUNG"
+        if "rpc_reply_tamper" in low or "x-cuttle-rpc-mac" in low:
+            return "RPC_REPLY_TAMPER"
         return "SPLIT_BRAIN"
 
     def log_event(self, level: str, msg: str, code: str | None = None):
@@ -2226,6 +2229,17 @@ class TriadController:
         tag = hmac.new(auth_key, msg, hashlib.sha256).hexdigest()
         return f"{ep} {sq} {tag} {clean_cmd}"
 
+    @staticmethod
+    def compute_triad_rpc_reply_mac(
+        auth_key: bytes, epoch: int, seq: int, status: int, body_bytes: bytes
+    ) -> str:
+        """
+        Compute the domain-separated 64-hex `X-Cuttle-Rpc-Mac` HMAC-SHA256 tag over
+        `"cuttle-triad-rpc-reply-v1:<epoch>:<seq>:<status>:" || body_bytes`.
+        """
+        prefix = f"cuttle-triad-rpc-reply-v1:{int(epoch)}:{int(seq)}:{int(status)}:".encode("ascii")
+        return hmac.new(auth_key, prefix + body_bytes, hashlib.sha256).hexdigest()
+
     def promote_standby_epoch(self, new_epoch: int | None = None) -> int:
         """
         Atomically promote this coordinator to a strictly higher monotonic `coordinator_epoch`
@@ -2259,15 +2273,21 @@ class TriadController:
     def _try_http_node_rpc(self, node: TriadNode, clean_cmd: str, timeout: float) -> str | None:
         """
         Attempt authenticated network-native `POST /triad/rpc` over TCP (`http_port`).
-        Returns the response string on HTTP 200/409/503, or `None` if the HTTP transport
-        is disabled, exceeds 512B command cap, or is currently unreachable (so the caller
-        transparently falls back to the out-of-band 16550 UART serial console).
+        Verifies the `X-Cuttle-Rpc-Mac` HMAC-SHA256 response tag bound to `(epoch, seq, status, body)`.
+        Returns the authenticated response string on HTTP 200/409, or `None` if the HTTP transport
+        is disabled, command is local-UART-only, role-gated (`403`/`503`), reply MAC is forged,
+        exceeds 512B command cap, or is currently unreachable (so the caller transparently falls
+        back to the out-of-band 16550 UART serial console).
         """
+        cmd_low = clean_cmd.lower()
+        first_tok = cmd_low.split()[0] if cmd_low else ""
         if (
             self.unit_test
             or not self.spec.forward_node_ports
             or self.desired_guard_lockdown
             or len(clean_cmd) > 512
+            or first_tok in ("halt", "poweroff", "reboot")
+            or cmd_low.startswith(("service role", "svc role"))
             or node.state != "ONLINE"
             or not node.proc
             or node.proc.poll() is not None
@@ -2287,24 +2307,43 @@ class TriadController:
             )
             try:
                 with urllib.request.urlopen(req, timeout=min(max(0.5, timeout), 2.5)) as resp:
-                    text = resp.read().decode("utf-8", errors="replace").strip()
+                    raw_body = resp.read()
+                    got_mac = (resp.headers.get("X-Cuttle-Rpc-Mac") or "").strip().lower()
+                    exp_mac = self.compute_triad_rpc_reply_mac(auth_key, ep, base_seq, 200, raw_body)
+                    if len(got_mac) != 64 or not safe_token_eq(got_mac, exp_mac):
+                        self.log_event(
+                            "ALERT",
+                            f"{node.name}: Rejected HTTP /triad/rpc 200 reply with missing or forged X-Cuttle-Rpc-Mac (epoch={ep}, seq={base_seq}); falling back to UART.",
+                            code="RPC_REPLY_TAMPER",
+                        )
+                        return None
+                    text = raw_body.decode("utf-8", errors="replace").strip()
                     self.rpc_http_ok_total += 1
                     return text
             except urllib.error.HTTPError as e:
+                raw_err = b""
                 err_body = ""
                 try:
-                    err_body = e.read().decode("utf-8", errors="replace").strip()
+                    raw_err = e.read()
+                    err_body = raw_err.decode("utf-8", errors="replace").strip()
                 except Exception:
                     pass
                 if e.code == 409:
+                    got_mac = (e.headers.get("X-Cuttle-Rpc-Mac") or "").strip().lower() if e.headers else ""
+                    exp_mac = self.compute_triad_rpc_reply_mac(auth_key, ep, base_seq, 409, raw_err)
+                    if len(got_mac) != 64 or not safe_token_eq(got_mac, exp_mac):
+                        self.log_event(
+                            "ALERT",
+                            f"{node.name}: Rejected unauthenticated HTTP 409 /triad/rpc reply with missing or forged X-Cuttle-Rpc-Mac (epoch={ep}, seq={base_seq}).",
+                            code="RPC_REPLY_TAMPER",
+                        )
+                        return None
                     self.log_event(
                         "ALERT",
                         f"{node.name}: Coordinator fenced by higher node epoch on /triad/rpc (epoch={ep}): {err_body}",
                         code="SPLIT_BRAIN",
                     )
                     return err_body or "error: EACCES (stale triad coordinator epoch)"
-                if e.code == 503 and err_body:
-                    return err_body
                 return None
             except Exception:
                 return None
@@ -8643,7 +8682,7 @@ def run_stage8_security_and_wal_unit_tests(tmp_dir: Path, sc_harness: RealOsShel
     rpc_ctrl.shutdown()
     node0 = rpc_ctrl.nodes[0]
     node0_key = rpc_ctrl._derive_node_net_auth_key(node0)
-    mock_rpc_state = {"min_epoch": 1, "last_seq": 0, "calls": []}
+    mock_rpc_state = {"min_epoch": 1, "last_seq": 0, "calls": [], "tamper_reply_mac": False}
 
     class _MockNodeRpcHandler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -8673,15 +8712,30 @@ def run_stage8_security_and_wal_unit_tests(tmp_dir: Path, sc_harness: RealOsShel
                 self.wfile.write(b"error: EACCES (invalid triad RPC HMAC or replay)\n")
                 return
             if ep_i < mock_rpc_state["min_epoch"]:
+                fenced_body = b"error: EACCES (stale triad coordinator epoch)\n"
+                rep_mac = hmac.new(
+                    node0_key,
+                    f"cuttle-triad-rpc-reply-v1:{ep_i}:{seq_i}:409:".encode("ascii") + fenced_body,
+                    hashlib.sha256,
+                ).hexdigest()
                 self.send_response(409)
+                self.send_header("X-Cuttle-Rpc-Mac", rep_mac)
                 self.end_headers()
-                self.wfile.write(b"error: EACCES (stale triad coordinator epoch)\n")
+                self.wfile.write(fenced_body)
                 return
             mock_rpc_state["last_seq"] = seq_i
             mock_rpc_state["calls"].append((ep_i, seq_i, cmd_s))
             body_out = f"rpc-ok:{cmd_s}\n".encode("ascii")
+            rep_mac = hmac.new(
+                node0_key,
+                f"cuttle-triad-rpc-reply-v1:{ep_i}:{seq_i}:200:".encode("ascii") + body_out,
+                hashlib.sha256,
+            ).hexdigest()
+            if mock_rpc_state["tamper_reply_mac"]:
+                rep_mac = "0" * 64
             self.send_response(200)
             self.send_header("Content-Length", str(len(body_out)))
+            self.send_header("X-Cuttle-Rpc-Mac", rep_mac)
             self.end_headers()
             self.wfile.write(body_out)
 
@@ -8706,11 +8760,20 @@ def run_stage8_security_and_wal_unit_tests(tmp_dir: Path, sc_harness: RealOsShel
         assert rpc_ctrl.rpc_http_ok_total == 1 and rpc_ctrl.rpc_uart_fallback_total == 0
         assert len(mock_rpc_state["calls"]) == 1 and mock_rpc_state["calls"][0][2] == "uname"
 
+        # Forged / MITM-modified HTTP /triad/rpc response MAC must be refused and flagged!
+        mock_rpc_state["tamper_reply_mac"] = True
+        out_tamper = rpc_ctrl.send_node_rpc(node0, "uname")
+        mock_rpc_state["tamper_reply_mac"] = False
+        assert out_tamper != "rpc-ok:uname", "send_node_rpc must reject HTTP /triad/rpc replies with forged X-Cuttle-Rpc-Mac"
+        assert any(e.get("code") == "RPC_REPLY_TAMPER" for e in rpc_ctrl.events), "forged RPC reply MAC must log RPC_REPLY_TAMPER alert"
+        fb_before_409 = rpc_ctrl.rpc_uart_fallback_total
+        assert fb_before_409 == 1
+
         mock_rpc_state["min_epoch"] = 9
         out_fenced = rpc_ctrl.send_node_rpc(node0, "uname")
         assert "stale triad coordinator epoch" in out_fenced, out_fenced
         assert any(e.get("code") == "SPLIT_BRAIN" for e in rpc_ctrl.events)
-        assert rpc_ctrl.rpc_uart_fallback_total == 0, "HTTP 409 epoch fencing must not fall back to UART"
+        assert rpc_ctrl.rpc_uart_fallback_total == fb_before_409, "HTTP 409 epoch fencing must not fall back to UART"
     finally:
         mock_node_srv.shutdown()
         mock_node_srv.server_close()
@@ -8718,7 +8781,7 @@ def run_stage8_security_and_wal_unit_tests(tmp_dir: Path, sc_harness: RealOsShel
     # With HTTP /triad/rpc unreachable, send_node_rpc must fall back cleanly to UART:
     out_fb = rpc_ctrl.send_node_rpc(node0, "uname", timeout=0.6)
     assert out_fb == "uart:uname", f"expected UART fallback when HTTP RPC port is closed, got {out_fb!r}"
-    assert rpc_ctrl.rpc_uart_fallback_total == 1
+    assert rpc_ctrl.rpc_uart_fallback_total == fb_before_409 + 1
 
     # 8d. UART 16550A newline-nudge + read-only retry resilience under heavy TCG scheduling stalls:
     uart_ctrl = TriadController(

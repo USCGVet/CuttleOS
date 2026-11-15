@@ -723,6 +723,10 @@ pub(crate) fn service_udp_status_modern(n: &mut VnetModern) {
         Some(k) => target_enterprise::LivedNet::with_auth_key(mac, k),
         None => target_enterprise::LivedNet::new_unprovisioned(mac),
     };
+    {
+        let sh = crate::KERNEL_SHELL.lock();
+        svc.set_boot_firewall_policy(&sh.fw, sh.guard_lockdown);
+    }
     serial_write_str("UDP SVC UP modern ip=10.0.2.15 port=8080\n");
     serial_write_str("NET SVC UP ip=10.0.2.15 udp=8080 tcp=80 icmp=echo\n");
     enable_https(&mut svc, mac);
@@ -1286,6 +1290,10 @@ pub(crate) fn service_udp_status_legacy() {
         Some(k) => target_enterprise::LivedNet::with_auth_key(mac, k),
         None => target_enterprise::LivedNet::new_unprovisioned(mac),
     };
+    {
+        let sh = crate::KERNEL_SHELL.lock();
+        svc.set_boot_firewall_policy(&sh.fw, sh.guard_lockdown);
+    }
     enable_https(&mut svc, mac);
 
     // Bounded service window.

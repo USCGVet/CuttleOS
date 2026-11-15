@@ -353,6 +353,8 @@ pub enum IpcOp {
     CronQuery = 18,
     /// `POST /cron` scheduled periodic jobs mutation (`svc-http -> svc-sh` IPC, requires valid session `sid`).
     CronControl = 19,
+    /// `POST /triad/rpc` authenticated Triad coordinator RPC (`svc-http -> svc-sh` IPC, requires HMAC proof).
+    TriadRpc = 20,
 }
 
 impl IpcOp {
@@ -371,6 +373,7 @@ impl IpcOp {
                 | IpcOp::VaultWrite
                 | IpcOp::GuardControl
                 | IpcOp::CronControl
+                | IpcOp::TriadRpc
         )
     }
 
@@ -394,7 +397,8 @@ impl IpcOp {
             | IpcOp::VaultRead
             | IpcOp::VaultWrite
             | IpcOp::GuardControl
-            | IpcOp::CronControl => ServiceId::Shell,
+            | IpcOp::CronControl
+            | IpcOp::TriadRpc => ServiceId::Shell,
         }
     }
 
@@ -414,7 +418,8 @@ impl IpcOp {
             IpcOp::ShellExec
             | IpcOp::UserElfExec
             | IpcOp::GuardControl
-            | IpcOp::CronControl => SvcSyscall::Exec,
+            | IpcOp::CronControl
+            | IpcOp::TriadRpc => SvcSyscall::Exec,
             IpcOp::VfsWrite
             | IpcOp::VfsDelete
             | IpcOp::VaultRead
@@ -1374,7 +1379,7 @@ impl ServiceSupervisor {
                 (toks, verb, mutating)
             }
             ServiceId::Shell => {
-                if matches!(op, IpcOp::ShellExec | IpcOp::UserElfExec) {
+                if matches!(op, IpcOp::ShellExec | IpcOp::UserElfExec | IpcOp::TriadRpc) {
                     let Some(toks) = ring3_parse_shell_body(body, op == IpcOp::UserElfExec) else {
                         self.services[idx].mailbox.ring3_parser_rejects = self.services[idx]
                             .mailbox
@@ -2986,6 +2991,7 @@ mod tests {
             IpcOp::GuardControl,
             IpcOp::CronQuery,
             IpcOp::CronControl,
+            IpcOp::TriadRpc,
         ];
 
         // 1. Exhaustive 4 NodeRoles × 3 ServiceIds × 8 SvcSyscalls matrix (96 combinations):

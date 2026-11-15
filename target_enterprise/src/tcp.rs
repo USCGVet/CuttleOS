@@ -254,6 +254,10 @@ pub struct Tcb {
     pub snd_nxt: u32,
     /// Send window — how much the peer is willing to accept.
     pub snd_wnd: u16,
+    /// Segment sequence number used for the last send-window update (RFC 793 §3.9).
+    pub snd_wl1: u32,
+    /// Segment acknowledgment number used for the last send-window update (RFC 793 §3.9).
+    pub snd_wl2: u32,
     /// Initial Receive Sequence (peer's SYN's sequence).
     pub rcv_irs: u32,
     /// Next sequence number expected from the peer.
@@ -274,6 +278,8 @@ impl Tcb {
         snd_una: 0,
         snd_nxt: 0,
         snd_wnd: 0,
+        snd_wl1: 0,
+        snd_wl2: 0,
         rcv_irs: 0,
         rcv_nxt: 0,
         rcv_wnd: 0,
@@ -341,11 +347,22 @@ pub enum TcpProcessError {
 ///
 /// Initial Sequence Number (ISN) generation: we derive ours
 /// deterministically from `local_port ^ remote_port ^ now_ticks` so
-/// the state machine is reproducible per test run. Real production
-/// uses a CSPRNG seed mixed with current time; that's a swap-in.
+/// the state machine is reproducible per test run. Live network callers
+/// supply a keyed HMAC-SHA256 ISN via [`process_segment_with_isn`].
 pub fn process_segment(
+    tcb: Tcb,
+    seg: &TcpSegmentView<'_>,
+    now_ticks: u32,
+) -> Result<(Tcb, Reply), TcpProcessError> {
+    process_segment_with_isn(tcb, seg, None, now_ticks)
+}
+
+/// Drive the TCP state machine one step, optionally supplying a caller-generated
+/// keyed Initial Sequence Number (`custom_isn`) on passive-open `Listen -> SynReceived`.
+pub fn process_segment_with_isn(
     mut tcb: Tcb,
     seg: &TcpSegmentView<'_>,
+    custom_isn: Option<u32>,
     now_ticks: u32,
 ) -> Result<(Tcb, Reply), TcpProcessError> {
     // Reject CLOSED unconditionally. Per RFC 793 we'd send RST.
@@ -388,13 +405,16 @@ pub fn process_segment(
             // Remember the peer.
             tcb.remote_port = seg.src_port;
             // Mint our ISN.
-            let isn = deterministic_isn(tcb.local_port, seg.src_port, now_ticks);
+            let isn = custom_isn
+                .unwrap_or_else(|| deterministic_isn(tcb.local_port, seg.src_port, now_ticks));
             tcb.snd_iss = isn;
             tcb.snd_una = isn;
             tcb.snd_nxt = isn.wrapping_add(1); // SYN consumes one sequence number
             tcb.rcv_irs = seg.seq;
             tcb.rcv_nxt = seg.seq.wrapping_add(1);
             tcb.snd_wnd = seg.window;
+            tcb.snd_wl1 = seg.seq;
+            tcb.snd_wl2 = tcb.snd_una;
             tcb.state = TcpState::SynReceived;
             // Reply: SYN+ACK with our seq=isn, ack=rcv_nxt.
             Ok((
@@ -419,6 +439,8 @@ pub fn process_segment(
             }
             tcb.snd_una = seg.ack;
             tcb.snd_wnd = seg.window;
+            tcb.snd_wl1 = seg.seq;
+            tcb.snd_wl2 = seg.ack;
             tcb.state = TcpState::Established;
             // Handshake ACK may piggyback the first data segment
             // (HTTP GET on the third packet). Consume it here so the
@@ -508,11 +530,15 @@ pub fn process_segment(
             if !seg.payload.is_empty() || (seg.flags & tcp_flags::FIN) != 0 {
                 return Err(TcpProcessError::OutOfWindow);
             }
-            if seg.flags & tcp_flags::ACK != 0
-                && wrapping_lt(tcb.snd_una, seg.ack)
-                && wrapping_le(seg.ack, tcb.snd_nxt)
-            {
-                tcb.snd_una = seg.ack;
+            let max_rcv = tcb.rcv_nxt.wrapping_add((tcb.rcv_wnd as u32).max(1));
+            if !wrapping_le(tcb.rcv_nxt, seg.seq) || !wrapping_le(seg.seq, max_rcv) {
+                return Err(TcpProcessError::OutOfWindow);
+            }
+            if seg.flags & tcp_flags::ACK != 0 {
+                let _ = try_update_snd_wnd(&mut tcb, seg);
+                if wrapping_lt(tcb.snd_una, seg.ack) && wrapping_le(seg.ack, tcb.snd_nxt) {
+                    tcb.snd_una = seg.ack;
+                }
             }
             Ok((tcb, Reply::NONE))
         }
@@ -550,6 +576,34 @@ pub fn process_segment(
     }
 }
 
+/// Validate and apply a peer send-window update per RFC 793 §3.9 (`SND.WL1` / `SND.WL2`),
+/// rejecting out-of-window sequence/acknowledgment segments and stale reordered window updates.
+pub fn try_update_snd_wnd(tcb: &mut Tcb, seg: &TcpSegmentView<'_>) -> bool {
+    if (seg.flags & tcp_flags::ACK) == 0 {
+        return false;
+    }
+    if !wrapping_le(tcb.snd_una, seg.ack) || !wrapping_le(seg.ack, tcb.snd_nxt) {
+        return false;
+    }
+    let max_rcv = tcb.rcv_nxt.wrapping_add((tcb.rcv_wnd as u32).max(1));
+    if !wrapping_le(tcb.rcv_nxt, seg.seq) || !wrapping_le(seg.seq, max_rcv) {
+        return false;
+    }
+    let eff_seq = tcb.rcv_nxt;
+    let wl_uninit = tcb.snd_wl1 == 0 && tcb.snd_wl2 == 0;
+    let newer = wl_uninit
+        || wrapping_lt(tcb.snd_wl1, eff_seq)
+        || (tcb.snd_wl1 == eff_seq && wrapping_le(tcb.snd_wl2, seg.ack));
+    if newer {
+        tcb.snd_wnd = seg.window;
+        tcb.snd_wl1 = eff_seq;
+        tcb.snd_wl2 = seg.ack;
+        true
+    } else {
+        false
+    }
+}
+
 /// Drive ESTABLISHED (and handshake-ACK-with-data) through payload
 /// and/or FIN. RFC 793: data is sequenced first, then FIN consumes one
 /// extra sequence number. A payload+FIN segment is how HTTP/1.0 clients
@@ -558,21 +612,29 @@ fn established_data_or_fin(
     mut tcb: Tcb,
     seg: &TcpSegmentView<'_>,
 ) -> Result<(Tcb, Reply), TcpProcessError> {
+    let has_data = !seg.payload.is_empty();
+    let has_fin = seg.flags & tcp_flags::FIN != 0;
+    if has_data || has_fin {
+        if seg.seq != tcb.rcv_nxt {
+            return Err(TcpProcessError::OutOfWindow);
+        }
+    } else {
+        let max_rcv = tcb.rcv_nxt.wrapping_add((tcb.rcv_wnd as u32).max(1));
+        if !wrapping_le(tcb.rcv_nxt, seg.seq) || !wrapping_le(seg.seq, max_rcv) {
+            return Err(TcpProcessError::OutOfWindow);
+        }
+    }
+
+    let _ = try_update_snd_wnd(&mut tcb, seg);
     if seg.flags & tcp_flags::ACK != 0
         && wrapping_lt(tcb.snd_una, seg.ack)
         && wrapping_le(seg.ack, tcb.snd_nxt)
     {
         tcb.snd_una = seg.ack;
     }
-    tcb.snd_wnd = seg.window;
 
-    let has_data = !seg.payload.is_empty();
-    let has_fin = seg.flags & tcp_flags::FIN != 0;
     if !has_data && !has_fin {
         return Ok((tcb, Reply::NONE));
-    }
-    if seg.seq != tcb.rcv_nxt {
-        return Err(TcpProcessError::OutOfWindow);
     }
     if has_data {
         tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(seg.payload.len() as u32);
@@ -581,6 +643,7 @@ fn established_data_or_fin(
         tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(1);
         tcb.state = TcpState::CloseWait;
     }
+    tcb.snd_wl1 = tcb.rcv_nxt;
     Ok((
         tcb,
         Reply {
@@ -816,6 +879,7 @@ mod tests {
             rcv_irs: 0x2000_0000,
             rcv_nxt: 0x2000_0001,
             rcv_wnd: 65535,
+            ..Tcb::EMPTY
         };
 
         // Client → server: 5-byte payload
@@ -851,6 +915,7 @@ mod tests {
             rcv_irs: 0x2000_0000,
             rcv_nxt: 0x2000_0001,
             rcv_wnd: 65535,
+            ..Tcb::EMPTY
         };
 
         let mut buf = [0u8; 32];
@@ -884,6 +949,7 @@ mod tests {
             rcv_irs: 0x2000_0000,
             rcv_nxt: 0x2000_0002,
             rcv_wnd: 65535,
+            ..Tcb::EMPTY
         };
         let (next, reply) = close(tcb).unwrap();
         assert_eq!(next.state, TcpState::LastAck);
@@ -911,6 +977,7 @@ mod tests {
             rcv_irs: 0x2000_0000,
             rcv_nxt: 0x2000_0002,
             rcv_wnd: 65535,
+            ..Tcb::EMPTY
         };
         let mut buf = [0u8; 32];
         let n = TcpImpl::build_segment(
@@ -990,6 +1057,7 @@ mod tests {
             rcv_irs: 50,
             rcv_nxt: 51,
             rcv_wnd: 65535,
+            ..Tcb::EMPTY
         };
         let (next, reply) = send_payload(tcb, 12).unwrap();
         tcb = next;
@@ -1056,6 +1124,7 @@ mod tests {
             rcv_irs: 0x2000,
             rcv_nxt: 0x2001,
             rcv_wnd: 65535,
+            ..Tcb::EMPTY
         };
         let body = b"bye";
         let mut buf = [0u8; 40];
@@ -1095,6 +1164,7 @@ mod tests {
             rcv_irs: 50,
             rcv_nxt: 51,
             rcv_wnd: 65535,
+            ..Tcb::EMPTY
         };
         let mut buf = [0u8; 32];
         let n = TcpImpl::build_segment(
@@ -1126,6 +1196,7 @@ mod tests {
             rcv_irs: 50,
             rcv_nxt: 51,
             rcv_wnd: 65535,
+            ..Tcb::EMPTY
         };
         // 1. Server initiates close from Established -> FinWait1 (emitting FIN|ACK at seq=121).
         let (tcb, fin_reply) = close(tcb).unwrap();
@@ -1197,6 +1268,7 @@ mod tests {
             rcv_irs: 500,
             rcv_nxt: 501,
             rcv_wnd: 65535,
+            ..Tcb::EMPTY
         };
         let mut buf = [0u8; 40];
 

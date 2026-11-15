@@ -178,6 +178,15 @@ const JOURNAL_FULL_MSG: &[u8] =
 pub const DURABLE_UNPROVISIONED_MSG: &[u8] =
     b"error: EROFS (device key not provisioned; durable writes refused)\n";
 
+/// Typed refusal returned by [`OsShell::exec_triad_rpc`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TriadRpcError {
+    /// Service / role / capability / syntax policy refusal from [`crate::svc_runtime::ServiceSupervisor`].
+    Service(crate::svc_runtime::ServiceError),
+    /// Command output reached `out.len()` and was refused instead of silently truncating.
+    OutputTooLarge,
+}
+
 /// Periodic scheduled task entry in CuttleChronos (`cron`).
 #[derive(Copy, Clone, Debug)]
 pub struct CronJob {
@@ -1836,11 +1845,84 @@ impl OsShell {
                 };
                 (code, n)
             }
+            IpcOp::TriadRpc => {
+                return Err(ServiceError::BadRequest);
+            }
         };
 
         self.svc
             .complete_mailbox_response(target, status_code, resp_len);
         Ok((status_code, resp_len))
+    }
+
+    /// Execute an authenticated `POST /triad/rpc` command through [`ServiceSupervisor`]
+    /// role and capability mediation (`IpcOp::TriadRpc` targeting `svc-sh`, plus `svc-sql`
+    /// mediation for SQL commands), refusing role escalation (`service role`), power
+    /// control (`halt` / `poweroff` / `reboot`), and oversized outputs (`>= out.len()`).
+    #[inline(never)]
+    pub fn exec_triad_rpc(
+        &mut self,
+        raw_cmd: &[u8],
+        via_http_gateway: bool,
+        boots: u64,
+        out: &mut [u8],
+    ) -> Result<usize, TriadRpcError> {
+        use crate::svc_runtime::{IpcOp, ServiceError};
+
+        self.svc
+            .check_endpoint_access(IpcOp::TriadRpc, via_http_gateway, true, &mut self.audit)
+            .map_err(TriadRpcError::Service)?;
+
+        let trimmed = trim_ascii(raw_cmd);
+        if trimmed.is_empty()
+            || out.is_empty()
+            || trimmed
+                .iter()
+                .any(|&b| b == 0 || b == b'\r' || b == b'\n' || (b < 0x20 && b != b'\t') || b == 0x7f)
+        {
+            return Err(TriadRpcError::Service(ServiceError::BadRequest));
+        }
+
+        let (cmd, rest) = split_first_word(trimmed);
+        let (sub, _) = split_first_word(trim_ascii(rest));
+        if (bytes_eq(cmd, b"service") || bytes_eq(cmd, b"svc")) && bytes_eq(sub, b"role") {
+            self.record_audit(33, AuditVerdict::Denied, b"shell:rpc:role-denied");
+            return Err(TriadRpcError::Service(ServiceError::CapabilityDenied));
+        }
+        if bytes_eq(cmd, b"halt") || bytes_eq(cmd, b"poweroff") || bytes_eq(cmd, b"reboot") {
+            self.record_audit(14, AuditVerdict::Denied, b"shell:rpc:power-denied");
+            return Err(TriadRpcError::Service(ServiceError::CapabilityDenied));
+        }
+
+        self.svc
+            .mediate_endpoint(IpcOp::TriadRpc, via_http_gateway, true, &mut self.audit)
+            .map_err(TriadRpcError::Service)?;
+
+        if bytes_eq(cmd, b"sql") {
+            let sql_op = if crate::sql::SqlDb::is_readonly_query(rest) {
+                IpcOp::SqlQuery
+            } else {
+                IpcOp::SqlMutate
+            };
+            self.svc
+                .mediate_endpoint(sql_op, via_http_gateway, true, &mut self.audit)
+                .map_err(TriadRpcError::Service)?;
+        } else if bytes_eq(cmd, b"triad") && bytes_eq(sub, b"propose") {
+            self.svc
+                .mediate_endpoint(IpcOp::SqlMutate, via_http_gateway, true, &mut self.audit)
+                .map_err(TriadRpcError::Service)?;
+        }
+
+        let prev_owner = self.sql_owner_override;
+        self.sql_owner_override = crate::sql::SQL_OWNER_TRIAD;
+        let action = self.exec_line(trimmed, boots, 0, 0, out);
+        self.sql_owner_override = prev_owner;
+        let n = action.bytes_written();
+        if n >= out.len() {
+            self.record_audit(34, AuditVerdict::Error, b"shell:rpc:output-overflow");
+            return Err(TriadRpcError::OutputTooLarge);
+        }
+        Ok(n)
     }
 
     /// Serialize `self.db` into an 8-sector (`4 KiB`) partition image sealed with `self.seal_key`.
@@ -5171,7 +5253,7 @@ impl OsShell {
             .is_err()
         {
             return copy_into(
-                b"error: EACCES (svc-sql disabled by node role or policy)\n",
+                b"error: EACCES (svc-sh disabled by node role or policy)\n",
                 out,
             );
         }
