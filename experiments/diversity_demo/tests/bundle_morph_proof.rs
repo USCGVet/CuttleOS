@@ -132,23 +132,100 @@ fn load_bundle_modules(root: &Path) -> Vec<String> {
         .collect()
 }
 
-struct SourceBackup {
-    path: PathBuf,
-    pristine: String,
+fn copy_crate_tree_no_target(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("create staged crate dir");
+    for entry in std::fs::read_dir(src).expect("read_dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        if matches!(name_s.as_ref(), "target" | ".git" | ".vscode" | ".idea") {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        let ty = entry.file_type().expect("file_type");
+        if ty.is_dir() {
+            copy_crate_tree_no_target(&from, &to);
+        } else if ty.is_file() {
+            std::fs::copy(&from, &to).expect("copy staged file");
+        }
+    }
 }
 
-impl Drop for SourceBackup {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::write(&self.path, &self.pristine) {
-            eprintln!(
-                "bundle_morph_proof: CRITICAL restore failed for {}: {}",
-                self.path.display(),
-                e
-            );
-        } else {
-            let bak = self.path.with_extension("rs.preexp.bak");
-            let _ = std::fs::remove_file(bak);
+fn assert_clean_checkout_dir(root: &Path, rel_src: &str) {
+    let dir = root.join(rel_src);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                assert!(
+                    !name.ends_with(".candidate.rs") && !name.ends_with(".rs.preexp.bak"),
+                    "refusing to run with stale staging file in live checkout: {}",
+                    p.display()
+                );
+            }
         }
+    }
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--", rel_src])
+        .current_dir(root)
+        .output()
+    {
+        if out.status.success() {
+            let txt = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                txt.trim().is_empty(),
+                "live checkout has modified/untracked files under {}: {}",
+                rel_src,
+                txt.trim()
+            );
+        }
+    }
+}
+
+struct StagedProofWorkspace {
+    root: PathBuf,
+    enterprise: PathBuf,
+    kernel_crate: PathBuf,
+}
+
+impl Drop for StagedProofWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn stage_proof_workspace(real_root: &Path) -> StagedProofWorkspace {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stage = std::env::temp_dir().join(format!(
+        "cuttle-bundle-proof-{}-{}",
+        std::process::id(),
+        ts
+    ));
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage).expect("create stage root");
+    for f in ["locked_modules.toml", "factory_keys.toml"] {
+        let src = real_root.join(f);
+        if src.exists() {
+            std::fs::copy(&src, stage.join(f)).expect("copy root policy");
+        }
+    }
+    copy_crate_tree_no_target(&real_root.join("contracts"), &stage.join("contracts"));
+    copy_crate_tree_no_target(
+        &real_root.join("target_enterprise"),
+        &stage.join("target_enterprise"),
+    );
+    copy_crate_tree_no_target(
+        &real_root.join("target_enterprise_kernel"),
+        &stage.join("target_enterprise_kernel"),
+    );
+    StagedProofWorkspace {
+        enterprise: stage.join("target_enterprise"),
+        kernel_crate: stage.join("target_enterprise_kernel"),
+        root: stage,
     }
 }
 
@@ -175,11 +252,11 @@ fn full_bundle_kernel_modules_boot_under_qemu() {
     let wall0 = Instant::now();
     let _g = FS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let root = workspace_root();
-    let enterprise = root.join("target_enterprise");
-    let kernel_crate = root.join("target_enterprise_kernel");
+    let live_enterprise = root.join("target_enterprise");
+    let live_kernel_crate = root.join("target_enterprise_kernel");
     let pkg_crate = root.join("factory_builder_pkg");
 
-    if !kernel_crate.join("Cargo.toml").exists() {
+    if !live_kernel_crate.join("Cargo.toml").exists() {
         eprintln!("SKIP: target_enterprise_kernel missing");
         return;
     }
@@ -203,10 +280,10 @@ fn full_bundle_kernel_modules_boot_under_qemu() {
         PROOF_CYCLE
     );
 
-    // 1) Backup
-    let mut backups: Vec<SourceBackup> = Vec::new();
+    assert_clean_checkout_dir(&root, "target_enterprise/src");
+    let mut live_snapshots: Vec<(PathBuf, String)> = Vec::new();
     for m in &modules {
-        let path = enterprise.join("src").join(format!("{}.rs", m));
+        let path = live_enterprise.join("src").join(format!("{}.rs", m));
         assert!(
             path.exists(),
             "enrolled module missing on disk: {} ({})",
@@ -215,8 +292,13 @@ fn full_bundle_kernel_modules_boot_under_qemu() {
         );
         let pristine = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
-        backups.push(SourceBackup { path, pristine });
+        live_snapshots.push((path, pristine));
     }
+
+    // Stage an isolated copy under %TEMP% so morphing never touches the live checkout.
+    let staged = stage_proof_workspace(&root);
+    let enterprise = staged.enterprise.clone();
+    let kernel_crate = staged.kernel_crate.clone();
 
     // 2) Diversify
     let mut zero_diversity: Vec<String> = Vec::new();
@@ -364,16 +446,11 @@ fn full_bundle_kernel_modules_boot_under_qemu() {
         wall_ms
     );
 
-    drop(backups);
-    for m in &modules {
-        let path = enterprise.join("src").join(format!("{}.rs", m));
-        let body = std::fs::read_to_string(&path).expect("re-read after restore");
-        assert!(body.len() > 50, "{} empty after restore?", m);
-        assert!(
-            !path.with_extension("rs.preexp.bak").exists(),
-            "leftover backup for {}",
-            m
-        );
+    drop(staged);
+    assert_clean_checkout_dir(&root, "target_enterprise/src");
+    for (path, before) in &live_snapshots {
+        let body = std::fs::read_to_string(path).expect("re-read live checkout");
+        assert_eq!(&body, before, "live checkout modified at {}", path.display());
     }
     let _ = diversify_stats; // kept for future report dump
 }

@@ -8,13 +8,86 @@
 use diversity_demo::{
     evaluate_mtd_gate, render_report, run_experiment, ExperimentArgs, MtdGateStatus,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-// Both tests mutate `target_enterprise/src/tls.rs` (write a candidate,
-// then restore the pristine version). Running them concurrently would
-// race on that file. Serialize via a process-global Mutex.
+// Tests stage isolated copies of the required source files under `%TEMP%`
+// so running `cargo test --workspace` never mutates tracked checkout files.
 static FS_MUTEX: Mutex<()> = Mutex::new(());
+
+struct StagedEnterprise {
+    dir: PathBuf,
+}
+
+impl Drop for StagedEnterprise {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn copy_tree_no_target(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("create staged dir");
+    for entry in std::fs::read_dir(src).expect("read_dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        if matches!(name_s.as_ref(), "target" | ".git" | ".vscode" | ".idea") {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        let ty = entry.file_type().expect("file_type");
+        if ty.is_dir() {
+            copy_tree_no_target(&from, &to);
+        } else if ty.is_file() {
+            std::fs::copy(&from, &to).expect("copy staged file");
+        }
+    }
+}
+
+fn stage_fast_enterprise(label: &str, members: &[&str]) -> (StagedEnterprise, PathBuf, PathBuf) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "cuttle-divdemo-{}-{}-{}",
+        label,
+        std::process::id(),
+        nonce
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let root = workspace_root();
+    let target_dir = dir.join("target_enterprise");
+    let src_dir = target_dir.join("src");
+    std::fs::create_dir_all(&src_dir).expect("create staged src");
+    std::fs::copy(
+        root.join("locked_modules.toml"),
+        dir.join("locked_modules.toml"),
+    )
+    .expect("copy locked_modules.toml");
+    std::fs::create_dir_all(dir.join("contracts")).expect("create staged contracts");
+    std::fs::copy(
+        root.join("contracts").join("Cargo.toml"),
+        dir.join("contracts").join("Cargo.toml"),
+    )
+    .expect("copy contracts Cargo.toml");
+    std::fs::copy(
+        root.join("target_enterprise").join("Cargo.toml"),
+        target_dir.join("Cargo.toml"),
+    )
+    .expect("copy target_enterprise Cargo.toml");
+    for m in members {
+        let from = root
+            .join("target_enterprise")
+            .join("src")
+            .join(format!("{m}.rs"));
+        let to = src_dir.join(format!("{m}.rs"));
+        std::fs::copy(&from, &to).expect("copy member source");
+    }
+    let results_dir = dir.join("results").join(label);
+    (StagedEnterprise { dir }, target_dir, results_dir)
+}
 
 fn workspace_root() -> PathBuf {
     // Tests live at `<root>/experiments/diversity_demo/tests/`; the
@@ -27,17 +100,16 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn fast_args(results_subdir: &str, cycles: u64) -> ExperimentArgs {
-    let root = workspace_root();
-    let results_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("results").join(results_subdir);
-    ExperimentArgs {
+fn fast_args(results_subdir: &str, cycles: u64) -> (StagedEnterprise, ExperimentArgs) {
+    let (staged, target_dir, results_dir) = stage_fast_enterprise(results_subdir, &["tls"]);
+    let kernel_crate_dir = staged.dir.join("target_enterprise_kernel");
+    let args = ExperimentArgs {
         cycles,
-        target_dir: root.join("target_enterprise"),
+        target_dir,
         module: "tls".to_string(),
         bundle_name: None,
         bundle_modules: None,
-        kernel_crate_dir: root.join("target_enterprise_kernel"),
+        kernel_crate_dir,
         results_dir,
         fast_mode: true,
         // Skip verify — when running under `cargo test`, the verify
@@ -57,13 +129,14 @@ fn fast_args(results_subdir: &str, cycles: u64) -> ExperimentArgs {
         layout_seed_enabled: false,
         // Production default: stack-pad off (gadget inflation vs layout seed).
         stack_pad_enabled: false,
-    }
+    };
+    (staged, args)
 }
 
 #[test]
 fn smoke_3_cycles_run_clean() {
     let _g = FS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let args = fast_args("smoke3", 3);
+    let (_staged, args) = fast_args("smoke3", 3);
     let summary = run_experiment(&args).expect("run_experiment");
     let report = render_report(&summary, &args.results_dir).expect("render_report");
     assert!(report.exists(), "REPORT.md was not written at {}", report.display());
@@ -119,7 +192,7 @@ fn smoke_3_cycles_run_clean() {
 #[test]
 fn save_candidates_writes_one_file_per_accepted_cycle() {
     let _g = FS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let mut args = fast_args("savecands3", 3);
+    let (_staged, mut args) = fast_args("savecands3", 3);
     args.save_candidates = true;
     let summary = run_experiment(&args).expect("run_experiment");
     let cand_dir = args.results_dir.join("candidates");
@@ -158,7 +231,7 @@ fn save_candidates_writes_one_file_per_accepted_cycle() {
 #[test]
 fn entropy_floor_not_zero() {
     let _g = FS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let args = fast_args("entropy3", 3);
+    let (_staged, args) = fast_args("entropy3", 3);
     let summary = run_experiment(&args).expect("run_experiment");
     assert!(
         summary.cycles_completed >= 2,
@@ -191,7 +264,7 @@ fn entropy_floor_not_zero() {
 #[test]
 fn layout_seed_relocates_offsets_and_is_recorded() {
     let _g = FS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let mut args = fast_args("layoutseed_fast4", 4);
+    let (_staged, mut args) = fast_args("layoutseed_fast4", 4);
     args.layout_seed_enabled = true;
     let summary = run_experiment(&args).expect("run_experiment");
     assert!(summary.layout_seed_enabled, "summary must record seeding");
@@ -270,7 +343,7 @@ fn layout_seed_relocates_offsets_and_is_recorded() {
 #[test]
 fn default_stack_pad_off_in_experiment() {
     let _g = FS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let mut args = fast_args("stackpad_off3", 3);
+    let (_staged, mut args) = fast_args("stackpad_off3", 3);
     args.save_candidates = true;
     assert!(!args.stack_pad_enabled);
     let summary = run_experiment(&args).expect("run_experiment");
@@ -295,7 +368,7 @@ fn default_stack_pad_off_in_experiment() {
 #[test]
 fn no_layout_seed_keeps_legacy_record_shape() {
     let _g = FS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let args = fast_args("layoutseed_off2", 2);
+    let (_staged, args) = fast_args("layoutseed_off2", 2);
     assert!(!args.layout_seed_enabled, "fast_args pins the legacy path");
     let summary = run_experiment(&args).expect("run_experiment");
     assert!(!summary.layout_seed_enabled);
@@ -310,19 +383,22 @@ fn no_layout_seed_keeps_legacy_record_shape() {
 // TASK-036 Phase B: bundle-mode smoke tests
 // =====================================================================
 
-fn fast_bundle_args(results_subdir: &str, cycles: u64, members: &[&str]) -> ExperimentArgs {
-    let root = workspace_root();
-    let results_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("results").join(results_subdir);
-    ExperimentArgs {
+fn fast_bundle_args(
+    results_subdir: &str,
+    cycles: u64,
+    members: &[&str],
+) -> (StagedEnterprise, ExperimentArgs) {
+    let (staged, target_dir, results_dir) = stage_fast_enterprise(results_subdir, members);
+    let kernel_crate_dir = staged.dir.join("target_enterprise_kernel");
+    let args = ExperimentArgs {
         cycles,
-        target_dir: root.join("target_enterprise"),
+        target_dir,
         // In bundle mode `module` is a label for the summary; the
         // actual files come from `bundle_modules`.
         module: "kernel".to_string(),
         bundle_name: Some("kernel".to_string()),
         bundle_modules: Some(members.iter().map(|s| s.to_string()).collect()),
-        kernel_crate_dir: root.join("target_enterprise_kernel"),
+        kernel_crate_dir,
         results_dir,
         fast_mode: true,
         skip_verify: true,
@@ -332,7 +408,8 @@ fn fast_bundle_args(results_subdir: &str, cycles: u64, members: &[&str]) -> Expe
         boot_each_cycle: false,
         layout_seed_enabled: false,
         stack_pad_enabled: false,
-    }
+    };
+    (staged, args)
 }
 
 /// 3-cycle fast-mode run against a 2-module bundle. Asserts:
@@ -350,7 +427,7 @@ fn smoke_bundle_2_member_3_cycles() {
     // declaration, both have established morph-round-trip tests, both
     // have public files at target_enterprise/src/<name>.rs that the
     // pristine-restore machinery can find.
-    let args = fast_bundle_args("bundle_smoke_2x3", 3, &["tls", "wal"]);
+    let (_staged, args) = fast_bundle_args("bundle_smoke_2x3", 3, &["tls", "wal"]);
 
     // Confirm both source files exist before the run.
     for member in ["tls", "wal"] {
@@ -440,7 +517,7 @@ fn smoke_bundle_2_member_3_cycles() {
 #[test]
 fn boot_each_cycle_is_noop_under_fast_mode() {
     let _g = FS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let mut args = fast_args("boot_each_cycle_fast_noop", 3);
+    let (_staged, mut args) = fast_args("boot_each_cycle_fast_noop", 3);
     args.boot_each_cycle = true;
     let summary = run_experiment(&args).expect("run_experiment");
 
@@ -530,18 +607,42 @@ fn boot_each_cycle_real_mode_captures_per_cycle_serial_logs() {
         return;
     }
 
-    let results_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("results").join("real_boot_each_cycle_2");
-    // Ensure a clean run — remove any stale per-cycle directories.
-    let _ = std::fs::remove_dir_all(&results_dir);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stage_root = std::env::temp_dir().join(format!(
+        "cuttle-divdemo-real-{}-{}",
+        std::process::id(),
+        nonce
+    ));
+    let _ = std::fs::remove_dir_all(&stage_root);
+    std::fs::create_dir_all(&stage_root).expect("create stage_root");
+    let _stage_guard = StagedEnterprise {
+        dir: stage_root.clone(),
+    };
+    for f in ["Cargo.toml", "Cargo.lock", "locked_modules.toml"] {
+        let src = root.join(f);
+        if src.exists() {
+            std::fs::copy(&src, stage_root.join(f)).expect("copy workspace file");
+        }
+    }
+    copy_tree_no_target(&root.join("contracts"), &stage_root.join("contracts"));
+    copy_tree_no_target(
+        &root.join("target_enterprise"),
+        &stage_root.join("target_enterprise"),
+    );
+    copy_tree_no_target(&kernel_crate, &stage_root.join("target_enterprise_kernel"));
+
+    let results_dir = stage_root.join("results").join("real_boot_each_cycle_2");
 
     let args = ExperimentArgs {
         cycles: 2,
-        target_dir: root.join("target_enterprise"),
+        target_dir: stage_root.join("target_enterprise"),
         module: "tls".to_string(),
         bundle_name: None,
         bundle_modules: None,
-        kernel_crate_dir: kernel_crate,
+        kernel_crate_dir: stage_root.join("target_enterprise_kernel"),
         results_dir: results_dir.clone(),
         fast_mode: false,
         skip_verify: true,
@@ -624,4 +725,123 @@ fn boot_each_cycle_real_mode_captures_per_cycle_serial_logs() {
         }
     }
     assert!(log_count >= 1, "no captured .log files in {}", logs_dir.display());
+}
+
+#[test]
+fn stale_candidate_or_backup_aborts_experiment_without_overwriting_source() {
+    let _g = FS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Case A: stale `<member>.candidate.rs` left behind by an interrupted run.
+    let (_staged_a, args_a) = fast_bundle_args("stale_cand_guard", 2, &["tls", "wal"]);
+    let tls_path = args_a.target_dir.join("src").join("tls.rs");
+    let wal_path = args_a.target_dir.join("src").join("wal.rs");
+    let tls_before = std::fs::read_to_string(&tls_path).expect("read staged tls.rs");
+    let wal_before = std::fs::read_to_string(&wal_path).expect("read staged wal.rs");
+    let stale_cand = args_a.target_dir.join("src").join("tls.candidate.rs");
+    std::fs::write(&stale_cand, "// stale poisoned candidate\npub fn poisoned() {}\n")
+        .expect("write stale candidate");
+
+    let err_a = run_experiment(&args_a)
+        .expect_err("pre-existing tls.candidate.rs must abort run_experiment before morphing");
+    let msg_a = format!("{err_a:#}");
+    assert!(
+        msg_a.contains("tls.candidate.rs") || msg_a.contains("stale"),
+        "expected stale candidate diagnostic, got: {msg_a}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tls_path).expect("re-read tls.rs"),
+        tls_before,
+        "tls.rs must remain byte-for-byte unchanged when stale candidate is rejected"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&wal_path).expect("re-read wal.rs"),
+        wal_before,
+        "wal.rs must remain byte-for-byte unchanged when stale candidate is rejected"
+    );
+    assert!(
+        stale_cand.exists(),
+        "stale candidate must not be silently consumed or deleted on preflight failure"
+    );
+
+    // Case B: stale `<member>.rs.preexp.bak` left behind by a crashed run.
+    let (_staged_b, args_b) = fast_bundle_args("stale_bak_guard", 2, &["tls", "wal"]);
+    let wal_bak = args_b.target_dir.join("src").join("wal.rs.preexp.bak");
+    std::fs::write(&wal_bak, "// original backup from interrupted run\n")
+        .expect("write stale backup");
+    let err_b = run_experiment(&args_b)
+        .expect_err("pre-existing wal.rs.preexp.bak must abort run_experiment before overwriting backup");
+    let msg_b = format!("{err_b:#}");
+    assert!(
+        msg_b.contains("wal.rs.preexp.bak") || msg_b.contains("stale"),
+        "expected stale backup diagnostic, got: {msg_b}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&wal_bak).expect("re-read wal.rs.preexp.bak"),
+        "// original backup from interrupted run\n",
+        "existing backup must not be overwritten when preflight rejects"
+    );
+}
+
+#[test]
+fn smoke_suite_never_touches_live_checkout_sources() {
+    let _g = FS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let root = workspace_root();
+    let live_tls = root.join("target_enterprise").join("src").join("tls.rs");
+    let live_wal = root.join("target_enterprise").join("src").join("wal.rs");
+    let tls_bytes_before = std::fs::read(&live_tls).expect("read live tls.rs");
+    let wal_bytes_before = std::fs::read(&live_wal).expect("read live wal.rs");
+    let tls_mtime_before = std::fs::metadata(&live_tls)
+        .and_then(|m| m.modified())
+        .expect("mtime live tls.rs");
+    let wal_mtime_before = std::fs::metadata(&live_wal)
+        .and_then(|m| m.modified())
+        .expect("mtime live wal.rs");
+
+    let (_staged, args) = fast_bundle_args("live_checkout_untouched", 3, &["tls", "wal"]);
+    assert_ne!(
+        args.target_dir,
+        root.join("target_enterprise"),
+        "test target_dir must be staged outside the live checkout"
+    );
+    let summary = run_experiment(&args).expect("run_experiment on staged copy");
+    assert_eq!(summary.cycles_completed, 3);
+
+    assert_eq!(
+        std::fs::read(&live_tls).expect("re-read live tls.rs"),
+        tls_bytes_before,
+        "live target_enterprise/src/tls.rs modified"
+    );
+    assert_eq!(
+        std::fs::read(&live_wal).expect("re-read live wal.rs"),
+        wal_bytes_before,
+        "live target_enterprise/src/wal.rs modified"
+    );
+    assert_eq!(
+        std::fs::metadata(&live_tls)
+            .and_then(|m| m.modified())
+            .expect("mtime live tls.rs after"),
+        tls_mtime_before,
+        "live target_enterprise/src/tls.rs mtime changed"
+    );
+    assert_eq!(
+        std::fs::metadata(&live_wal)
+            .and_then(|m| m.modified())
+            .expect("mtime live wal.rs after"),
+        wal_mtime_before,
+        "live target_enterprise/src/wal.rs mtime changed"
+    );
+    assert!(
+        !root
+            .join("target_enterprise")
+            .join("src")
+            .join("tls.candidate.rs")
+            .exists()
+    );
+    assert!(
+        !root
+            .join("target_enterprise")
+            .join("src")
+            .join("wal.candidate.rs")
+            .exists()
+    );
 }

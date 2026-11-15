@@ -32,11 +32,95 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cuttle_morph_engine::{
     daemon::{run_daemon, DaemonArgs, DAEMON_LOG},
     verify_chain_with_options, SynthesizerKind, VerifyOptions, ATTEST_DIR_ENV,
+    FEDERATION_CONFIG_ENV, SIGNING_KEY_ENV,
 };
 
 static MUTEX: Mutex<()> = Mutex::new(());
 
 const MODULES: &[&str] = &["tls", "wal", "net"];
+
+fn copy_crate_tree_no_target(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).expect("create staged crate dir");
+    for entry in fs::read_dir(src).expect("read_dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        if matches!(name_s.as_ref(), "target" | ".git" | ".vscode" | ".idea") {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        let ty = entry.file_type().expect("file_type");
+        if ty.is_dir() {
+            copy_crate_tree_no_target(&from, &to);
+        } else if ty.is_file() {
+            fs::copy(&from, &to).expect("copy staged file");
+        }
+    }
+}
+
+fn assert_clean_checkout_dir(root: &Path, rel_src: &str) {
+    let dir = root.join(rel_src);
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                assert!(
+                    !name.ends_with(".candidate.rs") && !name.ends_with(".rs.preexp.bak"),
+                    "refusing to run with stale staging file in live checkout: {}",
+                    p.display()
+                );
+            }
+        }
+    }
+    if let Ok(out) = Command::new("git")
+        .args(["status", "--porcelain", "--", rel_src])
+        .current_dir(root)
+        .output()
+    {
+        if out.status.success() {
+            let txt = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                txt.trim().is_empty(),
+                "live checkout has modified/untracked files under {}: {}",
+                rel_src,
+                txt.trim()
+            );
+        }
+    }
+}
+
+fn stage_bundle_boot_workspace(root: &Path, run_id: u64) -> PathBuf {
+    let stage = std::env::temp_dir().join(format!(
+        "cuttle-bsoak-boot-{}-{}",
+        std::process::id(),
+        run_id
+    ));
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage).expect("create stage root");
+    for f in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "locked_modules.toml",
+        "factory_keys.toml",
+        "factory_signing_key.bin",
+    ] {
+        let src = root.join(f);
+        if src.exists() {
+            fs::copy(&src, stage.join(f)).expect("copy root file");
+        }
+    }
+    for d in [
+        "contracts",
+        "target_enterprise",
+        "target_enterprise_kernel",
+        "diversifier",
+        "verifier",
+    ] {
+        copy_crate_tree_no_target(&root.join(d), &stage.join(d));
+    }
+    stage
+}
 
 const REQUIRED_BANNERS: &[&str] = &[
     "CUTTLE-TE OK",
@@ -254,6 +338,7 @@ fn mini_bundle_soak_then_qemu_boot() {
         .expect("build verify");
     assert!(st.success());
 
+    assert_clean_checkout_dir(&root, "target_enterprise/src");
     let snaps = snapshot_modules(&root);
     let run_id = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -264,21 +349,66 @@ fn mini_bundle_soak_then_qemu_boot() {
         .join(format!("boot_run_{}", run_id));
     fs::create_dir_all(&results_dir).ok();
 
+    let stage_root = stage_bundle_boot_workspace(&root, run_id);
+    let stage_soak = stage_root.join("soak_cfg");
+    fs::create_dir_all(&stage_soak).expect("stage soak cfg");
+    fs::copy(soak.join("scheduler.toml"), stage_soak.join("scheduler.toml"))
+        .expect("copy scheduler.toml");
+    let staged_kernel_crate = stage_root.join("target_enterprise_kernel");
+
     let prev_attest = std::env::var_os(ATTEST_DIR_ENV);
+    let prev_key = std::env::var_os(SIGNING_KEY_ENV);
+    let prev_fed = std::env::var_os(FEDERATION_CONFIG_ENV);
+    let prev_cwd = std::env::current_dir().unwrap();
+    struct Cleanup {
+        prev_cwd: PathBuf,
+        prev_attest: Option<std::ffi::OsString>,
+        prev_key: Option<std::ffi::OsString>,
+        prev_fed: Option<std::ffi::OsString>,
+        stage_root: PathBuf,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev_cwd);
+            unsafe {
+                match &self.prev_attest {
+                    Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
+                    None => std::env::remove_var(ATTEST_DIR_ENV),
+                }
+                match &self.prev_key {
+                    Some(v) => std::env::set_var(SIGNING_KEY_ENV, v),
+                    None => std::env::remove_var(SIGNING_KEY_ENV),
+                }
+                match &self.prev_fed {
+                    Some(v) => std::env::set_var(FEDERATION_CONFIG_ENV, v),
+                    None => std::env::remove_var(FEDERATION_CONFIG_ENV),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.stage_root);
+        }
+    }
+    let cleanup = Cleanup {
+        prev_cwd,
+        prev_attest,
+        prev_key,
+        prev_fed,
+        stage_root: stage_root.clone(),
+    };
+
     unsafe {
         std::env::set_var(ATTEST_DIR_ENV, &results_dir);
+        std::env::set_var(SIGNING_KEY_ENV, stage_root.join("factory_signing_key.bin"));
+        if stage_root.join("factory_keys.toml").exists() {
+            std::env::set_var(FEDERATION_CONFIG_ENV, stage_root.join("factory_keys.toml"));
+        }
     }
+    std::env::set_current_dir(&stage_root).unwrap();
 
-    let state_path = soak.join("scheduler_state.json");
-    let daemon_log = soak.join(DAEMON_LOG);
-    let _ = fs::remove_file(&state_path);
-    let _ = fs::remove_file(&daemon_log);
-
-    let prev_cwd = std::env::current_dir().unwrap();
-    std::env::set_current_dir(&root).unwrap();
+    let state_path = stage_soak.join("scheduler_state.json");
+    let daemon_log = stage_soak.join(DAEMON_LOG);
 
     let daemon_args = DaemonArgs {
-        root: soak.clone(),
+        root: stage_soak.clone(),
         max_iters: iters,
         max_cycle_secs: 900,
         heartbeat_secs: 3600,
@@ -289,24 +419,13 @@ fn mini_bundle_soak_then_qemu_boot() {
     };
 
     eprintln!(
-        "bundle_soak_boot: phase 1 daemon max_iters={} modules={:?}",
-        iters, MODULES
+        "bundle_soak_boot: phase 1 daemon max_iters={} modules={:?} staged_root={}",
+        iters,
+        MODULES,
+        stage_soak.display()
     );
 
-    let report = match run_daemon(&daemon_args) {
-        Ok(r) => r,
-        Err(e) => {
-            std::env::set_current_dir(&prev_cwd).ok();
-            unsafe {
-                match prev_attest {
-                    Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-                    None => std::env::remove_var(ATTEST_DIR_ENV),
-                }
-            }
-            restore_modules(&snaps);
-            panic!("daemon failed: {:#}", e);
-        }
-    };
+    let report = run_daemon(&daemon_args).unwrap_or_else(|e| panic!("daemon failed: {:#}", e));
 
     eprintln!(
         "bundle_soak_boot: daemon accepted={} rejected={}",
@@ -344,41 +463,21 @@ fn mini_bundle_soak_then_qemu_boot() {
         layout_seed, last_cycle
     );
 
-    // Sources are still morphed on disk — that is the point.
+    // Staged sources are still morphed on disk — that is the point.
     let elf = match factory_builder::build_kernel_with_layout_seed(
-        &kernel_crate,
+        &staged_kernel_crate,
         Some(layout_seed),
     ) {
         Ok(p) => p,
         Err(e) => {
-            std::env::set_current_dir(&prev_cwd).ok();
-            unsafe {
-                match prev_attest {
-                    Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-                    None => std::env::remove_var(ATTEST_DIR_ENV),
-                }
-            }
-            restore_modules(&snaps);
             eprintln!("SKIP: kernel build failed: {:#}", e);
             return;
         }
     };
 
     eprintln!("bundle_soak_boot: phase 3 QEMU boot {}", elf.display());
-    let serial = match boot_kernel(&elf, &results_dir, last_cycle) {
-        Ok(p) => p,
-        Err(e) => {
-            std::env::set_current_dir(&prev_cwd).ok();
-            unsafe {
-                match prev_attest {
-                    Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-                    None => std::env::remove_var(ATTEST_DIR_ENV),
-                }
-            }
-            restore_modules(&snaps);
-            panic!("QEMU boot failed after morphed bundle soak: {}", e);
-        }
-    };
+    let serial = boot_kernel(&elf, &results_dir, last_cycle)
+        .unwrap_or_else(|e| panic!("QEMU boot failed after morphed bundle soak: {}", e));
 
     let log_text = fs::read_to_string(&serial).expect("read serial");
     let mut missing = Vec::new();
@@ -390,14 +489,6 @@ fn mini_bundle_soak_then_qemu_boot() {
         }
     }
     if !missing.is_empty() {
-        std::env::set_current_dir(&prev_cwd).ok();
-        unsafe {
-            match prev_attest {
-                Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-                None => std::env::remove_var(ATTEST_DIR_ENV),
-            }
-        }
-        restore_modules(&snaps);
         panic!(
             "missing banners after bundle soak + boot: {:?}\nlog tail:\n{}",
             missing,
@@ -432,18 +523,13 @@ fn mini_bundle_soak_then_qemu_boot() {
     );
     let _ = fs::write(results_dir.join("REPORT.md"), report_md);
 
-    restore_modules(&snaps);
-    std::env::set_current_dir(&prev_cwd).ok();
-    unsafe {
-        match prev_attest {
-            Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-            None => std::env::remove_var(ATTEST_DIR_ENV),
-        }
-    }
+    drop(cleanup);
+    let _ = restore_modules as fn(&[(PathBuf, String)]);
 
+    assert_clean_checkout_dir(&root, "target_enterprise/src");
     for (p, before) in &snaps {
         let after = fs::read_to_string(p).unwrap();
-        assert_eq!(&after, before, "restore failed for {}", p.display());
+        assert_eq!(&after, before, "live checkout modified for {}", p.display());
     }
 
     eprintln!(

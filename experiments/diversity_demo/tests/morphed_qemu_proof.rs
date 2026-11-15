@@ -179,24 +179,100 @@ fn required_banners_include_ahci_e1000_nvme_hw() {
 /// bijective mix production uses (`cycle_layout_seed`).
 const PROOF_CYCLE: u64 = 9001;
 
-struct SourceBackup {
-    path: PathBuf,
-    pristine: String,
+fn copy_crate_tree_no_target(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("create staged crate dir");
+    for entry in std::fs::read_dir(src).expect("read_dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        if matches!(name_s.as_ref(), "target" | ".git" | ".vscode" | ".idea") {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        let ty = entry.file_type().expect("file_type");
+        if ty.is_dir() {
+            copy_crate_tree_no_target(&from, &to);
+        } else if ty.is_file() {
+            std::fs::copy(&from, &to).expect("copy staged file");
+        }
+    }
 }
 
-impl Drop for SourceBackup {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::write(&self.path, &self.pristine) {
-            eprintln!(
-                "morphed_qemu_proof: CRITICAL restore failed for {}: {}",
-                self.path.display(),
-                e
-            );
-        } else {
-            // Best-effort remove any leftover .preexp.bak litter.
-            let bak = self.path.with_extension("rs.preexp.bak");
-            let _ = std::fs::remove_file(bak);
+fn assert_clean_checkout_dir(root: &Path, rel_src: &str) {
+    let dir = root.join(rel_src);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                assert!(
+                    !name.ends_with(".candidate.rs") && !name.ends_with(".rs.preexp.bak"),
+                    "refusing to run with stale staging file in live checkout: {}",
+                    p.display()
+                );
+            }
         }
+    }
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--", rel_src])
+        .current_dir(root)
+        .output()
+    {
+        if out.status.success() {
+            let txt = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                txt.trim().is_empty(),
+                "live checkout has modified/untracked files under {}: {}",
+                rel_src,
+                txt.trim()
+            );
+        }
+    }
+}
+
+struct StagedProofWorkspace {
+    root: PathBuf,
+    enterprise: PathBuf,
+    kernel_crate: PathBuf,
+}
+
+impl Drop for StagedProofWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn stage_proof_workspace(real_root: &Path) -> StagedProofWorkspace {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stage = std::env::temp_dir().join(format!(
+        "cuttle-morphed-proof-{}-{}",
+        std::process::id(),
+        ts
+    ));
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage).expect("create stage root");
+    for f in ["locked_modules.toml", "factory_keys.toml"] {
+        let src = real_root.join(f);
+        if src.exists() {
+            std::fs::copy(&src, stage.join(f)).expect("copy root policy");
+        }
+    }
+    copy_crate_tree_no_target(&real_root.join("contracts"), &stage.join("contracts"));
+    copy_crate_tree_no_target(
+        &real_root.join("target_enterprise"),
+        &stage.join("target_enterprise"),
+    );
+    copy_crate_tree_no_target(
+        &real_root.join("target_enterprise_kernel"),
+        &stage.join("target_enterprise_kernel"),
+    );
+    StagedProofWorkspace {
+        enterprise: stage.join("target_enterprise"),
+        kernel_crate: stage.join("target_enterprise_kernel"),
+        root: stage,
     }
 }
 
@@ -212,14 +288,14 @@ fn morphed_modules_boot_under_qemu_with_banners() {
 
     let _g = FS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let root = workspace_root();
-    let enterprise = root.join("target_enterprise");
-    let kernel_crate = root.join("target_enterprise_kernel");
+    let live_enterprise = root.join("target_enterprise");
+    let live_kernel_crate = root.join("target_enterprise_kernel");
     let pkg_crate = root.join("factory_builder_pkg");
 
-    if !kernel_crate.join("Cargo.toml").exists() {
+    if !live_kernel_crate.join("Cargo.toml").exists() {
         eprintln!(
             "SKIP: target_enterprise_kernel missing at {}",
-            kernel_crate.display()
+            live_kernel_crate.display()
         );
         return;
     }
@@ -235,17 +311,10 @@ fn morphed_modules_boot_under_qemu_with_banners() {
         return;
     }
 
-    // Results dir early — base/variant ELFs land here for churn + boot.
-    let results_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("results")
-        .join("morphed_qemu_proof");
-    let _ = std::fs::remove_dir_all(&results_dir);
-    std::fs::create_dir_all(&results_dir).ok();
-
-    // 1) Backup pristines (Drop restores even on panic).
-    let mut backups: Vec<SourceBackup> = Vec::new();
+    assert_clean_checkout_dir(&root, "target_enterprise/src");
+    let mut live_snapshots: Vec<(PathBuf, String)> = Vec::new();
     for m in PROOF_MODULES {
-        let path = enterprise.join("src").join(format!("{}.rs", m));
+        let path = live_enterprise.join("src").join(format!("{}.rs", m));
         assert!(
             path.exists(),
             "precondition: {} must exist",
@@ -253,8 +322,20 @@ fn morphed_modules_boot_under_qemu_with_banners() {
         );
         let pristine = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
-        backups.push(SourceBackup { path, pristine });
+        live_snapshots.push((path, pristine));
     }
+
+    // Stage an isolated copy under %TEMP% so morphing never touches the live checkout.
+    let staged = stage_proof_workspace(&root);
+    let enterprise = staged.enterprise.clone();
+    let kernel_crate = staged.kernel_crate.clone();
+
+    // Results dir early — base/variant ELFs land here for churn + boot.
+    let results_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("results")
+        .join("morphed_qemu_proof");
+    let _ = std::fs::remove_dir_all(&results_dir);
+    std::fs::create_dir_all(&results_dir).ok();
 
     // 2) Build **base** kernel from pristine sources (cycle N layout seed).
     //    Consecutive-cycle comparison: base uses PROOF_CYCLE, variant
@@ -437,22 +518,13 @@ fn morphed_modules_boot_under_qemu_with_banners() {
         churn.summary_line()
     );
 
-    // backups Drop → restore pristines
-    drop(backups);
+    drop(staged);
 
-    // Post-condition: sources restored.
-    for m in PROOF_MODULES {
-        let path = enterprise.join("src").join(format!("{}.rs", m));
-        let body = std::fs::read_to_string(&path).expect("re-read after restore");
-        assert!(
-            body.len() > 100,
-            "{} empty after restore?",
-            path.display()
-        );
-        // Heuristic: diversified sources usually still contain the module's
-        // public contract name; more importantly, no leftover backup.
-        let bak = path.with_extension("rs.preexp.bak");
-        assert!(!bak.exists(), "leftover backup {}", bak.display());
+    // Post-condition: live checkout was never touched.
+    assert_clean_checkout_dir(&root, "target_enterprise/src");
+    for (path, before) in &live_snapshots {
+        let body = std::fs::read_to_string(path).expect("re-read live checkout");
+        assert_eq!(&body, before, "live checkout modified at {}", path.display());
     }
 
     // Silence unused import if Duration only used conceptually.

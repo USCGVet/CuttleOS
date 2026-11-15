@@ -435,6 +435,39 @@ pub fn run_experiment(args: &ExperimentArgs) -> Result<RunSummary> {
             );
         }
     }
+    // Fail closed if a prior interrupted run left any staging candidate or
+    // pre-experiment backup in `target_dir/src`. Reading a disturbed tree as
+    // `pristines` and deleting the leftover `.candidate.rs` files would
+    // silently promote unreviewed machine output over the source files.
+    let target_src_dir = args.target_dir.join("src");
+    for (member, bk) in members.iter().zip(backups.iter()) {
+        let cand = target_src_dir.join(format!("{}.candidate.rs", member));
+        if cand.exists() {
+            bail!(
+                "diversity_demo: refusing to run: pre-existing candidate file {} (left by an interrupted run)",
+                cand.display()
+            );
+        }
+        if bk.exists() {
+            bail!(
+                "diversity_demo: refusing to run: pre-existing backup file {} (left by an interrupted run)",
+                bk.display()
+            );
+        }
+    }
+    if let Ok(entries) = fs::read_dir(&target_src_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                if name.ends_with(".candidate.rs") || name.ends_with(".rs.preexp.bak") {
+                    bail!(
+                        "diversity_demo: refusing to run: dirty target source dir contains {}",
+                        p.display()
+                    );
+                }
+            }
+        }
+    }
     // Read pristine for each source.
     let mut pristines: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
@@ -513,16 +546,22 @@ pub fn run_experiment(args: &ExperimentArgs) -> Result<RunSummary> {
 
     // Restore every member. Even on success — leaving any diversified
     // module in place would break the next `cargo build --workspace`.
+    let mut restore_err: Option<anyhow::Error> = None;
     for (member, src) in members.iter().zip(sources.iter()) {
         if let Some(p) = pristines.get(member) {
             if let Err(e) = fs::write(src, p) {
-                eprintln!(
-                    "diversity_demo: WARNING — failed to restore pristine {}: {:#}",
-                    src.display(),
-                    e
-                );
+                let err = anyhow::Error::new(e)
+                    .context(format!("failed to restore pristine {}", src.display()));
+                eprintln!("diversity_demo: ERROR — {:#}", err);
+                if restore_err.is_none() {
+                    restore_err = Some(err);
+                }
             }
         }
+    }
+    if let Some(err) = restore_err {
+        // Keep `.rs.preexp.bak` files intact so the operator can recover.
+        return Err(err);
     }
     // Backups are only useful while the run is mid-flight; remove on
     // a clean restore so we don't leave litter in the target crate.

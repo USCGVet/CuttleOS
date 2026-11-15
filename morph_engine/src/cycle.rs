@@ -203,6 +203,14 @@ fn prepare_candidate(args: &CycleArgs) -> Result<PreparedCandidate> {
     let _ = factory::fingerprint();
 
     let source_path = args.target_dir.join(format!("{}.rs", args.module));
+    let cand_path = args.target_dir.join(format!("{}.candidate.rs", args.module));
+    if cand_path.exists() {
+        bail!(
+            "refusing to morph {}: pre-existing candidate file {} (left by an interrupted run)",
+            args.module,
+            cand_path.display()
+        );
+    }
     let prev_source = fs::read_to_string(&source_path)
         .with_context(|| format!("read {}", source_path.display()))?;
 
@@ -306,7 +314,6 @@ fn prepare_candidate(args: &CycleArgs) -> Result<PreparedCandidate> {
         attest_div_log.perturb_decisions.len()
     );
 
-    let cand_path = args.target_dir.join(format!("{}.candidate.rs", args.module));
     fs::write(&cand_path, &candidate)?;
 
     Ok(PreparedCandidate {
@@ -1042,6 +1049,11 @@ fn prune_old_kernel_images(images_dir: &Path, label: &str, current_cycle: u64) {
 /// exe path. Used by image emission to locate sibling crates without
 /// hard-coding an absolute path.
 fn workspace_root_guess() -> Result<PathBuf> {
+    if let Ok(cwd) = env::current_dir() {
+        if cwd.join("Cargo.toml").exists() && cwd.join("contracts").join("Cargo.toml").exists() {
+            return Ok(cwd);
+        }
+    }
     let exe = env::current_exe().context("locate morph exe")?;
     // `<root>/target/<profile>/morph(.exe)` → go up twice.
     let two_up = exe
@@ -1287,6 +1299,16 @@ pub fn run_bundle(args: &BundleCycleArgs) -> Result<()> {
             "run_bundle: workspace crate not found at {}",
             crate_dir.display()
         );
+    }
+    for module in &args.modules {
+        let candidate_path = src_dir.join(format!("{}.candidate.rs", module));
+        if candidate_path.exists() {
+            bail!(
+                "run_bundle: refusing to morph {}: pre-existing candidate file {} (left by an interrupted run)",
+                module,
+                candidate_path.display()
+            );
+        }
     }
 
     // Stage 1: diversify every member.

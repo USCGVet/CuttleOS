@@ -31,11 +31,88 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cuttle_morph_engine::{
     daemon::{run_daemon, DaemonArgs, DaemonReport, DAEMON_LOG},
     verify_chain_with_options, SynthesizerKind, VerifyOptions, ATTEST_DIR_ENV,
+    FEDERATION_CONFIG_ENV, SIGNING_KEY_ENV,
 };
 
-/// Serialize so concurrent soak runs cannot race on target_minimal
-/// or the env-based attest dir.
+/// Serialize so concurrent soak runs cannot race on env-based attest dir.
 static SOAK_MUTEX: Mutex<()> = Mutex::new(());
+
+fn copy_crate_tree_no_target(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).expect("create staged crate dir");
+    for entry in fs::read_dir(src).expect("read_dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        if matches!(name_s.as_ref(), "target" | ".git" | ".vscode" | ".idea") {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        let ty = entry.file_type().expect("file_type");
+        if ty.is_dir() {
+            copy_crate_tree_no_target(&from, &to);
+        } else if ty.is_file() {
+            fs::copy(&from, &to).expect("copy staged file");
+        }
+    }
+}
+
+fn assert_clean_checkout_dir(root: &Path, rel_src: &str) {
+    let dir = root.join(rel_src);
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                assert!(
+                    !name.ends_with(".candidate.rs") && !name.ends_with(".rs.preexp.bak"),
+                    "refusing to run with stale staging file in live checkout: {}",
+                    p.display()
+                );
+            }
+        }
+    }
+    if let Ok(out) = Command::new("git")
+        .args(["status", "--porcelain", "--", rel_src])
+        .current_dir(root)
+        .output()
+    {
+        if out.status.success() {
+            let txt = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                txt.trim().is_empty(),
+                "live checkout has modified/untracked files under {}: {}",
+                rel_src,
+                txt.trim()
+            );
+        }
+    }
+}
+
+fn stage_minimal_soak_workspace(root: &Path, run_id: u64) -> PathBuf {
+    let stage = std::env::temp_dir().join(format!(
+        "cuttle-soak-short-{}-{}",
+        std::process::id(),
+        run_id
+    ));
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage).expect("create stage root");
+    for f in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "locked_modules.toml",
+        "factory_keys.toml",
+        "factory_signing_key.bin",
+    ] {
+        let src = root.join(f);
+        if src.exists() {
+            fs::copy(&src, stage.join(f)).expect("copy root file");
+        }
+    }
+    for d in ["contracts", "target_minimal", "diversifier", "verifier"] {
+        copy_crate_tree_no_target(&root.join(d), &stage.join(d));
+    }
+    stage
+}
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -158,11 +235,12 @@ fn short_daemon_soak_three_accepts() {
         .expect("cargo build verify");
     assert!(verify_status.success(), "failed to build verify binary");
 
-    // Snapshot target_minimal lib so we can restore after morph deploys.
-    let lib_path = root.join("target_minimal").join("src").join("lib.rs");
-    let lib_before = fs::read_to_string(&lib_path).expect("read lib.rs before soak");
+    assert_clean_checkout_dir(&root, "target_minimal/src");
+    let live_lib_path = root.join("target_minimal").join("src").join("lib.rs");
+    let live_lib_before = fs::read_to_string(&live_lib_path).expect("read live lib.rs before soak");
 
-    // Fresh results dir + clean scheduler state for this run.
+    // Fresh results dir + isolated staged workspace under %TEMP% so the
+    // live git checkout is never mutated during the soak.
     let run_id = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -170,81 +248,82 @@ fn short_daemon_soak_three_accepts() {
     let results_dir = soak.join("results").join(format!("run_{}", run_id));
     fs::create_dir_all(&results_dir).expect("create results dir");
 
-    // Isolate perf.jsonl: the production baseline was measured on a
-    // quiet host and absolute-ns fields (feistel_mix at 5 ns) flap
-    // under load when the soak runs. A short soak proves the *loop*
-    // (accept/attest/deploy), not the perf envelope — that has its own
-    // suite. Move the live baseline aside and leave an empty file so
-    // the verifier takes the documented "no baseline → skip perf gate"
-    // path. Restored in the cleanup block below.
-    let perf_path = root.join("perf.jsonl");
-    let perf_bak = results_dir.join("perf.jsonl.production.bak");
-    let had_perf = perf_path.exists();
-    if had_perf {
-        fs::copy(&perf_path, &perf_bak).expect("backup perf.jsonl");
-        fs::write(&perf_path, "").expect("clear perf.jsonl for soak");
-    }
+    let stage_root = stage_minimal_soak_workspace(&root, run_id);
+    let stage_soak = stage_root.join("soak_cfg");
+    fs::create_dir_all(&stage_soak).expect("create stage soak cfg");
+    fs::copy(soak.join("scheduler.toml"), stage_soak.join("scheduler.toml"))
+        .expect("copy soak scheduler.toml");
 
-    // Point attest log at the soak results dir so we don't append to
-    // the operator's production chain. (set_var is unsafe on Rust 2024
-    // edition — process-wide env mutation.)
     let prev_attest = std::env::var_os(ATTEST_DIR_ENV);
+    let prev_key = std::env::var_os(SIGNING_KEY_ENV);
+    let prev_fed = std::env::var_os(FEDERATION_CONFIG_ENV);
+    let prev_cwd = std::env::current_dir().expect("cwd");
+    struct Cleanup {
+        prev_cwd: PathBuf,
+        prev_attest: Option<std::ffi::OsString>,
+        prev_key: Option<std::ffi::OsString>,
+        prev_fed: Option<std::ffi::OsString>,
+        stage_root: PathBuf,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev_cwd);
+            unsafe {
+                match &self.prev_attest {
+                    Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
+                    None => std::env::remove_var(ATTEST_DIR_ENV),
+                }
+                match &self.prev_key {
+                    Some(v) => std::env::set_var(SIGNING_KEY_ENV, v),
+                    None => std::env::remove_var(SIGNING_KEY_ENV),
+                }
+                match &self.prev_fed {
+                    Some(v) => std::env::set_var(FEDERATION_CONFIG_ENV, v),
+                    None => std::env::remove_var(FEDERATION_CONFIG_ENV),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.stage_root);
+        }
+    }
+    let cleanup = Cleanup {
+        prev_cwd,
+        prev_attest,
+        prev_key,
+        prev_fed,
+        stage_root: stage_root.clone(),
+    };
+
     unsafe {
         std::env::set_var(ATTEST_DIR_ENV, &results_dir);
+        std::env::set_var(SIGNING_KEY_ENV, stage_root.join("factory_signing_key.bin"));
+        if stage_root.join("factory_keys.toml").exists() {
+            std::env::set_var(FEDERATION_CONFIG_ENV, stage_root.join("factory_keys.toml"));
+        }
     }
+    std::env::set_current_dir(&stage_root).expect("cd staged workspace root");
 
-    // Copy soak scheduler into place; wipe state so global_cycle starts 0.
-    let state_path = soak.join("scheduler_state.json");
-    let _ = fs::remove_file(&state_path);
-    // daemon.log for this root
-    let daemon_log = soak.join(DAEMON_LOG);
-    let _ = fs::remove_file(&daemon_log);
-
-    // Morph must resolve relative paths from workspace root.
-    // run_daemon uses absolute paths from scheduler.toml; those are
-    // workspace-relative, so set CWD via std::env::set_current_dir.
-    let prev_cwd = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(&root).expect("cd workspace root");
+    let state_path = stage_soak.join("scheduler_state.json");
+    let daemon_log = stage_soak.join(DAEMON_LOG);
 
     let args = DaemonArgs {
-        root: soak.clone(),
+        root: stage_soak.clone(),
         max_iters: iters,
         max_cycle_secs: 600, // generous: verify scratch can be slow cold
         heartbeat_secs: 3600,
         poll_secs: 0,
         synthesizer: SynthesizerKind::PassThrough,
         emit_image: false,
-        // Semantics-only soak: absolute-ns perf baselines flap under
-        // load and would reject a green golden path (measured earlier).
         no_perf_check: true,
     };
 
     eprintln!(
-        "soak_short: starting daemon max_iters={} root={} attest_dir={}",
+        "soak_short: starting daemon max_iters={} staged_root={} attest_dir={}",
         iters,
-        soak.display(),
+        stage_soak.display(),
         results_dir.display()
     );
 
-    let report = match run_daemon(&args) {
-        Ok(r) => r,
-        Err(e) => {
-            // Restore env/cwd before panicking.
-            std::env::set_current_dir(&prev_cwd).ok();
-            unsafe {
-                match prev_attest {
-                    Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-                    None => std::env::remove_var(ATTEST_DIR_ENV),
-                }
-            }
-            // Restore lib + perf baseline if morph deployed mid-failure.
-            let _ = fs::write(&lib_path, &lib_before);
-            if had_perf {
-                let _ = fs::copy(&perf_bak, &perf_path);
-            }
-            panic!("run_daemon failed: {:#}", e);
-        }
-    };
+    let report = run_daemon(&args).unwrap_or_else(|e| panic!("run_daemon failed: {:#}", e));
 
     eprintln!(
         "soak_short: DaemonReport accepted={} rejected={} ticks={} idle={}",
@@ -297,47 +376,12 @@ fn short_daemon_soak_three_accepts() {
         results_dir.join("REPORT.md").display()
     );
 
-    // Restore target_minimal source to pre-soak bytes.
-    // Prefer last_good if the cycle left one that matches pre-soak
-    // content length-ish; otherwise write the snapshot we took.
-    let last_good = root
-        .join("target_minimal")
-        .join("src")
-        .join("lib.last_good.rs");
-    if last_good.exists() {
-        // last_good is the pre-morph content of the *last* cycle, which
-        // may itself be a prior morph. Restore the absolute pre-soak
-        // snapshot for determinism of the workspace tree.
-        let _ = last_good;
-    }
-    fs::write(&lib_path, &lib_before).expect("restore lib.rs after soak");
-    // Clean candidate litter if any.
-    let cand = root
-        .join("target_minimal")
-        .join("src")
-        .join("lib.candidate.rs");
-    let _ = fs::remove_file(cand);
-
-    // Restore production perf baseline (and the soak-written samples
-    // stay in results_dir if the verifier appended any).
-    if had_perf {
-        // If the soak wrote samples into perf.jsonl, park them.
-        if let Ok(soak_perf) = fs::read_to_string(&perf_path) {
-            if !soak_perf.trim().is_empty() {
-                let _ = fs::write(results_dir.join("perf.jsonl.soak_samples"), soak_perf);
-            }
-        }
-        fs::copy(&perf_bak, &perf_path).expect("restore production perf.jsonl");
-    }
-
-    // Restore env + cwd.
-    std::env::set_current_dir(&prev_cwd).ok();
-    unsafe {
-        match prev_attest {
-            Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-            None => std::env::remove_var(ATTEST_DIR_ENV),
+    if let Ok(soak_perf) = fs::read_to_string(stage_root.join("perf.jsonl")) {
+        if !soak_perf.trim().is_empty() {
+            let _ = fs::write(results_dir.join("perf.jsonl.soak_samples"), soak_perf);
         }
     }
+    drop(cleanup);
 
     // Assertions — the pass bar.
     assert_eq!(
@@ -364,11 +408,12 @@ fn short_daemon_soak_three_accepts() {
     assert_eq!(rejects, 0, "daemon.log has cycle_reject events");
     assert!(attest_ok, "attestation chain failed verify-attest");
 
-    // Restored source must match pre-soak snapshot.
-    let lib_after = fs::read_to_string(&lib_path).expect("read lib after restore");
+    // Post-condition: live checkout was never touched.
+    assert_clean_checkout_dir(&root, "target_minimal/src");
+    let live_lib_after = fs::read_to_string(&live_lib_path).expect("read live lib after soak");
     assert_eq!(
-        lib_after, lib_before,
-        "target_minimal/src/lib.rs was not restored to pre-soak content"
+        live_lib_after, live_lib_before,
+        "live target_minimal/src/lib.rs must never be modified by soak_short"
     );
 
     eprintln!(

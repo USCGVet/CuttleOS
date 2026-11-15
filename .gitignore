@@ -1,7 +1,10 @@
-# Rust / Cargo build artifacts
+# Rust / Cargo build artifacts and morph staging files
 /target/
 **/target/
 **/*.rs.bk
+**/*.candidate.rs
+**/*.last_good.rs
+**/*.rs.preexp.bak
 *.pdb
 
 # Secret keys & signing material (never commit)

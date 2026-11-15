@@ -42,9 +42,98 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cuttle_morph_engine::{
     daemon::{run_daemon, DaemonArgs, DaemonReport, DAEMON_LOG},
     verify_chain_with_options, SynthesizerKind, VerifyOptions, ATTEST_DIR_ENV,
+    FEDERATION_CONFIG_ENV, SIGNING_KEY_ENV,
 };
 
 static SOAK_MUTEX: Mutex<()> = Mutex::new(());
+
+fn copy_crate_tree_no_target(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).expect("create staged crate dir");
+    for entry in fs::read_dir(src).expect("read_dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        if matches!(name_s.as_ref(), "target" | ".git" | ".vscode" | ".idea") {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        let ty = entry.file_type().expect("file_type");
+        if ty.is_dir() {
+            copy_crate_tree_no_target(&from, &to);
+        } else if ty.is_file() {
+            fs::copy(&from, &to).expect("copy staged file");
+        }
+    }
+}
+
+fn check_clean_checkout_dir(root: &Path, rel_src: &str) -> Result<(), String> {
+    let dir = root.join(rel_src);
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                if name.ends_with(".candidate.rs") || name.ends_with(".rs.preexp.bak") {
+                    return Err(format!(
+                        "stale staging file in checkout: {}",
+                        p.display()
+                    ));
+                }
+            }
+        }
+    }
+    if root.join(".git").exists() {
+        if let Ok(out) = Command::new("git")
+            .args(["status", "--porcelain", "--", rel_src])
+            .current_dir(root)
+            .output()
+        {
+            if out.status.success() {
+                let txt = String::from_utf8_lossy(&out.stdout);
+                if !txt.trim().is_empty() {
+                    return Err(format!(
+                        "dirty git working tree under {}: {}",
+                        rel_src,
+                        txt.trim()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stage_north_star_workspace(root: &Path, run_id: u64) -> PathBuf {
+    let stage = std::env::temp_dir().join(format!(
+        "cuttle-northstar-{}-{}",
+        std::process::id(),
+        run_id
+    ));
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage).expect("create stage root");
+    for f in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "locked_modules.toml",
+        "factory_keys.toml",
+        "factory_signing_key.bin",
+    ] {
+        let src = root.join(f);
+        if src.exists() {
+            fs::copy(&src, stage.join(f)).expect("copy root file");
+        }
+    }
+    for d in [
+        "contracts",
+        "target_enterprise",
+        "target_enterprise_kernel",
+        "diversifier",
+        "verifier",
+    ] {
+        copy_crate_tree_no_target(&root.join(d), &stage.join(d));
+    }
+    stage
+}
 
 const DEFAULT_ITERS: u64 = 5;
 const MAX_ITERS: u64 = 20;
@@ -952,6 +1041,33 @@ fn collect_bundle_hashes_distinct_and_accepted_only() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn soak_staging_rejects_stale_candidates_and_leaves_live_tree_untouched() {
+    let dir = std::env::temp_dir().join(format!(
+        "cuttle_nss_guard_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let src = dir.join("target_enterprise").join("src");
+    fs::create_dir_all(&src).expect("create mock src");
+    fs::write(src.join("tls.rs"), "pub fn ok() {}\n").unwrap();
+    assert!(check_clean_checkout_dir(&dir, "target_enterprise/src").is_ok());
+
+    fs::write(src.join("tls.candidate.rs"), "pub fn stale() {}\n").unwrap();
+    let err = check_clean_checkout_dir(&dir, "target_enterprise/src")
+        .expect_err("stale .candidate.rs must fail preflight check");
+    assert!(err.contains("tls.candidate.rs"), "err={err}");
+    fs::remove_file(src.join("tls.candidate.rs")).unwrap();
+
+    fs::write(src.join("wal.rs.preexp.bak"), "pub fn bak() {}\n").unwrap();
+    let err_bak = check_clean_checkout_dir(&dir, "target_enterprise/src")
+        .expect_err("stale .rs.preexp.bak must fail preflight check");
+    assert!(err_bak.contains("wal.rs.preexp.bak"), "err={err_bak}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // Gated multi-cycle daemon soak
 // ---------------------------------------------------------------------------
@@ -999,7 +1115,8 @@ fn north_star_bundle_kernel_daemon_soak() {
         .expect("build verify");
     assert!(verify_status.success(), "failed to build verify binary");
 
-    // Snapshot every enrolled module so we can restore after morph deploys.
+    check_clean_checkout_dir(&root, "target_enterprise/src")
+        .unwrap_or_else(|e| panic!("north_star_soak preflight failed: {}", e));
     let snaps = snapshot_modules(&root, &modules);
 
     let run_id = SystemTime::now()
@@ -1009,23 +1126,65 @@ fn north_star_bundle_kernel_daemon_soak() {
     let results_dir = soak.join("results").join(format!("run_{}", run_id));
     fs::create_dir_all(&results_dir).expect("results dir");
 
-    // Soak-local scheduler: only full kernel bundle, due every tick.
-    let sched_path = soak.join("scheduler.toml");
+    let stage_root = stage_north_star_workspace(&root, run_id);
+    let stage_soak = stage_root.join("soak_cfg");
+    fs::create_dir_all(&stage_soak).expect("stage soak cfg");
+
+    // Soak-local scheduler inside staged workspace: only full kernel bundle, due every tick.
+    let sched_path = stage_soak.join("scheduler.toml");
     write_soak_scheduler(&sched_path, &modules);
     let _ = fs::copy(&sched_path, results_dir.join("scheduler.toml"));
 
     let prev_attest = std::env::var_os(ATTEST_DIR_ENV);
+    let prev_key = std::env::var_os(SIGNING_KEY_ENV);
+    let prev_fed = std::env::var_os(FEDERATION_CONFIG_ENV);
+    let prev_cwd = std::env::current_dir().expect("cwd");
+    struct Cleanup {
+        prev_cwd: PathBuf,
+        prev_attest: Option<std::ffi::OsString>,
+        prev_key: Option<std::ffi::OsString>,
+        prev_fed: Option<std::ffi::OsString>,
+        stage_root: PathBuf,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev_cwd);
+            unsafe {
+                match &self.prev_attest {
+                    Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
+                    None => std::env::remove_var(ATTEST_DIR_ENV),
+                }
+                match &self.prev_key {
+                    Some(v) => std::env::set_var(SIGNING_KEY_ENV, v),
+                    None => std::env::remove_var(SIGNING_KEY_ENV),
+                }
+                match &self.prev_fed {
+                    Some(v) => std::env::set_var(FEDERATION_CONFIG_ENV, v),
+                    None => std::env::remove_var(FEDERATION_CONFIG_ENV),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.stage_root);
+        }
+    }
+    let cleanup = Cleanup {
+        prev_cwd,
+        prev_attest,
+        prev_key,
+        prev_fed,
+        stage_root: stage_root.clone(),
+    };
+
     unsafe {
         std::env::set_var(ATTEST_DIR_ENV, &results_dir);
+        std::env::set_var(SIGNING_KEY_ENV, stage_root.join("factory_signing_key.bin"));
+        if stage_root.join("factory_keys.toml").exists() {
+            std::env::set_var(FEDERATION_CONFIG_ENV, stage_root.join("factory_keys.toml"));
+        }
     }
+    std::env::set_current_dir(&stage_root).expect("cd staged workspace");
 
-    let state_path = soak.join("scheduler_state.json");
-    let daemon_log = soak.join(DAEMON_LOG);
-    let _ = fs::remove_file(&state_path);
-    let _ = fs::remove_file(&daemon_log);
-
-    let prev_cwd = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(&root).expect("cd workspace");
+    let state_path = stage_soak.join("scheduler_state.json");
+    let daemon_log = stage_soak.join(DAEMON_LOG);
 
     // TASK-126: optional kernel ELF emit + churn (expensive). Opt in via
     // CUTTLE_SOAK_EMIT_IMAGE=1 when measuring positional bps on cadence.
@@ -1040,7 +1199,7 @@ fn north_star_bundle_kernel_daemon_soak() {
     // Durable seals attach via CUTTLE_DURABLE_SEALS_DIR (TASK-146/147);
     // DaemonArgs has no separate field.
     let args = DaemonArgs {
-        root: soak.clone(),
+        root: stage_soak.clone(),
         max_iters: iters,
         max_cycle_secs: MAX_CYCLE_SECS,
         heartbeat_secs: 3600,
@@ -1051,27 +1210,14 @@ fn north_star_bundle_kernel_daemon_soak() {
     };
 
     eprintln!(
-        "north_star_soak: max_iters={} modules={} root={}",
+        "north_star_soak: max_iters={} modules={} staged_root={}",
         iters,
         modules.len(),
-        soak.display()
+        stage_soak.display()
     );
 
     let t0 = Instant::now();
-    let report = match run_daemon(&args) {
-        Ok(r) => r,
-        Err(e) => {
-            std::env::set_current_dir(&prev_cwd).ok();
-            unsafe {
-                match prev_attest {
-                    Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-                    None => std::env::remove_var(ATTEST_DIR_ENV),
-                }
-            }
-            restore_modules(&snaps);
-            panic!("run_daemon failed: {:#}", e);
-        }
-    };
+    let report = run_daemon(&args).unwrap_or_else(|e| panic!("run_daemon failed: {:#}", e));
     let wall_secs = t0.elapsed().as_secs_f64();
 
     eprintln!(
@@ -1161,68 +1307,26 @@ fn north_star_bundle_kernel_daemon_soak() {
                 .unwrap_or(iters)
         };
         let layout_seed = cycle_layout_seed(last_cycle);
-        let kernel_crate = root.join("target_enterprise_kernel");
+        let kernel_crate = stage_root.join("target_enterprise_kernel");
         eprintln!(
             "north_star_soak: phase boot layout_seed={:#x} last_cycle={} \
-             (sources still morphed)",
+             (staged sources still morphed)",
             layout_seed, last_cycle
         );
 
         if !kernel_crate.join("Cargo.toml").exists() {
-            restore_modules(&snaps);
-            std::env::set_current_dir(&prev_cwd).ok();
-            unsafe {
-                match prev_attest {
-                    Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-                    None => std::env::remove_var(ATTEST_DIR_ENV),
-                }
-            }
             panic!("CUTTLE_NORTH_STAR_BOOT=1 but target_enterprise_kernel missing");
         }
         if find_qemu().is_none() {
-            restore_modules(&snaps);
-            std::env::set_current_dir(&prev_cwd).ok();
-            unsafe {
-                match prev_attest {
-                    Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-                    None => std::env::remove_var(ATTEST_DIR_ENV),
-                }
-            }
             panic!("CUTTLE_NORTH_STAR_BOOT=1 but qemu-system-x86_64 not found");
         }
 
-        let elf = match factory_builder::build_kernel_with_layout_seed(
-            &kernel_crate,
-            Some(layout_seed),
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                restore_modules(&snaps);
-                std::env::set_current_dir(&prev_cwd).ok();
-                unsafe {
-                    match prev_attest {
-                        Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-                        None => std::env::remove_var(ATTEST_DIR_ENV),
-                    }
-                }
-                panic!("north-star boot: kernel build failed: {:#}", e);
-            }
-        };
+        let elf = factory_builder::build_kernel_with_layout_seed(&kernel_crate, Some(layout_seed))
+            .unwrap_or_else(|e| panic!("north-star boot: kernel build failed: {:#}", e));
         eprintln!("north_star_soak: QEMU boot {}", elf.display());
-        let serial = match boot_kernel(&elf, &results_dir, last_cycle) {
-            Ok(p) => p,
-            Err(e) => {
-                restore_modules(&snaps);
-                std::env::set_current_dir(&prev_cwd).ok();
-                unsafe {
-                    match prev_attest {
-                        Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-                        None => std::env::remove_var(ATTEST_DIR_ENV),
-                    }
-                }
-                panic!("north-star QEMU boot failed after full-bundle soak: {}", e);
-            }
-        };
+        let serial = boot_kernel(&elf, &results_dir, last_cycle).unwrap_or_else(|e| {
+            panic!("north-star QEMU boot failed after full-bundle soak: {}", e)
+        });
         let log_text = fs::read_to_string(&serial).expect("read serial");
         let mut missing = Vec::new();
         let mut banners_ok = 0usize;
@@ -1256,14 +1360,6 @@ fn north_star_bundle_kernel_daemon_soak() {
                 }
             }
             if !hw_gate_missing.is_empty() {
-                restore_modules(&snaps);
-                std::env::set_current_dir(&prev_cwd).ok();
-                unsafe {
-                    match prev_attest {
-                        Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-                        None => std::env::remove_var(ATTEST_DIR_ENV),
-                    }
-                }
                 panic!(
                     "north-star boot REQUIRE_HW missing: {:?} \
                      (unset CUTTLE_NORTH_STAR_REQUIRE_HW to disable)",
@@ -1276,14 +1372,6 @@ fn north_star_bundle_kernel_daemon_soak() {
             );
         }
         if !missing.is_empty() {
-            restore_modules(&snaps);
-            std::env::set_current_dir(&prev_cwd).ok();
-            unsafe {
-                match prev_attest {
-                    Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-                    None => std::env::remove_var(ATTEST_DIR_ENV),
-                }
-            }
             panic!(
                 "north-star boot missing banners: {:?}\nlog tail:\n{}",
                 missing,
@@ -1329,21 +1417,16 @@ fn north_star_bundle_kernel_daemon_soak() {
         results_dir.join("REPORT.md").display()
     );
 
-    restore_modules(&snaps);
+    drop(cleanup);
+    let _ = restore_modules as fn(&[(PathBuf, String)]);
 
-    std::env::set_current_dir(&prev_cwd).ok();
-    unsafe {
-        match prev_attest {
-            Some(v) => std::env::set_var(ATTEST_DIR_ENV, v),
-            None => std::env::remove_var(ATTEST_DIR_ENV),
-        }
-    }
-
+    check_clean_checkout_dir(&root, "target_enterprise/src")
+        .unwrap_or_else(|e| panic!("north_star_soak postflight failed: {}", e));
     for (p, before) in &snaps {
         let after = fs::read_to_string(p).expect("re-read");
         assert_eq!(
             &after, before,
-            "{} not restored after north-star soak",
+            "{} must never be modified in live checkout",
             p.display()
         );
     }

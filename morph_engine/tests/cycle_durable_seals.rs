@@ -33,6 +33,56 @@ fn stamp() -> u128 {
         .unwrap_or(0)
 }
 
+fn copy_crate_tree_no_target(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).expect("create staged crate dir");
+    for entry in fs::read_dir(src).expect("read_dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        if matches!(name_s.as_ref(), "target" | ".git" | ".vscode" | ".idea") {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        let ty = entry.file_type().expect("file_type");
+        if ty.is_dir() {
+            copy_crate_tree_no_target(&from, &to);
+        } else if ty.is_file() {
+            fs::copy(&from, &to).expect("copy staged file");
+        }
+    }
+}
+
+/// Stage an isolated minimal Cuttle workspace under `%TEMP%` so `run_cycle`,
+/// `run_bundle`, `propose_cycle`, `attest_proposal`, and `verify` operate
+/// exclusively on disposable copies and never touch the live git checkout.
+fn stage_minimal_workspace(label: &str) -> PathBuf {
+    let real_root = workspace_root();
+    let stage = std::env::temp_dir().join(format!(
+        "cuttle-morph-it-{}-{}-{}",
+        label,
+        std::process::id(),
+        stamp()
+    ));
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage).expect("create stage dir");
+    for f in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "locked_modules.toml",
+        "factory_keys.toml",
+    ] {
+        let src = real_root.join(f);
+        if src.exists() {
+            fs::copy(&src, stage.join(f)).expect("copy root manifest");
+        }
+    }
+    for dir in ["contracts", "target_minimal", "diversifier", "verifier"] {
+        copy_crate_tree_no_target(&real_root.join(dir), &stage.join(dir));
+    }
+    stage
+}
+
 fn last_accepted_entry(attest_dir: &Path) -> serde_json::Value {
     let log = attest_dir.join("attest.log.jsonl");
     let txt = fs::read_to_string(&log).expect("read attest log");
@@ -49,20 +99,21 @@ fn last_accepted_entry(attest_dir: &Path) -> serde_json::Value {
 #[test]
 fn cycle_attaches_durable_seals_from_dir() {
     let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let root = workspace_root();
+    let real_root = workspace_root();
 
     // Ensure verify binary exists (cycle stage 3 shells out).
     let st = Command::new("cargo")
         .args(["build", "-p", "cuttle-verifier", "--bin", "verify"])
-        .current_dir(&root)
+        .current_dir(&real_root)
         .status()
         .expect("cargo build verify");
     assert!(st.success(), "build verify failed");
 
-    let run_dir = root
-        .join("experiments")
-        .join("cycle_durable_seals")
-        .join(format!("run_{}", stamp()));
+    let live_lib = real_root.join("target_minimal").join("src").join("lib.rs");
+    let live_lib_before = fs::read(&live_lib).expect("read live lib.rs");
+
+    let stage_root = stage_minimal_workspace("durable-seals");
+    let run_dir = stage_root.join("run_artifacts");
     let attest_dir = run_dir.join("attest");
     let seals_dir = run_dir.join("seals");
     fs::create_dir_all(&attest_dir).unwrap();
@@ -98,37 +149,20 @@ fn cycle_attaches_durable_seals_from_dir() {
         .write_file(&seals_dir.join("fixture_wal.json"))
         .unwrap();
 
-    let lib_path = root.join("target_minimal").join("src").join("lib.rs");
-    let lib_before = fs::read_to_string(&lib_path).expect("read lib.rs");
-
-    // Perf baseline can flap under load; clear for this one-shot cycle.
-    let perf_path = root.join("perf.jsonl");
-    let perf_bak = run_dir.join("perf.jsonl.bak");
-    let had_perf = perf_path.exists();
-    if had_perf {
-        fs::copy(&perf_path, &perf_bak).ok();
-        fs::write(&perf_path, "").ok();
-    }
-
     let prev_attest = std::env::var_os(ATTEST_DIR_ENV);
     let prev_seals = std::env::var_os(DURABLE_SEALS_DIR_ENV);
     let prev_key = std::env::var_os(SIGNING_KEY_ENV);
     let prev_fed = std::env::var_os(FEDERATION_CONFIG_ENV);
     let prev_cwd = std::env::current_dir().expect("cwd");
 
-    // Safety: restore env/cwd/lib and remove temp run_dir even on panic.
+    // Safety: restore env/cwd and remove staged workspace even on panic.
     struct Guard {
         prev_cwd: PathBuf,
         prev_attest: Option<std::ffi::OsString>,
         prev_seals: Option<std::ffi::OsString>,
         prev_key: Option<std::ffi::OsString>,
         prev_fed: Option<std::ffi::OsString>,
-        lib_path: PathBuf,
-        lib_before: String,
-        had_perf: bool,
-        perf_path: PathBuf,
-        perf_bak: PathBuf,
-        run_dir: PathBuf,
+        stage_root: PathBuf,
     }
     impl Drop for Guard {
         fn drop(&mut self) {
@@ -151,28 +185,16 @@ fn cycle_attaches_durable_seals_from_dir() {
                     None => std::env::remove_var(FEDERATION_CONFIG_ENV),
                 }
             }
-            let _ = fs::write(&self.lib_path, &self.lib_before);
-            if self.had_perf {
-                let _ = fs::copy(&self.perf_bak, &self.perf_path);
-            }
-            let _ = fs::remove_dir_all(&self.run_dir);
-            if let Some(parent) = self.run_dir.parent() {
-                let _ = fs::remove_dir(parent);
-            }
+            let _ = fs::remove_dir_all(&self.stage_root);
         }
     }
     let _guard = Guard {
-        prev_cwd: prev_cwd.clone(),
-        prev_attest: prev_attest.clone(),
-        prev_seals: prev_seals.clone(),
-        prev_key: prev_key.clone(),
-        prev_fed: prev_fed.clone(),
-        lib_path: lib_path.clone(),
-        lib_before: lib_before.clone(),
-        had_perf,
-        perf_path: perf_path.clone(),
-        perf_bak: perf_bak.clone(),
-        run_dir: run_dir.clone(),
+        prev_cwd,
+        prev_attest,
+        prev_seals,
+        prev_key,
+        prev_fed,
+        stage_root: stage_root.clone(),
     };
 
     unsafe {
@@ -182,15 +204,15 @@ fn cycle_attaches_durable_seals_from_dir() {
         std::env::set_var(SIGNING_KEY_ENV, &key_path);
         std::env::set_var(FEDERATION_CONFIG_ENV, &fed_path);
     }
-    std::env::set_current_dir(&root).expect("cd workspace");
+    std::env::set_current_dir(&stage_root).expect("cd staged workspace");
 
     // Unique cycle id so candidate hash differs across re-runs if needed.
     let cycle = (stamp() % 1_000_000) as u64 + 10_000;
     let args = CycleArgs {
         cycle,
         module: "lib".into(),
-        target_dir: root.join("target_minimal").join("src"),
-        manifest: Some(root.join("target_minimal").join("manifest.txt")),
+        target_dir: stage_root.join("target_minimal").join("src"),
+        manifest: Some(stage_root.join("target_minimal").join("manifest.txt")),
         synthesizer: SynthesizerKind::PassThrough,
         emit_image: false,
         no_perf_check: true,
@@ -204,6 +226,11 @@ fn cycle_attaches_durable_seals_from_dir() {
         attest_dir.display()
     );
     run_cycle(&args).expect("run_cycle should accept");
+    assert_eq!(
+        fs::read(&live_lib).expect("re-read live lib.rs"),
+        live_lib_before,
+        "live target_minimal/src/lib.rs must never be touched"
+    );
 
     // Structural verify with require_durable_seals hard-fails if missing.
     verify_chain_with_options(&VerifyOptions {
@@ -251,19 +278,17 @@ fn rejected_cycles_preserve_v11_chain_cleanup_candidates_and_record_bundle_seman
     use ed25519_dalek::Signer as _;
 
     let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let root = workspace_root();
+    let real_root = workspace_root();
 
     let st = Command::new("cargo")
         .args(["build", "-p", "cuttle-verifier", "--bin", "verify"])
-        .current_dir(&root)
+        .current_dir(&real_root)
         .status()
         .expect("cargo build verify");
     assert!(st.success(), "build verify failed");
 
-    let run_dir = root
-        .join("experiments")
-        .join("cycle_durable_seals")
-        .join(format!("run_rej_{}", stamp()));
+    let stage_root = stage_minimal_workspace("rejected-v11");
+    let run_dir = stage_root.join("run_rej_artifacts");
     let attest_dir = run_dir.join("attest");
     fs::create_dir_all(&attest_dir).unwrap();
 
@@ -283,15 +308,10 @@ fn rejected_cycles_preserve_v11_chain_cleanup_candidates_and_record_bundle_seman
     )
     .unwrap();
 
-    let src_dir = root.join("target_minimal").join("src");
-    let lib_path = src_dir.join("lib.rs");
-    let lib_before = fs::read_to_string(&lib_path).expect("read lib.rs");
-    let lib_last_good = src_dir.join("lib.last_good.rs");
-    let had_last_good = lib_last_good.exists();
+    let src_dir = stage_root.join("target_minimal").join("src");
     let bad_mod = "tmp_stage8_reject_probe";
     let bad_src_path = src_dir.join(format!("{bad_mod}.rs"));
     let bad_cand_path = src_dir.join(format!("{bad_mod}.candidate.rs"));
-    let bad_last_good_path = src_dir.join(format!("{bad_mod}.last_good.rs"));
     // Valid Rust AST so diversifier succeeds (and emits semantic_decisions on `probe`),
     // while `bad_manifest` triggers immediate <5ms static rejection (`MissingManifestSymbols`) in `verify`!
     fs::write(
@@ -314,14 +334,7 @@ fn rejected_cycles_preserve_v11_chain_cleanup_candidates_and_record_bundle_seman
         prev_seals: Option<std::ffi::OsString>,
         prev_key: Option<std::ffi::OsString>,
         prev_fed: Option<std::ffi::OsString>,
-        lib_path: PathBuf,
-        lib_before: String,
-        lib_last_good: PathBuf,
-        had_last_good: bool,
-        bad_src_path: PathBuf,
-        bad_cand_path: PathBuf,
-        bad_last_good_path: PathBuf,
-        run_dir: PathBuf,
+        stage_root: PathBuf,
     }
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -344,17 +357,7 @@ fn rejected_cycles_preserve_v11_chain_cleanup_candidates_and_record_bundle_seman
                     None => std::env::remove_var(FEDERATION_CONFIG_ENV),
                 }
             }
-            let _ = fs::write(&self.lib_path, &self.lib_before);
-            if !self.had_last_good {
-                let _ = fs::remove_file(&self.lib_last_good);
-            }
-            let _ = fs::remove_file(&self.bad_src_path);
-            let _ = fs::remove_file(&self.bad_cand_path);
-            let _ = fs::remove_file(&self.bad_last_good_path);
-            let _ = fs::remove_dir_all(&self.run_dir);
-            if let Some(parent) = self.run_dir.parent() {
-                let _ = fs::remove_dir(parent);
-            }
+            let _ = fs::remove_dir_all(&self.stage_root);
         }
     }
     let _cleanup = Cleanup {
@@ -363,14 +366,7 @@ fn rejected_cycles_preserve_v11_chain_cleanup_candidates_and_record_bundle_seman
         prev_seals,
         prev_key,
         prev_fed,
-        lib_path: lib_path.clone(),
-        lib_before: lib_before.clone(),
-        lib_last_good,
-        had_last_good,
-        bad_src_path: bad_src_path.clone(),
-        bad_cand_path: bad_cand_path.clone(),
-        bad_last_good_path,
-        run_dir: run_dir.clone(),
+        stage_root: stage_root.clone(),
     };
 
     unsafe {
@@ -379,7 +375,7 @@ fn rejected_cycles_preserve_v11_chain_cleanup_candidates_and_record_bundle_seman
         std::env::set_var(SIGNING_KEY_ENV, &key_path);
         std::env::set_var(FEDERATION_CONFIG_ENV, &fed_path);
     }
-    std::env::set_current_dir(&root).expect("cd workspace");
+    std::env::set_current_dir(&stage_root).expect("cd staged workspace");
 
     // 1. Seed chain with a v11 accepted entry signed by `sk` (1ms, no scratch compile needed).
     let sig0 = sk.sign(&[0x55u8; 32]);
@@ -464,7 +460,7 @@ fn rejected_cycles_preserve_v11_chain_cleanup_candidates_and_record_bundle_seman
     let bargs = BundleCycleArgs {
         cycle: 103,
         bundle_name: "test_bundle".into(),
-        workspace: root.join("target_minimal"),
+        workspace: stage_root.join("target_minimal"),
         modules: vec![bad_mod.into()],
         manifest: Some(bad_manifest),
         synthesizer: SynthesizerKind::PassThrough,
@@ -499,4 +495,76 @@ fn rejected_cycles_preserve_v11_chain_cleanup_candidates_and_record_bundle_seman
         "bundle_div_log must merge member semantic_decisions, got: {:?}",
         b_div_log.semantic_decisions
     );
+}
+
+#[test]
+fn stale_candidate_file_is_rejected_before_run_cycle_or_run_bundle_touches_source() {
+    use cuttle_morph_engine::{propose_cycle, run_bundle, BundleCycleArgs};
+
+    let _g = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let stage_root = stage_minimal_workspace("cand-guard");
+    struct DropDir(PathBuf);
+    impl Drop for DropDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _drop_stage = DropDir(stage_root.clone());
+
+    let src_dir = stage_root.join("target_minimal").join("src");
+    let lib_path = src_dir.join("lib.rs");
+    let lib_before = fs::read_to_string(&lib_path).expect("read staged lib.rs");
+    let stale_cand_path = src_dir.join("lib.candidate.rs");
+    let stale_cand_body = "// candidate left by an interrupted run\npub fn leftover() {}\n";
+    fs::write(&stale_cand_path, stale_cand_body).expect("write stale lib.candidate.rs");
+
+    let cargs = CycleArgs {
+        cycle: 501,
+        module: "lib".into(),
+        target_dir: src_dir.clone(),
+        manifest: Some(stage_root.join("target_minimal").join("manifest.txt")),
+        synthesizer: SynthesizerKind::PassThrough,
+        emit_image: false,
+        no_perf_check: true,
+        durable_seals_dir: None,
+    };
+
+    let err_cycle = run_cycle(&cargs)
+        .expect_err("run_cycle must reject pre-existing lib.candidate.rs before morphing");
+    assert!(
+        format!("{err_cycle:#}").contains("pre-existing candidate"),
+        "unexpected run_cycle error: {err_cycle:#}"
+    );
+    assert_eq!(fs::read_to_string(&lib_path).unwrap(), lib_before);
+    assert_eq!(fs::read_to_string(&stale_cand_path).unwrap(), stale_cand_body);
+
+    let prop_out = stage_root.join("proposal.json");
+    let err_prop = propose_cycle(&cargs, &prop_out)
+        .expect_err("propose_cycle must reject pre-existing lib.candidate.rs before morphing");
+    assert!(
+        format!("{err_prop:#}").contains("pre-existing candidate"),
+        "unexpected propose_cycle error: {err_prop:#}"
+    );
+    assert_eq!(fs::read_to_string(&lib_path).unwrap(), lib_before);
+    assert_eq!(fs::read_to_string(&stale_cand_path).unwrap(), stale_cand_body);
+
+    let bargs = BundleCycleArgs {
+        cycle: 502,
+        bundle_name: "mini".into(),
+        workspace: stage_root.join("target_minimal"),
+        modules: vec!["lib".into()],
+        manifest: Some(stage_root.join("target_minimal").join("manifest.txt")),
+        synthesizer: SynthesizerKind::PassThrough,
+        emit_image: false,
+        no_perf_check: true,
+        durable_seals_dir: None,
+    };
+    let err_bundle = run_bundle(&bargs)
+        .expect_err("run_bundle must reject pre-existing lib.candidate.rs before morphing");
+    assert!(
+        format!("{err_bundle:#}").contains("pre-existing candidate"),
+        "unexpected run_bundle error: {err_bundle:#}"
+    );
+    assert_eq!(fs::read_to_string(&lib_path).unwrap(), lib_before);
+    assert_eq!(fs::read_to_string(&stale_cand_path).unwrap(), stale_cand_body);
 }
