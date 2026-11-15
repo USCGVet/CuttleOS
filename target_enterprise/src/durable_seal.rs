@@ -51,22 +51,8 @@ pub fn derive_seal_key(
     node_id: &[u8],
 ) -> [u8; DURABLE_DIGEST_LEN] {
     const LABEL: &[u8] = b"cuttle-durable-seal-v1:";
-    let mut msg = [0u8; 64];
-    let mut pos = 0usize;
-    let mut i = 0usize;
-    while i < LABEL.len() && pos < msg.len() {
-        msg[pos] = LABEL[i];
-        pos += 1;
-        i += 1;
-    }
-    let mut j = 0usize;
-    while j < node_id.len() && pos < msg.len() {
-        msg[pos] = node_id[j];
-        pos += 1;
-        j += 1;
-    }
     let mut out = [0u8; DURABLE_DIGEST_LEN];
-    hmac_sha256(root_secret, &msg[..pos], &mut out);
+    hmac_sha256_parts(root_secret, &[LABEL, node_id], &mut out);
     out
 }
 
@@ -78,22 +64,8 @@ pub fn derive_legacy_seal_key(
     node_id: &[u8],
 ) -> [u8; DURABLE_DIGEST_LEN] {
     const LABEL: &[u8] = b"proteus-durable-seal-v1:";
-    let mut msg = [0u8; 64];
-    let mut pos = 0usize;
-    let mut i = 0usize;
-    while i < LABEL.len() && pos < msg.len() {
-        msg[pos] = LABEL[i];
-        pos += 1;
-        i += 1;
-    }
-    let mut j = 0usize;
-    while j < node_id.len() && pos < msg.len() {
-        msg[pos] = node_id[j];
-        pos += 1;
-        j += 1;
-    }
     let mut out = [0u8; DURABLE_DIGEST_LEN];
-    hmac_sha256(root_secret, &msg[..pos], &mut out);
+    hmac_sha256_parts(root_secret, &[LABEL, node_id], &mut out);
     out
 }
 
@@ -104,22 +76,8 @@ pub fn derive_attest_key(
     context: &[u8],
 ) -> [u8; DURABLE_DIGEST_LEN] {
     const LABEL: &[u8] = b"cuttle-remote-attest-v1:";
-    let mut msg = [0u8; 64];
-    let mut pos = 0usize;
-    let mut i = 0usize;
-    while i < LABEL.len() && pos < msg.len() {
-        msg[pos] = LABEL[i];
-        pos += 1;
-        i += 1;
-    }
-    let mut j = 0usize;
-    while j < context.len() && pos < msg.len() {
-        msg[pos] = context[j];
-        pos += 1;
-        j += 1;
-    }
     let mut out = [0u8; DURABLE_DIGEST_LEN];
-    hmac_sha256(root_secret, &msg[..pos], &mut out);
+    hmac_sha256_parts(root_secret, &[LABEL, context], &mut out);
     out
 }
 
@@ -276,6 +234,28 @@ pub fn derive_crash_dump_aead_key(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> [u8; A
     out
 }
 
+/// Fallible detached RFC 8439 `ChaCha20-Poly1305` in-place encryption returning
+/// `None` (after zeroizing `buf`) if the input exceeds the 256 GiB RFC 8439 block limit.
+pub fn try_chacha20_poly1305_encrypt_in_place(
+    key: &[u8; AEAD_KEY_LEN],
+    nonce: &[u8; AEAD_NONCE_LEN],
+    aad: &[u8],
+    buf: &mut [u8],
+) -> Option<[u8; AEAD_TAG_LEN]> {
+    let cipher = ChaCha20Poly1305::new(key.into());
+    match cipher.encrypt_in_place_detached(Nonce::from_slice(nonce), aad, buf) {
+        Ok(tag) => {
+            let mut out = [0u8; AEAD_TAG_LEN];
+            out.copy_from_slice(&tag);
+            Some(out)
+        }
+        Err(_) => {
+            zeroize_secret_bytes(buf);
+            None
+        }
+    }
+}
+
 /// Encrypt `buf` in place under RFC 8439 `ChaCha20-Poly1305` (`key`, `nonce`, `aad`)
 /// and return the 128-bit detached `Poly1305` authentication tag.
 pub fn chacha20_poly1305_encrypt_in_place(
@@ -284,13 +264,7 @@ pub fn chacha20_poly1305_encrypt_in_place(
     aad: &[u8],
     buf: &mut [u8],
 ) -> [u8; AEAD_TAG_LEN] {
-    let cipher = ChaCha20Poly1305::new(key.into());
-    let tag = cipher
-        .encrypt_in_place_detached(Nonce::from_slice(nonce), aad, buf)
-        .expect("ChaCha20-Poly1305 detached encryption cannot fail on bounded slice");
-    let mut out = [0u8; AEAD_TAG_LEN];
-    out.copy_from_slice(&tag);
-    out
+    try_chacha20_poly1305_encrypt_in_place(key, nonce, aad, buf).unwrap_or([0u8; AEAD_TAG_LEN])
 }
 
 /// Verify `tag` in constant time and decrypt `buf` in place under RFC 8439
@@ -421,12 +395,8 @@ pub mod ab_journal {
 
     /// Compute the SHA-256 digest over a contiguous slice of 512-byte sectors.
     pub fn hash_sector_slice(sectors: &[[u8; 512]]) -> [u8; DURABLE_DIGEST_LEN] {
-        // SAFETY: `[[u8; 512]]` has identical layout and alignment (`1`) to `[u8]` of length `sectors.len() * 512`.
-        let flat = unsafe {
-            core::slice::from_raw_parts(sectors.as_ptr().cast::<u8>(), sectors.len() * 512)
-        };
         let mut out = [0u8; DURABLE_DIGEST_LEN];
-        seal_bytes(flat, &mut out);
+        seal_bytes(sectors.as_flattened(), &mut out);
         out
     }
 
@@ -1167,6 +1137,28 @@ mod tests {
         assert_eq!(
             decide_ab_recovery(false, false, None, false),
             AbRecoveryDecision::TamperedPrimary
+        );
+    }
+
+    #[test]
+    fn key_derivation_does_not_silently_truncate_long_identifiers() {
+        let id_a = b"prod-region-us-east-cluster-0001-rack-0042-triad-node-01";
+        let id_b = b"prod-region-us-east-cluster-0001-rack-0042-triad-node-02";
+        assert_ne!(id_a, id_b);
+        assert_ne!(
+            derive_seal_key(&DEFAULT_DURABLE_SEAL_KEY, id_a),
+            derive_seal_key(&DEFAULT_DURABLE_SEAL_KEY, id_b),
+            "derive_seal_key must hash the full node_id without 64-byte buffer truncation"
+        );
+        assert_ne!(
+            derive_legacy_seal_key(&DEFAULT_LEGACY_DURABLE_SEAL_KEY, id_a),
+            derive_legacy_seal_key(&DEFAULT_LEGACY_DURABLE_SEAL_KEY, id_b),
+            "derive_legacy_seal_key must hash the full node_id without 64-byte buffer truncation"
+        );
+        assert_ne!(
+            derive_attest_key(&DEFAULT_ATTEST_KEY, id_a),
+            derive_attest_key(&DEFAULT_ATTEST_KEY, id_b),
+            "derive_attest_key must hash the full context without 64-byte buffer truncation"
         );
     }
 }

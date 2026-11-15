@@ -21,7 +21,7 @@ impl Base64 for Base64Impl {
 }
 
 pub fn encoded_len_impl(n: usize) -> usize {
-    n.div_ceil(3) * 4
+    n.div_ceil(3).saturating_mul(4)
 }
 
 fn dec_val(c: u8) -> Result<u8, Base64Error> {
@@ -36,31 +36,34 @@ fn dec_val(c: u8) -> Result<u8, Base64Error> {
 }
 
 pub fn encode_impl(input: &[u8], out: &mut [u8]) -> Result<usize, Base64Error> {
-    let need = encoded_len_impl(input.len());
+    let need = input
+        .len()
+        .div_ceil(3)
+        .checked_mul(4)
+        .ok_or(Base64Error::BufferTooSmall)?;
     if out.len() < need {
         return Err(Base64Error::BufferTooSmall);
     }
-    let mut i = 0usize;
     let mut o = 0usize;
-    while i + 3 <= input.len() {
-        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
+    let chunks = input.chunks_exact(3);
+    let rem = chunks.remainder();
+    for chunk in chunks {
+        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
         out[o] = ENC[((n >> 18) & 0x3F) as usize];
         out[o + 1] = ENC[((n >> 12) & 0x3F) as usize];
         out[o + 2] = ENC[((n >> 6) & 0x3F) as usize];
         out[o + 3] = ENC[(n & 0x3F) as usize];
-        i += 3;
         o += 4;
     }
-    let rem = input.len() - i;
-    if rem == 1 {
-        let n = (input[i] as u32) << 16;
+    if rem.len() == 1 {
+        let n = (rem[0] as u32) << 16;
         out[o] = ENC[((n >> 18) & 0x3F) as usize];
         out[o + 1] = ENC[((n >> 12) & 0x3F) as usize];
         out[o + 2] = b'=';
         out[o + 3] = b'=';
         o += 4;
-    } else if rem == 2 {
-        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
+    } else if rem.len() == 2 {
+        let n = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
         out[o] = ENC[((n >> 18) & 0x3F) as usize];
         out[o + 1] = ENC[((n >> 12) & 0x3F) as usize];
         out[o + 2] = ENC[((n >> 6) & 0x3F) as usize];
@@ -70,6 +73,43 @@ pub fn encode_impl(input: &[u8], out: &mut [u8]) -> Result<usize, Base64Error> {
     Ok(o)
 }
 
+fn decode_quad(quad: &[u8], is_last: bool) -> Result<(u32, usize), Base64Error> {
+    let [c0, c1, c2, c3] = [quad[0], quad[1], quad[2], quad[3]];
+    if c0 == b'=' || c1 == b'=' {
+        return Err(Base64Error::InvalidInput);
+    }
+    let v0 = dec_val(c0)? as u32;
+    let v1 = dec_val(c1)? as u32;
+    let (v2, pad2) = if c2 == b'=' {
+        (0u32, true)
+    } else {
+        (dec_val(c2)? as u32, false)
+    };
+    let (v3, pad3) = if c3 == b'=' {
+        (0u32, true)
+    } else {
+        (dec_val(c3)? as u32, false)
+    };
+    if pad2 && !pad3 {
+        return Err(Base64Error::InvalidInput);
+    }
+    if (pad2 || pad3) && !is_last {
+        return Err(Base64Error::InvalidInput);
+    }
+    if (pad2 && (v1 & 0x0F) != 0) || (pad3 && !pad2 && (v2 & 0x03) != 0) {
+        return Err(Base64Error::InvalidInput);
+    }
+    let n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+    let produce = if pad2 {
+        1
+    } else if pad3 {
+        2
+    } else {
+        3
+    };
+    Ok((n, produce))
+}
+
 pub fn decode_impl(input: &[u8], out: &mut [u8]) -> Result<usize, Base64Error> {
     if input.is_empty() {
         return Ok(0);
@@ -77,48 +117,20 @@ pub fn decode_impl(input: &[u8], out: &mut [u8]) -> Result<usize, Base64Error> {
     if input.len() % 4 != 0 {
         return Err(Base64Error::BadLength);
     }
+    let num_quads = input.len() / 4;
+    let mut total_out = 0usize;
+    for (idx, quad) in input.chunks_exact(4).enumerate() {
+        let (_, produce) = decode_quad(quad, idx + 1 == num_quads)?;
+        total_out = total_out
+            .checked_add(produce)
+            .ok_or(Base64Error::BufferTooSmall)?;
+    }
+    if out.len() < total_out {
+        return Err(Base64Error::BufferTooSmall);
+    }
     let mut o = 0usize;
-    let mut i = 0usize;
-    while i < input.len() {
-        let c0 = input[i];
-        let c1 = input[i + 1];
-        let c2 = input[i + 2];
-        let c3 = input[i + 3];
-        if c0 == b'=' || c1 == b'=' {
-            return Err(Base64Error::InvalidInput);
-        }
-        let v0 = dec_val(c0)? as u32;
-        let v1 = dec_val(c1)? as u32;
-        let (v2, pad2) = if c2 == b'=' {
-            (0u32, true)
-        } else {
-            (dec_val(c2)? as u32, false)
-        };
-        let (v3, pad3) = if c3 == b'=' {
-            (0u32, true)
-        } else {
-            (dec_val(c3)? as u32, false)
-        };
-        if pad2 && !pad3 {
-            return Err(Base64Error::InvalidInput);
-        }
-        if (pad2 || pad3) && i + 4 != input.len() {
-            return Err(Base64Error::InvalidInput);
-        }
-        if (pad2 && (v1 & 0x0F) != 0) || (pad3 && !pad2 && (v2 & 0x03) != 0) {
-            return Err(Base64Error::InvalidInput);
-        }
-        let n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
-        let produce = if pad2 {
-            1
-        } else if pad3 {
-            2
-        } else {
-            3
-        };
-        if o + produce > out.len() {
-            return Err(Base64Error::BufferTooSmall);
-        }
+    for (idx, quad) in input.chunks_exact(4).enumerate() {
+        let (n, produce) = decode_quad(quad, idx + 1 == num_quads)?;
         out[o] = ((n >> 16) & 0xFF) as u8;
         if produce >= 2 {
             out[o + 1] = ((n >> 8) & 0xFF) as u8;
@@ -127,7 +139,6 @@ pub fn decode_impl(input: &[u8], out: &mut [u8]) -> Result<usize, Base64Error> {
             out[o + 2] = (n & 0xFF) as u8;
         }
         o += produce;
-        i += 4;
     }
     Ok(o)
 }
@@ -310,5 +321,30 @@ mod tests {
             Base64Impl::decode(b"YWJ=", &mut d),
             Err(Base64Error::InvalidInput)
         );
+    }
+
+    #[test]
+    fn decode_is_all_or_nothing_and_encoded_len_saturates_on_overflow() {
+        let mut short_out = [0xCCu8; 4];
+        assert_eq!(
+            Base64Impl::decode(b"Zm9vYmFy", &mut short_out),
+            Err(Base64Error::BufferTooSmall)
+        );
+        assert_eq!(
+            short_out, [0xCCu8; 4],
+            "decode must not partially overwrite out before returning BufferTooSmall"
+        );
+
+        let mut bad_tail_out = [0xDDu8; 8];
+        assert_eq!(
+            Base64Impl::decode(b"Zm9v@@@@", &mut bad_tail_out),
+            Err(Base64Error::InvalidInput)
+        );
+        assert_eq!(
+            bad_tail_out, [0xDDu8; 8],
+            "decode must not emit plaintext from prefix quads when a trailing quad is invalid"
+        );
+
+        assert_eq!(Base64Impl::encoded_len(usize::MAX), usize::MAX);
     }
 }

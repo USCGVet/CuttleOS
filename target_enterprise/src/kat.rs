@@ -298,10 +298,18 @@ fn hkdf_vector(
     // OKM buffer sized to the larger of the two cases (82).
     let mut okm = [0u8; 82];
     let n = exp_okm.len();
-    assert!(n <= 82);
-    hkdf_expand(&prk, info, &mut okm[..n]);
+    let Some(okm_slice) = okm.get_mut(..n) else {
+        return KatResult {
+            id,
+            pass: false,
+            actual: prk,
+            expected: *exp_prk,
+            okm_match: false,
+        };
+    };
+    hkdf_expand(&prk, info, okm_slice);
     let prk_ok = &prk == exp_prk;
-    let okm_ok = &okm[..n] == exp_okm;
+    let okm_ok = okm_slice == exp_okm;
     KatResult {
         id,
         pass: prk_ok && okm_ok,

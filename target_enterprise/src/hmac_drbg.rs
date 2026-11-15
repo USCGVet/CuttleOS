@@ -8,7 +8,8 @@
 use cuttle_contracts::DRBG_OUT_LEN;
 use cuttle_contracts::{HmacDrbg, DRBG_SEED_LEN};
 
-use crate::tls::hmac_sha256;
+use crate::durable_seal::zeroize_secret_bytes;
+use crate::tls::hmac_sha256_parts;
 
 pub struct HmacDrbgImpl;
 
@@ -19,20 +20,14 @@ impl HmacDrbg for HmacDrbgImpl {
 }
 
 pub fn expand_impl(seed: &[u8; DRBG_SEED_LEN], label: &[u8], out: &mut [u8]) {
-    // message = label || 0x01
-    let mut msg = [0u8; 256];
-    let n = core::cmp::min(label.len(), 255);
-    msg[..n].copy_from_slice(&label[..n]);
-    msg[n] = 0x01;
     let mut block = [0u8; 32];
-    hmac_sha256(seed, &msg[..n + 1], &mut block);
-    let take = core::cmp::min(out.len(), 32);
+    hmac_sha256_parts(seed, &[label, &[0x01]], &mut block);
+    let take = core::cmp::min(out.len(), block.len());
     out[..take].copy_from_slice(&block[..take]);
-    let mut i = take;
-    while i < out.len() {
-        out[i] = 0;
-        i += 1;
+    if take < out.len() {
+        out[take..].fill(0);
     }
+    zeroize_secret_bytes(&mut block);
 }
 
 /// Banner seed + label.
@@ -221,5 +216,20 @@ mod tests {
     #[test]
     fn seed_len() {
         assert_eq!(BANNER_SEED.len(), 32);
+    }
+
+    #[test]
+    fn long_labels_beyond_255_bytes_do_not_silently_collide() {
+        let lab_a = [b'x'; 300];
+        let mut lab_b = [b'x'; 300];
+        lab_b[299] = b'y';
+        let mut out_a = [0u8; 32];
+        let mut out_b = [0u8; 32];
+        HmacDrbgImpl::expand(&BANNER_SEED, &lab_a, &mut out_a);
+        HmacDrbgImpl::expand(&BANNER_SEED, &lab_b, &mut out_b);
+        assert_ne!(
+            out_a, out_b,
+            "HmacDrbg::expand must hash the entire label rather than silently truncating at 255 bytes"
+        );
     }
 }

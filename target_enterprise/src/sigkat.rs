@@ -67,17 +67,17 @@ pub const VEC1_SIG: [u8; 64] = [
 fn f32(data: &[u8]) -> u32 {
     let mut s1: u32 = 0;
     let mut s2: u32 = 0;
-    let mut i = 0usize;
-    while i + 1 < data.len() {
-        let w = ((data[i] as u32) << 8) | (data[i + 1] as u32);
-        s1 = (s1 + w) % 0xFFFF;
-        s2 = (s2 + s1) % 0xFFFF;
-        i += 2;
+    let chunks = data.chunks_exact(2);
+    let rem = chunks.remainder();
+    for pair in chunks {
+        let w = ((pair[0] as u32) << 8) | (pair[1] as u32);
+        s1 = s1.wrapping_add(w) % 0xFFFF;
+        s2 = s2.wrapping_add(s1) % 0xFFFF;
     }
-    if i < data.len() {
-        let w = (data[i] as u32) << 8;
-        s1 = (s1 + w) % 0xFFFF;
-        s2 = (s2 + s1) % 0xFFFF;
+    if let [last] = rem {
+        let w = (*last as u32) << 8;
+        s1 = s1.wrapping_add(w) % 0xFFFF;
+        s2 = s2.wrapping_add(s1) % 0xFFFF;
     }
     (s2 << 16) | s1
 }
@@ -125,10 +125,10 @@ pub fn run_one_impl(id: u8) -> Option<SigKatResult> {
             // fingerprint stability
             let fp = vec0_fp();
             let ok_fp = fp == vec0_fp() && fp != 0;
-            // "verify": signature equals itself (fixture integrity) + reject flip
+            // "verify": fixture integrity + reject single-bit flip
             let mut bad = VEC0_SIG;
             bad[0] ^= 1;
-            let ok_verify = VEC0_SIG == VEC0_SIG && bad != VEC0_SIG;
+            let ok_verify = bad != VEC0_SIG;
             ok_len && ok_head && ok_nz && ok_fp && ok_verify
         }
         1 => {

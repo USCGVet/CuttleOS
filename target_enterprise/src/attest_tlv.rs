@@ -25,26 +25,27 @@ pub fn encode_impl(tag: u16, value: &[u8], out: &mut [u8]) -> Result<usize, Atte
     if value.len() > ATTEST_TLV_MAX_VAL {
         return Err(AttestTlvError::ValueTooLong);
     }
-    let need = ATTEST_TLV_HDR_LEN + value.len();
-    if out.len() < need {
-        return Err(AttestTlvError::BufferTooSmall);
-    }
-    out[0..2].copy_from_slice(&tag.to_le_bytes());
-    out[2..4].copy_from_slice(&(value.len() as u16).to_le_bytes());
-    out[4..4 + value.len()].copy_from_slice(value);
+    let need = ATTEST_TLV_HDR_LEN
+        .checked_add(value.len())
+        .ok_or(AttestTlvError::ValueTooLong)?;
+    let dst = out.get_mut(..need).ok_or(AttestTlvError::BufferTooSmall)?;
+    dst[0..2].copy_from_slice(&tag.to_le_bytes());
+    dst[2..4].copy_from_slice(&(value.len() as u16).to_le_bytes());
+    dst[ATTEST_TLV_HDR_LEN..need].copy_from_slice(value);
     Ok(need)
 }
 
 pub fn decode_impl(buf: &[u8]) -> Result<AttestTlvRecord, AttestTlvError> {
-    if buf.len() < ATTEST_TLV_HDR_LEN {
-        return Err(AttestTlvError::Truncated);
-    }
-    let tag = u16::from_le_bytes([buf[0], buf[1]]);
-    let len = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+    let hdr = buf.get(..ATTEST_TLV_HDR_LEN).ok_or(AttestTlvError::Truncated)?;
+    let tag = u16::from_le_bytes([hdr[0], hdr[1]]);
+    let len = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
     if len > ATTEST_TLV_MAX_VAL {
         return Err(AttestTlvError::ValueTooLong);
     }
-    if buf.len() < ATTEST_TLV_HDR_LEN + len {
+    let need = ATTEST_TLV_HDR_LEN
+        .checked_add(len)
+        .ok_or(AttestTlvError::ValueTooLong)?;
+    if buf.len() < need {
         return Err(AttestTlvError::Truncated);
     }
     Ok(AttestTlvRecord {
@@ -61,18 +62,19 @@ pub fn count_sequence_impl(buf: &[u8]) -> Result<usize, AttestTlvError> {
         if n >= ATTEST_TLV_MAX_TAGS {
             return Err(AttestTlvError::TooMany);
         }
-        if buf.len() - off < ATTEST_TLV_HDR_LEN {
-            return Err(AttestTlvError::Truncated);
-        }
-        let len = u16::from_le_bytes([buf[off + 2], buf[off + 3]]) as usize;
+        let rem = buf.get(off..).ok_or(AttestTlvError::Truncated)?;
+        let hdr = rem.get(..ATTEST_TLV_HDR_LEN).ok_or(AttestTlvError::Truncated)?;
+        let len = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
         if len > ATTEST_TLV_MAX_VAL {
             return Err(AttestTlvError::ValueTooLong);
         }
-        let rec = ATTEST_TLV_HDR_LEN + len;
-        if buf.len() - off < rec {
+        let rec = ATTEST_TLV_HDR_LEN
+            .checked_add(len)
+            .ok_or(AttestTlvError::ValueTooLong)?;
+        if rem.len() < rec {
             return Err(AttestTlvError::Truncated);
         }
-        off += rec;
+        off = off.checked_add(rec).ok_or(AttestTlvError::Truncated)?;
         n += 1;
     }
     Ok(n)
@@ -80,10 +82,25 @@ pub fn count_sequence_impl(buf: &[u8]) -> Result<usize, AttestTlvError> {
 
 /// Banner fixture: cycle + seed + module → 3 tags.
 pub fn banner_three_tags(out: &mut [u8]) -> Result<usize, AttestTlvError> {
-    let mut pos = 0;
-    pos += AttestTlvImpl::encode(ATTEST_TLV_TAG_CYCLE, &6201u32.to_le_bytes(), &mut out[pos..])?;
-    pos += AttestTlvImpl::encode(ATTEST_TLV_TAG_SEED, &0xAAu8.to_le_bytes(), &mut out[pos..])?;
-    pos += AttestTlvImpl::encode(ATTEST_TLV_TAG_MODULE, b"ahci", &mut out[pos..])?;
+    let mut stage = [0u8; 32];
+    let mut pos = 0usize;
+    pos += AttestTlvImpl::encode(
+        ATTEST_TLV_TAG_CYCLE,
+        &6201u32.to_le_bytes(),
+        stage.get_mut(pos..).ok_or(AttestTlvError::BufferTooSmall)?,
+    )?;
+    pos += AttestTlvImpl::encode(
+        ATTEST_TLV_TAG_SEED,
+        &0xAAu8.to_le_bytes(),
+        stage.get_mut(pos..).ok_or(AttestTlvError::BufferTooSmall)?,
+    )?;
+    pos += AttestTlvImpl::encode(
+        ATTEST_TLV_TAG_MODULE,
+        b"ahci",
+        stage.get_mut(pos..).ok_or(AttestTlvError::BufferTooSmall)?,
+    )?;
+    let dst = out.get_mut(..pos).ok_or(AttestTlvError::BufferTooSmall)?;
+    dst.copy_from_slice(&stage[..pos]);
     Ok(pos)
 }
 
@@ -230,5 +247,18 @@ mod tests {
         p += AttestTlvImpl::encode(1, b"a", &mut b[p..]).unwrap();
         p += AttestTlvImpl::encode(2, b"bb", &mut b[p..]).unwrap();
         assert_eq!(AttestTlvImpl::count_sequence(&b[..p]).unwrap(), 2);
+    }
+
+    #[test]
+    fn banner_three_tags_leaves_output_unmodified_on_short_buffer() {
+        let mut out = [0xEEu8; 10];
+        assert_eq!(
+            banner_three_tags(&mut out),
+            Err(AttestTlvError::BufferTooSmall)
+        );
+        assert_eq!(
+            out, [0xEEu8; 10],
+            "failed banner_three_tags must not leave partial TLV records in out"
+        );
     }
 }
