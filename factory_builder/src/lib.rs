@@ -853,6 +853,101 @@ pub const DEVICE_SECRET_KEY_FILENAME: &str = "device_secret_key.bin";
 /// key to the guest kernel out-of-band (`-fw_cfg name=opt/cuttle_device_key,file=...`).
 pub const FW_CFG_DEVICE_KEY_NAME: &str = "opt/cuttle_device_key";
 
+/// QEMU `fw_cfg` selector path used to pass a one-time 48-byte operator TPM
+/// anti-rollback re-anchor token (`-fw_cfg name=opt/cuttle_tpm_reanchor,file=...`).
+pub const FW_CFG_TPM_REANCHOR_NAME: &str = "opt/cuttle_tpm_reanchor";
+
+/// Mint a one-time 48-byte `CTTLRA01` operator TPM re-anchor token from the 32-byte
+/// device master key at `master_key_path` and active `tpm_counter`, writing it to `out_path`.
+pub fn mint_tpm_reanchor_token_file(
+    master_key_path: &Path,
+    tpm_counter: u64,
+    out_path: &Path,
+) -> Result<[u8; 48]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    fn hmac_sha256_32(key: &[u8; 32], chunks: &[&[u8]]) -> [u8; 32] {
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5cu8; 64];
+        for i in 0..32 {
+            ipad[i] ^= key[i];
+            opad[i] ^= key[i];
+        }
+        let mut inner = Sha256::new();
+        inner.update(ipad);
+        for c in chunks {
+            inner.update(c);
+        }
+        let inner_hash = inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(opad);
+        outer.update(inner_hash);
+        let digest = outer.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        for b in ipad.iter_mut().chain(opad.iter_mut()) {
+            // SAFETY: valid stack byte; volatile wipe avoids dead-store elimination.
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+        out
+    }
+
+    let bytes = fs::read(master_key_path)
+        .with_context(|| format!("read device master key at {}", master_key_path.display()))?;
+    if bytes.len() != 32 {
+        bail!(
+            "invalid device master key at {}: expected 32 bytes, found {} bytes",
+            master_key_path.display(),
+            bytes.len()
+        );
+    }
+    if bytes.iter().all(|&b| b == 0) {
+        bail!(
+            "refusing all-zero device master key at {}",
+            master_key_path.display()
+        );
+    }
+    let mut master = [0u8; 32];
+    master.copy_from_slice(&bytes);
+    let mut seal_key = hmac_sha256_32(
+        &master,
+        &[b"cuttle-durable-seal-v1:cuttle-ahci-wal-seal-v1"],
+    );
+    for b in &mut master {
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+
+    let mut tok = [0u8; 48];
+    tok[0..8].copy_from_slice(b"CTTLRA01");
+    tok[8..16].copy_from_slice(&tpm_counter.to_le_bytes());
+    let mac = hmac_sha256_32(&seal_key, &[b"cuttle-tpm-reanchor-v1:", &tok[0..16]]);
+    for b in &mut seal_key {
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    tok[16..48].copy_from_slice(&mac);
+
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create parent dir {}", parent.display()))?;
+        }
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(out_path)
+        .with_context(|| format!("write TPM re-anchor token at {}", out_path.display()))?;
+    f.write_all(&tok)?;
+    f.sync_all()?;
+    Ok(tok)
+}
+
 /// Load an existing 32-byte device secret key from `path`, strictly refusing
 /// malformed or all-zero files without overwriting them, or generate a fresh
 /// 256-bit cryptographically random key via OS CSPRNG (`OsRng`) and persist
@@ -1390,5 +1485,45 @@ mod tests {
         assert_ne!(default_elf, prod_elf);
         assert!(default_elf.ends_with("target/x86_64-unknown-none/release/target_enterprise_kernel"));
         assert!(prod_elf.ends_with("target/prod/x86_64-unknown-none/release/target_enterprise_kernel"));
+    }
+
+    #[test]
+    fn mint_tpm_reanchor_token_file_matches_kernel_seal_key_derivation_and_rejects_bad_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "cuttle_reanchor_tok_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let master_path = dir.join("device_secret_key.bin");
+        let master = [0x6Bu8; 32];
+        fs::write(&master_path, master).unwrap();
+        let out_path = dir.join("reanchor.bin");
+
+        let minted = mint_tpm_reanchor_token_file(&master_path, 500_003, &out_path)
+            .expect("mint_tpm_reanchor_token_file must succeed on valid 32-byte master key");
+        let disk_bytes = fs::read(&out_path).unwrap();
+        assert_eq!(disk_bytes.as_slice(), &minted);
+
+        let seal_key =
+            target_enterprise::durable_seal::derive_seal_key(&master, b"cuttle-ahci-wal-seal-v1");
+        let expected =
+            target_enterprise::state_store::compute_tpm_reanchor_token(&seal_key, 500_003);
+        assert_eq!(minted, expected);
+        assert!(target_enterprise::state_store::verify_tpm_reanchor_token(
+            &seal_key, 500_003, &minted
+        ));
+
+        // Reject missing, wrong-size, or all-zero master key files:
+        assert!(mint_tpm_reanchor_token_file(&dir.join("missing.bin"), 1, &out_path).is_err());
+        let short_key = dir.join("short.bin");
+        fs::write(&short_key, [1u8; 16]).unwrap();
+        assert!(mint_tpm_reanchor_token_file(&short_key, 1, &out_path).is_err());
+        let zero_key = dir.join("zero.bin");
+        fs::write(&zero_key, [0u8; 32]).unwrap();
+        assert!(mint_tpm_reanchor_token_file(&zero_key, 1, &out_path).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

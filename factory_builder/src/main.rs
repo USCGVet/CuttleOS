@@ -29,7 +29,7 @@ use std::process::ExitCode;
 
 use factory_builder::{
     build_kernel_with_layout_seed_and_prod, format_image_line, locate_pkg_crate,
-    package_kernel_via_pkg, validate_elf,
+    mint_tpm_reanchor_token_file, package_kernel_via_pkg, validate_elf,
 };
 
 fn main() -> ExitCode {
@@ -50,6 +50,7 @@ fn run(args: &[String]) -> Result<()> {
     }
     match args[0].as_str() {
         "build-kernel" => cmd_build_kernel(&args[1..]),
+        "mint-tpm-reanchor" => cmd_mint_tpm_reanchor(&args[1..]),
         "-h" | "--help" => {
             usage();
             Ok(())
@@ -62,7 +63,8 @@ fn usage() {
     eprintln!(
         "usage:\n  \
          factory_builder --candidate <kernel.elf> --out <bios.img> [--uefi <uefi.img>]\n  \
-         factory_builder build-kernel --kernel-crate <dir> [--layout-seed <u64>] [--prod]\n\n\
+         factory_builder build-kernel --kernel-crate <dir> [--layout-seed <u64>] [--prod]\n  \
+         factory_builder mint-tpm-reanchor --master-key <device_secret_key.bin> --tpm-counter <u64> --out <token.bin>\n\n\
          Output format (one per emitted image, parsed by morph_engine):\n  \
          <kind> <abs-path> <hex-sha256>\n    \
          where kind ∈ {{bios, uefi}}"
@@ -143,5 +145,46 @@ fn cmd_build_kernel(args: &[String]) -> Result<()> {
     // Stdout = one line, the absolute path. The smoke test pipes this
     // straight into the package mode.
     println!("{}", elf.display());
+    Ok(())
+}
+
+fn cmd_mint_tpm_reanchor(args: &[String]) -> Result<()> {
+    let mut master_key: Option<PathBuf> = None;
+    let mut tpm_counter: Option<u64> = None;
+    let mut out_path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--master-key" => {
+                master_key = Some(PathBuf::from(
+                    args.get(i + 1).context("--master-key needs value")?,
+                ));
+                i += 2;
+            }
+            "--tpm-counter" => {
+                tpm_counter = Some(
+                    args.get(i + 1)
+                        .context("--tpm-counter needs value")?
+                        .parse()
+                        .context("--tpm-counter must be a u64")?,
+                );
+                i += 2;
+            }
+            "--out" => {
+                out_path = Some(PathBuf::from(args.get(i + 1).context("--out needs value")?));
+                i += 2;
+            }
+            other => bail!("unknown argument: {}", other),
+        }
+    }
+    let master_key = master_key.context("--master-key is required")?;
+    let tpm_counter = tpm_counter.context("--tpm-counter is required")?;
+    let out_path = out_path.context("--out is required")?;
+    mint_tpm_reanchor_token_file(&master_key, tpm_counter, &out_path)?;
+    eprintln!(
+        "factory_builder: minted 48-byte TPM re-anchor token (tpm_counter={}) at {}",
+        tpm_counter,
+        out_path.display()
+    );
     Ok(())
 }

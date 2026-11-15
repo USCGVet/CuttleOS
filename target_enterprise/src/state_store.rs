@@ -747,20 +747,42 @@ pub fn commit<D: SectorIo>(
         return Err(CommitError::BadLayout);
     }
     let digests = image.digests();
-    let io = |stage: CommitStage| move |fault: IoFault| CommitError::Io { stage, fault };
+    stage_shadow_slot(dev, layout, image, &digests)?;
+    finalize_staged_commit(dev, key, layout, boots, commit_seq, image, &digests, None)
+}
 
-    // 1. Stage the complete image in the shadow slot and prove it landed.
+fn stage_shadow_slot<D: SectorIo>(
+    dev: &mut D,
+    layout: &StoreLayout,
+    image: &StateImage,
+    digests: &ImageDigests,
+) -> Result<(), CommitError> {
+    let io = |stage: CommitStage| move |fault: IoFault| CommitError::Io { stage, fault };
     write_slot(dev, layout.shadow_lba, image).map_err(io(CommitStage::Stage))?;
     let staged = slot_digests(dev, layout.shadow_lba).map_err(io(CommitStage::Stage))?;
-    if staged != digests {
+    if staged != *digests {
         return Err(CommitError::Verify {
             stage: CommitStage::Stage,
         });
     }
+    Ok(())
+}
+
+fn finalize_staged_commit<D: SectorIo>(
+    dev: &mut D,
+    key: &[u8; DURABLE_DIGEST_LEN],
+    layout: &StoreLayout,
+    boots: u64,
+    commit_seq: u64,
+    image: &StateImage,
+    digests: &ImageDigests,
+    tpm_anchor_ctr: Option<u64>,
+) -> Result<AbCommitHeader, CommitError> {
+    let io = |stage: CommitStage| move |fault: IoFault| CommitError::Io { stage, fault };
 
     // 2. Point of no return: record that the shadow slot holds the new state.
     let in_flight = if let Some((aead_nonce, wal_tag, fs_tag, sql_tag)) = image.aead_envelope() {
-        AbCommitHeader {
+        let base = AbCommitHeader {
             state: AB_STATE_IN_FLIGHT,
             format_version: AB_FORMAT_V3,
             boots,
@@ -772,6 +794,12 @@ pub fn commit<D: SectorIo>(
             wal_tag,
             fs_tag,
             sql_tag,
+            tpm_anchored: false,
+            tpm_nv_counter: 0,
+        };
+        match tpm_anchor_ctr {
+            Some(ctr) => base.with_tpm_anchor(true, ctr),
+            None => base,
         }
     } else {
         AbCommitHeader::unencrypted(
@@ -796,7 +824,7 @@ pub fn commit<D: SectorIo>(
     // 3. Install into the primary slot and prove it landed.
     write_slot(dev, layout.primary_lba, image).map_err(io(CommitStage::Install))?;
     let installed = slot_digests(dev, layout.primary_lba).map_err(io(CommitStage::Install))?;
-    if installed != digests {
+    if installed != *digests {
         return Err(CommitError::Verify {
             stage: CommitStage::Install,
         });
@@ -1179,6 +1207,79 @@ pub enum PersistError {
     /// complete image, and re-uses page-store slots the interrupted commit
     /// may already have made the committed ones.
     StoreFaulted,
+    /// Advancing the hardware TPM 2.0 NV anti-rollback counter (`0x0150_0010`) failed.
+    TpmAnchor(cuttle_contracts::TpmError),
+}
+
+/// Why hardware TPM 2.0 anti-rollback anchoring stopped a boot. See [`BootError::TpmAnchor`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TpmBootFault {
+    /// The disk commit record is marked `tpm_anchored = true`, but no TPM 2.0 TIS device answered.
+    AnchoredDiskMissingTpm,
+    /// A TPM 2.0 TIS transport, startup, or NV command failed while verifying or advancing the anchor.
+    TpmDeviceError(cuttle_contracts::TpmError),
+    /// An anchored disk found no initialized counter (`tpm_counter == 0`), or an unanchored/wiped
+    /// disk was presented against an active TPM NV counter without a valid operator re-anchor token.
+    CounterMissingOrUnanchored {
+        /// Active TPM NV counter (`0` when the counter index is missing or unwritten on an anchored disk).
+        tpm_counter: u64,
+    },
+    /// The disk commit record claims a `tpm_nv_counter` strictly ahead of the hardware TPM NV counter.
+    DiskAheadOfTpm {
+        /// `tpm_nv_counter` recorded in the authenticated disk commit header.
+        disk_counter: u64,
+        /// Current hardware TPM NV counter (`0x0150_0010`).
+        tpm_counter: u64,
+    },
+    /// An operator re-anchor token (`opt/cuttle_tpm_reanchor`) failed magic, counter, or HMAC checks.
+    InvalidReanchorToken,
+}
+
+/// 8-byte magic header (`CTTLRA01`) for an operator TPM anti-rollback re-anchor token.
+pub const TPM_REANCHOR_MAGIC: [u8; 8] = *b"CTTLRA01";
+/// Byte length (`48`) of an operator TPM anti-rollback re-anchor token (`magic[8] || tpm_counter_le[8] || hmac[32]`).
+pub const TPM_REANCHOR_TOKEN_LEN: usize = 48;
+
+/// Mint a one-time operator TPM re-anchor token bound to `seal_key` and active `tpm_counter`.
+pub fn compute_tpm_reanchor_token(
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+    tpm_counter: u64,
+) -> [u8; TPM_REANCHOR_TOKEN_LEN] {
+    let mut out = [0u8; TPM_REANCHOR_TOKEN_LEN];
+    out[0..8].copy_from_slice(&TPM_REANCHOR_MAGIC);
+    out[8..16].copy_from_slice(&tpm_counter.to_le_bytes());
+    let mut mac = [0u8; DURABLE_DIGEST_LEN];
+    crate::tls::hmac_sha256_parts(
+        seal_key,
+        &[b"cuttle-tpm-reanchor-v1:", &out[0..16]],
+        &mut mac,
+    );
+    out[16..48].copy_from_slice(&mac);
+    zeroize_secret_bytes(&mut mac);
+    out
+}
+
+/// Verify an operator TPM re-anchor token in constant time against `seal_key` and `expected_tpm_counter`.
+pub fn verify_tpm_reanchor_token(
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+    expected_tpm_counter: u64,
+    token: &[u8; TPM_REANCHOR_TOKEN_LEN],
+) -> bool {
+    if !is_seal_key_set(seal_key) {
+        return false;
+    }
+    let mut expected = compute_tpm_reanchor_token(seal_key, expected_tpm_counter);
+    let mut header_diff = 0u8;
+    let mut i = 0usize;
+    while i < 16 {
+        header_diff |= token[i] ^ expected[i];
+        i += 1;
+    }
+    let tok_mac: &[u8; DURABLE_DIGEST_LEN] = (&token[16..48]).try_into().unwrap();
+    let exp_mac: &[u8; DURABLE_DIGEST_LEN] = (&expected[16..48]).try_into().unwrap();
+    let mac_ok = constant_time_eq(tok_mac, exp_mac);
+    zeroize_secret_bytes(&mut expected);
+    header_diff == 0 && mac_ok
 }
 
 /// Why the page store (`LBA 2048..`) stopped a boot. See [`BootError::PagedStore`].
@@ -1223,6 +1324,8 @@ pub enum BootError {
     /// operator repairs the cause (the wrong device key is the common one) or
     /// replaces the disk, and until then every byte is still there.
     PagedStore(PagedBootFault),
+    /// Hardware TPM 2.0 anti-rollback anchor verification failed closed (`0x0150_0010`).
+    TpmAnchor(TpmBootFault),
 }
 
 /// What a successful [`ShellStore::commit`] did.
@@ -1248,6 +1351,10 @@ pub struct ShellStore {
     quarantine_lba: u64,
     commit_seq: u64,
     min_commit_seq: u64,
+    /// Whether this store is bound to hardware TPM 2.0 NV counter `0x0150_0010`.
+    tpm_anchored: bool,
+    /// Last TPM 2.0 NV counter value verified on boot or written by [`ShellStore::commit_with_tpm`].
+    tpm_nv_counter: u64,
     /// Digests of the plaintext image known to be encrypted in both slots, if any.
     stored_plain: Option<ImageDigests>,
     /// Durable `PagedBlockStore` anchor committed inside `AB_FORMAT_V3`.
@@ -1268,6 +1375,8 @@ impl ShellStore {
             quarantine_lba,
             commit_seq: 0,
             min_commit_seq: 0,
+            tpm_anchored: false,
+            tpm_nv_counter: 0,
             stored_plain: None,
             durable_anchor: crate::paged_store::PagedAnchor::zero(),
             paged: crate::paged_store::PagedBlockStore::new(),
@@ -1863,6 +1972,8 @@ impl ShellStore {
         counter_boots: u64,
     ) -> Result<BootReport, BootError> {
         self.commit_seq = 0;
+        self.tpm_anchored = false;
+        self.tpm_nv_counter = 0;
         self.stored_plain = None;
         self.durable_anchor = crate::paged_store::PagedAnchor::zero();
         self.paged.reset();
@@ -2076,6 +2187,496 @@ impl ShellStore {
             outcome: BootOutcome::Rejected { preserved: true },
             boots: counter_boots,
         })
+    }
+
+    fn peek_anchored_commit_headers<D: SectorIo>(
+        &self,
+        dev: &mut D,
+        seal_key: &[u8; DURABLE_DIGEST_LEN],
+    ) -> Result<(Option<AbCommitHeader>, Option<AbCommitHeader>), BootError> {
+        let mut sec = [0u8; SECTOR_BYTES];
+        let primary = match dev.read_sector(self.layout.commit_lba, &mut sec) {
+            Ok(()) => verify_ab_commit_sector(seal_key, &sec)
+                .filter(|h| h.format_version == AB_FORMAT_V3 && h.tpm_anchored),
+            Err(_) => None,
+        };
+        if primary.is_some() {
+            return Ok((primary, primary));
+        }
+        let mut any = None;
+        if quarantine_present(dev, self.quarantine_lba).map_err(BootError::Io)? {
+            let q_layout = quarantine_layout(self.quarantine_lba);
+            if dev.read_sector(q_layout.commit_lba, &mut sec).is_ok() {
+                any = verify_ab_commit_sector(seal_key, &sec)
+                    .filter(|h| h.format_version == AB_FORMAT_V3 && h.tpm_anchored);
+            }
+        }
+        Ok((None, any))
+    }
+
+    fn commit_anchored_with_present_tpm<D: SectorIo, B: crate::tpm::TpmTisBus>(
+        &mut self,
+        dev: &mut D,
+        sh: &mut OsShell,
+        boots: u64,
+        drv: &mut crate::tpm::TpmTisDriver<B>,
+        force_write: bool,
+    ) -> Result<Committed, PersistError> {
+        if self.faulted {
+            return Err(PersistError::StoreFaulted);
+        }
+        let key = sh.seal_key;
+        if !is_seal_key_set(&key) {
+            self.stored_plain = None;
+            return Err(PersistError::Commit(CommitError::KeyUnset));
+        }
+        if !self.layout.is_valid_for(dev.capacity_sectors()) {
+            self.stored_plain = None;
+            return Err(PersistError::Commit(CommitError::BadLayout));
+        }
+
+        let paged_cap = self.supports_paged_for(dev);
+        if paged_cap {
+            if !sh.is_paged_mode() {
+                sh.set_paged_mode(true);
+                sh.mark_all_paged_dirty();
+            }
+            if !self.durable_anchor.is_active() {
+                if self.paged.tx_lsn() != 0 {
+                    self.paged.reset();
+                }
+                sh.mark_all_paged_dirty();
+            } else if self.paged.tx_lsn() != self.durable_anchor.tx_lsn
+                || self.paged.merkle_root() != self.durable_anchor.merkle_root
+            {
+                match self
+                    .paged
+                    .recover_at_anchor(dev, &key, &self.durable_anchor)
+                {
+                    Ok(_) => sh.mark_all_paged_dirty(),
+                    Err(e) => {
+                        self.faulted |= Self::paged_err_touched_device(&e);
+                        return Err(Self::map_paged_commit_err(e));
+                    }
+                }
+            } else if sh.paged_anchor() != self.durable_anchor {
+                sh.mark_all_paged_dirty();
+            }
+
+            let need_paged_commit = !self.durable_anchor.is_active()
+                || sh.db.has_dirty_pages()
+                || sh.fs.is_dir_dirty();
+            if need_paged_commit {
+                let max_logical =
+                    crate::paged_store::PagedBlockStore::max_logical_pages_for_sectors(
+                        dev.capacity_sectors(),
+                    );
+                let sql_rows = match sh.db.sync_to_paged_store(&mut self.paged, max_logical) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        sh.set_paged_anchor(self.durable_anchor);
+                        sh.mark_all_paged_dirty();
+                        return Err(Self::map_paged_commit_err(e));
+                    }
+                };
+                if let Err(e) = sh.sync_vfs_to_paged_store(&mut self.paged, max_logical) {
+                    sh.set_paged_anchor(self.durable_anchor);
+                    sh.mark_all_paged_dirty();
+                    return Err(Self::map_paged_commit_err(e));
+                }
+                let (uf, ub) = sh.user_file_summary();
+                self.paged.set_summary_counts(sql_rows, uf, ub);
+                match self.paged.commit_dirty(dev, &key, boots) {
+                    Ok(anchor) => sh.set_paged_anchor(anchor),
+                    Err(e) => {
+                        self.faulted |= Self::paged_err_touched_device(&e);
+                        sh.set_paged_anchor(self.durable_anchor);
+                        sh.mark_all_paged_dirty();
+                        return Err(Self::map_paged_commit_err(e));
+                    }
+                }
+            } else {
+                sh.set_paged_anchor(self.durable_anchor);
+            }
+        }
+
+        let records = match sh.pack_state_image(boots, &mut self.image) {
+            Ok(r) => r,
+            Err(pe) => {
+                if paged_cap {
+                    sh.set_paged_anchor(self.durable_anchor);
+                    sh.mark_all_paged_dirty();
+                }
+                return Err(PersistError::Pack(pe));
+            }
+        };
+        let plain_digests = self.image.digests();
+        if !force_write && self.tpm_anchored && self.stored_plain == Some(plain_digests) {
+            return Ok(Committed::Unchanged);
+        }
+        let seq = self.commit_seq.wrapping_add(1);
+        let nonce_base =
+            derive_commit_nonce(&key, boots, seq, &plain_digests, sh.vault_entropy_snapshot());
+        if !self.image.encrypt_in_place(&key, &nonce_base) {
+            self.stored_plain = None;
+            if paged_cap {
+                sh.set_paged_anchor(self.durable_anchor);
+                sh.mark_all_paged_dirty();
+            }
+            return Err(PersistError::Commit(CommitError::KeyUnset));
+        }
+
+        let enc_digests = self.image.digests();
+        // Stage 1: write + verify shadow slot BEFORE incrementing the hardware TPM counter so
+        // only the single 512-byte `IN_FLIGHT` commit sector separates `TPM2_NV_Increment` from
+        // durable roll-forward.
+        if let Err(e) = stage_shadow_slot(dev, &self.layout, &self.image, &enc_digests) {
+            self.stored_plain = None;
+            self.faulted |= matches!(e, CommitError::Io { .. } | CommitError::Verify { .. });
+            if paged_cap {
+                sh.set_paged_anchor(self.durable_anchor);
+                sh.mark_all_paged_dirty();
+            }
+            return Err(PersistError::Commit(e));
+        }
+
+        if let Err(e) = drv.ensure_started() {
+            self.stored_plain = None;
+            if paged_cap {
+                sh.set_paged_anchor(self.durable_anchor);
+                sh.mark_all_paged_dirty();
+            }
+            return Err(PersistError::TpmAnchor(e));
+        }
+        if !self.tpm_anchored {
+            match drv.probe_rollback_counter(crate::tpm::TPM_NV_INDEX_ROLLBACK_CTR) {
+                Ok(crate::tpm::TpmCounterProbe::Undefined) => {
+                    if let Err(e) = drv.nv_define_space(
+                        crate::tpm::TPM_NV_INDEX_ROLLBACK_CTR,
+                        crate::tpm::TPM_NV_COUNTER_ATTRS,
+                        8,
+                    ) {
+                        self.stored_plain = None;
+                        if paged_cap {
+                            sh.set_paged_anchor(self.durable_anchor);
+                            sh.mark_all_paged_dirty();
+                        }
+                        return Err(PersistError::TpmAnchor(e));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.stored_plain = None;
+                    if paged_cap {
+                        sh.set_paged_anchor(self.durable_anchor);
+                        sh.mark_all_paged_dirty();
+                    }
+                    return Err(PersistError::TpmAnchor(e));
+                }
+            }
+        }
+        let new_tpm_ctr = match drv.nv_increment_counter(crate::tpm::TPM_NV_INDEX_ROLLBACK_CTR) {
+            Ok(c) => c,
+            Err(e) => {
+                self.stored_plain = None;
+                if paged_cap {
+                    sh.set_paged_anchor(self.durable_anchor);
+                    sh.mark_all_paged_dirty();
+                }
+                return Err(PersistError::TpmAnchor(e));
+            }
+        };
+
+        match finalize_staged_commit(
+            dev,
+            &key,
+            &self.layout,
+            boots,
+            seq,
+            &self.image,
+            &enc_digests,
+            Some(new_tpm_ctr),
+        ) {
+            Ok(hdr) => {
+                self.commit_seq = seq;
+                if seq > self.min_commit_seq {
+                    self.min_commit_seq = seq;
+                }
+                self.tpm_anchored = true;
+                self.tpm_nv_counter = new_tpm_ctr;
+                sh.commit_seq = seq;
+                if paged_cap {
+                    self.durable_anchor = sh.paged_anchor();
+                }
+                self.stored_plain = Some(plain_digests);
+                Ok(Committed::Written {
+                    commit: hdr,
+                    records,
+                })
+            }
+            Err(e) => {
+                self.stored_plain = None;
+                self.faulted |= matches!(e, CommitError::Io { .. } | CommitError::Verify { .. });
+                if paged_cap {
+                    sh.set_paged_anchor(self.durable_anchor);
+                    sh.mark_all_paged_dirty();
+                }
+                Err(PersistError::Commit(e))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn boot_with_present_tpm<D: SectorIo, B: crate::tpm::TpmTisBus>(
+        &mut self,
+        dev: &mut D,
+        sh: &mut OsShell,
+        keys: &ShellKeys,
+        counter_boots: u64,
+        drv: &mut crate::tpm::TpmTisDriver<B>,
+        reanchor_token: Option<&[u8; TPM_REANCHOR_TOKEN_LEN]>,
+        primary_anchored: Option<AbCommitHeader>,
+        any_anchored: Option<AbCommitHeader>,
+    ) -> Result<BootReport, BootError> {
+        drv.ensure_started()
+            .map_err(|e| BootError::TpmAnchor(TpmBootFault::TpmDeviceError(e)))?;
+        let probe = drv
+            .probe_rollback_counter(crate::tpm::TPM_NV_INDEX_ROLLBACK_CTR)
+            .map_err(|e| BootError::TpmAnchor(TpmBootFault::TpmDeviceError(e)))?;
+
+        match (probe, reanchor_token) {
+            (
+                crate::tpm::TpmCounterProbe::Undefined | crate::tpm::TpmCounterProbe::Unwritten,
+                Some(tok),
+            ) => {
+                if !verify_tpm_reanchor_token(&keys.seal, 0, tok) {
+                    return Err(BootError::TpmAnchor(TpmBootFault::InvalidReanchorToken));
+                }
+                if probe == crate::tpm::TpmCounterProbe::Undefined {
+                    drv.nv_define_space(
+                        crate::tpm::TPM_NV_INDEX_ROLLBACK_CTR,
+                        crate::tpm::TPM_NV_COUNTER_ATTRS,
+                        8,
+                    )
+                    .map_err(|e| BootError::TpmAnchor(TpmBootFault::TpmDeviceError(e)))?;
+                }
+                self.min_commit_seq = 0;
+                let report = self.boot(dev, sh, keys, counter_boots)?;
+                self.commit_anchored_with_present_tpm(dev, sh, report.boots, drv, true)
+                    .map_err(BootError::Persist)?;
+                Ok(report)
+            }
+            (
+                crate::tpm::TpmCounterProbe::Undefined | crate::tpm::TpmCounterProbe::Unwritten,
+                None,
+            ) => {
+                if any_anchored.is_some() {
+                    self.paged.reset();
+                    self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+                    reset_shell(sh, keys, counter_boots);
+                    return Err(BootError::TpmAnchor(
+                        TpmBootFault::CounterMissingOrUnanchored { tpm_counter: 0 },
+                    ));
+                }
+                if probe == crate::tpm::TpmCounterProbe::Undefined {
+                    drv.nv_define_space(
+                        crate::tpm::TPM_NV_INDEX_ROLLBACK_CTR,
+                        crate::tpm::TPM_NV_COUNTER_ATTRS,
+                        8,
+                    )
+                    .map_err(|e| BootError::TpmAnchor(TpmBootFault::TpmDeviceError(e)))?;
+                }
+                let report = self.boot(dev, sh, keys, counter_boots)?;
+                if matches!(report.outcome, BootOutcome::Restored { .. }) {
+                    // Existing unanchored deployment upgrading onto a TPM: anchor immediately
+                    // with a single NV increment (no 64-step catch-up loop).
+                    self.commit_anchored_with_present_tpm(dev, sh, report.boots, drv, true)
+                        .map_err(BootError::Persist)?;
+                }
+                Ok(report)
+            }
+            (crate::tpm::TpmCounterProbe::Active(c_tpm), Some(tok)) => {
+                if !verify_tpm_reanchor_token(&keys.seal, c_tpm, tok) {
+                    return Err(BootError::TpmAnchor(TpmBootFault::InvalidReanchorToken));
+                }
+                self.min_commit_seq = 0;
+                let report = self.boot(dev, sh, keys, counter_boots)?;
+                self.commit_anchored_with_present_tpm(dev, sh, report.boots, drv, true)
+                    .map_err(BootError::Persist)?;
+                Ok(report)
+            }
+            (crate::tpm::TpmCounterProbe::Active(c_tpm), None) => {
+                let Some(hdr) = primary_anchored else {
+                    self.paged.reset();
+                    self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+                    reset_shell(sh, keys, counter_boots);
+                    return Err(BootError::TpmAnchor(
+                        TpmBootFault::CounterMissingOrUnanchored { tpm_counter: c_tpm },
+                    ));
+                };
+                let min_expected = c_tpm.saturating_sub(1);
+                if hdr.tpm_nv_counter < min_expected {
+                    self.paged.reset();
+                    self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+                    reset_shell(sh, keys, counter_boots);
+                    return Err(BootError::Rollback {
+                        found: hdr.tpm_nv_counter,
+                        min_expected,
+                    });
+                }
+                if hdr.tpm_nv_counter > c_tpm {
+                    self.paged.reset();
+                    self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+                    reset_shell(sh, keys, counter_boots);
+                    return Err(BootError::TpmAnchor(TpmBootFault::DiskAheadOfTpm {
+                        disk_counter: hdr.tpm_nv_counter,
+                        tpm_counter: c_tpm,
+                    }));
+                }
+
+                self.commit_seq = 0;
+                self.tpm_anchored = false;
+                self.tpm_nv_counter = 0;
+                self.stored_plain = None;
+                self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+                self.paged.reset();
+                self.faulted = false;
+                let layout = self.layout;
+                let paged_cap = self.supports_paged_for(dev);
+
+                let (recovery, restore, boots) =
+                    match self.recover_and_load(dev, &layout, sh, keys, counter_boots) {
+                        Ok(Some((rec, res, b))) if rec.commit == Some(hdr) => (rec, res, b),
+                        Ok(_) => {
+                            self.paged.reset();
+                            self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+                            reset_shell(sh, keys, counter_boots);
+                            return Err(BootError::Io(IoFault::DeviceError));
+                        }
+                        Err(e) => {
+                            if matches!(e, BootError::PagedStore(_)) {
+                                self.paged.reset();
+                                self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+                                reset_shell(sh, keys, counter_boots);
+                            }
+                            return Err(e);
+                        }
+                    };
+
+                if hdr.commit_seq < self.min_commit_seq {
+                    self.paged.reset();
+                    self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+                    reset_shell(sh, keys, counter_boots);
+                    if paged_cap {
+                        sh.set_paged_mode(true);
+                        sh.mark_all_paged_dirty();
+                    }
+                    return Err(BootError::Rollback {
+                        found: hdr.commit_seq,
+                        min_expected: self.min_commit_seq,
+                    });
+                }
+                if !recovery.repaired_primary
+                    && matches!(
+                        recovery.source,
+                        RecoverySource::ShadowHeal | RecoverySource::JournalReplay
+                    )
+                {
+                    if let Some(fault) = recovery.repair_fault {
+                        return Err(BootError::Io(fault));
+                    }
+                }
+
+                self.commit_seq = hdr.commit_seq;
+                if self.commit_seq > self.min_commit_seq {
+                    self.min_commit_seq = self.commit_seq;
+                }
+                self.tpm_anchored = true;
+                self.tpm_nv_counter = hdr.tpm_nv_counter;
+                sh.commit_seq = hdr.commit_seq;
+                self.stored_plain = Some(self.image.digests());
+                if quarantine_present(dev, self.quarantine_lba).map_err(BootError::Io)? {
+                    clear_quarantine(dev, self.quarantine_lba).map_err(BootError::Io)?;
+                }
+                Ok(BootReport {
+                    outcome: BootOutcome::Restored {
+                        restore,
+                        source: recovery.source,
+                        from_quarantine: false,
+                        repaired_primary: recovery.repaired_primary,
+                        repaired_shadow: recovery.repaired_shadow,
+                        repair_fault: recovery.repair_fault,
+                        recommitted: false,
+                    },
+                    boots,
+                })
+            }
+        }
+    }
+
+    /// Boot the store while enforcing hardware TPM 2.0 NV monotonic anti-rollback anchoring (`0x0150_0010`).
+    pub fn boot_with_tpm<D: SectorIo, B: crate::tpm::TpmTisBus>(
+        &mut self,
+        dev: &mut D,
+        sh: &mut OsShell,
+        keys: &ShellKeys,
+        counter_boots: u64,
+        tpm: Option<&mut crate::tpm::TpmTisDriver<B>>,
+        reanchor_token: Option<&[u8; TPM_REANCHOR_TOKEN_LEN]>,
+    ) -> Result<BootReport, BootError> {
+        if !is_seal_key_set(&keys.seal) {
+            return Err(BootError::KeyUnset);
+        }
+        if !quarantine_fits(&self.layout, self.quarantine_lba, dev.capacity_sectors()) {
+            return Err(BootError::BadLayout);
+        }
+        let (primary_anchored, any_anchored) =
+            self.peek_anchored_commit_headers(dev, &keys.seal)?;
+
+        if let Some(drv) = tpm {
+            if drv.probe_did_vid().is_some() {
+                let res = self.boot_with_present_tpm(
+                    dev,
+                    sh,
+                    keys,
+                    counter_boots,
+                    drv,
+                    reanchor_token,
+                    primary_anchored,
+                    any_anchored,
+                );
+                let _ = drv.relinquish_locality_0();
+                return res;
+            }
+        }
+        if any_anchored.is_some() || reanchor_token.is_some() {
+            self.paged.reset();
+            self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+            reset_shell(sh, keys, counter_boots);
+            return Err(BootError::TpmAnchor(TpmBootFault::AnchoredDiskMissingTpm));
+        }
+        self.boot(dev, sh, keys, counter_boots)
+    }
+
+    /// Commit `sh` to `dev` and advance the hardware TPM 2.0 NV anti-rollback anchor (`0x0150_0010`) when present.
+    pub fn commit_with_tpm<D: SectorIo, B: crate::tpm::TpmTisBus>(
+        &mut self,
+        dev: &mut D,
+        sh: &mut OsShell,
+        boots: u64,
+        tpm: Option<&mut crate::tpm::TpmTisDriver<B>>,
+    ) -> Result<Committed, PersistError> {
+        if let Some(drv) = tpm {
+            if drv.probe_did_vid().is_some() {
+                let res = self.commit_anchored_with_present_tpm(dev, sh, boots, drv, false);
+                let _ = drv.relinquish_locality_0();
+                return res;
+            }
+        }
+        if self.tpm_anchored {
+            return Err(PersistError::TpmAnchor(cuttle_contracts::TpmError::BadTag));
+        }
+        self.commit(dev, sh, boots)
     }
 }
 
@@ -4680,5 +5281,304 @@ mod node_tests {
         );
         replay_disk.reboot();
         assert!(all_sectors(&replay_disk) == replay_before);
+    }
+
+    #[test]
+    fn anchored_disk_fails_closed_when_tpm_absent_erroring_or_counter_missing() {
+        use crate::tpm::{
+            MemTpmTisBus, TpmTisBus, TpmTisDriver, TPM_DEFAULT_DID_VID, TPM_DID_VID_0,
+            TPM_NV_INDEX_ROLLBACK_CTR,
+        };
+        use cuttle_contracts::TPM_SU_CLEAR;
+
+        let mut disk = MemDisk::new(4096);
+        let mut tpm = TpmTisDriver::new(MemTpmTisBus::new());
+        tpm.startup(TPM_SU_CLEAR).unwrap();
+
+        let mut st = store();
+        let mut sh = Box::new(OsShell::empty());
+        let rep = st
+            .boot_with_tpm(&mut disk, &mut sh, &keys(), 1, Some(&mut tpm), None)
+            .expect("initial blank boot with TPM");
+        assert!(matches!(rep.outcome, BootOutcome::Fresh));
+        let _ = run(&mut sh, "write /var/anchored.txt strict-tpm");
+        match st
+            .commit_with_tpm(&mut disk, &mut sh, 1, Some(&mut tpm))
+            .expect("anchored commit")
+        {
+            Committed::Written { commit, .. } => {
+                assert!(commit.tpm_anchored);
+                assert_eq!(commit.tpm_nv_counter, 1);
+            }
+            other => panic!("expected Written, got {other:?}"),
+        }
+
+        // 1. Anchored disk booted with TPM absent (`None`) MUST fail closed!
+        let mut st_no_tpm = store();
+        let mut sh_no_tpm = Box::new(OsShell::empty());
+        assert_eq!(
+            st_no_tpm.boot_with_tpm::<_, MemTpmTisBus>(
+                &mut disk,
+                &mut sh_no_tpm,
+                &keys(),
+                2,
+                None,
+                None,
+            ),
+            Err(BootError::TpmAnchor(TpmBootFault::AnchoredDiskMissingTpm))
+        );
+
+        // 2. Anchored disk booted with a present but erroring TPM MUST fail closed!
+        struct FaultyPresentTisBus;
+        impl TpmTisBus for FaultyPresentTisBus {
+            fn read_u8(&mut self, offset: usize) -> u8 {
+                if (TPM_DID_VID_0..TPM_DID_VID_0 + 4).contains(&offset) {
+                    TPM_DEFAULT_DID_VID.to_le_bytes()[offset - TPM_DID_VID_0]
+                } else {
+                    0
+                }
+            }
+            fn write_u8(&mut self, _offset: usize, _val: u8) {}
+        }
+        let mut bad_tpm = TpmTisDriver::new(FaultyPresentTisBus);
+        let mut st_bad = store();
+        let mut sh_bad = Box::new(OsShell::empty());
+        assert!(matches!(
+            st_bad.boot_with_tpm(&mut disk, &mut sh_bad, &keys(), 2, Some(&mut bad_tpm), None),
+            Err(BootError::TpmAnchor(TpmBootFault::TpmDeviceError(_)))
+        ));
+
+        // 3. Anchored disk booted when NV index `0x0150_0010` was wiped (`clear_nv_slots`) MUST
+        //    fail closed without silently re-creating the counter at 0!
+        tpm.startup(TPM_SU_CLEAR).unwrap();
+        tpm.bus_mut().clear_nv_slots();
+        let mut st_missing = store();
+        let mut sh_missing = Box::new(OsShell::empty());
+        assert_eq!(
+            st_missing.boot_with_tpm(&mut disk, &mut sh_missing, &keys(), 2, Some(&mut tpm), None),
+            Err(BootError::TpmAnchor(
+                TpmBootFault::CounterMissingOrUnanchored { tpm_counter: 0 }
+            ))
+        );
+        assert!(
+            tpm.nv_read_public(TPM_NV_INDEX_ROLLBACK_CTR).is_err(),
+            "missing rollback index on anchored disk must not be auto-defined"
+        );
+    }
+
+    #[test]
+    fn decoupled_tpm_counter_handles_used_tpm_high_commit_seq_and_one_behind_crash() {
+        use crate::tpm::{MemTpmTisBus, TpmTisDriver, TPM_NV_INDEX_ROLLBACK_CTR};
+        use cuttle_contracts::TPM_SU_CLEAR;
+
+        // Part A: Used TPM whose monotonic counter starts at `500_000` (far above `commit_seq = 1`).
+        let mut bus = MemTpmTisBus::new();
+        bus.set_counter_high_water(500_000);
+        let mut tpm = TpmTisDriver::new(bus);
+        tpm.startup(TPM_SU_CLEAR).unwrap();
+
+        let mut disk = MemDisk::new(4096);
+        let mut st = store();
+        let mut sh = Box::new(OsShell::empty());
+        st.boot_with_tpm(&mut disk, &mut sh, &keys(), 1, Some(&mut tpm), None)
+            .expect("fresh boot on used TPM");
+        let _ = run(&mut sh, "append /var/ver.txt v1");
+        match st
+            .commit_with_tpm(&mut disk, &mut sh, 1, Some(&mut tpm))
+            .expect("commit #1 on used TPM")
+        {
+            Committed::Written { commit, .. } => {
+                assert_eq!(commit.commit_seq, 1);
+                assert!(commit.tpm_anchored);
+                assert_eq!(commit.tpm_nv_counter, 500_001);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let snap_1: Vec<[u8; SECTOR_BYTES]> =
+            (0..4096).map(|l| disk.peek(l as u64)).collect();
+
+        // Next boot MUST succeed even though `tpm_nv_counter` (500_001) != `commit_seq` (1)!
+        tpm.startup(TPM_SU_CLEAR).unwrap();
+        let mut st2 = store();
+        let mut sh2 = Box::new(OsShell::empty());
+        st2.boot_with_tpm(&mut disk, &mut sh2, &keys(), 2, Some(&mut tpm), None)
+            .expect("reboot on used TPM must not strand legitimate node");
+        assert_eq!(run(&mut sh2, "cat /var/ver.txt"), "v1\n");
+
+        let _ = run(&mut sh2, "append /var/ver.txt v2");
+        st2.commit_with_tpm(&mut disk, &mut sh2, 2, Some(&mut tpm))
+            .unwrap();
+        let _ = run(&mut sh2, "append /var/ver.txt v3");
+        st2.commit_with_tpm(&mut disk, &mut sh2, 2, Some(&mut tpm))
+            .unwrap();
+        assert_eq!(tpm.nv_read_counter(TPM_NV_INDEX_ROLLBACK_CTR).unwrap(), 500_003);
+
+        // Simulate power loss immediately after `TPM2_NV_Increment` (`500_004`) before disk write (`500_003`):
+        // boot MUST accept 1-behind (`500_003 == 500_004 - 1`).
+        assert_eq!(
+            tpm.nv_increment_counter(TPM_NV_INDEX_ROLLBACK_CTR).unwrap(),
+            500_004
+        );
+        tpm.startup(TPM_SU_CLEAR).unwrap();
+        let mut st3 = store();
+        let mut sh3 = Box::new(OsShell::empty());
+        st3.boot_with_tpm(&mut disk, &mut sh3, &keys(), 3, Some(&mut tpm), None)
+            .expect("1-behind crash window must recover cleanly");
+        assert_eq!(run(&mut sh3, "cat /var/ver.txt"), "v1\nv2\nv3\n");
+
+        // Replaying `snap_1` (`tpm_nv_counter = 500_001` vs TPM `500_004`) MUST fail with `Rollback`!
+        let mut rolled_disk = MemDisk::new(4096);
+        for (i, s) in snap_1.iter().enumerate() {
+            rolled_disk.poke(i as u64, |dst| *dst = *s);
+        }
+        let mut st_rb = store();
+        let mut sh_rb = Box::new(OsShell::empty());
+        assert_eq!(
+            st_rb.boot_with_tpm(&mut rolled_disk, &mut sh_rb, &keys(), 4, Some(&mut tpm), None),
+            Err(BootError::Rollback {
+                found: 500_001,
+                min_expected: 500_003,
+            })
+        );
+
+        // Part B: Existing unanchored deployment with `commit_seq = 250` (> legacy 64-step cap)
+        // upgrades cleanly onto a fresh TPM with a single NV increment.
+        let mut legacy_disk = MemDisk::new(4096);
+        let (_, mut sh_leg, mut st_leg) = boot(&mut legacy_disk, &keys(), 1);
+        st_leg.commit_seq = 249;
+        let _ = run(&mut sh_leg, "append /var/legacy250.txt high-seq");
+        match st_leg.commit(&mut legacy_disk, &mut sh_leg, 1).unwrap() {
+            Committed::Written { commit, .. } => {
+                assert_eq!(commit.commit_seq, 250);
+                assert!(!commit.tpm_anchored);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let mut fresh_tpm = TpmTisDriver::new(MemTpmTisBus::new());
+        fresh_tpm.startup(TPM_SU_CLEAR).unwrap();
+        let mut st_up = store();
+        let mut sh_up = Box::new(OsShell::empty());
+        st_up
+            .boot_with_tpm(
+                &mut legacy_disk,
+                &mut sh_up,
+                &keys(),
+                2,
+                Some(&mut fresh_tpm),
+                None,
+            )
+            .expect("boot_with_tpm must anchor high-commit_seq legacy disk without 64-step cap");
+        let _ = run(&mut sh_up, "append /var/legacy250.txt post-anchor");
+        match st_up
+            .commit_with_tpm(&mut legacy_disk, &mut sh_up, 2, Some(&mut fresh_tpm))
+            .expect("commit_with_tpm after high-commit_seq upgrade")
+        {
+            Committed::Written { commit, .. } => {
+                assert!(commit.commit_seq >= 251);
+                assert!(commit.tpm_anchored);
+                assert!(commit.tpm_nv_counter >= 1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operator_reanchor_token_recovers_restored_disk_and_rejects_bad_tokens() {
+        use crate::tpm::{MemTpmTisBus, TpmTisDriver, TPM_NV_INDEX_ROLLBACK_CTR};
+        use cuttle_contracts::TPM_SU_CLEAR;
+
+        let mut tpm = TpmTisDriver::new(MemTpmTisBus::new());
+        tpm.startup(TPM_SU_CLEAR).unwrap();
+
+        let mut disk = MemDisk::new(4096);
+        let mut st = store();
+        let mut sh = Box::new(OsShell::empty());
+        st.boot_with_tpm(&mut disk, &mut sh, &keys(), 1, Some(&mut tpm), None)
+            .unwrap();
+        for i in 1..=3 {
+            let _ = run(&mut sh, &std::format!("write /var/f{i}.txt val{i}"));
+            st.commit_with_tpm(&mut disk, &mut sh, 1, Some(&mut tpm))
+                .unwrap();
+        }
+        assert_eq!(tpm.nv_read_counter(TPM_NV_INDEX_ROLLBACK_CTR).unwrap(), 3);
+
+        // Operator replaces failed disk with a fresh blank disk while TPM counter is `3`:
+        let mut replacement = MemDisk::new(4096);
+        // 1. Without token: refused!
+        let mut st_ref = store();
+        let mut sh_ref = Box::new(OsShell::empty());
+        assert_eq!(
+            st_ref.boot_with_tpm(&mut replacement, &mut sh_ref, &keys(), 2, Some(&mut tpm), None),
+            Err(BootError::TpmAnchor(
+                TpmBootFault::CounterMissingOrUnanchored { tpm_counter: 3 }
+            ))
+        );
+
+        // 2. Wrong counter or wrong key in token: refused with `InvalidReanchorToken`!
+        let bad_ctr_tok = compute_tpm_reanchor_token(&keys().seal, 2);
+        assert_eq!(
+            st_ref.boot_with_tpm(
+                &mut replacement,
+                &mut sh_ref,
+                &keys(),
+                2,
+                Some(&mut tpm),
+                Some(&bad_ctr_tok)
+            ),
+            Err(BootError::TpmAnchor(TpmBootFault::InvalidReanchorToken))
+        );
+        let bad_key_tok = compute_tpm_reanchor_token(&[0xAA; 32], 3);
+        assert_eq!(
+            st_ref.boot_with_tpm(
+                &mut replacement,
+                &mut sh_ref,
+                &keys(),
+                2,
+                Some(&mut tpm),
+                Some(&bad_key_tok)
+            ),
+            Err(BootError::TpmAnchor(TpmBootFault::InvalidReanchorToken))
+        );
+
+        // 3. Valid operator token for `(seal_key, 3)` increments TPM counter to `4` and anchors!
+        let valid_tok = compute_tpm_reanchor_token(&keys().seal, 3);
+        assert!(verify_tpm_reanchor_token(&keys().seal, 3, &valid_tok));
+        let mut st_ok = store();
+        let mut sh_ok = Box::new(OsShell::empty());
+        st_ok
+            .boot_with_tpm(
+                &mut replacement,
+                &mut sh_ok,
+                &keys(),
+                2,
+                Some(&mut tpm),
+                Some(&valid_tok),
+            )
+            .expect("valid operator reanchor token must re-anchor replacement disk");
+        assert_eq!(tpm.nv_read_counter(TPM_NV_INDEX_ROLLBACK_CTR).unwrap(), 4);
+
+        // Subsequent normal boot (`None` token) succeeds cleanly!
+        let mut st_next = store();
+        let mut sh_next = Box::new(OsShell::empty());
+        st_next
+            .boot_with_tpm(&mut replacement, &mut sh_next, &keys(), 3, Some(&mut tpm), None)
+            .expect("re-anchored replacement disk must boot normally without token");
+
+        // Replaying the spent `valid_tok` (`counter = 3`) on another wiped disk fails (`InvalidReanchorToken`)!
+        let mut another_wiped = MemDisk::new(4096);
+        let mut st_replay = store();
+        let mut sh_replay = Box::new(OsShell::empty());
+        assert_eq!(
+            st_replay.boot_with_tpm(
+                &mut another_wiped,
+                &mut sh_replay,
+                &keys(),
+                4,
+                Some(&mut tpm),
+                Some(&valid_tok)
+            ),
+            Err(BootError::TpmAnchor(TpmBootFault::InvalidReanchorToken))
+        );
     }
 }

@@ -642,12 +642,12 @@ pub(crate) fn banner_tpm_nv_rollback() {
         derive_attest_key, derive_legacy_seal_key, derive_seal_key,
     };
     use target_enterprise::state_store::{
-        BootError, Committed, IoFault, SectorIo, ShellKeys, ShellStore, AHCI_STATE_LAYOUT,
-        SECTOR_BYTES,
+        compute_tpm_reanchor_token, BootError, Committed, IoFault, SectorIo, ShellKeys, ShellStore,
+        TpmBootFault, AHCI_STATE_LAYOUT, SECTOR_BYTES,
     };
     use target_enterprise::tpm::{
-        MemTpmTisBus, TpmTisDriver, TPM_NV_INDEX_DEVICE_KEY, TPM_NV_INDEX_ROLLBACK_CTR,
-        TPM_NV_ORDINARY_ATTRS,
+        probe_and_unseal_tpm_nv_device_key, provision_sealed_tpm_nv_device_key,
+        tpm_pcr_extend_sha256_math, MemTpmTisBus, TpmTisDriver, TPM_NV_INDEX_ROLLBACK_CTR,
     };
 
     #[derive(Clone)]
@@ -688,23 +688,32 @@ pub(crate) fn banner_tpm_nv_rollback() {
         panic!("TPM_NV_ROLLBACK: startup failed");
     }
     let master_in = [0x9Cu8; 32];
-    if tpm
-        .nv_define_space(TPM_NV_INDEX_DEVICE_KEY, TPM_NV_ORDINARY_ATTRS, 32)
+    let seal_nonce = [0x24u8; 12];
+    let pcr0_m = [0xA0u8; 32];
+    let pcr7_m = [0xB7u8; 32];
+    let pcr0_boot = tpm_pcr_extend_sha256_math(&[0u8; 32], &pcr0_m);
+    let pcr7_boot = tpm_pcr_extend_sha256_math(&[0u8; 32], &pcr7_m);
+    if tpm.pcr_extend_sha256(0, &pcr0_m).is_err()
+        || tpm.pcr_extend_sha256(7, &pcr7_m).is_err()
+        || provision_sealed_tpm_nv_device_key(
+            &mut tpm,
+            &master_in,
+            &seal_nonce,
+            &pcr0_boot,
+            &pcr7_boot,
+        )
         .is_err()
-        || tpm
-            .nv_write_bytes(TPM_NV_INDEX_DEVICE_KEY, &master_in, 0)
-            .is_err()
     {
-        panic!("TPM_NV_ROLLBACK: NV device-key define/write failed");
+        panic!("TPM_NV_ROLLBACK: sealed NV device-key provision failed");
     }
     let _ = tpm.startup(TPM_SU_CLEAR);
-    let mut master_out = [0u8; 32];
-    if tpm
-        .nv_read_bytes(TPM_NV_INDEX_DEVICE_KEY, 0, &mut master_out)
-        .is_err()
-        || master_out != master_in
-    {
-        panic!("TPM_NV_ROLLBACK: NV device-key readback mismatch");
+    let _ = tpm.pcr_extend_sha256(0, &pcr0_m);
+    let _ = tpm.pcr_extend_sha256(7, &pcr7_m);
+    let Some(master_out) = probe_and_unseal_tpm_nv_device_key(&mut tpm) else {
+        panic!("TPM_NV_ROLLBACK: sealed NV device-key unseal failed");
+    };
+    if master_out != master_in || probe_and_unseal_tpm_nv_device_key(&mut tpm).is_some() {
+        panic!("TPM_NV_ROLLBACK: NV device-key mismatch or read-lock missing");
     }
 
     let keys = ShellKeys {
@@ -715,59 +724,82 @@ pub(crate) fn banner_tpm_nv_rollback() {
 
     let mut disk = MiniDisk::new(1600);
     let mut store = alloc::boxed::Box::new(ShellStore::new(AHCI_STATE_LAYOUT, 1216));
-    let f0 = tpm
-        .nv_ensure_and_read_counter(TPM_NV_INDEX_ROLLBACK_CTR)
-        .expect("TPM_NV_ROLLBACK: ensure counter");
-    if f0 != 0 {
-        panic!("TPM_NV_ROLLBACK: initial counter non-zero");
-    }
-    store.set_min_commit_seq(f0);
     let mut sh = alloc::boxed::Box::new(target_enterprise::OsShell::with_seal_key(keys.seal));
     sh.legacy_seal_key = keys.legacy_seal;
     sh.attest_key = keys.attest;
     sh.set_durable_provisioned(true);
-    if store.boot(&mut disk, &mut sh, &keys, 1).is_err() {
-        panic!("TPM_NV_ROLLBACK: boot #1 failed");
+    if store
+        .boot_with_tpm(&mut disk, &mut sh, &keys, 1, Some(&mut tpm), None)
+        .is_err()
+    {
+        panic!("TPM_NV_ROLLBACK: boot_with_tpm #1 failed");
     }
     let mut out = [0u8; 128];
     sh.exec_line(b"write /var/nv.txt gen1", 1, 0, 0, &mut out);
-    let s1 = match store.commit(&mut disk, &mut sh, 1) {
-        Ok(Committed::Written { commit, .. }) => commit.commit_seq,
-        _ => panic!("TPM_NV_ROLLBACK: commit #1 failed"),
-    };
-    if tpm.nv_advance_counter_to(TPM_NV_INDEX_ROLLBACK_CTR, s1) != Ok(1) {
-        panic!("TPM_NV_ROLLBACK: counter advance #1 failed");
+    match store.commit_with_tpm(&mut disk, &mut sh, 1, Some(&mut tpm)) {
+        Ok(Committed::Written { commit, .. }) if commit.tpm_anchored && commit.tpm_nv_counter == 1 => {}
+        _ => panic!("TPM_NV_ROLLBACK: commit_with_tpm #1 failed"),
     }
     let snapshot_gen1 = disk.clone();
 
     sh.exec_line(b"write /var/nv.txt gen2", 1, 0, 0, &mut out);
-    let s2 = match store.commit(&mut disk, &mut sh, 1) {
-        Ok(Committed::Written { commit, .. }) => commit.commit_seq,
-        _ => panic!("TPM_NV_ROLLBACK: commit #2 failed"),
-    };
-    if tpm.nv_advance_counter_to(TPM_NV_INDEX_ROLLBACK_CTR, s2) != Ok(2) {
-        panic!("TPM_NV_ROLLBACK: counter advance #2 failed");
+    if store
+        .commit_with_tpm(&mut disk, &mut sh, 1, Some(&mut tpm))
+        .is_err()
+    {
+        panic!("TPM_NV_ROLLBACK: commit_with_tpm #2 failed");
+    }
+    sh.exec_line(b"write /var/nv.txt gen3", 1, 0, 0, &mut out);
+    if store
+        .commit_with_tpm(&mut disk, &mut sh, 1, Some(&mut tpm))
+        .is_err()
+        || tpm.nv_read_counter(TPM_NV_INDEX_ROLLBACK_CTR) != Ok(3)
+    {
+        panic!("TPM_NV_ROLLBACK: commit_with_tpm #3 failed");
     }
 
-    // Warm reboot: TPM NV counter stays at 2; replacing disk with gen1 snapshot must be rejected!
+    // Warm reboot: TPM NV counter stays at 3 (`min_expected = 2`); replacing disk with gen1 (`ctr = 1`) must fail!
     let _ = tpm.startup(TPM_SU_CLEAR);
-    let f_reboot = tpm
-        .nv_ensure_and_read_counter(TPM_NV_INDEX_ROLLBACK_CTR)
-        .expect("TPM_NV_ROLLBACK: read reboot counter");
-    if f_reboot != 2 {
-        panic!("TPM_NV_ROLLBACK: counter lost across startup");
-    }
     let mut stale_disk = snapshot_gen1;
     let mut store_rb = alloc::boxed::Box::new(ShellStore::new(AHCI_STATE_LAYOUT, 1216));
-    store_rb.set_min_commit_seq(f_reboot);
     let mut sh_rb = alloc::boxed::Box::new(target_enterprise::OsShell::empty());
-    if store_rb.boot(&mut stale_disk, &mut sh_rb, &keys, 2)
+    if store_rb.boot_with_tpm(&mut stale_disk, &mut sh_rb, &keys, 2, Some(&mut tpm), None)
         != Err(BootError::Rollback {
             found: 1,
             min_expected: 2,
         })
     {
         panic!("TPM_NV_ROLLBACK: whole-disk rollback was not rejected");
+    }
+
+    // Anchored disk without TPM (`None`) must fail closed, and blank disk without re-anchor token must fail closed!
+    if store_rb.boot_with_tpm::<_, MemTpmTisBus>(&mut disk, &mut sh_rb, &keys, 2, None, None)
+        != Err(BootError::TpmAnchor(TpmBootFault::AnchoredDiskMissingTpm))
+    {
+        panic!("TPM_NV_ROLLBACK: missing TPM on anchored disk was not rejected");
+    }
+    let mut wiped_disk = MiniDisk::new(1600);
+    if store_rb.boot_with_tpm(&mut wiped_disk, &mut sh_rb, &keys, 2, Some(&mut tpm), None)
+        != Err(BootError::TpmAnchor(
+            TpmBootFault::CounterMissingOrUnanchored { tpm_counter: 3 },
+        ))
+    {
+        panic!("TPM_NV_ROLLBACK: wiped disk without operator token was not rejected");
+    }
+    let tok = compute_tpm_reanchor_token(&keys.seal, 3);
+    if store_rb
+        .boot_with_tpm(
+            &mut wiped_disk,
+            &mut sh_rb,
+            &keys,
+            2,
+            Some(&mut tpm),
+            Some(&tok),
+        )
+        .is_err()
+        || tpm.nv_read_counter(TPM_NV_INDEX_ROLLBACK_CTR) != Ok(4)
+    {
+        panic!("TPM_NV_ROLLBACK: operator re-anchor token recovery failed");
     }
 
     serial_write_str("TPM_NV_ROLLBACK OK idx=0x01500010 monotonic=verified\n");

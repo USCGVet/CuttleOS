@@ -20,6 +20,9 @@ pub(crate) use crate::*;
 /// QEMU `fw_cfg` selector path carrying the 32-byte CSPRNG device master key.
 pub(crate) const FW_CFG_DEVICE_KEY_PATH: &str = "opt/cuttle_device_key";
 
+/// QEMU `fw_cfg` selector path carrying an optional 48-byte one-time operator TPM re-anchor token.
+pub(crate) const FW_CFG_TPM_REANCHOR_PATH: &str = "opt/cuttle_tpm_reanchor";
+
 /// Cached `(master_key, is_fw_cfg_provisioned)` resolved once on first use during boot
 /// and scrubbed from `.bss` via [`scrub_cached_master_key`] before entering the live network loop.
 static PROVISIONED_MASTER_KEY: spin::Mutex<Option<([u8; 32], bool)>> = spin::Mutex::new(None);
@@ -278,6 +281,17 @@ impl target_enterprise::tpm::TpmTisBus for HwTpmTisBus {
         // are 4-byte aligned within the `0xFED4_0000` MMIO page.
         unsafe { mmio_read32(self.base_phys + (offset as u64)) }
     }
+
+    fn delay_us(&mut self, us: u32) {
+        let mut rem = us;
+        while rem > 0 {
+            // SAFETY: Running at CPL=0; ISA diagnostic port `0x80` read is a side-effect-free
+            // ~1 us I/O bus cycle delay on PC/QEMU/KVM chipsets.
+            let _ = unsafe { inb(0x80) };
+            core::hint::spin_loop();
+            rem -= 1;
+        }
+    }
 }
 
 /// Probe physical TPM 2.0 TIS Locality 0 (`0xFED4_0000`) and harvest 16 random
@@ -288,7 +302,7 @@ pub(crate) fn probe_hw_tpm_random_16() -> Option<(u32, [u8; 16])> {
         base_phys: TPM_TIS_BASE_PHYS,
     });
     let did_vid = drv.probe_did_vid()?;
-    let _ = drv.startup(TPM_SU_CLEAR);
+    let _ = drv.ensure_started();
     let mut rnd = [0u8; 16];
     drv.get_random(&mut rnd).ok()?;
     drv.relinquish_locality_0();
@@ -329,45 +343,54 @@ fn generate_hw_entropy_master_key() -> [u8; 32] {
     out
 }
 
-/// Probe physical TPM 2.0 TIS Locality 0 (`0xFED4_0000`) for a sealed 32-byte out-of-band
-/// device master key stored in NV index `0x0150_0011` (`TPM_NV_INDEX_DEVICE_KEY`) on
-/// non-`fw_cfg` bare-metal / UEFI hardware platforms.
+/// Probe physical TPM 2.0 TIS Locality 0 (`0xFED4_0000`) for a PCR0+PCR7 policy-gated,
+/// AEAD-sealed (`CTK1`) 32-byte device master key stored in NV index `0x0150_0011`
+/// (`TPM_NV_INDEX_DEVICE_KEY`), read-locking the index for the remainder of the boot.
 fn probe_hw_tpm_nv_device_key() -> Option<[u8; 32]> {
     use target_enterprise::tls_provider::{classify_fw_cfg_device_key, FwCfgKeyStatus};
     use target_enterprise::tpm::{
-        TpmTisDriver, TPMA_NV_WRITTEN, TPM_NV_INDEX_DEVICE_KEY, TPM_TIS_BASE_PHYS,
+        probe_and_unseal_tpm_nv_device_key, TpmTisDriver, TPM_TIS_BASE_PHYS,
     };
     let mut drv = TpmTisDriver::new(HwTpmTisBus {
         base_phys: TPM_TIS_BASE_PHYS,
     });
-    let _did_vid = drv.probe_did_vid()?;
-    if drv.startup(cuttle_contracts::TPM_SU_STATE).is_err() {
-        let _ = drv.startup(TPM_SU_CLEAR);
-    }
-    let info = match drv.nv_read_public(TPM_NV_INDEX_DEVICE_KEY) {
-        Ok(i) => i,
-        Err(_) => {
+    let mut raw = match probe_and_unseal_tpm_nv_device_key(&mut drv) {
+        Some(k) => k,
+        None => {
             drv.relinquish_locality_0();
             return None;
         }
     };
-    if info.data_size != 32 || (info.attributes & TPMA_NV_WRITTEN) == 0 {
-        drv.relinquish_locality_0();
-        return None;
-    }
-    let mut raw = [0u8; 32];
-    let read_ok = drv.nv_read_bytes(TPM_NV_INDEX_DEVICE_KEY, 0, &mut raw).is_ok();
     drv.relinquish_locality_0();
-    if !read_ok {
-        target_enterprise::durable_seal::zeroize_secret_bytes(&mut raw);
-        return None;
-    }
     let out = match classify_fw_cfg_device_key(Some((32, &raw))) {
         FwCfgKeyStatus::Valid(valid) => Some(valid),
         _ => None,
     };
     target_enterprise::durable_seal::zeroize_secret_bytes(&mut raw);
     out
+}
+
+/// Read an optional 48-byte operator TPM re-anchor token (`CTTLRA01`) from QEMU `fw_cfg`
+/// (`opt/cuttle_tpm_reanchor`), returning `Err(())` if the entry is present with a bad length.
+pub(crate) fn read_fw_cfg_tpm_reanchor_token(
+) -> Result<Option<[u8; target_enterprise::state_store::TPM_REANCHOR_TOKEN_LEN]>, ()> {
+    use target_enterprise::state_store::TPM_REANCHOR_TOKEN_LEN;
+    let Some((sel, size)) = fw_cfg_select(FW_CFG_TPM_REANCHOR_PATH) else {
+        return Ok(None);
+    };
+    if size as usize != TPM_REANCHOR_TOKEN_LEN {
+        return Err(());
+    }
+    // SAFETY: Running at CPL=0; `FW_CFG_CTL` (0x510) latches the active `fw_cfg` directory stream.
+    unsafe { outw(FW_CFG_CTL, sel) };
+    let mut out = [0u8; TPM_REANCHOR_TOKEN_LEN];
+    let mut i = 0usize;
+    while i < TPM_REANCHOR_TOKEN_LEN {
+        // SAFETY: Running at CPL=0 after latching `sel`; `FW_CFG_DATA` (0x511) streams the blob bytes.
+        out[i] = unsafe { inb(FW_CFG_DATA) };
+        i += 1;
+    }
+    Ok(Some(out))
 }
 
 /// Resolve and return `(master_key, is_fw_cfg_provisioned)`.

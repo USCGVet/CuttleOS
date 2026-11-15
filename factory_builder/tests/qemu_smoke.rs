@@ -2288,6 +2288,165 @@ fn boots_uefi_ovmf_under_qemu_and_emits_banners() {
     );
 }
 
+fn find_swtpm_and_check_qemu_tpmdev(qemu: &Path) -> Option<PathBuf> {
+    let help = Command::new(qemu).args(["-tpmdev", "help"]).output().ok()?;
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    );
+    if !help.status.success() || !combined.contains("emulator") {
+        return None;
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        for cand in ["swtpm", "swtpm.exe"] {
+            let p = dir.join(cand);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+#[test]
+#[ignore = "requires nightly rust-src + factory_builder_pkg + qemu-system-x86_64 (+ swtpm/-tpmdev when supported by host QEMU)"]
+fn swtpm_tis_rollback_and_reanchor_under_qemu_when_supported() {
+    let _guard = QEMU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(qemu) = find_qemu() else {
+        panic!("qemu-system-x86_64 not found");
+    };
+    let Some(swtpm) = find_swtpm_and_check_qemu_tpmdev(&qemu) else {
+        eprintln!(
+            "smoke[swtpm]: SKIPPED (unverified on this host: QEMU binary {} lacks `-tpmdev emulator` or `swtpm` is not installed)",
+            qemu.display()
+        );
+        return;
+    };
+
+    let root = workspace_root();
+    let images_dir = root.join("target").join("cuttle_images");
+    std::fs::create_dir_all(&images_dir).expect("create images_dir");
+    let bios = images_dir.join("qemu_swtpm_bios.img");
+    let kernel_crate = root.join("target_enterprise_kernel");
+    let pkg_crate = factory_builder::locate_pkg_crate().expect("locate_pkg_crate");
+    let elf = factory_builder::build_kernel(&kernel_crate).expect("build_kernel");
+    factory_builder::package_kernel_via_pkg(&pkg_crate, &elf, &bios, None)
+        .expect("package_kernel_via_pkg");
+
+    let swtpm_dir = images_dir.join("swtpm_state");
+    let _ = std::fs::remove_dir_all(&swtpm_dir);
+    std::fs::create_dir_all(&swtpm_dir).expect("create swtpm_dir");
+    let swtpm_sock = swtpm_dir.join("swtpm.sock");
+
+    let ahci_disk = images_dir.join("ahci_swtpm_test.img");
+    std::fs::write(&ahci_disk, vec![0u8; 4 * 1024 * 1024]).expect("init 4 MiB ahci_swtpm_test.img");
+    let key_path = swtpm_dir.join("device_secret_key.bin");
+    factory_builder::ensure_device_secret_key(&key_path).expect("ensure_device_secret_key");
+
+    let boot_with_swtpm = |attach_tpm: bool, reanchor_tok: Option<&Path>| -> String {
+        let mut swtpm_proc = if attach_tpm {
+            let _ = std::fs::remove_file(&swtpm_sock);
+            let child = Command::new(&swtpm)
+                .args(["socket", "--tpm2", "--tpmstate"])
+                .arg(format!("dir={}", swtpm_dir.display()))
+                .arg("--ctrl")
+                .arg(format!("type=unixio,path={}", swtpm_sock.display()))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn swtpm");
+            let sock_deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < sock_deadline && !swtpm_sock.exists() {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Some(child)
+        } else {
+            None
+        };
+
+        let log_path = swtpm_dir.join("serial.log");
+        let _ = std::fs::remove_file(&log_path);
+        let mut cmd = Command::new(&qemu);
+        cmd.args(["-cpu", "qemu64,+rdrand,+smap,+smep", "-smp", "4"])
+            .arg("-fw_cfg")
+            .arg(format!(
+                "name={},file={}",
+                factory_builder::FW_CFG_DEVICE_KEY_NAME,
+                key_path.display()
+            ))
+            .arg("-drive")
+            .arg(format!("format=raw,file={},if=ide", bios.display()))
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=ahd0,format=raw,file={}",
+                ahci_disk.display()
+            ))
+            .args(["-device", "ahci,id=ahci0", "-device", "ide-hd,drive=ahd0,bus=ahci0.0"])
+            .arg("-serial")
+            .arg(format!("file:{}", log_path.display()))
+            .args(["-display", "none", "-no-reboot", "-m", "256M"]);
+        if attach_tpm {
+            cmd.arg("-chardev")
+                .arg(format!("socket,id=chrtpm,path={}", swtpm_sock.display()))
+                .args(["-tpmdev", "emulator,id=tpm0,chardev=chrtpm", "-device", "tpm-tis,tpmdev=tpm0"]);
+        }
+        if let Some(tok) = reanchor_tok {
+            cmd.arg("-fw_cfg").arg(format!(
+                "name={},file={}",
+                factory_builder::FW_CFG_TPM_REANCHOR_NAME,
+                tok.display()
+            ));
+        }
+        let mut qproc = cmd.spawn().expect("spawn qemu with swtpm");
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(120));
+            let s = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if s.contains("CUTTLE-TE HALT") || s.contains("CUTTLE-TE PANIC") {
+                break;
+            }
+            if qproc.try_wait().ok().flatten().is_some() {
+                break;
+            }
+        }
+        let _ = qproc.kill();
+        let _ = qproc.wait();
+        if let Some(mut sp) = swtpm_proc.take() {
+            let _ = sp.kill();
+            let _ = sp.wait();
+        }
+        std::fs::read_to_string(&log_path).unwrap_or_default()
+    };
+
+    // Boot #1 (commits twice during boot: fixture commit + end-of-boot stamp -> ctr=2), snapshot!
+    let log1 = boot_with_swtpm(true, None);
+    assert!(log1.contains("CUTTLE-TE HALT"), "swtpm boot #1 failed:\n{log1}");
+    let snap1 = std::fs::read(&ahci_disk).unwrap();
+
+    // Boot #2 & Boot #3 advance TPM NV counter past snap1 + 1:
+    let log2 = boot_with_swtpm(true, None);
+    assert!(log2.contains("CUTTLE-TE HALT") && log2.contains("SHELL resume OK"), "swtpm boot #2 failed:\n{log2}");
+    let log3 = boot_with_swtpm(true, None);
+    assert!(log3.contains("CUTTLE-TE HALT") && log3.contains("SHELL resume OK"), "swtpm boot #3 failed:\n{log3}");
+
+    // Missing TPM on anchored disk MUST fail closed:
+    let log_no_tpm = boot_with_swtpm(false, None);
+    assert!(
+        log_no_tpm.contains("STORAGE FAULT: TPM-anchored disk requires TPM 2.0 at 0xFED40000"),
+        "anchored disk booted without TPM!\n{log_no_tpm}"
+    );
+
+    // Replaying snap1 against higher TPM counter MUST fail closed:
+    std::fs::write(&ahci_disk, &snap1).unwrap();
+    let log_rb = boot_with_swtpm(true, None);
+    assert!(
+        log_rb.contains("STORAGE FAULT: whole-disk rollback detected"),
+        "swtpm snapshot rollback was not rejected!\n{log_rb}"
+    );
+}
+
 #[test]
 fn workspace_root_has_kernel_and_pkg_dirs() {
     // Cheap non-ignored test: at least confirm the directory layout is

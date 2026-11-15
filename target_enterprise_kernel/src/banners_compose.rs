@@ -646,93 +646,34 @@ fn persist_error_str(e: &target_enterprise::state_store::PersistError) -> &'stat
         PersistError::StoreFaulted => {
             "an earlier commit failed; the store takes no more writes until the next boot recovers it"
         }
-    }
-}
-
-/// Synchronize `SHELL_STORE.min_commit_seq` from hardware TPM 2.0 NV monotonic counter
-/// `0x0150_0010` when a physical or `swtpm` TIS controller is present at `0xFED4_0000`.
-fn sync_hw_tpm_rollback_floor_on_boot() {
-    use target_enterprise::tpm::{
-        TpmTisDriver, TPM_NV_INDEX_ROLLBACK_CTR, TPM_TIS_BASE_PHYS,
-    };
-    let mut drv = TpmTisDriver::new(HwTpmTisBus {
-        base_phys: TPM_TIS_BASE_PHYS,
-    });
-    if drv.probe_did_vid().is_none() {
-        return;
-    }
-    if drv.startup(cuttle_contracts::TPM_SU_STATE).is_err() {
-        let _ = drv.startup(TPM_SU_CLEAR);
-    }
-    match drv.nv_ensure_and_read_counter(TPM_NV_INDEX_ROLLBACK_CTR) {
-        Ok(floor) => {
-            if floor > 0 {
-                let mut store = SHELL_STORE.lock();
-                if floor > store.min_commit_seq() {
-                    store.set_min_commit_seq(floor);
-                }
-            }
-        }
-        // A TPM answered the probe and then could not give the counter. The
-        // boot goes on without a floor (see Claude-Recommendations.md: this
-        // path is fail-open), but it does not go on silently.
-        Err(_) => serial_write_str(
-            "TPM WARNING: rollback counter unreadable; booting without an anti-rollback floor
-",
-        ),
-    }
-    drv.relinquish_locality_0();
-}
-
-/// Advance hardware TPM 2.0 NV monotonic counter `0x0150_0010` to `new_seq` after a
-/// durable disk commit succeeds when a physical TIS controller is attached.
-fn advance_hw_tpm_rollback_counter_on_commit(new_seq: u64) {
-    use target_enterprise::tpm::{
-        TpmTisDriver, TPM_NV_INDEX_ROLLBACK_CTR, TPM_TIS_BASE_PHYS,
-    };
-    let mut drv = TpmTisDriver::new(HwTpmTisBus {
-        base_phys: TPM_TIS_BASE_PHYS,
-    });
-    if drv.probe_did_vid().is_none() {
-        return;
-    }
-    if drv
-        .nv_advance_counter_to(TPM_NV_INDEX_ROLLBACK_CTR, new_seq)
-        .is_err()
-    {
-        // The commit itself is durable; what is lost is the floor that would
-        // catch a later rollback of the disk to before it. Say so once per
-        // boot rather than once per commit.
-        static WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-        if !WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-            serial_write_str(
-                "TPM WARNING: rollback counter not advanced; the anti-rollback floor is stale
-",
-            );
+        PersistError::TpmAnchor(_) => {
+            "hardware TPM 2.0 anti-rollback counter advance failed (NV 0x01500010)"
         }
     }
-    drv.relinquish_locality_0();
 }
 
-/// Commit the shell's state to the AHCI disk, stamped with generation `boots`.
+/// Commit the shell's state to the AHCI disk, stamped with generation `boots`,
+/// advancing and binding hardware TPM 2.0 NV monotonic counter `0x0150_0010` when present.
 /// Returns once the state is durable in both slots, or says why it is not.
 pub(crate) fn persist_shell_to_ahci(
     sh: &mut target_enterprise::OsShell,
     boots: u64,
 ) -> Result<target_enterprise::state_store::Committed, target_enterprise::state_store::PersistError>
 {
-    use target_enterprise::state_store::{CommitError, CommitStage, Committed, PersistError};
+    use target_enterprise::state_store::{CommitError, CommitStage, PersistError};
+    use target_enterprise::tpm::{TpmTisDriver, TPM_TIS_BASE_PHYS};
     let mut disk = StorageDisk::state_disk().map_err(|fault| {
         PersistError::Commit(CommitError::Io {
             stage: CommitStage::Stage,
             fault,
         })
     })?;
-    let res = SHELL_STORE.lock().commit(&mut disk, sh, boots)?;
-    if let Committed::Written { ref commit, .. } = res {
-        advance_hw_tpm_rollback_counter_on_commit(commit.commit_seq);
-    }
-    Ok(res)
+    let mut tpm = TpmTisDriver::new(HwTpmTisBus {
+        base_phys: TPM_TIS_BASE_PHYS,
+    });
+    SHELL_STORE
+        .lock()
+        .commit_with_tpm(&mut disk, sh, boots, Some(&mut tpm))
 }
 
 /// Make the shell's state durable if anything durable changed since the last
@@ -792,11 +733,31 @@ pub(crate) fn shell_store_boot() {
         return;
     }
 
-    sync_hw_tpm_rollback_floor_on_boot();
+    let mut reanchor_tok = match crate::provisioning::read_fw_cfg_tpm_reanchor_token() {
+        Ok(tok) => tok,
+        Err(()) => storage_fault(
+            "TPM re-anchor token invalid (opt/cuttle_tpm_reanchor must be 48 bytes)",
+        ),
+    };
     let booted = match StorageDisk::state_disk() {
-        Ok(mut disk) => SHELL_STORE.lock().boot(&mut disk, sh, &keys, counter),
+        Ok(mut disk) => {
+            let mut tpm = target_enterprise::tpm::TpmTisDriver::new(HwTpmTisBus {
+                base_phys: target_enterprise::tpm::TPM_TIS_BASE_PHYS,
+            });
+            SHELL_STORE.lock().boot_with_tpm(
+                &mut disk,
+                sh,
+                &keys,
+                counter,
+                Some(&mut tpm),
+                reanchor_tok.as_ref(),
+            )
+        }
         Err(fault) => Err(BootError::Io(fault)),
     };
+    if let Some(ref mut tok_bytes) = reanchor_tok {
+        target_enterprise::durable_seal::zeroize_secret_bytes(tok_bytes);
+    }
     let report = match booted {
         Ok(r) => r,
         Err(BootError::KeyUnset) => storage_fault("seal key unset at boot"),
@@ -804,7 +765,7 @@ pub(crate) fn shell_store_boot() {
         Err(BootError::Io(_)) => storage_fault("state disk unusable at boot"),
         Err(BootError::Persist(e)) => storage_fault(persist_error_str(&e)),
         Err(BootError::Rollback { .. }) => {
-            storage_fault("whole-disk rollback detected (commit_seq below floor)")
+            storage_fault("whole-disk rollback detected (commit counter below floor)")
         }
         // The node did not start over. Doing so would put a fresh page store on
         // top of the SQL rows and files that are still on this disk.
@@ -814,6 +775,23 @@ pub(crate) fn shell_store_boot() {
         Err(BootError::PagedStore(PagedBootFault::Unanchored)) => storage_fault(
             "state cannot be authenticated and the page store holds data (nothing was started over; check the device key)",
         ),
+        Err(BootError::TpmAnchor(target_enterprise::state_store::TpmBootFault::AnchoredDiskMissingTpm)) => {
+            storage_fault("TPM-anchored disk requires TPM 2.0 at 0xFED40000 (device absent)")
+        }
+        Err(BootError::TpmAnchor(target_enterprise::state_store::TpmBootFault::TpmDeviceError(_))) => {
+            storage_fault("TPM 2.0 communication or NV error while verifying anti-rollback anchor")
+        }
+        Err(BootError::TpmAnchor(
+            target_enterprise::state_store::TpmBootFault::CounterMissingOrUnanchored { .. },
+        )) => storage_fault(
+            "TPM 2.0 anti-rollback counter mismatch (missing NV 0x01500010 or unanchored disk; supply opt/cuttle_tpm_reanchor to re-anchor)",
+        ),
+        Err(BootError::TpmAnchor(target_enterprise::state_store::TpmBootFault::DiskAheadOfTpm { .. })) => {
+            storage_fault("disk commit counter is ahead of hardware TPM 2.0 NV 0x01500010")
+        }
+        Err(BootError::TpmAnchor(target_enterprise::state_store::TpmBootFault::InvalidReanchorToken)) => {
+            storage_fault("TPM re-anchor token rejected (magic, counter, or HMAC mismatch)")
+        }
     };
 
     if report.boots != counter {

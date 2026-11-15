@@ -363,6 +363,10 @@ pub mod ab_journal {
         pub fs_tag: [u8; AEAD_TAG_LEN],
         /// 128-bit `Poly1305` authentication tag over the encrypted SQL partition (`[0; 16]` in v1/v2).
         pub sql_tag: [u8; AEAD_TAG_LEN],
+        /// Whether this commit record is cryptographically anchored to a hardware TPM 2.0 NV monotonic counter.
+        pub tpm_anchored: bool,
+        /// Hardware TPM 2.0 NV monotonic counter value (`0x0150_0010`) bound into this commit (`0` when `!tpm_anchored`).
+        pub tpm_nv_counter: u64,
     }
 
     impl AbCommitHeader {
@@ -388,7 +392,16 @@ pub mod ab_journal {
                 wal_tag: [0u8; AEAD_TAG_LEN],
                 fs_tag: [0u8; AEAD_TAG_LEN],
                 sql_tag: [0u8; AEAD_TAG_LEN],
+                tpm_anchored: false,
+                tpm_nv_counter: 0,
             }
+        }
+
+        /// Return a copy of `self` with the TPM 2.0 NV anti-rollback anchor fields set.
+        pub const fn with_tpm_anchor(mut self, tpm_anchored: bool, tpm_nv_counter: u64) -> Self {
+            self.tpm_anchored = tpm_anchored;
+            self.tpm_nv_counter = if tpm_anchored { tpm_nv_counter } else { 0 };
+            self
         }
     }
 
@@ -428,6 +441,7 @@ pub mod ab_journal {
             || (hdr.format_version != AB_FORMAT_V1
                 && hdr.format_version != AB_FORMAT_V2
                 && hdr.format_version != AB_FORMAT_V3)
+            || (hdr.tpm_anchored && hdr.format_version != AB_FORMAT_V3)
         {
             return false;
         }
@@ -448,11 +462,17 @@ pub mod ab_journal {
         out[96..128].copy_from_slice(&hdr.sql_sha);
         let mut mac = [0u8; DURABLE_DIGEST_LEN];
         if hdr.format_version == AB_FORMAT_V3 {
+            out[10] = u8::from(hdr.tpm_anchored);
             out[160..172].copy_from_slice(&hdr.aead_nonce);
             out[172..188].copy_from_slice(&hdr.wal_tag);
             out[188..204].copy_from_slice(&hdr.fs_tag);
             out[204..220].copy_from_slice(&hdr.sql_tag);
-            hmac_sha256_parts(key, &[&out[0..128], &out[160..220]], &mut mac);
+            if hdr.tpm_anchored {
+                out[220..228].copy_from_slice(&hdr.tpm_nv_counter.to_le_bytes());
+                hmac_sha256_parts(key, &[&out[0..128], &out[160..228]], &mut mac);
+            } else {
+                hmac_sha256_parts(key, &[&out[0..128], &out[160..220]], &mut mac);
+            }
         } else {
             seal_bytes_keyed(key, &out[0..128], &mut mac);
         }
@@ -480,12 +500,27 @@ pub mod ab_journal {
         };
         let mut expected_mac = [0u8; DURABLE_DIGEST_LEN];
         expected_mac.copy_from_slice(&sec[128..160]);
+        let mut tpm_anchored = false;
+        let mut tpm_nv_counter = 0u64;
         if format_version == AB_FORMAT_V3 {
-            if !sec[220..512].iter().all(|&b| b == 0) {
+            tpm_anchored = match sec[10] {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            if !sec[11..16].iter().all(|&b| b == 0) {
+                return None;
+            }
+            let tail_zero_start = if tpm_anchored { 228 } else { 220 };
+            if !sec[tail_zero_start..512].iter().all(|&b| b == 0) {
                 return None;
             }
             let mut actual_mac = [0u8; DURABLE_DIGEST_LEN];
-            hmac_sha256_parts(key, &[&sec[0..128], &sec[160..220]], &mut actual_mac);
+            hmac_sha256_parts(
+                key,
+                &[&sec[0..128], &sec[160..tail_zero_start]],
+                &mut actual_mac,
+            );
             if !constant_time_eq(&actual_mac, &expected_mac) {
                 return None;
             }
@@ -511,6 +546,11 @@ pub mod ab_journal {
             wal_tag.copy_from_slice(&sec[172..188]);
             fs_tag.copy_from_slice(&sec[188..204]);
             sql_tag.copy_from_slice(&sec[204..220]);
+            if tpm_anchored {
+                let mut ctr_b = [0u8; 8];
+                ctr_b.copy_from_slice(&sec[220..228]);
+                tpm_nv_counter = u64::from_le_bytes(ctr_b);
+            }
         }
         Some(AbCommitHeader {
             state,
@@ -524,6 +564,8 @@ pub mod ab_journal {
             wal_tag,
             fs_tag,
             sql_tag,
+            tpm_anchored,
+            tpm_nv_counter,
         })
     }
 
@@ -945,6 +987,8 @@ mod tests {
             wal_tag: [0xB1; 16],
             fs_tag: [0xB2; 16],
             sql_tag: [0xB3; 16],
+            tpm_anchored: false,
+            tpm_nv_counter: 0,
         };
         let mut sec = [0u8; 512];
         assert!(pack_ab_commit_sector(&key, &hdr, &mut sec));
@@ -957,6 +1001,45 @@ mod tests {
             assert!(
                 verify_ab_commit_sector(&key, &bad).is_none(),
                 "tampering byte {tamper_off} must invalidate AB_FORMAT_V3 commit sector"
+            );
+        }
+    }
+
+    #[test]
+    fn ab_format_v3_tpm_anchor_binds_flag_and_counter_under_hmac() {
+        use super::ab_journal::*;
+        let key = derive_seal_key(&DEFAULT_DURABLE_SEAL_KEY, b"v3-tpm-anchor");
+        let hdr = AbCommitHeader {
+            state: AB_STATE_QUIESCENT,
+            format_version: AB_FORMAT_V3,
+            boots: 9,
+            commit_seq: 251,
+            wal_sha: [0x11; 32],
+            fs_sha: [0x22; 32],
+            sql_sha: [0x33; 32],
+            aead_nonce: [0xA5; 12],
+            wal_tag: [0xB1; 16],
+            fs_tag: [0xB2; 16],
+            sql_tag: [0xB3; 16],
+            tpm_anchored: true,
+            tpm_nv_counter: 500_007,
+        };
+        let mut sec = [0u8; 512];
+        assert!(pack_ab_commit_sector(&key, &hdr, &mut sec));
+        assert_eq!(sec[10], 1);
+        let decoded = verify_ab_commit_sector(&key, &sec).expect("anchored v3 sector must verify");
+        assert_eq!(decoded, hdr);
+        assert!(decoded.tpm_anchored);
+        assert_eq!(decoded.tpm_nv_counter, 500_007);
+
+        // Tampering `tpm_anchored` (`sec[10]`), reserved bytes (`sec[11]`),
+        // `tpm_nv_counter` (`sec[220..228]`), or trailing zeros (`sec[228]`) must fail HMAC/zero check.
+        for tamper_off in [10usize, 11, 220, 227, 228] {
+            let mut bad = sec;
+            bad[tamper_off] ^= 0x01;
+            assert!(
+                verify_ab_commit_sector(&key, &bad).is_none(),
+                "tampering byte {tamper_off} must invalidate anchored AB_FORMAT_V3 commit sector"
             );
         }
     }
