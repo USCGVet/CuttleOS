@@ -1170,6 +1170,26 @@ pub enum PersistError {
     Pack(StatePackError),
     /// The store refused or failed the commit.
     Commit(CommitError),
+    /// An earlier commit on this store failed at the device, so what the disk
+    /// holds is undecided until recovery runs. The store refuses to write
+    /// again before the next [`ShellStore::boot`]; this call wrote nothing.
+    ///
+    /// Writing again without recovering first is how a failed commit becomes
+    /// lost data: the retry stages over the one slot that still holds a
+    /// complete image, and re-uses page-store slots the interrupted commit
+    /// may already have made the committed ones.
+    StoreFaulted,
+}
+
+/// Why the page store (`LBA 2048..`) stopped a boot. See [`BootError::PagedStore`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PagedBootFault {
+    /// The state was authenticated, and the page store does not hold the
+    /// epoch that state anchors (a damaged page with no redo copy, a missing
+    /// or replayed superblock, or a device too small for it).
+    AnchorMismatch,
+    /// The state could not be authenticated, and the page store holds data.
+    Unanchored,
 }
 
 /// Why [`ShellStore::boot`] could not decide what to start from.
@@ -1191,6 +1211,18 @@ pub enum BootError {
         /// Minimum `commit_seq` required by the external high-water mark.
         min_expected: u64,
     },
+    /// The page store holds data this boot cannot use, and the node did not
+    /// start over on top of it. (Recovery may already have repaired a slot or
+    /// a page from its own authenticated copy; nothing else was written.)
+    ///
+    /// The small state slots are copied to the quarantine area before a
+    /// rejected boot starts over, so nothing is lost by starting over. The
+    /// page store (SQL rows and file contents) is far larger than any spare
+    /// area, and a node that started over would overwrite it with its first
+    /// commit. So this is an error, not a [`BootOutcome::Rejected`]: the
+    /// operator repairs the cause (the wrong device key is the common one) or
+    /// replaces the disk, and until then every byte is still there.
+    PagedStore(PagedBootFault),
 }
 
 /// What a successful [`ShellStore::commit`] did.
@@ -1222,6 +1254,9 @@ pub struct ShellStore {
     durable_anchor: crate::paged_store::PagedAnchor,
     /// Page-granular encrypted CoW + CWAL block engine (`LBA 2048..` when disk `>= 4096` sectors).
     paged: crate::paged_store::PagedBlockStore,
+    /// A commit failed at the device since the last [`ShellStore::boot`].
+    /// See [`PersistError::StoreFaulted`].
+    faulted: bool,
     image: StateImage,
 }
 
@@ -1236,8 +1271,16 @@ impl ShellStore {
             stored_plain: None,
             durable_anchor: crate::paged_store::PagedAnchor::zero(),
             paged: crate::paged_store::PagedBlockStore::new(),
+            faulted: false,
             image: StateImage::zeroed(),
         }
+    }
+
+    /// Whether a commit has failed at the device since the last
+    /// [`ShellStore::boot`]. While it has, [`ShellStore::commit`] returns
+    /// [`PersistError::StoreFaulted`] without writing.
+    pub const fn is_faulted(&self) -> bool {
+        self.faulted
     }
 
     /// Borrow the underlying page-granular CoW + CWAL block storage engine.
@@ -1288,7 +1331,23 @@ impl ShellStore {
                     fault: IoFault::DeviceError,
                 })
             }
+            PagedStoreError::VerifyFailed => PersistError::Commit(CommitError::Verify {
+                stage: CommitStage::Stage,
+            }),
         }
+    }
+
+    /// Whether a page-store error can have left the device part-written.
+    /// The others are refused before the first write.
+    fn paged_err_touched_device(err: &crate::paged_store::PagedStoreError) -> bool {
+        use crate::paged_store::PagedStoreError;
+        matches!(
+            err,
+            PagedStoreError::Io(_)
+                | PagedStoreError::VerifyFailed
+                | PagedStoreError::CorruptOrTampered
+                | PagedStoreError::RollbackOrAnchorMismatch
+        )
     }
 
     fn hydrate_paged_into<D: SectorIo>(
@@ -1340,6 +1399,9 @@ impl ShellStore {
         sh: &mut OsShell,
         boots: u64,
     ) -> Result<Committed, PersistError> {
+        if self.faulted {
+            return Err(PersistError::StoreFaulted);
+        }
         let key = sh.seal_key;
         if !is_seal_key_set(&key) {
             self.stored_plain = None;
@@ -1369,7 +1431,10 @@ impl ShellStore {
                     .recover_at_anchor(dev, &key, &self.durable_anchor)
                 {
                     Ok(_) => sh.mark_all_paged_dirty(),
-                    Err(e) => return Err(Self::map_paged_commit_err(e)),
+                    Err(e) => {
+                        self.faulted |= Self::paged_err_touched_device(&e);
+                        return Err(Self::map_paged_commit_err(e));
+                    }
                 }
             } else if sh.paged_anchor() != self.durable_anchor {
                 sh.mark_all_paged_dirty();
@@ -1401,6 +1466,7 @@ impl ShellStore {
                 match self.paged.commit_dirty(dev, &key, boots) {
                     Ok(anchor) => sh.set_paged_anchor(anchor),
                     Err(e) => {
+                        self.faulted |= Self::paged_err_touched_device(&e);
                         sh.set_paged_anchor(self.durable_anchor);
                         sh.mark_all_paged_dirty();
                         return Err(Self::map_paged_commit_err(e));
@@ -1454,8 +1520,10 @@ impl ShellStore {
             }
             Err(e) => {
                 // The slots are in an unknown intermediate state until the
-                // next recovery; forget what we believed was stored.
+                // next recovery; forget what we believed was stored, and do
+                // not write over them again before that recovery has run.
                 self.stored_plain = None;
+                self.faulted |= matches!(e, CommitError::Io { .. } | CommitError::Verify { .. });
                 if paged_cap {
                     sh.set_paged_anchor(self.durable_anchor);
                     sh.mark_all_paged_dirty();
@@ -1585,6 +1653,9 @@ impl ShellStore {
         if recovery.source == RecoverySource::Empty {
             return Ok(None);
         }
+        // Set when a slot authenticated and unpacked, but the page store does
+        // not hold the epoch it anchors.
+        let mut pages_missing = false;
         if let Ok(legacy_plain) =
             self.decrypt_slot_if_needed(&keys.seal, recovery.commit.as_ref())
         {
@@ -1594,7 +1665,7 @@ impl ShellStore {
                         restore.migrated_legacy |= legacy_plain;
                         return Ok(Some((recovery, restore, boots)));
                     }
-                    Ok(false) => {}
+                    Ok(false) => pages_missing = true,
                     Err(f) => return Err(BootError::Io(f)),
                 }
             }
@@ -1612,11 +1683,17 @@ impl ShellStore {
                             restore.migrated_legacy |= legacy_plain;
                             return Ok(Some((recovery, restore, boots)));
                         }
-                        Ok(false) => {}
+                        Ok(false) => pages_missing = true,
                         Err(f) => return Err(BootError::Io(f)),
                     }
                 }
             }
+        }
+        if pages_missing {
+            // The state is genuine; part of what it refers to is not there.
+            // That is not "a disk this boot cannot authenticate": report it,
+            // and let nothing start over on top of the pages that remain.
+            return Err(BootError::PagedStore(PagedBootFault::AnchorMismatch));
         }
         Ok(None)
     }
@@ -1789,6 +1866,8 @@ impl ShellStore {
         self.stored_plain = None;
         self.durable_anchor = crate::paged_store::PagedAnchor::zero();
         self.paged.reset();
+        // Recovery below settles whatever a failed commit left behind.
+        self.faulted = false;
         if !is_seal_key_set(&keys.seal) {
             return Err(BootError::KeyUnset);
         }
@@ -1839,9 +1918,17 @@ impl ShellStore {
             });
         }
 
-        let found = match self.recover_and_load(dev, &layout, sh, keys, counter_boots)? {
-            Some(v) => Some(v),
-            None => self.try_migrate_v1(dev, sh, keys, counter_boots)?,
+        let found = match self.recover_and_load(dev, &layout, sh, keys, counter_boots) {
+            Ok(Some(v)) => Some(v),
+            Ok(None) => self.try_migrate_v1(dev, sh, keys, counter_boots)?,
+            Err(e) => {
+                if matches!(e, BootError::PagedStore(_)) {
+                    self.paged.reset();
+                    self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+                    reset_shell(sh, keys, counter_boots);
+                }
+                return Err(e);
+            }
         };
         if let Some((recovery, restore, boots)) = found {
             let found_seq = recovery.commit.map(|h| h.commit_seq).unwrap_or(0);
@@ -1857,6 +1944,22 @@ impl ShellStore {
                     found: found_seq,
                     min_expected: self.min_commit_seq,
                 });
+            }
+            // The state came from the shadow slot and the device refused to
+            // let the primary slot be rewritten from it. The shadow slot is
+            // then the only complete copy, and it is exactly where the next
+            // commit stages its image: one power cut during that write would
+            // leave no copy at all. A node in this condition must not commit,
+            // so it must not serve.
+            if !recovery.repaired_primary
+                && matches!(
+                    recovery.source,
+                    RecoverySource::ShadowHeal | RecoverySource::JournalReplay
+                )
+            {
+                if let Some(fault) = recovery.repair_fault {
+                    return Err(BootError::Io(fault));
+                }
             }
             self.commit_seq = found_seq;
             sh.commit_seq = found_seq;
@@ -1894,9 +1997,15 @@ impl ShellStore {
         // The store holds something this boot cannot authenticate.
         if quarantine_present(dev, self.quarantine_lba).map_err(BootError::Io)? {
             let q_layout = quarantine_layout(self.quarantine_lba);
-            if let Some((recovery, restore, boots)) =
-                self.recover_and_load(dev, &q_layout, sh, keys, counter_boots)?
-            {
+            let from_quarantine =
+                match self.recover_and_load(dev, &q_layout, sh, keys, counter_boots) {
+                    Ok(v) => v,
+                    // The quarantined copy is genuine but the pages it anchors
+                    // are no longer on this disk: it cannot be restored.
+                    Err(BootError::PagedStore(_)) => None,
+                    Err(e) => return Err(e),
+                };
+            if let Some((recovery, restore, boots)) = from_quarantine {
                 let found_seq = recovery.commit.map(|h| h.commit_seq).unwrap_or(0);
                 if found_seq < self.min_commit_seq {
                     self.paged.reset();
@@ -1929,6 +2038,29 @@ impl ShellStore {
                     boots,
                 });
             }
+        }
+        // An external high-water mark says this node has committed state. A
+        // disk that cannot be authenticated is then no reason to start again
+        // from sequence zero: the node would serve defaults in place of state
+        // the mark proves existed, and its own next boot would find a
+        // sequence below the mark and refuse. Same answer as for a wiped disk.
+        if self.min_commit_seq > 0 {
+            self.paged.reset();
+            self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+            reset_shell(sh, keys, counter_boots);
+            return Err(BootError::Rollback {
+                found: 0,
+                min_expected: self.min_commit_seq,
+            });
+        }
+        // Starting over is only acceptable when nothing is lost by it. The
+        // slots are small enough to copy aside; the page store is not, and
+        // the first commit of a fresh node would write over it.
+        if paged_cap && !paged_blank {
+            self.paged.reset();
+            self.durable_anchor = crate::paged_store::PagedAnchor::zero();
+            reset_shell(sh, keys, counter_boots);
+            return Err(BootError::PagedStore(PagedBootFault::Unanchored));
         }
         // Keep a copy before this boot's first commit overwrites the slots.
         // `quarantine` leaves an existing copy alone.
@@ -3405,21 +3537,305 @@ mod node_tests {
 
     #[test]
     fn failed_commit_is_reported_and_the_next_boot_is_consistent() {
-        let mut disk = disk_with_one();
-        let (_, mut sh, mut st) = boot(&mut disk, &keys(), 2);
+        // Count the operations of the commit that will be made to fail.
+        let mut dry = disk_with_one();
+        let (_, mut sh, mut st) = boot(&mut dry, &keys(), 2);
         apply_generation(&mut sh, "two");
-        disk.io_error_at = Some(disk.ops + 40);
-        let err = st.commit(&mut disk, &mut sh, 2).expect_err("device error");
-        assert!(matches!(err, PersistError::Commit(CommitError::Io { .. })), "{err:?}");
-        // The store no longer claims to know what is on disk, so a retry
-        // really writes instead of reporting "unchanged".
+        dry.ops = 0;
+        st.commit(&mut dry, &mut sh, 2).expect("dry run");
+        let total = dry.ops;
+
+        let (mut old, mut new) = (0usize, 0usize);
+        for fail_at in 0..total {
+            let mut disk = disk_with_one();
+            let (_, mut sh, mut st) = boot(&mut disk, &keys(), 2);
+            apply_generation(&mut sh, "two");
+            disk.ops = 0;
+            disk.io_error_at = Some(fail_at);
+            let err = st.commit(&mut disk, &mut sh, 2).expect_err("device error");
+            assert!(
+                matches!(err, PersistError::Commit(CommitError::Io { .. })),
+                "op {fail_at}: {err:?}"
+            );
+            assert!(st.is_faulted(), "op {fail_at}");
+
+            // What the disk holds is undecided until recovery runs. The store
+            // neither reports "unchanged" nor writes over the slots again: a
+            // second attempt would stage over the one slot that may be the
+            // only complete copy.
+            let ops_before = disk.ops;
+            assert_eq!(
+                st.commit(&mut disk, &mut sh, 2),
+                Err(PersistError::StoreFaulted),
+                "op {fail_at}"
+            );
+            assert_eq!(disk.ops, ops_before, "op {fail_at}: a refused commit touched the device");
+
+            // The next boot settles it: the old state or the new one, whole.
+            disk.reboot();
+            let (report, mut sh2, mut st2) = boot(&mut disk, &keys(), 3);
+            assert!(
+                matches!(report.outcome, BootOutcome::Restored { .. }),
+                "op {fail_at}: {:?}",
+                report.outcome
+            );
+            match generation(&mut sh2).as_str() {
+                "one" => old += 1,
+                "two" => new += 1,
+                other => panic!("op {fail_at}: {other}"),
+            }
+
+            // And the store takes commits again.
+            assert!(!st2.is_faulted());
+            apply_generation(&mut sh2, "three");
+            assert!(matches!(
+                st2.commit(&mut disk, &mut sh2, 3).expect("commit after recovery"),
+                Committed::Written { .. }
+            ));
+            disk.reboot();
+            let (_, mut sh3, _) = boot(&mut disk, &keys(), 4);
+            assert_eq!(generation(&mut sh3), "three", "op {fail_at}");
+        }
+        assert!(old > 0 && new > 0, "old={old} new={new}");
+    }
+
+    /// The state is in the shadow slot only, and the device will not let the
+    /// primary slot be rewritten from it. The next commit would stage its
+    /// image over that shadow slot, so a node in this condition must not
+    /// come up as if it were healthy.
+    #[test]
+    fn a_primary_slot_the_device_will_not_let_be_repaired_stops_the_boot() {
+        let damaged = || {
+            let mut d = disk_with_one();
+            d.poke(AHCI_STATE_LAYOUT.primary_lba + 1, |s| s[8] ^= 0xFF);
+            d
+        };
+        let mut dry = damaged();
+        let (report, _, _) = boot(&mut dry, &keys(), 2);
         assert!(matches!(
-            st.commit(&mut disk, &mut sh, 2).expect("retry"),
-            Committed::Written { .. }
+            report.outcome,
+            BootOutcome::Restored {
+                source: RecoverySource::ShadowHeal,
+                repaired_primary: true,
+                ..
+            }
         ));
+        let total = dry.ops;
+
+        let (mut stopped, mut served) = (0usize, 0usize);
+        for fail_at in 0..total {
+            let mut disk = damaged();
+            disk.io_error_at = Some(fail_at);
+            let mut sh = Box::new(OsShell::empty());
+            let mut st = store();
+            match st.boot(&mut disk, &mut sh, &keys(), 2) {
+                Ok(report) => {
+                    served += 1;
+                    if let BootOutcome::Restored {
+                        source,
+                        repaired_primary,
+                        ..
+                    } = report.outcome
+                    {
+                        let from_shadow = matches!(
+                            source,
+                            RecoverySource::ShadowHeal | RecoverySource::JournalReplay
+                        );
+                        assert!(
+                            !from_shadow || repaired_primary,
+                            "error at op {fail_at}: serving from the shadow slot with the primary slot still damaged"
+                        );
+                    }
+                    assert_eq!(generation(&mut sh), "one", "error at op {fail_at}");
+                }
+                Err(e) => {
+                    stopped += 1;
+                    assert!(matches!(e, BootError::Io(_)), "error at op {fail_at}: {e:?}");
+                }
+            }
+            // Whatever this boot did, the state is still there for the next one.
+            disk.reboot();
+            let (_, mut sh2, _) = boot(&mut disk, &keys(), 3);
+            assert_eq!(generation(&mut sh2), "one", "error at op {fail_at}");
+        }
+        assert!(stopped > 0 && served > 0, "stopped={stopped} served={served}");
+    }
+
+    #[test]
+    fn an_unverifiable_disk_is_not_restarted_from_zero_under_a_rollback_floor() {
+        let mut disk = disk_with_one();
+        disk.poke(AHCI_STATE_LAYOUT.primary_lba + 3, |s| s[1] ^= 0xFF);
+        disk.poke(AHCI_STATE_LAYOUT.shadow_lba + 3, |s| s[1] ^= 0xFF);
+        let before: Vec<_> = (0..DISK_SECTORS as u64).map(|l| disk.peek(l)).collect();
+
+        let mut sh = Box::new(OsShell::empty());
+        let mut st = store();
+        st.set_min_commit_seq(1);
+        assert_eq!(
+            st.boot(&mut disk, &mut sh, &keys(), 2),
+            Err(BootError::Rollback {
+                found: 0,
+                min_expected: 1,
+            })
+        );
+        assert!(sh.fs.stat(b"/var/gen").is_err());
         disk.reboot();
-        let (_, mut sh2, _) = boot(&mut disk, &keys(), 3);
-        assert_eq!(generation(&mut sh2), "two");
+        assert!(
+            (0..DISK_SECTORS as u64).all(|l| disk.peek(l) == before[l as usize]),
+            "a refused boot wrote to the disk"
+        );
+
+        // Without a floor the same disk is set aside and the node starts over.
+        let (report, _, _) = boot(&mut disk, &keys(), 2);
+        assert_eq!(report.outcome, BootOutcome::Rejected { preserved: true });
+    }
+
+    /// What happens today when the page store runs out of logical pages: the
+    /// shell has no admission check for it, so the command is accepted and
+    /// the commit that follows fails. That failure is safe (nothing reaches
+    /// the device, and the last committed state comes back whole), which is
+    /// what this test pins. It is not graceful: the kernel treats a failed
+    /// commit as a storage fault and halts. See Claude-Recommendations.md;
+    /// when the shell learns to refuse the command with `ENOSPC` instead,
+    /// this test should change to expect that.
+    #[test]
+    fn a_full_page_store_fails_the_commit_without_writing_and_loses_nothing_committed() {
+        use crate::paged_store::{PagedBlockStore, PAGED_STORE_MIN_DISK_SECTORS};
+        let cap = PAGED_STORE_MIN_DISK_SECTORS as usize;
+        let max_logical = PagedBlockStore::max_logical_pages_for_sectors(cap as u64);
+        let mut disk = MemDisk::new(cap);
+        let (_, mut sh, mut st) = boot(&mut disk, &keys(), 1);
+        apply_generation(&mut sh, "one");
+        st.commit(&mut disk, &mut sh, 1).expect("first commit");
+
+        // Files of two pages each, committed one at a time, until one does not fit.
+        let body: Vec<u8> = (0..4001usize).map(|i| (i % 251) as u8).collect();
+        let mut committed_files = 0usize;
+        let mut refused = None;
+        for f in 0..90usize {
+            let path = std::format!("/var/fill_{f:02}.bin");
+            sh.fs
+                .seed_file(path.as_bytes(), &body, body.len(), 500 + f as u64)
+                .expect("the filesystem itself has room");
+            let ops_before = disk.ops;
+            match st.commit(&mut disk, &mut sh, 1) {
+                Ok(_) => committed_files += 1,
+                Err(e) => {
+                    assert_eq!(disk.ops, ops_before, "a commit that cannot fit wrote to the device");
+                    refused = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = refused.expect("the page store never filled");
+        assert!(
+            matches!(err, PersistError::Pack(StatePackError::Filesystem(_))),
+            "{err:?}"
+        );
+        assert!(!st.is_faulted(), "nothing was written, so there is nothing to recover");
+        assert!(
+            committed_files * 2 > max_logical / 2 && committed_files * 2 < max_logical,
+            "filled {committed_files} two-page files into {max_logical} logical pages"
+        );
+
+        // Everything that was committed is still there, byte for byte.
+        disk.reboot();
+        let (report, mut sh2, _) = boot(&mut disk, &keys(), 2);
+        assert!(matches!(report.outcome, BootOutcome::Restored { .. }), "{:?}", report.outcome);
+        assert_eq!(generation(&mut sh2), "one");
+        for f in 0..committed_files {
+            let path = std::format!("/var/fill_{f:02}.bin");
+            let h = sh2
+                .fs
+                .open(path.as_bytes(), cuttle_contracts::FS_O_RDONLY)
+                .unwrap_or_else(|_| panic!("{path} lost"));
+            let mut back = std::vec![0u8; body.len()];
+            assert_eq!(sh2.fs.read(h, 0, &mut back).unwrap(), body.len(), "{path}");
+            sh2.fs.close(h).unwrap();
+            assert!(back == body, "{path} changed");
+        }
+        let not_committed = std::format!("/var/fill_{committed_files:02}.bin");
+        assert!(sh2.fs.stat(not_committed.as_bytes()).is_err());
+    }
+
+    /// The page store is too large to copy aside, so a boot that cannot use
+    /// it must leave it alone. The accident this guards against is the same
+    /// one as `state_survives_boots_without_the_device_key`: one boot with
+    /// the wrong key.
+    #[test]
+    fn a_paged_disk_this_boot_cannot_authenticate_is_left_untouched_until_it_can() {
+        use crate::paged_store::PAGED_STORE_MIN_DISK_SECTORS;
+        let cap = PAGED_STORE_MIN_DISK_SECTORS as usize;
+        let mut disk = MemDisk::new(cap);
+        let (report, mut sh, mut st) = boot(&mut disk, &keys(), 1);
+        assert_eq!(report.outcome, BootOutcome::Fresh);
+        assert!(sh.is_paged_mode());
+        apply_generation(&mut sh, "one");
+        assert!(sql(&mut sh, "CREATE TABLE big (id INT, v TEXT)").ends_with("OK\n"));
+        for r in 0..200 {
+            assert_eq!(
+                sql(&mut sh, &std::format!("INSERT INTO big VALUES ({r}, 'row-{r}')")),
+                "INSERT 1\n"
+            );
+        }
+        st.commit(&mut disk, &mut sh, 1).expect("commit");
+        assert!(st.paged_store().allocated_page_count() >= 8);
+        disk.reboot();
+        let snapshot = |d: &MemDisk| -> Vec<[u8; SECTOR_BYTES]> {
+            (0..cap as u64).map(|l| d.peek(l)).collect()
+        };
+        let before = snapshot(&disk);
+
+        // A boot with the wrong device key, twice.
+        for (n, k) in [other_keys(), ShellKeys { seal: [0x5A; 32], ..keys() }]
+            .iter()
+            .enumerate()
+        {
+            let mut sh_w = Box::new(OsShell::empty());
+            let mut st_w = store();
+            assert_eq!(
+                st_w.boot(&mut disk, &mut sh_w, k, 2 + n as u64),
+                Err(BootError::PagedStore(PagedBootFault::Unanchored)),
+                "wrong-key boot {n}"
+            );
+            assert!(sh_w.fs.stat(b"/var/gen").is_err());
+            disk.reboot();
+            assert!(snapshot(&disk) == before, "wrong-key boot {n} wrote to the disk");
+        }
+
+        // The device key is back, and so is everything else.
+        let (report, mut sh2, _) = boot(&mut disk, &keys(), 4);
+        assert!(
+            matches!(
+                report.outcome,
+                BootOutcome::Restored {
+                    from_quarantine: false,
+                    ..
+                }
+            ),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(generation(&mut sh2), "one");
+        assert_eq!(sql(&mut sh2, "SELECT COUNT(*) FROM big"), "count\n200\n");
+
+        // The state slots wiped, the page store intact: also not a blank disk.
+        let mut wiped = MemDisk::new(cap);
+        for (l, sec) in before.iter().enumerate() {
+            wiped.poke(l as u64, |s| *s = *sec);
+        }
+        for l in AHCI_STATE_LAYOUT.primary_lba..=AHCI_STATE_LAYOUT.commit_lba {
+            wiped.poke(l, |s| *s = [0u8; SECTOR_BYTES]);
+        }
+        let wiped_before = snapshot(&wiped);
+        let mut sh_z = Box::new(OsShell::empty());
+        let mut st_z = store();
+        assert_eq!(
+            st_z.boot(&mut wiped, &mut sh_z, &keys(), 5),
+            Err(BootError::PagedStore(PagedBootFault::Unanchored))
+        );
+        wiped.reboot();
+        assert!(snapshot(&wiped) == wiped_before);
     }
 
     #[test]
@@ -4212,7 +4628,8 @@ mod node_tests {
             );
         }
 
-        // 7a. Corrupt 1 byte in a committed home page (`SqlCatalog` or `VfsData` not in `C3`'s 2-page CWAL) -> `Rejected`.
+        // 7a. Corrupt 1 byte in a committed home page (`SqlCatalog` or `VfsData` not in `C3`'s 2-page CWAL):
+        //     the boot is refused, not restarted from defaults.
         let mut corrupt_disk = clone_from_sectors(&snap_c3);
         let cat_lid = st2
             .paged_store()
@@ -4221,20 +4638,47 @@ mod node_tests {
         let cat_phys = st2.paged_store().merkle_proof(cat_lid).unwrap().entry.phys_slot;
         let cat_lba = PAGE_POOL_BASE_LBA + (cat_phys as u64) * 8;
         corrupt_disk.poke(cat_lba + 1, |sec| sec[100] ^= 0x80);
-        let (rep_corrupt, _, _) = boot(&mut corrupt_disk, &keys(), 4);
+        let all_sectors = |d: &MemDisk| -> Vec<[u8; SECTOR_BYTES]> {
+            (0..cap_sectors).map(|l| d.peek(l as u64)).collect()
+        };
+        // The state is genuine and one of its pages is not: the boot stops, and
+        // the disk is left exactly as found. (Starting over here would put a
+        // fresh, empty page store on top of every other page.)
+        let corrupt_before = all_sectors(&corrupt_disk);
+        let mut sh_corrupt = Box::new(OsShell::empty());
+        let mut st_corrupt = store();
         assert_eq!(
-            rep_corrupt.outcome,
-            BootOutcome::Rejected { preserved: true }
+            st_corrupt.boot(&mut corrupt_disk, &mut sh_corrupt, &keys(), 4),
+            Err(BootError::PagedStore(PagedBootFault::AnchorMismatch))
+        );
+        assert_eq!(sh_corrupt.db.table_count(), fresh_shell(4).db.table_count());
+        corrupt_disk.reboot();
+        assert!(
+            all_sectors(&corrupt_disk) == corrupt_before,
+            "a boot refused for a damaged page wrote to the disk"
+        );
+        // Because nothing was overwritten, undoing the damage brings it all back.
+        corrupt_disk.poke(cat_lba + 1, |sec| sec[100] ^= 0x80);
+        let (rep_fixed, mut sh_fixed, _) = boot(&mut corrupt_disk, &keys(), 5);
+        assert!(matches!(rep_fixed.outcome, BootOutcome::Restored { .. }));
+        assert_eq!(
+            sql(&mut sh_fixed, "SELECT COUNT(*) FROM events"),
+            "count\n1080\n"
         );
 
-        // 7b. Replay older valid `C2` superblocks (`tx_lsn=2`) while `AB_FORMAT_V3` demands `C3` (`tx_lsn=3`) -> `Rejected`.
+        // 7b. Replay older valid `C2` superblocks (`tx_lsn=2`) while `AB_FORMAT_V3` demands `C3` (`tx_lsn=3`):
+        //     refused the same way.
         let mut replay_disk = clone_from_sectors(&snap_c3);
         replay_disk.poke(SUPERBLOCK_A_LBA, |sec| *sec = snap_sb_a_c2);
         replay_disk.poke(SUPERBLOCK_B_LBA, |sec| *sec = snap_sb_b_c2);
-        let (rep_replay, _, _) = boot(&mut replay_disk, &keys(), 4);
+        let replay_before = all_sectors(&replay_disk);
+        let mut sh_replay = Box::new(OsShell::empty());
+        let mut st_replay = store();
         assert_eq!(
-            rep_replay.outcome,
-            BootOutcome::Rejected { preserved: true }
+            st_replay.boot(&mut replay_disk, &mut sh_replay, &keys(), 4),
+            Err(BootError::PagedStore(PagedBootFault::AnchorMismatch))
         );
+        replay_disk.reboot();
+        assert!(all_sectors(&replay_disk) == replay_before);
     }
 }

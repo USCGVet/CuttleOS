@@ -116,6 +116,17 @@ Every `ALERT` event emitted by the controller includes a machine-parseable `code
 - **Automated Recovery & Forensics**:
   1. The controller automatically terminates the halted VM, archives the faulted disk image to `node<id>/ahci_node<id>.fault_<ts>_<n>.img`, provisions a fresh zeroed 1 MiB `ahci_node<id>.img`, and runs `heal_and_remorph_node` to rebuild the node from the 2-of-3 majority + WAL.
   2. Inspect host disk space (`df -h` / volume free space) and the archived `.fault_*.img` image (including any encrypted `CTTLPENC` panic record at `LBA 1536..=1567`).
+- **Faults that are not device errors** (the text after `STORAGE FAULT:`). In each of these the node halted instead of starting over, so on a standalone node (no Triad to heal from) the data is still on the disk: fix the cause and reboot, and image the disk before replacing it. The only writes recovery makes before such a halt are repairs of a slot or a page from its own verified copy.
+  - `state cannot be authenticated and the page store holds data (nothing was started over; check the device key)`: the state slots did not verify under this boot's device key, and the disk has a page store (`LBA 2048..`, disks of 4096 sectors or more) with SQL rows and file contents in it. The usual cause is a wrong or missing `-fw_cfg` device key. With the right key the next boot restores everything. On a disk without a page store the same condition is `SHELL resume REJECTED` and the node starts over, because there the unverifiable slots fit in the quarantine area.
+  - `page store does not hold the epoch the committed state anchors (nothing was started over)`: the state verified, and a page it refers to is damaged with no redo copy, or the page-store superblocks are older than the state. Starting over would overwrite the pages that are intact.
+  - `state disk unusable at boot`: also raised when the state had to be read from the shadow slot and the device refused the rewrite of the primary slot. The shadow slot is then the only complete copy and the next commit would stage over it, so the node does not serve.
+  - `an earlier commit failed; the store takes no more writes until the next boot recovers it`: a second commit was attempted after a failed one. The kernel halts on the first failure, so seeing this means a caller carried on after an error.
+  - `whole-disk rollback detected (commit_seq below floor)`: also raised when the disk cannot be authenticated at all while a rollback floor (TPM NV counter) is set. The node no longer starts over from sequence zero in that case.
+- **Related serial lines** (no halt):
+  - `TPM WARNING: rollback counter unreadable; booting without an anti-rollback floor` and `TPM WARNING: rollback counter not advanced; the anti-rollback floor is stale`: the TPM floor is not protecting this node. Treat as an alert.
+  - `NVME_HW REFUSED: namespace is not formatted with plain 512-byte blocks`: the NVMe namespace uses 4 KiB blocks or per-block metadata; the driver will not use it.
+  - `STORAGE REFUSED: opt/cuttle_storage_backend is not one of ahci, nvme, virtio, auto`: a mistyped backend pin. The node does not fall back to auto-probing.
+  - `CONTINUITY resume NOTICE: continuity region unreadable; ...` and `CONTINUITY NOTICE: continuity region could not be written; ...`: a bad sector in the boot-counter hint region (`LBA 1024..1032`). The boot continues; the sealed state decides the boot generation.
 
 ### `DISK_ROLLBACK_DETECTED` {#disk_rollback_detected}
 

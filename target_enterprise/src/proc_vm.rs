@@ -139,6 +139,23 @@ pub struct UserTrapFrame {
     pub rflags: u64,
 }
 
+/// The `RFLAGS` bits a ring-3 process owns: the arithmetic status flags
+/// (`CF`, `PF`, `AF`, `ZF`, `SF`, `OF`) and `DF`.
+pub const USER_RFLAGS_OWNED: u64 = 0x0000_0CD5;
+
+/// The `RFLAGS` value to resume a ring-3 process with, given the value saved
+/// when it left ring 3.
+///
+/// A saved value comes from user mode and can carry bits user code is able to
+/// set but must not bring back through the kernel: `NT` (a kernel `iretq`
+/// executed with it set faults), `TF`, `AC`, `ID`. `IOPL`, `RF`, `VM`, `VIF`
+/// and `VIP` are never the process's to choose. So everything outside
+/// [`USER_RFLAGS_OWNED`] is dropped, and `IF` (with the always-one bit 1) is
+/// forced on so the preemption timer keeps firing.
+pub const fn sanitize_user_rflags(saved: u64) -> u64 {
+    (saved & USER_RFLAGS_OWNED) | 0x202
+}
+
 /// Lifecycle state of an entry in [`ProcessTable`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProcState {
@@ -1118,7 +1135,7 @@ impl ProcessTable {
     pub fn on_timer_preempt(&mut self, slot: usize, tf: UserTrapFrame) {
         if slot < MAX_PROCS && self.procs[slot].state == ProcState::Running {
             self.procs[slot].trap_frame = tf;
-            self.procs[slot].trap_frame.rflags |= 0x202;
+            self.procs[slot].trap_frame.rflags = sanitize_user_rflags(tf.rflags);
             self.procs[slot].preemptions = self.procs[slot].preemptions.wrapping_add(1);
             self.procs[slot].state = ProcState::Ready;
         }
@@ -2196,5 +2213,41 @@ mod tests {
         assert_eq!(table.procs[slot].last_ipc_fnv, expected_fnv);
         assert_eq!(table.procs[slot].last_ipc_status, 1);
         assert_eq!(arena.allocated_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod rflags_tests {
+    use super::{sanitize_user_rflags, USER_RFLAGS_OWNED};
+
+    #[test]
+    fn a_resumed_process_keeps_its_status_flags_and_nothing_else() {
+        const NT: u64 = 1 << 14;
+        const IOPL: u64 = 3 << 12;
+        const TF: u64 = 1 << 8;
+        const IF: u64 = 1 << 9;
+        const AC: u64 = 1 << 18;
+        const RF: u64 = 1 << 16;
+        const VM: u64 = 1 << 17;
+        const ID: u64 = 1 << 21;
+
+        // A fresh frame is unchanged.
+        assert_eq!(sanitize_user_rflags(0x202), 0x202);
+        // Interrupts cannot be left off, and bit 1 is always set.
+        assert_eq!(sanitize_user_rflags(0), 0x202);
+        // Every status flag and DF survive.
+        assert_eq!(sanitize_user_rflags(USER_RFLAGS_OWNED), USER_RFLAGS_OWNED | 0x202);
+        // Nothing a process could use against the kernel or its neighbours does.
+        for hostile in [NT, IOPL, TF, AC, RF, VM, ID, u64::MAX] {
+            let out = sanitize_user_rflags(hostile | 0x0C5);
+            assert_eq!(
+                out & (NT | IOPL | TF | AC | RF | VM | ID),
+                0,
+                "flag bits {hostile:#x} reached ring 3 as {out:#x}"
+            );
+            assert_eq!(out & IF, IF);
+            assert_eq!(out & 0x0C5, 0x0C5);
+            assert_eq!(out >> 22, 0);
+        }
     }
 }

@@ -82,6 +82,74 @@ pub const IDENTIFY_BUF_SIZE: usize = 4096;
 /// NVMe block size, locked at 512 across morph cycles.
 pub const NVME_BLOCK_SIZE: usize = 512;
 
+/// Why an Identify Namespace structure does not describe a namespace the
+/// driver can use as a state disk. See [`identify_namespace_512_sectors`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IdentifyNsError {
+    /// The buffer ends before a field that must be read.
+    Truncated,
+    /// `NSZE` is zero: no such namespace, or no capacity.
+    Empty,
+    /// `FLBAS` selects an LBA format beyond the count in `NLBAF`.
+    BadFormatIndex,
+    /// The current LBA format has `2^lbads`-byte logical blocks, not 512.
+    UnsupportedBlockSize {
+        /// `LBADS` of the current format (9 means 512 bytes, 12 means 4 KiB).
+        lbads: u8,
+    },
+    /// The current LBA format carries per-block metadata, which the driver
+    /// neither supplies nor reads.
+    UnsupportedMetadata,
+}
+
+/// Capacity, in 512-byte logical blocks, of the namespace described by
+/// `id_ns` (the data returned by Identify Namespace, CNS `0x00`), or the
+/// reason the driver must not use it.
+///
+/// The I/O path transfers [`NVME_BLOCK_SIZE`] bytes per logical block through
+/// a single PRP entry, and takes `NSZE` as a count of 512-byte sectors. Both
+/// are only true for a namespace whose current LBA format (`FLBAS`, byte 26,
+/// indexing `LBAF[n]` at byte `128 + 4n`) has `LBADS == 9` and no metadata.
+/// On any other format the same commands address different bytes and transfer
+/// more than the one DMA page they name, so the format is checked before the
+/// namespace is used at all.
+pub fn identify_namespace_512_sectors(id_ns: &[u8]) -> Result<u64, IdentifyNsError> {
+    const NSZE: usize = 0;
+    const NLBAF: usize = 25;
+    const FLBAS: usize = 26;
+    const LBAF0: usize = 128;
+    if id_ns.len() < LBAF0 + 4 {
+        return Err(IdentifyNsError::Truncated);
+    }
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&id_ns[NSZE..NSZE + 8]);
+    let nsze = u64::from_le_bytes(raw);
+    if nsze == 0 {
+        return Err(IdentifyNsError::Empty);
+    }
+    // Format index: bits 3:0, extended by bits 6:5 on namespaces with more
+    // than 16 formats. `NLBAF` is the highest valid index.
+    let flbas = id_ns[FLBAS];
+    let idx = (flbas & 0x0F) as usize | ((((flbas >> 5) & 0x03) as usize) << 4);
+    if idx > id_ns[NLBAF] as usize {
+        return Err(IdentifyNsError::BadFormatIndex);
+    }
+    let off = LBAF0 + 4 * idx;
+    if id_ns.len() < off + 4 {
+        return Err(IdentifyNsError::Truncated);
+    }
+    let lbaf = u32::from_le_bytes([id_ns[off], id_ns[off + 1], id_ns[off + 2], id_ns[off + 3]]);
+    let metadata_bytes = lbaf & 0xFFFF;
+    let lbads = ((lbaf >> 16) & 0xFF) as u8;
+    if lbads != 9 {
+        return Err(IdentifyNsError::UnsupportedBlockSize { lbads });
+    }
+    if metadata_bytes != 0 {
+        return Err(IdentifyNsError::UnsupportedMetadata);
+    }
+    Ok(nsze)
+}
+
 // ---------------------------------------------------------------------------
 // Submission Queue Entry — 64 bytes, NVMe 1.4 §4.2
 // ---------------------------------------------------------------------------
@@ -1109,5 +1177,86 @@ mod tests {
         emu.ring_sq_doorbell(1, 1);
         let cqe = emu.fetch_completion(1).expect("completion");
         assert_eq!(cqe.status(), 0x80, "overflowing LBA must return NVMe LBA Out of Range (0x80)");
+    }
+}
+
+#[cfg(test)]
+mod identify_ns_tests {
+    use super::{identify_namespace_512_sectors, IdentifyNsError};
+
+    /// An Identify Namespace structure with `nsze` blocks, `formats` LBA
+    /// formats given as `(metadata_bytes, lbads)`, and `current` selected.
+    fn id_ns(nsze: u64, formats: &[(u16, u8)], current: u8) -> [u8; 4096] {
+        let mut b = [0u8; 4096];
+        b[0..8].copy_from_slice(&nsze.to_le_bytes());
+        b[25] = (formats.len() - 1) as u8;
+        b[26] = current;
+        for (i, (ms, lbads)) in formats.iter().enumerate() {
+            let v = (*ms as u32) | ((*lbads as u32) << 16);
+            b[128 + 4 * i..132 + 4 * i].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn a_512_byte_namespace_reports_its_capacity() {
+        assert_eq!(identify_namespace_512_sectors(&id_ns(8192, &[(0, 9)], 0)), Ok(8192));
+        // The current format is the one that counts, not the first one listed.
+        assert_eq!(
+            identify_namespace_512_sectors(&id_ns(4096, &[(0, 12), (0, 9)], 1)),
+            Ok(4096)
+        );
+        // Only the fields that are read need to be present.
+        assert_eq!(
+            identify_namespace_512_sectors(&id_ns(2048, &[(0, 9)], 0)[..132]),
+            Ok(2048)
+        );
+    }
+
+    #[test]
+    fn a_namespace_formatted_any_other_way_is_refused() {
+        assert_eq!(
+            identify_namespace_512_sectors(&id_ns(1024, &[(0, 12)], 0)),
+            Err(IdentifyNsError::UnsupportedBlockSize { lbads: 12 })
+        );
+        assert_eq!(
+            identify_namespace_512_sectors(&id_ns(1024, &[(0, 9), (0, 12)], 1)),
+            Err(IdentifyNsError::UnsupportedBlockSize { lbads: 12 })
+        );
+        assert_eq!(
+            identify_namespace_512_sectors(&id_ns(1024, &[(8, 9)], 0)),
+            Err(IdentifyNsError::UnsupportedMetadata)
+        );
+        // An all-zero LBA format entry is not a 512-byte format.
+        assert_eq!(
+            identify_namespace_512_sectors(&id_ns(1024, &[(0, 0)], 0)),
+            Err(IdentifyNsError::UnsupportedBlockSize { lbads: 0 })
+        );
+    }
+
+    #[test]
+    fn empty_short_and_inconsistent_structures_are_refused() {
+        assert_eq!(
+            identify_namespace_512_sectors(&id_ns(0, &[(0, 9)], 0)),
+            Err(IdentifyNsError::Empty)
+        );
+        assert_eq!(identify_namespace_512_sectors(&[]), Err(IdentifyNsError::Truncated));
+        assert_eq!(
+            identify_namespace_512_sectors(&id_ns(64, &[(0, 9)], 0)[..131]),
+            Err(IdentifyNsError::Truncated)
+        );
+        // FLBAS names format 3 of a namespace that has two.
+        assert_eq!(
+            identify_namespace_512_sectors(&id_ns(64, &[(0, 9), (0, 9)], 3)),
+            Err(IdentifyNsError::BadFormatIndex)
+        );
+        // A valid high index whose entry lies beyond the buffer.
+        let mut big = id_ns(64, &[(0, 9)], 0);
+        big[25] = 63;
+        big[26] = 0x0F | (0x03 << 5);
+        assert_eq!(
+            identify_namespace_512_sectors(&big[..300]),
+            Err(IdentifyNsError::Truncated)
+        );
     }
 }

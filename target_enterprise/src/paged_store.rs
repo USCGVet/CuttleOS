@@ -22,10 +22,16 @@
 //!
 //! 1. **Per-Page Authenticated Encryption (`ChaCha20-Poly1305`, RFC 8439):**
 //!    Every 4 KiB physical page carries a 64-byte `CTTLPGE1` header (`domain`, `flags`,
-//!    `logical_id`, `phys_slot`, `payload_len`, `owner_id`, `page_lsn`, 96-bit unique
-//!    `(page_lsn, phys_slot, domain)` nonce, 128-bit Poly1305 tag) and `4,032` bytes of
-//!    ciphertext with `AAD = header[0..28]`. Cross-page substitution, cross-domain replay,
-//!    and bit-flips fail closed.
+//!    `logical_id`, `phys_slot`, `payload_len`, `owner_id`, `page_lsn`, 96-bit nonce,
+//!    128-bit Poly1305 tag) and `4,032` bytes of ciphertext with `AAD = header[0..28]`.
+//!    Cross-page substitution, cross-domain replay, and bit-flips fail closed.
+//!
+//!    The nonce is derived from the header **and the plaintext** (see `page_nonce`), so
+//!    two different page images are never sealed under one nonce, whatever happens to the
+//!    LSN. That matters because an epoch can be written and then abandoned (a power cut
+//!    between this store's commit and the `AB_FORMAT_V3` commit that anchors it, or a
+//!    failed commit): the next commit writes different contents to the same physical slots.
+//!    Independently of that, an LSN is never reused: see [`PagedBlockStore::lsn_floor`].
 //! 2. **Binary SHA-256 Merkle Anti-Rollback Root (`page_lsn_merkle_root`):**
 //!    An 8-level binary SHA-256 Merkle tree commits all `256` `(logical_id, domain, flags,
 //!    phys_slot, owner_id, page_lsn)` directory leaves into a 32-byte root anchored both in
@@ -273,6 +279,9 @@ pub enum PagedStoreError {
     CorruptOrTampered,
     /// Requested `PagedAnchor` was not found or its LSN/Merkle root was rolled back.
     RollbackOrAnchorMismatch,
+    /// A page, directory or superblock the device accepted read back differently
+    /// (a dropped or misdirected write). The epoch being written is not committed.
+    VerifyFailed,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -328,6 +337,47 @@ pub fn derive_paged_mac_key(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> [u8; DURABLE
 pub fn derive_paged_aead_key(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> [u8; DURABLE_DIGEST_LEN] {
     let mut out = [0u8; DURABLE_DIGEST_LEN];
     seal_bytes_keyed(seal_key, b"CTTLPGS1-AEAD-KEY-v1", &mut out);
+    out
+}
+
+/// Derive the domain-separated 256-bit `HMAC-SHA256` key for content-bound page nonces.
+pub fn derive_paged_nonce_key(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> [u8; DURABLE_DIGEST_LEN] {
+    let mut out = [0u8; DURABLE_DIGEST_LEN];
+    seal_bytes_keyed(seal_key, b"CTTLPGS1-NONCE-KEY-v1", &mut out);
+    out
+}
+
+/// The keys the page store derives from the seal key. Wiped when dropped, so
+/// every early return in commit and recovery clears them.
+struct PagedKeys {
+    mac: [u8; DURABLE_DIGEST_LEN],
+    aead: [u8; DURABLE_DIGEST_LEN],
+    nonce: [u8; DURABLE_DIGEST_LEN],
+}
+
+impl PagedKeys {
+    fn derive(seal_key: &[u8; DURABLE_DIGEST_LEN]) -> Self {
+        Self {
+            mac: derive_paged_mac_key(seal_key),
+            aead: derive_paged_aead_key(seal_key),
+            nonce: derive_paged_nonce_key(seal_key),
+        }
+    }
+}
+
+impl Drop for PagedKeys {
+    fn drop(&mut self) {
+        zeroize_secret_bytes(&mut self.mac);
+        zeroize_secret_bytes(&mut self.aead);
+        zeroize_secret_bytes(&mut self.nonce);
+    }
+}
+
+fn sha256_of(data: &[u8]) -> [u8; DURABLE_DIGEST_LEN] {
+    let mut h = Sha256::new();
+    h.update(data);
+    let mut out = [0u8; DURABLE_DIGEST_LEN];
+    out.copy_from_slice(&h.finalize());
     out
 }
 
@@ -532,17 +582,40 @@ fn verify_superblock(
     })
 }
 
-fn page_nonce(page_lsn: u64, phys_slot: u16, domain: PageDomain) -> [u8; AEAD_NONCE_LEN] {
+/// The 96-bit nonce one page image is sealed under:
+/// `HMAC-SHA256(nonce_key, "CTTLPGE1-NONCE-v2:" || header[0..28] || SHA-256(plaintext))[0..12]`.
+///
+/// `header[0..28]` is the page's authenticated header (domain, flags, logical id,
+/// physical slot, payload length, owner, LSN) and `plaintext` is the whole
+/// zero-padded 4,032-byte payload area. Because the nonce depends on every
+/// byte that is encrypted, the same nonce means the same page image and so the
+/// same ciphertext: writing different contents to a physical slot under an LSN
+/// that was already used there cannot repeat a (key, nonce) pair. Encryption
+/// stays deterministic, which commit and recovery rely on (the redo frame and
+/// the home page of a commit are byte-identical).
+///
+/// Pages written before this derivation carry `(page_lsn, phys_slot, domain, 0xA5)`
+/// in the same header field and are still read: decryption uses the stored nonce,
+/// which the Poly1305 tag authenticates.
+fn page_nonce(
+    nonce_key: &[u8; DURABLE_DIGEST_LEN],
+    header28: &[u8],
+    plaintext: &[u8],
+) -> [u8; AEAD_NONCE_LEN] {
+    const LABEL: &[u8; 18] = b"CTTLPGE1-NONCE-v2:";
+    let mut msg = [0u8; 18 + 28 + DURABLE_DIGEST_LEN];
+    msg[0..18].copy_from_slice(LABEL);
+    msg[18..46].copy_from_slice(&header28[0..28]);
+    msg[46..78].copy_from_slice(&sha256_of(plaintext));
+    let mut mac = [0u8; DURABLE_DIGEST_LEN];
+    seal_bytes_keyed(nonce_key, &msg, &mut mac);
     let mut n = [0u8; AEAD_NONCE_LEN];
-    n[0..8].copy_from_slice(&page_lsn.to_le_bytes());
-    n[8..10].copy_from_slice(&phys_slot.to_le_bytes());
-    n[10] = domain as u8;
-    n[11] = 0xA5;
+    n.copy_from_slice(&mac[0..AEAD_NONCE_LEN]);
     n
 }
 
 fn encrypt_page_sectors(
-    aead_key: &[u8; DURABLE_DIGEST_LEN],
+    keys: &PagedKeys,
     logical_id: u16,
     phys_slot: u16,
     domain: PageDomain,
@@ -566,14 +639,13 @@ fn encrypt_page_sectors(
     flat[16..20].copy_from_slice(&owner_id.to_le_bytes());
     flat[20..28].copy_from_slice(&page_lsn.to_le_bytes());
 
-    let nonce = page_nonce(page_lsn, phys_slot, domain);
-    flat[28..40].copy_from_slice(&nonce);
-
     let mut aad = [0u8; 28];
     aad.copy_from_slice(&flat[0..28]);
     flat[PAGED_PAGE_HEADER_BYTES..PAGED_PAGE_HEADER_BYTES + payload.len()].copy_from_slice(payload);
+    let nonce = page_nonce(&keys.nonce, &aad, &flat[PAGED_PAGE_HEADER_BYTES..]);
+    flat[28..40].copy_from_slice(&nonce);
     let tag = chacha20_poly1305_encrypt_in_place(
-        aead_key,
+        &keys.aead,
         &nonce,
         &aad,
         &mut flat[PAGED_PAGE_HEADER_BYTES..],
@@ -614,17 +686,17 @@ fn decrypt_page_sectors(
     if !flat[56..64].iter().all(|&b| b == 0) {
         return None;
     }
-    let expected_nonce = page_nonce(page_lsn, phys_slot, domain);
-    if flat[28..40] != expected_nonce {
-        return None;
-    }
+    // The stored nonce is not trusted for anything but decryption: a page
+    // sealed under any other nonce fails the Poly1305 check below.
+    let mut nonce = [0u8; AEAD_NONCE_LEN];
+    nonce.copy_from_slice(&flat[28..40]);
     let mut tag = [0u8; AEAD_TAG_LEN];
     tag.copy_from_slice(&flat[40..56]);
     let mut aad = [0u8; 28];
     aad.copy_from_slice(&flat[0..28]);
     if !chacha20_poly1305_decrypt_in_place(
         aead_key,
-        &expected_nonce,
+        &nonce,
         &aad,
         &mut flat[PAGED_PAGE_HEADER_BYTES..],
         &tag,
@@ -770,6 +842,14 @@ pub struct PagedBlockStore {
     vfs_files: u32,
     vfs_bytes: u32,
     last_dirty_pages_written: usize,
+    /// Highest LSN any page may already have been sealed under: by this
+    /// instance (including commits that failed part-way) or, as far as the
+    /// device shows, by an earlier one. See [`Self::lsn_floor`].
+    lsn_floor: u64,
+    /// Home pages the last recovery rewrote from the redo journal.
+    last_recovery_healed: usize,
+    /// Whether the last recovery completed an interrupted (`IN_FLIGHT`) commit.
+    last_recovery_rolled_forward: bool,
     merkle_root: [u8; DURABLE_DIGEST_LEN],
     dir: Vec<PageDirEntry>,
     pages: Vec<CachedLogicalPage>,
@@ -793,6 +873,9 @@ impl PagedBlockStore {
             vfs_files: 0,
             vfs_bytes: 0,
             last_dirty_pages_written: 0,
+            lsn_floor: 0,
+            last_recovery_healed: 0,
+            last_recovery_rolled_forward: false,
             merkle_root: [0u8; DURABLE_DIGEST_LEN],
             dir: Vec::new(),
             pages: Vec::new(),
@@ -800,7 +883,12 @@ impl PagedBlockStore {
     }
 
     /// Clear all in-memory cached state.
+    ///
+    /// [`Self::lsn_floor`] is kept: forgetting which LSNs were used is the one
+    /// thing a reset must not do.
     pub fn reset(&mut self) {
+        self.last_recovery_healed = 0;
+        self.last_recovery_rolled_forward = false;
         self.initialized = false;
         self.active_slot = 0;
         self.tx_lsn = 0;
@@ -863,6 +951,36 @@ impl PagedBlockStore {
     /// Number of dirty 4 KiB logical pages written during the most recent [`Self::commit_dirty`] call.
     pub const fn last_dirty_pages_written(&self) -> usize {
         self.last_dirty_pages_written
+    }
+
+    /// The highest LSN that may already have been used to seal a page.
+    ///
+    /// The next commit takes an LSN above both this and [`Self::tx_lsn`], so an
+    /// LSN is used for at most one epoch. Without that, an epoch that was
+    /// written and then abandoned (the anchoring `AB_FORMAT_V3` commit did not
+    /// happen, or the commit failed part-way) would share its LSN with the
+    /// epoch that replaces it, and a page of the abandoned epoch left behind
+    /// by a lost write would pass every check of the new one: the directory
+    /// binds a page by slot and LSN, not by content.
+    ///
+    /// The floor rises when a commit starts writing, and at recovery to the
+    /// highest LSN in either authenticated superblock or in an authenticated
+    /// redo-journal header (a bulk commit records its LSN there, durably,
+    /// before its first page is written).
+    pub const fn lsn_floor(&self) -> u64 {
+        self.lsn_floor
+    }
+
+    /// Home pages the most recent recovery found damaged and rewrote from the
+    /// redo journal. Non-zero means sectors changed outside a commit.
+    pub const fn last_recovery_healed(&self) -> usize {
+        self.last_recovery_healed
+    }
+
+    /// Whether the most recent recovery completed a commit that a power cut
+    /// had interrupted after its redo journal was durable.
+    pub const fn last_recovery_rolled_forward(&self) -> bool {
+        self.last_recovery_rolled_forward
     }
 
     /// Current [`PagedAnchor`] snapshot.
@@ -1063,6 +1181,13 @@ impl PagedBlockStore {
         None
     }
 
+    /// The committed directory entry of `logical_id`: where its page lives and
+    /// under which LSN it was sealed. `None` before the first commit or
+    /// recovery, or when `logical_id` is out of range.
+    pub fn dir_entry(&self, logical_id: u16) -> Option<PageDirEntry> {
+        self.dir.get(logical_id as usize).copied()
+    }
+
     /// Construct a Merkle inclusion proof for `logical_id` from the current committed directory.
     pub fn merkle_proof(&self, logical_id: u16) -> Option<PageMerkleProof> {
         if self.dir.len() < PAGED_MAX_LOGICAL_PAGES {
@@ -1119,8 +1244,18 @@ impl PagedBlockStore {
             return Ok(self.anchor());
         }
 
+        let keys = PagedKeys::derive(seal_key);
+
+        // An unmounted store is about to write its first epoch over whatever
+        // the region holds. Learn which LSNs that content already used.
+        if !self.initialized {
+            self.observe_lsn_floor(dev, &keys);
+        }
         let prev_lsn = self.tx_lsn;
-        let next_lsn = prev_lsn.checked_add(1).ok_or(PagedStoreError::OutOfPages)?;
+        let next_lsn = prev_lsn
+            .max(self.lsn_floor)
+            .checked_add(1)
+            .ok_or(PagedStoreError::OutOfPages)?;
         let target_slot: u8 = if !self.initialized {
             0
         } else {
@@ -1173,15 +1308,15 @@ impl PagedBlockStore {
             };
         }
 
-        let mut mac_key = derive_paged_mac_key(seal_key);
-        let mut aead_key = derive_paged_aead_key(seal_key);
-
         let mut dir_secs = Box::new([[0u8; SECTOR_BYTES]; SECTORS_PER_PAGE]);
         let dir_sha256 = encode_dir_sectors(&new_dir, &mut dir_secs);
         let merkle_root = compute_dir_merkle_root(&new_dir);
 
         let mut page_buf = Box::new([[0u8; SECTOR_BYTES]; SECTORS_PER_PAGE]);
         let mut sb_sec = [0u8; SECTOR_BYTES];
+        // SHA-256 of each dirty page as written, for the read-back check below.
+        let mut page_digests: Vec<[u8; DURABLE_DIGEST_LEN]> =
+            Vec::with_capacity(dirty_allocated.len());
 
         let use_cwal_redo = dirty_allocated.len() <= CWAL_MAX_REDO_PAGES;
         let cwal_redo_count = if use_cwal_redo {
@@ -1190,8 +1325,17 @@ impl PagedBlockStore {
             0u16
         };
 
-        // 1. Write CWAL physical redo log (for <= 14 dirty pages) OR stage CoW home pages directly
-        //    into free physical slots (for > 14 bulk pages) BEFORE touching the target Superblock.
+        let dir_lba = if target_slot == 0 { DIR_A_LBA } else { DIR_B_LBA };
+        let sb_lba = if target_slot == 0 {
+            SUPERBLOCK_A_LBA
+        } else {
+            SUPERBLOCK_B_LBA
+        };
+        let home_lba = |entry: &PageDirEntry| -> u64 {
+            PAGE_POOL_BASE_LBA + (entry.phys_slot as u64) * (SECTORS_PER_PAGE as u64)
+        };
+        let io = PagedStoreError::Io;
+
         let mut cwal_hasher = Sha256::new();
         let mut cwal_hdr = [0u8; SECTOR_BYTES];
         cwal_hdr[0..8].copy_from_slice(&PAGED_CWAL_MAGIC);
@@ -1200,14 +1344,17 @@ impl PagedBlockStore {
         cwal_hdr[18..20].copy_from_slice(&(dirty_allocated.len() as u16).to_le_bytes());
         cwal_hasher.update(&cwal_hdr[0..20]);
 
+        // Pages sealed under `next_lsn` reach the device from here on. Whatever
+        // happens next, that LSN is spent: a later attempt takes a higher one.
+        self.lsn_floor = next_lsn;
+
+        // 1. Small commit (<= 14 dirty pages): write the CWAL physical redo frames.
         if use_cwal_redo {
-            let mut r_idx = 0usize;
-            while r_idx < dirty_allocated.len() {
-                let lid = dirty_allocated[r_idx];
+            for (r_idx, &lid) in dirty_allocated.iter().enumerate() {
                 let entry = new_dir[lid as usize];
                 let p = &self.pages[lid as usize];
-                let encrypt_res = encrypt_page_sectors(
-                    &aead_key,
+                encrypt_page_sectors(
+                    &keys,
                     lid,
                     entry.phys_slot,
                     entry.domain,
@@ -1216,62 +1363,23 @@ impl PagedBlockStore {
                     next_lsn,
                     &p.payload[..p.payload_len as usize],
                     &mut page_buf,
-                );
-                if let Err(e) = encrypt_res {
-                    zeroize_secret_bytes(&mut mac_key);
-                    zeroize_secret_bytes(&mut aead_key);
-                    return Err(e);
-                }
+                )?;
+                page_digests.push(sha256_of(page_buf.as_flattened()));
 
                 let mut desc_sec = [0u8; SECTOR_BYTES];
                 desc_sec[0..8].copy_from_slice(&PAGED_FRAME_MAGIC);
                 desc_sec[8..16].copy_from_slice(&next_lsn.to_le_bytes());
                 desc_sec[16..18].copy_from_slice(&lid.to_le_bytes());
-                entry.encode((&mut desc_sec[18..34]).try_into().unwrap());
+                let mut raw_entry = [0u8; 16];
+                entry.encode(&mut raw_entry);
+                desc_sec[18..34].copy_from_slice(&raw_entry);
 
                 cwal_hasher.update(&desc_sec[0..34]);
                 cwal_hasher.update(page_buf.as_flattened());
 
                 let frame_lba = CWAL_BASE_LBA + 1 + (r_idx as u64) * CWAL_REDO_FRAME_SECTORS;
-                if let Err(f) = dev
-                    .write_sector(frame_lba, &desc_sec)
-                    .and_then(|()| dev.write_sectors(frame_lba + 1, &page_buf[..]))
-                {
-                    zeroize_secret_bytes(&mut mac_key);
-                    zeroize_secret_bytes(&mut aead_key);
-                    return Err(PagedStoreError::Io(f));
-                }
-                r_idx += 1;
-            }
-        } else {
-            // Bulk CoW commit (`> 14` dirty pages): write encrypted pages directly to free CoW slots
-            // before publishing the new directory/superblock. `S0` remains completely untouched!
-            for &lid in &dirty_allocated {
-                let entry = new_dir[lid as usize];
-                let p = &self.pages[lid as usize];
-                let encrypt_res = encrypt_page_sectors(
-                    &aead_key,
-                    lid,
-                    entry.phys_slot,
-                    entry.domain,
-                    entry.flags,
-                    entry.owner_id,
-                    next_lsn,
-                    &p.payload[..p.payload_len as usize],
-                    &mut page_buf,
-                );
-                if let Err(e) = encrypt_res {
-                    zeroize_secret_bytes(&mut mac_key);
-                    zeroize_secret_bytes(&mut aead_key);
-                    return Err(e);
-                }
-                let phys_lba =
-                    PAGE_POOL_BASE_LBA + (entry.phys_slot as u64) * (SECTORS_PER_PAGE as u64);
-                if let Err(f) = dev.write_sectors(phys_lba, &page_buf[..]) {
-                    zeroize_secret_bytes(&mut mac_key);
-                    zeroize_secret_bytes(&mut aead_key);
-                    return Err(PagedStoreError::Io(f));
-                }
+                dev.write_sector(frame_lba, &desc_sec).map_err(io)?;
+                dev.write_sectors(frame_lba + 1, &page_buf[..]).map_err(io)?;
             }
         }
 
@@ -1279,57 +1387,71 @@ impl PagedBlockStore {
         cwal_sha256.copy_from_slice(&cwal_hasher.finalize());
         cwal_hdr[20..52].copy_from_slice(&cwal_sha256);
         let mut cwal_tag = [0u8; DURABLE_DIGEST_LEN];
-        seal_bytes_keyed(&mac_key, &cwal_hdr[0..52], &mut cwal_tag);
+        seal_bytes_keyed(&keys.mac, &cwal_hdr[0..52], &mut cwal_tag);
         cwal_hdr[52..84].copy_from_slice(&cwal_tag);
 
-        let dir_lba = if target_slot == 0 { DIR_A_LBA } else { DIR_B_LBA };
-        let sb_lba = if target_slot == 0 {
-            SUPERBLOCK_A_LBA
-        } else {
-            SUPERBLOCK_B_LBA
-        };
+        if use_cwal_redo {
+            // Redo frames, their header and the inactive directory become durable together.
+            dev.write_sector(CWAL_BASE_LBA, &cwal_hdr).map_err(io)?;
+            dev.write_sectors(dir_lba, &dir_secs[..]).map_err(io)?;
+            dev.flush().map_err(io)?;
 
-        // Write CWAL header + inactive Page Directory and flush before updating Superblock.
-        if let Err(f) = dev
-            .write_sector(CWAL_BASE_LBA, &cwal_hdr)
-            .and_then(|()| dev.write_sectors(dir_lba, &dir_secs[..]))
-            .and_then(|()| dev.flush())
-        {
-            zeroize_secret_bytes(&mut mac_key);
-            zeroize_secret_bytes(&mut aead_key);
-            return Err(PagedStoreError::Io(f));
-        }
+            if !dirty_allocated.is_empty() {
+                // 2. Publish the `IN_FLIGHT` superblock: recovery can now roll this
+                //    epoch forward from the redo frames.
+                let sb_inflight = PagedSuperblock {
+                    state: PAGED_STATE_IN_FLIGHT,
+                    slot_idx: target_slot,
+                    boots,
+                    tx_lsn: next_lsn,
+                    prev_tx_lsn: prev_lsn,
+                    allocated_pages: allocated_total,
+                    cwal_redo_count,
+                    sql_rows: self.sql_rows,
+                    vfs_files: self.vfs_files,
+                    vfs_bytes: self.vfs_bytes,
+                    dir_sha256,
+                    cwal_sha256,
+                    merkle_root,
+                };
+                pack_superblock(&keys.mac, &sb_inflight, &mut sb_sec);
+                dev.write_sector(sb_lba, &sb_sec).map_err(io)?;
+                dev.flush().map_err(io)?;
 
-        if use_cwal_redo && !dirty_allocated.is_empty() {
-            // 2. Publish `IN_FLIGHT` Superblock: CWAL redo + Directory are now durable on disk.
-            let sb_inflight = PagedSuperblock {
-                state: PAGED_STATE_IN_FLIGHT,
-                slot_idx: target_slot,
-                boots,
-                tx_lsn: next_lsn,
-                prev_tx_lsn: prev_lsn,
-                allocated_pages: allocated_total,
-                cwal_redo_count,
-                sql_rows: self.sql_rows,
-                vfs_files: self.vfs_files,
-                vfs_bytes: self.vfs_bytes,
-                dir_sha256,
-                cwal_sha256,
-                merkle_root,
-            };
-            pack_superblock(&mac_key, &sb_inflight, &mut sb_sec);
-            if let Err(f) = dev.write_sector(sb_lba, &sb_sec).and_then(|()| dev.flush()) {
-                zeroize_secret_bytes(&mut mac_key);
-                zeroize_secret_bytes(&mut aead_key);
-                return Err(PagedStoreError::Io(f));
+                // 3. Install the dirty pages into their new CoW home slots.
+                for &lid in &dirty_allocated {
+                    let entry = new_dir[lid as usize];
+                    let p = &self.pages[lid as usize];
+                    encrypt_page_sectors(
+                        &keys,
+                        lid,
+                        entry.phys_slot,
+                        entry.domain,
+                        entry.flags,
+                        entry.owner_id,
+                        next_lsn,
+                        &p.payload[..p.payload_len as usize],
+                        &mut page_buf,
+                    )?;
+                    dev.write_sectors(home_lba(&entry), &page_buf[..]).map_err(io)?;
+                }
+                dev.flush().map_err(io)?;
             }
-
-            // 3. Install ONLY the dirty 4 KiB pages into their new CoW home physical slots.
+        } else {
+            // Bulk commit (> 14 dirty pages): no redo frames; the pages go straight to
+            // free CoW slots, so `S0` stays untouched until the superblock is written.
+            //
+            // The journal header goes first, and is made durable before the first
+            // page: it carries `next_lsn`, and it is the only record that this LSN
+            // was used if power is cut before the superblock. Recovery raises
+            // `lsn_floor` from it.
+            dev.write_sector(CWAL_BASE_LBA, &cwal_hdr).map_err(io)?;
+            dev.flush().map_err(io)?;
             for &lid in &dirty_allocated {
                 let entry = new_dir[lid as usize];
                 let p = &self.pages[lid as usize];
-                if let Err(e) = encrypt_page_sectors(
-                    &aead_key,
+                encrypt_page_sectors(
+                    &keys,
                     lid,
                     entry.phys_slot,
                     entry.domain,
@@ -1338,27 +1460,31 @@ impl PagedBlockStore {
                     next_lsn,
                     &p.payload[..p.payload_len as usize],
                     &mut page_buf,
-                ) {
-                    zeroize_secret_bytes(&mut mac_key);
-                    zeroize_secret_bytes(&mut aead_key);
-                    return Err(e);
-                }
-                let phys_lba =
-                    PAGE_POOL_BASE_LBA + (entry.phys_slot as u64) * (SECTORS_PER_PAGE as u64);
-                if let Err(f) = dev.write_sectors(phys_lba, &page_buf[..]) {
-                    zeroize_secret_bytes(&mut mac_key);
-                    zeroize_secret_bytes(&mut aead_key);
-                    return Err(PagedStoreError::Io(f));
-                }
+                )?;
+                page_digests.push(sha256_of(page_buf.as_flattened()));
+                dev.write_sectors(home_lba(&entry), &page_buf[..]).map_err(io)?;
             }
-            if let Err(f) = dev.flush() {
-                zeroize_secret_bytes(&mut mac_key);
-                zeroize_secret_bytes(&mut aead_key);
-                return Err(PagedStoreError::Io(f));
-            }
+            dev.write_sectors(dir_lba, &dir_secs[..]).map_err(io)?;
+            dev.flush().map_err(io)?;
         }
 
-        // 4. Finalize target Superblock as `QUIESCENT` and flush.
+        // Prove the epoch landed before a superblock calls it committed: read every
+        // page of this commit and the directory back and compare. A device that
+        // reported success for a write it dropped or misdirected is caught here,
+        // while the previous epoch is still the committed one.
+        for (i, &lid) in dirty_allocated.iter().enumerate() {
+            dev.read_sectors(home_lba(&new_dir[lid as usize]), &mut page_buf[..])
+                .map_err(io)?;
+            if sha256_of(page_buf.as_flattened()) != page_digests[i] {
+                return Err(PagedStoreError::VerifyFailed);
+            }
+        }
+        dev.read_sectors(dir_lba, &mut page_buf[..]).map_err(io)?;
+        if sha256_of(page_buf.as_flattened()) != dir_sha256 {
+            return Err(PagedStoreError::VerifyFailed);
+        }
+
+        // 4. Finalize target Superblock as `QUIESCENT`, flush, and read it back.
         let sb_quiescent = PagedSuperblock {
             state: PAGED_STATE_QUIESCENT,
             slot_idx: target_slot,
@@ -1374,11 +1500,14 @@ impl PagedBlockStore {
             cwal_sha256,
             merkle_root,
         };
-        pack_superblock(&mac_key, &sb_quiescent, &mut sb_sec);
-        let fin_res = dev.write_sector(sb_lba, &sb_sec).and_then(|()| dev.flush());
-        zeroize_secret_bytes(&mut mac_key);
-        zeroize_secret_bytes(&mut aead_key);
-        fin_res.map_err(PagedStoreError::Io)?;
+        pack_superblock(&keys.mac, &sb_quiescent, &mut sb_sec);
+        dev.write_sector(sb_lba, &sb_sec).map_err(io)?;
+        dev.flush().map_err(io)?;
+        let mut sb_back = [0u8; SECTOR_BYTES];
+        dev.read_sector(sb_lba, &mut sb_back).map_err(io)?;
+        if sb_back != sb_sec {
+            return Err(PagedStoreError::VerifyFailed);
+        }
 
         // Commit succeeded: advance in-memory directory & clear dirty flags.
         self.dir.copy_from_slice(&new_dir[..]);
@@ -1392,6 +1521,36 @@ impl PagedBlockStore {
         self.merkle_root = merkle_root;
         self.last_dirty_pages_written = dirty_allocated.len();
         Ok(self.anchor())
+    }
+
+    /// Raise [`Self::lsn_floor`] to the highest LSN the device shows was used:
+    /// in either authenticated superblock, or in an authenticated redo-journal
+    /// header. Sectors that cannot be read or authenticated contribute nothing.
+    fn observe_lsn_floor<D: SectorIo>(&mut self, dev: &mut D, keys: &PagedKeys) {
+        let mut seen = 0u64;
+        let mut sec = [0u8; SECTOR_BYTES];
+        if dev.read_sector(SUPERBLOCK_A_LBA, &mut sec).is_ok() {
+            if let Some(sb) = verify_superblock(&keys.mac, 0, &sec) {
+                seen = seen.max(sb.tx_lsn);
+            }
+        }
+        if dev.read_sector(SUPERBLOCK_B_LBA, &mut sec).is_ok() {
+            if let Some(sb) = verify_superblock(&keys.mac, 1, &sec) {
+                seen = seen.max(sb.tx_lsn);
+            }
+        }
+        if dev.read_sector(CWAL_BASE_LBA, &mut sec).is_ok() && sec[0..8] == PAGED_CWAL_MAGIC {
+            let mut tag = [0u8; DURABLE_DIGEST_LEN];
+            tag.copy_from_slice(&sec[52..84]);
+            if seal_matches_keyed(&keys.mac, &sec[0..52], &tag) {
+                seen = seen.max(u64::from_le_bytes([
+                    sec[8], sec[9], sec[10], sec[11], sec[12], sec[13], sec[14], sec[15],
+                ]));
+            }
+        }
+        if seen > self.lsn_floor {
+            self.lsn_floor = seen;
+        }
     }
 
     /// Recover the latest valid committed epoch directly from `dev` (standalone mode).
@@ -1452,16 +1611,18 @@ impl PagedBlockStore {
             return Ok(None);
         }
 
-        let mut mac_key = derive_paged_mac_key(seal_key);
-        let mut aead_key = derive_paged_aead_key(seal_key);
+        let keys = PagedKeys::derive(seal_key);
+        // Every LSN the region shows was used counts, including an epoch this
+        // recovery is about to pass over because the anchor names another one.
+        self.observe_lsn_floor(dev, &keys);
 
         let sb_a = if a_ok {
-            verify_superblock(&mac_key, 0, &sec_a)
+            verify_superblock(&keys.mac, 0, &sec_a)
         } else {
             None
         };
         let sb_b = if b_ok {
-            verify_superblock(&mac_key, 1, &sec_b)
+            verify_superblock(&keys.mac, 1, &sec_b)
         } else {
             None
         };
@@ -1506,29 +1667,21 @@ impl PagedBlockStore {
                 c_idx += 1;
                 continue;
             };
-            match self.try_load_superblock(dev, &mac_key, &aead_key, avail_phys, max_logical, &sb) {
-                Ok(anchor) => {
-                    zeroize_secret_bytes(&mut mac_key);
-                    zeroize_secret_bytes(&mut aead_key);
-                    return Ok(Some(anchor));
-                }
+            match self.try_load_superblock(dev, &keys, avail_phys, max_logical, &sb) {
+                Ok(anchor) => return Ok(Some(anchor)),
                 Err(e) => {
                     last_err = e;
                 }
             }
             c_idx += 1;
         }
-
-        zeroize_secret_bytes(&mut mac_key);
-        zeroize_secret_bytes(&mut aead_key);
         Err(last_err)
     }
 
     fn try_load_superblock<D: SectorIo>(
         &mut self,
         dev: &mut D,
-        mac_key: &[u8; DURABLE_DIGEST_LEN],
-        aead_key: &[u8; DURABLE_DIGEST_LEN],
+        keys: &PagedKeys,
         avail_phys: usize,
         max_logical: usize,
         sb: &PagedSuperblock,
@@ -1573,7 +1726,7 @@ impl PagedBlockStore {
                 if cwal_lsn == sb.tx_lsn
                     && hdr_cnt == sb.cwal_redo_count
                     && constant_time_eq(&hdr_sha, &sb.cwal_sha256)
-                    && seal_matches_keyed(mac_key, &cwal_hdr[0..52], &hdr_tag)
+                    && seal_matches_keyed(&keys.mac, &cwal_hdr[0..52], &hdr_tag)
                 {
                     let mut hasher = Sha256::new();
                     hasher.update(&cwal_hdr[0..20]);
@@ -1627,12 +1780,14 @@ impl PagedBlockStore {
             return Err(PagedStoreError::CorruptOrTampered);
         }
 
-        // Verify and decrypt every mapped logical page; if a home page fails verification or
-        // `sb.state == IN_FLIGHT`, heal it from the authenticated CWAL redo frame when available.
+        // Verify and decrypt every mapped logical page; if a home page fails verification
+        // (always possible while `sb.state == IN_FLIGHT`), restore it from the authenticated
+        // CWAL redo frame when there is one.
         let mut loaded_pages = Vec::with_capacity(PAGED_MAX_LOGICAL_PAGES);
         loaded_pages.resize_with(PAGED_MAX_LOGICAL_PAGES, CachedLogicalPage::empty);
         let mut page_buf = Box::new([[0u8; SECTOR_BYTES]; SECTORS_PER_PAGE]);
-        let mut healed_any = false;
+        // Home pages rewritten from the redo journal: where, and what they must read back as.
+        let mut healed: Vec<(u64, [u8; DURABLE_DIGEST_LEN])> = Vec::new();
 
         let mut lid = 0usize;
         while lid < PAGED_MAX_LOGICAL_PAGES {
@@ -1645,7 +1800,7 @@ impl PagedBlockStore {
                     PAGE_POOL_BASE_LBA + (e.phys_slot as u64) * (SECTORS_PER_PAGE as u64);
                 let home_read = dev.read_sectors(phys_lba, &mut page_buf[..]);
                 let home_ok = if home_read.is_ok() {
-                    decrypt_page_sectors(aead_key, lid as u16, &e, &mut page_buf)
+                    decrypt_page_sectors(&keys.aead, lid as u16, &e, &mut page_buf)
                 } else {
                     None
                 };
@@ -1664,14 +1819,17 @@ impl PagedBlockStore {
                         };
                         let mut repair_copy = cwal_cipher.clone();
                         let Some(plen) =
-                            decrypt_page_sectors(aead_key, lid as u16, &e, &mut repair_copy)
+                            decrypt_page_sectors(&keys.aead, lid as u16, &e, &mut repair_copy)
                         else {
                             return Err(PagedStoreError::CorruptOrTampered);
                         };
-                        // Best-effort repair of the home physical slot on disk from CWAL ciphertext.
-                        let _ = dev.write_sectors(phys_lba, &cwal_cipher[..]);
+                        // Rewrite the home slot from the redo image. This must succeed:
+                        // the next commit overwrites the redo journal, and a home page
+                        // left damaged would then be this page's only copy, gone.
+                        dev.write_sectors(phys_lba, &cwal_cipher[..])
+                            .map_err(PagedStoreError::Io)?;
+                        healed.push((phys_lba, sha256_of(cwal_cipher.as_flattened())));
                         page_buf = repair_copy;
-                        healed_any = true;
                         plen
                     }
                 };
@@ -1694,8 +1852,23 @@ impl PagedBlockStore {
             lid += 1;
         }
 
-        if healed_any || sb.state == PAGED_STATE_IN_FLIGHT {
-            let _ = dev.flush();
+        // Make the repairs durable and prove they landed before anything relies on them.
+        if !healed.is_empty() {
+            dev.flush().map_err(PagedStoreError::Io)?;
+            for (lba, digest) in &healed {
+                dev.read_sectors(*lba, &mut page_buf[..])
+                    .map_err(PagedStoreError::Io)?;
+                if sha256_of(page_buf.as_flattened()) != *digest {
+                    return Err(PagedStoreError::VerifyFailed);
+                }
+            }
+        }
+
+        // Close an interrupted commit. Until its superblock says `QUIESCENT` this epoch
+        // depends on the redo journal, which the next commit overwrites; so a store
+        // that cannot record the roll-forward is not handed back as recovered.
+        let rolled_forward = sb.state == PAGED_STATE_IN_FLIGHT;
+        if rolled_forward {
             let sb_lba = if sb.slot_idx == 0 {
                 SUPERBLOCK_A_LBA
             } else {
@@ -1706,8 +1879,16 @@ impl PagedBlockStore {
                 ..*sb
             };
             let mut sb_sec = [0u8; SECTOR_BYTES];
-            pack_superblock(mac_key, &sb_quiescent, &mut sb_sec);
-            let _ = dev.write_sector(sb_lba, &sb_sec).and_then(|()| dev.flush());
+            pack_superblock(&keys.mac, &sb_quiescent, &mut sb_sec);
+            dev.write_sector(sb_lba, &sb_sec)
+                .map_err(PagedStoreError::Io)?;
+            dev.flush().map_err(PagedStoreError::Io)?;
+            let mut sb_back = [0u8; SECTOR_BYTES];
+            dev.read_sector(sb_lba, &mut sb_back)
+                .map_err(PagedStoreError::Io)?;
+            if sb_back != sb_sec {
+                return Err(PagedStoreError::VerifyFailed);
+            }
         }
 
         self.ensure_tables();
@@ -1721,6 +1902,8 @@ impl PagedBlockStore {
         self.vfs_files = sb.vfs_files;
         self.vfs_bytes = sb.vfs_bytes;
         self.last_dirty_pages_written = 0;
+        self.last_recovery_healed = healed.len();
+        self.last_recovery_rolled_forward = rolled_forward;
         self.merkle_root = sb.merkle_root;
         Ok(self.anchor())
     }
@@ -2066,5 +2249,516 @@ mod tests {
             store.recover_latest(&mut disk, &key),
             Err(PagedStoreError::CorruptOrTampered)
         );
+    }
+}
+
+/// Tests against the fault-injecting disk model: abandoned epochs, dropped
+/// writes, and recovery that is itself interrupted or refused.
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+    use crate::durable_seal::DEFAULT_DURABLE_SEAL_KEY;
+    use crate::state_store::testdisk::{CacheLoss, MemDisk};
+    extern crate std;
+    use std::vec::Vec;
+
+    // The smallest disk the store accepts: 237 physical pages, 118 logical.
+    const SECTORS: usize = PAGED_STORE_MIN_DISK_SECTORS as usize;
+
+    fn key() -> [u8; DURABLE_DIGEST_LEN] {
+        DEFAULT_DURABLE_SEAL_KEY
+    }
+
+    /// A page body that depends on `tag` and `lid` in every byte.
+    fn body(tag: u8, lid: u16) -> Vec<u8> {
+        (0..3000usize)
+            .map(|i| (i as u8).wrapping_mul(31) ^ tag ^ (lid as u8).wrapping_mul(7))
+            .collect()
+    }
+
+    fn put(store: &mut PagedBlockStore, lids: core::ops::Range<u16>, tag: u8) {
+        for lid in lids {
+            store
+                .put_page(lid, PageDomain::VfsData, 0, lid as u32, &body(tag, lid))
+                .expect("put_page");
+        }
+    }
+
+    fn page(store: &PagedBlockStore, lid: u16) -> Vec<u8> {
+        store.get_page(lid).expect("page present").3.to_vec()
+    }
+
+    /// The disk as a power cycle would leave it: flushed contents only.
+    fn clone_disk(d: &MemDisk) -> MemDisk {
+        let mut c = MemDisk::new(SECTORS);
+        for l in 0..SECTORS as u64 {
+            let sec = d.peek(l);
+            c.poke(l, |s| *s = sec);
+        }
+        c
+    }
+
+    fn recovered_at(disk: &mut MemDisk, anchor: &PagedAnchor) -> PagedBlockStore {
+        let mut s = PagedBlockStore::new();
+        s.recover_at_anchor(disk, &key(), anchor)
+            .expect("recover_at_anchor");
+        s
+    }
+
+    /// `(state, tx_lsn)` of the superblock in `slot`, read without authentication.
+    fn raw_superblock(disk: &MemDisk, slot: u8) -> (u8, u64) {
+        let sec = disk.peek(SUPERBLOCK_A_LBA + slot as u64);
+        let mut lsn = [0u8; 8];
+        lsn.copy_from_slice(&sec[24..32]);
+        (sec[10], u64::from_le_bytes(lsn))
+    }
+
+    /// Every physical slot whose stored header carries `lsn`.
+    fn slots_bearing_lsn(disk: &MemDisk, lsn: u64) -> Vec<u16> {
+        let (avail, _) = PagedBlockStore::geometry_for_sectors(SECTORS as u64);
+        (0..avail as u16)
+            .filter(|p| {
+                let sec = disk.peek(PAGE_POOL_BASE_LBA + (*p as u64) * SECTORS_PER_PAGE as u64);
+                let mut l = [0u8; 8];
+                l.copy_from_slice(&sec[20..28]);
+                sec[0..8] == PAGED_PAGE_MAGIC && u64::from_le_bytes(l) == lsn
+            })
+            .collect()
+    }
+
+    /// Every physical slot the store's committed directory maps under `lsn`.
+    fn slots_mapped_at_lsn(store: &PagedBlockStore, lsn: u64) -> Vec<u16> {
+        (0..PAGED_MAX_LOGICAL_PAGES as u16)
+            .filter_map(|lid| store.dir_entry(lid))
+            .filter(|e| e.is_mapped() && e.page_lsn == lsn)
+            .map(|e| e.phys_slot)
+            .collect()
+    }
+
+    #[test]
+    fn two_different_page_images_never_share_a_nonce_and_equal_images_encrypt_identically() {
+        let keys = PagedKeys::derive(&key());
+        let seal = |payload: &[u8]| {
+            let mut secs = Box::new([[0u8; SECTOR_BYTES]; SECTORS_PER_PAGE]);
+            // Same logical page, same physical slot, same LSN every time: only
+            // the contents differ. This is what a commit that replaces an
+            // abandoned epoch writes.
+            encrypt_page_sectors(&keys, 5, 9, PageDomain::SqlLeaf, 0, 77, 41, payload, &mut secs)
+                .expect("encrypt");
+            secs
+        };
+        let a = seal(&body(1, 5));
+        let a_again = seal(&body(1, 5));
+        let b = seal(&body(2, 5));
+        // One byte of difference, at the very end of the payload area.
+        let mut near = body(1, 5);
+        near.resize(PAGED_PAGE_PAYLOAD_BYTES, 0);
+        near[PAGED_PAGE_PAYLOAD_BYTES - 1] ^= 1;
+        let c = seal(&near);
+
+        let nonce = |s: &[[u8; SECTOR_BYTES]; SECTORS_PER_PAGE]| s.as_flattened()[28..40].to_vec();
+        assert_eq!(a.as_flattened(), a_again.as_flattened(), "encryption must be deterministic");
+        assert_ne!(nonce(&a), nonce(&b), "different contents sealed under one nonce");
+        assert_ne!(nonce(&a), nonce(&c), "a one-byte difference must change the nonce");
+
+        // What nonce reuse would give away: the XOR of the two ciphertexts
+        // equal to the XOR of the two plaintexts.
+        let (fa, fb) = (a.as_flattened(), b.as_flattened());
+        let (pa, pb) = (body(1, 5), body(2, 5));
+        let leaks = (0..pa.len()).all(|i| {
+            fa[PAGED_PAGE_HEADER_BYTES + i] ^ fb[PAGED_PAGE_HEADER_BYTES + i] == pa[i] ^ pb[i]
+        });
+        assert!(!leaks, "ciphertexts of two page images share a keystream");
+
+        // Both still decrypt to what was sealed.
+        let entry = PageDirEntry {
+            phys_slot: 9,
+            domain: PageDomain::SqlLeaf,
+            flags: 0,
+            owner_id: 77,
+            page_lsn: 41,
+        };
+        let mut back = b.clone();
+        let n = decrypt_page_sectors(&keys.aead, 5, &entry, &mut back).expect("decrypt");
+        assert_eq!(&back.as_flattened()[PAGED_PAGE_HEADER_BYTES..][..n], &body(2, 5)[..]);
+    }
+
+    #[test]
+    fn pages_sealed_under_the_previous_nonce_derivation_are_still_read() {
+        let keys = PagedKeys::derive(&key());
+        let entry = PageDirEntry {
+            phys_slot: 3,
+            domain: PageDomain::VfsData,
+            flags: 0,
+            owner_id: 12,
+            page_lsn: 6,
+        };
+        let payload = body(9, 2);
+        let mut secs = Box::new([[0u8; SECTOR_BYTES]; SECTORS_PER_PAGE]);
+        {
+            let flat = secs.as_flattened_mut();
+            flat[0..8].copy_from_slice(&PAGED_PAGE_MAGIC);
+            flat[8] = entry.domain as u8;
+            flat[9] = entry.flags;
+            flat[10..12].copy_from_slice(&2u16.to_le_bytes());
+            flat[12..14].copy_from_slice(&entry.phys_slot.to_le_bytes());
+            flat[14..16].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+            flat[16..20].copy_from_slice(&entry.owner_id.to_le_bytes());
+            flat[20..28].copy_from_slice(&entry.page_lsn.to_le_bytes());
+            // The derivation pages were written with before: (lsn, slot, domain, 0xA5).
+            let mut nonce = [0u8; AEAD_NONCE_LEN];
+            nonce[0..8].copy_from_slice(&entry.page_lsn.to_le_bytes());
+            nonce[8..10].copy_from_slice(&entry.phys_slot.to_le_bytes());
+            nonce[10] = entry.domain as u8;
+            nonce[11] = 0xA5;
+            flat[28..40].copy_from_slice(&nonce);
+            let mut aad = [0u8; 28];
+            aad.copy_from_slice(&flat[0..28]);
+            flat[PAGED_PAGE_HEADER_BYTES..PAGED_PAGE_HEADER_BYTES + payload.len()]
+                .copy_from_slice(&payload);
+            let tag = chacha20_poly1305_encrypt_in_place(
+                &keys.aead,
+                &nonce,
+                &aad,
+                &mut flat[PAGED_PAGE_HEADER_BYTES..],
+            );
+            flat[40..56].copy_from_slice(&tag);
+        }
+        let n = decrypt_page_sectors(&keys.aead, 2, &entry, &mut secs).expect("legacy page");
+        assert_eq!(&secs.as_flattened()[PAGED_PAGE_HEADER_BYTES..][..n], &payload[..]);
+
+        // A nonce that was not the one used to seal is still rejected.
+        let mut secs2 = Box::new([[0u8; SECTOR_BYTES]; SECTORS_PER_PAGE]);
+        encrypt_page_sectors(&keys, 2, 3, PageDomain::VfsData, 0, 12, 6, &payload, &mut secs2)
+            .unwrap();
+        secs2.as_flattened_mut()[30] ^= 1;
+        assert!(decrypt_page_sectors(&keys.aead, 2, &entry, &mut secs2).is_none());
+    }
+
+    /// The window this store is built around: its own commit is durable, and
+    /// power is lost before the state image that anchors it is. The node
+    /// comes back at the previous anchor and commits something else.
+    #[test]
+    fn an_abandoned_epoch_does_not_share_its_lsn_with_the_epoch_that_replaces_it() {
+        let mut disk = MemDisk::new(SECTORS);
+        let mut s = PagedBlockStore::new();
+        put(&mut s, 0..6, 1);
+        let a = s.commit_dirty(&mut disk, &key(), 1).expect("epoch A");
+
+        put(&mut s, 2..4, 2);
+        let b = s.commit_dirty(&mut disk, &key(), 1).expect("epoch B");
+        assert!(b.tx_lsn > a.tx_lsn);
+        let b_slots = slots_mapped_at_lsn(&s, b.tx_lsn);
+        assert_eq!(b_slots.len(), 2);
+
+        // Reboot. The anchor on disk still names A.
+        disk.reboot();
+        let mut r = recovered_at(&mut disk, &a);
+        assert_eq!(page(&r, 2), body(1, 2));
+        assert!(r.lsn_floor() >= b.tx_lsn, "the abandoned epoch's LSN must be remembered");
+
+        put(&mut r, 2..4, 3);
+        let c = r.commit_dirty(&mut disk, &key(), 2).expect("epoch C");
+        assert!(
+            c.tx_lsn > b.tx_lsn,
+            "epoch C took LSN {} although abandoned epoch B already sealed pages under {}",
+            c.tx_lsn,
+            b.tx_lsn
+        );
+        // C went to the physical slots B had used, which is what makes a
+        // shared LSN dangerous.
+        assert_eq!(slots_mapped_at_lsn(&r, c.tx_lsn), b_slots);
+
+        // The same holds when the store object survives (a failed state
+        // commit in the same boot) instead of being rebuilt by recovery.
+        let mut same_boot = recovered_at(&mut disk, &c);
+        put(&mut same_boot, 0..1, 4);
+        let d = same_boot.commit_dirty(&mut disk, &key(), 2).expect("epoch D");
+        let mut back_at_c = PagedBlockStore::new();
+        back_at_c.recover_at_anchor(&mut disk, &key(), &c).unwrap();
+        put(&mut back_at_c, 0..1, 5);
+        let e = back_at_c.commit_dirty(&mut disk, &key(), 2).expect("epoch E");
+        assert!(e.tx_lsn > d.tx_lsn);
+    }
+
+    /// A lost write must not be able to pass off a page of an abandoned
+    /// epoch as the page of the epoch that replaced it.
+    #[test]
+    fn a_page_left_over_from_an_abandoned_epoch_is_never_returned_as_current() {
+        for bulk in [false, true] {
+            let n: u16 = if bulk { 20 } else { 3 };
+            let mut disk = MemDisk::new(SECTORS);
+            let mut s = PagedBlockStore::new();
+            put(&mut s, 0..n, 1);
+            let a = s.commit_dirty(&mut disk, &key(), 1).unwrap();
+
+            // Epoch B rewrites every page, is durable, and is then abandoned.
+            put(&mut s, 0..n, 2);
+            let b = s.commit_dirty(&mut disk, &key(), 1).unwrap();
+            let b_slot_of_page0 = s.dir_entry(0).unwrap().phys_slot;
+            let b_home = PAGE_POOL_BASE_LBA + b_slot_of_page0 as u64 * SECTORS_PER_PAGE as u64;
+            let b_page0: Vec<[u8; SECTOR_BYTES]> =
+                (0..SECTORS_PER_PAGE as u64).map(|i| disk.peek(b_home + i)).collect();
+
+            disk.reboot();
+            let mut r = recovered_at(&mut disk, &a);
+            put(&mut r, 0..n, 3);
+            let c = r.commit_dirty(&mut disk, &key(), 2).unwrap();
+            assert_eq!(
+                r.dir_entry(0).unwrap().phys_slot,
+                b_slot_of_page0,
+                "test premise: C reuses B's slot"
+            );
+            assert_ne!(c.tx_lsn, b.tx_lsn);
+
+            // The device lost C's write of page 0: B's bytes are still there.
+            for (i, sec) in b_page0.iter().enumerate() {
+                disk.poke(b_home + i as u64, |s| *s = *sec);
+            }
+            disk.reboot();
+            let mut after = PagedBlockStore::new();
+            match after.recover_at_anchor(&mut disk, &key(), &c) {
+                // A small commit still has its redo frame: the page is restored.
+                Ok(_) => {
+                    assert!(!bulk, "a bulk commit has no redo copy to restore from");
+                    assert_eq!(page(&after, 0), body(3, 0), "stale page returned as current");
+                    assert_eq!(after.last_recovery_healed(), 1);
+                }
+                // A bulk commit does not: the loss is reported, not papered over.
+                Err(e) => {
+                    assert!(bulk, "small commit should have healed: {e:?}");
+                    assert_eq!(e, PagedStoreError::CorruptOrTampered);
+                }
+            }
+        }
+    }
+
+    /// A bulk commit writes pages before any superblock names its LSN. Cut
+    /// power anywhere in it, recover, commit again: no page on the disk may
+    /// carry the new epoch's LSN unless the new epoch put it there.
+    #[test]
+    fn a_power_cut_anywhere_in_a_bulk_commit_never_leaves_pages_under_a_reused_lsn() {
+        let mut base = MemDisk::new(SECTORS);
+        // One page more than the redo journal holds: the smallest bulk commit.
+        const N: u16 = CWAL_MAX_REDO_PAGES as u16 + 1;
+        let mut s0 = PagedBlockStore::new();
+        put(&mut s0, 0..N, 1);
+        let a = s0.commit_dirty(&mut base, &key(), 1).unwrap();
+        base.reboot();
+
+        // Count the operations of the bulk commit that will be interrupted.
+        let mut dry = clone_disk(&base);
+        let mut sd = recovered_at(&mut dry, &a);
+        put(&mut sd, 0..N, 2);
+        dry.ops = 0;
+        let b = sd.commit_dirty(&mut dry, &key(), 2).unwrap();
+        let total = dry.ops;
+        assert!(total > 200, "expected a bulk commit, got {total} ops");
+
+        let mut leftovers_seen = 0usize;
+        for cut in 0..total {
+            // Every cut point, with the three cache-loss models in rotation.
+            let loss = match cut % 3 {
+                0 => CacheLoss::KeepAll,
+                1 => CacheLoss::DropAll,
+                _ => CacheLoss::Random(cut as u64 + 7),
+            };
+            {
+                let mut disk = clone_disk(&base);
+                let mut w = recovered_at(&mut disk, &a);
+                put(&mut w, 0..N, 2);
+                disk.ops = 0;
+                disk.cache_loss = loss;
+                disk.power_cut_at = Some(cut);
+                assert!(w.commit_dirty(&mut disk, &key(), 2).is_err());
+                disk.reboot();
+
+                // Either epoch may be the survivor; A must always be reachable
+                // until B's superblock is durable.
+                let mut r = PagedBlockStore::new();
+                let got = r
+                    .recover_latest(&mut disk, &key())
+                    .expect("recover_latest after a cut")
+                    .expect("a committed epoch");
+                assert!(got == a || got == b, "cut {cut}: recovered neither A nor B");
+                let want = if got == a { 1 } else { 2 };
+                for lid in 0..N {
+                    assert_eq!(page(&r, lid), body(want, lid), "cut {cut}: torn epoch");
+                }
+                if !slots_bearing_lsn(&disk, b.tx_lsn).is_empty() && got == a {
+                    leftovers_seen += 1;
+                }
+
+                // One page changes; the commit after the cut.
+                put(&mut r, 5..6, 9);
+                let c = r.commit_dirty(&mut disk, &key(), 3).expect("commit after recovery");
+                let mut mapped = slots_mapped_at_lsn(&r, c.tx_lsn);
+                let mut bearing = slots_bearing_lsn(&disk, c.tx_lsn);
+                mapped.sort_unstable();
+                bearing.sort_unstable();
+                assert_eq!(
+                    bearing, mapped,
+                    "cut {cut} ({loss:?}): pages of the interrupted commit carry the LSN of the next one"
+                );
+            }
+        }
+        assert!(leftovers_seen > 0, "the sweep never produced the case under test");
+    }
+
+    #[test]
+    fn a_write_the_device_dropped_fails_the_commit_instead_of_committing_a_hole() {
+        for bulk in [false, true] {
+            let n: u16 = if bulk { 18 } else { 4 };
+            let mut base = MemDisk::new(SECTORS);
+            let mut s0 = PagedBlockStore::new();
+            put(&mut s0, 0..n, 1);
+            let a = s0.commit_dirty(&mut base, &key(), 1).unwrap();
+            base.reboot();
+
+            let mut dry = clone_disk(&base);
+            let mut sd = recovered_at(&mut dry, &a);
+            put(&mut sd, 0..n, 2);
+            dry.ops = 0;
+            sd.commit_dirty(&mut dry, &key(), 2).unwrap();
+            let total = dry.ops;
+
+            let (mut failed, mut passed) = (0usize, 0usize);
+            for drop_at in 0..total {
+                let mut disk = clone_disk(&base);
+                let mut w = recovered_at(&mut disk, &a);
+                put(&mut w, 0..n, 2);
+                disk.ops = 0;
+                disk.drop_write_at = Some(drop_at);
+                let res = w.commit_dirty(&mut disk, &key(), 2);
+                disk.reboot();
+                match res {
+                    // A commit that reports success must be whole on the next boot,
+                    // with nothing to repair.
+                    Ok(anchor) => {
+                        passed += 1;
+                        let r = recovered_at(&mut disk, &anchor);
+                        for lid in 0..n {
+                            assert_eq!(page(&r, lid), body(2, lid), "drop at {drop_at}");
+                        }
+                        assert_eq!(
+                            r.last_recovery_healed(),
+                            0,
+                            "drop at {drop_at}: commit reported success with a damaged home page"
+                        );
+                    }
+                    // A commit that reports failure leaves the previous epoch committed.
+                    Err(e) => {
+                        failed += 1;
+                        assert_eq!(e, PagedStoreError::VerifyFailed, "drop at {drop_at}");
+                        let r = recovered_at(&mut disk, &a);
+                        for lid in 0..n {
+                            assert_eq!(page(&r, lid), body(1, lid), "drop at {drop_at}");
+                        }
+                    }
+                }
+            }
+            // Every sector of every home page, the directory and the superblock
+            // is covered by the read-back.
+            let min_checked = n as usize * SECTORS_PER_PAGE + SECTORS_PER_PAGE + 1;
+            assert!(
+                failed >= min_checked,
+                "bulk={bulk}: only {failed} dropped writes were caught, expected >= {min_checked}"
+            );
+            assert!(passed > 0, "bulk={bulk}: reads and flushes cannot be dropped");
+        }
+    }
+
+    /// An interrupted small commit is rolled forward from its redo frames.
+    /// Recovery must either finish that (pages home, superblock `QUIESCENT`,
+    /// both durable) or report failure: the next commit overwrites the redo
+    /// frames, so "recovered" with the superblock still `IN_FLIGHT` is one
+    /// power cut away from an epoch that cannot be loaded at all.
+    #[test]
+    fn recovery_of_an_interrupted_commit_finishes_the_roll_forward_or_fails() {
+        let mut base = MemDisk::new(SECTORS);
+        let mut s0 = PagedBlockStore::new();
+        put(&mut s0, 0..5, 1);
+        let a = s0.commit_dirty(&mut base, &key(), 1).unwrap();
+        base.reboot();
+
+        let mut dry = clone_disk(&base);
+        let mut sd = recovered_at(&mut dry, &a);
+        put(&mut sd, 1..4, 2);
+        dry.ops = 0;
+        let b = sd.commit_dirty(&mut dry, &key(), 2).unwrap();
+        let total = dry.ops;
+
+        // Find the cuts that leave B's superblock durable and IN_FLIGHT.
+        let mut in_flight_disks = Vec::new();
+        for cut in 0..total {
+            let mut disk = clone_disk(&base);
+            let mut w = recovered_at(&mut disk, &a);
+            put(&mut w, 1..4, 2);
+            disk.ops = 0;
+            disk.cache_loss = CacheLoss::DropAll;
+            disk.power_cut_at = Some(cut);
+            let _ = w.commit_dirty(&mut disk, &key(), 2);
+            disk.reboot();
+            let in_flight = (0..2u8).any(|slot| {
+                raw_superblock(&disk, slot) == (PAGED_STATE_IN_FLIGHT, b.tx_lsn)
+            });
+            if in_flight {
+                in_flight_disks.push(clone_disk(&disk));
+            }
+        }
+        assert!(in_flight_disks.len() >= 3, "no IN_FLIGHT disks produced");
+
+        let b_slot = |disk: &MemDisk| -> u8 {
+            (0..2u8)
+                .find(|s| raw_superblock(disk, *s).1 == b.tx_lsn)
+                .expect("B's superblock")
+        };
+
+        let (mut refused, mut completed) = (0usize, 0usize);
+        // The first, a middle and the last such disk: before any home page is
+        // written, part-way through, and with only the closing superblock missing.
+        let picks = [0, in_flight_disks.len() / 2, in_flight_disks.len() - 1];
+        for start in picks.iter().map(|i| &in_flight_disks[*i]) {
+            // Undisturbed: rolled forward, reported, and durable.
+            let mut disk = clone_disk(start);
+            let r = recovered_at(&mut disk, &b);
+            assert!(r.last_recovery_rolled_forward());
+            for lid in 1..4 {
+                assert_eq!(page(&r, lid), body(2, lid));
+            }
+            let ops = disk.ops;
+            disk.reboot();
+            assert_eq!(raw_superblock(&disk, b_slot(&disk)).0, PAGED_STATE_QUIESCENT);
+            let again = recovered_at(&mut disk, &b);
+            assert!(!again.last_recovery_rolled_forward());
+            assert_eq!(again.last_recovery_healed(), 0);
+
+            // With the device refusing each operation of that recovery in turn.
+            for fail_at in 0..ops {
+                let mut disk = clone_disk(start);
+                disk.io_error_at = Some(fail_at);
+                let mut r = PagedBlockStore::new();
+                let res = r.recover_at_anchor(&mut disk, &key(), &b);
+                disk.reboot();
+                let state = raw_superblock(&disk, b_slot(&disk)).0;
+                match res {
+                    Ok(_) => {
+                        completed += 1;
+                        assert_eq!(
+                            state, PAGED_STATE_QUIESCENT,
+                            "error at op {fail_at}: recovery reported success with the commit still open"
+                        );
+                        let healthy = recovered_at(&mut disk, &b);
+                        assert_eq!(
+                            healthy.last_recovery_healed(),
+                            0,
+                            "error at op {fail_at}: recovery reported success with a home page not restored"
+                        );
+                    }
+                    Err(_) => refused += 1,
+                }
+            }
+        }
+        assert!(refused > 0 && completed > 0, "refused={refused} completed={completed}");
     }
 }

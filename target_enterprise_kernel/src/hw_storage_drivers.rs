@@ -1659,16 +1659,38 @@ impl NvmeHwState {
             sqe.prp1 = self.data_pa;
             sqe.cdw10 = 0x00; // CNS = 0x00 (Identify Namespace)
             self.submit_admin(&sqe)?;
-            // SAFETY: `self.data_pa` holds the 4 KiB Identify Namespace structure (`NSZE` at bytes 0..8 LE).
-            let nsze = unsafe {
-                let mut raw = [0u8; 8];
-                core::ptr::copy_nonoverlapping(pa_to_va(self.data_pa), raw.as_mut_ptr(), 8);
-                u64::from_le_bytes(raw)
-            };
-            if nsze == 0 {
-                return Err(IoFault::DeviceError);
+            // The I/O path moves 512 bytes per logical block through one PRP
+            // entry. On a namespace formatted any other way (4 KiB blocks, or
+            // blocks with metadata) the same commands would transfer past the
+            // DMA page and misplace every sector, so such a namespace is
+            // refused here, before anything is read from or written to it.
+            // Bytes 0..384 hold everything the check reads: the size, the format
+            // selector, and all 64 LBA format entries a namespace can select.
+            let mut id_ns = [0u8; 384];
+            // SAFETY: `self.data_pa` holds the 4 KiB Identify Namespace structure.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    pa_to_va(self.data_pa),
+                    id_ns.as_mut_ptr(),
+                    id_ns.len(),
+                );
             }
-            self.sectors = nsze;
+            match target_enterprise::nvme::identify_namespace_512_sectors(&id_ns) {
+                Ok(nsze) => self.sectors = nsze,
+                Err(e) => {
+                    use target_enterprise::nvme::IdentifyNsError;
+                    if matches!(
+                        e,
+                        IdentifyNsError::UnsupportedBlockSize { .. }
+                            | IdentifyNsError::UnsupportedMetadata
+                    ) {
+                        serial_write_str(
+                            "NVME_HW REFUSED: namespace is not formatted with plain 512-byte blocks\n",
+                        );
+                    }
+                    return Err(IoFault::DeviceError);
+                }
+            }
         }
 
         // Create I/O Completion Queue 1 (`PC = 1 | IEN = 1`, `IV = 0`).
@@ -1706,7 +1728,9 @@ impl NvmeHwState {
         if cid == 0 { 1 } else { cid }
     }
 
-    pub(crate) fn ensure_ready(&mut self) -> Result<(), target_enterprise::state_store::IoFault> {
+    /// Whether the controller is enabled, not in fatal status, and still on
+    /// the queues this driver gave it.
+    fn is_ready(&self) -> bool {
         use target_enterprise::nvme::{CSTS_CFS, CSTS_RDY, REG_ASQ, REG_CSTS};
         // SAFETY: `self.bar0` is mapped uncached.
         let (csts, cur_asq) = unsafe {
@@ -1715,7 +1739,14 @@ impl NvmeHwState {
                 mmio_read64(self.bar0 + REG_ASQ as u64),
             )
         };
-        if (csts & CSTS_CFS) != 0 || (csts & CSTS_RDY) == 0 || cur_asq != self.asq_pa {
+        (csts & CSTS_CFS) == 0 && (csts & CSTS_RDY) != 0 && cur_asq == self.asq_pa
+    }
+
+    /// Re-initialise a controller that is not ready. Only for use between
+    /// operations (when a disk handle is taken): re-initialisation clears the
+    /// data page, so it must never run after a caller has staged a write.
+    pub(crate) fn ensure_ready(&mut self) -> Result<(), target_enterprise::state_store::IoFault> {
+        if !self.is_ready() {
             self.reinit_controller()?;
         }
         Ok(())
@@ -1732,7 +1763,18 @@ impl NvmeHwState {
         use target_enterprise::nvme::{SubmissionQueueEntry, IO_QUEUE_ENTRIES};
         use target_enterprise::state_store::IoFault;
 
-        self.ensure_ready()?;
+        // A controller found not ready at this point fails the command. It is
+        // re-initialised for the next one, but not transparently for this one:
+        // the caller has already staged its payload in the data page, which
+        // re-initialisation clears (the write would store zeros and report
+        // success), and a flush issued to a controller that has just been
+        // reset says nothing about the writes that came before the reset.
+        if !self.is_ready() {
+            // The result does not change this command's outcome; if it failed,
+            // the next command finds the controller not ready and fails too.
+            let _ = self.reinit_controller();
+            return Err(IoFault::DeviceError);
+        }
         let cid = self.alloc_cid();
         let mut sqe = SubmissionQueueEntry::EMPTY;
         sqe.cdw0 = SubmissionQueueEntry::cdw0(opcode, cid);
@@ -2154,10 +2196,18 @@ impl VirtioBlkHwState {
         Ok(())
     }
 
-    fn ensure_ready(&mut self) -> Result<(), target_enterprise::state_store::IoFault> {
+    /// Whether the device still reports `DRIVER_OK` on the queue this driver gave it.
+    fn is_ready(&self) -> bool {
         // SAFETY: `self.io_base` is VirtIO-blk BAR0.
         let (status, cur_pfn) = unsafe { (inb(self.io_base + 18), inl(self.io_base + 8)) };
-        if (status & 4) == 0 || cur_pfn != (self.q_pa >> 12) as u32 {
+        (status & 4) != 0 && cur_pfn == (self.q_pa >> 12) as u32
+    }
+
+    /// Re-initialise a device that is not ready. Only for use between
+    /// operations (when a disk handle is taken): re-initialisation clears the
+    /// request page, so it must never run after a caller has staged a write.
+    fn ensure_ready(&mut self) -> Result<(), target_enterprise::state_store::IoFault> {
+        if !self.is_ready() {
             self.reinit_hw()?;
         }
         Ok(())
@@ -2175,7 +2225,14 @@ impl VirtioBlkHwState {
         use target_enterprise::async_io::AsyncIoKind;
         use target_enterprise::state_store::IoFault;
 
-        self.ensure_ready()?;
+        // As for NVMe: a device found not ready here fails this request. It is
+        // re-initialised for the next one, but the request page the caller has
+        // just filled is cleared by that, so issuing the request anyway would
+        // write zeros and report success.
+        if !self.is_ready() {
+            let _ = self.reinit_hw();
+            return Err(IoFault::DeviceError);
+        }
         let hdr_pa = self.req_pa;
         let data_pa = self.req_pa + 16;
         let st_pa = self.req_pa + 16 + 512;
@@ -2350,7 +2407,8 @@ impl target_enterprise::state_store::SectorIo for VirtioBlkDisk {
 }
 
 /// Optional `fw_cfg` storage backend override (`opt/cuttle_storage_backend`):
-/// `0 = Unchecked`, `1 = Auto`, `2 = Ahci`, `3 = Nvme`, `4 = Virtio`.
+/// `0 = Unchecked`, `1 = Auto`, `2 = Ahci`, `3 = Nvme`, `4 = Virtio`,
+/// `5 = Invalid` (a value was given and is none of `ahci`, `nvme`, `virtio`, `auto`).
 static PREFERRED_STORAGE_BACKEND: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);
 /// Sticky active auto-probed backend (`0 = None`, `1 = Ahci`, `2 = Nvme`, `3 = Virtio`).
@@ -2382,7 +2440,15 @@ fn preferred_storage_backend() -> u8 {
             b"ahci" => 2,
             b"nvme" => 3,
             b"virtio" => 4,
-            _ => 1,
+            b"" | b"auto" => 1,
+            // An operator who pins a backend and mistypes it must not get
+            // whichever disk happens to answer first instead.
+            _ => {
+                serial_write_str(
+                    "STORAGE REFUSED: opt/cuttle_storage_backend is not one of ahci, nvme, virtio, auto\n",
+                );
+                5
+            }
         }
     } else {
         1
@@ -2405,6 +2471,7 @@ impl StorageDisk {
             2 => return AhciDisk::state_disk().map(StorageDisk::Ahci),
             3 => return NvmeDisk::state_disk().map(StorageDisk::Nvme),
             4 => return VirtioBlkDisk::state_disk().map(StorageDisk::VirtioBlk),
+            5 => return Err(target_enterprise::state_store::IoFault::DeviceError),
             _ => {}
         }
         match ACTIVE_STORAGE_BACKEND.load(Ordering::Acquire) {
@@ -2624,9 +2691,19 @@ pub(crate) fn banner_continuity() {
     let mut disk = StorageDisk::state_disk().expect("CONTINUITY: no storage disk available");
 
     // Read and authenticate header sector under `seal_key`.
+    //
+    // This region is a hint: the sealed shell state carries the authoritative
+    // boot generation and `shell_store_boot` brings the counter back in line
+    // with it. So nothing that goes wrong with these nine sectors may stop
+    // the boot. An unreadable sector is handled like a failed checksum (start
+    // the region over), and a failed write is reported and left for the next
+    // boot. Panicking here instead would turn one bad sector in a hint into
+    // a node that never reaches its intact state at LBA 1040.
     let mut scratch_sec = [0u8; 512];
-    disk.read_sector(CONTINUITY_LBA, &mut scratch_sec)
-        .expect("CONTINUITY: read header sector");
+    let mut region_readable = disk.read_sector(CONTINUITY_LBA, &mut scratch_sec).is_ok();
+    if !region_readable {
+        scratch_sec = [0u8; 512];
+    }
     let mut wal_buf = [0u8; kf::WAL_CAPACITY];
     let mut resumed_boots: u64 = 0;
     let mut resumed_cursor: usize = 0;
@@ -2636,17 +2713,29 @@ pub(crate) fn banner_continuity() {
     {
         let mut s = 0u64;
         while s < CONTINUITY_WAL_SECTORS {
-            disk.read_sector(CONTINUITY_LBA + 1 + s, &mut scratch_sec)
-                .expect("CONTINUITY: read WAL sector");
+            if disk
+                .read_sector(CONTINUITY_LBA + 1 + s, &mut scratch_sec)
+                .is_err()
+            {
+                region_readable = false;
+                break;
+            }
             let off = (s as usize) * 512;
             wal_buf[off..off + 512].copy_from_slice(&scratch_sec);
             s += 1;
         }
-        if crc32_ieee(&wal_buf) == want_crc && hdr_cursor <= kf::WAL_CAPACITY {
+        if region_readable
+            && crc32_ieee(&wal_buf) == want_crc
+            && hdr_cursor <= kf::WAL_CAPACITY
+        {
             resumed_boots = hdr_boots;
             resumed_cursor = hdr_cursor;
             is_resume = true;
+        } else {
+            wal_buf = [0u8; kf::WAL_CAPACITY];
         }
+    } else if !region_readable {
+        // Reported below.
     } else if scratch_sec[..8] == CONTINUITY_MAGIC[..]
         || scratch_sec[..8] == CONTINUITY_LEGACY_MAGIC[..]
     {
@@ -2655,6 +2744,12 @@ pub(crate) fn banner_continuity() {
         );
     } else if &scratch_sec[..4] == b"PRTS" {
         serial_write_str("CONTINUITY resume NOTICE: legacy format, state not migrated\n");
+    }
+
+    if !region_readable {
+        serial_write_str(
+            "CONTINUITY resume NOTICE: continuity region unreadable; starting it over (sealed state decides the boot generation)\n",
+        );
     }
 
     let mut wal: WalImpl<{ kf::WAL_CAPACITY }> = if is_resume {
@@ -2732,25 +2827,33 @@ pub(crate) fn banner_continuity() {
     // Persist: WAL region sectors then header (header LAST so a crash
     // mid-write never presents a valid header over a stale region).
     let backing = wal.backing();
-    let mut s = 0u64;
-    while s < CONTINUITY_WAL_SECTORS {
-        let off = (s as usize) * 512;
-        scratch_sec.copy_from_slice(&backing[off..off + 512]);
-        disk.write_sector(CONTINUITY_LBA + 1 + s, &scratch_sec)
-            .expect("CONTINUITY: write WAL sector");
-        s += 1;
-    }
-    // Barrier: the region must be on the platter before a header that
-    // vouches for it, or a power cut could leave a valid header over a
-    // half-written region.
-    disk.flush().expect("CONTINUITY: flush WAL region");
     let new_crc = crc32_ieee(backing);
     CONTINUITY_CURSOR.store(wal.durable_cursor() as u64, core::sync::atomic::Ordering::Relaxed);
     CONTINUITY_CRC.store(new_crc as u64, core::sync::atomic::Ordering::Relaxed);
-    scratch_sec = continuity_header(this_boot, wal.durable_cursor() as u32, new_crc);
-    disk.write_sector(CONTINUITY_LBA, &scratch_sec)
-        .expect("CONTINUITY: write header sector");
-    disk.flush().expect("CONTINUITY: flush header sector");
+    let header = continuity_header(this_boot, wal.durable_cursor() as u32, new_crc);
+    let mut persist = || -> Result<(), target_enterprise::state_store::IoFault> {
+        let mut s = 0u64;
+        while s < CONTINUITY_WAL_SECTORS {
+            let off = (s as usize) * 512;
+            scratch_sec.copy_from_slice(&backing[off..off + 512]);
+            disk.write_sector(CONTINUITY_LBA + 1 + s, &scratch_sec)?;
+            s += 1;
+        }
+        // Barrier: the region must be on the platter before a header that
+        // vouches for it, or a power cut could leave a valid header over a
+        // half-written region.
+        disk.flush()?;
+        disk.write_sector(CONTINUITY_LBA, &header)?;
+        disk.flush()
+    };
+    if persist().is_err() {
+        // A stale header over a part-written region fails its checksum on the
+        // next boot, which then starts the region over.
+        serial_write_str(
+            "CONTINUITY NOTICE: continuity region could not be written; next boot will reconcile\n",
+        );
+        return;
+    }
 
     {
         let mut line = [0u8; 64];

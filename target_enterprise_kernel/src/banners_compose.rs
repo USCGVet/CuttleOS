@@ -643,6 +643,9 @@ fn persist_error_str(e: &target_enterprise::state_store::PersistError) -> &'stat
             stage: CommitStage::Stage,
         }) => "shadow slot read back differently (previous state intact)",
         PersistError::Commit(CommitError::Verify { .. }) => "a written sector read back differently",
+        PersistError::StoreFaulted => {
+            "an earlier commit failed; the store takes no more writes until the next boot recovers it"
+        }
     }
 }
 
@@ -661,13 +664,22 @@ fn sync_hw_tpm_rollback_floor_on_boot() {
     if drv.startup(cuttle_contracts::TPM_SU_STATE).is_err() {
         let _ = drv.startup(TPM_SU_CLEAR);
     }
-    if let Ok(floor) = drv.nv_ensure_and_read_counter(TPM_NV_INDEX_ROLLBACK_CTR) {
-        if floor > 0 {
-            let mut store = SHELL_STORE.lock();
-            if floor > store.min_commit_seq() {
-                store.set_min_commit_seq(floor);
+    match drv.nv_ensure_and_read_counter(TPM_NV_INDEX_ROLLBACK_CTR) {
+        Ok(floor) => {
+            if floor > 0 {
+                let mut store = SHELL_STORE.lock();
+                if floor > store.min_commit_seq() {
+                    store.set_min_commit_seq(floor);
+                }
             }
         }
+        // A TPM answered the probe and then could not give the counter. The
+        // boot goes on without a floor (see Claude-Recommendations.md: this
+        // path is fail-open), but it does not go on silently.
+        Err(_) => serial_write_str(
+            "TPM WARNING: rollback counter unreadable; booting without an anti-rollback floor
+",
+        ),
     }
     drv.relinquish_locality_0();
 }
@@ -684,7 +696,21 @@ fn advance_hw_tpm_rollback_counter_on_commit(new_seq: u64) {
     if drv.probe_did_vid().is_none() {
         return;
     }
-    let _ = drv.nv_advance_counter_to(TPM_NV_INDEX_ROLLBACK_CTR, new_seq);
+    if drv
+        .nv_advance_counter_to(TPM_NV_INDEX_ROLLBACK_CTR, new_seq)
+        .is_err()
+    {
+        // The commit itself is durable; what is lost is the floor that would
+        // catch a later rollback of the disk to before it. Say so once per
+        // boot rather than once per commit.
+        static WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            serial_write_str(
+                "TPM WARNING: rollback counter not advanced; the anti-rollback floor is stale
+",
+            );
+        }
+    }
     drv.relinquish_locality_0();
 }
 
@@ -736,7 +762,7 @@ pub(crate) fn persist_shell_if_changed(sh: &mut target_enterprise::OsShell, forc
 /// known and before anything serves requests.
 pub(crate) fn shell_store_boot() {
     use target_enterprise::state_store::{
-        BootError, BootOutcome, BootReport, RecoverySource, ShellKeys,
+        BootError, BootOutcome, BootReport, PagedBootFault, RecoverySource, ShellKeys,
     };
     let provisioned = is_device_key_provisioned();
     let keys = ShellKeys {
@@ -780,6 +806,14 @@ pub(crate) fn shell_store_boot() {
         Err(BootError::Rollback { .. }) => {
             storage_fault("whole-disk rollback detected (commit_seq below floor)")
         }
+        // The node did not start over. Doing so would put a fresh page store on
+        // top of the SQL rows and files that are still on this disk.
+        Err(BootError::PagedStore(PagedBootFault::AnchorMismatch)) => storage_fault(
+            "page store does not hold the epoch the committed state anchors (nothing was started over)",
+        ),
+        Err(BootError::PagedStore(PagedBootFault::Unanchored)) => storage_fault(
+            "state cannot be authenticated and the page store holds data (nothing was started over; check the device key)",
+        ),
     };
 
     if report.boots != counter {

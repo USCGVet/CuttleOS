@@ -1,259 +1,272 @@
 # Claude Recommendations
 
-This round was not a normal review round. The user asked me to review the core OS and improve it directly, with one bar: *would you trust your own data on it*. So this file has two parts:
+This was not a normal review round. The user asked me to review what the builder added since the last round and to fix what I found, with one bar: *would you trust your own data on it*. So this file has three parts:
 
-1. **What I changed** in the working tree (nothing is committed), each with the test that proves it.
-2. **What is still open** for the builder, by priority.
+1. **Two things to know first** (next section): the test suite rewrote source files during this round, and nothing here is committed.
+2. **What I changed** in the working tree (nothing is committed), each with the test that proves it.
+3. **What is still open** for the builder, by priority.
 
-**Scope.** I read the core at `d279d75`: the kernel crate (`target_enterprise_kernel/src`) and the storage, filesystem, SQL, shell-persistence, memory and SMP modules of `target_enterprise/src`. Three read-only reviewer passes covered the storage library, the memory/interrupt/SMP core, and the drivers and key provisioning; I checked every finding below against the code before acting on it or listing it. I did **not** review the diff of the 22 commits `917109c..d279d75` as a whole, and I did **not** verify last round's status lines (see the table below).
+**Commits reviewed:** `51874a1..6dd5197` (ten commits, 43 files, about 25,800 lines added). I read the new page store (`paged_store.rs`) and its coupling to the state store line by line. Three read-only review passes covered the kernel storage drivers, the network stack, and the TPM and Ring-3 process code. Each open finding below says whether I confirmed it against the code myself or am relaying a pass's trace. Line numbers are from `6dd5197` for files I did not change; for files I changed I name the function instead.
 
-Line numbers are from the working tree as I left it.
+## Know this first
+
+### A. Running the required checks rewrote two tracked source files
+- **Where:** `target_enterprise/src/tls.rs` and `target_enterprise/src/wal.rs` in the working tree; `snapshot_modules` / `restore_modules` in `morph_engine/tests/north_star_soak.rs:431-453` and `morph_engine/tests/bundle_soak_boot.rs:88-105`.
+- **What happened:** the session started with two untracked files, `tls.candidate.rs` and `wal.candidate.rs` (single-line, comment-stripped diversifier output, left by an earlier run). I ran `cargo test --workspace --no-fail-fast` as the procedure requires. It exited 0, and afterwards `tls.rs` and `wal.rs` held the candidate bytes (same sizes, 8,750 and 23,736 bytes) and the candidate files were gone. `git diff --stat` shows 838 lines deleted, 2 added.
+- **Problem:** the morph soak tests run on the live checkout. They snapshot the modules by reading whatever is on disk and put that back at the end, so a tree that is already disturbed is "restored" to the disturbed state, and the run still passes.
+- **Effect:** the mandatory pre-commit check can silently replace reviewed source with machine output. The code still compiles and behaves the same, so nothing fails. One `git commit -a` away from losing every comment and all formatting in those modules.
+- **State now:** restored. The user approved it and I ran `git checkout HEAD -- target_enterprise/src/tls.rs target_enterprise/src/wal.rs`; both files match `HEAD` again and no `*.candidate.rs` file is left in the tree. The defect in the tests is still open.
+- **Fix (builder):** run morph cycles on a copy of the tree, never the checkout. Until then: fail the test at start if any `*.candidate.rs` exists or `git status` shows a modified module, and take the snapshot from `git show HEAD:<path>`. Add a post-condition to the suite that the working tree is unchanged.
+- **What triggers it:** a stale candidate file. I ran the same suite in a second, clean worktree and it came through unchanged, so a clean checkout is safe. The candidates were left by an earlier run (an interrupted one, I assume); the next run then promoted them. So the exposure is: any interrupted test run poisons the next one, and that next run passes.
+
+### B. Everything I changed is uncommitted
+The changes below are in the working tree. I developed and verified them in a separate git worktree (so the run in A could not touch them) and then applied the patch here.
+
+---
 
 ## Test status
 
-Host: the user's Windows 11 machine; stable 1.93.1; pinned `nightly-2026-10-22`; QEMU, TCG.
+Host: the user's Windows 11 machine; pinned `nightly-2026-10-22` for the kernel; QEMU under TCG.
 
-- `cargo test --workspace --no-fail-fast`: **exit 0; 4,470 passed, 16 ignored** by cargo's own counts (4,390 passed, 16 ignored before my changes, same host, same day). Both figures include the verifier's nested release run of `target_enterprise`, whose one deliberate failing probe (`watchdog::stage8_verifier_gate_probe::must_run_in_verifier`) appears in the log in both runs.
-  The run predates one last kernel-only change (the panic handler's ordering). The kernel is outside the workspace; the suites that read its ELF (`cuttle-binmorph`, `cuttle-mtd-metrics`) were re-run on the final build and passed.
-- `target_enterprise` unit tests: **1,835 passed** (1,796 before this round; 39 new).
-- `cargo test -p factory_builder --test qemu_smoke -- --ignored`: **3 passed**. `tampered_ahci_seal_is_rejected_under_qemu` was rewritten; see "Behaviour changes" below.
-- `(cd target_enterprise_kernel && cargo build --release)`: **passed**, no warnings from the crate. The production variant (`factory_builder build-kernel --prod`) also builds.
+**Before my changes** (`6dd5197`, this checkout):
+- `cargo test --workspace --no-fail-fast`: **exit 0; 4,568 passed, 19 ignored** by cargo's own counts, in about 75 minutes. The count includes the verifier's nested release run of `target_enterprise`, whose one deliberate failing probe (`watchdog::stage8_verifier_gate_probe::must_run_in_verifier`) appears in the log of a passing run. This is the run that rewrote `tls.rs` and `wal.rs`.
+- `python tools/triad_controller.py --unit-test`: **passed** (run here, before my patch was applied; not re-run after).
+
+**With my changes** (a clean worktree at `6dd5197` plus the patch):
+- `cargo test --workspace --no-fail-fast`: **exit 0; 4,598 passed, 19 ignored.** The 30 extra are my 15 new tests, each counted once in the library run and once in the verifier's nested run. The worktree was unchanged afterwards apart from my files.
+- `target_enterprise` unit tests: **1,899 passed** (1,884 before).
+- `cargo test -p factory_builder --test qemu_smoke -- --ignored`: **6 passed** (BIOS boot, UEFI/OVMF boot, three-seed morph continuity, 4 MiB page store across a reboot, NVMe-only persistence, tampered seal).
+- `(cd target_enterprise_kernel && cargo build --release)`: **passed**, no warnings from the crate.
 - `python -c "import ast; ..."` on `tools/triad_controller.py`: **passed**.
-- `python tools/triad_controller.py --unit-test`: **passed** (it drives the real shell through `shell_harness`).
-- **Live, on real VMs** (beyond the required checks): `python tools/triad_controller.py --self-test --accel tcg` (3 VMs): **passed**. Two caveats:
-  - `target/cuttle_images/run_bios.img` was from 23 October, so the self-test would have run an old kernel. I rebuilt it from the current ELF first (Low list).
-  - The run logged `TMR parity vote could not verify 2/3 majority: unreadable state probe` on all three nodes three times, each right after a restart step. The test does not treat that as a failure, and I did not establish whether those alerts predate this round.
-  - It ran before one last change to the panic handler's ordering; the QEMU smoke tests were re-run after it.
-- `tools/cuttle_fleet.py --self-test` (18 VMs): **not run.**
+- After that full run I made three small edits (wording of two fault messages and their runbook lines, and a larger buffer for the NVMe format check) and re-ran the kernel build, the `target_enterprise` unit tests (1,899 passed) and the six QEMU cases (6 passed). The whole workspace suite was not re-run in the worktree after those three edits; it was run in this checkout afterwards (next paragraph).
 
-One trap I walked into: building the `--prod` kernel leaves that variant at `target_enterprise_kernel/target/x86_64-unknown-none/release/`, and three workspace tests that read "the real kernel ELF" then fail on their size thresholds. They pass again once the default kernel is rebuilt. It is listed below as Medium #9.
+**In this checkout, final state** (patch applied, `tls.rs` and `wal.rs` restored from `HEAD`, README sentence added): all four required checks, run after the last edit to any source file.
+- `cargo test --workspace --no-fail-fast`: **exit 0; 4,598 passed, 19 ignored.**
+- `cargo test -p factory_builder --test qemu_smoke -- --ignored`: **6 passed.**
+- `(cd target_enterprise_kernel && cargo build --release)`: **passed.**
+- `python -c "import ast; ..."` on `tools/triad_controller.py`: **passed.**
+- The tree came through this run unchanged: the same ten modified files before and after, each with an identical diff, and no untracked files.
+
+**Not run:** `triad_controller.py --self-test` and `cuttle_fleet.py --self-test` (live VMs). A `--prod` kernel build.
 
 ## Verification of last round's items
 
-I did not do this step this round. Every item is carried over unverified.
+The builder marked every item. "Exists and passes" means the named test is in the tree and the suite it belongs to passed this round; where I also read the code or the test I say so. I did not re-run the live Triad or fleet self-tests.
 
 | # | Item | Builder's status | Verdict |
 |---|---|---|---|
-| 1–14 | Round 9 items in the previous version of this file | Fixed (`d9869f1`, `a3ce4bf`, `fddcbf6`, `82fd583`, `a6ca484`) | **Not verified this round** |
-| R1–R15 | `Cuttle-OS-Recommendations.md` | Fixed (`82fd583`, `a6ca484`, `d9869f1`) | **Not verified this round** |
-
-One of them I touched in passing: Round 9 #13 asked the multi-seed QEMU test to check persisted state on disk. It does (it pins the first journal record at `LBA 1041`), and that assertion caught a byte-order change I had made to the journal; I restored the order.
+| High 1 | Controller does not know about repair, rejection, quarantine, storage halt | Fixed (`b995e5e`) | **Verified fixed.** Read `_handle_node_storage_fault` and `handle_guest_serial_line` in `tools/triad_controller.py` (archives the faulted image, replaces it, heals) and the runbook entries. `python tools/triad_controller.py --unit-test` passed. Two of the test names in the status line do not exist (`stage4_serial_events`, `stage4_storage_fault`); the real one is `stage4_storage_events`. |
+| High 2 | Fleet self-test not run against the kernel | Fixed (`7c321a6`, `b995e5e`) | **Not verified.** The evidence is a claim that two live runs passed. I did not re-run them. |
+| Medium 1 | A commit is ~110 single-sector commands | Fixed (`7c321a6`) | **Verified fixed.** `batched_commit_and_recovery_uses_multisector_transfers_and_supports_lba48` exists and passes; `SectorIo` has the multi-sector methods. |
+| Medium 2 | One-sector journal | Fixed (`d3f1925`, `fdb1522`) | **Verified fixed.** The three named migration and capacity tests exist and pass. I read `try_migrate_v1`. |
+| Medium 3 | Whole-disk rollback not detected | Fixed (`fdb1522`, `b995e5e`) | **Partly fixed.** The floor in `ShellStore::boot` works and is tested. The TPM that is supposed to supply it is fail-open and can strand a node (High 2 below). |
+| Medium 4 | No early IDT | Fixed (`946910d`) | **Verified** by the QEMU smoke run (it checks `verify_early_bsp_idt_active`). Not re-read. |
+| Medium 5 | Boot service window has no deadline | Fixed (`b917e2f`) | **Partly fixed.** The window is now bounded, but it was done by taking the shell out of the path, which also took the firewall and lockdown checks out (Medium 2 below). |
+| Medium 6 | Keyless node accepts writes | Fixed (`fdb1522`) | **Verified fixed.** Read the `EPHEMERAL` path in `shell_store_boot`; the named test exists and passes. |
+| Medium 7 | Time counted in HLT wake-ups | Fixed (`b917e2f`) | **Partly fixed.** The TCP time base in `LivedNet` still advances once per received frame (High 6 below). |
+| Medium 8 | False preemption of the Ring-3 worker | Fixed (`946910d`) | Exists and passes under QEMU. Not re-read. |
+| Medium 9 | Tests depend on the last kernel variant built | Fixed (`946910d`) | Exists and passes. Not re-read. |
+| Medium 10–12 | Built-in files, vault nonce, WAL frame format | Fixed (`d3f1925`) | Named tests exist and pass. Not re-read. |
+| Low: AP SHA-256, TLB shootdown, heap comment, serial, virtio-net | Unverified | Accepted as unverified, as the builder says. |
+| Low: emergency dump writer | Fixed | **Partly.** The AHCI path has its own slot and buffers; the NVMe emergency path shares the mainline data page and queue (Low list). |
+| Low: boot counter, aborted SQL owners, partial restore, file times | Fixed | Named tests exist and pass. Not re-read. |
+| Low: `decide_ab_recovery` | Fixed, test `ab_recovery_matrix_covers_clean_interrupted_corrupt_and_double_fault` | **Not resolved as stated.** No test of that name exists. `durable_seal.rs` has other tests that call the function. |
+| Low: stale Triad base image | Fixed, test `stage4_stale_bios` | The test is `stage4_bios_freshness`; it is part of the unit run that passed. Not re-read. |
+| Low: README | Partly fixed | See the README items in the Low list; new overstatements arrived with B4–B6. |
 
 ---
 
 ## What I changed
 
-All of it is in the working tree, uncommitted. The idea behind most of it: the code that decides whether data survives was inlined in the kernel, where it cannot be unit-tested, and the one "power cut at every sector" test re-implemented the write sequence in the test body instead of calling it. That logic now lives in one library module and is tested against a disk model that misbehaves the way disks do.
-
-### New: `target_enterprise/src/state_store.rs`
-
-- **Commit** (`commit`): stage the image in the shadow slot, flush, read back; write the `IN_FLIGHT` record, flush, read back; install the primary slot, flush, read back; write the `QUIESCENT` record, flush, read back. Four flush barriers (there were five); the module docs say what each is for.
-- **Recovery** (`recover`): authenticate the commit record, then use the primary slot if it matches, otherwise the shadow slot if it matches (roll-forward for `IN_FLIGHT`, a reported repair for `QUIESCENT`), otherwise refuse and leave the disk untouched. An unreadable sector counts as a damaged one.
-- **Node policy** (`ShellStore`): pack and commit a live `OsShell`; decide at boot what the shell starts from; copy state that cannot be authenticated to a quarantine area (`LBA 1152..=1205`) before starting over, and restore it on a later boot that can authenticate it.
-- **Disk model for tests** (`testdisk::MemDisk`): a volatile write cache, a power cut at a chosen operation that tears the sector being written and keeps all, none or a random subset of unflushed writes, reported I/O errors, silently dropped writes, unreadable sectors.
-
 ### Defects fixed
 
 | # | Defect (before) | Fix | Proof |
 |---|---|---|---|
-| 1 | A commit failure was discarded (`let _ = persist_shell_to_ahci(..)` at four call sites) and `sync` printed `sync: ok` regardless. | `persist_shell_if_changed` returns only when the state is on disk; a failed commit stops the node with `STORAGE FAULT: <reason>`. | `state_store::node_tests::failed_commit_is_reported_and_the_next_boot_is_consistent`; `state_store::tests::io_error_at_every_operation_fails_the_commit_and_recovers_cleanly` |
-| 2 | The 512-byte journal sector overflowed once the state held a few firewall rules, tasks, cron jobs and IMA digests, or two 200-byte files. From then on **every** commit failed to pack and nothing (files and SQL included) reached the disk again, silently. | Commands that add a journal record check an exact size budget first and refuse with `ENOSPC`; file copies in the journal are optional and never crowd out a state record. | `state_store::node_tests::every_state_the_shell_accepts_can_be_packed_and_restored` (fails with `Journal(OutOfCapacity)` after `fw block 10.4.0.0/16` when the budget is disabled); `...many_and_large_files_persist_and_restore_byte_for_byte` |
-| 3 | Only seven counters triggered a commit. File writes, firewall rules, tasks, capability grants, cron jobs and IMA digests were not saved until something else changed; a SQL `COMMIT` did not trigger one either, so a committed transaction could be lost. | The trigger is `OsShell::durable_fingerprint`, built from the same record enumeration the journal writes, a mutation counter inside the filesystem, and the SQL committed sequence. | `state_store::node_tests::every_durable_change_moves_the_fingerprint`; `...committed_transaction_is_on_disk_and_uncommitted_one_is_not` |
-| 4 | Network replies were transmitted before the commit. | Commit first, then transmit (main loop and boot service window). | Ordering is in `main.rs` and `net_service.rs`; the property it relies on is #1. Not separately tested under QEMU. |
-| 5 | Boot panicked with `SHELL resume: cross-boot AHCI state drift` whenever the boot counter and the saved generation were not exactly one apart. A power cut between the counter update and the first commit of a boot (several seconds) made every later boot panic. | The generation comes from the sealed state; the counter is a hint and is rewritten to follow it. | `state_store::node_tests::boot_counter_ahead_of_or_behind_the_saved_generation_still_restores` |
-| 6 | If the continuity header was lost, the counter restarted at 1, the restore was skipped (`if boots > 1`), and fixture state was committed over the real state. | Restore no longer depends on the counter. | Same test as #5 (the "behind" case). |
-| 7 | Boot panicked unless `/var/boot.ok` read `ready` and the `kv` row `boot.state` was `ready|1`; both are ordinary user-writable state. | Removed. A resumed boot never asserts on stored content. | Code removal in `banner_shell_compose`; QEMU multi-seed test still passes. |
-| 8 | A damaged primary slot was rejected even when the shadow slot held a verified copy; an all-zero primary slot, or an all-zero filesystem or SQL superblock, was treated as "nothing stored" and then overwritten. | Recovery checks both slots against the commit record; a missing partition is an error. | `state_store::tests::damage_to_any_primary_sector_is_healed_from_shadow_and_reported`; `state_store::node_tests::damaged_or_zeroed_primary_slot_is_healed_not_treated_as_a_blank_disk`; `...a_partition_zeroed_in_both_slots_is_rejected_not_silently_reset`; QEMU `tampered_ahci_seal_is_rejected_under_qemu` |
-| 9 | A rejected disk was overwritten in the same boot. One boot without the `-fw_cfg` device key therefore destroyed the stored state. | The slots are copied to the quarantine area first; a later boot that can authenticate the copy restores it. | `state_store::node_tests::state_survives_boots_without_the_device_key`; `...unverifiable_state_is_preserved_before_the_node_starts_over`; QEMU tamper test (boot 3) |
-| 10 | Every AHCI error or timeout was a panic, the HBA was re-probed and the port restarted on every commit, and only `TFD.ERR` was checked. | `try_issue_with_prdtl` returns a fault and checks the `PxIS` error bits, `TFD` ERR/DF and the transferred byte count; the port is probed once; capacity comes from IDENTIFY and every LBA is range-checked. | Engine side: `state_store::tests::unreadable_sector_in_either_slot_or_the_commit_record_does_not_stop_recovery`. Driver side: exercised by the three QEMU tests; error paths not injected under QEMU. |
-| 11 | Restoring the filesystem partition ignored `open`/`write` failures. With the journal's small-file copies already holding 256-byte reservations, a large file could fail to restore, be dropped without an error, and then be absent from the next commit. | Two passes: validate every directory entry, remove existing user files, then recreate each file with a reservation that is guaranteed to fit. Any failure fails the restore. | `shell::tests::filesystem_restore_recreates_every_file_when_the_pool_is_tight` |
-| 12 | `write`, `writehex` at offset 0 and HTTP `PUT /fs` truncated the file before knowing the new contents fit; a failed write left it empty. HTTP reported `201` with `wrote 0 bytes`. | `MemRamFs::can_replace` is asked first; the reply is `ENOSPC` (HTTP 507) and the file is unchanged. | `vfs::tests::can_replace_predicts_truncating_overwrite_exactly`; `shell::tests::overwrite_that_does_not_fit_leaves_the_existing_file_untouched` |
-| 13 | `CREATE INDEX` had no capacity check. On a nearly full database the save then dropped rows silently (`break`) or indexed past the buffer. | Capacity check added; `try_save_partition` writes every committed row or returns `TooLarge`. | `sql::tests::create_index_respects_partition_capacity_and_a_full_database_saves_every_row` |
-| 14 | The SQL transaction idle timeout advanced once per received Ethernet frame. Sixteen unrelated frames rolled back an open transaction; the client's remaining statements then ran in autocommit and were saved: half a transaction on disk. | The timeout and cron tick on the calibrated timer epoch (about one second). After a timeout the owner's statements are refused until it sends `ROLLBACK`, `COMMIT` (which reports the loss) or `BEGIN`. | `sql::tests::idle_timeout_aborts_the_transaction_until_its_owner_acknowledges_it`. The kernel-side tick change is not tested under QEMU. |
-| 15 | The boot service window restored the shell itself, served mutating requests, never committed, and its state was then discarded. | The store is booted once, before the window; the window commits before replying; `banner_shell_compose` no longer resets a shell that holds real state. | QEMU smoke tests; no test sends a mutating request during the window. |
-| 16 | The continuity region was rewritten in place with no flush, and `resumed_boots + 1` could overflow. | Flush after the region and after the header; saturating add. | Not tested (the region is now only a hint). |
-| 17 | The panic handler attempted the crash dump (MMIO and disk) before printing the message, so a panic caused by either could hang silently. | Order is now: stop the other CPUs and scrub keys, print the message, then attempt the dump. | Not tested. |
-| 18 | The commit path used the AP SHA-256 offload, which can return a stale digest after a timeout. | The store hashes on the boot CPU. | Covered by the store tests; the offload itself is unchanged (Low list). |
-| 19 | Console input arriving during a commit was dropped (polled UART, 16-byte FIFO). This became visible once every mutating command committed. | A 512-byte receive ring, pumped from the AHCI wait loops. | QEMU `morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu` (its interactive part failed without it). |
+| 1 | **Page encryption reused nonces.** A page's nonce was `(LSN, physical slot, domain)`. When the page store committed and power was lost before the state image that anchors it (the window the two-epoch design exists for), the next boot went back to the previous epoch and its next commit took the same LSN and the same physical slots, with different contents: two plaintexts under one ChaCha20-Poly1305 key and nonce. A failed commit retried in the same boot did the same. | The nonce is now derived from the page header **and** the plaintext (`page_nonce`), so a nonce can only repeat for an identical page image. Encryption stays deterministic, which recovery relies on. Pages written before the change still decrypt (the stored nonce is used and the tag authenticates it). | `paged_store::fault_tests::two_different_page_images_never_share_a_nonce_and_equal_images_encrypt_identically`; `...pages_sealed_under_the_previous_nonce_derivation_are_still_read` |
+| 2 | **An LSN could be used by two epochs.** The directory binds a page by slot and LSN, not by content. With a reused LSN, a page of the abandoned epoch left in place by one lost write passed every check of the new epoch: stale data returned as current, no error. | `PagedBlockStore::lsn_floor`: every LSN the device shows was used (either authenticated superblock, or an authenticated journal header) is skipped, and a commit spends its LSN the moment it starts writing. A bulk commit now makes its journal header durable before its first page, because it has no superblock yet to carry the LSN. | `...an_abandoned_epoch_does_not_share_its_lsn_with_the_epoch_that_replaces_it`; `...a_page_left_over_from_an_abandoned_epoch_is_never_returned_as_current`; `...a_power_cut_anywhere_in_a_bulk_commit_never_leaves_pages_under_a_reused_lsn` (every cut point) |
+| 3 | **The page store never read back what it wrote.** The state slots are verified by read-back; pages, directory and superblock were not. A write the device acknowledged and dropped produced a "committed" epoch with a hole, found at the next boot. | `commit_dirty` reads every page of the commit, the directory and the final superblock back and compares, before the superblock is written as committed. A mismatch is `PagedStoreError::VerifyFailed` and the previous epoch stays committed. | `...a_write_the_device_dropped_fails_the_commit_instead_of_committing_a_hole` (every operation, small and bulk commits) |
+| 4 | **Recovery ignored the device.** Rolling an interrupted commit forward discarded the results of the page rewrite, the flush and the superblock write (`let _ =`, three places). Recovery could report success with the superblock still `IN_FLIGHT`; the next commit overwrites the redo journal that epoch still needed. | Each step is checked and read back. Recovery either finishes the roll-forward durably or fails. `last_recovery_healed()` and `last_recovery_rolled_forward()` report what it did. | `...recovery_of_an_interrupted_commit_finishes_the_roll_forward_or_fails` (device error at every operation of the recovery) |
+| 5 | **One bad sector in the page pool erased the node.** A page that failed verification made boot return `Rejected`; the node started from defaults and its first commit put a new, empty page store over every other page. The existing test asserted this outcome, with `preserved: true`. | `ShellStore::boot` returns `BootError::PagedStore(AnchorMismatch)` and does not start over. The kernel halts with a storage fault that says so. (Before stopping, recovery may repair a slot or a page from its own authenticated copy; it writes nothing else.) | `state_store::node_tests::stage_b4_enterprise_paged_store_scale_incremental_writes_crash_and_tamper_proof`, cases 7a and 7b: the disk is byte-identical afterwards, and undoing the damage brings all 1,080 rows back |
+| 6 | **One boot with the wrong device key erased the page store.** Last round's quarantine saves the 53-sector slots before a rejected boot starts over. The page store (all SQL rows and file contents on disks of 4,096 sectors or more) is not in it, and was overwritten. | `BootError::PagedStore(Unanchored)`: a node whose state cannot be authenticated, on a disk whose page store is not blank, halts instead of starting over. | `...a_paged_disk_this_boot_cannot_authenticate_is_left_untouched_until_it_can` (two wrong-key boots leave the disk byte-identical, then the right key restores everything; also state slots wiped with the page store intact) |
+| 7 | **A commit could be retried over the only good copy.** After a commit failed at the device, `ShellStore::commit` could be called again. It would stage into the shadow slot (possibly the only complete image) and rewrite page-store slots the interrupted commit might already have made the committed ones. | The store is marked faulted and returns `PersistError::StoreFaulted` without touching the device until `boot()` has run recovery. | `...failed_commit_is_reported_and_the_next_boot_is_consistent` (device error at every operation of a commit) |
+| 8 | **A node served from the shadow slot with the primary unrepairable.** If the device refused the rewrite of the primary slot, boot carried on with a warning. The next commit stages over the shadow slot, so one power cut would leave no copy. | `boot()` returns `BootError::Io` in that case. A refused repair of the *shadow* slot is still only a warning. | `...a_primary_slot_the_device_will_not_let_be_repaired_stops_the_boot` (device error at every operation of the boot) |
+| 9 | **A rollback floor did not stop a start-over.** With a floor set (TPM counter), a wiped disk was refused but an unauthenticatable one was not: the node started over from sequence zero, and its own next boot then failed the floor check for good. | Both cases return `BootError::Rollback`, and nothing is written. | `...an_unverifiable_disk_is_not_restarted_from_zero_under_a_rollback_floor` |
+| 10 | **NVMe and VirtIO-blk could store zeros and report success.** `submit_io` / `submit_req` re-initialised a not-ready device before issuing the command. Re-initialisation clears the data page the caller had just filled. A flush was likewise acknowledged across a device reset. | A device found not ready inside an operation fails that operation (and is re-initialised for the next). Re-initialisation between operations, when a disk handle is taken, is unchanged. | **Unverified under fault**: no test makes a device not-ready mid-commit. The QEMU cases pass, and fix 3 now catches this failure in the page store regardless of the driver. |
+| 11 | **NVMe block size was assumed.** Identify Namespace was read for its size only. On a namespace with 4 KiB blocks or per-block metadata the same commands transfer past the one DMA page and misplace every sector. | `nvme::identify_namespace_512_sectors` checks the current LBA format; the driver refuses anything but plain 512-byte blocks (`NVME_HW REFUSED: ...`). | `nvme::identify_ns_tests` (three tests) for the decision. The driver's use of it is exercised by the NVMe QEMU case for the accepting path only. |
+| 12 | **A bad sector in the boot-counter hint stopped the node for good.** `banner_continuity` used `.expect()` on every read, write and flush of `LBA 1024..1032`, a region its own comment calls a hint. | An unreadable region is started over, a failed write is reported, and the boot continues; the sealed state decides the boot generation as before. | **Unverified under fault.** QEMU cases pass on the normal path. |
+| 13 | **A mistyped storage backend pin meant "auto".** `opt/cuttle_storage_backend` values other than the three names fell through to auto-probing. | An unrecognised non-empty value refuses storage with a message. `auto` and empty still mean auto. | **Untested.** |
+| 14 | **`SYSCALL` left `NT` set in the kernel.** The flag mask cleared `TF`, `IF`, `DF`, `AC` only. Ring 3 can set `NT`; the next `iretq` on that CPU (the entry into another process) then faults in the kernel, and that process is reaped for it. Saved user flags were restored unsanitised. | `NT` and `IOPL` added to the mask; `proc_vm::sanitize_user_rflags` keeps only the status flags and `DF`, and is used where a process is entered and where a preempted frame is saved. | `proc_vm::rflags_tests::a_resumed_process_keeps_its_status_flags_and_nothing_else` for the sanitiser. The mask itself is **unverified with hostile flags** under QEMU (Medium 9). |
+| 15 | **TPM failures were silent.** Reading the floor at boot and advancing it after a commit both discarded errors. | Two serial warnings (one per boot). This is visibility only; the design problems are High 2. | None; no QEMU case attaches a TPM. |
 
-The central guarantee, old state or new state after a power cut and never a mixture, is `state_store::tests::power_cut_at_every_operation_recovers_old_or_new_never_a_mixture` (every device operation, four cache-loss models), `...power_cut_during_a_second_consecutive_commit_never_loses_the_first`, and on a real shell `state_store::node_tests::power_cut_during_commit_boots_into_old_or_new_state_never_a_mixture`. I checked that these have teeth: removing the flush after the shadow slot makes the first one fail.
+Also pinned, not changed: `...a_full_page_store_fails_the_commit_without_writing_and_loses_nothing_committed` shows what happens when the page store fills (High 4).
+
+I checked that the new tests have teeth: with fixes 1–9 removed, all eleven tests named in those rows fail and the compatibility test still passes; with only the bulk-commit header of fix 2 removed, only its test fails.
 
 ### Behaviour changes the builder should know about
 
-- **One tampered slot is repaired, not rejected.** `tampered_ahci_seal_is_rejected_under_qemu` used to flip one byte at `LBA 1041` and expect `SHELL resume REJECTED`. It now has two cases: that same flip must produce `SHELL resume REPAIRED` and `SHELL resume OK` with both slots identical afterwards; the same flip in both slots must produce `SHELL resume REJECTED`, no `SHELL resume OK`, and the rejected sectors byte for byte in the quarantine area. The tampered bytes are never used in either case. The old assertion is kept for the case where it still holds.
-- **Every durable change commits before its reply.** A mutating console command now takes about a second under TCG (Medium #1). Each `writehex` chunk is one such command.
-- **Cron ticks are timer epochs** (about one second), no longer one per command or frame.
-- **New replies:** `error: ENOSPC (durable state journal full; ...)`, `error: ENOSPC (file does not fit; nothing was changed)` (HTTP 507), `error: transaction timed out and was rolled back; ...`.
-- **New serial lines:** `SHELL resume REPAIRED`, `SHELL resume RECOVERED`, `SHELL resume NOTICE: ...`, `SHELL resume WARNING: ...`, `CUTTLE-TE PANIC: STORAGE FAULT: ...`. `SHELL resume OK` and `SHELL resume REJECTED: HMAC-SHA256 seal verification failed (tampered disk)` are unchanged; both are now printed right after the `CONTINUITY` lines.
-- **On-disk format is unchanged**, including the journal's record order. New on disk: the quarantine area at `LBA 1152..=1205`.
-- `durable_seal::ab_journal::decide_ab_recovery` is no longer called by the kernel. I left it and its test in place with a doc note.
+- **A paged disk that cannot be used halts the node; it does not start over.** `SHELL resume REJECTED` (quarantine, then defaults) now happens only when there is no page store to lose: disks under 4,096 sectors, or a blank page-store region. Triad nodes use 1 MiB disks and are not affected. The controller already treats `STORAGE FAULT:` as "archive the image, replace it, heal".
+- **Two of my own tests from last round changed meaning.** `failed_commit_is_reported_and_the_next_boot_is_consistent` used to assert that a retry after a failed commit writes; it now asserts the retry is refused and the next boot is consistent. The `stage_b4` test's cases 7a and 7b used to assert `Rejected { preserved: true }`. These are deliberate, for the reasons in rows 5 and 7; nothing was loosened to make a test pass.
+- **New types:** `BootError::PagedStore(PagedBootFault)`, `PersistError::StoreFaulted`, `PagedStoreError::VerifyFailed`, `nvme::IdentifyNsError`. The kernel's two exhaustive matches have arms for them.
+- **New serial lines:** three `STORAGE FAULT:` texts (the two page-store ones and the faulted-store one), `TPM WARNING: ...` (two), `NVME_HW REFUSED: ...`, `STORAGE REFUSED: ...`, `CONTINUITY ... NOTICE` (two). All are in `docs/runbooks/README.md` under `DISK_STORAGE_FAULT`.
+- **Files touched:** `target_enterprise/src/{paged_store,state_store,nvme,proc_vm}.rs`, `target_enterprise_kernel/src/{banners_compose,hw_storage_drivers,proc_hw}.rs`, `docs/runbooks/README.md`, `README.md`, and this file.
+- **A page-store commit does more I/O:** one read per page written, eight sectors for the directory and one for the superblock, plus one extra write and flush for bulk commits. The LSN can now skip values.
+- **On-disk format:** unchanged layout. New pages carry a different nonce in the same header field. A kernel from before this change cannot read pages written after it (it compares the nonce with the old derivation); the reverse works.
+- `PagedBlockStore::reset()` keeps `lsn_floor`. The three key buffers are wiped by a `Drop` guard on every exit.
 
 ---
 
 ## High priority
 
-### 1. The host controller does not know about repair, rejection, quarantine or a storage halt
-- **Where:**
-  - `tools/triad_controller.py`: no occurrence of `SHELL resume REPAIRED`, `SHELL resume REJECTED`, `SHELL resume RECOVERED` or `STORAGE FAULT`; boot classification at `:1973-1975` reads only the `CONTINUITY` lines.
-  - `docs/runbooks/README.md`: no entry for any of them.
-  - The kernel side is `shell_store_boot` and `storage_fault` in `target_enterprise_kernel/src/banners_compose.rs`.
-- **Problem:** the node now repairs a damaged primary slot, sets unverifiable state aside, and halts when a commit fails. Each of these is one serial line and, for the first two, one audit event. Nothing on the host reads them.
-- **Effect:**
-  - A repaired slot is evidence that sectors changed outside a commit. Today nobody is told, so self-healing hides the event it should surface.
-  - A node halted by `STORAGE FAULT` looks like any hung node; the heal path will reboot the same disk.
-  - The quarantine area is released at the next verified boot, whether or not anyone looked at it.
-- **Fix:**
-  - Parse these lines when a node boots and add alert codes and runbook entries for them.
-  - Treat `STORAGE FAULT` as a failed disk (replace the image, then heal), not as a hang.
-  - On `REJECTED`, copy the quarantine sectors out of the node's AHCI image on the host before the node's next verified boot releases them.
-  - Add controller unit tests with fake serial logs for each line.
-- Status: Fixed — test: `tools/triad_controller.py --unit-test` (`run_stage8_security_and_wal_unit_tests`: `stage4_serial_events` REPAIRED/RECOVERED/REJECTED/EPHEMERAL + 108-sector quarantine archive, `stage4_storage_fault` disk replacement + WAL rebuild, runbook anchor check) — commit: `b995e5e`
+### 1. The workspace test run modifies tracked source
+See "Know this first", A.
 
-### 2. The fleet self-test has not been run against this kernel
-- **Where:** `tools/cuttle_fleet.py --self-test`; the `web` and `index` jobs, which sync files with many `writehex` chunks.
-- **Problem:** this round changed what the controllers drive: commit timing (every mutating console command now commits, including each `writehex` chunk), cron cadence, the transaction-timeout replies and the boot sequence. The Triad self-test passed on three VMs. The 18-VM fleet self-test was not run, and it is the one that exercises file sync and cron.
-- **Effect:** I do not know whether the fleet's timeouts and cron expectations still hold. The Triad run also logged three `unreadable state probe` alerts that I could not attribute (see Test status).
+### 2. The TPM rollback floor is fail-open, and can strand a legitimate node
+- **Where:** `sync_hw_tpm_rollback_floor_on_boot` and `advance_hw_tpm_rollback_counter_on_commit` in `target_enterprise_kernel/src/banners_compose.rs`; `nv_ensure_and_read_counter` and `nv_advance_counter_to` at `target_enterprise/src/tpm.rs:1168-1205`; polling budget at `tpm.rs:477`.
+- **Problem (confirmed by reading):**
+  - No TPM, or a TPM that errors, means no floor. `nv_ensure_and_read_counter` treats *any* failure to read the index as "first boot", defines it and returns 0. Nothing on disk records that the node was ever anchored.
+  - `nv_advance_counter_to` refuses when the counter is more than 64 behind, and the caller discarded the result. A node whose `commit_seq` is above 64 when the index is first created never gets a floor. That is every existing deployment.
+- **Problem (from the review pass, not re-read by me):**
+  - The counter is assumed to start at 0 and track `commit_seq` one for one. A new TPM NV counter starts from the highest value any counter on that TPM has held, so on a used TPM the first increment can land far above `commit_seq` and the next boot is refused.
+  - A replaced or restored disk, or a lost commit sector, on a machine whose counter is above zero is a permanent boot refusal with no authorised way to re-anchor.
+  - Every wait is 4,096 register reads with no clock, which real devices can exceed on NV writes.
+  - The named tests and the boot banner re-implement the glue against the in-memory TPM. The three kernel functions that run have no coverage, and no QEMU case attaches a TPM.
+- **Effect:** the README says a TPM-equipped standalone node rejects whole-disk rollback (`README.md:138`). In practice the check works only while everything about the TPM is healthy and the counters happen to line up, and when they do not line up the node refuses to boot instead.
 - **Fix:**
-  - Run the fleet self-test with `--accel tcg` before building on this.
-  - Compare the Triad self-test's alert log with a run of `d279d75` to settle whether the probe alerts are new.
-  - If file sync is too slow, fix it in the driver (Medium #1), not by loosening the commit rule.
-- Status: Fixed — test: `tools/triad_controller.py --unit-test` (`stage4_serial_framing`, `stage4_clean_shutdown`), `tools/triad_controller.py --self-test --accel tcg` (`0` `unreadable state probe` alerts; root cause was `_background_scheduler` firing after `shutdown()`), `tools/cuttle_fleet.py --self-test --accel tcg` (18 VMs across `web`, `sql`, `index`, `cron`) — commit: `7c321a6`, `b995e5e`
+  - Decouple the two numbers: increment the counter on commit and store the resulting value inside the authenticated commit record; at boot accept the record's value equal to the counter, or one behind.
+  - Record "TPM-anchored" in the sealed state, and make absent, erroring or missing-index a storage fault on an anchored disk. Define-if-missing only on a blank disk.
+  - Remove the 64-step cap. Use timed waits.
+  - Move the glue into `target_enterprise` behind `TpmTisBus` so host tests drive the real functions with a fault-injecting bus, and add one QEMU case with an emulated TPM.
+  - Add an operator-authorised re-anchor procedure and a runbook entry.
+- **What I did:** the two warnings (row 15) and the start-over fix (row 9). The rest is open.
+
+### 3. The state disk is whichever backend answers first
+- **Where:** `StorageDisk::state_disk` in `target_enterprise_kernel/src/hw_storage_drivers.rs` (the three `if let Ok(..)` probes); the probes return `IoFault::DeviceError` for both "absent" and "present but failed".
+- **Problem (confirmed):** the order AHCI, NVMe, VirtIO-blk is tried on every boot and any error falls through to the next backend, which then becomes sticky for that boot. Nothing ties a node to a disk, and the chosen backend is not logged.
+- **Effect:** a transient AHCI failure, or a changed device set, boots the node on a different disk. A blank one starts fresh while the real state sits on the other; a later boot can flip back, leaving two histories. The standard smoke topology attaches all three kinds.
+- **Fix:** distinguish absent from failed in each probe and fall through only on absent; select by an authenticated store label or commit record under the device key when more than one candidate exists; refuse `Fresh` when another attached disk holds a Cuttle store; log backend and capacity at boot. Tests: state on NVMe with a blank AHCI disk added must not start fresh; an AHCI IDENTIFY failure with NVMe present must stop.
+
+### 4. A full page store halts the node, and the documented limits do not fit in it
+- **Where:** `OsShell::sync_vfs_to_paged_store` (`target_enterprise/src/shell.rs:662`) and `SqlDb::sync_to_paged_store` (`target_enterprise/src/sql.rs:3330`) return `OutOfPages`; `ShellStore::map_paged_commit_err` turns it into `PersistError::Pack`; `persist_shell_if_changed` treats any failed commit as a storage fault. Limits: `PAGED_MAX_LOGICAL_PAGES = 256`, and `max_logical = 118` on a 2 MiB disk; `README.md:139`.
+- **Problem (confirmed, with a test):** nothing checks page demand when a command is accepted. The README promises 8 tables × 2,048 rows and 96 files on disks of 2 MiB and up. 16,384 rows need 513 pages. On a 2 MiB disk about 55 files of two pages each fill the store.
+- **Effect:** an authorised user who writes enough ordinary data stops the node (`STORAGE FAULT: filesystem partition could not be packed`). No acknowledged data is lost: the commit fails before any write and the last committed state comes back whole, which `a_full_page_store_fails_the_commit_without_writing_and_loses_nothing_committed` pins. It is an outage, and last round's rule was that a command that cannot be saved is refused with `ENOSPC`, not accepted.
+- **Fix:** exact accounting at the two places where pages are created. The filesystem counts directory groups and 4,000-byte chunks and refuses growth past its share (`can_replace` and the write path already do this for the byte pool). SQL counts non-empty leaf chunks in the working state and refuses an `INSERT` that would open a chunk past its share. The shell gives each its share of `max_logical` before a command runs, and `ShellStore` tells the shell `max_logical` for the device. Then change the pinned test to expect `ENOSPC` at the command, and correct the README limits to what a given disk can hold.
+
+### 5. The device key in the TPM is not sealed
+- **Where:** `probe_hw_tpm_nv_device_key` at `target_enterprise_kernel/src/provisioning.rs:332-371`; `TPM_NV_ORDINARY_ATTRS` and `write_pwap_session` at `target_enterprise/src/tpm.rs:548-601`.
+- **Problem (confirmed):** the 32-byte master key is read with a plain NV read under an empty password. The index is defined owner-writable and owner-readable with empty authorisation and no policy; there is no PCR binding, no read-lock after use and no session encryption. The probe checks only size and the written flag: not the attribute word, not the returned index. Comments, the banner and a test name call it "sealed".
+- **Effect:** anything that can issue TPM commands on that machine can read or replace the key that derives the seal, encryption, attestation and TLS identity keys, and can move the rollback counter. The key protects against theft of the disk alone.
+- **Fix:** seal it (a sealed object or an NV index under a PCR policy, read over an encrypted session, read-locked for the boot), or stop calling it sealed and state the real boundary in the README. At minimum verify the full attribute word and index and refuse on mismatch.
+
+### 6. The TCP time base advances once per received frame
+- **Where:** `self.ticks = self.ticks.wrapping_add(1)` at the top of `handle_frame_opt` (`target_enterprise/src/lived_net.rs:1082`) and again in `tick_tcp_rto_with_replies` (`:737`).
+- **Problem (confirmed):** the counter that drives retransmission, half-open reclaim, idle reset and SYN-cookie epochs also counts every inbound frame, before any filtering.
+- **Effect:** every TCP timeout shrinks with inbound frame rate. Unrelated traffic on the segment, or the node's own load, expires other peers' connections; since B5 each spurious timeout also collapses the congestion window. Responses are cut short (the client sees it through `Content-Length`).
+- **Fix:** advance `ticks` only from the timer. Give sequence-number generation its own counter or a keyed ISN. Test: N frames with no timer tick expire nothing.
+
+### 7. `/triad/rpc` runs commands outside the role gate
+- **Where:** `target_enterprise/src/lived_net.rs:3773-3910` (the handler calls `sh.exec_line` directly at `:3897`).
+- **Problem (confirmed):** every other HTTP route goes through the service and role check. This one does not, and detects a role refusal afterwards by searching the output for the text "disabled by node role". Per the review pass, commands with no per-command mediation (`service role`, `triad epoch`, `status`) run in every role.
+- **Effect:** a holder of the RPC key can run shell-mediated commands on a node whose role does not load that service, and change a node's role over HTTP. The role-isolation claim does not hold for this endpoint.
+- **Fix:** an explicit `IpcOp::TriadRpc` through `check_endpoint_access`, a typed refusal, and a role-matrix test with one non-SQL mutating command and `service role` per role.
 
 ---
 
 ## Medium priority
 
-### 1. A commit is about 110 single-sector AHCI commands
-- **Where:** `AhciHwPort::try_write_sector` / `try_read_sector` in `target_enterprise_kernel/src/hw_storage_drivers.rs`; `write_slot` and `slot_digests` in `target_enterprise/src/state_store.rs`.
-- **Problem:** each of the 26 sectors of a slot is one `WRITE DMA`, and each read-back one `READ DMA`, through a single 512-byte DMA buffer. Under TCG a commit takes about a second.
-- **Effect:** slow writes, long stretches in which the kernel serves nothing, and a longer window in which a power cut interrupts a commit (recovery handles it, but shorter is better).
-- **Fix:** give `SectorIo` a multi-sector read and write, back it with a 13 KiB DMA buffer and one PRD entry, and use READ/WRITE DMA EXT so the 28-bit LBA limit goes too. Keep the per-sector fault model in the tests.
-- Status: Fixed — test: `state_store::tests::power_cut_at_every_operation_recovers_old_or_new_never_a_mixture`, `state_store::tests::io_error_at_every_operation_fails_the_commit_and_recovers_cleanly`, `qemu_smoke::morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu` — commit: `7c321a6`
+### 1. IPv6 traffic is not subject to firewall rules
+- **Where:** `handle_ipv6`, `target_enterprise/src/lived_net.rs:1301-1306`; compare the IPv4 path at `:1148`.
+- **Problem (confirmed):** only the lockdown flag is consulted. Rules are IPv4-only.
+- **Effect:** a deny policy does not stop ICMPv6 echo or neighbour discovery. `README.md:123` lists the firewall next to "Dual-Stack IPv6" without saying so.
+- **Fix:** drop IPv6 by default unless enabled, or give rules an address family and evaluate them first. Test with a drop-all rule.
 
-### 2. The journal is one 512-byte sector
-- **Where:** `SHELL_JOURNAL_BYTES` at `target_enterprise/src/shell.rs:129`; the layout in `state_store::AHCI_STATE_LAYOUT`.
-- **Problem:** the worst-case state records (12 worker tasks, 8 firewall rules, 6 IMA digests, 4 cron jobs, two watermarks) need about 1,120 bytes. The budget now refuses the command that would overflow, which is correct but arrives early: a full task table and a full firewall table leave room for one cron job.
-- **Effect:** `ENOSPC` on ordinary configurations.
-- **Fix:** a version-2 layout with a journal of at least three sectors (there is free space on the disk), a format version in the commit record, and a migration test. The same change can lift the 4 KiB limits on files and SQL.
-- Status: Fixed — test: `state_store::node_tests::v1_disk_migrates_cleanly_to_v2_and_survives_mid_migration_power_cut`, `state_store::node_tests::large_files_up_to_10kib_and_sql_up_to_8kib_persist_in_v2`, `state_store::node_tests::v3_encrypted_store_leaves_zero_plaintext_on_disk_and_migrates_v2` — commit: `d3f1925`, `fdb1522`
+### 2. The boot service window enforces neither firewall nor lockdown (regression in this range)
+- **Where:** `target_enterprise_kernel/src/net_service.rs:933` and `:1393` (`svc.handle_frame(..)` with no shell); both checks in `lived_net.rs` are `if let Some(sh)`.
+- **Problem (confirmed):** taking the shell out of the window stopped early mutations, as intended, and also removed the checks.
+- **Effect:** blocked sources get echo, status and TLS handshakes for a short window on every boot, including on a locked-down node.
+- **Fix:** pass a read-only view of the rules and the lockdown flag into the window, or serve only ARP until the main loop. Add a boot-window test with a drop rule.
 
-### 3. Rolling the whole disk back is not detected
-- **Where:** `commit_seq` in `AbCommitHeader`; `ShellStore::boot`.
-- **Problem:** `commit_seq` now continues across boots, but it is anchored only on the disk it protects. An older, validly sealed image of the whole disk (both slots and the commit sector) boots as valid.
-- **Effect:** a single node cannot tell that its state went backwards. The Triad vote catches it only if the other two nodes disagree.
-- **Fix:** keep the high-water `commit_seq` somewhere the disk cannot rewrite: a TPM NV counter, or the controller (it already tracks `tx_seq` per node) refusing a node that reports a lower one.
-- Status: Fixed — test: `state_store::node_tests::anti_rollback_min_commit_seq_rejects_stale_disk_snapshot`, `shell::tests::attest_quote_binds_commit_seq_and_rejects_tampered_commit_seq`, `tools/triad_controller.py --unit-test` (`stage4_commit_seq`), `tools/triad_controller.py --self-test --accel tcg` (step 6c `DISK_ROLLBACK_DETECTED`) — commit: `fdb1522`, `b995e5e`
+### 3. The send window is taken from unvalidated segments and nothing probes a zero window
+- **Where:** `target_enterprise/src/tcp.rs:561-573`; `lived_net.rs:2428-2430`, `:798-814`. From the review pass.
+- **Problem:** `snd_wnd` is set from any segment matching the connection, with no sequence or acknowledgement check, and since B5 it gates transmission. There is no persist timer.
+- **Effect:** one lost or stale window update stalls a connection until it idles out, with the response cut short.
+- **Fix:** accept window updates only from acceptable segments; add a persist timer; test a zero window followed by a lost update.
 
-### 4. The kernel installs no IDT until the last boot step, and CPU exceptions bypass the panic path
-- **Where:** `init_runtime_idt_and_isrs` at `target_enterprise_kernel/src/smp_hw.rs:1074`, first reached from `banner_smp_hw` (`:2391`); `ISR_CPU_FAULT_DIAG` at `:1132`.
-- **Problem:** the disk restore, the boot service window and most of boot run on whatever IDT the bootloader left. After the IDT is installed, vectors 0–31 share one stub that prints `!EXC` and halts that CPU, recording nothing.
-- **Effect:** an exception early in boot is a triple fault: a reset loop with no message. Later, a fault is indistinguishable from any other, skips the key scrub and crash dump, and leaves the other CPUs running.
-- **Fix:** install the IDT, GDT and TSS right after `set_phys_offset`; give each vector a stub that records vector, error code, RIP and CR2 and enters the panic path.
-- Status: Fixed — test: `qemu_smoke::boots_under_qemu_and_emits_banner` (`verify_early_bsp_idt_active`), `qemu_smoke::tampered_ahci_seal_is_rejected_under_qemu` (Case 4 Ring-0 `ud2` `#UD` `vec=6` `CTTLPENC` encrypted crash dump) — commit: `946910d`
+### 4. Ring-3 processes share FPU/SIMD state and FS/GS base
+- **Where:** `UserTrapFrame` (`target_enterprise/src/proc_vm.rs:100-140`); `target_enterprise_kernel/src/proc_hw.rs`. From the review pass.
+- **Problem:** no save, restore or clear of x87/SSE/AVX state, and no per-process FS/GS base, although `FSGSBASE` is enabled.
+- **Effect:** one process's register contents are visible to the next on that CPU, and a preempted process resumes with another's.
+- **Fix:** an XSAVE area and FS/GS base per process; at minimum clear on entry.
 
-### 5. The boot service window has no absolute deadline
-- **Where:** `target_enterprise_kernel/src/net_service.rs:805-815` (`max_idle` at `:808`), and the legacy path at `:1274`.
-- **Problem:** the window closes only after 2,000,000 idle polls, and every frame resets the count. It also exposes the full mutating surface before the boot self-tests have finished.
-- **Effect:** steady traffic keeps a node in the window indefinitely, so it never reaches the main loop. (What it serves there is now committed.)
-- **Fix:** an absolute deadline, and status/ICMP/ARP only until the main loop.
-- Status: Fixed — test: `qemu_smoke::nvme_only_persistence_and_network_flood_resilience_under_qemu` — commit: `b917e2f`
+### 5. AHCI fault recovery re-probes and can come back on a different disk
+- **Where:** `restart_port_after_fault` and `try_probe_start_inner` in `hw_storage_drivers.rs`. From the review pass.
+- **Problem:** every failed command re-probes and takes the first linked port, without remembering which port or disk it had. A failed restart leaves the port stopped and drops the failure.
+- **Effect:** with two SATA devices, a link glitch moves later commits to the other disk for the rest of the boot.
+- **Fix:** remember the port and the IDENTIFY serial, restart only that port, compare, and mark the disk faulted if the restart fails.
 
-### 6. A node without its device key still accepts and saves writes
-- **Where:** `target_enterprise_kernel/src/provisioning.rs:334` (`FwCfgKeyStatus::Absent => (generate_hw_entropy_master_key(), false)`).
-- **Problem:** with the key absent or malformed the node runs on a throwaway key. It cannot read its disk, starts from defaults, and commits new state sealed with a key that will not exist after the reboot. `Absent` logs nothing.
-- **Effect:** the original state is now preserved in quarantine and comes back when the key does, but everything written during the keyless boot is unreadable afterwards, and it was acknowledged.
-- **Fix:** without a provisioned key, refuse durable writes (or refuse to serve), and say so on the console.
-- Status: Fixed — test: `shell::tests::unprovisioned_shell_refuses_all_durable_mutations_across_console_and_http_roles`, `qemu_smoke::tampered_ahci_seal_is_rejected_under_qemu` (Case 3 keyless boot) — commit: `fdb1522`
+### 6. Device timeouts are loop counts
+- **Where:** `wait_for_dma_completion` (`target_enterprise_kernel/src/smp_hw.rs:1029-1109`) and the budgets passed to it from the three drivers. From the review pass.
+- **Problem:** before the periodic timer is armed the wait is a pure spin, afterwards each iteration sleeps to the next interrupt, so one budget means about a second in one phase and hours in the other.
+- **Effect:** a slow flush at boot becomes a spurious storage fault; a hung device at runtime hangs the node instead of failing the commit.
+- **Fix:** TSC deadlines per command class, the same in both phases.
 
-### 7. Time is counted in HLT wake-ups, and the receive loop can starve everything else
-- **Where:** `live_os_console_loop` in `target_enterprise_kernel/src/main.rs` (the `while let Some(..) = vnet_rx(..)` drain); `HW_IRQ_WAKEUP_COUNTER` in `smp_hw.rs`.
-- **Problem:** the timer interrupt only runs while the boot CPU is halted, so a busy stretch of any length counts as at most one tick. The drain loop does not exit while frames keep arriving.
-- **Effect:** under sustained traffic the TCP retransmit timer, the login cooldown, cron and the SQL transaction timeout stop advancing, and the console is not polled.
-- **Fix:** take time from the TSC or HPET by subtraction, and bound the frames handled per pass.
-- Status: Fixed — test: `qemu_smoke::nvme_only_persistence_and_network_flood_resilience_under_qemu` — commit: `b917e2f`
+### 7. The VirtIO-blk state backend and the backend pin have no test
+- **Where:** `README.md:82,134` claim unified persistence across the three; `factory_builder/tests/qemu_smoke.rs` has AHCI-first cases and one NVMe-only case. `cuttle_storage_backend` appears only in the driver. From the review pass (grep).
+- **Fix:** a VirtIO-only two-boot case and a pin case with all three attached. This would also cover rows 10 and 13 above for the normal path.
 
-### 8. A pending timer interrupt is delivered as a false preemption of the Ring-3 worker
-- **Where:** `target_enterprise_kernel/src/banners_arch_platform.rs:859-884`, used by `exec_service_ring3_mailbox_live` (`:1178`).
-- **Problem:** the periodic timer and the preemption timer share vector `0x40`. The main loop runs with interrupts off, so after 4 ms of work a timer interrupt is latched. The preemption setup does not drain it before entering Ring 3.
-- **Effect:** a legitimate request is reported as a sandbox fault and fails. It needs more than 4 ms of work without an idle halt first, which a commit in the receive path provides.
-- **Fix:** mask and drain the periodic timer before arming, or give the preemption timer its own vector.
-- Status: Fixed — test: `qemu_smoke::boots_under_qemu_and_emits_banner` (`verify_ring3_under_latched_periodic_timer_live`) — commit: `946910d`
+### 8. A request can run before the handshake proves its source
+- **Where:** `lived_net.rs:2423-2561`; `tcp.rs:381-410`, `:666-671`. From the review pass; predates B5.
+- **Problem:** on port 80 the payload of an initial SYN is appended to the request buffer and dispatched before the connection is established, and the initial sequence number is a function of ports and the tick counter.
+- **Effect:** source-address rules and per-peer login throttling can be exercised from an unproven source, and a client that retransmits that data has its request run twice.
+- **Fix:** deliver payload only in established states; a keyed initial sequence number.
 
-### 9. Three workspace tests depend on which kernel variant was built last
-- **Where:** `binmorph/src/lib.rs:4622` (`funcs.len() >= 2000`), `binmorph/tests/differential_equiv.rs:2509`, `mtd_metrics/tests/independent_verifier.rs:366`.
-- **Problem:** they read the ELF at `target_enterprise_kernel/target/x86_64-unknown-none/release/`. A `--prod` build writes its smaller ELF to the same path.
-- **Effect:** after any production build the workspace run fails until the default kernel is rebuilt. I reproduced this.
-- **Fix:** build each variant to its own path, or have the tests build the input they measure.
-- Status: Fixed — test: `factory_builder::tests::prod_kernel_target_dir_is_isolated_from_default_kernel_elf` — commit: `946910d`
+### 9. No hostile-flags case for the system call path, and only `#DF` has its own stack in a process
+- **Where:** `banner_ring3_elf_multiprocess`; per-process IDT setup in `proc_hw.rs` (`ist = 1` for vector 8 only). The second point is from the review pass.
+- **Problem:** row 14 is tested for the sanitiser only. Separately, NMI and machine-check have no dedicated stack in the per-process IDT and are charged to whichever process is running.
+- **Fix:** a Ring-3 test program that sets `NT` and makes a system call, asserting the next process is unaffected; IST stacks and real handlers for vectors 2 and 18. Also treat a fault whose saved `CS` is not the user selector as a kernel error, not the process's.
 
-### 10. Writes to built-in files are accepted and never saved
-- **Where:** `check_writable_vfs_path` at `target_enterprise/src/shell.rs:5780` (protects only `/etc/os-release`); `is_default_system_file` at `:5331` (excluded from the filesystem partition).
-- **Problem:** `write /etc/hostname x` or `write /etc/motd x` succeeds, and the change is gone after a reboot.
-- **Effect:** an acknowledged write that silently does not persist.
-- **Fix:** refuse writes to every path `is_default_system_file` names, or persist them.
-- Status: Fixed — test: `shell::tests::built_in_system_files_refuse_write_writehex_rm_and_http_mutation` — commit: `d3f1925`
-
-### 11. The vault nonce is a 15-bit counter seeded from the boot count
-- **Where:** `target_enterprise/src/shell.rs:527`, `:3771`.
-- **Problem:** the counter only moves toward `0x7FFF`, after which `vault put` fails for good. After a state reset under the same seal key, a `(key name, nonce)` pair can repeat.
-- **Effect:** a permanent failure in the long run, and keystream reuse after a reset.
-- **Fix:** a 96-bit random or persisted monotonic nonce stored with each ciphertext.
-- Status: Fixed — test: `shell::tests::vault_96bit_nonce_diversifies_across_reset_and_stays_tmr_invariant` — commit: `d3f1925`
-
-### 12. The WAL frame format accepts a zero-filled tail, and `from_backing` erases what follows a bad frame
-- **Where:** `target_enterprise/src/wal.rs:145-181` and the replay loop; used by the continuity region.
-- **Problem:** a length of 0 with a CRC of 0 is a valid frame, so zeros past the true end parse as records. `from_backing` zero-fills everything after the first invalid frame and reports nothing.
-- **Effect:** a lost tail is not reported as lost; one damaged frame discards every later record. The shell journal is unaffected (its cursor is under the header HMAC).
-- **Fix:** a per-frame magic or sequence number covered by the CRC; return the number of bytes dropped instead of zeroing them.
-- Status: Fixed — test: `wal::tests::zero_filled_tail_and_corrupt_frame_preserve_bytes_and_report_dropped_len` — commit: `d3f1925`
+### 10. `/triad/rpc` replies are unauthenticated, and it answers on cleartext port 80
+- **Where:** `lived_net.rs:3895-3909`; `tools/triad_controller.py:2282-2292`. From the review pass.
+- **Effect:** command output can be read and replies substituted on the path. Small today (loopback, one command); real once the RPC crosses a network.
+- **Fix:** a MAC over the reply bound to epoch and sequence, checked by the controller, or TLS-only.
 
 ---
 
 ## Low priority
 
-### 13. Smaller items
-- **AP SHA-256 offload (`smp_hw.rs:701-761`):** a timed-out job is not cancelled and results carry no job id, so a late AP can hand the next caller the previous digest. It is off the commit path now; the boot banner still uses it.
-  - Status: Unverified — moved `AP_CRYPTO_BUF` to `.bss` and added monotonic `NEXT_AP_CRYPTO_JOB_ID` tagging in `smp_parallel_sha256_3way` in commit `946910d` (exercised by `qemu_smoke::boots_under_qemu_and_emits_banner`), but no fault test injects a delayed AP completing a timed-out job.
-- **Emergency crash-dump writer (`hw_storage_drivers.rs:225`):** it shares slot 0 and the DMA buffers with the normal path and reaches MMIO through `PT_MOD_LOCK`. A panic raised under that lock still hangs after printing its message.
-  - Status: Fixed — test: `qemu_smoke::tampered_ahci_seal_is_rejected_under_qemu` (Case 4 Ring-0 `#UD` `vec=6` writes `CTTLPENC` encrypted crash dump via lock-free AHCI Slot 1 DMA bypassing `PT_MOD_LOCK`) — commit: `7c321a6`, `fdb1522`, `946910d`
-- **Boot counter (`banner_continuity`):** the header is unauthenticated. It no longer gates the restore, but attestation quotes still print it.
-  - Status: Fixed — test: `durable_seal::tests::continuity_header_hmac_rejects_forged_boot_counter_and_unauthenticated_v1`, `qemu_smoke::morphed_kernel_boots_and_persists_state_across_multiple_seeds_under_qemu` — commit: `946910d`
-- **Aborted SQL transactions (`sql.rs`, `tx_aborted_owner`):** the state is per owner id, and anonymous HTTP clients share one id.
-  - Status: Fixed — test: `sql::tests::multiple_aborted_transaction_owners_are_tracked_independently`, `lived_net::tests::http_tcp_slots_and_recycled_sessions_use_isolated_sql_owners` — commit: `946910d`
-- **Partial restore on failure:** `unpack_disk_image`, `unpack_fs_partition` and `unpack_sql_partition` each verify before they apply, but a failure in the second or third leaves the first applied. `ShellStore` resets the shell; any other caller must too.
-  - Status: Fixed — test: `shell::tests::fs_partition_preserves_inode_mtime_and_unpack_state_image_is_atomic_on_error` — commit: `d3f1925`
-- **File times:** `pack_fs_partition` writes `mtime = 1` for every file (`shell.rs:1992`).
-  - Status: Fixed — test: `shell::tests::fs_partition_preserves_inode_mtime_and_unpack_state_image_is_atomic_on_error` — commit: `d3f1925`
-- **Production boot panics on a timing check:** `smp_hw.rs:2532` panics unless every AP acknowledges a TLB shootdown within 100,000 spins.
-  - Status: Unverified — widened `smp_broadcast_tlb_shootdown` to a `250 ms` calibrated TSC deadline (`50,000,000`-spin fallback) in commit `946910d` (exercised by `qemu_smoke::boots_under_qemu_and_emits_banner`), but no test stalls an AP past `100,000` spins.
-- **Heap exhaustion is a panic,** and the comment in `heap.rs` that nothing else allocates is wrong (`LivedNet` holds `Vec`s).
-  - Status: Unverified — corrected `heap.rs` doc comment in commit `946910d` to document `LivedNet` / HTTPS allocations and the `512 KiB` admission reserve (doc comments cannot be proved by a test; allocator OOM past admission reserve remains a fail-closed panic).
-- **Serial output:** `serial_write_byte` (`main.rs:591`) waits on the transmitter without a bound, and the service window prints a line per frame.
-  - Status: Unverified — bounded `serial_write_byte` LSR spin to `1,000,000` iterations and removed per-frame serial logging from the boot service window in commit `946910d`, but no QEMU test emulates a hung 16550 UART transmitter.
-- **virtio-net:** a transmit is dropped silently when the previous frame has not completed; `vnet_rx` returns "empty" for a discarded completion; the legacy fallback uses a 12-byte header where 10 is correct.
-  - Status: Unverified — bounded TX completion wait, multi-descriptor `vnet_rx` loop, and 10-byte legacy header fallback installed in commit `946910d` (modern path exercised by `qemu_smoke` and Triad/Fleet self-tests), but no QEMU test attaches a legacy-only VirtIO-net PCI device or stalls TX completion.
-- **`decide_ab_recovery`:** unused by the kernel now. Remove it with its test, or keep it as documented.
-  - Status: Fixed — test: `durable_seal::tests::ab_recovery_matrix_covers_clean_interrupted_corrupt_and_double_fault` (kept as standalone documented library helper) — commit: `7c321a6`
-- **Stale Triad base image:** `triad.bat` builds `target/cuttle_images/run_bios.img` only when it is missing, and the controller reuses it. Here it was three weeks older than the kernel ELF. I rebuilt it by hand and did not check what the controller does with a stale one. Rebuild it whenever the ELF is newer.
-  - Status: Fixed — test: `tools/triad_controller.py --unit-test` (`stage4_stale_bios` `needs_base_bios_rebuild`) — commit: `b995e5e`
-- **README:** the QEMU row says 130 banners; the smoke test checks 131. The `https.rs` import of `kernel_fixtures` is unused under `cuttle_prod` (one warning in the production build).
-  - Status: Partly fixed — `https.rs` `#[cfg(any(test, not(cuttle_prod)))]` gate verified warning-free via `factory_builder build-kernel --kernel-crate target_enterprise_kernel --prod` and `factory_builder::tests::prod_kernel_target_dir_is_isolated_from_default_kernel_elf` (commit `946910d`); `README.md` banner count (`131`) and `AB_FORMAT_V3` 53-sector storage documentation updated (doc prose is unverified per `GEMINI.md`).
+- **State image nonce** (`derive_commit_nonce`, `state_store.rs`): the nonce is the 64-bit sequence plus 30 bits derived from the content. A commit that was staged and abandoned shares its sequence with the next one, so only those 30 bits separate the two nonces. Use the full 94 bits from the MAC. (Mine.)
+- **`recover_latest` falls back an epoch silently** (`paged_store.rs`): without an anchor, a damaged newest epoch yields the previous one with no report. The kernel always recovers at an anchor; if a tool ever uses the standalone path, it should be told. (Mine.)
+- **The redo journal duplicates what copy-on-write already gives.** Small commits write every page twice (journal frame, then home slot) and take two extra flushes, although the previous epoch is untouched until the new superblock is written. The bulk path, which has no journal, is equally crash-safe. Consider dropping the journal for commits and keeping it only if in-place healing is wanted. (Mine; an observation, not a defect.)
+- **`stage_b4`'s power-cut sweep samples every third operation** (`.step_by(3)`). The new page-store tests sweep every operation; this one should too. (Mine.)
+- **Status lines name tests that do not exist** (three this round; see the table). Copy the name from the test, not from memory.
+- **NVMe emergency dump writer** shares the mainline data page and queue and takes the page-table lock, unlike the AHCI one. A panic during an NVMe command can overwrite that command's payload and write no dump. (Review pass.)
+- **AHCI issues commands without checking the engine is running**, and a flush is judged complete from `PxCI` alone. (Review pass; plausible, unconfirmed.)
+- **VirtIO-blk capacity offset assumes MSI-X is off** on a re-probe after a partial failure. (Review pass.)
+- **TPM response and command buffers holding the master key are not wiped** (`tpm.rs:1118`, `:1135`). (Review pass.)
+- **Ring-3 details:** a service worker still running after 32 quanta is not reaped (slot leak); `SYS_WRITE` reports the full length when fewer bytes were captured and IPC receive drops the tail of a message that does not fit (silent truncation); `handle_syscall` rewrites a shared capability table and does not restore it. (Review pass.)
+- **Network details:** RPC output over 8,192 bytes is cut without a marker while files go to 32 KiB; `halt` and `reboot` over RPC report success and do nothing; stale out-of-order segments are never released (one of eight slots each); an acknowledgement arriving on a duplicate segment does not flush queued data; FIN and SYN-ACK are never retransmitted; under lockdown every IPv6 frame on the link writes an audit record; duplicate-address probes are not answered and the ULA is a compile-time constant shared by all nodes. (Review pass.)
+- **README:** "sealed" for the TPM key and "rejects whole-disk rollback" for the TPM floor (High 2, High 5); the row and file limits (High 4); "Dual-Stack IPv6" is echo and neighbour discovery only, with no TCP or UDP service; "reassembly up to 32 KiB" is the accepted gap, capacity is eight segments; "sliding-window" covers the send side; "asynchronous/pipelined" block I/O is one polled command at a time. (I changed two things in the README: a sentence at `:138` for the paged-disk behaviour from this round, and `paged_store::fault_tests` in the evidence list at `:140`. Everything in this bullet is still to do.)
+- **Untracked files in `src/`:** the two `*.candidate.rs` files should never have been there; `.gitignore` them or, better, fix High 1.
 
 ---
 
 ## Process notes
-- **Put the decision logic where it can be tested.** Most of the High defects I fixed were in kernel glue: ignored results, an ordering, a panic on a counter. None of it could be reached by a unit test. The kernel side of persistence is now a device and some `serial_write_str` calls; keep it that way.
-- **A test that re-implements the sequence it is testing proves the test.** `stage17_ab_journal_survives_power_cut_at_every_sector...` wrote its own copy of the commit steps. The kernel's real sequence differed from it (payload sectors, flush, then superblocks) and its recovery skipped half the table.
-- **"`let _ =`" on a persistence call is a finding by itself.** Four of them hid the journal overflow.
-- **Boot must not assert on stored content.** A self-test that panics on what a user can write is a way to brick a node.
+- **A test suite must leave the tree as it found it.** High 1 is the kind of defect no reviewer finds by reading a diff.
+- **"Let it start over" is only safe for what was copied aside first.** B4 moved the bulk of the data out of the slots the quarantine protects and kept the start-over policy. When a new store is added, ask what every existing recovery policy now does to it.
+- **A nonce built from position needs a proof that the position is never reused.** Here the design's own crash window reused it. Derive nonces from content or from a counter that is durable before use.
+- **`let _ =` on a device call is still a finding by itself.** Three in page-store recovery, two around the TPM, two in the drivers.
+- **Re-implementing glue in a test proves the test.** The TPM tests and the boot banner call the library functions in their own order; the kernel functions that ship are not run by anything.
+- **Documented limits are claims.** 16,384 rows was never tried against a store with 256 pages.
 
 ## Not reviewed this round
-- Last round's status lines for #1–#14 and R1–R15 (table above).
-- The diff of `917109c..d279d75` outside the files listed under Scope: `binmorph`, `diversifier`, `morph_engine`, `mtd_metrics`, `verifier`, `factory_builder` (apart from `qemu_smoke.rs`), `fuzz/`, CI.
-- `tools/triad_controller.py`, `tools/cuttle_fleet.py`, `tools/chaos.py`: not read beyond the heal path and the disk-layout constants.
-- `lived_net.rs`, `svc_runtime.rs`, the TCP/TLS/HTTP stack, `x509.rs`, `tpm.rs`, `ebpf.rs`, `iommu.rs`: not reviewed, apart from call sites into the shell.
-- The Ring-3 stubs and KPTI tables beyond what the memory pass read.
-- The bootloader's behaviour (stack guard page, IDT state at entry).
-- Under QEMU I did not inject AHCI errors, cut power mid-commit, or send a mutating request during the boot service window. Those paths are tested against the disk model only.
-- WHPX: every run here was TCG.
-- Carried over from earlier rounds: `rustls` key-material clean-up when a reclaimed session is dropped; measured heap use under load on a VM; the rest of `triad_console.html`.
+- `sql.rs` (2,685 lines changed) beyond `sync_to_paged_store` and the head of `load_from_paged_store`: the B+Tree index, the paged row slots, transactions and undo.
+- `vfs.rs` paged extents beyond the limits; `shell.rs` (2,663 lines changed) beyond the page-store sync and load and the anchor in the state image.
+- `phys_mm.rs`, `slab_alloc.rs`, `memory.rs`, `heap.rs`, `panic_dump.rs`, `durable_seal.rs`, `ahci_fis.rs`: not read.
+- `smp_hw.rs`, `main.rs`, `banners_arch_platform.rs`, `banners_tls_net.rs`: only the call sites named above.
+- `async_io.rs` MSI/MSI-X programming and the PCI capability walker; virtio-net changes; the UEFI boot path.
+- `tools/triad_controller.py` (1,203 lines changed) beyond the storage-fault handler and the serial-line handler; `tools/cuttle_fleet.py`, `tools/chaos.py`.
+- `binmorph`, `factory_builder` (apart from running its tests), `morph_engine` beyond the two snapshot helpers.
+- `TriadIngressVoter`; `https.rs` session internals; the UDP handlers.
+- Findings marked "from the review pass" were traced through the code by that pass. I confirmed the ones marked confirmed and did not re-read the rest.
+- Live runs: `triad_controller.py --self-test` and `cuttle_fleet.py --self-test` were not run. Every QEMU run was TCG.
+- Under QEMU I injected no device faults. Rows 10, 12 and 13 are tested on the normal path only, and no QEMU case attaches a TPM, a 4 KiB NVMe namespace or a VirtIO-only disk.
+- Carried over: `rustls` key-material clean-up when a reclaimed session is dropped; measured heap use under load on a VM; the rest of `triad_console.html`.

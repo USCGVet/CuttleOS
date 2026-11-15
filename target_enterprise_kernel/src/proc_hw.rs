@@ -49,8 +49,14 @@ const MSR_IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 const EFER_SCE: u64 = 1 << 0;
 const SYSCALL_STAR_VAL: u64 = ((0x0013u64) << 48) | ((KERNEL_CODE_SEL as u64) << 32);
-/// Clear `TF (0x100) | IF (0x200) | DF (0x400) | AC (0x40000)` upon `0F 05` `SYSCALL` entry.
-const SYSCALL_FMASK_VAL: u64 = 0x0004_0700;
+/// Clear `TF (0x100) | IF (0x200) | DF (0x400) | IOPL (0x3000) | NT (0x4000) | AC (0x40000)`
+/// upon `0F 05` `SYSCALL` entry.
+///
+/// `NT` is in the mask because ring 3 can set it and `SYSCALL` otherwise carries
+/// it into the kernel: the next `iretq` on that CPU, which is the entry into
+/// whichever process runs next, then faults at CPL 0 and that process is the
+/// one reaped for it.
+const SYSCALL_FMASK_VAL: u64 = 0x0004_7700;
 
 const PTE_P: u64 = 1 << 0;
 const PTE_W: u64 = 1 << 1;
@@ -667,7 +673,9 @@ pub(crate) fn run_next_ready_process_quantum(
             let mut init_st = ProcBridgeState::default();
             init_st.user_cr3 = vm.user_pml4_pa;
             init_st.tf = initial_tf;
-            init_st.tf.rflags |= 0x202; // Keep `IF = 1` in CPL=3 so `0x50` preemption fires!
+            // Only the status flags a process may own survive into ring 3; `IF` is
+            // forced on so the `0x50` preemption timer fires.
+            init_st.tf.rflags = target_enterprise::proc_vm::sanitize_user_rflags(init_st.tf.rflags);
             core::ptr::write_volatile(st_ptr, init_st);
         }
     }
