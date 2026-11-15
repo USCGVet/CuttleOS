@@ -3232,10 +3232,12 @@ pub(crate) fn banner_continuity() {
         }
         wal = fresh;
     }
-    if wal
-        .flush(target_enterprise::wal::durable_wal_proof_init())
-        .is_err()
-    {
+    let Ok(wal_proof) =
+        target_enterprise::wal::durable_wal_proof(cuttle_contracts::caps::DURABLE_WAL_WRITE)
+    else {
+        panic!("CONTINUITY: wal cap denied");
+    };
+    if wal.flush(wal_proof).is_err() {
         panic!("CONTINUITY: flush failed");
     }
 

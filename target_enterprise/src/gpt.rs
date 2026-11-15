@@ -83,11 +83,16 @@ pub fn read_part_impl(image: &[u8], hdr: &GptHeader, idx: u32) -> Result<GptPart
     if idx >= hdr.num_parts {
         return Err(GptError::BadGeometry);
     }
-    let off = (hdr.part_lba as usize) * GPT_SECTOR + (idx as usize) * GPT_ENTRY_LEN;
-    if off + GPT_ENTRY_LEN > image.len() {
-        return Err(GptError::Truncated);
-    }
-    let e = &image[off..off + GPT_ENTRY_LEN];
+    let part_lba = usize::try_from(hdr.part_lba).map_err(|_| GptError::Truncated)?;
+    let base_off = part_lba
+        .checked_mul(GPT_SECTOR)
+        .ok_or(GptError::Truncated)?;
+    let entry_off = (idx as usize)
+        .checked_mul(GPT_ENTRY_LEN)
+        .ok_or(GptError::Truncated)?;
+    let off = base_off.checked_add(entry_off).ok_or(GptError::Truncated)?;
+    let end = off.checked_add(GPT_ENTRY_LEN).ok_or(GptError::Truncated)?;
+    let e = image.get(off..end).ok_or(GptError::Truncated)?;
     let mut present = false;
     for i in 0..16 {
         if e[i] != 0 {
@@ -320,5 +325,15 @@ mod tests {
         let h = GptImpl::parse_header(&img).unwrap();
         let p = GptImpl::read_part(&img, &h, 0).unwrap();
         assert_eq!((p.start_lba, p.end_lba), (34, 100));
+    }
+
+    #[test]
+    fn read_part_impl_rejects_u64_part_lba_multiply_overflow_as_truncated() {
+        let img = fix();
+        let mut hdr = GptImpl::parse_header(&img).unwrap();
+        // `1 << 55` * `512` (`1 << 9`) == `1 << 64`, which wraps to `0` on 64-bit `usize`
+        // without checked multiplication (or panics under `overflow-checks`).
+        hdr.part_lba = 1u64 << 55;
+        assert_eq!(read_part_impl(&img, &hdr, 0), Err(GptError::Truncated));
     }
 }

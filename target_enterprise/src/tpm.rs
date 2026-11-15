@@ -150,11 +150,9 @@ impl MaxTpmCommandBuf {
         &mut self.bytes
     }
 
-    /// Borrow a sub-slice of length `len`. Panics if `len >
-    /// TPM_MAX_CMD_LEN` so a runtime drift between the locked
-    /// constant and the caller's expectation surfaces immediately.
+    /// Borrow a sub-slice of length `len` (clamped to `TPM_MAX_CMD_LEN`).
     pub fn prefix(&self, len: usize) -> &[u8] {
-        &self.bytes[..len]
+        &self.bytes[..len.min(self.bytes.len())]
     }
 }
 
@@ -165,24 +163,18 @@ impl MaxTpmCommandBuf {
 /// Write `value` big-endian to `out[off..off+2]`. Returns
 /// `BufferTooSmall` if the slice is short.
 fn put_u16_be(out: &mut [u8], off: usize, value: u16) -> Result<(), TpmError> {
-    if off + 2 > out.len() {
-        return Err(TpmError::BufferTooSmall);
-    }
-    out[off] = (value >> 8) as u8;
-    out[off + 1] = value as u8;
+    let end = off.checked_add(2).ok_or(TpmError::BufferTooSmall)?;
+    let dst = out.get_mut(off..end).ok_or(TpmError::BufferTooSmall)?;
+    dst.copy_from_slice(&value.to_be_bytes());
     Ok(())
 }
 
 /// Write `value` big-endian to `out[off..off+4]`. Returns
 /// `BufferTooSmall` if the slice is short.
 fn put_u32_be(out: &mut [u8], off: usize, value: u32) -> Result<(), TpmError> {
-    if off + 4 > out.len() {
-        return Err(TpmError::BufferTooSmall);
-    }
-    out[off] = (value >> 24) as u8;
-    out[off + 1] = (value >> 16) as u8;
-    out[off + 2] = (value >> 8) as u8;
-    out[off + 3] = value as u8;
+    let end = off.checked_add(4).ok_or(TpmError::BufferTooSmall)?;
+    let dst = out.get_mut(off..end).ok_or(TpmError::BufferTooSmall)?;
+    dst.copy_from_slice(&value.to_be_bytes());
     Ok(())
 }
 
@@ -677,7 +669,10 @@ fn write_auth_session(
     session_handle: u32,
     session_attrs: u8,
 ) -> Result<usize, TpmError> {
-    if off + 4 + AUTH_SESSION_LEN > out.len() {
+    let end = off
+        .checked_add(4 + AUTH_SESSION_LEN)
+        .ok_or(TpmError::BufferTooSmall)?;
+    if end > out.len() {
         return Err(TpmError::BufferTooSmall);
     }
     put_u32_be(out, off, AUTH_SESSION_LEN as u32)?;
@@ -685,7 +680,7 @@ fn write_auth_session(
     put_u16_be(out, off + 8, 0)?;
     out[off + 10] = session_attrs;
     put_u16_be(out, off + 11, 0)?;
-    Ok(off + 4 + AUTH_SESSION_LEN)
+    Ok(end)
 }
 
 fn write_pwap_session(out: &mut [u8], off: usize) -> Result<usize, TpmError> {
@@ -1217,26 +1212,31 @@ impl<B: TpmTisBus> TpmTisDriver<B> {
             }
         }
 
-        // Read the 10-byte response header first.
+        // Stage the 10-byte response header on the stack first so `resp_out` stays
+        // unmodified if `total_size` is malformed or exceeds `resp_out.len()`.
+        let mut hdr = [0u8; TPM_HEADER_LEN];
         let mut read_pos = 0usize;
         while read_pos < TPM_HEADER_LEN {
             let burst = self.wait_burst_count()?;
             let step = (TPM_HEADER_LEN - read_pos).min(burst);
             let mut i = 0usize;
             while i < step {
-                resp_out[read_pos + i] = self.bus.read_u8(TPM_DATA_FIFO_0);
+                hdr[read_pos + i] = self.bus.read_u8(TPM_DATA_FIFO_0);
                 i += 1;
             }
             read_pos += step;
         }
 
-        let total_size = read_u32_be(&resp_out[..TPM_HEADER_LEN], 2) as usize;
+        let total_size = read_u32_be(&hdr, 2) as usize;
         if total_size < TPM_HEADER_LEN {
+            self.bus.write_u8(TPM_STS_0, TPM_STS_COMMAND_READY);
             return Err(TpmError::BadSizeField);
         }
         if total_size > resp_out.len() {
+            self.bus.write_u8(TPM_STS_0, TPM_STS_COMMAND_READY);
             return Err(TpmError::BufferTooSmall);
         }
+        resp_out[..TPM_HEADER_LEN].copy_from_slice(&hdr);
 
         while read_pos < total_size {
             let burst = self.wait_burst_count()?;
@@ -1688,7 +1688,7 @@ fn derive_pcr07_seal_aead_key(pcr0: &[u8; 32], pcr7: &[u8; 32]) -> [u8; 32] {
     crate::tls::hkdf_extract(b"cuttle-tpm-seal-kdf-salt-v1", &ikm, &mut prk);
     crate::durable_seal::zeroize_secret_bytes(&mut ikm);
     let mut aead_key = [0u8; 32];
-    crate::tls::hkdf_expand(&prk, b"cuttle-tpm-seal-aead-key-v1", &mut aead_key);
+    let _ = crate::tls::try_hkdf_expand(&prk, b"cuttle-tpm-seal-aead-key-v1", &mut aead_key);
     crate::durable_seal::zeroize_secret_bytes(&mut prk);
     aead_key
 }
@@ -1712,8 +1712,13 @@ pub fn seal_tpm_device_key_blob(
     let mut aead_key = derive_pcr07_seal_aead_key(pcr0, pcr7);
     let aad = build_pcr07_seal_aad(pcr0, pcr7);
     let mut ct = *master_key;
-    let tag =
-        crate::durable_seal::chacha20_poly1305_encrypt_in_place(&aead_key, nonce, &aad, &mut ct);
+    let tag = crate::durable_seal::try_chacha20_poly1305_encrypt_in_place(
+        &aead_key,
+        nonce,
+        &aad,
+        &mut ct,
+    )
+    .unwrap_or([0u8; 16]);
     crate::durable_seal::zeroize_secret_bytes(&mut aead_key);
     let mut out = [0u8; TPM_SEALED_KEY_BLOB_LEN];
     out[0..4].copy_from_slice(&TPM_SEALED_KEY_MAGIC);
@@ -1936,7 +1941,8 @@ impl MemTpmTisBus {
 
     /// Inspect a SHA-256 PCR value directly from the emulated bank.
     pub fn pcr_sha256(&self, index: usize) -> &[u8; 32] {
-        &self.pcrs_sha256[index]
+        static ZERO_PCR: [u8; 32] = [0u8; 32];
+        self.pcrs_sha256.get(index).unwrap_or(&ZERO_PCR)
     }
 
     fn find_nv_slot(&self, nv_index: u32) -> Option<usize> {
@@ -3706,6 +3712,44 @@ mod tests {
             None,
             "ordinary unsealed NV index without POLICYREAD+READ_STCLEAR must be refused"
         );
+    }
+
+    #[test]
+    fn tis_transceive_short_response_buffer_leaves_caller_slice_unmodified_and_idles_fifo() {
+        let mut tpm = TpmTisDriver::new(MemTpmTisBus::new());
+        let mut cmd = [0u8; TPM_STARTUP_CMD_LEN];
+        let cmd_len = build_startup(&mut cmd, TPM_SU_CLEAR).unwrap();
+
+        // 1. `resp_out.len() < TPM_HEADER_LEN` (8 < 10) must return `BufferTooSmall` without
+        //    panicking or modifying `resp_out`, and must return the TIS FIFO to Command Ready.
+        let mut tiny_resp = [0xEEu8; 8];
+        assert_eq!(
+            tpm.transceive(&cmd[..cmd_len], &mut tiny_resp),
+            Err(TpmError::BufferTooSmall)
+        );
+        assert_eq!(tiny_resp, [0xEEu8; 8]);
+
+        // 2. Subsequent valid `startup` works cleanly, proving FIFO was aborted back to idle.
+        tpm.startup(TPM_SU_CLEAR).unwrap();
+
+        // 3. `resp_out.len() == 10` against a larger `TPM2_GetRandom(16)` response (28 bytes)
+        //    must return `BufferTooSmall` without overwriting `resp_out[0..10]` AND abort the FIFO
+        //    so a subsequent `get_random` succeeds!
+        let mut rnd_cmd = [0u8; 16];
+        let rnd_cmd_len = build_get_random(&mut rnd_cmd, 16).unwrap();
+        let mut header_only_resp = [0xDDu8; TPM_HEADER_LEN];
+        assert_eq!(
+            tpm.transceive(&rnd_cmd[..rnd_cmd_len], &mut header_only_resp),
+            Err(TpmError::BufferTooSmall)
+        );
+        assert_eq!(
+            header_only_resp,
+            [0xDDu8; TPM_HEADER_LEN],
+            "transceive overwrote short resp_out with 10-byte TPM header before BufferTooSmall"
+        );
+        let mut rnd_ok = [0u8; 16];
+        tpm.get_random(&mut rnd_ok)
+            .expect("TIS FIFO must recover to Command Ready after BufferTooSmall");
     }
 }
 

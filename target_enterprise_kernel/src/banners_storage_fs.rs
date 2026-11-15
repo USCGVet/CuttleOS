@@ -20,7 +20,7 @@ pub(crate) fn banner_wal_replay() {
     // TASK-161: durable flush requires CapProof (DURABLE_WAL_WRITE).
     // Banner path is privileged init — self-grant the WAL durable bit.
     if wal
-        .flush(target_enterprise::wal::durable_wal_proof_init())
+        .flush(match target_enterprise::wal::durable_wal_proof(cuttle_contracts::caps::DURABLE_WAL_WRITE) { Ok(p) => p, Err(_) => panic!("WAL cap denied") })
         .is_err()
     {
         panic!("WAL flush failed");

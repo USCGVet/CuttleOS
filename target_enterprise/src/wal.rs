@@ -66,6 +66,10 @@ pub fn durable_wal_proof(held: u64) -> Result<CapProof, cuttle_contracts::CapErr
 /// Privileged self-grant for tests / banner / init (holds only the WAL
 /// durable bit). Not a bypass for unprivileged tasks — those must
 /// pass their real held mask through [`durable_wal_proof`].
+// `CapProof` has a crate-private field inside `cuttle_contracts` and can only be
+// minted via `Result<CapProof, CapError>`; `DURABLE_WAL_WRITE & DURABLE_WAL_WRITE`
+// is a compile-time constant tautology, and `tests/contract_surface.rs` locks this signature.
+#[allow(clippy::expect_used)]
 #[inline]
 pub fn durable_wal_proof_init() -> CapProof {
     durable_wal_proof(cuttle_contracts::caps::DURABLE_WAL_WRITE)
@@ -271,9 +275,10 @@ impl<const CAPACITY: usize> WriteAheadLog for WalImpl<CAPACITY> {
             return Err(WalError::OutOfCapacity);
         }
         // Frame layout: [len: u32 LE][crc32: u32 LE][payload..]
+        let lsn = self.next_lsn;
+        let next_lsn = lsn.checked_add(1).ok_or(WalError::OutOfCapacity)?;
         let off = self.write_cursor;
         let len_u32 = record.len() as u32;
-        let lsn = self.next_lsn;
         let crc = wal_frame_crc(lsn, record);
         write_u32_le(&mut self.buf[off..off + 4], len_u32);
         write_u32_le(&mut self.buf[off + 4..off + 8], crc);
@@ -281,7 +286,7 @@ impl<const CAPACITY: usize> WriteAheadLog for WalImpl<CAPACITY> {
         let payload_end = payload_start + record.len();
         self.buf[payload_start..payload_end].copy_from_slice(record);
         self.write_cursor = new_cursor;
-        self.next_lsn = lsn + 1;
+        self.next_lsn = next_lsn;
         Ok(lsn)
     }
 

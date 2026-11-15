@@ -275,24 +275,26 @@ impl PanicDumpImpl {
         aad_hdr[0..12].copy_from_slice(b"CTTLPENC-HDR");
         aad_hdr[12..28].copy_from_slice(&buf[0..16]);
         aad_hdr[28..40].copy_from_slice(&nonce_base);
-        let hdr_tag = crate::durable_seal::chacha20_poly1305_encrypt_in_place(
+        let hdr_tag = crate::durable_seal::try_chacha20_poly1305_encrypt_in_place(
             aead_key,
             &nonce_hdr,
             &aad_hdr,
             &mut buf[16..448],
-        );
+        )
+        .ok_or(CrashDumpError::LayoutOverflow)?;
 
         let mut aad_bdy = [0u8; 12 + 16 + 12 + 16];
         aad_bdy[0..12].copy_from_slice(b"CTTLPENC-BDY");
         aad_bdy[12..28].copy_from_slice(&buf[0..16]);
         aad_bdy[28..40].copy_from_slice(&nonce_base);
         aad_bdy[40..56].copy_from_slice(&hdr_tag);
-        let body_tag = crate::durable_seal::chacha20_poly1305_encrypt_in_place(
+        let body_tag = crate::durable_seal::try_chacha20_poly1305_encrypt_in_place(
             aead_key,
             &nonce_bdy,
             &aad_bdy,
             &mut buf[SECTOR_BYTES..CRASH_DUMP_BYTES],
-        );
+        )
+        .ok_or(CrashDumpError::LayoutOverflow)?;
 
         buf[448..460].copy_from_slice(&nonce_base);
         buf[460..476].copy_from_slice(&hdr_tag);
@@ -627,24 +629,23 @@ fn read_u64_le(buf: &[u8], off: usize) -> u64 {
 }
 
 fn copy_string_nul_padded(buf: &mut [u8], off: usize, capacity: usize, src: &str) {
-    let bytes = src.as_bytes();
-    let take = if bytes.len() > capacity - 1 {
-        capacity - 1
-    } else {
-        bytes.len()
-    };
-    let mut i = 0usize;
-    while i < take {
-        buf[off + i] = bytes[i];
-        i += 1;
+    if capacity == 0 {
+        return;
     }
+    let Some(dst) = buf.get_mut(off..off.saturating_add(capacity)) else {
+        return;
+    };
+    let bytes = src.as_bytes();
+    let max_body = capacity - 1;
+    let mut take = core::cmp::min(bytes.len(), max_body);
+    while take > 0 && !src.is_char_boundary(take) {
+        take -= 1;
+    }
+    dst[..take].copy_from_slice(&bytes[..take]);
     // Remainder already zero from the upfront fill in build_dump, but
     // belt-and-braces in case a caller reuses the buffer without
     // zeroing first.
-    while i < capacity {
-        buf[off + i] = 0;
-        i += 1;
-    }
+    dst[take..].fill(0);
 }
 
 fn read_nul_terminated_str(
@@ -652,10 +653,12 @@ fn read_nul_terminated_str(
     off: usize,
     capacity: usize,
 ) -> Result<&str, CrashDumpError> {
-    if off + capacity > buf.len() {
-        return Err(CrashDumpError::LayoutOverflow);
-    }
-    let slab = &buf[off..off + capacity];
+    let end_off = off
+        .checked_add(capacity)
+        .ok_or(CrashDumpError::LayoutOverflow)?;
+    let slab = buf
+        .get(off..end_off)
+        .ok_or(CrashDumpError::LayoutOverflow)?;
     let mut end = 0usize;
     while end < slab.len() && slab[end] != 0 {
         end += 1;
@@ -1203,5 +1206,33 @@ mod tests {
         assert_eq!(hdr.panic_loc, ctx.panic_loc);
         assert_eq!(hdr.message, ctx.message);
         assert_eq!(PanicDumpImpl::extract_kmsg(&recovered).unwrap(), kmsg);
+    }
+
+    #[test]
+    fn build_dump_clamps_multibyte_utf8_on_char_boundary_so_parse_succeeds() {
+        // Place a 4-byte UTF-8 codepoint (`'🦀'`) straddling `CRASH_LOC_MAX - 1` and `CRASH_MSG_MAX - 1`
+        // so naive byte clamping at `capacity - 1` leaves half a codepoint and breaks `parse_header`.
+        let loc_prefix = "a".repeat(CRASH_LOC_MAX - 3);
+        let loc_straddling = alloc::format!("{loc_prefix}🦀tail");
+        let msg_prefix = "m".repeat(CRASH_MSG_MAX - 2);
+        let msg_straddling = alloc::format!("{msg_prefix}🦀tail");
+
+        let regs = [0u64; CRASH_REG_COUNT];
+        let ctx = CrashContext {
+            wall_unix: 1_735_000_000,
+            tsc: 99,
+            panic_loc: &loc_straddling,
+            message: &msg_straddling,
+            registers: &regs,
+            backtrace: &[],
+            kmsg: b"ok",
+        };
+        let mut dump = [0u8; CRASH_DUMP_BYTES];
+        PanicDumpImpl::build_dump(&ctx, &mut dump).expect("build_dump");
+        PanicDumpImpl::verify_crc(&dump).expect("verify_crc");
+        let hdr = PanicDumpImpl::parse_header(&dump)
+            .expect("parse_header must succeed when multibyte UTF-8 straddles capacity-1");
+        assert_eq!(hdr.panic_loc, loc_prefix);
+        assert_eq!(hdr.message, msg_prefix);
     }
 }

@@ -48,10 +48,11 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use crate::durable_seal::chacha20_poly1305_encrypt_in_place;
 use crate::durable_seal::{
-    chacha20_poly1305_decrypt_in_place, chacha20_poly1305_encrypt_in_place, constant_time_eq,
-    is_seal_key_set, seal_bytes_keyed, seal_matches_keyed, zeroize_secret_bytes, AEAD_NONCE_LEN,
-    AEAD_TAG_LEN, DURABLE_DIGEST_LEN,
+    chacha20_poly1305_decrypt_in_place, constant_time_eq, is_seal_key_set, seal_bytes_keyed,
+    seal_matches_keyed, zeroize_secret_bytes, AEAD_NONCE_LEN, AEAD_TAG_LEN, DURABLE_DIGEST_LEN,
 };
 use crate::state_store::{IoFault, SectorIo, SECTOR_BYTES};
 
@@ -704,6 +705,7 @@ fn page_nonce(
     seal_bytes_keyed(nonce_key, &msg, &mut mac);
     let mut n = [0u8; AEAD_NONCE_LEN];
     n.copy_from_slice(&mac[0..AEAD_NONCE_LEN]);
+    zeroize_secret_bytes(&mut mac);
     n
 }
 
@@ -737,12 +739,15 @@ fn encrypt_page_sectors(
     flat[PAGED_PAGE_HEADER_BYTES..PAGED_PAGE_HEADER_BYTES + payload.len()].copy_from_slice(payload);
     let nonce = page_nonce(&keys.nonce, &aad, &flat[PAGED_PAGE_HEADER_BYTES..]);
     flat[28..40].copy_from_slice(&nonce);
-    let tag = chacha20_poly1305_encrypt_in_place(
+    let Some(tag) = crate::durable_seal::try_chacha20_poly1305_encrypt_in_place(
         &keys.aead,
         &nonce,
         &aad,
         &mut flat[PAGED_PAGE_HEADER_BYTES..],
-    );
+    ) else {
+        flat.fill(0);
+        return Err(PagedStoreError::KeyUnset);
+    };
     flat[40..56].copy_from_slice(&tag);
     Ok(())
 }

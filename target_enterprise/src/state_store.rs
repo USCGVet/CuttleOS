@@ -96,9 +96,8 @@ use crate::durable_seal::ab_journal::{
     AB_FORMAT_V1, AB_FORMAT_V2, AB_FORMAT_V3, AB_STATE_IN_FLIGHT, AB_STATE_QUIESCENT,
 };
 use crate::durable_seal::{
-    chacha20_poly1305_decrypt_in_place, chacha20_poly1305_encrypt_in_place, constant_time_eq,
-    derive_disk_aead_key, is_seal_key_set, seal_bytes_keyed, zeroize_secret_bytes, AEAD_NONCE_LEN,
-    AEAD_TAG_LEN, DURABLE_DIGEST_LEN,
+    chacha20_poly1305_decrypt_in_place, constant_time_eq, derive_disk_aead_key, is_seal_key_set,
+    seal_bytes_keyed, zeroize_secret_bytes, AEAD_NONCE_LEN, AEAD_TAG_LEN, DURABLE_DIGEST_LEN,
 };
 use crate::shell::{OsShell, StatePackError, StateRestore};
 use crate::wal::crc32_ieee;
@@ -461,15 +460,42 @@ impl StateImage {
         let wal_flat = self.wal.as_flattened_mut();
         wal_flat.copy_within(0..116, 68);
         let (n_wal, aad_wal) = state_aead_nonce_and_aad(&canon, 0);
-        let wal_tag = chacha20_poly1305_encrypt_in_place(&aead_key, &n_wal, &aad_wal, &mut wal_flat[68..]);
+        let Some(wal_tag) = crate::durable_seal::try_chacha20_poly1305_encrypt_in_place(
+            &aead_key,
+            &n_wal,
+            &aad_wal,
+            &mut wal_flat[68..],
+        ) else {
+            zeroize_secret_bytes(&mut aead_key);
+            self.clear();
+            return false;
+        };
 
         let fs_flat = self.fs.as_flattened_mut();
         let (n_fs, aad_fs) = state_aead_nonce_and_aad(&canon, 1);
-        let fs_tag = chacha20_poly1305_encrypt_in_place(&aead_key, &n_fs, &aad_fs, fs_flat);
+        let Some(fs_tag) = crate::durable_seal::try_chacha20_poly1305_encrypt_in_place(
+            &aead_key,
+            &n_fs,
+            &aad_fs,
+            fs_flat,
+        ) else {
+            zeroize_secret_bytes(&mut aead_key);
+            self.clear();
+            return false;
+        };
 
         let sql_flat = self.sql.as_flattened_mut();
         let (n_sql, aad_sql) = state_aead_nonce_and_aad(&canon, 2);
-        let sql_tag = chacha20_poly1305_encrypt_in_place(&aead_key, &n_sql, &aad_sql, sql_flat);
+        let Some(sql_tag) = crate::durable_seal::try_chacha20_poly1305_encrypt_in_place(
+            &aead_key,
+            &n_sql,
+            &aad_sql,
+            sql_flat,
+        ) else {
+            zeroize_secret_bytes(&mut aead_key);
+            self.clear();
+            return false;
+        };
 
         zeroize_secret_bytes(&mut aead_key);
 
@@ -683,7 +709,8 @@ fn slot_digests<D: SectorIo>(dev: &mut D, base: u64) -> Result<ImageDigests, IoF
         let mut rem = count;
         while rem > 0 {
             let take = rem.min(CHUNK);
-            dev.read_sectors(base + idx as u64, &mut chunk[..take])?;
+            let lba = base.checked_add(idx as u64).ok_or(IoFault::OutOfRange)?;
+            dev.read_sectors(lba, &mut chunk[..take])?;
             let mut s = 0usize;
             while s < take {
                 hasher.update(chunk[s]);
@@ -1024,13 +1051,20 @@ const QUARANTINE_MAGIC: [u8; 8] = *b"CTTLQUA1";
 pub const fn quarantine_layout(base: u64) -> StoreLayout {
     StoreLayout {
         primary_lba: base,
-        shadow_lba: base + STATE_IMAGE_SECTORS as u64,
-        commit_lba: base + 2 * STATE_IMAGE_SECTORS as u64,
+        shadow_lba: base.saturating_add(STATE_IMAGE_SECTORS as u64),
+        commit_lba: base.saturating_add(2 * STATE_IMAGE_SECTORS as u64),
     }
 }
 
-const fn quarantine_marker_lba(base: u64) -> u64 {
-    base + 2 * STATE_IMAGE_SECTORS as u64 + 1
+fn checked_quarantine_marker_lba(base: u64, capacity_sectors: u64) -> Result<u64, IoFault> {
+    let end = base
+        .checked_add(QUARANTINE_SECTORS)
+        .ok_or(IoFault::OutOfRange)?;
+    if end > capacity_sectors {
+        return Err(IoFault::OutOfRange);
+    }
+    base.checked_add(2 * STATE_IMAGE_SECTORS as u64 + 1)
+        .ok_or(IoFault::OutOfRange)
 }
 
 /// `true` iff the quarantine area at `base` fits the device and overlaps
@@ -1043,7 +1077,7 @@ fn quarantine_fits(layout: &StoreLayout, base: u64, capacity_sectors: u64) -> bo
         return false;
     }
     let n = STATE_IMAGE_SECTORS as u64;
-    let clear_of = |start: u64, len: u64| end <= start || base >= start + len;
+    let clear_of = |start: u64, len: u64| end <= start || base >= start.saturating_add(len);
     clear_of(layout.primary_lba, n) && clear_of(layout.shadow_lba, n) && clear_of(layout.commit_lba, 1)
 }
 
@@ -1055,8 +1089,9 @@ fn quarantine_marker(sec: &[u8; SECTOR_BYTES]) -> bool {
 
 /// `true` iff the quarantine area at `base` holds a preserved copy.
 pub fn quarantine_present<D: SectorIo>(dev: &mut D, base: u64) -> Result<bool, IoFault> {
+    let marker_lba = checked_quarantine_marker_lba(base, dev.capacity_sectors())?;
     let mut sec = [0u8; SECTOR_BYTES];
-    dev.read_sector(quarantine_marker_lba(base), &mut sec)?;
+    dev.read_sector(marker_lba, &mut sec)?;
     Ok(quarantine_marker(&sec))
 }
 
@@ -1071,12 +1106,14 @@ pub fn quarantine<D: SectorIo>(
     layout: &StoreLayout,
     base: u64,
 ) -> Result<bool, IoFault> {
-    if !quarantine_fits(layout, base, dev.capacity_sectors()) {
+    let cap = dev.capacity_sectors();
+    if !quarantine_fits(layout, base, cap) {
         return Err(IoFault::OutOfRange);
     }
     if quarantine_present(dev, base)? {
         return Ok(false);
     }
+    let marker_lba = checked_quarantine_marker_lba(base, cap)?;
     let dst = quarantine_layout(base);
     // An unreadable source sector is preserved as zeros: the copy exists to
     // keep whatever can still be read, so one bad sector must not stop it.
@@ -1088,22 +1125,21 @@ pub fn quarantine<D: SectorIo>(
         let mut off = 0usize;
         while off < total {
             let take = (total - off).min(CHUNK);
-            if dev
-                .read_sectors(from + off as u64, &mut chunk[..take])
-                .is_err()
-            {
+            let from_lba = from.checked_add(off as u64).ok_or(IoFault::OutOfRange)?;
+            let to_lba = to.checked_add(off as u64).ok_or(IoFault::OutOfRange)?;
+            if dev.read_sectors(from_lba, &mut chunk[..take]).is_err() {
                 let mut s = 0usize;
                 while s < take {
-                    if dev
-                        .read_sector(from + (off + s) as u64, &mut chunk[s])
-                        .is_err()
-                    {
+                    let s_lba = from
+                        .checked_add((off + s) as u64)
+                        .ok_or(IoFault::OutOfRange)?;
+                    if dev.read_sector(s_lba, &mut chunk[s]).is_err() {
                         chunk[s] = [0u8; SECTOR_BYTES];
                     }
                     s += 1;
                 }
             }
-            dev.write_sectors(to + off as u64, &chunk[..take])?;
+            dev.write_sectors(to_lba, &chunk[..take])?;
             off += take;
         }
         Ok(())
@@ -1117,7 +1153,7 @@ pub fn quarantine<D: SectorIo>(
     marker[0..8].copy_from_slice(&QUARANTINE_MAGIC);
     let crc = crc32_ieee(&marker[0..8]);
     marker[8..12].copy_from_slice(&crc.to_le_bytes());
-    dev.write_sector(quarantine_marker_lba(base), &marker)?;
+    dev.write_sector(marker_lba, &marker)?;
     dev.flush()?;
     Ok(true)
 }
@@ -1125,7 +1161,8 @@ pub fn quarantine<D: SectorIo>(
 /// Release the quarantine area at `base` so a later unverifiable state can
 /// be preserved in it.
 pub fn clear_quarantine<D: SectorIo>(dev: &mut D, base: u64) -> Result<(), IoFault> {
-    dev.write_sector(quarantine_marker_lba(base), &[0u8; SECTOR_BYTES])?;
+    let marker_lba = checked_quarantine_marker_lba(base, dev.capacity_sectors())?;
+    dev.write_sector(marker_lba, &[0u8; SECTOR_BYTES])?;
     dev.flush()
 }
 
@@ -1275,9 +1312,13 @@ pub fn verify_tpm_reanchor_token(
         header_diff |= token[i] ^ expected[i];
         i += 1;
     }
-    let tok_mac: &[u8; DURABLE_DIGEST_LEN] = (&token[16..48]).try_into().unwrap();
-    let exp_mac: &[u8; DURABLE_DIGEST_LEN] = (&expected[16..48]).try_into().unwrap();
-    let mac_ok = constant_time_eq(tok_mac, exp_mac);
+    let mut tok_mac = [0u8; DURABLE_DIGEST_LEN];
+    tok_mac.copy_from_slice(&token[16..48]);
+    let mut exp_mac = [0u8; DURABLE_DIGEST_LEN];
+    exp_mac.copy_from_slice(&expected[16..48]);
+    let mac_ok = constant_time_eq(&tok_mac, &exp_mac);
+    zeroize_secret_bytes(&mut tok_mac);
+    zeroize_secret_bytes(&mut exp_mac);
     zeroize_secret_bytes(&mut expected);
     header_diff == 0 && mac_ok
 }
@@ -1617,7 +1658,10 @@ impl ShellStore {
         if self.stored_plain == Some(plain_digests) {
             return Ok(Committed::Unchanged);
         }
-        let seq = self.commit_seq.wrapping_add(1);
+        let seq = self
+            .commit_seq
+            .checked_add(1)
+            .ok_or(PersistError::Commit(CommitError::BadLayout))?;
         let nonce_base =
             derive_commit_nonce(&key, boots, seq, &plain_digests, sh.vault_entropy_snapshot());
         if !self.image.encrypt_in_place(&key, &nonce_base) {
@@ -2353,7 +2397,10 @@ impl ShellStore {
         if !force_write && self.tpm_anchored && self.stored_plain == Some(plain_digests) {
             return Ok(Committed::Unchanged);
         }
-        let seq = self.commit_seq.wrapping_add(1);
+        let seq = self
+            .commit_seq
+            .checked_add(1)
+            .ok_or(PersistError::Commit(CommitError::BadLayout))?;
         let nonce_base =
             derive_commit_nonce(&key, boots, seq, &plain_digests, sh.vault_entropy_snapshot());
         if !self.image.encrypt_in_place(&key, &nonce_base) {
@@ -3010,8 +3057,9 @@ fn classify_candidate_disk<D: SectorIo>(
         return Ok(CandidateDiskClass::Authenticated);
     }
 
+    let q_marker_lba = checked_quarantine_marker_lba(quarantine_lba, dev.capacity_sectors())?;
     let mut q_marker = [0u8; SECTOR_BYTES];
-    dev.read_sector(quarantine_marker_lba(quarantine_lba), &mut q_marker)?;
+    dev.read_sector(q_marker_lba, &mut q_marker)?;
     any_nonzero |= sector_has_nonzero(&q_marker);
     if quarantine_marker(&q_marker) {
         any_nonzero = true;
@@ -6371,5 +6419,22 @@ mod node_tests {
                 occupied: StateBackendKind::Virtio,
             }
         );
+    }
+
+    #[test]
+    fn quarantine_present_and_clear_reject_overflowing_or_oob_base_lba() {
+        let mut disk = MemDisk::new(512);
+        // Canary at LBA 106 (`u64::MAX.wrapping_add(107)`) must never be touched by wrap-around!
+        let canary = [0xC3u8; SECTOR_BYTES];
+        disk.write_sector(106, &canary).unwrap();
+
+        assert_eq!(quarantine_present(&mut disk, u64::MAX), Err(IoFault::OutOfRange));
+        assert_eq!(clear_quarantine(&mut disk, u64::MAX), Err(IoFault::OutOfRange));
+        assert_eq!(quarantine_present(&mut disk, 500), Err(IoFault::OutOfRange));
+        assert_eq!(clear_quarantine(&mut disk, 500), Err(IoFault::OutOfRange));
+
+        let mut check = [0u8; SECTOR_BYTES];
+        disk.read_sector(106, &mut check).unwrap();
+        assert_eq!(check, canary, "LBA 106 canary must remain untouched");
     }
 }

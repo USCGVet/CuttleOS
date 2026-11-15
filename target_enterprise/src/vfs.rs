@@ -199,25 +199,29 @@ pub fn normalise_path(path: &[u8], out: &mut [u8]) -> Result<usize, FsError> {
         return Ok(1);
     }
 
+    // Pre-compute total normalized byte length before writing any byte into `out`.
+    let mut needed = 0usize;
+    let mut ps = 0usize;
+    while ps < n_segs {
+        needed = needed
+            .checked_add(1)
+            .and_then(|v| v.checked_add(lens[ps]))
+            .ok_or(FsError::NameTooLong)?;
+        ps += 1;
+    }
+    if needed > out.len() {
+        return Err(FsError::NameTooLong);
+    }
+
     // Stitch segments separated by '/', leading '/'.
     let mut w = 0usize;
     let mut s = 0usize;
     while s < n_segs {
-        if w >= out.len() {
-            return Err(FsError::NameTooLong);
-        }
         out[w] = b'/';
         w += 1;
         let start = starts[s];
         let len = lens[s];
-        if w + len > out.len() {
-            return Err(FsError::NameTooLong);
-        }
-        let mut k = 0usize;
-        while k < len {
-            out[w + k] = path[start + k];
-            k += 1;
-        }
+        out[w..w + len].copy_from_slice(&path[start..start + len]);
         w += len;
         s += 1;
     }
@@ -1804,18 +1808,22 @@ impl<const N: usize> Vfs for VfsImpl<N> {
 /// Compile-time assertion that the locked handle packing fits the
 /// surface contract (mount-id bits = 8, per-fs bits = 24, sum = 32).
 const _: () = {
-    if VFS_MOUNT_ID_BITS + 24 != 32 {
-        panic!("VFS handle packing must total 32 bits");
-    }
-    if (VFS_PER_FS_MASK as u64) != ((1u64 << 24) - 1) {
-        panic!("VFS per-fs mask must cover 24 bits");
-    }
-    if VFS_MAX_MOUNT_ID != 255 {
-        panic!("VFS max mount id must be 255 with 8-bit packing");
-    }
-    if FS_MAX_MOUNTS > 255 {
-        panic!("FS_MAX_MOUNTS exceeds VFS handle packing");
-    }
+    assert!(
+        VFS_MOUNT_ID_BITS + 24 == 32,
+        "VFS handle packing must total 32 bits"
+    );
+    assert!(
+        (VFS_PER_FS_MASK as u64) == ((1u64 << 24) - 1),
+        "VFS per-fs mask must cover 24 bits"
+    );
+    assert!(
+        VFS_MAX_MOUNT_ID == 255,
+        "VFS max mount id must be 255 with 8-bit packing"
+    );
+    assert!(
+        FS_MAX_MOUNTS <= 255,
+        "FS_MAX_MOUNTS exceeds VFS handle packing"
+    );
 };
 
 // ============================================================
@@ -2572,5 +2580,19 @@ mod tests {
         let n2 = fs.read(h2, 0, &mut buf).unwrap();
         fs.close(h2).unwrap();
         assert_eq!(&buf[..n2], b"important\n");
+    }
+
+    #[test]
+    fn normalise_path_leaves_output_unmodified_on_name_too_long() {
+        let mut out = [0xAAu8; 8];
+        assert_eq!(
+            normalise_path(b"/alpha/bravo", &mut out),
+            Err(FsError::NameTooLong)
+        );
+        assert_eq!(
+            out,
+            [0xAAu8; 8],
+            "normalise_path wrote partial segments into out before NameTooLong"
+        );
     }
 }

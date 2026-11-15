@@ -308,30 +308,32 @@ pub fn read_file_impl(
     if cluster < 2 {
         return Err(FatError::BadChain);
     }
+    let start_cluster = cluster;
     let mut hare = fat_next(bpb, image, cluster)?;
     if hare == Some(cluster) {
         return Err(FatError::BadChain);
     }
-    let mut written = 0usize;
     let need = ent.size as usize;
     let max_hops = max_data_clusters(bpb, image);
+
+    // Pass 1: validate the entire cluster chain and every sector slice before mutating `out`.
+    let mut verified = 0usize;
     let mut hops = 0usize;
-    while written < need {
+    while verified < need {
         hops += 1;
         if hops > max_hops {
             return Err(FatError::BadChain);
         }
         let lba = cluster_to_lba_checked(bpb, cluster)?;
         let mut s = 0u8;
-        while s < bpb.sectors_per_cluster && written < need {
+        while s < bpb.sectors_per_cluster && verified < need {
             let sec_lba = lba.checked_add(s as u32).ok_or(FatError::Truncated)?;
-            let sec = sector_slice(image, sec_lba)?;
-            let take = core::cmp::min(FAT_SECTOR_SIZE, need - written);
-            out[written..written + take].copy_from_slice(&sec[..take]);
-            written += take;
+            let _ = sector_slice(image, sec_lba)?;
+            let take = core::cmp::min(FAT_SECTOR_SIZE, need - verified);
+            verified += take;
             s += 1;
         }
-        if written >= need {
+        if verified >= need {
             break;
         }
         match fat_next(bpb, image, cluster)? {
@@ -353,6 +355,26 @@ pub fn read_file_impl(
             }
             None => return Err(FatError::BadChain),
         }
+    }
+
+    // Pass 2: copy verified cluster sectors into `out`.
+    cluster = start_cluster;
+    let mut written = 0usize;
+    while written < need {
+        let lba = cluster_to_lba_checked(bpb, cluster)?;
+        let mut s = 0u8;
+        while s < bpb.sectors_per_cluster && written < need {
+            let sec_lba = lba.checked_add(s as u32).ok_or(FatError::Truncated)?;
+            let sec = sector_slice(image, sec_lba)?;
+            let take = core::cmp::min(FAT_SECTOR_SIZE, need - written);
+            out[written..written + take].copy_from_slice(&sec[..take]);
+            written += take;
+            s += 1;
+        }
+        if written >= need {
+            break;
+        }
+        cluster = fat_next(bpb, image, cluster)?.ok_or(FatError::BadChain)?;
     }
     Ok(need)
 }
@@ -777,5 +799,18 @@ mod tests {
             .expect("FAT32 cyclic cluster chain hung instead of returning BadChain");
         assert_eq!(r_lookup, Err(FatError::BadChain));
         assert_eq!(r_read, Err(FatError::BadChain));
+    }
+
+    #[test]
+    fn read_file_leaves_output_unmodified_when_cluster_chain_ends_early() {
+        let img = fixture();
+        let fs = Fat32Impl::mount(&img).unwrap();
+        let mut e = fs.lookup_root(&img, &FAT_HELLO_83).unwrap();
+        // `HELLO.TXT` occupies 1 cluster (512 bytes) ending in EOC; claiming 600 bytes
+        // fails after the first cluster with `BadChain` and must not leave partial bytes in `out`.
+        e.size = 600;
+        let mut out = [0xCCu8; 640];
+        assert_eq!(fs.read_file(&img, &e, &mut out), Err(FatError::BadChain));
+        assert_eq!(out, [0xCCu8; 640], "read_file wrote partial cluster before BadChain");
     }
 }

@@ -91,26 +91,29 @@ fn write_u64_le(buf: &mut [u8], off: usize, v: u64) {
 /// Absolute byte offset of LBA `lba` inside an image.
 #[inline]
 pub fn lba_offset(lba: u32) -> usize {
-    (lba as usize) * JFS_SECTOR_SIZE
+    (lba as usize).saturating_mul(JFS_SECTOR_SIZE)
+}
+
+#[inline]
+fn checked_lba_offset(lba: u32) -> Result<usize, JfsError> {
+    (lba as usize)
+        .checked_mul(JFS_SECTOR_SIZE)
+        .ok_or(JfsError::Truncated)
 }
 
 /// Slice one sector out of `image`. Returns [`JfsError::Truncated`]
 /// if the LBA falls off the end.
 pub fn sector_slice(image: &[u8], lba: u32) -> Result<&[u8], JfsError> {
-    let off = lba_offset(lba);
-    if off + JFS_SECTOR_SIZE > image.len() {
-        return Err(JfsError::Truncated);
-    }
-    Ok(&image[off..off + JFS_SECTOR_SIZE])
+    let off = checked_lba_offset(lba)?;
+    let end = off.checked_add(JFS_SECTOR_SIZE).ok_or(JfsError::Truncated)?;
+    image.get(off..end).ok_or(JfsError::Truncated)
 }
 
 /// Mutable sector slice (fixture builders).
 pub fn sector_slice_mut(image: &mut [u8], lba: u32) -> Result<&mut [u8], JfsError> {
-    let off = lba_offset(lba);
-    if off + JFS_SECTOR_SIZE > image.len() {
-        return Err(JfsError::Truncated);
-    }
-    Ok(&mut image[off..off + JFS_SECTOR_SIZE])
+    let off = checked_lba_offset(lba)?;
+    let end = off.checked_add(JFS_SECTOR_SIZE).ok_or(JfsError::Truncated)?;
+    image.get_mut(off..end).ok_or(JfsError::Truncated)
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +196,8 @@ pub fn durable_fs_proof(
     cuttle_contracts::mint_cap_proof(held, cuttle_contracts::caps::DURABLE_FS_WRITE)
 }
 
-/// Privileged self-grant for fixtures / banner / tests (TASK-164).
+/// Privileged self-grant for unit tests (TASK-164).
+#[cfg(test)]
 #[inline]
 pub fn durable_fs_proof_init() -> cuttle_contracts::CapProof {
     durable_fs_proof(cuttle_contracts::caps::DURABLE_FS_WRITE)
@@ -376,11 +380,16 @@ impl JournalFs for JfsImpl {
         }
         // Slot `ino` sits at byte offset ino * JFS_INODE_LEN within the
         // inode table, which starts at inode_table_lba.
-        let byte_off = lba_offset(self.sb.inode_table_lba) + (ino as usize) * JFS_INODE_LEN;
-        if byte_off + JFS_INODE_LEN > image.len() {
-            return Err(JfsError::Truncated);
-        }
-        parse_inode(&image[byte_off..byte_off + JFS_INODE_LEN], ino)
+        let table_off = checked_lba_offset(self.sb.inode_table_lba)?;
+        let slot_off = (ino as usize)
+            .checked_mul(JFS_INODE_LEN)
+            .ok_or(JfsError::Truncated)?;
+        let byte_off = table_off.checked_add(slot_off).ok_or(JfsError::Truncated)?;
+        let end = byte_off
+            .checked_add(JFS_INODE_LEN)
+            .ok_or(JfsError::Truncated)?;
+        let raw = image.get(byte_off..end).ok_or(JfsError::Truncated)?;
+        parse_inode(raw, ino)
     }
 
     fn read_dir(
@@ -399,15 +408,19 @@ impl JournalFs for JfsImpl {
         if n % JFS_DIRENT_LEN != 0 {
             return Err(JfsError::BadDirent);
         }
+        // Pass 1: validate every dirent before invoking `sink`.
+        let mut v_off = 0usize;
+        while v_off + JFS_DIRENT_LEN <= n {
+            let _ = parse_dirent(&body[v_off..v_off + JFS_DIRENT_LEN])?;
+            v_off += JFS_DIRENT_LEN;
+        }
+        // Pass 2: emit verified dirents.
         let mut count = 0usize;
         let mut off = 0usize;
         while off + JFS_DIRENT_LEN <= n {
-            match parse_dirent(&body[off..off + JFS_DIRENT_LEN])? {
-                None => {}
-                Some((ino, name)) => {
-                    sink(JfsDirEntry { ino, name });
-                    count += 1;
-                }
+            if let Some((ino, name)) = parse_dirent(&body[off..off + JFS_DIRENT_LEN])? {
+                sink(JfsDirEntry { ino, name });
+                count += 1;
             }
             off += JFS_DIRENT_LEN;
         }
@@ -448,25 +461,37 @@ impl JfsImpl {
         if out.len() < size {
             return Err(JfsError::BufferTooSmall);
         }
-        let mut written = 0usize;
-        let mut ei = 0usize;
-        while ei < 3 && written < size {
-            let lba = inode.extents[ei];
+        // Pass 1: validate all required extents and sector bounds before writing `out`.
+        let mut verified = 0usize;
+        let mut vei = 0usize;
+        while vei < 3 && verified < size {
+            let lba = inode.extents[vei];
             if lba == 0 {
                 break;
             }
             if lba < self.sb.data_start_lba {
                 return Err(JfsError::BadInode);
             }
+            let _ = sector_slice(image, lba)?;
+            let take = core::cmp::min(JFS_SECTOR_SIZE, size - verified);
+            verified += take;
+            vei += 1;
+        }
+        if verified < size {
+            // Not enough extents to cover size_bytes — corrupt image.
+            return Err(JfsError::Truncated);
+        }
+
+        // Pass 2: copy verified sectors into `out`.
+        let mut written = 0usize;
+        let mut ei = 0usize;
+        while ei < 3 && written < size {
+            let lba = inode.extents[ei];
             let sec = sector_slice(image, lba)?;
             let take = core::cmp::min(JFS_SECTOR_SIZE, size - written);
             out[written..written + take].copy_from_slice(&sec[..take]);
             written += take;
             ei += 1;
-        }
-        if written < size {
-            // Not enough extents to cover size_bytes — corrupt image.
-            return Err(JfsError::Truncated);
         }
         Ok(size)
     }
@@ -497,6 +522,7 @@ pub fn build_banner_fixture(out: &mut [u8]) -> Result<usize, JfsError> {
     if out.len() < FIXTURE_BYTES {
         return Err(JfsError::BufferTooSmall);
     }
+    let fs_cap = cuttle_contracts::caps::DURABLE_FS_WRITE;
     // Zero the whole image first.
     let mut i = 0usize;
     while i < FIXTURE_BYTES {
@@ -514,7 +540,11 @@ pub fn build_banner_fixture(out: &mut [u8]) -> Result<usize, JfsError> {
         data_start_lba: 2,
         free_bitmap_lba: 0,
     };
-    encode_superblock(&sb, &mut out[..JFS_SB_LEN], durable_fs_proof_init())?;
+    encode_superblock(
+        &sb,
+        &mut out[..JFS_SB_LEN],
+        durable_fs_proof(fs_cap).map_err(|_| JfsError::BadSuperblock)?,
+    )?;
 
     // Inode 1: root directory, body at LBA 2, size = one dirent.
     let root = JfsInode {
@@ -525,7 +555,11 @@ pub fn build_banner_fixture(out: &mut [u8]) -> Result<usize, JfsError> {
         kind: JFS_KIND_DIR,
     };
     let root_off = lba_offset(1) + 1 * JFS_INODE_LEN;
-    encode_inode(&root, &mut out[root_off..root_off + JFS_INODE_LEN], durable_fs_proof_init())?;
+    encode_inode(
+        &root,
+        &mut out[root_off..root_off + JFS_INODE_LEN],
+        durable_fs_proof(fs_cap).map_err(|_| JfsError::BadSuperblock)?,
+    )?;
 
     // Inode 2: hello.txt, body at LBA 3.
     let hello = JfsInode {
@@ -536,11 +570,20 @@ pub fn build_banner_fixture(out: &mut [u8]) -> Result<usize, JfsError> {
         kind: JFS_KIND_FILE,
     };
     let hello_off = lba_offset(1) + 2 * JFS_INODE_LEN;
-    encode_inode(&hello, &mut out[hello_off..hello_off + JFS_INODE_LEN], durable_fs_proof_init())?;
+    encode_inode(
+        &hello,
+        &mut out[hello_off..hello_off + JFS_INODE_LEN],
+        durable_fs_proof(fs_cap).map_err(|_| JfsError::BadSuperblock)?,
+    )?;
 
     // Root dir body at LBA 2: one dirent for "hello.txt" → ino 2.
     let dir_sec = sector_slice_mut(out, 2)?;
-    encode_dirent(2, b"hello.txt", &mut dir_sec[..JFS_DIRENT_LEN], durable_fs_proof_init())?;
+    encode_dirent(
+        2,
+        b"hello.txt",
+        &mut dir_sec[..JFS_DIRENT_LEN],
+        durable_fs_proof(fs_cap).map_err(|_| JfsError::BadSuperblock)?,
+    )?;
 
     // File body at LBA 3.
     let file_sec = sector_slice_mut(out, 3)?;
@@ -1167,5 +1210,60 @@ mod tests {
         let fs = JfsImpl::mount(&meta_leak).unwrap();
         let mut out = [0u8; 32];
         assert_eq!(fs.read_file(&meta_leak, 2, &mut out), Err(JfsError::BadInode));
+    }
+
+    #[test]
+    fn read_dir_and_read_file_are_all_or_nothing_on_corrupt_tail() {
+        // 1. `read_dir`: valid first dirent followed by corrupt second dirent (`name_len = 250`)
+        //    must return `Err(JfsError::BadDirent)` without having invoked `sink` on entry 0.
+        let mut bad_dir = fixture();
+        let root_two_entries = JfsInode {
+            ino: 1,
+            size_bytes: (2 * JFS_DIRENT_LEN) as u32,
+            mtime_unix: 1_773_578_096,
+            extents: [2, 0, 0],
+            kind: JFS_KIND_DIR,
+        };
+        encode_inode(
+            &root_two_entries,
+            &mut bad_dir[lba_offset(1) + JFS_INODE_LEN..lba_offset(1) + 2 * JFS_INODE_LEN],
+            durable_fs_proof_init(),
+        )
+        .unwrap();
+        // Corrupt dirent #1 at `LBA 2 + JFS_DIRENT_LEN`: non-zero `ino` + `name_len = 250` (> JFS_NAME_MAX).
+        let d1_off = lba_offset(2) + JFS_DIRENT_LEN;
+        write_u32_le(&mut bad_dir, d1_off, 2);
+        bad_dir[d1_off + 4] = 250;
+        let fs_dir = JfsImpl::mount(&bad_dir).unwrap();
+        let mut sink_calls = 0usize;
+        assert_eq!(
+            fs_dir.read_dir(&bad_dir, 1, &mut |_| sink_calls += 1),
+            Err(JfsError::BadDirent)
+        );
+        assert_eq!(sink_calls, 0, "read_dir invoked sink before validating trailing dirent");
+
+        // 2. `read_file`: inode claiming 600 bytes with only 1 extent (`[3, 0, 0]`) must return
+        //    `Err(JfsError::Truncated)` without clobbering `out[0..512]`.
+        let mut bad_file = fixture();
+        let short_extents = JfsInode {
+            ino: 2,
+            size_bytes: 600,
+            mtime_unix: 1_773_578_096,
+            extents: [3, 0, 0],
+            kind: JFS_KIND_FILE,
+        };
+        encode_inode(
+            &short_extents,
+            &mut bad_file[lba_offset(1) + 2 * JFS_INODE_LEN..lba_offset(1) + 3 * JFS_INODE_LEN],
+            durable_fs_proof_init(),
+        )
+        .unwrap();
+        let fs_file = JfsImpl::mount(&bad_file).unwrap();
+        let mut out = [0xDDu8; 640];
+        assert_eq!(
+            fs_file.read_file(&bad_file, 2, &mut out),
+            Err(JfsError::Truncated)
+        );
+        assert_eq!(out, [0xDDu8; 640], "read_file wrote partial extent before Truncated");
     }
 }

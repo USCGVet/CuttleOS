@@ -1232,10 +1232,12 @@ impl BTreePager {
         if min_key > max_key {
             return Ok(0);
         }
-        let mut leaf_id = self.find_leaf_page(min_key)?;
-        let mut written = 0usize;
+        let start_leaf = self.find_leaf_page(min_key)?;
+        // Pass 1: validate leaf seals, record layout, and total matching count before mutating `out`.
+        let mut leaf_id = start_leaf;
+        let mut needed = 0usize;
         let mut hops = 0usize;
-        while leaf_id != BTREE_NO_PAGE && hops < BTREE_MAX_PAGES {
+        'count_scan: while leaf_id != BTREE_NO_PAGE && hops < BTREE_MAX_PAGES {
             let kind = self.verify_page_seal(leaf_id)?;
             if kind != BTreePageKind::Leaf {
                 return Err(BTreeError::PageTampered { page_id: leaf_id });
@@ -1247,14 +1249,36 @@ impl BTreePager {
                     .read_leaf_record(leaf_id, i)
                     .ok_or(BTreeError::PageTampered { page_id: leaf_id })?;
                 if rec.key > max_key {
-                    return Ok(written);
+                    break 'count_scan;
                 }
                 if rec.key >= min_key {
-                    if written >= out.len() {
+                    if needed >= out.len() {
                         return Err(BTreeError::BufferTooSmall);
                     }
-                    out[written] = rec;
-                    written += 1;
+                    needed += 1;
+                }
+                i += 1;
+            }
+            leaf_id = self.page_next_leaf(leaf_id);
+            hops += 1;
+        }
+
+        // Pass 2: write verified records into `out` (`needed <= out.len()`).
+        leaf_id = start_leaf;
+        let mut written = 0usize;
+        hops = 0;
+        while leaf_id != BTREE_NO_PAGE && hops < BTREE_MAX_PAGES && written < needed {
+            let count = self.page_count(leaf_id);
+            let mut i = 0usize;
+            while i < count && written < needed {
+                if let Some(rec) = self.read_leaf_record(leaf_id, i) {
+                    if rec.key > max_key {
+                        return Ok(written);
+                    }
+                    if rec.key >= min_key {
+                        out[written] = rec;
+                        written += 1;
+                    }
                 }
                 i += 1;
             }
@@ -1642,5 +1666,23 @@ mod tests {
             active, 1,
             "all non-root internal and leaf pages must be reclaimed when height-3 tree empties"
         );
+    }
+
+    #[test]
+    fn scan_range_leaves_output_unmodified_when_buffer_is_too_small() {
+        let mut pager = BTreePager::new(TEST_BTREE_KEY).unwrap();
+        pager.insert(10, b"k10", b"v10", 1).unwrap();
+        pager.insert(20, b"k20", b"v20", 2).unwrap();
+        pager.insert(30, b"k30", b"v30", 3).unwrap();
+
+        let mut sentinel = BTreeRecord::empty();
+        sentinel.key = -777;
+        let mut out = [sentinel, sentinel];
+        assert_eq!(
+            pager.scan_range(10, 30, &mut out),
+            Err(BTreeError::BufferTooSmall)
+        );
+        assert_eq!(out[0].key, -777, "scan_range clobbered out[0] on BufferTooSmall");
+        assert_eq!(out[1].key, -777, "scan_range clobbered out[1] on BufferTooSmall");
     }
 }

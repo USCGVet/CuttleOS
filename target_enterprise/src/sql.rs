@@ -13,13 +13,11 @@
 //!   protected by a keyed `HMAC-SHA256` tag (with automatic migration from legacy
 //!   8-sector `4 KiB` v1 images).
 
-use crate::durable_seal::{is_seal_key_set, DURABLE_DIGEST_LEN};
+use crate::durable_seal::{is_seal_key_set, zeroize_secret_bytes, DURABLE_DIGEST_LEN};
 use crate::paged_store::{
     PageDomain, PagedBlockStore, PagedStoreError, PAGED_PAGE_PAYLOAD_BYTES,
 };
 use alloc::vec::Vec;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 
 /// Maximum number of relational tables in a standalone/inline [`SqlDb`] instance.
 pub const SQL_MAX_TABLES: usize = 4;
@@ -1817,7 +1815,8 @@ impl SqlDb {
                 col += 1;
             }
             rpos += append_bytes(&mut row_buf, rpos, b"\n");
-            if (pos + rpos > max_out_len && actual_count > 0) || pos + rpos > out.len() {
+            let next_pos = pos.saturating_add(rpos);
+            if (next_pos > max_out_len && actual_count > 0) || next_pos > out.len() {
                 break;
             }
             pos += append_bytes(out, pos, &row_buf[..rpos]);
@@ -2975,7 +2974,10 @@ impl SqlDb {
         if !is_seal_key_set(key) {
             return Err(SqlSaveError::KeyUnset);
         }
-        let total_bytes = sectors.len() * 512;
+        let total_bytes = sectors
+            .len()
+            .checked_mul(512)
+            .ok_or(SqlSaveError::TooLarge)?;
         if total_bytes < 512 {
             return Err(SqlSaveError::TooLarge);
         }
@@ -3170,7 +3172,9 @@ impl SqlDb {
         if sectors.is_empty() {
             return false;
         }
-        let total_bytes = sectors.len() * 512;
+        let Some(total_bytes) = sectors.len().checked_mul(512) else {
+            return false;
+        };
         let is_legacy = &sectors[0][0..8] == b"PRTSSQL1";
         if &sectors[0][0..8] != SQL_PART_MAGIC && !is_legacy {
             return false;
@@ -3996,15 +4000,15 @@ fn sql_part_hmac(
     sectors: &[[u8; 512]],
     out: &mut [u8; DURABLE_DIGEST_LEN],
 ) {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts 32-byte key");
-    mac.update(&sectors[0][0..20]);
-    mac.update(&sectors[0][52..512]);
-    let mut s = 1usize;
-    while s < sectors.len() {
-        mac.update(&sectors[s]);
-        s += 1;
-    }
-    out.copy_from_slice(&mac.finalize().into_bytes());
+    let Some((first, tail)) = sectors.split_first() else {
+        *out = [0u8; DURABLE_DIGEST_LEN];
+        return;
+    };
+    crate::tls::hmac_sha256_parts(
+        key,
+        &[&first[0..20], &first[52..512], tail.as_flattened()],
+        out,
+    );
 }
 
 fn sql_part_hmac_matches(
@@ -4020,6 +4024,7 @@ fn sql_part_hmac_matches(
         diff |= actual[i] ^ expected[i];
         i += 1;
     }
+    zeroize_secret_bytes(&mut actual);
     diff == 0
 }
 
@@ -4635,7 +4640,7 @@ fn append_u64(out: &mut [u8], pos: usize, mut val: u64) -> usize {
 fn append_i64(out: &mut [u8], pos: usize, val: i64) -> usize {
     if val < 0 {
         let mut written = append_bytes(out, pos, b"-");
-        written += append_u64(out, pos + written, val.unsigned_abs());
+        written += append_u64(out, pos.saturating_add(written), val.unsigned_abs());
         written
     } else {
         append_u64(out, pos, val as u64)
@@ -4674,11 +4679,17 @@ fn append_hex_bytes(out: &mut [u8], pos: usize, src: &[u8]) -> usize {
     let mut written = 0usize;
     let mut i = 0usize;
     while i < src.len() {
-        if pos + written + 2 > out.len() {
+        let Some(base) = pos.checked_add(written) else {
             break;
-        }
-        out[pos + written] = HEX[(src[i] >> 4) as usize];
-        out[pos + written + 1] = HEX[(src[i] & 0xF) as usize];
+        };
+        let Some(end) = base.checked_add(2) else {
+            break;
+        };
+        let Some(pair) = out.get_mut(base..end) else {
+            break;
+        };
+        pair[0] = HEX[(src[i] >> 4) as usize];
+        pair[1] = HEX[(src[i] & 0xF) as usize];
         written += 2;
         i += 1;
     }
