@@ -85,6 +85,38 @@ pub const PROC_SYS_IPC_RECV: u64 = 66;
 /// Extended Ring-3 syscall: return hardware SMP CPU core index (`0..3`) executing this quantum.
 pub const PROC_SYS_GETCPU: u64 = 67;
 
+/// Extended Ring-3 syscall: set canonical user `FS_BASE` (`IA32_FS_BASE`, TLS pointer) for this process.
+pub const PROC_SYS_SET_FS_BASE: u64 = 68;
+
+/// Extended Ring-3 syscall: set canonical user `GS_BASE` (`IA32_GS_BASE`) for this process.
+pub const PROC_SYS_SET_GS_BASE: u64 = 69;
+
+/// 16-byte-aligned 512-byte architectural `FXSAVE64` / `FXRSTOR64` x87 + SSE/XMM save area.
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FxSaveArea {
+    /// Raw 512-byte `FXSAVE64` image (`FCW` at `0..2`, `MXCSR` at `24..28`, `XMM0..XMM15` at `160..416`).
+    pub bytes: [u8; 512],
+}
+
+impl FxSaveArea {
+    /// Clean architectural user-mode x87/SSE state (`FCW = 0x037F`, `MXCSR = 0x1F80`, zeroed `ST`/`XMM` registers).
+    pub const fn clean_user_default() -> Self {
+        let mut bytes = [0u8; 512];
+        bytes[0] = 0x7F;
+        bytes[1] = 0x03;
+        bytes[24] = 0x80;
+        bytes[25] = 0x1F;
+        Self { bytes }
+    }
+}
+
+/// Return `true` iff `va` is a canonical 48-bit lower-half user virtual address (`< 0x0000_8000_0000_0000`).
+#[inline]
+pub const fn is_canonical_user_tls_base(va: u64) -> bool {
+    va < 0x0000_8000_0000_0000
+}
+
 /// POSIX `ENOMEM` (`12`) returned negatively (`-12`) when `PROC_SYS_BRK` exceeds the heap window or physical RAM.
 pub const PROC_ENOMEM: i64 = 12;
 
@@ -690,6 +722,12 @@ pub struct ProcessEntry {
     pub last_ipc_status: u32,
     /// Snapshot of `PT[103] + 0x268` (`fnv_out`) captured immediately before `SYS_EXIT` scrubs `ipc_page_pa`.
     pub last_ipc_fnv: u64,
+    /// Per-process 512-byte `FXSAVE64` / `FXRSTOR64` x87 + SSE/SIMD register state.
+    pub fxsave: FxSaveArea,
+    /// Per-process canonical user `IA32_FS_BASE` (`TLS` pointer).
+    pub user_fs_base: u64,
+    /// Per-process canonical user `IA32_GS_BASE`.
+    pub user_gs_base: u64,
 }
 
 impl ProcessEntry {
@@ -743,6 +781,9 @@ impl ProcessEntry {
             inbox_len: 0,
             last_ipc_status: 0,
             last_ipc_fnv: 0,
+            fxsave: FxSaveArea::clean_user_default(),
+            user_fs_base: 0,
+            user_gs_base: 0,
         }
     }
 
@@ -801,6 +842,13 @@ impl ProcessEntry {
         self.inbox_len = 0;
         self.last_ipc_status = 0;
         self.last_ipc_fnv = 0;
+        self.fxsave.bytes.fill(0);
+        self.fxsave.bytes[0] = 0x7F;
+        self.fxsave.bytes[1] = 0x03;
+        self.fxsave.bytes[24] = 0x80;
+        self.fxsave.bytes[25] = 0x1F;
+        self.user_fs_base = 0;
+        self.user_gs_base = 0;
     }
 }
 
@@ -832,6 +880,66 @@ pub struct ProcessTable {
 }
 
 impl ProcessTable {
+    /// Snapshot per-process x87/SIMD (`FXSAVE64`) and canonical `FS_BASE`/`GS_BASE` registers upon leaving Ring-3.
+    pub fn save_arch_ext_state(
+        &mut self,
+        slot: usize,
+        fx: &FxSaveArea,
+        fs_base: u64,
+        gs_base: u64,
+    ) {
+        if slot >= MAX_PROCS {
+            return;
+        }
+        self.procs[slot].fxsave.bytes.copy_from_slice(&fx.bytes);
+        // Mask reserved `MXCSR` bits (`bytes[24..28]`, baseline `MXCSR_MASK = 0x0000_FFBF`) so
+        // `FXRSTOR64` in Ring-0 can never `#GP(0)` on corrupted flags.
+        let mxcsr = u32::from_le_bytes([
+            fx.bytes[24],
+            fx.bytes[25],
+            fx.bytes[26],
+            fx.bytes[27],
+        ]) & 0x0000_FFBF;
+        self.procs[slot].fxsave.bytes[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+        self.procs[slot].user_fs_base = if is_canonical_user_tls_base(fs_base) {
+            fs_base
+        } else {
+            0
+        };
+        self.procs[slot].user_gs_base = if is_canonical_user_tls_base(gs_base) {
+            gs_base
+        } else {
+            0
+        };
+    }
+
+    /// Copy `slot`'s `FXSAVE64` image into `fx_out` in place and return its `(user_fs_base, user_gs_base)`.
+    pub fn load_arch_ext_state_into(&self, slot: usize, fx_out: &mut FxSaveArea) -> (u64, u64) {
+        if slot >= MAX_PROCS {
+            *fx_out = FxSaveArea::clean_user_default();
+            return (0, 0);
+        }
+        fx_out.bytes.copy_from_slice(&self.procs[slot].fxsave.bytes);
+        let fs = if is_canonical_user_tls_base(self.procs[slot].user_fs_base) {
+            self.procs[slot].user_fs_base
+        } else {
+            0
+        };
+        let gs = if is_canonical_user_tls_base(self.procs[slot].user_gs_base) {
+            self.procs[slot].user_gs_base
+        } else {
+            0
+        };
+        (fs, gs)
+    }
+
+    /// Load per-process x87/SIMD (`FXRSTOR64`) and canonical `FS_BASE`/`GS_BASE` registers before entering Ring-3.
+    pub fn load_arch_ext_state(&self, slot: usize) -> (FxSaveArea, u64, u64) {
+        let mut fx = FxSaveArea::clean_user_default();
+        let (fs, gs) = self.load_arch_ext_state_into(slot, &mut fx);
+        (fx, fs, gs)
+    }
+
     /// Construct an empty `.bss`-friendly process table.
     pub const fn new() -> Self {
         let mut procs = [ProcessEntry::empty(0); MAX_PROCS];
@@ -1252,6 +1360,7 @@ impl ProcessTable {
         let a3 = tf.r10;
         let a4 = tf.r8;
         let a5 = tf.r9;
+        tf.rflags = sanitize_user_rflags(tf.rflags);
 
         self.procs[slot].syscalls = self.procs[slot].syscalls.wrapping_add(1);
         let pid = self.procs[slot].pid;
@@ -1259,120 +1368,31 @@ impl ProcessTable {
         let cap_task_slot = (slot % crate::syscall::CAP_TABLE_TASKS) as u64;
 
         // 1. Standard Cuttle contract syscalls (`0..SYS_MAX`), gated via `CapProof` in `dispatch_syscall`.
+        //    Save and restore `RUNTIME_CAP_TABLE[cap_task_slot]` on every exit path!
         if nr < SYS_MAX {
+            let prev_cap = crate::syscall::get_task_cap_mask(cap_task_slot).unwrap_or(u64::MAX);
             let _ = crate::syscall::set_task_cap_mask(cap_task_slot, cap_mask);
-            if nr == SYS_EXIT {
-                let code = a0 as i32;
-                let ipc_pa = self.procs[slot].vm.ipc_page_pa;
-                if ipc_pa != 0 {
-                    let mut ipc_snap = [0u8; 16];
-                    source.read_frame_bytes(ipc_pa, 0x268, &mut ipc_snap);
-                    self.procs[slot].last_ipc_fnv = u64::from_le_bytes([
-                        ipc_snap[0],
-                        ipc_snap[1],
-                        ipc_snap[2],
-                        ipc_snap[3],
-                        ipc_snap[4],
-                        ipc_snap[5],
-                        ipc_snap[6],
-                        ipc_snap[7],
-                    ]);
-                    self.procs[slot].last_ipc_status =
-                        u32::from_le_bytes([ipc_snap[8], ipc_snap[9], ipc_snap[10], ipc_snap[11]]);
-                }
-                self.procs[slot].vm.release_all_frames(source);
-                self.procs[slot].exit_code = code;
-                self.procs[slot].state = ProcState::Exited;
-                self.total_exited = self.total_exited.wrapping_add(1);
-                return SyscallStepOutcome::Exited(code);
-            }
-            if nr == SYS_GETPID {
-                tf.rax = pid as u64;
-                self.procs[slot].trap_frame = tf;
-                return SyscallStepOutcome::Continue;
-            }
-            if nr == crate::syscall::SYS_GETTIME_NS {
-                tf.rax = monotonic_ns;
-                self.procs[slot].trap_frame = tf;
-                return SyscallStepOutcome::Continue;
-            }
-            if nr == SYS_YIELD || nr == SYS_SLEEP_MS {
-                tf.rax = 0;
-                self.procs[slot].trap_frame = tf;
-                self.procs[slot].preemptions = self.procs[slot].preemptions.wrapping_add(1);
-                self.procs[slot].state = ProcState::Ready;
-                return SyscallStepOutcome::Yielded;
-            }
-            if nr == SYS_WRITE {
-                // Validate capability via `dispatch_syscall` first, then copy validated user slice.
-                match dispatch_syscall(cap_task_slot, cap_mask, SYS_WRITE, a0, 0, 0, a3, a4, a5) {
-                    Ok(_) => {
-                        let fd = a0;
-                        let len = (a2 as usize).min(PROC_STDOUT_CAP);
-                        if (fd == 1 || fd == 2) && a2 <= 4096 {
-                            let mut tmp = [0u8; PROC_STDOUT_CAP];
-                            if self.read_user_bytes(slot, a1, &mut tmp[..len], source).is_ok() {
-                                let avail = PROC_STDOUT_CAP.saturating_sub(self.procs[slot].stdout_len);
-                                let copy_n = len.min(avail);
-                                let cur = self.procs[slot].stdout_len;
-                                self.procs[slot].stdout_buf[cur..cur + copy_n]
-                                    .copy_from_slice(&tmp[..copy_n]);
-                                self.procs[slot].stdout_len += copy_n;
-                                tf.rax = len as u64;
-                            } else {
-                                tf.rax = (-14i64) as u64; // -EFAULT
-                            }
-                        } else {
-                            tf.rax = (-(Errno::EINVAL as i64)) as u64;
-                        }
-                    }
-                    Err(e) => {
-                        tf.rax = (-(e as i64)) as u64;
-                    }
-                }
-                self.procs[slot].trap_frame = tf;
-                return SyscallStepOutcome::Continue;
-            }
-            if nr == SYS_READ {
-                match dispatch_syscall(cap_task_slot, cap_mask, SYS_READ, a0, 0, 0, a3, a4, a5) {
-                    Ok(_) => {
-                        if a0 == 0 && self.procs[slot].inbox_len > 0 {
-                            let msg = self.procs[slot].inbox[0];
-                            let take = msg.len.min(a2 as usize);
-                            if self.write_user_bytes(slot, a1, &msg.data[..take], source).is_ok() {
-                                let rem = self.procs[slot].inbox_len - 1;
-                                let mut m = 0usize;
-                                while m < rem {
-                                    self.procs[slot].inbox[m] = self.procs[slot].inbox[m + 1];
-                                    m += 1;
-                                }
-                                self.procs[slot].inbox[rem] = ProcIpcMsg::empty();
-                                self.procs[slot].inbox_len = rem;
-                                tf.rax = take as u64;
-                            } else {
-                                tf.rax = (-14i64) as u64; // -EFAULT
-                            }
-                        } else {
-                            tf.rax = 0;
-                        }
-                    }
-                    Err(e) => {
-                        tf.rax = (-(e as i64)) as u64;
-                    }
-                }
-                self.procs[slot].trap_frame = tf;
-                return SyscallStepOutcome::Continue;
-            }
-
-            match dispatch_syscall(cap_task_slot, cap_mask, nr, a0, a1, a2, a3, a4, a5) {
-                Ok(v) => tf.rax = v,
-                Err(e) => tf.rax = (-(e as i64)) as u64,
-            }
-            self.procs[slot].trap_frame = tf;
-            return SyscallStepOutcome::Continue;
+            let outcome = self.handle_std_syscall(
+                slot,
+                nr,
+                a0,
+                a1,
+                a2,
+                a3,
+                a4,
+                a5,
+                tf,
+                pid,
+                cap_mask,
+                cap_task_slot,
+                monotonic_ns,
+                source,
+            );
+            let _ = crate::syscall::set_task_cap_mask(cap_task_slot, prev_cap);
+            return outcome;
         }
 
-        // 2. Process-runtime extended syscalls (`64..=67`).
+        // 2. Process-runtime extended syscalls (`64..=69`).
         match nr {
             PROC_SYS_BRK => {
                 let heap_base = self.procs[slot].vm.heap_base_va();
@@ -1472,39 +1492,215 @@ impl ProcessTable {
                     let max_len = a1 as usize;
                     let tag_out_va = a2;
                     let msg = self.procs[slot].inbox[0];
-                    let copy_n = msg.len.min(max_len);
-                    let body_ok = self
-                        .write_user_bytes(slot, ptr_va, &msg.data[..copy_n], source)
-                        .is_ok();
-                    let tag_meta =
-                        ((msg.sender_pid as u64) << 32) | (msg.tag as u64);
-                    let tag_ok = if tag_out_va == 0 {
-                        true
+                    if max_len < msg.len {
+                        tf.rax = (-90i64) as u64; // -EMSGSIZE (leave inbox[0] intact!)
                     } else {
-                        self.write_user_bytes(slot, tag_out_va, &tag_meta.to_le_bytes(), source)
-                            .is_ok()
-                    };
-                    if body_ok && tag_ok {
-                        let rem = self.procs[slot].inbox_len - 1;
-                        let mut m = 0usize;
-                        while m < rem {
-                            self.procs[slot].inbox[m] = self.procs[slot].inbox[m + 1];
-                            m += 1;
+                        let body_ok = self
+                            .write_user_bytes(slot, ptr_va, &msg.data[..msg.len], source)
+                            .is_ok();
+                        let tag_meta =
+                            ((msg.sender_pid as u64) << 32) | (msg.tag as u64);
+                        let tag_ok = if tag_out_va == 0 {
+                            true
+                        } else {
+                            self.write_user_bytes(slot, tag_out_va, &tag_meta.to_le_bytes(), source)
+                                .is_ok()
+                        };
+                        if body_ok && tag_ok {
+                            let rem = self.procs[slot].inbox_len - 1;
+                            let mut m = 0usize;
+                            while m < rem {
+                                self.procs[slot].inbox[m] = self.procs[slot].inbox[m + 1];
+                                m += 1;
+                            }
+                            self.procs[slot].inbox[rem] = ProcIpcMsg::empty();
+                            self.procs[slot].inbox_len = rem;
+                            tf.rax = msg.len as u64;
+                        } else {
+                            tf.rax = (-14i64) as u64; // -EFAULT
                         }
-                        self.procs[slot].inbox[rem] = ProcIpcMsg::empty();
-                        self.procs[slot].inbox_len = rem;
-                        tf.rax = copy_n as u64;
-                    } else {
-                        tf.rax = (-14i64) as u64; // -EFAULT
                     }
                 }
             }
             PROC_SYS_GETCPU => {
                 tf.rax = cpu_id as u64;
             }
+            PROC_SYS_SET_FS_BASE => {
+                if is_canonical_user_tls_base(a0) {
+                    self.procs[slot].user_fs_base = a0;
+                    tf.rax = 0;
+                } else {
+                    tf.rax = (-(Errno::EINVAL as i64)) as u64;
+                }
+            }
+            PROC_SYS_SET_GS_BASE => {
+                if is_canonical_user_tls_base(a0) {
+                    self.procs[slot].user_gs_base = a0;
+                    tf.rax = 0;
+                } else {
+                    tf.rax = (-(Errno::EINVAL as i64)) as u64;
+                }
+            }
             _ => {
                 tf.rax = (-(Errno::ENOSYS as i64)) as u64;
             }
+        }
+        self.procs[slot].trap_frame = tf;
+        SyscallStepOutcome::Continue
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_std_syscall<S: PageFrameSource>(
+        &mut self,
+        slot: usize,
+        nr: u64,
+        a0: u64,
+        a1: u64,
+        a2: u64,
+        a3: u64,
+        a4: u64,
+        a5: u64,
+        mut tf: UserTrapFrame,
+        pid: u32,
+        cap_mask: u64,
+        cap_task_slot: u64,
+        monotonic_ns: u64,
+        source: &mut S,
+    ) -> SyscallStepOutcome {
+        if nr == SYS_EXIT {
+            let code = a0 as i32;
+            let ipc_pa = self.procs[slot].vm.ipc_page_pa;
+            if ipc_pa != 0 {
+                let mut ipc_snap = [0u8; 16];
+                source.read_frame_bytes(ipc_pa, 0x268, &mut ipc_snap);
+                self.procs[slot].last_ipc_fnv = u64::from_le_bytes([
+                    ipc_snap[0],
+                    ipc_snap[1],
+                    ipc_snap[2],
+                    ipc_snap[3],
+                    ipc_snap[4],
+                    ipc_snap[5],
+                    ipc_snap[6],
+                    ipc_snap[7],
+                ]);
+                self.procs[slot].last_ipc_status =
+                    u32::from_le_bytes([ipc_snap[8], ipc_snap[9], ipc_snap[10], ipc_snap[11]]);
+            }
+            self.procs[slot].vm.release_all_frames(source);
+            self.procs[slot].exit_code = code;
+            self.procs[slot].state = ProcState::Exited;
+            self.total_exited = self.total_exited.wrapping_add(1);
+            return SyscallStepOutcome::Exited(code);
+        }
+        if nr == SYS_GETPID {
+            tf.rax = pid as u64;
+            self.procs[slot].trap_frame = tf;
+            return SyscallStepOutcome::Continue;
+        }
+        if nr == crate::syscall::SYS_GETTIME_NS {
+            tf.rax = monotonic_ns;
+            self.procs[slot].trap_frame = tf;
+            return SyscallStepOutcome::Continue;
+        }
+        if nr == SYS_YIELD || nr == SYS_SLEEP_MS {
+            tf.rax = 0;
+            self.procs[slot].trap_frame = tf;
+            self.procs[slot].preemptions = self.procs[slot].preemptions.wrapping_add(1);
+            self.procs[slot].state = ProcState::Ready;
+            return SyscallStepOutcome::Yielded;
+        }
+        if nr == SYS_WRITE {
+            match dispatch_syscall(cap_task_slot, cap_mask, SYS_WRITE, a0, 0, 0, a3, a4, a5) {
+                Ok(_) => {
+                    let fd = a0;
+                    if (fd == 1 || fd == 2) && a2 <= 4096 {
+                        let req_len = a2 as usize;
+                        let mut first_chunk = [0u8; PROC_STDOUT_CAP];
+                        let mut ptr_ok = true;
+                        let mut off = 0usize;
+                        let mut chk = [0u8; PROC_STDOUT_CAP];
+                        while off < req_len {
+                            let step = (req_len - off).min(PROC_STDOUT_CAP);
+                            let Some(va) = a1.checked_add(off as u64) else {
+                                ptr_ok = false;
+                                break;
+                            };
+                            if self.read_user_bytes(slot, va, &mut chk[..step], source).is_err() {
+                                ptr_ok = false;
+                                break;
+                            }
+                            if off == 0 {
+                                first_chunk[..step].copy_from_slice(&chk[..step]);
+                            }
+                            off += step;
+                        }
+                        if !ptr_ok {
+                            tf.rax = (-14i64) as u64; // -EFAULT
+                        } else if req_len == 0 {
+                            tf.rax = 0;
+                        } else {
+                            let avail =
+                                PROC_STDOUT_CAP.saturating_sub(self.procs[slot].stdout_len);
+                            if avail == 0 {
+                                tf.rax = (-28i64) as u64; // -ENOSPC (never silently discard!)
+                            } else {
+                                let copy_n = req_len.min(avail);
+                                let cur = self.procs[slot].stdout_len;
+                                self.procs[slot].stdout_buf[cur..cur + copy_n]
+                                    .copy_from_slice(&first_chunk[..copy_n]);
+                                self.procs[slot].stdout_len += copy_n;
+                                tf.rax = copy_n as u64;
+                            }
+                        }
+                    } else {
+                        tf.rax = (-(Errno::EINVAL as i64)) as u64;
+                    }
+                }
+                Err(e) => {
+                    tf.rax = (-(e as i64)) as u64;
+                }
+            }
+            self.procs[slot].trap_frame = tf;
+            return SyscallStepOutcome::Continue;
+        }
+        if nr == SYS_READ {
+            match dispatch_syscall(cap_task_slot, cap_mask, SYS_READ, a0, 0, 0, a3, a4, a5) {
+                Ok(_) => {
+                    if a0 == 0 && self.procs[slot].inbox_len > 0 {
+                        let msg = self.procs[slot].inbox[0];
+                        if (a2 as usize) < msg.len {
+                            tf.rax = (-90i64) as u64; // -EMSGSIZE (never silently truncate!)
+                        } else if self
+                            .write_user_bytes(slot, a1, &msg.data[..msg.len], source)
+                            .is_ok()
+                        {
+                            let rem = self.procs[slot].inbox_len - 1;
+                            let mut m = 0usize;
+                            while m < rem {
+                                self.procs[slot].inbox[m] = self.procs[slot].inbox[m + 1];
+                                m += 1;
+                            }
+                            self.procs[slot].inbox[rem] = ProcIpcMsg::empty();
+                            self.procs[slot].inbox_len = rem;
+                            tf.rax = msg.len as u64;
+                        } else {
+                            tf.rax = (-14i64) as u64; // -EFAULT
+                        }
+                    } else {
+                        tf.rax = 0;
+                    }
+                }
+                Err(e) => {
+                    tf.rax = (-(e as i64)) as u64;
+                }
+            }
+            self.procs[slot].trap_frame = tf;
+            return SyscallStepOutcome::Continue;
+        }
+
+        match dispatch_syscall(cap_task_slot, cap_mask, nr, a0, a1, a2, a3, a4, a5) {
+            Ok(v) => tf.rax = v,
+            Err(e) => tf.rax = (-(e as i64)) as u64,
         }
         self.procs[slot].trap_frame = tf;
         SyscallStepOutcome::Continue
@@ -1537,6 +1733,12 @@ pub enum ElfProgramKind {
     FaultStackGuard,
     /// Deliberate Ring-3 privileged `cli` (`0xFA`, `#GP` vector `13` test).
     FaultPrivCli,
+    /// Hostile `RFLAGS.NT = 1` + `0F 05` `SYSCALL` (`SYS_YIELD`) + per-process `XMM0` & `FS_BASE`
+    /// isolation test (`SYS_EXIT(55)` on exact match, `SYS_EXIT(91)` on any cross-process leak or `NT` leak).
+    HostileSyscallNtAndSimd {
+        /// Unique 64-bit canary loaded into `XMM0` and `[fs:0]` (`.data` TLS slot) before yielding.
+        token: u64,
+    },
 }
 
 /// Synthesize a valid 64-bit x86-64 multi-segment `ET_DYN` ELF64 image (`<= 2048` file bytes,
@@ -1721,6 +1923,105 @@ pub fn build_elf64_program(
         }
         ElfProgramKind::FaultPrivCli => {
             text[c] = 0xFA; // cli at CPL=3 -> #GP (vec 13)
+        }
+        ElfProgramKind::HostileSyscallNtAndSimd { token } => {
+            // 1. `lea r12, [rip -> 0x3000]` (`.data` TLS slot); `movabs r13, token`; `mov [r12], r13`.
+            let disp_data = (0x2000i32 - ((c + 7) as i32)).to_le_bytes();
+            text[c..c + 7].copy_from_slice(&[
+                0x4C,
+                0x8D,
+                0x25,
+                disp_data[0],
+                disp_data[1],
+                disp_data[2],
+                disp_data[3],
+            ]);
+            c += 7;
+            let tok_b = token.to_le_bytes();
+            text[c..c + 10].copy_from_slice(&[
+                0x49, 0xBD, tok_b[0], tok_b[1], tok_b[2], tok_b[3], tok_b[4], tok_b[5], tok_b[6],
+                tok_b[7],
+            ]);
+            c += 10;
+            text[c..c + 4].copy_from_slice(&[0x4D, 0x89, 0x2C, 0x24]); // mov [r12], r13
+            c += 4;
+
+            // 2. `PROC_SYS_SET_FS_BASE (68)` with `rdi = r12` via `0F 05` `SYSCALL`.
+            text[c..c + 13].copy_from_slice(&[
+                0x4C, 0x89, 0xE7, // mov rdi, r12
+                0xB8, 0x44, 0x00, 0x00, 0x00, // mov eax, 68 (PROC_SYS_SET_FS_BASE)
+                0x0F, 0x05, // syscall
+                0x48, 0x85, 0xC0, // test rax, rax
+            ]);
+            c += 13;
+            let jnz1 = c;
+            text[c..c + 2].copy_from_slice(&[0x75, 0x00]); // jnz fail
+            c += 2;
+
+            // 3. Load `xmm0 = r13` (`mov rax, r13; movq xmm0, rax`).
+            text[c..c + 8].copy_from_slice(&[
+                0x4C, 0x89, 0xE8, // mov rax, r13
+                0x66, 0x48, 0x0F, 0x6E, 0xC0, // movq xmm0, rax
+            ]);
+            c += 8;
+
+            // 4. Set hostile `RFLAGS.NT (0x4000)` in Ring-3 and execute `SYSCALL` (`SYS_YIELD = 10`)!
+            text[c..c + 17].copy_from_slice(&[
+                0x9C, // pushfq
+                0x48, 0x81, 0x0C, 0x24, 0x00, 0x40, 0x00, 0x00, // or qword ptr [rsp], 0x4000
+                0x9D, // popfq
+                0xB8, 0x0A, 0x00, 0x00, 0x00, // mov eax, 10 (SYS_YIELD)
+                0x0F, 0x05, // syscall
+            ]);
+            c += 17;
+
+            // 5. After resuming across another process's quantum:
+            //    (a) `RFLAGS.NT` must have been cleared by `sanitize_user_rflags`.
+            text[c..c + 7].copy_from_slice(&[
+                0x9C, // pushfq
+                0x58, // pop rax
+                0xA9, 0x00, 0x40, 0x00, 0x00, // test eax, 0x4000
+            ]);
+            c += 7;
+            let jnz2 = c;
+            text[c..c + 2].copy_from_slice(&[0x75, 0x00]); // jnz fail
+            c += 2;
+
+            //    (b) `xmm0` must still equal `r13`!
+            text[c..c + 8].copy_from_slice(&[
+                0x66, 0x48, 0x0F, 0x7E, 0xC0, // movq rax, xmm0
+                0x4C, 0x39, 0xE8, // cmp rax, r13
+            ]);
+            c += 8;
+            let jne3 = c;
+            text[c..c + 2].copy_from_slice(&[0x75, 0x00]); // jne fail
+            c += 2;
+
+            //    (c) `qword ptr fs:[0]` (`fs:[rbx]` with `rbx = 0`) must still equal `r13`!
+            text[c..c + 9].copy_from_slice(&[
+                0x31, 0xDB, // xor ebx, ebx
+                0x64, 0x48, 0x8B, 0x03, // mov rax, qword ptr fs:[rbx]
+                0x4C, 0x39, 0xE8, // cmp rax, r13
+            ]);
+            c += 9;
+            let jne4 = c;
+            text[c..c + 2].copy_from_slice(&[0x75, 0x00]); // jne fail
+            c += 2;
+
+            //    (d) `SYS_EXIT(55)` on full success; `SYS_EXIT(91)` on any failure!
+            text[c..c + 7].copy_from_slice(&[
+                0xBF, 0x37, 0x00, 0x00, 0x00, // mov edi, 55
+                0xEB, 0x05, // jmp do_exit (+5)
+            ]);
+            c += 7;
+            let fail_pos = c;
+            text[c..c + 5].copy_from_slice(&[0xBF, 0x5B, 0x00, 0x00, 0x00]); // mov edi, 91
+            c += 5;
+            text[c..c + 4].copy_from_slice(&[0x31, 0xC0, 0x0F, 0x05]); // xor eax, eax; syscall
+
+            for br in [jnz1, jnz2, jne3, jne4] {
+                text[br + 1] = ((fail_pos as isize) - ((br + 2) as isize)) as i8 as u8;
+            }
         }
     }
 
@@ -2213,6 +2514,197 @@ mod tests {
         assert_eq!(table.procs[slot].last_ipc_fnv, expected_fnv);
         assert_eq!(table.procs[slot].last_ipc_status, 1);
         assert_eq!(arena.allocated_count(), 0);
+    }
+
+    #[test]
+    fn per_process_fxsave_and_fs_gs_base_isolate_simd_and_tls_registers() {
+        let mut arena = HostFrameArena::new(128);
+        let mut table = ProcessTable::new();
+        let mut elf = [0u8; 2048];
+        let n = build_elf64_program(
+            ElfProgramKind::CpuBoundWorker { iterations: 4 },
+            1,
+            &mut elf,
+        );
+        let (_pid_a, slot_a) = table
+            .spawn_elf64(&elf[..n], CAP_ALL, 1, None, &mut arena)
+            .unwrap();
+        let (_pid_b, slot_b) = table
+            .spawn_elf64(&elf[..n], CAP_ALL, 2, None, &mut arena)
+            .unwrap();
+
+        // Newly spawned processes start with clean FCW=0x037F, MXCSR=0x1F80, zeroed XMM, and FS/GS=0.
+        let (init_fx_a, init_fs_a, init_gs_a) = table.load_arch_ext_state(slot_a);
+        assert_eq!(init_fx_a, FxSaveArea::clean_user_default());
+        assert_eq!((init_fs_a, init_gs_a), (0, 0));
+
+        // Non-canonical or higher-half kernel addresses are rejected with -EINVAL (-22) on PROC_SYS_SET_FS_BASE/GS_BASE.
+        let mut tf_bad = table.procs[slot_a].trap_frame;
+        tf_bad.rax = PROC_SYS_SET_FS_BASE;
+        tf_bad.rdi = 0xFFFF_8000_0000_0000;
+        let _ = table.handle_syscall(slot_a, tf_bad, 0, 100, &mut arena);
+        assert_eq!(table.procs[slot_a].trap_frame.rax, (-22i64) as u64);
+
+        // Valid canonical TLS base set via PROC_SYS_SET_FS_BASE / PROC_SYS_SET_GS_BASE succeeds for A and B independently.
+        let tls_a = table.procs[slot_a].vm.base_va + 0x3000;
+        let gs_a = table.procs[slot_a].vm.base_va + 0x3040;
+        let mut tf_a = table.procs[slot_a].trap_frame;
+        tf_a.rax = PROC_SYS_SET_FS_BASE;
+        tf_a.rdi = tls_a;
+        let _ = table.handle_syscall(slot_a, tf_a, 0, 101, &mut arena);
+        assert_eq!(table.procs[slot_a].trap_frame.rax, 0);
+        tf_a = table.procs[slot_a].trap_frame;
+        tf_a.rax = PROC_SYS_SET_GS_BASE;
+        tf_a.rdi = gs_a;
+        let _ = table.handle_syscall(slot_a, tf_a, 0, 102, &mut arena);
+        assert_eq!(table.procs[slot_a].trap_frame.rax, 0);
+
+        // Save distinct XMM0 payloads (`bytes[160..176]`) for A and B, verify B never clobbers A!
+        let (_, fs_a_now, gs_a_now) = table.load_arch_ext_state(slot_a);
+        let mut fx_a = FxSaveArea::clean_user_default();
+        fx_a.bytes[160..168].copy_from_slice(&0xA111_2222_3333_4444u64.to_le_bytes());
+        table.save_arch_ext_state(slot_a, &fx_a, fs_a_now, gs_a_now);
+
+        let tls_b = table.procs[slot_b].vm.base_va + 0x3008;
+        let mut fx_b = FxSaveArea::clean_user_default();
+        fx_b.bytes[160..168].copy_from_slice(&0xB555_6666_7777_8888u64.to_le_bytes());
+        table.save_arch_ext_state(slot_b, &fx_b, tls_b, 0);
+
+        let (got_fx_a, got_fs_a, got_gs_a) = table.load_arch_ext_state(slot_a);
+        let (got_fx_b, got_fs_b, got_gs_b) = table.load_arch_ext_state(slot_b);
+        assert_eq!(&got_fx_a.bytes[160..168], &0xA111_2222_3333_4444u64.to_le_bytes());
+        assert_eq!((got_fs_a, got_gs_a), (tls_a, gs_a));
+        assert_eq!(&got_fx_b.bytes[160..168], &0xB555_6666_7777_8888u64.to_le_bytes());
+        assert_eq!((got_fs_b, got_gs_b), (tls_b, 0));
+    }
+
+    #[test]
+    fn sys_write_and_ipc_recv_never_silently_truncate_and_restore_shared_cap_slot() {
+        let mut arena = HostFrameArena::new(128);
+        let mut table = ProcessTable::new();
+        let mut elf = [0u8; 2048];
+        let n = build_elf64_program(
+            ElfProgramKind::CpuBoundWorker { iterations: 2 },
+            3,
+            &mut elf,
+        );
+        let (pid_a, slot_a) = table
+            .spawn_elf64(&elf[..n], SVC_CAP_IPC, 3, None, &mut arena)
+            .unwrap();
+        let (pid_b, slot_b) = table
+            .spawn_elf64(&elf[..n], SVC_CAP_IPC, 4, None, &mut arena)
+            .unwrap();
+        let _ = pid_a;
+
+        // 1. Pre-populate shared `RUNTIME_CAP_TABLE[slot_a]` with a sentinel mask (`0xDEAD_BEEF`)
+        //    and verify `handle_syscall` restores it on exit!
+        let cap_slot = (slot_a % crate::syscall::CAP_TABLE_TASKS) as u64;
+        crate::syscall::set_task_cap_mask(cap_slot, 0xDEAD_BEEF).unwrap();
+        let mut tf = table.procs[slot_a].trap_frame;
+        tf.rax = SYS_GETPID;
+        let _ = table.handle_syscall(slot_a, tf, 0, 1_000, &mut arena);
+        assert_eq!(
+            crate::syscall::get_task_cap_mask(cap_slot).unwrap(),
+            0xDEAD_BEEF,
+            "handle_syscall must restore RUNTIME_CAP_TABLE[cap_task_slot] before returning"
+        );
+
+        // 2. `SYS_WRITE`: write 250 bytes first, then attempt 20 more bytes into 256-byte stdout_buf:
+        //    must return actual captured length (`6`, never `20`!) and `-ENOSPC` (`-28`) once full!
+        let data_va_a = table.procs[slot_a].vm.base_va + 0x3000;
+        table
+            .write_user_bytes(slot_a, data_va_a, &[b'X'; 260], &mut arena)
+            .unwrap();
+        tf = table.procs[slot_a].trap_frame;
+        tf.rax = SYS_WRITE;
+        tf.rdi = 1;
+        tf.rsi = data_va_a;
+        tf.rdx = 250;
+        let _ = table.handle_syscall(slot_a, tf, 0, 1_001, &mut arena);
+        assert_eq!(table.procs[slot_a].trap_frame.rax, 250);
+
+        tf = table.procs[slot_a].trap_frame;
+        tf.rax = SYS_WRITE;
+        tf.rdi = 1;
+        tf.rsi = data_va_a;
+        tf.rdx = 20;
+        let _ = table.handle_syscall(slot_a, tf, 0, 1_002, &mut arena);
+        assert_eq!(
+            table.procs[slot_a].trap_frame.rax, 6,
+            "SYS_WRITE must report actual bytes captured (6), never claim 20 on partial capture"
+        );
+
+        tf = table.procs[slot_a].trap_frame;
+        tf.rax = SYS_WRITE;
+        tf.rdi = 1;
+        tf.rsi = data_va_a;
+        tf.rdx = 8;
+        let _ = table.handle_syscall(slot_a, tf, 0, 1_003, &mut arena);
+        assert_eq!(
+            table.procs[slot_a].trap_frame.rax,
+            (-28i64) as u64,
+            "SYS_WRITE on full stdout_buf must refuse with -ENOSPC (-28), never silently drop bytes"
+        );
+
+        // 3. `PROC_SYS_IPC_RECV` & `SYS_READ`: receiving a 32-byte message into an 8-byte buffer
+        //    must return `-EMSGSIZE` (`-90`) WITHOUT dequeuing `inbox[0]`!
+        let msg32 = [b'M'; 32];
+        table
+            .write_user_bytes(slot_a, data_va_a, &msg32, &mut arena)
+            .unwrap();
+        tf = table.procs[slot_a].trap_frame;
+        tf.rax = PROC_SYS_IPC_SEND;
+        tf.rdi = pid_b as u64;
+        tf.rsi = 0x77;
+        tf.rdx = data_va_a;
+        tf.r10 = 32;
+        let _ = table.handle_syscall(slot_a, tf, 0, 1_004, &mut arena);
+        assert_eq!(table.procs[slot_a].trap_frame.rax, 32);
+
+        let rx_va_b = table.procs[slot_b].vm.base_va + 0x3040;
+        let mut tf_b = table.procs[slot_b].trap_frame;
+        tf_b.rax = PROC_SYS_IPC_RECV;
+        tf_b.rdi = rx_va_b;
+        tf_b.rsi = 8; // too small for 32-byte message!
+        tf_b.rdx = 0;
+        let _ = table.handle_syscall(slot_b, tf_b, 0, 1_005, &mut arena);
+        assert_eq!(
+            table.procs[slot_b].trap_frame.rax,
+            (-90i64) as u64,
+            "PROC_SYS_IPC_RECV with undersized buffer must fail with -EMSGSIZE (-90)"
+        );
+        assert_eq!(
+            table.procs[slot_b].inbox_len, 1,
+            "undersized PROC_SYS_IPC_RECV must leave message intact in inbox"
+        );
+
+        tf_b = table.procs[slot_b].trap_frame;
+        tf_b.rax = SYS_READ;
+        tf_b.rdi = 0;
+        tf_b.rsi = rx_va_b;
+        tf_b.rdx = 8; // also too small on SYS_READ(0)!
+        let _ = table.handle_syscall(slot_b, tf_b, 0, 1_006, &mut arena);
+        assert_eq!(
+            table.procs[slot_b].trap_frame.rax,
+            (-90i64) as u64,
+            "SYS_READ(0) with undersized buffer must fail with -EMSGSIZE (-90)"
+        );
+        assert_eq!(table.procs[slot_b].inbox_len, 1);
+
+        // Full 32-byte receive succeeds with zero lost bytes!
+        tf_b = table.procs[slot_b].trap_frame;
+        tf_b.rax = PROC_SYS_IPC_RECV;
+        tf_b.rdi = rx_va_b;
+        tf_b.rsi = 32;
+        tf_b.rdx = 0;
+        let _ = table.handle_syscall(slot_b, tf_b, 0, 1_007, &mut arena);
+        assert_eq!(table.procs[slot_b].trap_frame.rax, 32);
+        assert_eq!(table.procs[slot_b].inbox_len, 0);
+        let mut got = [0u8; 32];
+        table
+            .read_user_bytes(slot_b, rx_va_b, &mut got, &mut arena)
+            .unwrap();
+        assert_eq!(got, msg32);
     }
 }
 

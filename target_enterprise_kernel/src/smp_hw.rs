@@ -1912,9 +1912,13 @@ unsafe fn init_runtime_idt_and_isrs() {
         while cpu < MAX_SMP_CPUS {
             let (_, _, rsp0_top) = guarded_ap_stack_bounds_va(cpu);
             let (_, _, ist1_top) = guarded_ist1_bounds_va(cpu);
-            let (_, _, ist2_top) = guarded_ist2_bounds_va(cpu);
-            let mut tss = Tss64::with_stacks(rsp0_top - 16, ist1_top - 16);
-            tss.ist[1] = ist2_top - 16;
+            let (_, ist2_base, ist2_top) = guarded_ist2_bounds_va(cpu);
+            let tss = Tss64::with_ist_stacks(
+                rsp0_top - 16,
+                ist1_top - 16,
+                ist2_base + 2048 - 16,
+                ist2_top - 16,
+            );
             let tss_bytes = tss.to_bytes();
             let tss_phys = RUNTIME_TSS_BASE_PHYS + (cpu as u64) * 0x80;
             let tss_dst = pa_to_va(tss_phys);
@@ -1943,7 +1947,7 @@ unsafe fn init_runtime_idt_and_isrs() {
             } else if v == 8 {
                 (isr_exc_stubs_base_va + (v as u64) * 16, 1u8)
             } else if v == 18 {
-                (isr_exc_stubs_base_va + (v as u64) * 16, 2u8)
+                (isr_exc_stubs_base_va + (v as u64) * 16, 3u8)
             } else if v < 0x20 {
                 (isr_exc_stubs_base_va + (v as u64) * 16, 0u8)
             } else if v == 0xFF {

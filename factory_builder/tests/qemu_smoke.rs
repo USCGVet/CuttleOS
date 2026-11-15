@@ -290,6 +290,11 @@ fn boots_under_qemu_and_emits_banner() {
         "QEMU smoke: expected OS_ARMOR tlb_ipi=3 vtd_slpt=ok ap_crypto=3 ioapic=1 vtd_drhd=ok!\nSerial log:\n{}",
         log_contents
     );
+    assert!(
+        log_contents.contains("nt_fmask=1 simd_fsgs=2 timeout_reap=1 ist23=1"),
+        "QEMU smoke: expected RING3_ELF_MP nt_fmask=1 simd_fsgs=2 timeout_reap=1 ist23=1!\nSerial log:\n{}",
+        log_contents
+    );
     {
         let ahci_bytes = std::fs::read(&ahci_disk).expect("read ahci_hw.img after boot 1");
         let commit_off = 1149 * 512;

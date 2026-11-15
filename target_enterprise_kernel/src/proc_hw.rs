@@ -15,8 +15,8 @@ use target_enterprise::interrupts::{
 use target_enterprise::phys_mm::PageFrameSource;
 use target_enterprise::proc_vm::{
     build_elf64_from_mailbox_worker, build_elf64_program, expected_cpu_worker_exit_code,
-    ElfProgramKind, ProcAddressSpace, ProcError, ProcFaultInfo, ProcState, ProcessTable,
-    SyscallStepOutcome, UserTrapFrame, MAX_PROCS,
+    ElfProgramKind, FxSaveArea, ProcAddressSpace, ProcError, ProcFaultInfo, ProcState,
+    ProcessTable, SyscallStepOutcome, UserTrapFrame, MAX_PROCS,
 };
 use target_enterprise::svc_runtime::{Ring3MailboxHwVerdict, ServiceId, SVC_CAP_IPC};
 
@@ -44,6 +44,7 @@ const MSR_IA32_EFER: u32 = 0xC000_0080;
 const MSR_IA32_STAR: u32 = 0xC000_0081;
 const MSR_IA32_LSTAR: u32 = 0xC000_0082;
 const MSR_IA32_FMASK: u32 = 0xC000_0084;
+const MSR_IA32_FS_BASE: u32 = 0xC000_0100;
 const MSR_IA32_GS_BASE: u32 = 0xC000_0101;
 const MSR_IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
@@ -321,8 +322,8 @@ fn build_trampoline_page(out: &mut [u8; 4096]) {
     out[p..p + 3].copy_from_slice(&[0x0F, 0x20, 0xD9]); // mov rcx, cr3
     p += 3;
     emit_store_to_rax(out, &mut p, REG_RCX, offset_of!(ProcBridgeState, kernel_cr3));
-    // lea rsp, [rax + 0x800] (rsp0_top = sup_rw_va + 0xA00)
-    out[p..p + 7].copy_from_slice(&[0x48, 0x8D, 0xA0, 0x00, 0x08, 0x00, 0x00]);
+    // lea rsp, [rax + 0x400] (rsp0_top = sup_rw_va + 0x600)
+    out[p..p + 7].copy_from_slice(&[0x48, 0x8D, 0xA0, 0x00, 0x04, 0x00, 0x00]);
     p += 7;
     emit_load_from_rax(out, &mut p, REG_RCX, offset_of!(ProcBridgeState, user_cr3));
     out[p..p + 3].copy_from_slice(&[0x0F, 0x22, 0xD9]); // mov cr3, rcx
@@ -400,9 +401,9 @@ fn build_trampoline_page(out: &mut [u8; 4096]) {
     emit_lea_rax_state(out, &mut p);
     out[p..p + 4].copy_from_slice(&[0x0F, 0x01, 0xF8, 0xFC]); // swapgs (restore GS); cld
     p += 4;
-    // Save untrusted user RSP without dereferencing it, then pivot to supervisor stack `[rax + 0xE00]`!
+    // Save untrusted user RSP without dereferencing it, then pivot to supervisor stack `[rax + 0x680]` (`sup_rw_va + 0x880`)!
     emit_store_to_rax(out, &mut p, REG_RSP, tf_base + offset_of!(UserTrapFrame, rsp));
-    out[p..p + 7].copy_from_slice(&[0x48, 0x8D, 0xA0, 0x00, 0x0E, 0x00, 0x00]); // lea rsp, [rax + 0xE00]
+    out[p..p + 7].copy_from_slice(&[0x48, 0x8D, 0xA0, 0x80, 0x06, 0x00, 0x00]); // lea rsp, [rax + 0x680]
     p += 7;
     emit_store_non_rax_gprs(out, &mut p);
     // Hardware `syscall` placed next RIP in `rcx` and RFLAGS in `r11`.
@@ -527,16 +528,20 @@ pub(crate) fn run_next_ready_process_quantum(
         return None;
     }
 
-    // 1. Claim next `Ready` process slot under `KERNEL_PROC_TABLE` (no nested locks!).
-    let claimed: Option<(usize, u32, ProcAddressSpace, UserTrapFrame)> =
+    // 1. Claim next `Ready` process slot and snapshot its per-process `FXSAVE64` + `FS_BASE`/`GS_BASE`
+    //    state under `KERNEL_PROC_TABLE` (no nested locks!).
+    let mut proc_fx = FxSaveArea::clean_user_default();
+    let mut kern_fx = FxSaveArea::clean_user_default();
+    let claimed: Option<(usize, u32, ProcAddressSpace, UserTrapFrame, u64, u64)> =
         with_proc_table_lock(|table| {
             let slot = table.claim_next_ready(cpu_id)?;
             let pid = table.procs[slot].pid;
             let vm = table.procs[slot].vm;
             let tf = table.procs[slot].trap_frame;
-            Some((slot, pid, vm, tf))
+            let (user_fs, user_gs) = table.load_arch_ext_state_into(slot, &mut proc_fx);
+            Some((slot, pid, vm, tf, user_fs, user_gs))
         });
-    let (slot, pid, vm, initial_tf) = claimed?;
+    let (slot, pid, vm, initial_tf, user_fs_base, user_gs_base) = claimed?;
 
     // SAFETY: Running at CPL=0; ensure CPU protections and Local APIC MMIO page are mapped.
     unsafe {
@@ -555,8 +560,10 @@ pub(crate) fn run_next_ready_process_quantum(
     let gdtr_orig_va = sup_rw_va + 0x060;
     let idtr_orig_va = sup_rw_va + 0x070;
     let tss_va = sup_rw_va + 0x100;
-    let rsp0_top = sup_rw_va + 0xA00;
-    let ist1_top = sup_rw_va + 0xE00;
+    let rsp0_top = sup_rw_va + 0x600;
+    let ist1_top = sup_rw_va + 0xB00;
+    let ist2_top = sup_rw_va + 0xD80;
+    let ist3_top = sup_rw_va + 0x1000;
 
     {
         // SAFETY: `vm.tramp_pa` is an exclusive 4 KiB frame mapped in `PHYS_MAP_OFFSET` and owned
@@ -576,7 +583,12 @@ pub(crate) fn run_next_ready_process_quantum(
             let entries_ptr = idt_dst.cast::<IdtEntry>();
             let mut exc_v = 0u8;
             while exc_v < 32 {
-                let ist = if exc_v == 8 { 1 } else { 0 };
+                let ist = match exc_v {
+                    8 => 1,
+                    2 => 2,
+                    18 => 3,
+                    _ => 0,
+                };
                 core::ptr::write_unaligned(
                     entries_ptr.add(exc_v as usize),
                     IdtEntry::new(
@@ -639,7 +651,7 @@ pub(crate) fn run_next_ready_process_quantum(
     }
 
     {
-        let tss = Tss64::with_stacks(rsp0_top, ist1_top);
+        let tss = Tss64::with_ist_stacks(rsp0_top, ist1_top, ist2_top, ist3_top);
         let tss_bytes = tss.to_bytes();
         let gdt = Gdt::new_full(tss_va, (TSS64_LEN - 1) as u32);
         let gdt_bytes = gdt.to_table_bytes();
@@ -707,8 +719,11 @@ pub(crate) fn run_next_ready_process_quantum(
     let orig_star: u64;
     let orig_lstar: u64;
     let orig_fmask: u64;
+    let orig_fs_base: u64;
     let orig_gs_base: u64;
     let orig_kgs_base: u64;
+    let post_user_fs: u64;
+    let post_user_gs: u64;
     let saved_tpr: u32;
     let saved_lvt_timer: u32;
     let saved_timer_init: u32;
@@ -727,6 +742,7 @@ pub(crate) fn run_next_ready_process_quantum(
         orig_star = rdmsr(MSR_IA32_STAR);
         orig_lstar = rdmsr(MSR_IA32_LSTAR);
         orig_fmask = rdmsr(MSR_IA32_FMASK);
+        orig_fs_base = rdmsr(MSR_IA32_FS_BASE);
         orig_gs_base = rdmsr(MSR_IA32_GS_BASE);
         orig_kgs_base = rdmsr(MSR_IA32_KERNEL_GS_BASE);
 
@@ -734,8 +750,22 @@ pub(crate) fn run_next_ready_process_quantum(
         wrmsr(MSR_IA32_STAR, SYSCALL_STAR_VAL);
         wrmsr(MSR_IA32_LSTAR, tramp_va + 0x200);
         wrmsr(MSR_IA32_FMASK, SYSCALL_FMASK_VAL);
-        wrmsr(MSR_IA32_GS_BASE, 0);
+        wrmsr(MSR_IA32_FS_BASE, user_fs_base);
+        wrmsr(MSR_IA32_GS_BASE, user_gs_base);
         wrmsr(MSR_IA32_KERNEL_GS_BASE, state_va);
+
+        // Save supervisor x87/SSE state (`FXSAVE64 [rdi]`) and load this process's sanitized
+        // `FxSaveArea` (`FXRSTOR64 [rdi]`) before entering Ring-3.
+        asm!(
+            ".byte 0x48, 0x0f, 0xae, 0x07",
+            in("rdi") kern_fx.bytes.as_mut_ptr(),
+            options(nostack, preserves_flags),
+        );
+        asm!(
+            ".byte 0x48, 0x0f, 0xae, 0x0f",
+            in("rdi") proc_fx.bytes.as_ptr(),
+            options(nostack, preserves_flags),
+        );
 
         saved_tpr = crate::mmio_read32(LAPIC_BASE + LAPIC_TPR_OFF);
         saved_lvt_timer = crate::mmio_read32(LAPIC_BASE + LAPIC_LVT_TIMER_OFF);
@@ -814,6 +844,21 @@ pub(crate) fn run_next_ready_process_quantum(
             clobber_abi("C"),
         );
 
+        // Snapshot this process's x87/SSE state (`FXSAVE64 [rdi]`) + `FS_BASE`/`GS_BASE` and restore
+        // supervisor x87/SSE state (`FXRSTOR64 [rdi]`) before releasing `cli`!
+        asm!(
+            ".byte 0x48, 0x0f, 0xae, 0x07",
+            in("rdi") proc_fx.bytes.as_mut_ptr(),
+            options(nostack, preserves_flags),
+        );
+        asm!(
+            ".byte 0x48, 0x0f, 0xae, 0x0f",
+            in("rdi") kern_fx.bytes.as_ptr(),
+            options(nostack, preserves_flags),
+        );
+        post_user_fs = rdmsr(MSR_IA32_FS_BASE);
+        post_user_gs = rdmsr(MSR_IA32_GS_BASE);
+
         // Disarm `0x50` preemption timer, drain/EOI any in-service APIC ISR vector (`0x20..=0xFF`),
         // and restore Local APIC + per-CPU runtime TSS + MSRs!
         crate::mmio_write32(
@@ -842,6 +887,7 @@ pub(crate) fn run_next_ready_process_quantum(
 
         crate::smp_hw::restore_cpu_runtime_tss_if_active(cpu_id as usize);
 
+        wrmsr(MSR_IA32_FS_BASE, orig_fs_base);
         wrmsr(MSR_IA32_GS_BASE, orig_gs_base);
         wrmsr(MSR_IA32_KERNEL_GS_BASE, orig_kgs_base);
         wrmsr(MSR_IA32_FMASK, orig_fmask);
@@ -883,6 +929,23 @@ pub(crate) fn run_next_ready_process_quantum(
 
     TOTAL_HW_QUANTA.fetch_add(1, Ordering::Relaxed);
 
+    // Hardware NMI (#2), Machine Check (#18), or any exception whose saved `CS` is not the
+    // Ring-3 user code selector (`USER_CODE_SEL`) is a fatal platform / kernel fault, never
+    // a user process fault — route straight to forensic crash containment instead of charging `slot`!
+    if bridge_out.exit_reason != EXIT_REASON_SYSCALL
+        && bridge_out.exit_reason != EXIT_REASON_PREEMPT
+    {
+        if bridge_out.fault_vec == 2 {
+            panic!("PROC_HW: hardware NMI (#2) interrupted Ring-3 quantum");
+        }
+        if bridge_out.fault_vec == 18 {
+            panic!("PROC_HW: hardware Machine Check (#18) interrupted Ring-3 quantum");
+        }
+        if (bridge_out.fault_cs as u16) != USER_CODE_SEL {
+            panic!("PROC_HW: supervisor-mode CPU exception (CS != USER_CODE_SEL) during Ring-3 quantum");
+        }
+    }
+
     // Verify KPTI hardware `CR3` isolation held during the entire Ring-3 quantum!
     if (bridge_out.observed_cr3 & PTE_ADDR_MASK) != vm.user_pml4_pa {
         panic!("PROC_HW: Ring-3 quantum did not execute under isolated user_pml4 CR3");
@@ -892,6 +955,9 @@ pub(crate) fn run_next_ready_process_quantum(
 
     // 6. Commit exit outcome (`Syscall`, `PreemptTimer`, or `CpuFault`) under `KERNEL_PROC_TABLE`.
     let res = with_proc_table_lock(|table| {
+        // Persist `FXSAVE64` + pre-syscall `FS_BASE`/`GS_BASE` BEFORE `handle_syscall` so
+        // `PROC_SYS_SET_FS_BASE` / `PROC_SYS_SET_GS_BASE` updates win cleanly!
+        table.save_arch_ext_state(slot, &proc_fx, post_user_fs, post_user_gs);
         let mut src = KernelPageFrameSource;
         match bridge_out.exit_reason {
             EXIT_REASON_SYSCALL => {
@@ -1139,6 +1205,14 @@ pub(crate) fn exec_service_elf64_mailbox_live(
         let st = table.procs[slot].state;
         let ipc_st = table.procs[slot].last_ipc_status;
         let ipc_fnv = table.procs[slot].last_ipc_fnv;
+        // Reap any timed-out worker still `Ready` or `Running` after 32 quanta so neither its
+        // slot nor its physical frames leak into `KERNEL_PROC_TABLE`!
+        if !matches!(st, ProcState::Exited | ProcState::Faulted | ProcState::Unused) {
+            let mut src = KernelPageFrameSource;
+            table.procs[slot].vm.release_all_frames(&mut src);
+            table.procs[slot].state = ProcState::Faulted;
+            table.total_faulted_reaped = table.total_faulted_reaped.wrapping_add(1);
+        }
         table.free_reaped_slot(slot);
         (st, ipc_st, ipc_fnv)
     });
@@ -1382,7 +1456,86 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
         t.free_reaped_slot(rslot);
     });
 
-    // ---- Phase 4: Verify 100% physical frame conservation (0 leaked frames across 11 processes!) ----
+    // ---- Phase 3b: Hostile `RFLAGS.NT = 1` + `0F 05` `SYSCALL`, per-process `XMM0` & `FS_BASE`
+    //                isolation, timed-out service worker reaping, and dedicated `IST2`/`IST3` check ----
+    {
+        let mut elf_a = [0u8; 2048];
+        let mut elf_b = [0u8; 2048];
+        let n_a = build_elf64_program(
+            ElfProgramKind::HostileSyscallNtAndSimd {
+                token: 0xA111_2222_3333_4444,
+            },
+            0xDEAD_A111,
+            &mut elf_a,
+        );
+        let n_b = build_elf64_program(
+            ElfProgramKind::HostileSyscallNtAndSimd {
+                token: 0xB555_6666_7777_8888,
+            },
+            0xDEAD_B222,
+            &mut elf_b,
+        );
+        let (slot_a, slot_b) = with_proc_table_lock(|t| {
+            let mut src = KernelPageFrameSource;
+            let (_, sa) = t
+                .spawn_elf64(&elf_a[..n_a], u64::MAX, 0xDEAD_A111, None, &mut src)
+                .expect("RING3_ELF_MP: spawn HostileSyscallNtAndSimd A");
+            let (_, sb) = t
+                .spawn_elf64(&elf_b[..n_b], u64::MAX, 0xDEAD_B222, None, &mut src)
+                .expect("RING3_ELF_MP: spawn HostileSyscallNtAndSimd B");
+            t.procs[sa].cpu_affinity_mask = 0x01;
+            t.procs[sb].cpu_affinity_mask = 0x01;
+            (sa, sb)
+        });
+        let mut nt_steps = 0usize;
+        while nt_steps < 64 {
+            let done = with_proc_table_lock(|t| {
+                t.procs[slot_a].state == ProcState::Exited
+                    && t.procs[slot_b].state == ProcState::Exited
+            });
+            if done {
+                break;
+            }
+            let _ = run_next_ready_process_quantum(0, 20_000_000);
+            nt_steps += 1;
+        }
+        with_proc_table_lock(|t| {
+            if t.procs[slot_a].state != ProcState::Exited
+                || t.procs[slot_b].state != ProcState::Exited
+                || t.procs[slot_a].exit_code != 55
+                || t.procs[slot_b].exit_code != 55
+            {
+                panic!("RING3_ELF_MP: HostileSyscallNtAndSimd failed (NT leak or XMM0/FS_BASE bleed)");
+            }
+            t.free_reaped_slot(slot_a);
+            t.free_reaped_slot(slot_b);
+        });
+
+        // Timed-out `SYS_YIELD` loop (`mov eax, 10; syscall; jmp -9`) exceeding 32 quanta must be
+        // cleanly reaped by `exec_service_elf64_mailbox_live` with zero leaked slots or frames!
+        let timeout_verdict = exec_service_elf64_mailbox_live(
+            ServiceId::Http,
+            &[0xB8, 0x0A, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xF7],
+            0xDEAD_7777,
+            false,
+            b"/spin",
+            b"x",
+            0,
+        );
+        if timeout_verdict != Ring3MailboxHwVerdict::FaultedOrPreempted {
+            panic!("RING3_ELF_MP: timed-out service worker did not return FaultedOrPreempted");
+        }
+
+        let tss_chk = Tss64::with_ist_stacks(0x1600, 0x1B00, 0x1D80, 0x2000).to_bytes();
+        let ist1_enc = u64::from_le_bytes(tss_chk[36..44].try_into().unwrap());
+        let ist2_enc = u64::from_le_bytes(tss_chk[44..52].try_into().unwrap());
+        let ist3_enc = u64::from_le_bytes(tss_chk[52..60].try_into().unwrap());
+        if ist1_enc != 0x1B00 || ist2_enc != 0x1D80 || ist3_enc != 0x2000 {
+            panic!("RING3_ELF_MP: Tss64 IST1/IST2/IST3 encoding mismatch");
+        }
+    }
+
+    // ---- Phase 4: Verify 100% physical frame conservation (0 leaked frames across all processes!) ----
     crate::heap::reclaim_empty_slabs();
     let after = crate::phys_mm_stats();
     if after.free_frames != baseline.free_frames {
@@ -1390,7 +1543,7 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
     }
 
     let smp_cpus = (cpu_union.count_ones() as u64).max(1);
-    let mut line = [0u8; 128];
+    let mut line = [0u8; 192];
     let mut pos = 0usize;
     let p0 = b"RING3_ELF_MP OK procs=11 preempts=";
     line[pos..pos + p0.len()].copy_from_slice(p0);
@@ -1404,7 +1557,7 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
     line[pos..pos + p2.len()].copy_from_slice(p2);
     pos += p2.len();
     pos += crate::dec_u64(isolated_count, &mut line[pos..]);
-    let p3 = b" respawn=1 leak=0\n";
+    let p3 = b" respawn=1 leak=0 nt_fmask=1 simd_fsgs=2 timeout_reap=1 ist23=1\n";
     line[pos..pos + p3.len()].copy_from_slice(p3);
     pos += p3.len();
     crate::serial_write_bytes(&line[..pos]);

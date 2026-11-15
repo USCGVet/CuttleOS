@@ -238,8 +238,11 @@ pub(crate) unsafe fn enable_cpu_memory_protections() -> u32 {
 
         let mut cr0_val: u64;
         asm!("mov {}, cr0", out(reg) cr0_val, options(nomem, nostack, preserves_flags));
-        if (cr0_val & (1 << 16)) == 0 {
-            cr0_val |= 1 << 16;
+        // Enforce `CR0.WP` (bit 16) + `CR0.MP` (bit 1) and clear `CR0.EM` (bit 2) + `CR0.TS` (bit 3)
+        // so `FXSAVE64` / `FXRSTOR64` and Ring-3 SSE instructions execute cleanly without `#UD`/`#NM`.
+        let cr0_want = (cr0_val & !((1 << 2) | (1 << 3))) | (1 << 16) | (1 << 1);
+        if cr0_val != cr0_want {
+            cr0_val = cr0_want;
             asm!("mov cr0, {}", in(reg) cr0_val, options(nomem, nostack, preserves_flags));
             asm!("mov {}, cr0", out(reg) cr0_val, options(nomem, nostack, preserves_flags));
         }
@@ -247,7 +250,8 @@ pub(crate) unsafe fn enable_cpu_memory_protections() -> u32 {
             active_mask |= CPU_SEC_WP;
         }
 
-        let mut cr4_want: u64 = 0;
+        // Baseline x86-64 mandatory `CR4.OSFXSR` (bit 9) + `CR4.OSXMMEXCPT` (bit 10).
+        let mut cr4_want: u64 = (1 << 9) | (1 << 10);
         if has_umip {
             cr4_want |= 1 << 11;
         }

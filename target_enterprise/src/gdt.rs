@@ -268,6 +268,17 @@ impl Tss64 {
         tss
     }
 
+    /// Construct a 64-bit TSS populated with `RSP0` plus dedicated Interrupt Stack Table
+    /// tops `IST1` (`#DF`), `IST2` (`#NMI`), and `IST3` (`#MC`).
+    pub const fn with_ist_stacks(rsp0: u64, ist1: u64, ist2: u64, ist3: u64) -> Self {
+        let mut tss = Self::new();
+        tss.rsp[0] = rsp0;
+        tss.ist[0] = ist1;
+        tss.ist[1] = ist2;
+        tss.ist[2] = ist3;
+        tss
+    }
+
     /// Encode this `Tss64` into its canonical 104-byte little-endian layout.
     pub fn to_bytes(&self) -> [u8; TSS64_LEN] {
         let mut out = [0u8; TSS64_LEN];
@@ -428,6 +439,21 @@ mod tests {
             u32::from_le_bytes(table[48..52].try_into().unwrap()),
             0xFFFF_8000
         );
+    }
+
+    #[test]
+    fn tss64_encodes_ist1_df_ist2_nmi_and_ist3_mc_stacks() {
+        let rsp0 = 0xFFFF_8000_0001_0600u64;
+        let ist1 = 0xFFFF_8000_0001_0B00u64;
+        let ist2 = 0xFFFF_8000_0001_0D80u64;
+        let ist3 = 0xFFFF_8000_0001_1000u64;
+        let tss = Tss64::with_ist_stacks(rsp0, ist1, ist2, ist3);
+        let bytes = tss.to_bytes();
+        assert_eq!(u64::from_le_bytes(bytes[4..12].try_into().unwrap()), rsp0);
+        assert_eq!(u64::from_le_bytes(bytes[36..44].try_into().unwrap()), ist1);
+        assert_eq!(u64::from_le_bytes(bytes[44..52].try_into().unwrap()), ist2);
+        assert_eq!(u64::from_le_bytes(bytes[52..60].try_into().unwrap()), ist3);
+        assert_eq!(u64::from_le_bytes(bytes[60..68].try_into().unwrap()), 0);
     }
 }
 
