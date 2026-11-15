@@ -2767,6 +2767,701 @@ fn virtio_only_and_pinned_multi_disk_storage_selection_under_qemu() {
 }
 
 #[test]
+#[ignore = "requires nightly rust-src + factory_builder_pkg + qemu-system-x86_64"]
+fn blkdebug_sector_io_faults_heal_from_shadow_and_fail_closed_on_double_slot_eio() {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let _guard = QEMU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(qemu) = find_qemu() else {
+        panic!("qemu-system-x86_64 not found");
+    };
+    let root = workspace_root();
+    let rel_dir = "target/cuttle_images/blkdebug_test";
+    let images_dir = root.join("target").join("cuttle_images").join("blkdebug_test");
+    let _ = std::fs::remove_dir_all(&images_dir);
+    std::fs::create_dir_all(&images_dir).expect("create blkdebug_test dir");
+
+    let bios = images_dir.join("bios.img");
+    let kernel_crate = root.join("target_enterprise_kernel");
+    let pkg_crate = factory_builder::locate_pkg_crate().expect("locate_pkg_crate");
+    let elf = factory_builder::build_kernel(&kernel_crate).expect("build_kernel");
+    factory_builder::package_kernel_via_pkg(&pkg_crate, &elf, &bios, None)
+        .expect("package_kernel_via_pkg for blkdebug test");
+
+    let key_path = images_dir.join("device_secret_key.bin");
+    factory_builder::ensure_device_secret_key(&key_path).expect("ensure_device_secret_key");
+    let pin_path = images_dir.join("backend_pin.txt");
+    std::fs::write(&pin_path, b"ahci\n").expect("write backend_pin.txt");
+
+    let ahci_disk = images_dir.join("ahci.img");
+    std::fs::write(&ahci_disk, vec![0u8; 4 * 1024 * 1024]).expect("init 4 MiB ahci.img");
+    let cfg_path = images_dir.join("blkdebug.cfg");
+
+    let run_guest = |blkdebug_cfg: Option<&str>,
+                     commands: &[&str],
+                     done: &dyn Fn(&str) -> bool|
+     -> (String, bool) {
+        let drive_spec = if let Some(cfg_body) = blkdebug_cfg {
+            std::fs::write(&cfg_path, cfg_body).expect("write blkdebug.cfg");
+            // Use workspace-relative forward-slash paths so Windows drive-letter colons
+            // (`D:\...`) never collide with QEMU's `blkdebug:<cfg>:<image>` delimiter.
+            format!(
+                "if=none,id=ahd0,format=raw,file=blkdebug:{rel_dir}/blkdebug.cfg:{rel_dir}/ahci.img"
+            )
+        } else {
+            format!("if=none,id=ahd0,format=raw,file={rel_dir}/ahci.img")
+        };
+
+        let mut qproc = Command::new(&qemu)
+            .current_dir(&root)
+            .args(smoke_accel_args())
+            .arg("-cpu")
+            .arg(PINNED_QEMU_CPU_MODEL)
+            .args(["-smp", "4"])
+            .arg("-fw_cfg")
+            .arg(format!(
+                "name={},file={rel_dir}/device_secret_key.bin",
+                factory_builder::FW_CFG_DEVICE_KEY_NAME,
+            ))
+            .arg("-fw_cfg")
+            .arg(format!("name=opt/cuttle_storage_backend,file={rel_dir}/backend_pin.txt"))
+            .arg("-drive")
+            .arg(format!("format=raw,file={rel_dir}/bios.img,if=ide"))
+            .arg("-drive")
+            .arg(drive_spec)
+            .args(["-device", "ahci,id=ahci0", "-device", "ide-hd,drive=ahd0,bus=ahci0.0"])
+            .args([
+                "-serial",
+                "stdio",
+                "-display",
+                "none",
+                "-no-reboot",
+                "-m",
+                "256M",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn blkdebug QEMU");
+
+        let mut qout = qproc.stdout.take().expect("qproc stdout");
+        let mut qerr = qproc.stderr.take().expect("qproc stderr");
+        let mut qin = qproc.stdin.take().expect("qproc stdin");
+        let buf = Arc::new(Mutex::new(String::new()));
+        let buf_bg = Arc::clone(&buf);
+        let reader = std::thread::spawn(move || {
+            let mut chunk = [0u8; 512];
+            while let Ok(n) = qout.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut g) = buf_bg.lock() {
+                    g.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                }
+            }
+        });
+        let err_buf = Arc::new(Mutex::new(String::new()));
+        let err_bg = Arc::clone(&err_buf);
+        let err_reader = std::thread::spawn(move || {
+            let mut chunk = [0u8; 512];
+            while let Ok(n) = qerr.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut g) = err_bg.lock() {
+                    g.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                }
+            }
+        });
+
+        let send_line = |stdin: &mut std::process::ChildStdin,
+                         log_buf: &Arc<Mutex<String>>,
+                         line: &str| {
+            let prompts_before = log_buf
+                .lock()
+                .map(|g| g.matches("cuttle> ").count())
+                .unwrap_or(0);
+            let payload = format!("{line}\n");
+            for chunk in payload.as_bytes().chunks(10) {
+                let _ = stdin.write_all(chunk);
+                let _ = stdin.flush();
+                std::thread::sleep(Duration::from_millis(6));
+            }
+            if !matches!(line, "halt" | "reboot" | "poweroff") {
+                let wait_until = Instant::now() + Duration::from_secs(15);
+                while Instant::now() < wait_until {
+                    let cur = log_buf
+                        .lock()
+                        .map(|g| g.matches("cuttle> ").count())
+                        .unwrap_or(0);
+                    if cur > prompts_before {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut sent = commands.is_empty();
+        let mut ok = false;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(80));
+            let snap = buf.lock().map(|g| g.clone()).unwrap_or_default();
+            if !sent && snap.contains("cuttle> ") {
+                std::thread::sleep(Duration::from_millis(50));
+                for &c in commands {
+                    send_line(&mut qin, &buf, c);
+                }
+                sent = true;
+            }
+            if sent && done(&snap) {
+                ok = true;
+                break;
+            }
+            if qproc.try_wait().ok().flatten().is_some() {
+                let final_snap = buf.lock().map(|g| g.clone()).unwrap_or_default();
+                ok = sent && done(&final_snap);
+                break;
+            }
+        }
+        drop(qin);
+        let _ = qproc.kill();
+        let _ = qproc.wait();
+        let _ = reader.join();
+        let _ = err_reader.join();
+        let mut out = buf
+            .lock()
+            .map(|g| g.replace("\r\n", "\n"))
+            .unwrap_or_default();
+        let stderr_str = err_buf.lock().map(|g| g.clone()).unwrap_or_default();
+        if !stderr_str.trim().is_empty() {
+            out.push_str("\n[qemu-stderr]\n");
+            out.push_str(&stderr_str);
+        }
+        (out, ok)
+    };
+
+    // 1) Seed durable SQL + VFS state across both primary (LBA 1040..1092) and shadow (LBA 1096..1148).
+    let (log1, ok1) = run_guest(
+        None,
+        &[
+            "sql CREATE TABLE io_t (id INT, v TEXT)",
+            "sql INSERT INTO io_t VALUES (42, 'survived-eio')",
+            "write /var/io.ok intact-after-eio",
+            "sync",
+            "halt",
+        ],
+        &|s| s.contains("system halting..."),
+    );
+    assert!(
+        ok1 && log1.contains("sync: ok "),
+        "blkdebug Boot #1 seed failed!\n{log1}"
+    );
+
+    // 2) Inject `EIO` (`errno = 5`) on `LBA 1024` (continuity header): boot must log the
+    //    unreadable continuity notice, advance boot generation from sealed state, and preserve SQL + VFS.
+    let cfg_lba_1024 = "\
+[inject-error]
+event = \"read_aio\"
+errno = \"5\"
+sector = \"1024\"
+once = \"on\"
+immediately = \"off\"
+";
+    let (log2, ok2) = run_guest(
+        Some(cfg_lba_1024),
+        &["sql SELECT * FROM io_t", "cat /var/io.ok", "sync", "halt"],
+        &|s| s.contains("system halting..."),
+    );
+    assert!(
+        ok2
+            && log2.contains(
+                "CONTINUITY resume NOTICE: continuity region unreadable; starting it over (sealed state decides the boot generation)"
+            )
+            && log2.contains("SHELL resume NOTICE: boot counter advanced to follow sealed state")
+            && log2.contains("SHELL resume OK")
+            && log2.contains("42|survived-eio")
+            && log2.contains("intact-after-eio"),
+        "blkdebug Boot #2 (LBA 1024 continuity EIO) failed!\n{log2}"
+    );
+
+    // 3) Inject `EIO` (`errno = 5`) across both pre-repair reads of `LBA 1040` (`ShellStore::boot`
+    //    `primary_blank` probe + `recover` `primary_read`), allowing `repair_slot`'s post-rewrite
+    //    verification read to succeed: `ShellStore` must heal primary from shadow (`LBA 1096..1148`),
+    //    log `SHELL resume REPAIRED`, and preserve SQL + VFS intact.
+    let cfg_lba_1040 = "\
+[inject-error]
+event = \"read_aio\"
+errno = \"5\"
+sector = \"1040\"
+once = \"on\"
+immediately = \"off\"
+
+[inject-error]
+event = \"read_aio\"
+errno = \"5\"
+sector = \"1040\"
+once = \"on\"
+immediately = \"off\"
+";
+    let (log3, ok3) = run_guest(
+        Some(cfg_lba_1040),
+        &["sql SELECT * FROM io_t", "cat /var/io.ok", "sync", "halt"],
+        &|s| s.contains("system halting..."),
+    );
+    assert!(
+        ok3
+            && log3.contains(
+                "SHELL resume REPAIRED: primary slot failed verification; state restored from shadow slot"
+            )
+            && log3.contains("SHELL resume OK")
+            && log3.contains("42|survived-eio")
+            && log3.contains("intact-after-eio"),
+        "blkdebug Boot #3 (LBA 1040 primary EIO -> shadow heal) failed!\n{log3}"
+    );
+
+    // 4) Inject simultaneous `EIO` (`errno = 5`) on both primary (`LBA 1040`) and shadow (`LBA 1096`):
+    //    guest MUST halt fail-closed with `STORAGE FAULT: state disk unusable at boot` and NEVER reach `SHELL resume OK`.
+    let cfg_double_slot = "\
+[inject-error]
+event = \"read_aio\"
+errno = \"5\"
+sector = \"1040\"
+once = \"off\"
+immediately = \"off\"
+
+[inject-error]
+event = \"read_aio\"
+errno = \"5\"
+sector = \"1096\"
+once = \"off\"
+immediately = \"off\"
+";
+    let (log4, ok4) = run_guest(
+        Some(cfg_double_slot),
+        &[],
+        &|s| s.contains("STORAGE FAULT: state disk unusable at boot"),
+    );
+    let _ = std::fs::remove_dir_all(&images_dir);
+    assert!(
+        ok4
+            && log4.contains("STORAGE FAULT: state disk unusable at boot")
+            && !log4.contains("SHELL resume OK")
+            && !log4.contains("cuttle> "),
+        "blkdebug Boot #4 (double-slot EIO at LBA 1040 + 1096) did not fail closed!\n{log4}"
+    );
+    eprintln!(
+        "smoke[blkdebug]: LBA 1024 continuity EIO recovery + LBA 1040 primary->shadow heal + LBA 1040/1096 double-slot fail-closed STORAGE FAULT PASSED"
+    );
+}
+
+#[test]
+#[ignore = "requires nightly rust-src + factory_builder_pkg + qemu-system-x86_64 + python"]
+fn enterprise_12mib_paged_v2_and_sustained_tls13_burnin_zero_alloc_failures() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let _guard = QEMU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(qemu) = find_qemu() else {
+        panic!("qemu-system-x86_64 not found");
+    };
+    let root = workspace_root();
+    let images_dir = root.join("target").join("cuttle_images").join("tls_burnin_12mib");
+    let _ = std::fs::remove_dir_all(&images_dir);
+    std::fs::create_dir_all(&images_dir).expect("create tls_burnin_12mib dir");
+
+    let bios = images_dir.join("bios.img");
+    let kernel_crate = root.join("target_enterprise_kernel");
+    let pkg_crate = factory_builder::locate_pkg_crate().expect("locate_pkg_crate");
+    let elf = factory_builder::build_kernel(&kernel_crate).expect("build_kernel");
+    factory_builder::package_kernel_via_pkg(&pkg_crate, &elf, &bios, None)
+        .expect("package_kernel_via_pkg for 12 MiB TLS burn-in test");
+
+    let key_path = images_dir.join("device_secret_key.bin");
+    factory_builder::ensure_device_secret_key(&key_path).expect("ensure_device_secret_key");
+    let key_bytes = std::fs::read(&key_path).expect("read device_secret_key.bin");
+    let key_hex: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+    let pin_path = images_dir.join("backend_pin.txt");
+    std::fs::write(&pin_path, b"ahci\n").expect("write backend_pin.txt");
+
+    // 12 MiB (24,576 sectors) exercises the full `PAGED_MAX_LOGICAL_PAGES_V2 = 1024` (4 MiB) capacity.
+    let ahci_disk = images_dir.join("ahci_12mib.img");
+    std::fs::write(&ahci_disk, vec![0u8; 12 * 1024 * 1024]).expect("init 12 MiB ahci_12mib.img");
+
+    let tcp80 = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral TCP 80");
+        l.local_addr().unwrap().port()
+    };
+    let tcp443 = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral TCP 443");
+        l.local_addr().unwrap().port()
+    };
+
+    let spawn_12mib_qemu = |with_net: bool| -> std::process::Child {
+        let mut cmd = Command::new(&qemu);
+        cmd.args(smoke_accel_args())
+            .arg("-cpu")
+            .arg(PINNED_QEMU_CPU_MODEL)
+            .args(["-smp", "4"])
+            .arg("-fw_cfg")
+            .arg(format!(
+                "name={},file={}",
+                factory_builder::FW_CFG_DEVICE_KEY_NAME,
+                key_path.display()
+            ))
+            .arg("-fw_cfg")
+            .arg(format!(
+                "name=opt/cuttle_storage_backend,file={}",
+                pin_path.display()
+            ))
+            .arg("-drive")
+            .arg(format!("format=raw,file={},if=ide", bios.display()))
+            .arg("-drive")
+            .arg(format!(
+                "if=none,id=ahd0,format=raw,file={}",
+                ahci_disk.display()
+            ))
+            .args(["-device", "ahci,id=ahci0", "-device", "ide-hd,drive=ahd0,bus=ahci0.0"]);
+        if with_net {
+            cmd.arg("-netdev")
+                .arg(format!(
+                    "user,id=unet0,hostfwd=tcp:127.0.0.1:{tcp80}-:80,hostfwd=tcp:127.0.0.1:{tcp443}-:443"
+                ))
+                .args([
+                    "-device",
+                    "virtio-net-pci,netdev=unet0,mac=52:54:00:12:34:56,disable-legacy=on,disable-modern=off",
+                ]);
+        }
+        cmd.args([
+            "-serial",
+            "stdio",
+            "-display",
+            "none",
+            "-no-reboot",
+            "-m",
+            "256M",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn 12 MiB TLS burn-in QEMU")
+    };
+
+    let send_line = |stdin: &mut std::process::ChildStdin,
+                     log_buf: &Arc<Mutex<String>>,
+                     line: &str| {
+        let prompts_before = log_buf
+            .lock()
+            .map(|g| g.matches("cuttle> ").count())
+            .unwrap_or(0);
+        let payload = format!("{line}\n");
+        for chunk in payload.as_bytes().chunks(10) {
+            let _ = stdin.write_all(chunk);
+            let _ = stdin.flush();
+            std::thread::sleep(Duration::from_millis(6));
+        }
+        if !matches!(line, "halt" | "reboot" | "poweroff") {
+            let wait_until = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < wait_until {
+                let cur = log_buf
+                    .lock()
+                    .map(|g| g.matches("cuttle> ").count())
+                    .unwrap_or(0);
+                if cur > prompts_before {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
+
+    let mut q1 = spawn_12mib_qemu(true);
+    let mut out1 = q1.stdout.take().expect("q1 stdout");
+    let mut in1 = q1.stdin.take().expect("q1 stdin");
+    let buf1 = Arc::new(Mutex::new(String::new()));
+    let buf1_bg = Arc::clone(&buf1);
+    let r1 = std::thread::spawn(move || {
+        let mut chunk = [0u8; 512];
+        while let Ok(n) = out1.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut g) = buf1_bg.lock() {
+                g.push_str(&String::from_utf8_lossy(&chunk[..n]));
+            }
+        }
+    });
+
+    let boot_deadline = Instant::now() + Duration::from_secs(60);
+    let mut cert_sha256 = String::new();
+    while Instant::now() < boot_deadline {
+        std::thread::sleep(Duration::from_millis(80));
+        let snap = buf1.lock().map(|g| g.clone()).unwrap_or_default();
+        if snap.contains("cuttle> ") {
+            for line in snap.replace("\r\n", "\n").lines() {
+                if let Some(idx) = line.find("HTTPS UP port=443") {
+                    if let Some(cidx) = line[idx..].find("cert_sha256=") {
+                        let hex_part = line[idx + cidx + "cert_sha256=".len()..].trim();
+                        cert_sha256 = hex_part.chars().take(64).collect();
+                    }
+                }
+            }
+            break;
+        }
+    }
+    let boot1_snap = buf1.lock().map(|g| g.replace("\r\n", "\n")).unwrap_or_default();
+    assert!(
+        cert_sha256.len() == 64 && boot1_snap.contains("AHCI_HW identify OK sectors=24576"),
+        "12 MiB Boot #1 did not emit 24,576-sector AHCI banner + HTTPS UP cert_sha256!\n{boot1_snap}"
+    );
+
+    let py_script = r#"
+import hashlib, hmac, pathlib, socket, ssl, sys, tempfile, time
+
+port = int(sys.argv[1])
+expect_sha = sys.argv[2].lower()
+master_key = bytes.fromhex(sys.argv[3])
+mac = bytes.fromhex("525400123456")
+auth_key = hmac.new(master_key, b"cuttle-net-auth-v1:" + mac, hashlib.sha256).digest()
+
+pem = ssl.get_server_certificate(("127.0.0.1", port), timeout=10)
+got_sha = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
+assert got_sha == expect_sha, f"cert pin mismatch: {got_sha} != {expect_sha}"
+
+tmp = pathlib.Path(tempfile.mkdtemp(prefix="cuttle_tls_burnin_"))
+cafile = tmp / "pinned.pem"
+cafile.write_text(pem, encoding="ascii")
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+ctx.load_verify_locations(cafile=str(cafile))
+
+def https_req(method: str, path: str, body: bytes = b"", cookie: str = "") -> tuple[int, dict[str, str], str]:
+    hdrs = [
+        f"{method} {path} HTTP/1.1",
+        "Host: localhost",
+        "Connection: close",
+    ]
+    if body:
+        hdrs.append(f"Content-Length: {len(body)}")
+    if cookie:
+        hdrs.append(f"Cookie: {cookie}")
+    raw_req = ("\r\n".join(hdrs) + "\r\n\r\n").encode("ascii") + body
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as raw:
+        with ctx.wrap_socket(raw, server_hostname="localhost") as tls:
+            assert tls.version() == "TLSv1.3", f"expected TLSv1.3, got {tls.version()}"
+            tls.sendall(raw_req)
+            resp = b""
+            while True:
+                try:
+                    ch = tls.recv(4096)
+                except (ssl.SSLEOFError, ConnectionResetError):
+                    break
+                if not ch:
+                    break
+                resp += ch
+    head, _, rbody = resp.partition(b"\r\n\r\n")
+    lines = head.decode("ascii", errors="replace").split("\r\n")
+    status = int(lines[0].split()[1])
+    hmap = {}
+    for ln in lines[1:]:
+        if ":" in ln:
+            k, v = ln.split(":", 1)
+            hmap[k.strip().lower()] = v.strip()
+    return status, hmap, rbody.decode("utf-8", errors="replace")
+
+# 1) Unauthenticated GET /mem over TLS 1.3 MUST be refused with 401.
+st_unauth, _, body_unauth = https_req("GET", "/mem")
+assert st_unauth == 401, f"expected 401 on unauthenticated GET /mem, got {st_unauth}: {body_unauth}"
+
+# 2) Inject 4 malformed/truncated TLS records on :443 and verify slot recovery.
+for junk in (
+    b"\x16\x03\x03\x00\x05bogus",
+    b"\x17\x03\x03\x00\x20" + b"X" * 32,
+    b"\x16\x03\x01\x00\x40truncated",
+    b"\xff\x00\xfe\x01\x02\x03",
+):
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as bad_sock:
+        try:
+            bad_sock.sendall(junk)
+            bad_sock.settimeout(0.3)
+            bad_sock.recv(256)
+        except OSError:
+            pass
+time.sleep(0.1)
+
+# 3) Authenticate via POST /session/login over TLS 1.3.
+login_tag = hmac.new(auth_key, b"cuttle-http-login-v1:1:admin", hashlib.sha256).hexdigest()
+st_login, h_login, b_login = https_req("POST", "/session/login", f"1 {login_tag} admin".encode("ascii"))
+assert st_login == 200 and "sid=" in b_login, f"TLS login failed: {st_login} {b_login}"
+sid_cookie = h_login.get("set-cookie", "").split(";", 1)[0].strip()
+assert sid_cookie.startswith("sid=") and len(sid_cookie) == 36, f"bad sid cookie: {sid_cookie!r}"
+
+# 4) Execute DDL + 24 sequential TLS 1.3 connections (> MAX_HTTPS_SESSIONS=16) + VFS PUT + GET /mem.
+st_ddl, _, b_ddl = https_req("POST", "/sql", b"CREATE TABLE tls_burn (id INT, tag TEXT)", sid_cookie)
+assert st_ddl == 200, f"CREATE TABLE failed: {st_ddl} {b_ddl}"
+
+for i in range(24):
+    q = f"INSERT INTO tls_burn VALUES ({i}, 'tls13-row-{i:02d}')".encode("ascii")
+    st_ins, _, b_ins = https_req("POST", "/sql", q, sid_cookie)
+    assert st_ins == 200 and "INSERT 1" in b_ins, f"iter {i} INSERT failed: {st_ins} {b_ins}"
+
+st_put, _, b_put = https_req("PUT", "/fs/var/tls_burn.txt", b"tls13-verified-payload-24-conns", sid_cookie)
+assert st_put in (200, 201), f"PUT /fs/var/tls_burn.txt failed: {st_put} {b_put}"
+st_get_fs, _, b_get_fs = https_req("GET", "/fs/var/tls_burn.txt", b"", sid_cookie)
+assert st_get_fs == 200 and b_get_fs == "tls13-verified-payload-24-conns", f"GET /fs/var/tls_burn.txt mismatch: {st_get_fs} {b_get_fs!r}"
+
+st_cnt, _, b_cnt = https_req("GET", "/sql?SELECT+COUNT(*)+FROM+tls_burn", b"", sid_cookie)
+assert st_cnt == 200 and "24" in b_cnt, f"SELECT COUNT(*) mismatch: {st_cnt} {b_cnt}"
+
+st_mem, _, b_mem = https_req("GET", "/mem", b"", sid_cookie)
+assert st_mem == 200 and "alloc_failures=0" in b_mem and "phys_free=" in b_mem and "phys_total=" in b_mem, f"GET /mem failed: {st_mem} {b_mem}"
+kv_mem = dict(tok.split("=", 1) for tok in b_mem.strip().split() if "=" in tok)
+assert int(kv_mem["phys_free"]) > 0 and int(kv_mem["phys_total"]) >= int(kv_mem["phys_free"]), f"unexpected /mem stats: {b_mem}"
+
+cafile.unlink(missing_ok=True)
+tmp.rmdir()
+print("TLS_BURNIN_OK " + b_mem.strip())
+"#;
+
+    let py_out = Command::new("python")
+        .args(["-c", py_script, &tcp443.to_string(), &cert_sha256, &key_hex])
+        .output()
+        .expect("invoke python OpenSSL TLS 1.3 burn-in client");
+    let py_stdout = String::from_utf8_lossy(&py_out.stdout);
+    let py_stderr = String::from_utf8_lossy(&py_out.stderr);
+
+    // Also verify `df`, `mem`, `sync`, and clean `halt` over serial on Boot #1:
+    for cmd in ["df", "mem", "sync", "halt"] {
+        send_line(&mut in1, &buf1, cmd);
+    }
+    let halt_wait = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < halt_wait {
+        let snap = buf1.lock().map(|g| g.clone()).unwrap_or_default();
+        if snap.contains("system halting...") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(in1);
+    let _ = q1.kill();
+    let _ = q1.wait();
+    let _ = r1.join();
+    let log1 = buf1
+        .lock()
+        .map(|g| g.replace("\r\n", "\n"))
+        .unwrap_or_default();
+
+    assert!(
+        py_out.status.success() && py_stdout.contains("TLS_BURNIN_OK"),
+        "OpenSSL TLS 1.3 burn-in client failed!\nstdout:\n{py_stdout}\nstderr:\n{py_stderr}\nserial:\n{log1}"
+    );
+    assert!(
+        log1.contains("alloc_failures=0") && log1.contains("sync: ok "),
+        "12 MiB Boot #1 serial `mem` / `sync` check failed!\n{log1}"
+    );
+
+    // Inspect raw `LBA 2048` / `LBA 2049` on `ahci_disk` to verify on-disk `CTTLPGS1` format v2
+    // (`ver == 2`, `dir_sectors == 32` for 1,024 logical pages, `merkle_depth == 10`).
+    let disk_raw = std::fs::read(&ahci_disk).expect("read 12 MiB ahci_disk after Boot #1");
+    assert_eq!(disk_raw.len(), 24_576 * 512);
+    let found_v2_sb = [2048usize, 2049usize].into_iter().any(|lba| {
+        let off = lba * 512;
+        let sec = &disk_raw[off..off + 512];
+        let ver = u16::from_le_bytes([sec[8], sec[9]]);
+        let dir_secs = u16::from_le_bytes([sec[52], sec[53]]);
+        let depth = sec[54];
+        &sec[0..8] == b"CTTLPGS1" && ver == 2 && dir_secs == 32 && depth == 10
+    });
+    assert!(
+        found_v2_sb,
+        "12 MiB ahci_disk did not commit a CTTLPGS1 format v2 superblock (ver=2, dir_sectors=32, merkle_depth=10)!"
+    );
+
+    // Boot #2 on the SAME 12 MiB AHCI disk: verify 24,576-sector PagedBlockStore v2 resume + all TLS mutations!
+    let mut q2 = spawn_12mib_qemu(false);
+    let mut out2 = q2.stdout.take().expect("q2 stdout");
+    let mut in2 = q2.stdin.take().expect("q2 stdin");
+    let buf2 = Arc::new(Mutex::new(String::new()));
+    let buf2_bg = Arc::clone(&buf2);
+    let r2 = std::thread::spawn(move || {
+        let mut chunk = [0u8; 512];
+        while let Ok(n) = out2.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut g) = buf2_bg.lock() {
+                g.push_str(&String::from_utf8_lossy(&chunk[..n]));
+            }
+        }
+    });
+
+    let deadline2 = Instant::now() + Duration::from_secs(60);
+    let mut sent2 = false;
+    let mut boot2_done = false;
+    while Instant::now() < deadline2 {
+        std::thread::sleep(Duration::from_millis(80));
+        let snap = buf2.lock().map(|g| g.clone()).unwrap_or_default();
+        if !sent2 && snap.contains("cuttle> ") {
+            std::thread::sleep(Duration::from_millis(50));
+            for cmd in [
+                "df",
+                "mem",
+                "sql SELECT COUNT(*) FROM tls_burn",
+                "sql SELECT tag FROM tls_burn WHERE id = 23",
+                "cat /var/tls_burn.txt",
+                "halt",
+            ] {
+                send_line(&mut in2, &buf2, cmd);
+            }
+            sent2 = true;
+        }
+        if sent2 && snap.contains("system halting...") {
+            boot2_done = true;
+            break;
+        }
+    }
+    drop(in2);
+    let _ = q2.kill();
+    let _ = q2.wait();
+    let _ = r2.join();
+    let log2 = buf2
+        .lock()
+        .map(|g| g.replace("\r\n", "\n"))
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&images_dir);
+
+    assert!(
+        boot2_done
+            && log2.contains("AHCI_HW identify OK sectors=24576")
+            && log2.contains("CONTINUITY resume OK")
+            && log2.contains("SHELL resume OK")
+            && log2.contains("fs: magic=CTTLPGS1")
+            && log2.contains("pool_bytes=")
+            && log2.contains("/262144 ")
+            && log2.contains("alloc_failures=0")
+            && log2.contains("count\n24")
+            && log2.contains("tls13-row-23")
+            && log2.contains("tls13-verified-payload-24-conns"),
+        "12 MiB Boot #2 failed to persist TLS-committed SQL + VFS state on 24,576-sector PagedBlockStore v2!\n{log2}"
+    );
+    eprintln!(
+        "smoke[tls13+12mib]: 12 MiB (24,576-sector, CTTLPGS1 v2 1024-page / depth-10 Merkle) PagedBlockStore + 24+ OpenSSL TLS 1.3 sessions + malformed-record recovery + alloc_failures=0 PASSED"
+    );
+}
+
+#[test]
 fn workspace_root_has_kernel_and_pkg_dirs() {
     // Cheap non-ignored test: at least confirm the directory layout is
     // intact. Useful so we catch a missing kernel crate even when

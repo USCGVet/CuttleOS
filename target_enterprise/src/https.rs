@@ -417,8 +417,9 @@ impl TlsSession {
             let state = match state {
                 Ok(state) => state,
                 Err(err) => {
-                    self.fail_and_scrub();
+                    drain_prefix_and_scrub(&mut self.rx, discard);
                     self.flush_alerts();
+                    self.fail_and_scrub();
                     return Err(SessionError::Tls(err));
                 }
             };
@@ -515,8 +516,8 @@ impl TlsSession {
                 return Err(SessionError::Overflow);
             }
             if let Some(err) = tls_error {
-                self.fail_and_scrub();
                 self.flush_alerts();
+                self.fail_and_scrub();
                 return Err(SessionError::Tls(err));
             }
             if stop {
@@ -535,22 +536,53 @@ impl TlsSession {
         scrub_vec_all_bytes(&mut self.plaintext);
     }
 
-    /// After a fatal error rustls queues an alert; encode it into `tx`.
+    /// After a fatal error rustls queues an alert in `sendable_tls`; encode it into `tx`.
+    /// Must pass `&mut self.rx` rather than `&mut []` because `rustls::unbuffered` retains
+    /// its `hs_deframer` progress offset into the caller's slice, and must stop immediately
+    /// once `EncodeTlsData` drains the alert (or if no alert is queued) so `deframe` is never
+    /// re-entered with `sent_fatal_alert == true` while trailing bytes remain in `self.rx`.
     fn flush_alerts(&mut self) {
-        let mut empty = [0u8; 0];
-        for _ in 0..8 {
-            let status = self.conn.process_tls_records(&mut empty);
-            match status.state {
+        for _ in 0..4 {
+            let status = self.conn.process_tls_records(&mut self.rx);
+            let step_discard = status.discard;
+            let step_state = status.state;
+            let keep_draining_plaintext = match step_state {
+                Ok(ConnectionState::ReadTraffic(mut traffic)) => {
+                    while traffic.next_record().is_some() {}
+                    true
+                }
                 Ok(ConnectionState::EncodeTlsData(mut encoder)) => {
                     let start = self.tx.len();
-                    self.tx.resize(start + 64, 0);
-                    match encoder.encode(&mut self.tx[start..]) {
-                        Ok(n) => self.tx.truncate(start + n),
-                        Err(_) => self.tx.truncate(start),
+                    let mut room = 64usize;
+                    loop {
+                        if start.saturating_add(room) > MAX_TX_BYTES {
+                            self.tx.truncate(start);
+                            break;
+                        }
+                        self.tx.resize(start + room, 0);
+                        match encoder.encode(&mut self.tx[start..]) {
+                            Ok(n) => {
+                                self.tx.truncate(start + n);
+                                break;
+                            }
+                            Err(EncodeError::InsufficientSize(InsufficientSizeError {
+                                required_size,
+                            })) => {
+                                room = required_size;
+                            }
+                            Err(_) => {
+                                self.tx.truncate(start);
+                                break;
+                            }
+                        }
                     }
+                    false
                 }
-                Ok(ConnectionState::TransmitTlsData(transmit)) => transmit.done(),
-                _ => break,
+                _ => false,
+            };
+            drain_prefix_and_scrub(&mut self.rx, step_discard);
+            if !keep_draining_plaintext {
+                break;
             }
         }
     }
@@ -1061,5 +1093,72 @@ mod tests {
             rx_spare.iter().all(|&b| b == 0),
             "TlsSession.rx spare capacity must be zero-scrubbed after record discard"
         );
+    }
+
+    #[test]
+    fn malformed_tls_records_never_panic_flush_alerts_and_scrub_rx() {
+        let _guard = crate::tls_provider::GOLDEN_LOCK.lock();
+        crate::tls_provider::reset_golden_rng([7u8; 32]);
+        let id = ServerIdentity::derive(&[9u8; 32], [0; 6]);
+        let config = server_config(&id, crate::tls_provider::golden_provider()).unwrap();
+
+        for (payload, expect_err, expect_alert) in [
+            // HandshakePayloadTooLarge inside hs_deframer (retains hs_deframer offset=10, no alert):
+            (&b"\x16\x03\x03\x00\x05bogus"[..], true, false),
+            (&b"\x16\x03\x03\x00\x05bogus\x16\x03\x03\x00\x05extra"[..], true, false),
+            // Malformed 1-byte ClientHello with trailing record (queues fatal decode_error alert + trailing rx):
+            (&b"\x16\x03\x03\x00\x05\x01\x00\x00\x01\x00\x16\x03\x03\x00\x05extra"[..], true, true),
+            // Unexpected ApplicationData before handshake (queues unexpected_message alert):
+            (&b"\x17\x03\x03\x00\x20XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"[..], true, true),
+            // Incomplete partial record (waits for more bytes without error or alert):
+            (&b"\x16\x03\x01\x00\x40truncated"[..], false, false),
+            // Invalid outer record header + trailing bytes:
+            (&b"\xff\x00\xfe\x01\x02\x03"[..], true, true),
+        ] {
+            let mut session = TlsSession::new(config.clone()).unwrap();
+            let res = session.receive(payload);
+            assert_eq!(res.is_err(), expect_err, "unexpected error status for {payload:?}");
+            if expect_err {
+                assert!(session.is_failed());
+                if expect_alert {
+                    assert!(
+                        !session.pending_tx().is_empty(),
+                        "fatal alert must be encoded into tx for {payload:?}"
+                    );
+                }
+                assert_eq!(session.rx_len(), 0);
+                let (rx_ptr, _rx_len, rx_cap) = session.rx_raw_parts_for_test();
+                let inspected = payload.len().min(rx_cap);
+                if inspected > 0 {
+                    let rx_spare = unsafe { core::slice::from_raw_parts(rx_ptr, inspected) };
+                    assert!(rx_spare.iter().all(|&b| b == 0), "failed rx spare bytes must be zeroed");
+                }
+            }
+        }
+
+        // Also verify post-handshake AEAD tag corruption with trailing bytes in ReadTraffic.
+        crate::tls_provider::reset_golden_rng(golden::RNG_SEED);
+        let id = ServerIdentity::derive(&golden::IDENTITY_SECRET, golden::MAC);
+        let config = server_config(&id, crate::tls_provider::golden_provider()).unwrap();
+        let mut session = TlsSession::new(config).unwrap();
+        session.receive(kf::HTTPS_GOLDEN_CLIENT_FLIGHTS[0]).unwrap();
+        let tx0 = session.pending_tx().len();
+        session.consume_tx(tx0);
+        session.receive(kf::HTTPS_GOLDEN_CLIENT_FLIGHTS[1]).unwrap();
+        let tx1 = session.pending_tx().len();
+        session.consume_tx(tx1);
+
+        let mut corrupted_app = kf::HTTPS_GOLDEN_CLIENT_FLIGHTS[2].to_vec();
+        let last = corrupted_app.len() - 1;
+        corrupted_app[last] ^= 0xff;
+        corrupted_app.extend_from_slice(b"\x17\x03\x03\x00\x05trail");
+        assert!(session.receive(&corrupted_app).is_err());
+        assert!(session.is_failed());
+        assert!(!session.pending_tx().is_empty(), "bad_record_mac alert must be encoded into tx");
+        assert_eq!(session.rx_len(), 0);
+        let (rx_ptr, _rx_len, rx_cap) = session.rx_raw_parts_for_test();
+        let inspected = corrupted_app.len().min(rx_cap);
+        let rx_spare = unsafe { core::slice::from_raw_parts(rx_ptr, inspected) };
+        assert!(rx_spare.iter().all(|&b| b == 0), "corrupted post-handshake rx spare bytes must be zeroed");
     }
 }
