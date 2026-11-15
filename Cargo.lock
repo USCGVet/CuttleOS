@@ -27,6 +27,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -1693,6 +1694,7 @@ checksum = "591ef38edfb78ca4771ee32cf494cb8771944bee237a9b91fc9c1424ac4b777b"
 name = "target_enterprise"
 version = "0.0.1"
 dependencies = [
+ "aes",
  "aes-gcm",
  "chacha20poly1305",
  "cuttle-contracts",

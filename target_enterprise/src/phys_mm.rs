@@ -156,6 +156,7 @@ pub type KernelPhysFrameManager = PhysFrameManager<KERNEL_LOW_BITMAP_WORDS>;
 impl<const WORDS: usize> PhysFrameManager<WORDS> {
     /// Construct an uninitialized zeroed manager suitable for `.bss` static placement.
     pub const fn empty() -> Self {
+        assert!(WORDS > 0 && WORDS <= KERNEL_LOW_BITMAP_WORDS);
         Self {
             usable_bits: [0u64; WORDS],
             alloc_bits: [0u64; WORDS],
@@ -370,22 +371,21 @@ impl<const WORDS: usize> PhysFrameManager<WORDS> {
 
     fn add_high_usable_range(&mut self, mut cur_pa: u64, end_pa: u64) {
         let extent_span_bytes = (HIGH_EXTENT_WORDS as u64) * 64 * PHYS_FRAME_BYTES;
+        debug_assert!(extent_span_bytes.is_power_of_two());
         while cur_pa < end_pa {
-            let chunk_end = match cur_pa.checked_add(extent_span_bytes) {
-                Some(v) if v < end_pa => v,
-                _ => end_pa,
-            };
-            // Try merging into an existing extent if `[cur_pa, chunk_end)` falls inside its 512 MiB window.
+            // Canonicalize every >= 4 GiB range to its natural 512 MiB arena base so unsorted
+            // or overlapping firmware regions always coalesce into the same HighExtent slot
+            // instead of creating aliasing HighExtents that double-allocate physical frames.
+            let arena_base = cur_pa & !(extent_span_bytes - 1);
+            let arena_end = arena_base.saturating_add(extent_span_bytes);
+            let sub_end = if end_pa < arena_end { end_pa } else { arena_end };
             let mut target_slot: Option<usize> = None;
             let mut s = 0usize;
             while s < MAX_HIGH_EXTENTS {
                 let ext = &self.high_extents[s];
-                if ext.frame_cap > 0 && cur_pa >= ext.base_pa {
-                    let max_end = ext.base_pa.saturating_add(extent_span_bytes);
-                    if cur_pa < max_end {
-                        target_slot = Some(s);
-                        break;
-                    }
+                if ext.frame_cap > 0 && ext.base_pa == arena_base {
+                    target_slot = Some(s);
+                    break;
                 }
                 s += 1;
             }
@@ -393,7 +393,7 @@ impl<const WORDS: usize> PhysFrameManager<WORDS> {
                 let mut e_slot = 0usize;
                 while e_slot < MAX_HIGH_EXTENTS {
                     if self.high_extents[e_slot].frame_cap == 0 {
-                        self.high_extents[e_slot].base_pa = cur_pa;
+                        self.high_extents[e_slot].base_pa = arena_base;
                         target_slot = Some(e_slot);
                         break;
                     }
@@ -401,18 +401,13 @@ impl<const WORDS: usize> PhysFrameManager<WORDS> {
                 }
             }
             let Some(slot) = target_slot else {
-                // High-extent descriptor slots full; stop cleanly without panicking.
-                break;
+                // High-extent descriptor slots full; skip this 512 MiB arena cleanly without panicking.
+                cur_pa = sub_end;
+                continue;
             };
             let ext = &mut self.high_extents[slot];
-            let max_end = ext.base_pa.saturating_add(extent_span_bytes);
-            let sub_end = if chunk_end < max_end {
-                chunk_end
-            } else {
-                max_end
-            };
-            let start_off = ((cur_pa - ext.base_pa) / PHYS_FRAME_BYTES) as usize;
-            let end_off = ((sub_end - ext.base_pa) / PHYS_FRAME_BYTES) as usize;
+            let start_off = ((cur_pa - arena_base) / PHYS_FRAME_BYTES) as usize;
+            let end_off = ((sub_end - arena_base) / PHYS_FRAME_BYTES) as usize;
             if end_off > ext.frame_cap {
                 ext.frame_cap = end_off;
             }
@@ -798,7 +793,7 @@ impl<const WORDS: usize> PhysFrameManager<WORDS> {
 /// so the compiler cannot dead-store-eliminate the scrub when memory is freed.
 #[inline]
 pub fn scrub_frame_bytes(buf: &mut [u8]) {
-    buf.fill(0);
+    zeroize::Zeroize::zeroize(buf);
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -852,7 +847,7 @@ const fn align_up_4k(addr: u64) -> Option<u64> {
 #[inline]
 const fn align_up_usize(val: usize, align: usize) -> usize {
     let mask = align - 1;
-    (val + mask) & !mask
+    val.saturating_add(mask) & !mask
 }
 
 #[cfg(test)]
@@ -1003,5 +998,44 @@ mod tests {
         let mut dirty = [0xA5u8; 4096];
         scrub_frame_bytes(&mut dirty);
         assert!(dirty.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn unsorted_and_overlapping_high_extents_never_double_allocate_frames() {
+        let mut pmm: PhysFrameManager<64> = PhysFrameManager::empty();
+        // Firmware / UEFI memory maps may report overlapping or out-of-order regions >= 4 GiB.
+        // Region A covers `[4 GiB + 4 MiB .. 4 GiB + 8 MiB)` (1,024 frames).
+        // Region B covers `[4 GiB .. 4 GiB + 12 MiB)` (3,072 frames, superset of Region A).
+        pmm.init_from_regions(
+            &[
+                PhysRegionDesc {
+                    start: LOW_4GIB_END + 0x0040_0000,
+                    end: LOW_4GIB_END + 0x0080_0000,
+                    usable: true,
+                },
+                PhysRegionDesc {
+                    start: LOW_4GIB_END,
+                    end: LOW_4GIB_END + 0x00C0_0000,
+                    usable: true,
+                },
+            ],
+            &[],
+        );
+
+        let st = pmm.stats();
+        assert_eq!(
+            st.free_frames, 3072,
+            "overlapping >= 4 GiB regions must canonicalize into one 512 MiB arena without double-counting"
+        );
+        assert_eq!(st.high_mem_usable_frames, 3072);
+
+        let mut allocated = alloc::collections::BTreeSet::new();
+        while let Some(pa) = pmm.alloc_frame() {
+            assert!(
+                allocated.insert(pa),
+                "duplicate physical frame allocated at PA {pa:#x} due to HighExtent aliasing"
+            );
+        }
+        assert_eq!(allocated.len(), 3072);
     }
 }

@@ -3111,13 +3111,15 @@ impl LivedNet {
                 && responses < 8
                 && session.pending_tx().len() < HTTPS_TX_HIGH_WATER
             {
+                let next_frame = frame_next_http_request(session.plaintext());
+                if matches!(next_frame, HttpFrameOutcome::Incomplete) {
+                    framing_exhausted = true;
+                    break;
+                }
                 let mut response = alloc::vec![0u8; 38_912];
                 let close_after;
-                let n = match frame_next_http_request(session.plaintext()) {
-                    HttpFrameOutcome::Incomplete => {
-                        framing_exhausted = true;
-                        break;
-                    }
+                let n = match next_frame {
+                    HttpFrameOutcome::Incomplete => unreachable!(),
                     HttpFrameOutcome::PayloadTooLarge => {
                         close_after = true;
                         build_http_413_response(&mut response)
@@ -3159,18 +3161,18 @@ impl LivedNet {
                         written
                     }
                 };
+                let mut send_failed = false;
                 if n > 0 {
-                    let mut send_failed = false;
                     for rec in response[..n].chunks(16_384) {
                         if session.send(rec).is_err() {
                             send_failed = true;
                             break;
                         }
                     }
-                    crate::durable_seal::zeroize_secret_bytes(&mut response[..n]);
-                    if send_failed {
-                        break;
-                    }
+                }
+                crate::https::scrub_vec_all_bytes(&mut response);
+                if send_failed {
+                    break;
                 }
                 responses += 1;
                 // `Connection: close`, malformed, or oversized request: end
@@ -3573,6 +3575,26 @@ impl LivedNet {
                 boots,
                 view.path,
                 tok,
+                &mut body,
+            ) {
+                Ok((status, bpos)) => {
+                    HttpImpl::build_response(status, b"text/plain", &body[..bpos], out).unwrap_or(0)
+                }
+                Err(e) => build_service_error_response(e, out),
+            };
+        }
+
+        if view.method == HttpMethod::Get && view.path == b"/mem" {
+            let tok = extract_session_token(view.headers_raw).unwrap_or(b"");
+            let s_idx = sh.validate_session(tok);
+            let mut body = [0u8; 256];
+            return match sh.dispatch_mailbox_op(
+                IpcOp::HttpGetMemTelemetry,
+                true,
+                s_idx.is_some(),
+                boots,
+                view.path,
+                b"",
                 &mut body,
             ) {
                 Ok((status, bpos)) => {
@@ -10943,5 +10965,74 @@ mod tests {
             0,
             "boot window (`shell = None`) must enforce persisted guard_lockdown"
         );
+    }
+
+    #[test]
+    fn mem_endpoint_refuses_unauthenticated_in_all_roles_and_serves_authenticated() {
+        use crate::svc_runtime::NodeRole;
+
+        let auth_key = [0x6Bu8; 32];
+        let roles = [
+            (NodeRole::Full, "HTTP/1.1 401"),
+            (NodeRole::Wfe, "HTTP/1.1 401"),
+            (NodeRole::Sql, "HTTP/1.1 503"),
+            (NodeRole::Shell, "HTTP/1.1 503"),
+        ];
+
+        for (role, expected_unauth_prefix) in roles {
+            let mut net = LivedNet::with_auth_key(MAC, auth_key);
+            let mut sh = crate::shell::OsShell::new();
+            sh.set_durable_provisioned(true);
+            sh.svc.set_role(role, &mut sh.audit);
+
+            // 1. Unauthenticated HTTP GET /mem must be refused in every role.
+            let mut resp = alloc::vec![0u8; 2048];
+            let req_unauth = b"GET /mem HTTP/1.1\r\nHost: cuttle\r\n\r\n";
+            let n = net.handle_http_request(req_unauth, 1, Some(&mut sh), &mut resp);
+            let s = core::str::from_utf8(&resp[..n]).unwrap();
+            assert!(
+                s.starts_with(expected_unauth_prefix),
+                "role {role:?} unauthenticated GET /mem expected {expected_unauth_prefix}, got: {s}"
+            );
+
+            // 2. Unauthenticated UDP :8080 `CMD mem` must be refused with EACCES in every role.
+            let payload = b"CMD mem";
+            let ulen = 8 + payload.len();
+            let mut udp = alloc::vec![0u8; ulen];
+            udp[0..2].copy_from_slice(&54000u16.to_be_bytes());
+            udp[2..4].copy_from_slice(&UDP_STATUS_PORT.to_be_bytes());
+            udp[4..6].copy_from_slice(&(ulen as u16).to_be_bytes());
+            udp[8..].copy_from_slice(payload);
+            let (fudp, fludp) = eth_ip(IP_PROTO_UDP, PEER_IP, GUEST_IP, &udp);
+            let mut uout = ReplySet::new();
+            net.handle_frame_with_shell(&fudp[..fludp], 1, &mut sh, &mut uout);
+            assert_eq!(uout.len(), 1);
+            let ubody = &uout.get(0).unwrap()[42..];
+            let us = core::str::from_utf8(ubody).unwrap();
+            assert!(
+                us.starts_with("error: EACCES"),
+                "role {role:?} unauthenticated UDP CMD mem must be refused, got: {us}"
+            );
+        }
+
+        // 3. Authenticated GET /mem on Full and Wfe roles returns 200 OK with Ring-0 memory telemetry.
+        for role in [NodeRole::Full, NodeRole::Wfe] {
+            let mut net = LivedNet::with_auth_key(MAC, auth_key);
+            let mut sh = crate::shell::OsShell::new();
+            sh.set_durable_provisioned(true);
+            sh.svc.set_role(role, &mut sh.audit);
+            let sid = sh.try_create_session(b"ops", b"chal-mem").expect("mint session");
+            let req_auth = alloc::format!(
+                "GET /mem HTTP/1.1\r\nHost: cuttle\r\nX-Session-Token: {}\r\n\r\n",
+                core::str::from_utf8(&sid).unwrap()
+            );
+            let mut resp = alloc::vec![0u8; 2048];
+            let n = net.handle_http_request(req_auth.as_bytes(), 1, Some(&mut sh), &mut resp);
+            let s = core::str::from_utf8(&resp[..n]).unwrap();
+            assert!(
+                s.starts_with("HTTP/1.1 200 OK") && s.contains("mem: heap_used="),
+                "role {role:?} authenticated GET /mem must serve telemetry, got: {s}"
+            );
+        }
     }
 }

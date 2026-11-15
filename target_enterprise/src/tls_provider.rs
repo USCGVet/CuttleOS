@@ -96,9 +96,23 @@ impl KernelRng {
         }
     }
 
-    /// Replace the generator state with one keyed by `seed`.
+    /// Replace the generator state with one keyed by `seed`, scrubbing any prior state in place.
     pub(crate) fn reseed(&self, mut seed: [u8; 32]) {
-        *self.inner.lock() = Some(ChaCha20Rng::from_seed(seed));
+        const { assert!(!core::mem::needs_drop::<ChaCha20Rng>()) };
+        let mut guard = self.inner.lock();
+        if let Some(prev) = guard.as_mut() {
+            // SAFETY: `ChaCha20Rng` is a plain-data CSPRNG state (`!needs_drop`); zeroing its bytes
+            // immediately prior to overwriting `*guard` prevents old keystreams from remaining in RAM.
+            unsafe {
+                core::ptr::write_bytes(
+                    (prev as *mut ChaCha20Rng).cast::<u8>(),
+                    0,
+                    core::mem::size_of::<ChaCha20Rng>(),
+                );
+            }
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        }
+        *guard = Some(ChaCha20Rng::from_seed(seed));
         seed.zeroize();
     }
 
@@ -121,8 +135,19 @@ impl SecureRandom for KernelRng {
             Some(rng) => {
                 rng.fill_bytes(buf);
                 if self.rekey_on_fill {
+                    const { assert!(!core::mem::needs_drop::<ChaCha20Rng>()) };
                     let mut next_seed = [0u8; 32];
                     rng.fill_bytes(&mut next_seed);
+                    // SAFETY: `ChaCha20Rng` has `!needs_drop`; scrubbing `rng` before replacing `*guard`
+                    // ensures forward-secrecy ratchet leaves zero old CSPRNG words in memory.
+                    unsafe {
+                        core::ptr::write_bytes(
+                            (rng as *mut ChaCha20Rng).cast::<u8>(),
+                            0,
+                            core::mem::size_of::<ChaCha20Rng>(),
+                        );
+                    }
+                    core::sync::atomic::compiler_fence(Ordering::SeqCst);
                     *guard = Some(ChaCha20Rng::from_seed(next_seed));
                     next_seed.zeroize();
                 }
@@ -318,17 +343,28 @@ impl hash::Context for Sha256Context {
     }
 }
 
-type HmacSha256Impl = ::hmac::Hmac<Sha256>;
-
 struct HmacSha256;
 
 static HMAC_SHA256: HmacSha256 = HmacSha256;
 
 impl hmac::Hmac for HmacSha256 {
     fn with_key(&self, key: &[u8]) -> Box<dyn hmac::Key> {
-        let mac = <HmacSha256Impl as ::hmac::Mac>::new_from_slice(key)
-            .expect("HMAC accepts any key length");
-        Box::new(HmacSha256Key(mac))
+        let mut k_block = [0u8; 64];
+        if key.len() <= 64 {
+            k_block[..key.len()].copy_from_slice(key);
+        } else {
+            let mut hashed: [u8; 32] = Sha256::digest(key).into();
+            k_block[..32].copy_from_slice(&hashed);
+            hashed.zeroize();
+        }
+        let mut ipad_key = [0x36u8; 64];
+        let mut opad_key = [0x5cu8; 64];
+        for i in 0..64 {
+            ipad_key[i] ^= k_block[i];
+            opad_key[i] ^= k_block[i];
+        }
+        k_block.zeroize();
+        Box::new(HmacSha256Key { ipad_key, opad_key })
     }
 
     fn hash_output_len(&self) -> usize {
@@ -336,26 +372,38 @@ impl hmac::Hmac for HmacSha256 {
     }
 }
 
-struct HmacSha256Key(HmacSha256Impl);
+struct HmacSha256Key {
+    ipad_key: [u8; 64],
+    opad_key: [u8; 64],
+}
 
 impl Drop for HmacSha256Key {
     fn drop(&mut self) {
-        self.0 = <HmacSha256Impl as ::hmac::Mac>::new_from_slice(&[0u8; 32])
-            .expect("HMAC accepts zero key");
-        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        self.ipad_key.zeroize();
+        self.opad_key.zeroize();
     }
 }
 
 impl hmac::Key for HmacSha256Key {
     fn sign_concat(&self, first: &[u8], middle: &[&[u8]], last: &[u8]) -> hmac::Tag {
-        use ::hmac::Mac;
-        let mut mac = self.0.clone();
-        mac.update(first);
+        let mut inner = Sha256::new();
+        inner.update(&self.ipad_key);
+        inner.update(first);
         for part in middle {
-            mac.update(part);
+            inner.update(part);
         }
-        mac.update(last);
-        hmac::Tag::new(&mac.finalize().into_bytes())
+        inner.update(last);
+        let mut inner_out: [u8; 32] = inner.finalize().into();
+
+        let mut outer = Sha256::new();
+        outer.update(&self.opad_key);
+        outer.update(&inner_out);
+        inner_out.zeroize();
+
+        let mut tag_bytes: [u8; 32] = outer.finalize().into();
+        let tag = hmac::Tag::new(&tag_bytes);
+        tag_bytes.zeroize();
+        tag
     }
 
     fn tag_len(&self) -> usize {
@@ -435,11 +483,21 @@ struct Tls13Aead(AeadKind);
 
 impl Tls13AeadAlgorithm for Tls13Aead {
     fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
-        Box::new(Tls13Encrypter { cipher: self.0.cipher(key.as_ref()), iv })
+        let mut iv_bytes = [0u8; 12];
+        iv_bytes.copy_from_slice(iv.as_ref());
+        Box::new(Tls13Encrypter {
+            cipher: self.0.cipher(key.as_ref()),
+            iv_bytes,
+        })
     }
 
     fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
-        Box::new(Tls13Decrypter { cipher: self.0.cipher(key.as_ref()), iv })
+        let mut iv_bytes = [0u8; 12];
+        iv_bytes.copy_from_slice(iv.as_ref());
+        Box::new(Tls13Decrypter {
+            cipher: self.0.cipher(key.as_ref()),
+            iv_bytes,
+        })
     }
 
     fn key_len(&self) -> usize {
@@ -463,13 +521,12 @@ impl Tls13AeadAlgorithm for Tls13Aead {
 
 struct Tls13Encrypter {
     cipher: AeadCipher,
-    iv: Iv,
+    iv_bytes: [u8; 12],
 }
 
 impl Drop for Tls13Encrypter {
     fn drop(&mut self) {
-        self.iv = Iv::default();
-        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        self.iv_bytes.zeroize();
     }
 }
 
@@ -483,9 +540,11 @@ impl MessageEncrypter for Tls13Encrypter {
         let mut payload = PrefixedPayload::with_capacity(total_len);
         payload.extend_from_chunks(&msg.payload);
         payload.extend_from_slice(&msg.typ.to_array());
-        let nonce = Nonce::new(&self.iv, seq).0;
+        let mut nonce = Nonce::new(&Iv::from(self.iv_bytes), seq).0;
         let aad = make_tls13_aad(total_len);
-        let tag = self.cipher.seal(&nonce, &aad, payload.as_mut())?;
+        let seal_res = self.cipher.seal(&nonce, &aad, payload.as_mut());
+        nonce.zeroize();
+        let tag = seal_res?;
         payload.extend_from_slice(&tag);
         // TLS 1.3 records carry the legacy 0x0303 version (RFC 8446 §5.1).
         Ok(OutboundOpaqueMessage::new(ContentType::ApplicationData, ProtocolVersion::TLSv1_2, payload))
@@ -498,13 +557,12 @@ impl MessageEncrypter for Tls13Encrypter {
 
 struct Tls13Decrypter {
     cipher: AeadCipher,
-    iv: Iv,
+    iv_bytes: [u8; 12],
 }
 
 impl Drop for Tls13Decrypter {
     fn drop(&mut self) {
-        self.iv = Iv::default();
-        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        self.iv_bytes.zeroize();
     }
 }
 
@@ -519,11 +577,13 @@ impl MessageDecrypter for Tls13Decrypter {
         if total_len < AEAD_TAG_LEN {
             return Err(Error::DecryptError);
         }
-        let nonce = Nonce::new(&self.iv, seq).0;
+        let mut nonce = Nonce::new(&Iv::from(self.iv_bytes), seq).0;
         let aad = make_tls13_aad(total_len);
         let plain_len = total_len - AEAD_TAG_LEN;
         let (body, tag) = payload.split_at_mut(plain_len);
-        self.cipher.open(&nonce, &aad, body, tag)?;
+        let open_res = self.cipher.open(&nonce, &aad, body, tag);
+        nonce.zeroize();
+        open_res?;
         payload.truncate(plain_len);
         msg.into_tls13_unpadded_message()
     }
@@ -691,12 +751,12 @@ static GOLDEN_SECP256R1: Secp256r1 = Secp256r1 { rng: &GOLDEN_RNG };
 
 /// The server's signing key. ECDSA nonces are derived per RFC 6979, so
 /// signing needs no RNG and a given (key, message) always signs identically.
-pub struct EcdsaP256SigningKey(p256::ecdsa::SigningKey);
+pub struct EcdsaP256SigningKey(Arc<p256::ecdsa::SigningKey>);
 
 impl EcdsaP256SigningKey {
-    /// Wrap a P-256 signing key.
+    /// Wrap a P-256 signing key behind a shared `Arc` so per-handshake signers never clone the secret scalar.
     pub fn new(key: p256::ecdsa::SigningKey) -> Self {
-        Self(key)
+        Self(Arc::new(key))
     }
 
     /// Uncompressed SEC1 public key (65 bytes).
@@ -731,7 +791,7 @@ impl fmt::Debug for EcdsaP256SigningKey {
 impl SigningKey for EcdsaP256SigningKey {
     fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
         if offered.contains(&SignatureScheme::ECDSA_NISTP256_SHA256) {
-            Some(Box::new(EcdsaP256Signer(self.0.clone())))
+            Some(Box::new(EcdsaP256Signer(Arc::clone(&self.0))))
         } else {
             None
         }
@@ -746,7 +806,7 @@ impl SigningKey for EcdsaP256SigningKey {
     }
 }
 
-struct EcdsaP256Signer(p256::ecdsa::SigningKey);
+struct EcdsaP256Signer(Arc<p256::ecdsa::SigningKey>);
 
 impl fmt::Debug for EcdsaP256Signer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1100,9 +1160,9 @@ pub fn self_test() -> Result<SelfTestReport, &'static str> {
 fn record_round_trip(alg: &Tls13Aead) -> Result<(), &'static str> {
     let key = [0x42u8; 32];
     let key = &key[..alg.key_len()];
-    let iv = || Iv::from([0x24u8; 12]);
-    let mut enc = Tls13Encrypter { cipher: alg.0.cipher(key), iv: iv() };
-    let mut dec = Tls13Decrypter { cipher: alg.0.cipher(key), iv: iv() };
+    let iv_bytes = [0x24u8; 12];
+    let mut enc = Tls13Encrypter { cipher: alg.0.cipher(key), iv_bytes };
+    let mut dec = Tls13Decrypter { cipher: alg.0.cipher(key), iv_bytes };
     let request: &[u8] = b"GET /healthz HTTP/1.1
 
 ";
@@ -1124,7 +1184,7 @@ fn record_round_trip(alg: &Tls13Aead) -> Result<(), &'static str> {
     }
     let mut tampered = sealed;
     tampered[9] ^= 0x01;
-    let mut dec2 = Tls13Decrypter { cipher: alg.0.cipher(key), iv: iv() };
+    let mut dec2 = Tls13Decrypter { cipher: alg.0.cipher(key), iv_bytes };
     let rejected = dec2
         .decrypt(
             InboundOpaqueMessage::new(ContentType::ApplicationData, ProtocolVersion::TLSv1_2, &mut tampered[5..]),

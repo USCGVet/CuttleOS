@@ -2829,6 +2829,7 @@ pub(crate) fn smp_hw_tick_and_sync(sh: &mut target_enterprise::OsShell) {
         }
         t += 1;
     }
+    crate::refresh_shell_mem_telemetry(sh);
 }
 
 /// Self-verify Intel VT-d (`vtd_hw`) Root Table -> Bus-0 Context Table -> 4-level SLPT

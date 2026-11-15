@@ -355,6 +355,8 @@ pub enum IpcOp {
     CronControl = 19,
     /// `POST /triad/rpc` authenticated Triad coordinator RPC (`svc-http -> svc-sh` IPC, requires HMAC proof).
     TriadRpc = 20,
+    /// `GET /mem` authenticated Ring-0 heap, slab, and physical-frame telemetry (`svc-http`, requires valid session `sid`).
+    HttpGetMemTelemetry = 21,
 }
 
 impl IpcOp {
@@ -364,6 +366,7 @@ impl IpcOp {
             self,
             IpcOp::SessionWhoami
                 | IpcOp::SessionLogout
+                | IpcOp::HttpGetMemTelemetry
                 | IpcOp::SqlMutate
                 | IpcOp::ShellExec
                 | IpcOp::UserElfExec
@@ -383,6 +386,7 @@ impl IpcOp {
             IpcOp::HttpGetStatus
             | IpcOp::HttpGetTelemetry
             | IpcOp::HttpGetDashboard
+            | IpcOp::HttpGetMemTelemetry
             | IpcOp::SessionLogin
             | IpcOp::SessionWhoami
             | IpcOp::SessionLogout
@@ -408,6 +412,7 @@ impl IpcOp {
             IpcOp::HttpGetStatus
             | IpcOp::HttpGetTelemetry
             | IpcOp::HttpGetDashboard
+            | IpcOp::HttpGetMemTelemetry
             | IpcOp::SessionLogin
             | IpcOp::SessionWhoami
             | IpcOp::SessionLogout

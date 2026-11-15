@@ -424,6 +424,49 @@ pub struct OsShell {
     paged_max_logical: usize,
     /// Most recent cryptographic [`crate::paged_store::PagedAnchor`] cross-anchored in the shell WAL header.
     paged_anchor: crate::paged_store::PagedAnchor,
+    /// Latest Ring-0 heap, slab, and physical-frame utilization snapshot (`mem` / `GET /mem`).
+    mem_telemetry: MemTelemetry,
+}
+
+/// Live Ring-0 heap, slab, and physical-frame utilization snapshot surfaced via
+/// the authenticated `mem` shell command and `GET /mem` HTTP/HTTPS endpoint.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MemTelemetry {
+    /// Bytes currently allocated across the kernel slab + fallback heap.
+    pub heap_used_bytes: u64,
+    /// Bytes currently free across usable physical RAM + fallback heap.
+    pub heap_free_bytes: u64,
+    /// High-water mark of simultaneously allocated heap bytes since boot.
+    pub heap_peak_bytes: u64,
+    /// Number of active 4 KiB slab pages (including warm empty slabs).
+    pub slab_active: u32,
+    /// Number of warm empty 4 KiB slab pages currently retained in cache.
+    pub slab_cached_empty: u32,
+    /// Number of active multi-page (`> 4 KiB`) spans.
+    pub large_spans: u32,
+    /// Free 4 KiB physical frames in `KERNEL_PHYS_MM`.
+    pub phys_free_frames: u64,
+    /// Total usable 4 KiB physical frames discovered in `KERNEL_PHYS_MM`.
+    pub phys_total_frames: u64,
+    /// Cumulative failed heap/slab allocation attempts since boot (`0` expected under healthy operation).
+    pub alloc_failures: u64,
+}
+
+impl MemTelemetry {
+    /// Zero-initialized telemetry snapshot for `.bss` / host unit tests.
+    pub const fn zero() -> Self {
+        Self {
+            heap_used_bytes: 0,
+            heap_free_bytes: 0,
+            heap_peak_bytes: 0,
+            slab_active: 0,
+            slab_cached_empty: 0,
+            large_spans: 0,
+            phys_free_frames: 0,
+            phys_total_frames: 0,
+            alloc_failures: 0,
+        }
+    }
 }
 
 impl OsShell {
@@ -488,6 +531,7 @@ impl OsShell {
             paged_mode: false,
             paged_max_logical: crate::paged_store::PAGED_MAX_LOGICAL_PAGES,
             paged_anchor: crate::paged_store::PagedAnchor::zero(),
+            mem_telemetry: MemTelemetry::zero(),
         }
     }
 
@@ -659,7 +703,9 @@ impl OsShell {
     ) {
         let was_paged = self.is_paged_mode();
         let prev_max_logical = self.paged_max_logical();
+        let prev_mem = self.mem_telemetry;
         *self = Self::empty();
+        self.mem_telemetry = prev_mem;
         self.seal_key = seal_key;
         self.legacy_seal_key = legacy_seal_key;
         self.attest_key = attest_key;
@@ -706,6 +752,42 @@ impl OsShell {
     /// Update the [`crate::paged_store::PagedAnchor`] to be cross-anchored on the next `pack_state_image`.
     pub fn set_paged_anchor(&mut self, anchor: crate::paged_store::PagedAnchor) {
         self.paged_anchor = anchor;
+    }
+
+    /// Update the live Ring-0 heap, slab, and physical-frame telemetry snapshot.
+    pub fn set_mem_telemetry(&mut self, snap: MemTelemetry) {
+        self.mem_telemetry = snap;
+    }
+
+    /// Read the latest Ring-0 heap, slab, and physical-frame telemetry snapshot.
+    pub const fn mem_telemetry(&self) -> MemTelemetry {
+        self.mem_telemetry
+    }
+
+    /// Format `self.mem_telemetry` into `out` (`mem: heap_used=... alloc_failures=...\n`).
+    pub fn cmd_mem(&self, out: &mut [u8]) -> usize {
+        let m = &self.mem_telemetry;
+        let mut pos = 0usize;
+        pos += copy_into(b"mem: heap_used=", &mut out[pos..]);
+        pos += dec_u64(m.heap_used_bytes, &mut out[pos..]);
+        pos += copy_into(b" heap_free=", &mut out[pos..]);
+        pos += dec_u64(m.heap_free_bytes, &mut out[pos..]);
+        pos += copy_into(b" heap_peak=", &mut out[pos..]);
+        pos += dec_u64(m.heap_peak_bytes, &mut out[pos..]);
+        pos += copy_into(b" slab_active=", &mut out[pos..]);
+        pos += dec_u64(m.slab_active as u64, &mut out[pos..]);
+        pos += copy_into(b" slab_cached=", &mut out[pos..]);
+        pos += dec_u64(m.slab_cached_empty as u64, &mut out[pos..]);
+        pos += copy_into(b" large_spans=", &mut out[pos..]);
+        pos += dec_u64(m.large_spans as u64, &mut out[pos..]);
+        pos += copy_into(b" phys_free=", &mut out[pos..]);
+        pos += dec_u64(m.phys_free_frames, &mut out[pos..]);
+        pos += copy_into(b" phys_total=", &mut out[pos..]);
+        pos += dec_u64(m.phys_total_frames, &mut out[pos..]);
+        pos += copy_into(b" alloc_failures=", &mut out[pos..]);
+        pos += dec_u64(m.alloc_failures, &mut out[pos..]);
+        pos += copy_into(b"\n", &mut out[pos..]);
+        pos
     }
 
     /// Re-mark all `SqlDb` and `MemRamFs` pages dirty so a retry after an I/O fault resyncs in full.
@@ -1582,6 +1664,11 @@ impl OsShell {
                 let n = self
                     .exec_line(mb_body, boots, 0, 0, resp_out)
                     .bytes_written();
+                (200u16, n)
+            }
+            IpcOp::HttpGetMemTelemetry => {
+                self.record_audit(24, AuditVerdict::Allowed, b"net:http:mem");
+                let n = self.cmd_mem(resp_out);
                 (200u16, n)
             }
             IpcOp::HttpGetDashboard => {
@@ -3889,6 +3976,12 @@ impl OsShell {
 
         if bytes_eq(cmd, b"attest") {
             let n = self.cmd_attest(boots, rest, out);
+            return ShellAction::Continue(n);
+        }
+
+        if bytes_eq(cmd, b"mem") {
+            self.record_audit(24, AuditVerdict::Allowed, b"shell:mem");
+            let n = self.cmd_mem(out);
             return ShellAction::Continue(n);
         }
 

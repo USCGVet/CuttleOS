@@ -148,6 +148,24 @@ pub(crate) fn phys_mm_stats() -> target_enterprise::phys_mm::PhysMmStats {
     with_phys_mm_lock(|pmm| pmm.stats())
 }
 
+/// Refresh `sh`'s live Ring-0 heap, slab, and physical-frame telemetry snapshot.
+pub(crate) fn refresh_shell_mem_telemetry(sh: &mut target_enterprise::OsShell) {
+    let hs = heap::stats();
+    let ss = heap::slab_stats();
+    let ps = phys_mm_stats();
+    sh.set_mem_telemetry(target_enterprise::shell::MemTelemetry {
+        heap_used_bytes: hs.used as u64,
+        heap_free_bytes: hs.free as u64,
+        heap_peak_bytes: heap::peak_used_bytes().max(ss.peak_used_bytes) as u64,
+        slab_active: ss.active_slabs.min(u32::MAX as usize) as u32,
+        slab_cached_empty: ss.empty_cached_slabs.min(u32::MAX as usize) as u32,
+        large_spans: ss.active_large_spans.min(u32::MAX as usize) as u32,
+        phys_free_frames: ps.free_frames as u64,
+        phys_total_frames: ps.total_usable_frames as u64,
+        alloc_failures: heap::alloc_failures(),
+    });
+}
+
 /// Allocate one zero-scrubbed 4 KiB physical frame from `KERNEL_PHYS_MM`.
 pub(crate) fn alloc_phys_frame_zeroed() -> Option<u64> {
     if !phys_mm_is_initialized() {
@@ -275,7 +293,7 @@ pub(crate) fn set_phys_offset(boot: &BootInfo) {
         if r.kind != MemoryRegionKind::Usable {
             continue;
         }
-        let start = r.start;
+        let start = r.start.max(0x10_0000);
         let end = r.end.min(0x1_0000_0000); // stay below 4 GiB
         if end <= start {
             continue;

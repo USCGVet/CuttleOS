@@ -21,6 +21,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -609,6 +610,7 @@ dependencies = [
 name = "target_enterprise"
 version = "0.0.1"
 dependencies = [
+ "aes",
  "aes-gcm",
  "chacha20poly1305",
  "cuttle-contracts",

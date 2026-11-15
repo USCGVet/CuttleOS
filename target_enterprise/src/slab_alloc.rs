@@ -88,6 +88,10 @@ pub struct SlabStats {
     pub total_allocs: u64,
     /// Cumulative deallocation count.
     pub total_deallocs: u64,
+    /// High-water mark of `used_bytes` since initialization.
+    pub peak_used_bytes: usize,
+    /// Cumulative failed `alloc` attempts.
+    pub alloc_failures: u64,
 }
 
 #[derive(Copy, Clone)]
@@ -238,6 +242,8 @@ pub struct SlabAllocator<
     active_large_spans: usize,
     total_allocs: u64,
     total_deallocs: u64,
+    peak_used_bytes: usize,
+    alloc_failures: u64,
 }
 
 /// Default kernel slab allocator configuration (`2,048` slabs + `512` large spans).
@@ -279,6 +285,8 @@ impl<
             active_large_spans: 0,
             total_allocs: 0,
             total_deallocs: 0,
+            peak_used_bytes: 0,
+            alloc_failures: 0,
         }
     }
 
@@ -298,10 +306,12 @@ impl<
             active_large_spans: self.active_large_spans,
             total_allocs: self.total_allocs,
             total_deallocs: self.total_deallocs,
+            peak_used_bytes: self.peak_used_bytes,
+            alloc_failures: self.alloc_failures,
         }
     }
 
-    /// Return `true` iff `ptr_va` belongs to a slab page or large span managed by `self`.
+    /// Return `true` iff `ptr_va` belongs to a slab page or large span (including interior pages) managed by `self`.
     pub fn owns_address(&self, ptr_va: usize) -> bool {
         if ptr_va == 0 {
             return false;
@@ -310,7 +320,49 @@ impl<
         if self.find_slab_by_page(page_va).is_some() {
             return true;
         }
-        self.find_large_by_base(page_va).is_some()
+        if self.find_large_by_base(page_va).is_some() {
+            return true;
+        }
+        let mut i = 0usize;
+        while i < MAX_LARGE {
+            let span = &self.large_spans[i];
+            if span.page_count > 0 && page_va >= span.base_va {
+                let end_va = span
+                    .base_va
+                    .saturating_add(span.page_count.saturating_mul(SLAB_PAGE_BYTES));
+                if page_va < end_va {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Return the full backing slot or multi-page span byte size for a valid allocation base `ptr_va`,
+    /// allowing `GlobalAlloc::dealloc` to zero-scrub the entire slot/span (including trailing padding).
+    pub fn slot_or_span_bytes(&self, ptr_va: usize) -> Option<usize> {
+        if ptr_va == 0 {
+            return None;
+        }
+        let page_va = ptr_va & !(SLAB_PAGE_BYTES - 1);
+        if let Some(desc_idx) = self.find_slab_by_page(page_va) {
+            let class_bytes = CLASS_SIZES[self.slabs[desc_idx].class_idx as usize];
+            if ((ptr_va - page_va) % class_bytes) == 0 {
+                return Some(class_bytes);
+            }
+            return None;
+        }
+        if (ptr_va & (SLAB_PAGE_BYTES - 1)) == 0 {
+            if let Some(slot_idx) = self.find_large_by_base(ptr_va) {
+                return Some(
+                    self.large_spans[slot_idx]
+                        .page_count
+                        .saturating_mul(SLAB_PAGE_BYTES),
+                );
+            }
+        }
+        None
     }
 
     /// Allocate a block satisfying `(size, align)` using `backend` for new physical pages.
@@ -321,12 +373,22 @@ impl<
         backend: &mut B,
     ) -> Option<usize> {
         if align == 0 || !align.is_power_of_two() {
+            self.alloc_failures = self.alloc_failures.wrapping_add(1);
             return None;
         }
-        if let Some(c) = size_class_for(size, align) {
-            return self.alloc_small(c, backend);
+        let res = if let Some(c) = size_class_for(size, align) {
+            self.alloc_small(c, backend)
+        } else {
+            self.alloc_large(size, align, backend)
+        };
+        if res.is_some() {
+            if self.used_bytes > self.peak_used_bytes {
+                self.peak_used_bytes = self.used_bytes;
+            }
+        } else {
+            self.alloc_failures = self.alloc_failures.wrapping_add(1);
         }
-        self.alloc_large(size, align, backend)
+        res
     }
 
     fn alloc_small<B: PageBackend>(&mut self, c: usize, backend: &mut B) -> Option<usize> {
@@ -385,9 +447,26 @@ impl<
             return Some(self.slabs[s_idx].page_va + slot * class_bytes);
         }
 
-        // 3. Allocate a fresh 4 KiB slab page from `backend`.
-        let desc_idx = self.find_free_slab_slot()?;
-        let page_va = backend.alloc_pages(1, 1)?;
+        // 3. Allocate a fresh 4 KiB slab page from `backend` (reclaiming a warm cached empty slab
+        //    from another size class on demand if descriptor slots or physical frames are full).
+        let desc_idx = match self.find_free_slab_slot() {
+            Some(idx) => idx,
+            None => {
+                if !self.reclaim_one_cached_empty(backend) {
+                    return None;
+                }
+                self.find_free_slab_slot()?
+            }
+        };
+        let page_va = match backend.alloc_pages(1, 1) {
+            Some(va) => va,
+            None => {
+                if !self.reclaim_one_cached_empty(backend) {
+                    return None;
+                }
+                backend.alloc_pages(1, 1)?
+            }
+        };
         if page_va == 0 || (page_va & (SLAB_PAGE_BYTES - 1)) != 0 {
             backend.free_pages(page_va, 1);
             return None;
@@ -422,7 +501,15 @@ impl<
             align / SLAB_PAGE_BYTES
         };
         let slot_idx = self.find_free_large_slot()?;
-        let base_va = backend.alloc_pages(pages, align_pages)?;
+        let base_va = match backend.alloc_pages(pages, align_pages) {
+            Some(va) => va,
+            None => {
+                if self.reclaim_empty_slabs(backend) == 0 {
+                    return None;
+                }
+                backend.alloc_pages(pages, align_pages)?
+            }
+        };
         if base_va == 0 || (base_va & (SLAB_PAGE_BYTES - 1)) != 0 {
             backend.free_pages(base_va, pages);
             return None;
@@ -502,7 +589,10 @@ impl<
             return Err(SlabError::MisalignedSlot);
         }
         let req_bytes = if size == 0 { 1 } else { size };
-        let expected_pages = (req_bytes + SLAB_PAGE_BYTES - 1) / SLAB_PAGE_BYTES;
+        let expected_pages = req_bytes
+            .checked_add(SLAB_PAGE_BYTES - 1)
+            .ok_or(SlabError::LayoutMismatch)?
+            / SLAB_PAGE_BYTES;
         let Some(slot_idx) = self.find_large_by_base(ptr_va) else {
             return Err(SlabError::UnknownAddress);
         };
@@ -522,6 +612,35 @@ impl<
         self.total_deallocs = self.total_deallocs.wrapping_add(1);
         backend.free_pages(ptr_va, pages);
         Ok(span_bytes)
+    }
+
+    /// Release a single warm cached empty 4 KiB slab page back to `backend` to relieve
+    /// descriptor or physical-frame pressure during cross-class bursts.
+    fn reclaim_one_cached_empty<B: PageBackend>(&mut self, backend: &mut B) -> bool {
+        let mut s = 0usize;
+        while s < MAX_SLABS {
+            if self.slabs[s].page_va != 0 && self.slabs[s].in_use == 0 {
+                let page_va = self.slabs[s].page_va;
+                let c = self.slabs[s].class_idx as usize;
+                self.remove_slab_hash(page_va);
+                self.slabs[s] = SlabMeta::empty();
+                self.active_slabs -= 1;
+                self.mapped_pages -= 1;
+                if self.class_empty_count[c] > 0 {
+                    self.class_empty_count[c] -= 1;
+                }
+                if self.class_hint[c] == s as u16 {
+                    self.class_hint[c] = EMPTY_BUCKET;
+                }
+                if s < self.slab_free_cursor {
+                    self.slab_free_cursor = s;
+                }
+                backend.free_pages(page_va, 1);
+                return true;
+            }
+            s += 1;
+        }
+        false
     }
 
     /// Release all warm cached empty 4 KiB slab pages back to `backend`, returning the
@@ -871,5 +990,58 @@ mod tests {
             initial_frames,
             "100,000-cycle slab + multi-page churn must leak zero physical frames"
         );
+    }
+
+    #[test]
+    fn warm_cached_slabs_reclaim_under_pressure_and_large_span_interior_checked() {
+        let mut backend = SimPhysPageBackend::new_16mib();
+        // Small descriptor table (`MAX_SLABS = 8`) to deterministically exercise descriptor pressure.
+        let mut slab: SlabAllocator<8, 16, 4, 8> = SlabAllocator::empty();
+
+        // Fill all 8 SlabDescriptor slots using class 6 (`2048 B`, 2 slots per 4 KiB page => 16 objects).
+        let mut c6 = [0usize; 16];
+        for slot in &mut c6 {
+            *slot = slab
+                .alloc(2048, 16, &mut backend)
+                .expect("8 slab pages in class 6 must fit MAX_SLABS=8");
+        }
+        // Free the first 4 objects (2 full pages), leaving 2 warm cached empty slabs + 6 active slabs = 8/8 descriptors!
+        for &va in &c6[..4] {
+            slab.dealloc(va, 2048, 16, &mut backend).unwrap();
+        }
+        assert_eq!(slab.stats().empty_cached_slabs, 2);
+        assert_eq!(slab.stats().active_slabs, 8);
+
+        // Request a `64 B` object (class 1): all 8 SlabDescriptor slots are occupied (6 active + 2 cached),
+        // so `alloc` MUST reclaim a warm cached slab from class 6 instead of failing OOM!
+        let small_va = slab
+            .alloc(64, 64, &mut backend)
+            .expect("alloc_small must reclaim warm cached slab when MAX_SLABS descriptors are full");
+        slab.dealloc(small_va, 64, 64, &mut backend).unwrap();
+        for &va in &c6[4..] {
+            slab.dealloc(va, 2048, 16, &mut backend).unwrap();
+        }
+        let _ = slab.reclaim_empty_slabs(&mut backend);
+
+        // Allocate a 3-page (`12,288 B`) LargeSpan and verify interior page VAs report `owns_address == true`
+        // and `usize::MAX` dealloc size fails closed with `LayoutMismatch` instead of overflowing.
+        let span_va = slab
+            .alloc(12_288, 4096, &mut backend)
+            .expect("3-page LargeSpan must allocate");
+        assert!(slab.owns_address(span_va));
+        assert!(
+            slab.owns_address(span_va + SLAB_PAGE_BYTES),
+            "interior page +4096 of multi-page LargeSpan must be owned by SlabAllocator"
+        );
+        assert!(
+            slab.owns_address(span_va + 2 * SLAB_PAGE_BYTES),
+            "interior page +8192 of multi-page LargeSpan must be owned by SlabAllocator"
+        );
+        assert_eq!(
+            slab.dealloc(span_va, usize::MAX, 4096, &mut backend),
+            Err(SlabError::LayoutMismatch),
+            "usize::MAX dealloc size must fail closed without arithmetic overflow"
+        );
+        slab.dealloc(span_va, 12_288, 4096, &mut backend).unwrap();
     }
 }

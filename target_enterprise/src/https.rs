@@ -374,14 +374,19 @@ impl TlsSession {
         self.rx.len()
     }
 
+    #[cfg(test)]
+    fn rx_raw_parts_for_test(&self) -> (*const u8, usize, usize) {
+        (self.rx.as_ptr(), self.rx.len(), self.rx.capacity())
+    }
+
     /// Ciphertext waiting to be transmitted across the wire.
     pub fn pending_tx(&self) -> &[u8] {
         &self.tx
     }
 
-    /// Drop the first `n` transmitted bytes from the queue.
+    /// Drop the first `n` transmitted bytes from the queue and zero-scrub the vacated tail.
     pub fn consume_tx(&mut self, n: usize) {
-        self.tx.drain(..n.min(self.tx.len()));
+        drain_prefix_and_scrub(&mut self.tx, n);
     }
 
     /// The handshake has completed (application data may flow).
@@ -412,8 +417,7 @@ impl TlsSession {
             let state = match state {
                 Ok(state) => state,
                 Err(err) => {
-                    self.rx.drain(..discard.min(self.rx.len()));
-                    self.failed = true;
+                    self.fail_and_scrub();
                     self.flush_alerts();
                     return Err(SessionError::Tls(err));
                 }
@@ -501,17 +505,17 @@ impl TlsSession {
                 // state is a future rustls addition we do not drive.
                 _ => stop = true,
             }
-            self.rx.drain(..discard.min(self.rx.len()));
+            drain_prefix_and_scrub(&mut self.rx, discard);
             if plaintext_overflow {
                 self.clear_plaintext_and_scrub();
                 return Err(SessionError::Overflow);
             }
             if overflow {
-                self.failed = true;
+                self.fail_and_scrub();
                 return Err(SessionError::Overflow);
             }
             if let Some(err) = tls_error {
-                self.failed = true;
+                self.fail_and_scrub();
                 self.flush_alerts();
                 return Err(SessionError::Tls(err));
             }
@@ -523,6 +527,12 @@ impl TlsSession {
             Some(_) => Err(SessionError::NotReady),
             None => Ok(()),
         }
+    }
+
+    fn fail_and_scrub(&mut self) {
+        self.failed = true;
+        scrub_vec_all_bytes(&mut self.rx);
+        scrub_vec_all_bytes(&mut self.plaintext);
     }
 
     /// After a fatal error rustls queues an alert; encode it into `tx`.
@@ -570,6 +580,27 @@ pub(crate) fn scrub_vec_all_bytes(v: &mut Vec<u8>) {
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
     v.clear();
+}
+
+/// Remove the first `n.min(v.len())` bytes from `v` and volatile-zeroize the newly vacated
+/// spare tail `[v.len() .. prev_len]` so in-place decrypted TLS 1.3 records never linger in heap memory.
+fn drain_prefix_and_scrub(v: &mut Vec<u8>, n: usize) {
+    let take = n.min(v.len());
+    if take == 0 {
+        return;
+    }
+    let prev_len = v.len();
+    v.drain(..take);
+    let new_len = v.len();
+    let ptr = v.as_mut_ptr();
+    let mut i = new_len;
+    while i < prev_len {
+        // SAFETY: `v` owned at least `prev_len` bytes before `drain`, and `Vec::drain` shifts `[take..prev_len]`
+        // down to `[0..new_len]` without shrinking `v.capacity()`, so `ptr.add(i)` is valid for writes.
+        unsafe { core::ptr::write_volatile(ptr.add(i), 0) };
+        i += 1;
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 /// Run `encrypt` against the tail of `tx`, growing it until the record fits.
@@ -988,6 +1019,47 @@ mod tests {
         assert!(
             spare.iter().all(|&b| b == 0),
             "clear_plaintext_and_scrub must zeroize residual plaintext in spare capacity"
+        );
+    }
+
+    #[test]
+    fn tls_session_scrubs_inplace_decrypted_rx_buffer_and_failed_buffers() {
+        let _guard = crate::tls_provider::GOLDEN_LOCK.lock();
+        crate::tls_provider::reset_golden_rng(golden::RNG_SEED);
+        let id = ServerIdentity::derive(&golden::IDENTITY_SECRET, golden::MAC);
+        let config = server_config(&id, crate::tls_provider::golden_provider()).unwrap();
+        let mut session = TlsSession::new(config).unwrap();
+
+        // Flights 0..=1 complete the TLS 1.3 handshake; flight 2 is an encrypted `GET /healthz` record.
+        session.receive(kf::HTTPS_GOLDEN_CLIENT_FLIGHTS[0]).unwrap();
+        let tx0 = session.pending_tx().len();
+        session.consume_tx(tx0);
+        session.receive(kf::HTTPS_GOLDEN_CLIENT_FLIGHTS[1]).unwrap();
+        let tx1 = session.pending_tx().len();
+        session.consume_tx(tx1);
+
+        let app_flight = kf::HTTPS_GOLDEN_CLIENT_FLIGHTS[2];
+        session.receive(app_flight).unwrap();
+        assert!(
+            session.plaintext().windows(8).any(|w| w == b"/healthz"),
+            "decrypted HTTP request must arrive in plaintext buffer"
+        );
+
+        // rustls UnbufferedServerConnection decrypts TLS 1.3 records IN PLACE inside `self.rx`
+        // before `self.rx` discards those record bytes. Verify zero residual plaintext in `rx` spare bytes!
+        let (rx_ptr, rx_len, rx_cap) = session.rx_raw_parts_for_test();
+        assert_eq!(rx_len, 0);
+        let inspected = app_flight.len().min(rx_cap);
+        assert!(inspected >= 32);
+        // SAFETY: `0..inspected` was initialized when `receive(app_flight)` extended `self.rx`.
+        let rx_spare = unsafe { core::slice::from_raw_parts(rx_ptr, inspected) };
+        assert!(
+            !rx_spare.windows(8).any(|w| w == b"/healthz"),
+            "in-place decrypted HTTP plaintext leaked in TlsSession.rx spare capacity"
+        );
+        assert!(
+            rx_spare.iter().all(|&b| b == 0),
+            "TlsSession.rx spare capacity must be zero-scrubbed after record discard"
         );
     }
 }

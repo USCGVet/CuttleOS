@@ -17,7 +17,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use linked_list_allocator::Heap as FallbackHeap;
 use target_enterprise::phys_mm::scrub_frame_bytes;
 use target_enterprise::slab_alloc::{KernelSlabAllocator, PageBackend, SlabStats};
@@ -39,6 +39,8 @@ static FALLBACK_REGION: SyncHeapRegion = SyncHeapRegion(UnsafeCell::new(HeapRegi
 static FALLBACK_START: AtomicUsize = AtomicUsize::new(0);
 static FALLBACK_END: AtomicUsize = AtomicUsize::new(0);
 static HEAP_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static PEAK_USED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 struct HeapInner {
     slab: KernelSlabAllocator,
@@ -116,19 +118,37 @@ struct EnterpriseGlobalAlloc;
 unsafe impl GlobalAlloc for EnterpriseGlobalAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if !HEAP_INITIALIZED.load(Ordering::Acquire) {
+            ALLOC_FAILURES.fetch_add(1, Ordering::Relaxed);
             return ptr::null_mut();
         }
         with_heap_lock(|inner| {
             let mut backend = KernelPhysBackend;
             if crate::phys_mm_is_initialized() {
                 if let Some(va) = inner.slab.alloc(layout.size(), layout.align(), &mut backend) {
+                    let cur = inner
+                        .slab
+                        .stats()
+                        .used_bytes
+                        .saturating_add(inner.fallback.used());
+                    PEAK_USED_BYTES.fetch_max(cur, Ordering::Relaxed);
                     return va as *mut u8;
                 }
             }
-            inner
-                .fallback
-                .allocate_first_fit(layout)
-                .map_or(ptr::null_mut(), |nn| nn.as_ptr())
+            match inner.fallback.allocate_first_fit(layout) {
+                Ok(nn) => {
+                    let cur = inner
+                        .slab
+                        .stats()
+                        .used_bytes
+                        .saturating_add(inner.fallback.used());
+                    PEAK_USED_BYTES.fetch_max(cur, Ordering::Relaxed);
+                    nn.as_ptr()
+                }
+                Err(()) => {
+                    ALLOC_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    ptr::null_mut()
+                }
+            }
         })
     }
 
@@ -157,11 +177,15 @@ unsafe impl GlobalAlloc for EnterpriseGlobalAlloc {
                 return;
             }
 
-            // Scrub small-slot bytes BEFORE releasing the slot bit (if `dealloc` reclaims the
-            // entire page, `KernelPhysBackend::free_pages` also scrubs the full 4 KiB frame).
-            if layout.size() > 0 {
-                // SAFETY: Caller guarantees `(ptr, layout)` is a live allocation owned by `inner.slab`.
-                let slice = unsafe { core::slice::from_raw_parts_mut(ptr, layout.size()) };
+            // Scrub the ENTIRE owning slab slot or multi-page span (including trailing padding bytes
+            // beyond `layout.size()`) BEFORE releasing the slot bit!
+            let scrub_len = inner
+                .slab
+                .slot_or_span_bytes(addr)
+                .unwrap_or(layout.size());
+            if scrub_len > 0 {
+                // SAFETY: `addr` is a live allocation base owned by `inner.slab` with backing capacity `scrub_len`.
+                let slice = unsafe { core::slice::from_raw_parts_mut(ptr, scrub_len) };
                 scrub_frame_bytes(slice);
             }
             let mut backend = KernelPhysBackend;
@@ -235,6 +259,16 @@ pub fn reclaim_empty_slabs() -> usize {
     })
 }
 
+/// Return the high-water mark of simultaneously allocated heap bytes since boot.
+pub fn peak_used_bytes() -> usize {
+    PEAK_USED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Return the cumulative count of failed global allocator requests since boot.
+pub fn alloc_failures() -> u64 {
+    ALLOC_FAILURES.load(Ordering::Relaxed)
+}
+
 /// Return `true` iff allocating `requested` bytes preserves at least
 /// [`KERNEL_HEAP_RESERVE_BYTES`] of free Ring-0 emergency headroom.
 pub fn has_headroom(requested: usize) -> bool {
@@ -242,10 +276,11 @@ pub fn has_headroom(requested: usize) -> bool {
         return false;
     }
     let st = stats();
-    target_enterprise::memory::kernel_guards::heap_has_headroom(
-        st.used,
-        st.total,
-        requested,
-        KERNEL_HEAP_RESERVE_BYTES,
-    )
+    requested <= st.free.saturating_sub(KERNEL_HEAP_RESERVE_BYTES)
+        && target_enterprise::memory::kernel_guards::heap_has_headroom(
+            st.used,
+            st.total,
+            requested,
+            KERNEL_HEAP_RESERVE_BYTES,
+        )
 }
