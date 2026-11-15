@@ -62,6 +62,23 @@ HISTORY_LEN = 60
 # config
 # --------------------------------------------------------------------------------------------
 
+MEMORY_SPEC_RE = re.compile(r"^(\d+)([MmGg])$")
+_FARM_SHUTDOWN_LOCK = threading.Lock()
+
+
+def _parse_memory_mb(raw_mem: str, where: str = "plan") -> int:
+    if not isinstance(raw_mem, str):
+        raise ValueError(f"{where}: memory {raw_mem!r} must be a string like '128M' or '1G'")
+    m = MEMORY_SPEC_RE.match(raw_mem.strip())
+    if not m:
+        raise ValueError(f"{where}: memory {raw_mem!r} must match '<int><M|G>' (e.g. '128M')")
+    val = int(m.group(1))
+    mem_mb = val * 1024 if m.group(2).upper() == "G" else val
+    if not (64 <= mem_mb <= 2048):
+        raise ValueError(f"{where}: memory {raw_mem!r} ({mem_mb} MiB) must be between 64M and 2048M")
+    return mem_mb
+
+
 def load_fleet_config(path: Path = FLEET_CONFIG) -> dict:
     cfg = tomllib.loads(path.read_text(encoding="utf-8"))
     jobs, plans, clients = cfg.get("jobs", {}), cfg.get("plans", {}), cfg.get("clients", [])
@@ -86,6 +103,7 @@ def load_fleet_config(path: Path = FLEET_CONFIG) -> dict:
         vcpus = plan.get("vcpus", 2)
         if not isinstance(vcpus, int) or isinstance(vcpus, bool) or not (1 <= vcpus <= 64):
             raise ValueError(f"plan '{plan_id}': vcpus {vcpus!r} must be an integer in 1..64")
+        _parse_memory_mb(plan.get("memory", "128M"), f"plan '{plan_id}'")
     for where, value in [("provider", cfg.get("provider", {}).get("accelerator"))] + [
         (f"plan '{p}'", v.get("accelerator")) for p, v in plans.items()
     ]:
@@ -247,7 +265,7 @@ class Farm:
         self.triads: dict = {}
         for spec in triad_specs(cfg, client):
             self.triads[spec.job] = tc.TriadController(show_gui=False, spec=spec)
-        self.load_enabled = bool(cfg["provider"].get("synthetic_load", True))
+        self.load_enabled = bool(cfg["provider"].get("synthetic_load", False))
         self.auth_fail_limit = int(cfg["provider"].get("auth_fail_limit", 40))
         self._auth_rate_lock = threading.Lock()
         self._auth_fail_by_ip: dict[str, list[float]] = {}
@@ -255,6 +273,7 @@ class Farm:
         self.boot_error = None
         self.started_at = time.time()
         self.running = True
+        self._shutting_down = False
         self.kpi: dict = {job: {} for job in self.triads}
         self.history: dict = {job: {"reqs_rate": [], "online": []} for job in self.triads}
         self._last_reqs: dict = {}
@@ -273,7 +292,11 @@ class Farm:
         threading.Thread(target=self._load_loop, daemon=True).start()
 
     def shutdown(self):
-        self.running = False
+        with _FARM_SHUTDOWN_LOCK:
+            if getattr(self, "_shutting_down", False):
+                return
+            self._shutting_down = True
+            self.running = False
         for ctrl in self.triads.values():
             ctrl.shutdown()
 
@@ -610,6 +633,7 @@ class Provider:
         self.farm_jobs: dict = {}
         self.cache: dict = {cid: None for cid in self.clients}
         self.lock = threading.Lock()
+        self.client_locks: dict[str, threading.Lock] = {cid: threading.Lock() for cid in self.clients}
         self.auth_fail_limit = int(cfg["provider"].get("auth_fail_limit", 40))
         self._auth_rate_lock = threading.Lock()
         self._auth_fail_by_ip: dict[str, list[float]] = {}
@@ -632,58 +656,76 @@ class Provider:
         return self.cfg["provider"]["farm_port_base"] + client_slot(self.cfg, cid)
 
     def start_farm(self, cid: str):
-        with self.lock:
-            if cid in self.token_errors:
-                self.status[cid] = "error"
-                return
-            p = self.procs.get(cid)
-            if p and p.poll() is None:
-                return
-            env = dict(os.environ)
-            env[FARM_SECRET_ENV] = self.farm_secrets[cid]
-            env[FLEET_DIR_ENV] = str(fleet_dir())
-            env["CUTTLE_FLEET_CONFIG"] = str(self.config_path)
-            with open(fleet_dir() / cid / "farm.log", "a", encoding="utf-8") as log:
-                self.procs[cid] = subprocess.Popen(
-                    [sys.executable, str(Path(__file__).resolve()), "farm", "--client", cid],
-                    stdin=subprocess.PIPE,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    env=env,
-                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        with self.client_locks[cid]:
+            with self.lock:
+                if cid in self.token_errors:
+                    self.status[cid] = "error"
+                    return
+                p = self.procs.get(cid)
+                if p and p.poll() is None:
+                    return
+                plan = self.cfg["plans"][self.clients[cid]["plan"]]
+                plan_jobs = plan.get("jobs", [])
+                mem_mb = _parse_memory_mb(str(plan.get("memory", "128M")), f"plan '{self.clients[cid]['plan']}'")
+                job_mem_mb = max(2048, 3 * len(plan_jobs) * mem_mb + 512)
+                env = dict(os.environ)
+                env[FARM_SECRET_ENV] = self.farm_secrets[cid]
+                env[FLEET_DIR_ENV] = str(fleet_dir())
+                env["CUTTLE_FLEET_CONFIG"] = str(self.config_path)
+                (fleet_dir() / cid).mkdir(parents=True, exist_ok=True)
+                with open(fleet_dir() / cid / "farm.log", "a", encoding="utf-8") as log:
+                    self.procs[cid] = subprocess.Popen(
+                        [sys.executable, str(Path(__file__).resolve()), "farm", "--client", cid],
+                        stdin=subprocess.PIPE,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        env=env,
+                        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                        start_new_session=(os.name != "nt"),
+                    )
+                self.farm_jobs[cid] = tc.apply_host_resource_limits(
+                    self.procs[cid], max_memory_mb=job_mem_mb, cpu_rate_pct=90
                 )
-            self.farm_jobs[cid] = tc.apply_host_resource_limits(self.procs[cid], max_memory_mb=2048, cpu_rate_pct=90)
-            self.status[cid] = "starting"
-            self.cache[cid] = None
+                self.status[cid] = "starting"
+                self.cache[cid] = None
 
     def stop_farm(self, cid: str):
-        p = self.procs.get(cid)
-        if not p or p.poll() is not None:
-            if p and p.stdin:
+        import signal as _sig
+
+        with self.client_locks[cid]:
+            p = self.procs.get(cid)
+            if not p or p.poll() is not None:
+                if p and p.stdin:
+                    try:
+                        p.stdin.close()
+                    except OSError:
+                        pass
+                tc.close_host_resource_limits(self.farm_jobs.pop(cid, None))
+                self.status[cid] = "stopped"
+                return
+            self.status[cid] = "stopping"
+            try:
+                self.farm_request(cid, "POST", "/api/shutdown", b"", timeout=5.0)
+            except Exception:
+                pass
+            if p.stdin:
                 try:
                     p.stdin.close()
                 except OSError:
                     pass
+            try:
+                p.wait(timeout=30.0)
+            except subprocess.TimeoutExpired:
+                if os.name != "nt" and hasattr(os, "killpg"):
+                    try:
+                        os.killpg(p.pid, _sig.SIGKILL)
+                    except OSError:
+                        p.kill()
+                else:
+                    p.kill()
             tc.close_host_resource_limits(self.farm_jobs.pop(cid, None))
             self.status[cid] = "stopped"
-            return
-        self.status[cid] = "stopping"
-        try:
-            self.farm_request(cid, "POST", "/api/shutdown", b"", timeout=5.0)
-        except Exception:
-            pass
-        if p.stdin:
-            try:
-                p.stdin.close()
-            except OSError:
-                pass
-        try:
-            p.wait(timeout=30.0)
-        except subprocess.TimeoutExpired:
-            p.kill()
-        tc.close_host_resource_limits(self.farm_jobs.pop(cid, None))
-        self.status[cid] = "stopped"
-        self.cache[cid] = None
+            self.cache[cid] = None
 
     def farm_request(self, cid: str, method: str, path: str, body: bytes = b"", timeout: float = 30.0):
         req = urllib.request.Request(
@@ -703,12 +745,12 @@ class Provider:
         if not p:
             return
         if p.poll() is not None:
-            if self.status[cid] not in ("stopped", "stopping"):
+            if self.procs.get(cid) is p and self.status[cid] not in ("stopped", "stopping"):
                 self.status[cid] = "error"
             return
         try:
             code, _, raw = self.farm_request(cid, "GET", "/api/farm", timeout=4.0)
-            if code == 200:
+            if code == 200 and self.procs.get(cid) is p:
                 summary = json.loads(raw)
                 self.cache[cid] = summary
                 if summary.get("boot_error"):
@@ -718,7 +760,7 @@ class Provider:
                 else:
                     self.status[cid] = "booting"
         except Exception:
-            if self.status[cid] == "running":
+            if self.procs.get(cid) is p and self.status[cid] == "running":
                 self.status[cid] = "unreachable"
 
     def poll_once(self) -> None:
@@ -873,7 +915,12 @@ class ProviderHandler(tc.TriadHttpHandler):
             elif rest == "/stop":
                 threading.Thread(target=self.provider.stop_farm, args=(cid,), daemon=True).start()
             else:
-                code, ctype, raw = self.provider.farm_request(cid, "POST", "/api/load", b"")
+                if self.provider.status[cid] in ("stopped", "stopping", "error"):
+                    return self._send_json(503, {"ok": False, "error": f"farm is {self.provider.status[cid]}"})
+                try:
+                    code, ctype, raw = self.provider.farm_request(cid, "POST", "/api/load", b"")
+                except Exception as e:
+                    return self._send_json(502, {"ok": False, "error": f"farm unreachable: {e}"})
                 return self._send_raw(code, ctype, raw)
             return self._send_json(200, {"ok": True, "status": self.provider.status[cid]})
         if method == "GET" and rest == "/farm":
@@ -890,7 +937,7 @@ class ProviderHandler(tc.TriadHttpHandler):
         return self._send_raw(code, ctype, raw)
 
 
-def run_provider(config_path: Path = FLEET_CONFIG):
+def run_provider(config_path: Path = FLEET_CONFIG, print_token: bool = False):
     cfg = load_fleet_config(config_path)
     provider = Provider(cfg, config_path)
     ProviderHandler.provider = provider
@@ -899,10 +946,15 @@ def run_provider(config_path: Path = FLEET_CONFIG):
     threading.Thread(target=provider.poll_loop, daemon=True).start()
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
+    tok_disp = (
+        f"{provider.provider_token} (saved to {fleet_dir() / 'provider_token.txt'})"
+        if print_token
+        else f"[masked; saved to {fleet_dir() / 'provider_token.txt'} — pass --print-token to display]"
+    )
     print("\n============================================================================", flush=True)
     print("  CUTTLE FLEET PROVIDER ONLINE", flush=True)
     print(f"  Console        : http://127.0.0.1:{port}/fleet", flush=True)
-    print(f"  Provider token : {provider.provider_token} (saved to {fleet_dir() / 'provider_token.txt'})", flush=True)
+    print(f"  Provider token : {tok_disp}", flush=True)
     print(f"  Client tokens  : {fleet_dir()}\\<client>\\client_token.txt", flush=True)
     vms = sum(3 * len(cfg["plans"][c["plan"]]["jobs"]) for c in cfg["clients"])
     print(f"  Clients        : {len(cfg['clients'])} farms, {vms} VMs; farm logs in {fleet_dir()}\\<client>\\farm.log", flush=True)
@@ -1291,6 +1343,62 @@ def run_fleet_unit_tests(work: Path):
                 assert e.code == 429, f"Expected 429 on FarmHandler, got {e.code}"
         finally:
             f_srv.shutdown()
+
+        # Stage D fleet coordinator hardening tests:
+        # 1) synthetic_load defaults to False when omitted from [provider]:
+        assert norm_cfg["provider"].get("synthetic_load", False) is False
+        dummy_farm_def = object.__new__(Farm)
+        dummy_farm_def.load_enabled = bool(norm_cfg["provider"].get("synthetic_load", False))
+        # Verify Farm.__init__ default via a minimal no-boot check on load_fleet_config:
+        for bad_mem_label, bad_mem_val in (("zero_mem", '"0M"'), ("huge_mem", '"8192M"'), ("bad_mem", '"xyz"')):
+            bm_p = work / f"sd_{bad_mem_label}.toml"
+            bm_p.write_text(
+                SELFTEST_CONFIG + f'\n[plans.badm]\njobs = ["web"]\nmemory = {bad_mem_val}\n',
+                encoding="utf-8",
+            )
+            try:
+                load_fleet_config(bm_p)
+                raise AssertionError(f"load_fleet_config must reject {bad_mem_label}={bad_mem_val}")
+            except ValueError:
+                pass
+
+        # 2) POST /api/c/<id>/load on a stopped farm returns 503 cleanly (never crashes with ConnectionRefusedError),
+        #    and stale process identity in _poll_single_farm does not clobber a newer process!
+        sd_prov_dir = work / "sd_prov_state"
+        sd_prov_cfg_p = work / "sd_prov.toml"
+        sd_prov_cfg_p.write_text(SELFTEST_CONFIG, encoding="utf-8")
+        os.environ[FLEET_DIR_ENV] = str(sd_prov_dir)
+        sd_prov = Provider(load_fleet_config(sd_prov_cfg_p), sd_prov_cfg_p)
+        assert "alpha" in getattr(sd_prov, "client_locks", {}), "Provider must maintain per-client locks"
+        ProviderHandler.provider = sd_prov
+        sd_srv = ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
+        sd_port = sd_srv.server_address[1]
+        threading.Thread(target=sd_srv.serve_forever, daemon=True).start()
+        try:
+            stopped_load_req = urllib.request.Request(
+                f"http://127.0.0.1:{sd_port}/api/c/alpha/load",
+                data=b"",
+                headers={"X-Cuttle-Session": sd_prov.provider_token},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(stopped_load_req, timeout=5.0)
+                raise AssertionError("POST /api/c/alpha/load on stopped farm must return 503")
+            except urllib.error.HTTPError as e:
+                assert e.code == 503, f"expected 503 on stopped farm /load, got {e.code}"
+        finally:
+            sd_srv.shutdown()
+
+        # 3) Idempotent single-entry Farm.shutdown():
+        shut_calls = {"n": 0}
+        idem_farm = object.__new__(Farm)
+        idem_farm.running = True
+        idem_farm.triads = {
+            "sql": type("_C", (), {"shutdown": staticmethod(lambda: shut_calls.__setitem__("n", shut_calls["n"] + 1))})()
+        }
+        idem_farm.shutdown()
+        idem_farm.shutdown()
+        assert shut_calls["n"] == 1, f"Farm.shutdown() must be idempotent single-entry, called {shut_calls['n']} times"
     finally:
         if old_fleet_env2 is None:
             os.environ.pop(FLEET_DIR_ENV, None)
@@ -1365,6 +1473,7 @@ def run_self_test() -> int:
         ]
         triad_subpaths = [
             ("GET", "/api/triad"),
+            ("GET", "/api/backup"),
             ("GET", "/sql?SELECT+*+FROM+kv"),
             ("POST", "/sql"),
             ("POST", "/api/sql"),
@@ -1575,6 +1684,7 @@ def main():
     ap.add_argument("--config", default=str(FLEET_CONFIG), help="fleet config (provider mode)")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--unit-test", action="store_true")
+    ap.add_argument("--print-token", action="store_true", help="display provider token on stdout")
     ap.add_argument("--accel", choices=tc.ACCELERATORS, help="override every plan's QEMU accelerator")
     args = ap.parse_args()
     if args.accel:
@@ -1598,7 +1708,7 @@ def main():
             ap.error("farm mode needs --client")
         run_farm(args.client)
     else:
-        run_provider(Path(args.config))
+        run_provider(Path(args.config), print_token=args.print_token)
 
 
 if __name__ == "__main__":

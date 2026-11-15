@@ -131,6 +131,7 @@ class TriadSpec:
     log_prefix: str = ""
     write_operator_token: bool = True  # False in fleet farms (which authenticate via farm secret)
     forward_node_ports: bool = True  # False in fleet farms so node ports are not exposed on loopback
+    wal_mirror_dir: Path | None = None  # optional off-box encrypted WAL mirror directory
     unit_test: bool = False  # True only in run_unit_self_tests() to skip QEMU/BASE_ELF packaging
 
     @property
@@ -432,17 +433,26 @@ def load_or_create_secret_file(path: Path, nbytes: int = 16, binary: bool = Fals
     return value
 
 
-def atomic_write_json(path: Path, obj) -> None:
-    """Serialize `obj` to JSON, flush + fsync a temporary sibling file, and atomically replace `path`."""
+def atomic_write_bytes(path: Path, data: bytes, secret: bool = False) -> None:
+    """Write `data` to a temporary sibling file, flush + fsync, and atomically replace `path`."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
-    payload = json.dumps(obj, indent=2).encode("utf-8")
     try:
-        with open(tmp, "wb") as f:
-            f.write(payload)
+        if secret:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            fd = os.open(str(tmp), flags, 0o600)
+            os.close(fd)
+            restrict_file_permissions(tmp)
+            open_mode = "r+b"
+        else:
+            open_mode = "wb"
+        with open(tmp, open_mode) as f:
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         tmp.replace(path)
+        if secret:
+            restrict_file_permissions(path)
         if os.name != "nt":
             try:
                 dir_fd = os.open(str(path.parent), getattr(os, "O_RDONLY", 0))
@@ -460,6 +470,55 @@ def atomic_write_json(path: Path, obj) -> None:
                 pass
 
 
+def atomic_write_json(path: Path, obj, secret: bool = False) -> None:
+    """Serialize `obj` to JSON, flush + fsync a temporary sibling file, and atomically replace `path`."""
+    payload = json.dumps(obj, indent=2).encode("utf-8")
+    atomic_write_bytes(path, payload, secret=secret)
+
+
+def _keystream_xor(key: bytes, domain: bytes, nonce: bytes, data: bytes) -> bytes:
+    """Domain-separated HMAC-SHA256 counter-mode stream XOR (`domain:enc: || nonce || counter_le64`)."""
+    out = bytearray(len(data))
+    prefix = domain + b":enc:" + nonce
+    offset = 0
+    counter = 0
+    while offset < len(data):
+        block = hmac.new(key, prefix + counter.to_bytes(8, "little"), hashlib.sha256).digest()
+        take = min(32, len(data) - offset)
+        for i in range(take):
+            out[offset + i] = data[offset + i] ^ block[i]
+        offset += take
+        counter += 1
+    return bytes(out)
+
+
+def _seal_authenticated_envelope(magic: bytes, domain: bytes, key: bytes, plaintext: bytes) -> bytes:
+    """Encrypt-then-MAC (`magic[9] || nonce[16] || ciphertext || hmac_sha256[32]`) under `key`."""
+    if len(magic) != 9 or len(key) != 32:
+        raise ValueError("envelope requires 9-byte magic and 32-byte master key")
+    nonce = os.urandom(16)
+    ciphertext = _keystream_xor(key, domain, nonce, plaintext)
+    tag = hmac.new(key, domain + b":mac:" + magic + nonce + ciphertext, hashlib.sha256).digest()
+    return magic + nonce + ciphertext + tag
+
+
+def _open_authenticated_envelope(
+    raw: bytes, expected_magic: bytes, domain: bytes, key: bytes
+) -> bytes:
+    """Verify constant-time HMAC-SHA256 tag BEFORE decrypting an authenticated envelope."""
+    if len(expected_magic) != 9 or len(key) != 32:
+        raise ValueError("envelope requires 9-byte magic and 32-byte master key")
+    if len(raw) < 9 + 16 + 32 or raw[:9] != expected_magic:
+        raise ValueError("malformed or unrecognized encrypted envelope header")
+    nonce = raw[9:25]
+    ciphertext = raw[25:-32]
+    got_tag = raw[-32:]
+    exp_tag = hmac.new(key, domain + b":mac:" + expected_magic + nonce + ciphertext, hashlib.sha256).digest()
+    if not hmac.compare_digest(got_tag, exp_tag):
+        raise ValueError("encrypted envelope HMAC authentication tag mismatch")
+    return _keystream_xor(key, domain, nonce, ciphertext)
+
+
 def is_printable_ascii_command(s: str) -> bool:
     """Return True iff `s` is non-empty and every character is printable ASCII (0x20..=0x7E)."""
     return bool(s) and all(0x20 <= ord(ch) <= 0x7E for ch in s)
@@ -472,14 +531,12 @@ def is_readonly_sql_query(q: str) -> bool:
         trimmed = trimmed[len("/*triad*/") :].strip()
     if not trimmed:
         return True
-    up = trimmed.upper()
-    return (
-        up.startswith("SELECT")
-        or up.startswith(".TABLES")
-        or up.startswith("SHOW")
-        or up.startswith(".SCHEMA")
-        or up.startswith(".DUMP")
-        or up.startswith("DESCRIBE")
+    return bool(
+        re.match(
+            r"^(?:SELECT(?:\b|[\s(*])|\.TABLES(?:\b|$)|SHOW\b|\.SCHEMA(?:\b|$)|\.DUMP(?:\b|$)|DESCRIBE\b)",
+            trimmed,
+            re.IGNORECASE,
+        )
     )
 
 
@@ -501,6 +558,7 @@ def is_readonly_shell_command(s: str) -> bool:
         "?",
         "uname",
         "status",
+        "mem",
         "uptime",
         "ps",
         "threads",
@@ -912,6 +970,7 @@ class TriadNode:
         self.consecutive_heals = 0
         self.commit_seq = 0
         self.storage_faulted = False
+        self.heal_scheduled = False
         self.last_disk_boot_status = "OK"
         self.archived_quarantine_files: list[Path] = []
         self.archived_fault_disks: list[Path] = []
@@ -938,10 +997,12 @@ class TriadNode:
         write_secret_file(self.device_key_path, node_key)
 
     def wipe_disks(self):
-        """Reset all 3 persistent disk images for this node to clean blank 1 MiB images."""
+        """Reset all 3 persistent disk images for this node to clean blank images (preserving >= 1 MiB configured size)."""
         for img in (self.ahci_img, self.virtio_img, self.nvme_img):
+            prev_sz = img.stat().st_size if img.exists() else (1024 * 1024)
+            target_sz = max(1024 * 1024, prev_sz)
             with open(img, "wb") as f:
-                f.write(b"\x00" * (1024 * 1024))
+                f.write(b"\x00" * target_sz)
                 f.flush()
                 os.fsync(f.fileno())
 
@@ -987,6 +1048,9 @@ class TriadController:
         state_dir.mkdir(parents=True, exist_ok=True)
         self.events: list[dict] = []
         self.coordinator_epoch: int = 1
+        self.fenced_out: bool = False
+        self._epoch_highest_tx_seq: int = 0
+        self._epoch_wal_created: bool = False
         self.rpc_http_ok_total: int = 0
         self.rpc_uart_fallback_total: int = 0
         self.write_latencies_sec: list[float] = []
@@ -1312,17 +1376,25 @@ class TriadController:
         self.restored_node_digests: dict[int, str] = {}
         self.node_commit_seq: dict[int, int] = {}
         self._after_wal_write_ahead_hook = None
+        self.wal_mirror_status: dict = {
+            "enabled": bool(s.wal_mirror_dir),
+            "ok": True,
+            "path": str(s.wal_mirror_dir / "triad_wal_mirror.enc") if s.wal_mirror_dir else "",
+            "last_tx_seq": 0,
+            "error": "",
+        }
         self._load_wal_from_disk()
         self.provision_sql_complete: bool = not bool(s.provision_sql) or (
             self.wal_checkpoint.get("tx_seq", 0) > 0
             or all(any(w == stmt for _, w in self.wal_entries) for stmt in s.provision_sql)
         )
         self.parity_file = state_dir / "parity_block.bin"
+        self.parity_meta_file = state_dir / "parity_meta.json"
         self.parity_Buffer = b"\x00" * SQL_PART_SIZE
         if s.has_sql and self.parity_file.exists():
             try:
                 raw_parity = self.parity_file.read_bytes()
-                if len(raw_parity) == SQL_PART_SIZE:
+                if len(raw_parity) == SQL_PART_SIZE and self._verify_loaded_parity_meta(raw_parity):
                     self.parity_Buffer = raw_parity
             except OSError:
                 pass
@@ -1338,23 +1410,408 @@ class TriadController:
         self._scheduler_thread: threading.Thread | None = None
         self.morph_op_lock = threading.Lock()
 
-    def _load_wal_from_disk(self):
-        prev_epoch = 0
-        if self.epoch_file.exists():
-            try:
-                ep_data = json.loads(self.epoch_file.read_text(encoding="utf-8"))
-                if isinstance(ep_data, dict):
-                    ep_val = ep_data.get("coordinator_epoch", 0)
-                    if isinstance(ep_val, int) and not isinstance(ep_val, bool) and ep_val >= 0:
-                        prev_epoch = ep_val
-            except Exception:
-                pass
-        if not self.wal_file.exists():
-            self.coordinator_epoch = prev_epoch + 1
-            atomic_write_json(
-                self.epoch_file,
-                {"state_schema": CURRENT_STATE_SCHEMA, "coordinator_epoch": self.coordinator_epoch},
+    @staticmethod
+    def _canonical_hmac_with_key(key_bytes: bytes, domain: bytes, payload: dict) -> str:
+        clean = {k: v for k, v in payload.items() if k != "hmac"}
+        canonical = json.dumps(clean, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hmac.new(key_bytes, domain + canonical, hashlib.sha256).hexdigest()
+
+    def _compute_wal_hmac(self, payload: dict) -> str:
+        return self._canonical_hmac_with_key(
+            self.master_key_bytes, b"cuttle-triad-wal-hmac-v1:", payload
+        )
+
+    def _compute_epoch_hmac(self, payload: dict) -> str:
+        return self._canonical_hmac_with_key(
+            self.master_key_bytes, b"cuttle-coordinator-epoch-v1:", payload
+        )
+
+    def _compute_parity_meta_hmac(self, payload: dict) -> str:
+        return self._canonical_hmac_with_key(
+            self.master_key_bytes, b"cuttle-parity-meta-v1:", payload
+        )
+
+    def _committed_tx_seq(self) -> int:
+        if (
+            self.wal_pending_tx is not None
+            and self.wal_pending_tx == self.triad_tx_seq
+            and self.triad_tx_seq > 0
+        ):
+            return self.triad_tx_seq - 1
+        return self.triad_tx_seq
+
+    def _save_coordinator_epoch(self) -> None:
+        committed_seq = self._committed_tx_seq()
+        self._epoch_highest_tx_seq = max(self._epoch_highest_tx_seq, committed_seq)
+        self._epoch_wal_created = bool(self._epoch_wal_created or self.wal_file.exists())
+        payload = {
+            "state_schema": CURRENT_STATE_SCHEMA,
+            "coordinator_epoch": int(self.coordinator_epoch),
+            "highest_tx_seq": int(self._epoch_highest_tx_seq),
+            "wal_created": bool(self._epoch_wal_created),
+            "node_rpc_seq": {
+                str(n.node_id): int(n.rpc_seq) for n in self.nodes if int(n.rpc_seq) > 0
+            },
+        }
+        payload["hmac"] = self._compute_epoch_hmac(payload)
+        atomic_write_json(self.epoch_file, payload, secret=True)
+
+    def _load_coordinator_epoch_file(self) -> int:
+        if not self.epoch_file.exists():
+            return 0
+        try:
+            ep_data = json.loads(self.epoch_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            self.log_event(
+                "ALERT",
+                f"Corrupt coordinator_epoch.json {self.epoch_file}: {e}",
+                code="WAL_CORRUPT",
             )
+            raise ValueError(f"WAL_CORRUPT: unreadable {self.epoch_file}: {e}") from e
+        if not isinstance(ep_data, dict):
+            raise ValueError("WAL_CORRUPT: coordinator_epoch.json root must be a JSON object")
+        ep_schema = ep_data.get("state_schema", 1)
+        if not isinstance(ep_schema, int) or isinstance(ep_schema, bool) or ep_schema < 1:
+            raise ValueError(f"WAL_CORRUPT: invalid coordinator_epoch state_schema: {ep_schema!r}")
+        if ep_schema > CURRENT_STATE_SCHEMA:
+            self.log_event(
+                "ALERT",
+                f"Refusing {self.epoch_file.name} with newer state_schema={ep_schema} (> {CURRENT_STATE_SCHEMA})",
+                code="SCHEMA_MISMATCH",
+            )
+            raise ValueError(
+                f"SCHEMA_MISMATCH: coordinator_epoch state_schema {ep_schema} > {CURRENT_STATE_SCHEMA}"
+            )
+        if ep_schema >= 2:
+            got_mac = str(ep_data.get("hmac") or "")
+            if not safe_token_eq(got_mac, self._compute_epoch_hmac(ep_data)):
+                self.log_event(
+                    "ALERT",
+                    f"HMAC verification failed on {self.epoch_file}!",
+                    code="WAL_CORRUPT",
+                )
+                raise ValueError(
+                    f"WAL_CORRUPT: {self.epoch_file.name} HMAC authentication tag mismatch"
+                )
+        ep_val = ep_data.get("coordinator_epoch", 0)
+        if not isinstance(ep_val, int) or isinstance(ep_val, bool) or ep_val < 0:
+            raise ValueError(f"WAL_CORRUPT: invalid coordinator_epoch value: {ep_val!r}")
+        high_tx = ep_data.get("highest_tx_seq", 0)
+        if not isinstance(high_tx, int) or isinstance(high_tx, bool) or high_tx < 0:
+            raise ValueError(f"WAL_CORRUPT: invalid highest_tx_seq: {high_tx!r}")
+        self._epoch_highest_tx_seq = high_tx
+        self._epoch_wal_created = bool(ep_data.get("wal_created", False))
+        raw_rpc = ep_data.get("node_rpc_seq", {})
+        if isinstance(raw_rpc, dict):
+            for n in self.nodes:
+                rv = raw_rpc.get(str(n.node_id))
+                if isinstance(rv, int) and not isinstance(rv, bool) and rv > n.rpc_seq:
+                    n.rpc_seq = rv
+        return ep_val
+
+    def _sync_wal_mirror(self, wal_payload: dict) -> None:
+        mirror_dir = self.spec.wal_mirror_dir
+        if mirror_dir is None:
+            return
+        mirror_path = mirror_dir / "triad_wal_mirror.enc"
+        try:
+            raw_json = json.dumps(wal_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            enc_blob = _seal_authenticated_envelope(
+                b"CTTLWMIR1", b"cuttle-wal-mirror-v1", self.master_key_bytes, raw_json
+            )
+            atomic_write_bytes(mirror_path, enc_blob, secret=True)
+            self.wal_mirror_status = {
+                "enabled": True,
+                "ok": True,
+                "path": str(mirror_path),
+                "last_tx_seq": int(self.triad_tx_seq),
+                "error": "",
+            }
+        except OSError as e:
+            self.wal_mirror_status = {
+                "enabled": True,
+                "ok": False,
+                "path": str(mirror_path),
+                "last_tx_seq": int(self.wal_mirror_status.get("last_tx_seq", 0)),
+                "error": str(e),
+            }
+            self.log_event(
+                "ALERT",
+                f"Failed to write off-box encrypted WAL mirror {mirror_path}: {e}",
+                code="WAL_CORRUPT",
+            )
+
+    def _verify_loaded_parity_meta(self, raw_parity: bytes) -> bool:
+        if not self.parity_meta_file.exists():
+            # Legacy parity_block.bin without parity_meta.json: accept only when WAL is at genesis (tx_seq == 0).
+            return self.triad_tx_seq == 0
+        try:
+            meta = json.loads(self.parity_meta_file.read_text(encoding="utf-8"))
+            if not isinstance(meta, dict):
+                return False
+            if not safe_token_eq(str(meta.get("hmac") or ""), self._compute_parity_meta_hmac(meta)):
+                return False
+            if meta.get("parity_sha256") != hashlib.sha256(raw_parity).hexdigest():
+                return False
+            return int(meta.get("triad_tx_seq", -1)) == int(self._committed_tx_seq())
+        except Exception:
+            return False
+
+    def export_encrypted_backup_bytes(self) -> bytes:
+        """Export an authenticated, encrypted `CTTLBKUP1` snapshot bundle of coordinator state."""
+        with self.wal_lock:
+            wal_exists = self.wal_file.exists()
+            wal_payload = (
+                json.loads(self.wal_file.read_text(encoding="utf-8")) if wal_exists else None
+            )
+            epoch_payload = (
+                json.loads(self.epoch_file.read_text(encoding="utf-8"))
+                if self.epoch_file.exists()
+                else None
+            )
+            parity_hex = (
+                self.parity_file.read_bytes().hex()
+                if (self.spec.has_sql and self.parity_file.exists())
+                else ""
+            )
+            bundle = {
+                "backup_format": 1,
+                "state_schema": CURRENT_STATE_SCHEMA,
+                "created_unix": int(time.time()),
+                "triad_name": self.spec.name,
+                "role": self.spec.role,
+                "coordinator_epoch": int(self.coordinator_epoch),
+                "triad_tx_seq": int(self._committed_tx_seq()),
+                "wal_exists": bool(wal_exists),
+                "wal_payload": wal_payload,
+                "epoch_payload": epoch_payload,
+                "min_allowed_version": int(self.min_allowed_version),
+                "desired_cron": [list(item) for item in self.desired_cron],
+                "desired_guard_lockdown": bool(self.desired_guard_lockdown),
+                "parity_hex": parity_hex,
+            }
+        plaintext = json.dumps(bundle, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return _seal_authenticated_envelope(
+            b"CTTLBKUP1", b"cuttle-backup-bundle-v1", self.master_key_bytes, plaintext
+        )
+
+    def export_encrypted_backup(self, dest_path: Path) -> dict:
+        blob = self.export_encrypted_backup_bytes()
+        atomic_write_bytes(dest_path, blob, secret=True)
+        return self.verify_encrypted_backup_bytes(blob, self.master_key_bytes)
+
+    @staticmethod
+    def verify_encrypted_backup_bytes(raw: bytes, master_key_bytes: bytes) -> dict:
+        plaintext = _open_authenticated_envelope(
+            raw, b"CTTLBKUP1", b"cuttle-backup-bundle-v1", master_key_bytes
+        )
+        bundle = json.loads(plaintext.decode("utf-8"))
+        if not isinstance(bundle, dict) or bundle.get("state_schema") != CURRENT_STATE_SCHEMA:
+            raise ValueError("unsupported or malformed backup bundle schema")
+        tx_seq = bundle.get("triad_tx_seq")
+        if not isinstance(tx_seq, int) or isinstance(tx_seq, bool) or tx_seq < 0:
+            raise ValueError("invalid backup triad_tx_seq")
+        if bundle.get("wal_exists"):
+            wal_p = bundle.get("wal_payload")
+            if not isinstance(wal_p, dict):
+                raise ValueError("backup bundle marks wal_exists=True but wal_payload is missing")
+            exp_wal_mac = TriadController._canonical_hmac_with_key(
+                master_key_bytes, b"cuttle-triad-wal-hmac-v1:", wal_p
+            )
+            if not safe_token_eq(str(wal_p.get("hmac") or ""), exp_wal_mac):
+                raise ValueError("inner triad_wal payload HMAC mismatch inside backup bundle")
+        ep_p = bundle.get("epoch_payload")
+        if ep_p is not None:
+            if not isinstance(ep_p, dict):
+                raise ValueError("malformed epoch_payload inside backup bundle")
+            exp_ep_mac = TriadController._canonical_hmac_with_key(
+                master_key_bytes, b"cuttle-coordinator-epoch-v1:", ep_p
+            )
+            if not safe_token_eq(str(ep_p.get("hmac") or ""), exp_ep_mac):
+                raise ValueError("inner coordinator_epoch payload HMAC mismatch inside backup bundle")
+        return {
+            "ok": True,
+            "triad_name": str(bundle.get("triad_name") or ""),
+            "role": str(bundle.get("role") or ""),
+            "coordinator_epoch": int(bundle.get("coordinator_epoch", 1)),
+            "triad_tx_seq": int(tx_seq),
+            "wal_exists": bool(bundle.get("wal_exists", False)),
+            "created_unix": int(bundle.get("created_unix", 0)),
+            "_bundle": bundle,
+        }
+
+    @staticmethod
+    def verify_encrypted_backup(backup_path: Path, master_key_bytes: bytes) -> dict:
+        return TriadController.verify_encrypted_backup_bytes(
+            backup_path.read_bytes(), master_key_bytes
+        )
+
+    @staticmethod
+    def restore_encrypted_backup(
+        backup_path: Path,
+        target_state_dir: Path,
+        master_key_path: Path,
+        force_disaster_recovery: bool = False,
+    ) -> dict:
+        if not master_key_path.exists():
+            raise ValueError(f"master key file {master_key_path} does not exist")
+        master_key_bytes = load_or_create_secret_file(master_key_path, 32, binary=True)
+        verified = TriadController.verify_encrypted_backup(backup_path, master_key_bytes)
+        bundle = verified["_bundle"]
+        target_state_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = target_state_dir / "controller.lock"
+        fh = open(lock_path, "a+b")
+        try:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b" ")
+                fh.flush()
+            fh.seek(0)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                raise RuntimeError(
+                    f"CONTROLLER_LOCK_CONFLICT: stop active controller on {target_state_dir} before restore"
+                ) from e
+            try:
+                existing_ep_file = target_state_dir / "coordinator_epoch.json"
+                existing_ep = 0
+                existing_high = 0
+                existing_rpc_seq: dict = {}
+                if existing_ep_file.exists():
+                    ep_cur = json.loads(existing_ep_file.read_text(encoding="utf-8"))
+                    if isinstance(ep_cur, dict):
+                        exp_m = TriadController._canonical_hmac_with_key(
+                            master_key_bytes, b"cuttle-coordinator-epoch-v1:", ep_cur
+                        )
+                        if int(ep_cur.get("state_schema", 1)) >= 2 and not safe_token_eq(
+                            str(ep_cur.get("hmac") or ""), exp_m
+                        ):
+                            raise ValueError("existing target coordinator_epoch.json failed HMAC verification")
+                        existing_ep = int(ep_cur.get("coordinator_epoch", 0))
+                        existing_high = int(ep_cur.get("highest_tx_seq", 0))
+                        if isinstance(ep_cur.get("node_rpc_seq"), dict):
+                            existing_rpc_seq = dict(ep_cur["node_rpc_seq"])
+                backup_tx = int(bundle["triad_tx_seq"])
+                if backup_tx < existing_high and not force_disaster_recovery:
+                    raise ValueError(
+                        f"refusing backup rollback: backup triad_tx_seq={backup_tx} < existing highest_tx_seq={existing_high} "
+                        f"(pass --force-disaster-recovery to override)"
+                    )
+                restored_epoch = max(existing_ep, int(bundle.get("coordinator_epoch", 1))) + 1
+                min_ver = max(1, int(bundle.get("min_allowed_version", 1)))
+                min_ver_mac = hmac.new(
+                    master_key_bytes,
+                    f"cuttle-min-version-v1:{min_ver}".encode("ascii"),
+                    hashlib.sha256,
+                ).hexdigest()
+                atomic_write_json(
+                    target_state_dir / "min_allowed_version.json",
+                    {
+                        "state_schema": CURRENT_STATE_SCHEMA,
+                        "min_allowed_version": min_ver,
+                        "hmac": min_ver_mac,
+                    },
+                    secret=True,
+                )
+                atomic_write_json(
+                    target_state_dir / "cron_jobs.json",
+                    {"state_schema": CURRENT_STATE_SCHEMA, "jobs": bundle.get("desired_cron", [])},
+                )
+                atomic_write_json(
+                    target_state_dir / "guard_posture.json",
+                    {
+                        "state_schema": CURRENT_STATE_SCHEMA,
+                        "lockdown": bool(bundle.get("desired_guard_lockdown", False)),
+                    },
+                )
+                merged_rpc_seq = dict(existing_rpc_seq)
+                ep_in = bundle.get("epoch_payload")
+                if isinstance(ep_in, dict) and isinstance(ep_in.get("node_rpc_seq"), dict):
+                    for k, v in ep_in["node_rpc_seq"].items():
+                        if isinstance(v, int) and v > int(merged_rpc_seq.get(k, 0)):
+                            merged_rpc_seq[k] = v
+                if bundle.get("wal_exists") and isinstance(bundle.get("wal_payload"), dict):
+                    wal_out = dict(bundle["wal_payload"])
+                    wal_out["state_schema"] = CURRENT_STATE_SCHEMA
+                    wal_out["coordinator_epoch"] = restored_epoch
+                    wal_out["hmac"] = TriadController._canonical_hmac_with_key(
+                        master_key_bytes, b"cuttle-triad-wal-hmac-v1:", wal_out
+                    )
+                    atomic_write_json(target_state_dir / "triad_wal.json", wal_out, secret=True)
+                else:
+                    (target_state_dir / "triad_wal.json").unlink(missing_ok=True)
+                ep_out = {
+                    "state_schema": CURRENT_STATE_SCHEMA,
+                    "coordinator_epoch": restored_epoch,
+                    "highest_tx_seq": backup_tx if force_disaster_recovery else max(existing_high, backup_tx),
+                    "wal_created": bool(bundle.get("wal_exists", False)),
+                    "node_rpc_seq": merged_rpc_seq,
+                }
+                ep_out["hmac"] = TriadController._canonical_hmac_with_key(
+                    master_key_bytes, b"cuttle-coordinator-epoch-v1:", ep_out
+                )
+                atomic_write_json(existing_ep_file, ep_out, secret=True)
+                p_hex = str(bundle.get("parity_hex") or "")
+                if p_hex:
+                    p_bytes = bytes.fromhex(p_hex)
+                    if len(p_bytes) == SQL_PART_SIZE:
+                        atomic_write_bytes(target_state_dir / "parity_block.bin", p_bytes)
+                        p_meta = {
+                            "state_schema": CURRENT_STATE_SCHEMA,
+                            "triad_tx_seq": backup_tx,
+                            "parity_sha256": hashlib.sha256(p_bytes).hexdigest(),
+                        }
+                        p_meta["hmac"] = TriadController._canonical_hmac_with_key(
+                            master_key_bytes, b"cuttle-parity-meta-v1:", p_meta
+                        )
+                        atomic_write_json(target_state_dir / "parity_meta.json", p_meta, secret=True)
+                return {
+                    "ok": True,
+                    "triad_tx_seq": backup_tx,
+                    "coordinator_epoch": restored_epoch,
+                }
+            finally:
+                try:
+                    fh.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+        finally:
+            fh.close()
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _load_wal_from_disk(self):
+        prev_epoch = self._load_coordinator_epoch_file()
+        if not self.wal_file.exists():
+            if self._epoch_wal_created or self._epoch_highest_tx_seq > 0:
+                self.log_event(
+                    "ALERT",
+                    f"Missing Triad WAL {self.wal_file} while coordinator_epoch.json records prior WAL state (highest_tx_seq={self._epoch_highest_tx_seq})!",
+                    code="WAL_CORRUPT",
+                )
+                raise ValueError(
+                    f"WAL_CORRUPT: missing {self.wal_file} while coordinator_epoch.json records prior WAL state"
+                )
+            self.coordinator_epoch = prev_epoch + 1
+            self._save_coordinator_epoch()
             return
         try:
             raw_text = self.wal_file.read_text(encoding="utf-8")
@@ -1373,6 +1830,10 @@ class TriadController:
                 raise ValueError(
                     f"SCHEMA_MISMATCH: WAL state_schema {raw_schema} > supported {CURRENT_STATE_SCHEMA}"
                 )
+            if raw_schema >= 2:
+                got_hmac = str(data.get("hmac") or "")
+                if not safe_token_eq(got_hmac, self._compute_wal_hmac(data)):
+                    raise ValueError("triad_wal.json HMAC authentication tag mismatch")
             if raw_schema < CURRENT_STATE_SCHEMA:
                 pre_backup = self.wal_file.with_name(f"{self.wal_file.name}.pre-v{raw_schema}")
                 try:
@@ -1450,6 +1911,13 @@ class TriadController:
                         raise ValueError(f"non-final WAL entry #{tid} cannot be pending")
                     pending_tx = tid
                 parsed_entries.append((tid, stmt))
+            eff_committed = (
+                (tx_seq - 1) if (pending_tx is not None and pending_tx == tx_seq and tx_seq > 0) else tx_seq
+            )
+            if raw_schema >= 2 and eff_committed < self._epoch_highest_tx_seq:
+                raise ValueError(
+                    f"triad_wal.json committed tx_seq {eff_committed} rolled back below coordinator_epoch highest_tx_seq {self._epoch_highest_tx_seq}"
+                )
             self.triad_tx_seq = tx_seq
             self.wal_entries = parsed_entries
             self.wal_pending_tx = pending_tx
@@ -1480,13 +1948,13 @@ class TriadController:
                         self.node_commit_seq[n.node_id] = cv
                         n.commit_seq = cv
 
-            atomic_write_json(
-                self.epoch_file,
-                {"state_schema": CURRENT_STATE_SCHEMA, "coordinator_epoch": self.coordinator_epoch},
-            )
             data["state_schema"] = CURRENT_STATE_SCHEMA
             data["coordinator_epoch"] = self.coordinator_epoch
-            atomic_write_json(self.wal_file, data)
+            data["hmac"] = self._compute_wal_hmac(data)
+            atomic_write_json(self.wal_file, data, secret=True)
+            self._epoch_wal_created = True
+            self._save_coordinator_epoch()
+            self._sync_wal_mirror(data)
         except Exception as e:
             if "SCHEMA_MISMATCH" in str(e):
                 raise ValueError(str(e)) from e
@@ -1529,7 +1997,11 @@ class TriadController:
                 if int(self.node_commit_seq.get(n.node_id, 0)) > 0
             },
         }
-        atomic_write_json(self.wal_file, payload)
+        payload["hmac"] = self._compute_wal_hmac(payload)
+        atomic_write_json(self.wal_file, payload, secret=True)
+        self._epoch_wal_created = True
+        self._save_coordinator_epoch()
+        self._sync_wal_mirror(payload)
 
     def _extract_table_col_types(self, table: str, donor: TriadNode | None = None) -> list[str]:
         """Determine column types ('INT' or 'TEXT') for `table` from `.schema`, `provision_sql`, or WAL."""
@@ -1922,8 +2394,8 @@ class TriadController:
         else:
             target_slot = "a"
             target_slot_img = node.slot_a_img
-        target_slot_img.write_bytes(bios_copy)
-        node.bios_img.write_bytes(bios_copy)
+        atomic_write_bytes(target_slot_img, bios_copy)
+        atomic_write_bytes(node.bios_img, bios_copy)
         node._staged_slot = target_slot
         node.release_version = ver
         node.morph_count += 1
@@ -2082,7 +2554,12 @@ class TriadController:
                 pass
 
         fault_archive: Path | None = None
+        prev_ahci_size = 1024 * 1024
         if node.ahci_img.exists():
+            try:
+                prev_ahci_size = max(1024 * 1024, node.ahci_img.stat().st_size)
+            except OSError:
+                prev_ahci_size = 1024 * 1024
             idx = len(node.archived_fault_disks) + 1
             candidate = node.node_dir / f"ahci_node{node.node_id}.fault_{int(time.time())}_{idx}.img"
             try:
@@ -2093,17 +2570,15 @@ class TriadController:
                 self.log_event("WARN", f"{node.name}: Failed to archive faulted AHCI disk: {e}")
 
         node.node_dir.mkdir(parents=True, exist_ok=True)
-        with open(node.ahci_img, "wb") as f:
-            f.write(b"\x00" * (1024 * 1024))
-            f.flush()
-            os.fsync(f.fileno())
+        atomic_write_bytes(node.ahci_img, b"\x00" * prev_ahci_size)
 
-        node.tampered = True
-        node.tx_seq = 0
-        node.state_digest = ""
-        node.commit_seq = 0
-        self.node_commit_seq[node.node_id] = 0
-        self.restored_tx_seq_nodes.discard(node.node_id)
+        with self.wal_lock:
+            node.tampered = True
+            node.tx_seq = 0
+            node.state_digest = ""
+            node.commit_seq = 0
+            self.node_commit_seq[node.node_id] = 0
+            self.restored_tx_seq_nodes.discard(node.node_id)
         self.heals_total[node.node_id] = self.heals_total.get(node.node_id, 0) + 1
 
         arch_note = f" (archived faulted disk to {fault_archive.name})" if fault_archive else ""
@@ -2243,9 +2718,9 @@ class TriadController:
     def promote_standby_epoch(self, new_epoch: int | None = None) -> int:
         """
         Atomically promote this coordinator to a strictly higher monotonic `coordinator_epoch`
-        (standby failover), persist `coordinator_epoch.json` (+ `triad_wal.json` if present),
-        and fence all online nodes so any stale primary coordinator at a lower epoch is
-        refused with HTTP 409 Conflict / `EACCES (stale triad coordinator epoch)`.
+        (standby failover), fence at least a 2-of-3 online quorum on live clusters before
+        committing the new epoch, and persist `coordinator_epoch.json` (+ `triad_wal.json` if present)
+        so any stale primary coordinator at a lower epoch is refused with HTTP 409 Conflict.
         """
         with self.wal_lock:
             cur = max(1, int(self.coordinator_epoch))
@@ -2254,21 +2729,68 @@ class TriadController:
                 raise ValueError(
                     f"standby promotion epoch {target} must exceed current coordinator_epoch {cur}"
                 )
+            cold_preboot = all(n.state == "INITIALIZING" for n in self.nodes)
+            online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
+            if not cold_preboot and len(online_nodes) < 2:
+                self.log_event(
+                    "ALERT",
+                    f"Refused standby epoch promotion to {target}: only {len(online_nodes)}/3 nodes ONLINE (>= 2 required).",
+                    code="QUORUM_LOST",
+                )
+                raise ValueError(
+                    f"QUORUM_LOST: standby promotion requires >= 2 online nodes (got {len(online_nodes)}/3)"
+                )
+            if not cold_preboot:
+                fenced_nodes: list[TriadNode] = []
+                for n in online_nodes:
+                    out = self.send_node_rpc(n, f"triad epoch {target}", timeout=3.0)
+                    low = (out or "").strip().lower()
+                    if "stale triad coordinator epoch" in low or "split-brain" in low:
+                        self.fenced_out = True
+                        self.log_event(
+                            "ALERT",
+                            f"{n.name}: Rejected standby promotion epoch={target} due to higher node epoch ({out})!",
+                            code="SPLIT_BRAIN",
+                        )
+                        raise ValueError(f"SPLIT_BRAIN: node rejected standby epoch {target}: {out}")
+                    if low and not low.startswith("error:"):
+                        if self._durable_sync_node(n, timeout=3.0):
+                            fenced_nodes.append(n)
+                if len(fenced_nodes) < 2:
+                    self.log_event(
+                        "ALERT",
+                        f"Refused standby epoch promotion to {target}: only {len(fenced_nodes)}/{len(online_nodes)} online nodes durably fenced.",
+                        code="QUORUM_LOST",
+                    )
+                    raise ValueError(
+                        f"QUORUM_LOST: standby promotion durably fenced only {len(fenced_nodes)}/{len(online_nodes)} nodes (>= 2 required)"
+                    )
             self.coordinator_epoch = target
-            atomic_write_json(
-                self.epoch_file,
-                {"state_schema": CURRENT_STATE_SCHEMA, "coordinator_epoch": self.coordinator_epoch},
-            )
+            self.fenced_out = False
+            self._save_coordinator_epoch()
             if self.wal_file.exists():
                 self._save_wal_to_disk()
-        for n in self.nodes:
-            if n.state == "ONLINE":
-                self.send_node_rpc(n, f"triad epoch {self.coordinator_epoch}", timeout=3.0)
         self.log_event(
             "RESYNC",
             f"Promoted standby coordinator to monotonic coordinator_epoch={self.coordinator_epoch} and fenced online nodes.",
         )
         return self.coordinator_epoch
+
+    def _durable_sync_node(self, node: TriadNode, timeout: float = 4.0) -> bool:
+        """
+        Verify durable persistence on `node` after a mutating command. On shell-enabled roles
+        (`full`, `shell`), execute explicit `sync` and require an error-free response. On
+        shell-disabled roles (`sql`, `wfe`), `svc-sh` intentionally denies `sync` (`EACCES`)
+        while the kernel command loop synchronously persists mutations (`persist_shell_if_changed`)
+        before sending any reply, so verify the node has not faulted or exited.
+        """
+        if node.storage_faulted:
+            return False
+        if not self.spec.has_shell:
+            return bool(self.unit_test or (node.proc is not None and node.proc.poll() is None))
+        sync_out = self.send_shell_cmd(node, "sync", timeout=timeout)
+        s = (sync_out or "").strip().lower()
+        return bool(s) and "error:" not in s and not node.storage_faulted
 
     def _try_http_node_rpc(self, node: TriadNode, clean_cmd: str, timeout: float) -> str | None:
         """
@@ -2295,6 +2817,10 @@ class TriadController:
             return None
         auth_key = self._derive_node_net_auth_key(node)
         ep = max(1, int(self.coordinator_epoch))
+        if cmd_low.startswith("triad epoch "):
+            toks = clean_cmd.split()
+            if len(toks) == 3 and toks[2].isdigit():
+                ep = max(ep, int(toks[2]))
         with node.rpc_lock:
             base_seq = max(node.rpc_seq + 1, int(time.time() * 1000))
             node.rpc_seq = base_seq
@@ -2319,6 +2845,13 @@ class TriadController:
                         return None
                     text = raw_body.decode("utf-8", errors="replace").strip()
                     self.rpc_http_ok_total += 1
+                    if self.wal_lock.acquire(blocking=False):
+                        try:
+                            self._save_coordinator_epoch()
+                        except Exception:
+                            pass
+                        finally:
+                            self.wal_lock.release()
                     return text
             except urllib.error.HTTPError as e:
                 raw_err = b""
@@ -2338,6 +2871,7 @@ class TriadController:
                             code="RPC_REPLY_TAMPER",
                         )
                         return None
+                    self.fenced_out = True
                     self.log_event(
                         "ALERT",
                         f"{node.name}: Coordinator fenced by higher node epoch on /triad/rpc (epoch={ep}): {err_body}",
@@ -2592,7 +3126,11 @@ class TriadController:
             return True
         node.missed_heartbeats += 1
         if node.missed_heartbeats >= MAX_HEARTBEAT_MISSES:
-            node.state = "HUNG"
+            with node._storage_fault_lock:
+                if node.heal_scheduled or node.state == "HEALING":
+                    return False
+                node.heal_scheduled = True
+                node.state = "HUNG"
             self.log_event(
                 "ALERT",
                 f"{node.name}: Missed {node.missed_heartbeats} consecutive serial heartbeats; marking HUNG and triggering recovery.",
@@ -2779,6 +3317,8 @@ class TriadController:
             return "role=" in joined or "error:" in joined
         if c == "status":
             return "net_tx=" in joined or "error:" in joined
+        if c == "mem":
+            return "phys_free=" in joined or "error:" in joined
         if c.startswith("cathex "):
             return "hex len=" in joined or "error:" in joined or "usage:" in joined
         if c.startswith("writehex "):
@@ -3218,25 +3758,41 @@ class TriadController:
     def _sync_files_from_peer(self, target: TriadNode, peer: TriadNode) -> bool:
         """
         Copy every file in `peer`'s shell filesystem onto `target` during a non-SQL heal using
-        chunked `cathex`/`writehex`, and verify every synced file's post-copy byte length and
-        SHA-256 digest before returning True.
+        chunked `cathex`/`writehex`, remove any stale `/var/...` files on `target` absent on `peer`,
+        and verify every synced file's post-copy byte length and SHA-256 digest before returning True.
         """
         ls_out = self.send_shell_cmd(peer, "ls", timeout=4.0)
         if not ls_out or ls_out.lower().startswith("error"):
             return False
-        if ls_out.strip() == "(empty)":
-            self.send_shell_cmd(target, "sync", timeout=3.0)
-            return True
+        peer_files: dict[str, int] = {}
         all_ok = True
-        for ln in ls_out.splitlines():
-            s_ln = ln.strip()
-            if not s_ln:
-                continue
-            m = re.match(r"^(.+?)\s+\((\d+)\s+B\)$", s_ln)
-            if not m:
-                all_ok = False
-                continue
-            fpath, flen = m.group(1), int(m.group(2))
+        if ls_out.strip() != "(empty)":
+            for ln in ls_out.splitlines():
+                s_ln = ln.strip()
+                if not s_ln:
+                    continue
+                m = re.match(r"^(.+?)\s+\((\d+)\s+B\)$", s_ln)
+                if not m:
+                    all_ok = False
+                    continue
+                peer_files[m.group(1)] = int(m.group(2))
+
+        target_ls = self.send_shell_cmd(target, "ls", timeout=4.0)
+        if target_ls and not target_ls.lower().startswith("error") and target_ls.strip() != "(empty)":
+            for ln in target_ls.splitlines():
+                s_ln = ln.strip()
+                if not s_ln:
+                    continue
+                m_t = re.match(r"^(.+?)\s+\((\d+)\s+B\)$", s_ln)
+                if m_t:
+                    tpath = m_t.group(1)
+                    if tpath.startswith("/var/") and tpath not in peer_files:
+                        self.send_shell_cmd(target, f"rm {quote_shell_path(tpath)}", timeout=3.0)
+
+        if not peer_files:
+            self.send_shell_cmd(target, "sync", timeout=3.0)
+            return all_ok
+        for fpath, flen in peer_files.items():
             peer_bytes = self._read_node_file_bytes(peer, fpath, expected_len=flen)
             if peer_bytes is None:
                 all_ok = False
@@ -3357,6 +3913,10 @@ class TriadController:
                                 f"converging; marking OFFLINE to prevent heal loop.",
                             )
                             return
+                        with corrupted._storage_fault_lock:
+                            if corrupted.heal_scheduled:
+                                return
+                            corrupted.heal_scheduled = True
                         corrupted.consecutive_heals += 1
                         self.heals_total[corrupted.node_id] = self.heals_total.get(corrupted.node_id, 0) + 1
                         corrupted.state = "HEALING"
@@ -3455,18 +4015,21 @@ class TriadController:
     def _save_parity_block(self, data: bytes) -> None:
         if len(data) != SQL_PART_SIZE:
             return
-        tmp_p = self.parity_file.with_name(f".{self.parity_file.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
         try:
-            with open(tmp_p, "wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_p, self.parity_file)
-        except OSError:
-            try:
-                tmp_p.unlink(missing_ok=True)
-            except OSError:
-                pass
+            atomic_write_bytes(self.parity_file, data)
+            p_meta = {
+                "state_schema": CURRENT_STATE_SCHEMA,
+                "triad_tx_seq": int(self._committed_tx_seq()),
+                "parity_sha256": hashlib.sha256(data).hexdigest(),
+            }
+            p_meta["hmac"] = self._compute_parity_meta_hmac(p_meta)
+            atomic_write_json(self.parity_meta_file, p_meta, secret=True)
+        except OSError as e:
+            self.log_event(
+                "ALERT",
+                f"Failed to persist RAID XOR parity block {self.parity_file}: {e}",
+                code="DISK_STORAGE_FAULT",
+            )
 
     def reconstruct_sql_partition_from_xor_parity(self, failed_node_id: int) -> bytes:
         """
@@ -3475,12 +4038,16 @@ class TriadController:
           - `D1 = D2 ^ D3 ^ P` (when `failed_node_id == 1`)
           - `D2 = D1 ^ D3 ^ P` (when `failed_node_id == 2`)
           - `D3 = D1 ^ D2 ^ P` (when `failed_node_id == 3`)
-        Verifies both surviving peer AHCI images are present and >= 8 KiB (`strict=True`),
-        writes and fsyncs the reconstructed 8 KiB partition directly to the failed node's
-        AHCI image at `SQL_PART_OFFSET`, and returns the reconstructed 8 KiB payload.
+        Refuses raw 8 KiB partition sector overwrites on `>= 2 MiB` `CTTLPGS1` paged-store disks
+        (where SQL rows live in per-node encrypted 4 KiB CoW pages and recovery uses WAL replay).
         """
         if failed_node_id not in (1, 2, 3):
             raise ValueError("XOR data parity covers Triad nodes 1 (D1), 2 (D2), and 3 (D3)")
+        for n in self.nodes:
+            if n.ahci_img.exists() and n.ahci_img.stat().st_size >= 2 * 1024 * 1024:
+                raise ValueError(
+                    "raw 8 KiB SQL partition XOR reconstruction is not valid on >= 2 MiB CTTLPGS1 paged-store disks; use WAL replay"
+                )
         if len(self.parity_Buffer) != SQL_PART_SIZE:
             raise ValueError("RAID parity buffer not initialized")
         peers = [n for n in self.nodes if n.node_id != failed_node_id]
@@ -3511,6 +4078,14 @@ class TriadController:
         q = sql_query.strip()
         if not q:
             return {"ok": False, "error": "empty SQL query", "output": "error: empty SQL query", "quorum": "0/3"}
+        q_clean = q[len("/*triad*/") :].strip() if q.startswith("/*triad*/") else q
+        if re.match(r"^(?:BEGIN|COMMIT|ROLLBACK)\b", q_clean, re.IGNORECASE):
+            return {
+                "ok": False,
+                "error": "explicit multi-statement transactions (BEGIN/COMMIT/ROLLBACK) are not supported over Triad SQL; submit atomic single statements",
+                "output": "error: explicit BEGIN/COMMIT/ROLLBACK not supported over Triad SQL",
+                "quorum": "0/3",
+            }
         is_read = is_readonly_sql_query(q)
 
         online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
@@ -3599,6 +4174,14 @@ class TriadController:
         # and `n.tx_seq` + `state_digest` commit update.
         write_t0 = time.monotonic()
         with self.wal_lock:
+            if self.fenced_out:
+                return {
+                    "ok": False,
+                    "status_code": 409,
+                    "error": "coordinator fenced by higher epoch; promote standby epoch first",
+                    "output": "error: EACCES (stale triad coordinator epoch)",
+                    "quorum": "0/3 FENCED",
+                }
             online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
             if len(online_nodes) < 2:
                 self.log_event(
@@ -3718,15 +4301,40 @@ class TriadController:
                         "per_node": per_node,
                     }
 
+                synced_nodes = []
+                for n in accepted_nodes:
+                    if self._durable_sync_node(n):
+                        synced_nodes.append(n)
+                if len(synced_nodes) < required_quorum:
+                    if self.wal_entries and self.wal_entries[-1][0] == tx_id:
+                        self.wal_entries.pop()
+                    self.triad_tx_seq = prev_tx_seq
+                    self.wal_pending_tx = None
+                    self.wal_pending_pre_digest = ""
+                    for n in accepted_nodes:
+                        self._rebuild_node_sql_from_committed_wal_locked(n)
+                    self._save_wal_to_disk()
+                    self.log_event(
+                        "ALERT",
+                        f"Aborted SQL tx #{tx_id} ({q}): durable sync failed on quorum ({len(synced_nodes)}/{len(online_nodes)} synced).",
+                        code="DISK_STORAGE_FAULT",
+                    )
+                    return {
+                        "ok": False,
+                        "error": "error: durable disk sync failed to reach quorum",
+                        "output": "error: durable disk sync failed to reach quorum",
+                        "quorum": f"{len(synced_nodes)}/{len(online_nodes)} online nodes durably synced",
+                        "per_node": per_node,
+                    }
+
                 self.wal_pending_tx = None
                 self.wal_pending_pre_digest = ""
-                for n in accepted_nodes:
-                    self.send_shell_cmd(n, "sync")
+                for n in synced_nodes:
                     n.tx_seq = tx_id
-                fp = self._state_fingerprint(accepted_nodes[0])
+                fp = self._state_fingerprint(synced_nodes[0])
                 if fp:
                     self.triad_state_digest = fp
-                    for n in accepted_nodes:
+                    for n in synced_nodes:
                         n.state_digest = fp
                 self._save_wal_to_disk()  # persist committed status, each node's applied tx_seq, and state digest
             finally:
@@ -3903,6 +4511,14 @@ class TriadController:
         # Mutating app write: hold `self.wal_lock` across write-ahead, replica execution,
         # and updating `tx_seq` / `desired_cron`.
         with self.wal_lock:
+            if self.fenced_out:
+                return {
+                    "ok": False,
+                    "status_code": 409,
+                    "error": "coordinator fenced by higher epoch; promote standby epoch first",
+                    "output": "error: EACCES (stale triad coordinator epoch)",
+                    "quorum": "0/3 FENCED",
+                }
             online_nodes = [n for n in self.nodes if n.state == "ONLINE"]
             if len(online_nodes) < 2:
                 self.log_event(
@@ -4000,15 +4616,34 @@ class TriadController:
                     }
 
                 if is_vault_mut:
+                    synced_nodes = []
+                    for n in accepted_nodes:
+                        if self._durable_sync_node(n):
+                            synced_nodes.append(n)
+                    if len(synced_nodes) < required_quorum:
+                        if self.wal_entries and self.wal_entries[-1][0] == tx_id:
+                            self.wal_entries.pop()
+                        self.triad_tx_seq = prev_tx_seq
+                        self.wal_pending_tx = None
+                        self.wal_pending_pre_digest = ""
+                        for n in accepted_nodes:
+                            self._rebuild_node_sql_from_committed_wal_locked(n)
+                        self._save_wal_to_disk()
+                        return {
+                            "ok": False,
+                            "error": "error: durable disk sync failed to reach quorum",
+                            "output": "error: durable disk sync failed to reach quorum",
+                            "quorum": f"{len(synced_nodes)}/{len(online_nodes)} online nodes durably synced",
+                            "per_node": per_node,
+                        }
                     self.wal_pending_tx = None
                     self.wal_pending_pre_digest = ""
-                    for n in accepted_nodes:
-                        self.send_shell_cmd(n, "sync")
+                    for n in synced_nodes:
                         n.tx_seq = tx_id
-                    fp = self._state_fingerprint(accepted_nodes[0])
+                    fp = self._state_fingerprint(synced_nodes[0])
                     if fp:
                         self.triad_state_digest = fp
-                        for n in accepted_nodes:
+                        for n in synced_nodes:
                             n.state_digest = fp
                     self._save_wal_to_disk()  # persist committed status, each node's applied tx_seq, and state digest
                 if app == "cron" and sub in ("add", "del"):
@@ -4204,15 +4839,16 @@ class TriadController:
             prev_ver = node.release_version
 
             # 1. DRAINING: Flush state to AHCI disk
-            node.state = "DRAINING"
+            with self.wal_lock:
+                node.state = "DRAINING"
+                if _wipe_disks or _fresh_ahci:
+                    self.node_commit_seq[node.node_id] = 0
+                    node.commit_seq = 0
             self.log_event(
                 "MTD",
                 f"{node.name}: Draining & sealing AHCI disk (peers {peers[0].name.split()[0]} + {peers[1].name.split()[0]} holding 2/3 majority)...",
             )
-            if _wipe_disks or _fresh_ahci:
-                self.node_commit_seq[node.node_id] = 0
-                node.commit_seq = 0
-            else:
+            if not (_wipe_disks or _fresh_ahci):
                 self.send_shell_cmd(node, "sync", timeout=3.0)
                 if not self.unit_test or node.device_key_path.exists():
                     self.verify_node_commit_seq(node)
@@ -4241,8 +4877,9 @@ class TriadController:
                 self.morph_node_image(node, new_seed, release_version=release_version)
 
             # 3. Boot freshly morphed VM from staged A/B slot
+            boot_timeout = 90.0 if self.accel == "tcg" else 35.0
             self.start_node_vm(node)
-            ok = self.await_boot(node, timeout=35.0)
+            ok = self.await_boot(node, timeout=boot_timeout)
             rolled_back = False
             if not ok:
                 tail_str = " | ".join(node.serial_tail[-5:])
@@ -4255,7 +4892,7 @@ class TriadController:
                         except Exception:
                             pass
                     try:
-                        shutil.copyfile(prev_slot_img, node.bios_img)
+                        atomic_write_bytes(node.bios_img, prev_slot_img.read_bytes())
                     except OSError:
                         node.state = "OFFLINE"
                         return False
@@ -4270,7 +4907,7 @@ class TriadController:
                         code="AB_ROLLBACK",
                     )
                     self.start_node_vm(node)
-                    rb_ok = self.await_boot(node, timeout=35.0)
+                    rb_ok = self.await_boot(node, timeout=boot_timeout)
                     if not rb_ok:
                         node.state = "OFFLINE"
                         return False
@@ -4413,11 +5050,20 @@ class TriadController:
             if getattr(self, "_live_shutdown", False):
                 return
             try:
+                healthy_peers = [n for n in self.nodes if n.node_id != node.node_id and n.state == "ONLINE"]
+                if len(healthy_peers) < 2:
+                    self.log_event(
+                        "ALERT",
+                        f"Cannot heal {node.name}: need 2 ONLINE peers for majority (got {len(healthy_peers)}/2).",
+                        code="QUORUM_LOST",
+                    )
+                    return
                 node.state = "HEALING"
-                self.node_commit_seq[node.node_id] = 0
-                node.commit_seq = 0
                 if node.storage_faulted:
                     node.storage_faulted = False
+                    with self.wal_lock:
+                        self.node_commit_seq[node.node_id] = 0
+                        node.commit_seq = 0
                     self.log_event(
                         "HEAL",
                         f"{node.name}: Rebuilding storage-faulted node onto fresh replacement AHCI image from 2/3 majority + WAL...",
@@ -4429,11 +5075,24 @@ class TriadController:
                 if not self.spec.has_sql:
                     # Non-SQL role (e.g. `wfe`): wipe the diverged persistent disk images, boot a
                     # freshly morphed kernel, sync served files from a healthy peer, and re-apply role.
+                    with self.wal_lock:
+                        self.node_commit_seq[node.node_id] = 0
+                        node.commit_seq = 0
                     self.log_event(
                         "HEAL",
                         f"{node.name}: Isolating diverged node; wiping filesystem image and rebuilding from peer + morphed ELF...",
                     )
                     self.bounce_and_morph_node(node.node_id, _lock_held=True, _wipe_disks=True)
+                    return
+                if node.proc is not None and node.proc.poll() is not None:
+                    # Dead/terminated guest (e.g. HUNG recovery): bounce into a morphed VM first and catch up via WAL.
+                    with self.wal_lock:
+                        node.tx_seq = 0
+                    self.log_event(
+                        "HEAL",
+                        f"{node.name}: Guest process exited before heal; rebooting morphed binary and replaying WAL...",
+                    )
+                    self.bounce_and_morph_node(node.node_id, _lock_held=True, _fresh_ahci=True)
                     return
 
                 # Verify 8 KiB 3-node XOR block parity recovery (D_corrupted = D_peerA ^ D_peerB ^ P)
@@ -4495,12 +5154,23 @@ class TriadController:
                     fp = self._state_fingerprint(node)
                     if fp:
                         node.state_digest = fp
+                    if not self.unit_test or node.device_key_path.exists():
+                        # Authoritative 2/3 majority + WAL reconstruction is now durably synced on disk;
+                        # re-anchor this node's authenticated commit_seq high-water mark to the rebuilt disk
+                        # so a wiped/rolled-back disk is not rejected during the immediately following morph.
+                        self.node_commit_seq[node.node_id] = 0
+                        node.commit_seq = 0
+                        if not self.verify_node_commit_seq(node):
+                            node.state = "OFFLINE"
+                            return
                     self._save_wal_to_disk()
                     node.tampered = False
 
                 # Force an immediate binary re-morph under the same `morph_op_lock` hold
                 self.bounce_and_morph_node(node.node_id, _lock_held=True)
             finally:
+                with node._storage_fault_lock:
+                    node.heal_scheduled = False
                 if node.state == "HEALING":
                     node.state = "OFFLINE" if (node.proc is not None and node.proc.poll() is not None) else "ONLINE"
 
@@ -4900,8 +5570,9 @@ class TriadController:
         for n in self.nodes:
             self.start_node_vm(n)
 
+        boot_timeout = 90.0 if self.accel == "tcg" else 35.0
         for n in self.nodes:
-            ok = self.await_boot(n, timeout=30.0)
+            ok = self.await_boot(n, timeout=boot_timeout)
             if ok:
                 if not self.apply_node_profile(n):
                     continue
@@ -4915,6 +5586,12 @@ class TriadController:
                 )
             else:
                 n.state = "OFFLINE"
+                if n.proc and n.proc.poll() is None:
+                    try:
+                        n.proc.kill()
+                        n.proc.wait(timeout=3.0)
+                    except Exception:
+                        pass
                 self.log_event("ERROR", f"{n.name} failed to reach interactive shell ready.")
 
         self._resolve_pending_wal_at_boot()
@@ -5095,6 +5772,12 @@ class TriadController:
                             self._save_wal_to_disk()
                         except Exception:
                             pass
+            if not self.unit_test and self.epoch_file.exists():
+                with self.wal_lock:
+                    try:
+                        self._save_coordinator_epoch()
+                    except Exception:
+                        pass
             for n in self.nodes:
                 if not self.unit_test:
                     n.state = "OFFLINE"
@@ -5625,6 +6308,9 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
 
     def _send_text(self, code: int, ctype: str, text: str, extra_headers: dict[str, str] | None = None):
         body = text.encode("utf-8")
+        self._send_bytes(code, ctype, body, extra_headers=extra_headers)
+
+    def _send_bytes(self, code: int, ctype: str, body: bytes, extra_headers: dict[str, str] | None = None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self._send_security_headers()
@@ -5730,6 +6416,20 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                 self.ctrl.render_prometheus_metrics(),
             )
 
+        if base_path == "/api/backup":
+            if not self._check_auth_or_reject_json():
+                return
+            try:
+                blob = self.ctrl.export_encrypted_backup_bytes()
+            except Exception as e:
+                return self._send_json(500, {"ok": False, "error": f"backup export failed: {e}"})
+            return self._send_bytes(
+                200,
+                "application/octet-stream",
+                blob,
+                extra_headers={"Content-Disposition": 'attachment; filename="triad_backup.cttlbkup"'},
+            )
+
         if base_path == "/api/triad":
             if not self._check_auth_or_reject_json():
                 return
@@ -5737,6 +6437,8 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
             data = {
                 "quorum_status": c.quorum_status,
                 "coordinator_epoch": c.coordinator_epoch,
+                "fenced_out": c.fenced_out,
+                "wal_mirror": c.wal_mirror_status,
                 "rpc_http_ok_total": c.rpc_http_ok_total,
                 "triad_tx_seq": c.triad_tx_seq,
                 "parity_sha256": c.parity_sha256,
@@ -5785,18 +6487,12 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                     "text/plain; charset=utf-8",
                     "error: query contains non-printable or control characters\n",
                 )
-            up = q.upper()
-            if not (
-                up.startswith("SELECT")
-                or up.startswith(".TABLES")
-                or up.startswith("SHOW")
-                or up.startswith(".SCHEMA")
-                or up.startswith("DESCRIBE")
-            ):
+            if not is_readonly_sql_query(q):
                 return self._send_text(
-                    401,
+                    405,
                     "text/plain; charset=utf-8",
-                    "error: unauthorized (use authenticated POST /sql for mutations)\n",
+                    "error: method not allowed (use authenticated POST /sql for mutations)\n",
+                    extra_headers={"Allow": "POST"},
                 )
             try:
                 res = self.ctrl.execute_triad_sql(q)
@@ -5806,6 +6502,15 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                     "text/plain; charset=utf-8",
                     f"error: {e}\n",
                 )
+            if not res.get("ok"):
+                err_txt = str(res.get("error") or res.get("output") or "error: SQL query failed")
+                low_err = err_txt.lower()
+                err_code = (
+                    503
+                    if ("quorum lost" in low_err or "split-brain" in low_err or "fewer than 2" in low_err)
+                    else 400
+                )
+                return self._send_text(err_code, "text/plain; charset=utf-8", err_txt + "\n")
             return self._send_text(200, "text/plain; charset=utf-8", res.get("output", "") + "\n")
 
         return self._send_text(404, "text/plain", "not found\n")
@@ -5852,7 +6557,7 @@ class TriadHttpHandler(BaseHTTPRequestHandler):
                 res = self.ctrl.execute_triad_sql(body)
             except ValueError as e:
                 return self._send_json(400, {"ok": False, "error": f"rejected: {e}"})
-            return self._send_json(200 if res.get("ok") else 400, res)
+            return self._send_json(res.get("status_code", 200 if res.get("ok") else 400), res)
 
         if self.path == "/api/sh":
             if not is_printable_ascii_command(body):
@@ -8552,6 +9257,19 @@ def run_stage8_security_and_wal_unit_tests(tmp_dir: Path, sc_harness: RealOsShel
     assert cs_ctrl2.verify_node_commit_seq(cs_ctrl2.nodes[2]) is False
     assert cs_ctrl2.nodes[2].tampered is True
     assert any(e.get("code") == "DISK_SEAL_REJECTED" and "OS-3" in e["msg"] for e in cs_ctrl2.events)
+    # Whole-disk wipe/rollback heal (`commit_seq=4 < high-water 139`) keeps high-water until authoritative
+    # WAL reconstruction finishes, then re-anchors `node_commit_seq` so emergency morph rejoins ONLINE:
+    sf_ctrl.node_commit_seq[3] = 139
+    sf_ctrl.nodes[2].commit_seq = 139
+    sc_harness.reset_node(3)
+    sc_harness.set_device_key(3, sf_ctrl.nodes[2].device_key_path.read_bytes())
+    sc_harness.set_commit_seq(3, 4)
+    assert sf_ctrl.verify_node_commit_seq(sf_ctrl.nodes[2]) is False
+    assert sf_ctrl.node_commit_seq[3] == 139
+    sf_ctrl.start_node_vm = lambda node: setattr(node, "last_disk_boot_status", "OK")
+    sf_ctrl.heal_and_remorph_node(sf_ctrl.nodes[2])
+    assert sf_ctrl.nodes[2].state == "ONLINE", f"OS-3 must rejoin ONLINE after wiped-disk heal, got {sf_ctrl.nodes[2].state}"
+    assert 4 <= sf_ctrl.node_commit_seq[3] < 139, f"re-anchored commit_seq expected in 4..138, got {sf_ctrl.node_commit_seq[3]}"
 
     # 7. Clean `shutdown()` wakes `_background_scheduler` immediately via `_stop_event` and joins it
     #    without firing a post-shutdown `_scheduler_step` or zombie `unreadable state probe` alert (`High #2`):
@@ -8844,6 +9562,263 @@ def run_stage8_security_and_wal_unit_tests(tmp_dir: Path, sc_harness: RealOsShel
     assert uart_ctrl.send_shell_cmd(unode, "write /var/x 1", timeout=0.5) == "error: command timed out"
     assert uart_attempts["rw"] == 1, "mutating UART command must never auto-retry on timeout"
 
+    # Stage D enterprise coordinator hardening tests:
+    assert not is_readonly_sql_query("SELECT1"), "SELECT1 without word boundary must not be treated as SELECT"
+    assert is_readonly_sql_query("SELECT 1"), "SELECT 1 must be read-only"
+    assert is_readonly_shell_command("mem"), "mem telemetry command must be allowed as read-only shell command"
+
+    sd_root = Path(tempfile.mkdtemp(prefix="cuttle_stage_d_unit_"))
+    try:
+        mirror_dir = sd_root / "offbox_mirror"
+        sd_state = sd_root / "triad_state"
+        sd_key = sd_root / "master_key.bin"
+        sd_ctrl = TriadController(
+            show_gui=False,
+            spec=TriadSpec(
+                name="sd-main",
+                state_dir=sd_state,
+                master_key_path=sd_key,
+                wal_mirror_dir=mirror_dir,
+                write_operator_token=False,
+            ),
+            unit_test=True,
+        )
+        sd_ctrl.shutdown()
+        for n in sd_ctrl.nodes:
+            n.state = "ONLINE"
+        sd_kv: dict[int, str] = {1: _GENESIS_KV_PROBE_MARKER, 2: _GENESIS_KV_PROBE_MARKER, 3: _GENESIS_KV_PROBE_MARKER}
+
+        def _sd_cmd(node, cmd, timeout=5.0):
+            c = cmd.strip()
+            if ".dump kv digest" in c:
+                return f"sqldump table=kv rows=3 off=0 count=0 digest={'a' * 64} ddl=435245415445205441424c45206b7620286b20544558542c207620544558542c2072657620494e5429"
+            if c.startswith("sql /*triad*/ INSERT"):
+                return "INSERT 1"
+            if c == "sync":
+                return "sync: ok"
+            if c.startswith("triad epoch "):
+                return f"triad: min_epoch={c.split()[-1]}"
+            return "ok"
+
+        sd_ctrl.send_shell_cmd = _sd_cmd
+        assert sd_ctrl.execute_triad_sql("BEGIN")["ok"] is False, "explicit BEGIN must be rejected on Triad SQL"
+        assert sd_ctrl.execute_triad_sql("COMMIT")["ok"] is False, "explicit COMMIT must be rejected on Triad SQL"
+        assert sd_ctrl.execute_triad_sql("ROLLBACK")["ok"] is False, "explicit ROLLBACK must be rejected on Triad SQL"
+
+        ins_res = sd_ctrl.execute_triad_sql("INSERT INTO kv VALUES ('sd.secret_marker', 'top_secret_val', 1)")
+        assert ins_res["ok"] is True, ins_res
+        wal_json = json.loads(sd_ctrl.wal_file.read_text(encoding="utf-8"))
+        ep_json = json.loads(sd_ctrl.epoch_file.read_text(encoding="utf-8"))
+        assert len(wal_json.get("hmac", "")) == 64, "triad_wal.json must carry a 64-hex HMAC tag"
+        assert len(ep_json.get("hmac", "")) == 64, "coordinator_epoch.json must carry a 64-hex HMAC tag"
+        assert ep_json.get("highest_tx_seq") == 1 and ep_json.get("wal_created") is True
+
+        mirror_file = mirror_dir / "triad_wal_mirror.enc"
+        assert mirror_file.exists(), "off-box encrypted WAL mirror must be written"
+        mirror_raw = mirror_file.read_bytes()
+        assert mirror_raw.startswith(b"CTTLWMIR1") and b"top_secret_val" not in mirror_raw
+
+        # Failed `sync` on majority during SQL write must fail closed without advancing tx_seq!
+        sd_ctrl.send_shell_cmd = lambda node, cmd, timeout=5.0: (
+            "error: EIO" if cmd.strip() == "sync" and node.node_id in (1, 2) else _sd_cmd(node, cmd, timeout)
+        )
+        fail_sync = sd_ctrl.execute_triad_sql("INSERT INTO kv VALUES ('sd.nosync', 'x', 1)")
+        assert fail_sync["ok"] is False and sd_ctrl.triad_tx_seq == 1, f"failed sync must abort tx: {fail_sync}"
+        sd_ctrl.send_shell_cmd = _sd_cmd
+
+        # Role="sql" (where svc-sh denies `sync` with EACCES while kernel synchronously persists SQL) commits cleanly:
+        sql_role_ctrl = TriadController(
+            show_gui=False,
+            spec=TriadSpec(name="sd-sql-role", role="sql", state_dir=sd_root / "sql_role_sync", master_key_path=sd_key, write_operator_token=False),
+            unit_test=True,
+        )
+        sql_role_ctrl.shutdown()
+        for n in sql_role_ctrl.nodes:
+            n.state = "ONLINE"
+        sql_role_ctrl.send_shell_cmd = lambda node, cmd, timeout=5.0: (
+            "error: EACCES (svc-sh disabled by node role or policy)" if cmd.strip() == "sync" else _sd_cmd(node, cmd, timeout)
+        )
+        sql_role_res = sql_role_ctrl.execute_triad_sql("INSERT INTO kv VALUES ('sql.role', 'ok', 1)")
+        assert sql_role_res["ok"] is True and sql_role_ctrl.triad_tx_seq == 1, f"role=sql must commit cleanly without svc-sh sync: {sql_role_res}"
+        assert sql_role_ctrl.promote_standby_epoch() == 2
+
+        # Tampered WAL HMAC must fail closed:
+        tampered_wal = dict(wal_json)
+        tampered_wal["triad_tx_seq"] = 99
+        tamper_dir = sd_root / "tamper_wal"
+        shutil.copytree(sd_state, tamper_dir)
+        (tamper_dir / "controller.lock").unlink(missing_ok=True)
+        (tamper_dir / "triad_wal.json").write_text(json.dumps(tampered_wal), encoding="utf-8")
+        try:
+            TriadController(
+                show_gui=False,
+                spec=TriadSpec(name="sd-tamper", state_dir=tamper_dir, master_key_path=sd_key, write_operator_token=False),
+                unit_test=True,
+            ).shutdown()
+            raise AssertionError("tampered triad_wal.json without matching HMAC must raise ValueError")
+        except ValueError as e:
+            assert "WAL" in str(e).upper() or "HMAC" in str(e).upper(), e
+
+        # Deleting triad_wal.json when coordinator_epoch.json records prior WAL state must fail closed!
+        del_dir = sd_root / "deleted_wal"
+        shutil.copytree(sd_state, del_dir)
+        (del_dir / "controller.lock").unlink(missing_ok=True)
+        (del_dir / "triad_wal.json").unlink()
+        try:
+            TriadController(
+                show_gui=False,
+                spec=TriadSpec(name="sd-del", state_dir=del_dir, master_key_path=sd_key, write_operator_token=False),
+                unit_test=True,
+            ).shutdown()
+            raise AssertionError("missing triad_wal.json when coordinator_epoch.json records wal_created must fail closed")
+        except ValueError as e:
+            assert "WAL_CORRUPT" in str(e) or "missing" in str(e).lower(), e
+
+        # Persisted monotonic node_rpc_seq survives restart when wall clock steps backward:
+        sd_ctrl.nodes[0].rpc_seq = 9_999_999_999_999
+        sd_ctrl._save_coordinator_epoch()
+        re_dir = sd_root / "rpc_seq_restart"
+        shutil.copytree(sd_state, re_dir)
+        (re_dir / "controller.lock").unlink(missing_ok=True)
+        re_ctrl = TriadController(
+            show_gui=False,
+            spec=TriadSpec(name="sd-rpc", state_dir=re_dir, master_key_path=sd_key, write_operator_token=False),
+            unit_test=True,
+        )
+        re_ctrl.shutdown()
+        assert re_ctrl.nodes[0].rpc_seq >= 9_999_999_999_999
+
+        # Live standby promotion requires >= 2 online nodes, and fenced_out blocks mutations with 409:
+        sd_ctrl.nodes[1].state = "OFFLINE"
+        sd_ctrl.nodes[2].state = "OFFLINE"
+        try:
+            sd_ctrl.promote_standby_epoch()
+            raise AssertionError("live promote_standby_epoch with only 1/3 ONLINE nodes must raise ValueError")
+        except ValueError as e:
+            assert "QUORUM_LOST" in str(e), e
+        sd_ctrl.nodes[1].state = "ONLINE"
+        sd_ctrl.nodes[2].state = "ONLINE"
+        sd_ctrl.fenced_out = True
+        fenced_sql = sd_ctrl.execute_triad_sql("INSERT INTO kv VALUES ('fenced', 'no', 1)")
+        assert fenced_sql["ok"] is False and fenced_sql.get("status_code") == 409, fenced_sql
+        promoted_ep = sd_ctrl.promote_standby_epoch()
+        assert promoted_ep > 1 and sd_ctrl.fenced_out is False
+
+        # Paged-store (>= 2 MiB) AHCI disk refuses raw 8 KiB XOR partition overwrite, and storage fault preserves disk size:
+        for n in sd_ctrl.nodes:
+            n.ahci_img.write_bytes(b"\x00" * (4 * 1024 * 1024))
+        try:
+            sd_ctrl.reconstruct_sql_partition_from_xor_parity(1)
+            raise AssertionError("reconstruct_sql_partition_from_xor_parity must refuse >= 2 MiB paged-store disk")
+        except ValueError:
+            pass
+        sd_ctrl.bounce_and_morph_node = lambda *a, **kw: True
+        sd_ctrl._handle_node_storage_fault(sd_ctrl.nodes[0], "STORAGE FAULT: test", async_heal=False)
+        assert sd_ctrl.nodes[0].ahci_img.stat().st_size == 4 * 1024 * 1024, "replacement AHCI disk must preserve 4 MiB size"
+
+        # _sync_files_from_peer removes stale /var files on target absent on peer:
+        wfe_ctrl = TriadController(
+            show_gui=False,
+            spec=TriadSpec(name="sd-wfe", role="wfe", state_dir=sd_root / "wfe_sync", master_key_path=sd_key, write_operator_token=False),
+            unit_test=True,
+        )
+        wfe_ctrl.shutdown()
+        removed_paths: list[str] = []
+
+        def _wfe_cmd(node, cmd, timeout=4.0):
+            if cmd == "ls":
+                return "/var/keep.txt (4 B)" if node.node_id == 2 else "/var/keep.txt (4 B)\n/var/rogue.txt (5 B)"
+            if cmd.startswith("rm "):
+                removed_paths.append(cmd.split(None, 1)[1])
+                return "ok"
+            if cmd == "sync":
+                return "sync: ok"
+            return "ok"
+
+        wfe_ctrl.send_shell_cmd = _wfe_cmd
+        wfe_ctrl._read_node_file_bytes = lambda node, fp, expected_len=None: b"same"
+        assert wfe_ctrl._sync_files_from_peer(wfe_ctrl.nodes[0], wfe_ctrl.nodes[1]) is True
+        assert "/var/rogue.txt" in removed_paths, f"expected /var/rogue.txt to be removed, got {removed_paths}"
+
+        # Encrypted backup / verify / restore + GET /api/backup unauthenticated 401 across all 4 roles + GET /sql 405/503:
+        bk_path = sd_root / "snapshot.cttlbkup"
+        sd_ctrl.export_encrypted_backup(bk_path)
+        meta = TriadController.verify_encrypted_backup(bk_path, sd_ctrl.master_key_bytes)
+        assert meta["triad_tx_seq"] == 1
+        corrupt_bk = sd_root / "corrupt.cttlbkup"
+        raw_bk = bytearray(bk_path.read_bytes())
+        raw_bk[-1] ^= 0xFF
+        corrupt_bk.write_bytes(bytes(raw_bk))
+        try:
+            TriadController.verify_encrypted_backup(corrupt_bk, sd_ctrl.master_key_bytes)
+            raise AssertionError("corrupted backup bundle must fail verify_encrypted_backup")
+        except ValueError:
+            pass
+
+        restore_dir = sd_root / "restored_state"
+        TriadController.restore_encrypted_backup(bk_path, restore_dir, sd_key)
+        restored_ctrl = TriadController(
+            show_gui=False,
+            spec=TriadSpec(name="sd-restored", state_dir=restore_dir, master_key_path=sd_key, write_operator_token=False),
+            unit_test=True,
+        )
+        restored_ctrl.shutdown()
+        assert restored_ctrl.triad_tx_seq == 1
+
+        for role_name in ("full", "wfe", "sql", "shell"):
+            r_dir = sd_root / f"bk_role_{role_name}"
+            r_ctrl = TriadController(
+                show_gui=False,
+                spec=TriadSpec(name=f"bk-{role_name}", role=role_name, state_dir=r_dir, master_key_path=sd_key, write_operator_token=False),
+                unit_test=True,
+            )
+            r_ctrl.shutdown()
+            prev_c = getattr(TriadHttpHandler, "ctrl", None)
+            TriadHttpHandler.ctrl = r_ctrl
+            r_srv = ThreadingHTTPServer(("127.0.0.1", 0), TriadHttpHandler)
+            r_port = r_srv.server_address[1]
+            threading.Thread(target=r_srv.serve_forever, daemon=True).start()
+            try:
+                for bad_hdr in ({}, {"X-Cuttle-Session": "wrong"}, {"X-Cuttle-Session": "é" * 16}):
+                    req_b = urllib.request.Request(f"http://127.0.0.1:{r_port}/api/backup", headers=bad_hdr)
+                    try:
+                        urllib.request.urlopen(req_b, timeout=5.0)
+                        raise AssertionError(f"role={role_name}: GET /api/backup without valid auth must return 401")
+                    except urllib.error.HTTPError as e:
+                        assert e.code == 401, f"role={role_name}: expected 401 on /api/backup, got {e.code}"
+                auth_hdr = {"X-Cuttle-Session": r_ctrl.coordinator_token}
+                with urllib.request.urlopen(
+                    urllib.request.Request(f"http://127.0.0.1:{r_port}/api/backup", headers=auth_hdr),
+                    timeout=5.0,
+                ) as resp_b:
+                    assert resp_b.status == 200
+                    dl_bytes = resp_b.read()
+                    assert dl_bytes.startswith(b"CTTLBKUP1")
+                    TriadController.verify_encrypted_backup_bytes(dl_bytes, r_ctrl.master_key_bytes)
+                if role_name == "sql":
+                    try:
+                        urllib.request.urlopen(
+                            urllib.request.Request(f"http://127.0.0.1:{r_port}/sql?DELETE+FROM+kv", headers=auth_hdr),
+                            timeout=5.0,
+                        )
+                        raise AssertionError("authenticated mutation on GET /sql must return 405")
+                    except urllib.error.HTTPError as e:
+                        assert e.code == 405, f"expected 405 on GET /sql mutation, got {e.code}"
+                    try:
+                        urllib.request.urlopen(
+                            urllib.request.Request(f"http://127.0.0.1:{r_port}/sql?SELECT+*+FROM+kv", headers=auth_hdr),
+                            timeout=5.0,
+                        )
+                        raise AssertionError("GET /sql with 0/3 online nodes must return 503")
+                    except urllib.error.HTTPError as e:
+                        assert e.code == 503, f"expected 503 on quorum-lost GET /sql, got {e.code}"
+            finally:
+                r_srv.shutdown()
+                r_srv.server_close()
+                TriadHttpHandler.ctrl = prev_c
+    finally:
+        shutil.rmtree(sd_root, ignore_errors=True)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Cuttle 3-as-1 Triad Hypervisor Controller")
@@ -8870,6 +9845,46 @@ def main():
         default=os.environ.get("CUTTLE_ACCEL") or "auto",
         help="QEMU accelerator: auto (WHPX if available, else TCG), whpx, or tcg. Default: $CUTTLE_ACCEL or auto",
     )
+    parser.add_argument(
+        "--state-dir",
+        type=Path,
+        default=None,
+        help="Override Triad coordinator state directory (default: target/cuttle_images/triad)",
+    )
+    parser.add_argument(
+        "--wal-mirror-dir",
+        type=Path,
+        default=None,
+        help="Optional off-box directory for continuous encrypted WAL mirroring (triad_wal_mirror.enc)",
+    )
+    parser.add_argument(
+        "--backup",
+        type=Path,
+        default=None,
+        help="Export an encrypted CTTLBKUP1 snapshot bundle from --state-dir and exit",
+    )
+    parser.add_argument(
+        "--verify-backup",
+        type=Path,
+        default=None,
+        help="Cryptographically verify an encrypted CTTLBKUP1 snapshot bundle and exit",
+    )
+    parser.add_argument(
+        "--restore",
+        type=Path,
+        default=None,
+        help="Restore a verified CTTLBKUP1 snapshot bundle into --state-dir and exit",
+    )
+    parser.add_argument(
+        "--force-disaster-recovery",
+        action="store_true",
+        help="Allow --restore even when backup triad_tx_seq is below target coordinator_epoch.json highest_tx_seq",
+    )
+    parser.add_argument(
+        "--print-token",
+        action="store_true",
+        help="Display the operator session token on stdout (otherwise masked and written only to operator_token.txt)",
+    )
     args = parser.parse_args()
 
     if args.fault_test:
@@ -8881,14 +9896,57 @@ def main():
         print("=== TRIAD CONTROLLER UNIT SELF-TESTS PASSED ===", flush=True)
         return
 
+    target_state_dir = args.state_dir if args.state_dir is not None else TRIAD_DIR
+    if args.verify_backup is not None:
+        key_bytes = load_or_create_secret_file(ROOT / "device_secret_key.bin", 32, binary=True)
+        info = TriadController.verify_encrypted_backup(args.verify_backup, key_bytes)
+        print(
+            f"VERIFIED backup {args.verify_backup}: triad={info['triad_name']} role={info['role']} "
+            f"epoch={info['coordinator_epoch']} tx_seq={info['triad_tx_seq']}",
+            flush=True,
+        )
+        return
+    if args.restore is not None:
+        res = TriadController.restore_encrypted_backup(
+            args.restore,
+            target_state_dir,
+            ROOT / "device_secret_key.bin",
+            force_disaster_recovery=args.force_disaster_recovery,
+        )
+        print(
+            f"RESTORED backup {args.restore} -> {target_state_dir}: "
+            f"epoch={res['coordinator_epoch']} tx_seq={res['triad_tx_seq']}",
+            flush=True,
+        )
+        return
+    if args.backup is not None:
+        b_ctrl = TriadController(
+            show_gui=False,
+            spec=TriadSpec(
+                state_dir=target_state_dir,
+                wal_mirror_dir=args.wal_mirror_dir,
+                write_operator_token=False,
+            ),
+            unit_test=True,
+        )
+        try:
+            info = b_ctrl.export_encrypted_backup(args.backup)
+        finally:
+            b_ctrl.shutdown()
+        print(
+            f"EXPORTED backup -> {args.backup}: epoch={info['coordinator_epoch']} tx_seq={info['triad_tx_seq']}",
+            flush=True,
+        )
+        return
+
     selftest_dir: Path | None = None
     if args.self_test:
         run_unit_self_tests()
         IMAGES_DIR.mkdir(parents=True, exist_ok=True)
         selftest_dir = Path(tempfile.mkdtemp(prefix="cuttle_triad_selftest_", dir=str(IMAGES_DIR)))
-        spec = TriadSpec(state_dir=selftest_dir, accel=args.accel)
+        spec = TriadSpec(state_dir=selftest_dir, wal_mirror_dir=args.wal_mirror_dir, accel=args.accel)
     else:
-        spec = TriadSpec(accel=args.accel)
+        spec = TriadSpec(state_dir=target_state_dir, wal_mirror_dir=args.wal_mirror_dir, accel=args.accel)
 
     ctrl = TriadController(show_gui=args.gui, spec=spec)
     TriadHttpHandler.ctrl = ctrl
@@ -8956,6 +10014,7 @@ def main():
                 # #17 & #22: Every authenticated endpoint refuses {no token, wrong token, non-ASCII token} with 401
                 auth_endpoints = [
                     ("GET", "/api/triad", None),
+                    ("GET", "/api/backup", None),
                     ("GET", "/sql?SELECT+*+FROM+kv", None),
                     ("POST", "/sql", b"SELECT * FROM kv"),
                     ("POST", "/api/sql", b"SELECT * FROM kv"),
@@ -9386,6 +10445,7 @@ def main():
                     "triad_wal.json must record triad_state_digest and node_state_digest (#10)"
                 )
                 data.pop("node_tx_seq", None)
+                data["hmac"] = ctrl._compute_wal_hmac(data)
                 wal_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
             ctrl = restart_controller(ctrl, before_boot=strip_node_tx_seq)
@@ -9418,11 +10478,16 @@ def main():
         return
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), TriadHttpHandler)
+    tok_display = (
+        ctrl.coordinator_token
+        if args.print_token
+        else "[masked; saved to operator_token.txt — pass --print-token to display]"
+    )
     print("\n============================================================================", flush=True)
     print(f"  CUTTLE 3-AS-1 TRIAD APPLIANCE ONLINE!", flush=True)
     print(f"  Unified Command Center : http://127.0.0.1:{args.port}/app", flush=True)
     print(f"  Live Ops Console       : http://127.0.0.1:{args.port}/console", flush=True)
-    print(f"  Operator Session Token : {ctrl.coordinator_token} (saved to triad/operator_token.txt)", flush=True)
+    print(f"  Operator Session Token : {tok_display}", flush=True)
     print(f"  Unified SQL Endpoint   : POST http://127.0.0.1:{args.port}/api/sql (with X-Cuttle-Session header)", flush=True)
     print(f"  Individual OS Ports    : OS-1 :18101 | OS-2 :18102 | OS-3 (Parity) :18103", flush=True)
     print(f"  Accelerator            : {ctrl.accel} (requested {args.accel})", flush=True)

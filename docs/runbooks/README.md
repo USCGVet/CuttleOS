@@ -21,7 +21,7 @@ Every `ALERT` event emitted by the controller includes a machine-parseable `code
 
 ### `QUORUM_LOST` {#quorum_lost}
 
-- **Symptom**: Fewer than 2 of 3 Triad nodes are in `ONLINE` state (`cuttle_triad_quorum_online_nodes < 2`). Mutating SQL/App writes and quorum reads fail closed with HTTP `400` / `quorum lost`.
+- **Symptom**: Fewer than 2 of 3 Triad nodes are in `ONLINE` state (`cuttle_triad_quorum_online_nodes < 2`). Mutating SQL/App writes fail closed (`400` on `POST /api/sql`), `GET /sql` read queries fail closed with HTTP `503`, and live standby epoch promotions (`POST /api/failover`) fail closed with HTTP `409` (`QUORUM_LOST: standby promotion requires >= 2 online nodes`).
 - **Single-Node vs. Two-Node Outage**:
   - **Single-Node Outage (2/3 Degraded)**: Appliance remains 100% available for reads and writes. Rolling morphs are automatically paused (`need 2 healthy peers for majority`).
   - **Two-Node Outage (1/3 or 0/3 Quorum Lost)**: Appliance fails closed to prevent split-brain writes.
@@ -57,10 +57,10 @@ Every `ALERT` event emitted by the controller includes a machine-parseable `code
 
 ### `WAL_CORRUPT` {#wal_corrupt}
 
-- **Symptom**: `triad_wal.json` failed JSON parsing or schema/invariant validation at startup. The controller copied the damaged file to `triad_wal.json.bad` and refused to start.
-- **WAL Corruption Recovery**:
-  1. Inspect `triad_wal.json.bad` and any pre-migration backup `triad_wal.json.pre-v*`.
-  2. If a pre-migration backup (`triad_wal.json.pre-v1`) is intact, or if all 3 node AHCI SQL partitions (`ahci_node{1,2,3}.img`) agree 3/3 on their on-disk state, restore from the verified backup or archive `triad_wal.json.bad` and allow the 3/3 online majority to re-checkpoint on boot.
+- **Symptom**: `triad_wal.json` or `coordinator_epoch.json` failed JSON parsing, schema validation, or `HMAC-SHA256` authentication tag verification; `triad_wal.json` was missing or rolled back below `coordinator_epoch.json`'s `highest_tx_seq` / `wal_created` anti-rollback floor; or an off-box encrypted WAL mirror write (`--wal-mirror-dir`, `CTTLWMIR1`) failed. On startup failures, the controller saves any damaged `triad_wal.json` to `triad_wal.json.bad` and refuses to start.
+- **WAL Corruption & Disaster Recovery**:
+  1. Inspect `triad_wal.json.bad`, `coordinator_epoch.json`, and any off-box `triad_wal_mirror.enc` or encrypted backup bundle (`*.cttlbkup`).
+  2. Verify an encrypted backup bundle with `python tools/triad_controller.py --verify-backup <snapshot.cttlbkup>` and restore it while the controller is stopped via `python tools/triad_controller.py --restore <snapshot.cttlbkup> [--state-dir <dir>]` (passing `--force-disaster-recovery` only when intentionally restoring an older `triad_tx_seq` below `highest_tx_seq`).
 
 ### `SCHEMA_MISMATCH` {#schema_mismatch}
 
@@ -78,11 +78,11 @@ Every `ALERT` event emitted by the controller includes a machine-parseable `code
 
 ### `SPLIT_BRAIN` {#split_brain}
 
-- **Symptom**: All 3 online nodes returned pairwise-distinct state probes (`o1 != o2 != o3`), or the 2 surviving nodes in a 2/3 degraded Triad disagreed (`o_a != o_b`). The controller entered fail-closed `SPLIT-BRAIN` status and refused to overwrite any node or accept new mutating writes.
-- **Split-Brain Triage**:
-  1. Query `GET /api/triad` and inspect the controller log for the per-table row diff diagnosis (`SQL table '<name>' mismatch diagnosis`).
-  2. Compare the committed `triad_wal.json` (`triad_tx_seq` and `triad_state_digest`) against each node's `node_state_digest`.
-  3. Identify the node(s) whose on-disk state matches `triad_state_digest`, stop the controller, replace the diverged node's AHCI image or remove its stale disk image so 2/3 majority matches `triad_state_digest`, and restart the controller to heal the 3rd node from the verified majority + WAL.
+- **Symptom**: All 3 online nodes returned pairwise-distinct state probes (`o1 != o2 != o3`), the 2 surviving nodes in a 2/3 degraded Triad disagreed (`o_a != o_b`), or a node fenced this coordinator on `/triad/rpc` due to a higher `coordinator_epoch` (`fenced_out = true`, returning HTTP `409 Conflict` on mutating requests). The controller entered fail-closed status and refused to overwrite any node or accept new mutating writes.
+- **Split-Brain & Epoch Fencing Triage**:
+  1. If `fenced_out` is `true` in `GET /api/triad`, stop any competing stale coordinator process and promote the active coordinator via `POST /api/failover` (requires `>= 2` online nodes to accept and `sync` the new epoch).
+  2. Otherwise query `GET /api/triad` and inspect the controller log for the per-table row diff diagnosis (`SQL table '<name>' mismatch diagnosis`).
+  3. Compare the committed `triad_wal.json` (`triad_tx_seq` and `triad_state_digest`) against each node's `node_state_digest`, stop the controller, remove or replace the diverged node's disk image so 2/3 majority matches `triad_state_digest`, and restart the controller to heal the 3rd node from the verified majority + WAL.
 
 ### `DISK_SLOT_REPAIRED` {#disk_slot_repaired}
 
@@ -112,9 +112,9 @@ Every `ALERT` event emitted by the controller includes a machine-parseable `code
 
 ### `DISK_STORAGE_FAULT` {#disk_storage_fault}
 
-- **Symptom**: A guest kernel halted fail-closed with `STORAGE FAULT: ...` because an AHCI read, write, flush, or layout check failed during boot or runtime persistence.
+- **Symptom**: A guest kernel halted fail-closed with `STORAGE FAULT: ...` because an AHCI read, write, flush, or layout check failed during boot or runtime persistence, or a quorum of online nodes failed durable `sync` during a Triad write.
 - **Automated Recovery & Forensics**:
-  1. The controller automatically terminates the halted VM, archives the faulted disk image to `node<id>/ahci_node<id>.fault_<ts>_<n>.img`, provisions a fresh zeroed 1 MiB `ahci_node<id>.img`, and runs `heal_and_remorph_node` to rebuild the node from the 2-of-3 majority + WAL.
+  1. The controller automatically terminates the halted VM, archives the faulted disk image to `node<id>/ahci_node<id>.fault_<ts>_<n>.img`, provisions a fresh zeroed replacement `ahci_node<id>.img` preserving the node's configured `>= 1 MiB` disk size (e.g. `4 MiB` / `12 MiB` `CTTLPGS1` paged-store disks), and runs `heal_and_remorph_node` to rebuild the node from the 2-of-3 majority + WAL.
   2. Inspect host disk space (`df -h` / volume free space) and the archived `.fault_*.img` image (including any encrypted `CTTLPENC` panic record at `LBA 1536..=1567`).
 - **Faults that are not device errors** (the text after `STORAGE FAULT:`). In each of these the node halted instead of starting over, so on a standalone node (no Triad to heal from) the data is still on the disk: fix the cause and reboot, and image the disk before replacing it. The only writes recovery makes before such a halt are repairs of a slot or a page from its own verified copy.
   - `state cannot be authenticated and the page store holds data (nothing was started over; check the device key)`: the state slots did not verify under this boot's device key, and the disk has a page store (`LBA 2048..`, disks of 4096 sectors or more) with SQL rows and file contents in it. The usual cause is a wrong or missing `-fw_cfg` device key. With the right key the next boot restores everything. On a disk without a page store the same condition is `SHELL resume REJECTED` and the node starts over, because there the unverifiable slots fit in the quarantine area.
@@ -160,3 +160,20 @@ Every `ALERT` event emitted by the controller includes a machine-parseable `code
    - Append the retired 32-byte Ed25519 public key (64 hex chars) to `revoked_pubkeys = ["<hex64>"]` in `factory_builder/build_policy.toml` and `target_enterprise_kernel/kernel_policy.toml`.
    - Re-sign both policy TOMLs (`policy_signature_ed25519`) with the active signing key.
    - Verify with `cargo test --workspace` that `revoked_key_rejected_by_loader_and_factory` passes and any manifest signed by the revoked key is rejected before boot.
+
+---
+
+## Encrypted Snapshot Backup, Off-Box WAL Mirror & Restore
+
+1. **Continuous Off-Box Encrypted WAL Mirroring (`CTTLWMIR1`)**:
+   - Pass `--wal-mirror-dir <offbox_mount>` to `tools/triad_controller.py`. Every committed WAL update atomically writes an Encrypt-then-MAC (`HMAC-SHA256`) `triad_wal_mirror.enc` bundle and exposes mirror health under `wal_mirror` in `GET /api/triad`.
+2. **Export, Verify & Restore Encrypted Snapshots (`CTTLBKUP1`)**:
+   - Online download (requires `X-Cuttle-Session` or `Authorization: Bearer`): `GET http://127.0.0.1:18080/api/backup`
+   - Offline CLI export: `python tools/triad_controller.py --state-dir <dir> --backup <snapshot.cttlbkup>`
+   - Cryptographic verification (checks outer `CTTLBKUP1` MAC + inner `triad_wal.json` and `coordinator_epoch.json` HMACs): `python tools/triad_controller.py --verify-backup <snapshot.cttlbkup>`
+   - Offline restore (refuses active `controller.lock` and refuses rollback below existing `highest_tx_seq` unless `--force-disaster-recovery` is supplied): `python tools/triad_controller.py --state-dir <dir> --restore <snapshot.cttlbkup>`
+
+## Verification Scope Note
+
+- **Verified in automated CI / QEMU smoke tests**: deterministic volatile-cache power-cut and bit-rot unit models, live QEMU `blkdebug` sector `EIO` primary-to-shadow self-healing and double-slot fail-closed halt, live `12 MiB` (`24,576`-sector) `CTTLPGS1` v2 paged-store persistence + sustained OpenSSL TLS 1.3 `:443` + malformed-record + `GET /mem` zero-allocation-failure burn-in, and live 3-VM Triad + 2-client Fleet self-tests.
+- **Unverified on Windows build hosts**: multi-day physical bare-metal server burn-in across heterogeneous NIC/NVMe/IOMMU silicon and live Linux `swtpm` daemon QEMU `-tpmdev` socket attachment (TPM 2.0 TIS/NV sealing and anti-rollback are verified against the deterministic in-process TPM 2.0 emulator on Windows).
