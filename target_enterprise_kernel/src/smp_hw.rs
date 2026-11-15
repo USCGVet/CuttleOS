@@ -661,6 +661,22 @@ pub(crate) fn ensure_tsc_calibrated() -> u64 {
     hz
 }
 
+/// Compute a wrap-safe 64-bit `RDTSC` deadline `timeout_ms` milliseconds in the future
+/// using [`ensure_tsc_calibrated`].
+#[inline]
+pub(crate) fn tsc_deadline_ms(timeout_ms: u32) -> u64 {
+    let hz = ensure_tsc_calibrated();
+    let cycles = ((hz as u128).saturating_mul(timeout_ms.max(1) as u128) / 1_000) as u64;
+    read_tsc().wrapping_add(cycles.max(100_000))
+}
+
+/// Return `true` once the CPU's monotonic 64-bit `RDTSC` counter has reached or passed
+/// `deadline_tsc` (wrap-safe modular comparison).
+#[inline]
+pub(crate) fn tsc_past_deadline(deadline_tsc: u64) -> bool {
+    read_tsc().wrapping_sub(deadline_tsc) < (1u64 << 63)
+}
+
 /// Read monotonic runtime timer ticks (`irqs_per_sec` Hz) derived from calibrated `RDTSC`
 /// wall-clock elapsed time (with `HW_IRQ_WAKEUP_COUNTER` floor), advancing smoothly even when
 /// `CPU 0` is 100% busy servicing network bursts or AHCI DMA commits without executing `HLT`.
@@ -1024,13 +1040,14 @@ pub(crate) fn enable_pci_device_msi_or_msix(
 }
 
 /// Submit an asynchronous DMA operation into [`GLOBAL_IO_RING`], wait for `poll_done()`
-/// using interrupt-driven `IRR` draining and hardware `HLT` sleep (once the periodic
-/// Local APIC safety timer is armed), and reap the ring slot upon completion or timeout.
+/// up to a calibrated wall-clock `timeout_ms` `RDTSC` deadline (enforced identically
+/// across both early spin-polling and post-boot hardware `HLT` sleep phases), and reap
+/// or cancel the ring slot upon completion or timeout.
 pub(crate) fn wait_for_dma_completion(
     kind: target_enterprise::async_io::AsyncIoKind,
     hw_slot: u16,
     is_net: bool,
-    max_spins: u32,
+    timeout_ms: u32,
     mut poll_done: impl FnMut() -> Result<bool, ()>,
 ) -> Result<bool, ()> {
     let tag = GLOBAL_IO_RING
@@ -1041,6 +1058,7 @@ pub(crate) fn wait_for_dma_completion(
     } else {
         read_hw_msi_blk_irqs()
     };
+    let deadline_tsc = tsc_deadline_ms(timeout_ms.max(1));
     crate::serial_rx_pump();
 
     let mut spins = 0u32;
@@ -1075,7 +1093,27 @@ pub(crate) fn wait_for_dma_completion(
         }
 
         spins = spins.wrapping_add(1);
-        if spins > max_spins {
+        let hlt_eligible = spins >= 64
+            && TSC_TIMER_ARMED.load(Ordering::Acquire)
+            && SMP_HW_INITIALIZED.load(Ordering::Acquire);
+        if ((spins & 0x3F) == 0 || hlt_eligible) && tsc_past_deadline(deadline_tsc) {
+            if let Ok(true) = poll_done() {
+                drain_pending_device_irqs();
+                let irqs_after = if is_net {
+                    read_hw_msi_net_irqs()
+                } else {
+                    read_hw_msi_blk_irqs()
+                };
+                let irq_seen = irqs_after > irqs_before;
+                if let Some(t) = tag {
+                    if let Some(mut r) = GLOBAL_IO_RING.try_lock() {
+                        let _ = r.complete(t, 0, irq_seen);
+                        let _ = r.reap(t);
+                    }
+                }
+                return Ok(irq_seen);
+            }
+            drain_pending_device_irqs();
             if let Some(t) = tag {
                 if let Some(mut r) = GLOBAL_IO_RING.try_lock() {
                     let _ = r.cancel_timed_out(t);
@@ -1086,10 +1124,7 @@ pub(crate) fn wait_for_dma_completion(
         if (spins & 0xFF) == 0 {
             crate::serial_rx_pump();
         }
-        if spins >= 64
-            && TSC_TIMER_ARMED.load(Ordering::Acquire)
-            && SMP_HW_INITIALIZED.load(Ordering::Acquire)
-        {
+        if hlt_eligible {
             // Periodic Local APIC Timer (`vector 0x40`) + MSI/MSI-X (`0x45`/`0x46`) are both active:
             // sleep in hardware `C1` (`sti; hlt; cli; ret`) instead of burning host CPU cycles!
             if let Some(mut r) = GLOBAL_IO_RING.try_lock() {

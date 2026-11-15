@@ -850,6 +850,8 @@ pub struct PagedBlockStore {
     last_recovery_healed: usize,
     /// Whether the last recovery completed an interrupted (`IN_FLIGHT`) commit.
     last_recovery_rolled_forward: bool,
+    /// Whether a standalone `recover_latest` call fell back to an older superblock epoch.
+    last_recovery_fell_back_epoch: bool,
     merkle_root: [u8; DURABLE_DIGEST_LEN],
     dir: Vec<PageDirEntry>,
     pages: Vec<CachedLogicalPage>,
@@ -876,6 +878,7 @@ impl PagedBlockStore {
             lsn_floor: 0,
             last_recovery_healed: 0,
             last_recovery_rolled_forward: false,
+            last_recovery_fell_back_epoch: false,
             merkle_root: [0u8; DURABLE_DIGEST_LEN],
             dir: Vec::new(),
             pages: Vec::new(),
@@ -889,6 +892,7 @@ impl PagedBlockStore {
     pub fn reset(&mut self) {
         self.last_recovery_healed = 0;
         self.last_recovery_rolled_forward = false;
+        self.last_recovery_fell_back_epoch = false;
         self.initialized = false;
         self.active_slot = 0;
         self.tx_lsn = 0;
@@ -981,6 +985,12 @@ impl PagedBlockStore {
     /// had interrupted after its redo journal was durable.
     pub const fn last_recovery_rolled_forward(&self) -> bool {
         self.last_recovery_rolled_forward
+    }
+
+    /// Whether a standalone [`Self::recover_latest`] call fell back to an older
+    /// superblock epoch because a newer epoch recorded on the device was damaged.
+    pub const fn last_recovery_fell_back_epoch(&self) -> bool {
+        self.last_recovery_fell_back_epoch
     }
 
     /// Current [`PagedAnchor`] snapshot.
@@ -1586,6 +1596,7 @@ impl PagedBlockStore {
         seal_key: &[u8; DURABLE_DIGEST_LEN],
         expected_anchor: Option<&PagedAnchor>,
     ) -> Result<Option<PagedAnchor>, PagedStoreError> {
+        self.last_recovery_fell_back_epoch = false;
         if !is_seal_key_set(seal_key) {
             return Err(PagedStoreError::KeyUnset);
         }
@@ -1668,7 +1679,13 @@ impl PagedBlockStore {
                 continue;
             };
             match self.try_load_superblock(dev, &keys, avail_phys, max_logical, &sb) {
-                Ok(anchor) => return Ok(Some(anchor)),
+                Ok(anchor) => {
+                    if expected_anchor.is_none() {
+                        self.last_recovery_fell_back_epoch =
+                            (c_idx > 0 && candidates[0].is_some()) || sb.tx_lsn < self.lsn_floor;
+                    }
+                    return Ok(Some(anchor));
+                }
                 Err(e) => {
                     last_err = e;
                 }
@@ -2760,5 +2777,72 @@ mod fault_tests {
             }
         }
         assert!(refused > 0 && completed > 0, "refused={refused} completed={completed}");
+    }
+
+    #[test]
+    fn standalone_recover_latest_reports_epoch_fallback_when_newest_epoch_is_damaged() {
+        let mut disk = MemDisk::new(SECTORS);
+        let mut s = PagedBlockStore::new();
+        s.put_page(1, PageDomain::VfsData, 10, 0, &body(1, 1)).unwrap();
+        let a1 = s.commit_dirty(&mut disk, &key(), 1).unwrap();
+        s.put_page(1, PageDomain::VfsData, 10, 0, &body(2, 1)).unwrap();
+        let a2 = s.commit_dirty(&mut disk, &key(), 1).unwrap();
+        assert!(a2.tx_lsn > a1.tx_lsn);
+        disk.reboot();
+
+        // 1. Healthy disk recovers newest epoch `a2` with `last_recovery_fell_back_epoch() == false`.
+        let mut r_ok = PagedBlockStore::new();
+        let got_ok = r_ok.recover_latest(&mut disk, &key()).unwrap().unwrap();
+        assert_eq!(got_ok.tx_lsn, a2.tx_lsn);
+        assert!(!r_ok.last_recovery_fell_back_epoch());
+
+        // 2. Damaging the older superblock (`a1`) while `a2` is intact still recovers `a2`
+        //    with `last_recovery_fell_back_epoch() == false`.
+        let a2_slot = u8::from(raw_superblock(&disk, 1).1 == a2.tx_lsn);
+        let a1_sb_lba = if a2_slot == 0 {
+            SUPERBLOCK_B_LBA
+        } else {
+            SUPERBLOCK_A_LBA
+        };
+        let mut disk_old_bad = clone_disk(&disk);
+        disk_old_bad.poke(a1_sb_lba, |sec| sec[20] ^= 0x55);
+        let mut r_old_bad = PagedBlockStore::new();
+        let got_old_bad = r_old_bad
+            .recover_latest(&mut disk_old_bad, &key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(got_old_bad.tx_lsn, a2.tx_lsn);
+        assert!(!r_old_bad.last_recovery_fell_back_epoch());
+
+        // 3. Damaging `a2`'s directory (`DIR_A_LBA` or `DIR_B_LBA`) forces `recover_latest`
+        //    to fall back to `a1` and report `last_recovery_fell_back_epoch() == true`.
+        let a2_dir_lba = if a2_slot == 0 { DIR_A_LBA } else { DIR_B_LBA };
+        let mut disk_dir_bad = clone_disk(&disk);
+        disk_dir_bad.poke(a2_dir_lba, |sec| sec[0] ^= 0xFF);
+        let mut r_dir_bad = PagedBlockStore::new();
+        let got_dir_bad = r_dir_bad
+            .recover_latest(&mut disk_dir_bad, &key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(got_dir_bad.tx_lsn, a1.tx_lsn);
+        assert_eq!(page(&r_dir_bad, 1), body(1, 1));
+        assert!(r_dir_bad.last_recovery_fell_back_epoch());
+
+        // 4. Damaging `a2`'s superblock sector directly while `CWAL_BASE_LBA` still proves
+        //    `a2.tx_lsn` existed ALSO reports `last_recovery_fell_back_epoch() == true`.
+        let a2_sb_lba = if a2_slot == 0 {
+            SUPERBLOCK_A_LBA
+        } else {
+            SUPERBLOCK_B_LBA
+        };
+        let mut disk_sb_bad = clone_disk(&disk);
+        disk_sb_bad.poke(a2_sb_lba, |sec| sec[20] ^= 0xAA);
+        let mut r_sb_bad = PagedBlockStore::new();
+        let got_sb_bad = r_sb_bad
+            .recover_latest(&mut disk_sb_bad, &key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(got_sb_bad.tx_lsn, a1.tx_lsn);
+        assert!(r_sb_bad.last_recovery_fell_back_epoch());
     }
 }

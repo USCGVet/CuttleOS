@@ -1063,5 +1063,111 @@ mod tests {
         unauth[20..24].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
         assert_eq!(verify_continuity_header(&unauth, &key), None);
     }
+
+    #[test]
+    fn ab_recovery_matrix_covers_clean_interrupted_corrupt_and_double_fault() {
+        use super::ab_journal::*;
+        let quiescent_hdr = AbCommitHeader::unencrypted(
+            AB_STATE_QUIESCENT,
+            AB_FORMAT_V3,
+            3,
+            12,
+            [0xAA; 32],
+            [0xBB; 32],
+            [0xCC; 32],
+        );
+        let in_flight_hdr = AbCommitHeader::unencrypted(
+            AB_STATE_IN_FLIGHT,
+            AB_FORMAT_V3,
+            3,
+            13,
+            [0x11; 32],
+            [0x22; 32],
+            [0x33; 32],
+        );
+
+        // 1. All-zero primary (`primary_all_zero = true`):
+        //    - returns `ReplayJournalToPrimary` when an `IN_FLIGHT` journal verifies (first commit interrupted)
+        //    - returns `Empty` otherwise
+        assert_eq!(
+            decide_ab_recovery(true, false, Some(in_flight_hdr), true),
+            AbRecoveryDecision::ReplayJournalToPrimary(in_flight_hdr)
+        );
+        for primary_valid in [false, true] {
+            for (hdr, journal_ok) in [
+                (None, false),
+                (None, true),
+                (Some(quiescent_hdr), false),
+                (Some(quiescent_hdr), true),
+                (Some(in_flight_hdr), false),
+            ] {
+                assert_eq!(
+                    decide_ab_recovery(true, primary_valid, hdr, journal_ok),
+                    AbRecoveryDecision::Empty
+                );
+            }
+        }
+
+        // 2. Clean quiescent commit (`AB_STATE_QUIESCENT`):
+        //    - primary intact -> `UsePrimary` regardless of shadow/journal state
+        //    - primary corrupt -> `TamperedPrimary` (even when shadow/journal is intact, never masked!)
+        assert_eq!(
+            decide_ab_recovery(false, true, Some(quiescent_hdr), true),
+            AbRecoveryDecision::UsePrimary
+        );
+        assert_eq!(
+            decide_ab_recovery(false, true, Some(quiescent_hdr), false),
+            AbRecoveryDecision::UsePrimary
+        );
+        assert_eq!(
+            decide_ab_recovery(false, false, Some(quiescent_hdr), true),
+            AbRecoveryDecision::TamperedPrimary
+        );
+        assert_eq!(
+            decide_ab_recovery(false, false, Some(quiescent_hdr), false),
+            AbRecoveryDecision::TamperedPrimary
+        );
+
+        // 3. Interrupted commit (`AB_STATE_IN_FLIGHT`):
+        //    - valid shadow journal -> `ReplayJournalToPrimary(hdr)` whether primary was half-written or intact
+        //    - corrupt shadow journal + intact primary -> `UsePrimary`
+        //    - corrupt shadow journal + corrupt primary (double fault) -> `TamperedPrimary`
+        assert_eq!(
+            decide_ab_recovery(false, true, Some(in_flight_hdr), true),
+            AbRecoveryDecision::ReplayJournalToPrimary(in_flight_hdr)
+        );
+        assert_eq!(
+            decide_ab_recovery(false, false, Some(in_flight_hdr), true),
+            AbRecoveryDecision::ReplayJournalToPrimary(in_flight_hdr)
+        );
+        assert_eq!(
+            decide_ab_recovery(false, true, Some(in_flight_hdr), false),
+            AbRecoveryDecision::UsePrimary
+        );
+        assert_eq!(
+            decide_ab_recovery(false, false, Some(in_flight_hdr), false),
+            AbRecoveryDecision::TamperedPrimary
+        );
+
+        // 4. Unreadable / unauthenticated commit sector (`None`):
+        //    - intact primary -> `UsePrimary`
+        //    - corrupt primary -> `TamperedPrimary`
+        assert_eq!(
+            decide_ab_recovery(false, true, None, false),
+            AbRecoveryDecision::UsePrimary
+        );
+        assert_eq!(
+            decide_ab_recovery(false, true, None, true),
+            AbRecoveryDecision::UsePrimary
+        );
+        assert_eq!(
+            decide_ab_recovery(false, false, None, true),
+            AbRecoveryDecision::TamperedPrimary
+        );
+        assert_eq!(
+            decide_ab_recovery(false, false, None, false),
+            AbRecoveryDecision::TamperedPrimary
+        );
+    }
 }
 

@@ -239,6 +239,20 @@ fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
+/// Return `true` if `path` (normalized) names a built-in Cuttle system file that is
+/// recreated on every boot and excluded from `PageDomain::VfsDir` / `PageDomain::VfsData`.
+pub fn is_builtin_system_file(path: &[u8]) -> bool {
+    bytes_eq(path, b"/etc/hostname")
+        || bytes_eq(path, b"/etc/os-release")
+        || bytes_eq(path, b"/etc/motd")
+        || bytes_eq(path, b"/proc/net")
+        || bytes_eq(path, b"/bin/fib")
+        || bytes_eq(path, b"/bin/sum")
+        || bytes_eq(path, b"/sbin/svc-http")
+        || bytes_eq(path, b"/sbin/svc-sql")
+        || bytes_eq(path, b"/sbin/svc-sh")
+}
+
 /// True iff `path` (already normalised) starts with `prefix` (also
 /// already normalised) on a path-component boundary.
 ///
@@ -368,6 +382,8 @@ pub struct MemRamFs<const I: usize, const P: usize> {
     dirty_inode_mask: [u64; 2],
     /// Whether directory metadata (`path`, `data_len`, `mtime`, or existence) changed since last sync.
     dir_dirty: bool,
+    /// Optional logical-page cap (`PageDomain::VfsDir` + `PageDomain::VfsData`) enforced in `paged_mode`.
+    paged_page_budget: Option<usize>,
 }
 
 impl<const I: usize, const P: usize> MemRamFs<I, P> {
@@ -387,7 +403,71 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
             paged_extents: Vec::new(),
             dirty_inode_mask: [0u64; 2],
             dir_dirty: false,
+            paged_page_budget: None,
         }
+    }
+
+    /// Set or clear the maximum logical 4 KiB pages (`VfsDir` + `VfsData`) this VFS may occupy in `paged_mode`.
+    pub fn set_paged_page_budget(&mut self, budget: Option<usize>) {
+        self.paged_page_budget = budget;
+    }
+
+    /// Return the configured logical-page budget in `paged_mode`, if any.
+    pub const fn paged_page_budget(&self) -> Option<usize> {
+        self.paged_page_budget
+    }
+
+    /// Exact number of `PagedBlockStore` logical pages (`PageDomain::VfsDir` + `PageDomain::VfsData`)
+    /// required to persist the current non-builtin files in `paged_mode`.
+    pub fn paged_pages_needed(&self) -> usize {
+        if !self.paged_mode {
+            return 0;
+        }
+        self.paged_pages_with_override(None)
+    }
+
+    fn paged_pages_with_override(&self, override_slot: Option<(usize, &[u8], usize)>) -> usize {
+        const VFS_DIR_GROUPS: usize = 8;
+        const VFS_INODES_PER_DIR_PAGE: usize = 12;
+        const VFS_DATA_CHUNK_CAP: usize = 4000;
+        let slots_len = self.inode_slots_len();
+        let mut total = 0usize;
+        let mut group_idx = 0usize;
+        while group_idx < VFS_DIR_GROUPS {
+            let base = group_idx * VFS_INODES_PER_DIR_PAGE;
+            let mut has_user_entry = false;
+            let mut group_data_pages = 0usize;
+            let mut off = 0usize;
+            while off < VFS_INODES_PER_DIR_PAGE {
+                let slot_idx = base + off;
+                let (used, path_slice, bytes_len): (bool, &[u8], usize) = match override_slot {
+                    Some((ov_idx, ov_path, ov_len)) if ov_idx == slot_idx => {
+                        (true, ov_path, ov_len)
+                    }
+                    _ if slot_idx < slots_len && self.inode_at(slot_idx).used => {
+                        let ino = self.inode_at(slot_idx);
+                        (
+                            true,
+                            &ino.path[..ino.path_len as usize],
+                            ino.data_len.max(ino.capacity) as usize,
+                        )
+                    }
+                    _ => (false, &[], 0),
+                };
+                if used && !is_builtin_system_file(path_slice) {
+                    has_user_entry = true;
+                    if bytes_len > 0 {
+                        group_data_pages += (bytes_len + VFS_DATA_CHUNK_CAP - 1) / VFS_DATA_CHUNK_CAP;
+                    }
+                }
+                off += 1;
+            }
+            if has_user_entry {
+                total += 1 + group_data_pages;
+            }
+            group_idx += 1;
+        }
+        total
     }
 
     /// `true` when page-granular extended capacity (`96` files, `256 KiB` pool) is active.
@@ -656,6 +736,11 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
             {
                 return Err(FsError::NoSpace);
             }
+            if let Some(budget) = self.paged_page_budget {
+                if self.paged_pages_with_override(Some((idx, &norm[..n], cap))) > budget {
+                    return Err(FsError::NoSpace);
+                }
+            }
             self.ensure_paged_extent(idx);
             self.paged_extents[idx].clear();
             self.paged_extents[idx].extend_from_slice(contents);
@@ -734,6 +819,11 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         {
             return Err(FsError::NoSpace);
         }
+        if let Some(budget) = self.paged_page_budget {
+            if self.paged_pages_with_override(Some((slot_idx, &norm[..n], dlen))) > budget {
+                return Err(FsError::NoSpace);
+            }
+        }
         self.ensure_paged_extent(slot_idx);
         self.paged_extents[slot_idx].clear();
         self.paged_extents[slot_idx].extend_from_slice(contents);
@@ -776,11 +866,13 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
         }
         let max_ino = self.max_inodes();
         let mut open_slot_free = false;
-        let mut inode_free = false;
+        let mut first_free_inode: Option<usize> = None;
         let mut i = 0usize;
         while i < max_ino {
             open_slot_free |= !self.open_at(i).used;
-            inode_free |= !self.inode_at(i).used;
+            if first_free_inode.is_none() && !self.inode_at(i).used {
+                first_free_inode = Some(i);
+            }
             i += 1;
         }
         if !open_slot_free {
@@ -790,8 +882,37 @@ impl<const I: usize, const P: usize> MemRamFs<I, P> {
             .pool_capacity()
             .saturating_sub(self.pool_used() as usize);
         match self.find_inode(&norm[..n]) {
-            Some(idx) => len <= free + self.inode_at(idx).capacity as usize,
-            None => inode_free && free > 0 && len <= free,
+            Some(idx) => {
+                if len > free + self.inode_at(idx).capacity as usize {
+                    return false;
+                }
+                if self.paged_mode {
+                    if let Some(budget) = self.paged_page_budget {
+                        if self.paged_pages_with_override(Some((idx, &norm[..n], len))) > budget {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            None => {
+                let Some(free_idx) = first_free_inode else {
+                    return false;
+                };
+                if !(free > 0 && len <= free) {
+                    return false;
+                }
+                if self.paged_mode {
+                    if let Some(budget) = self.paged_page_budget {
+                        if self.paged_pages_with_override(Some((free_idx, &norm[..n], len)))
+                            > budget
+                        {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -1062,6 +1183,11 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
                     if remaining == 0 {
                         return Err(FsError::NoSpace);
                     }
+                    if let Some(budget) = self.paged_page_budget {
+                        if self.paged_pages_with_override(Some((idx, &norm[..n], 0))) > budget {
+                            return Err(FsError::NoSpace);
+                        }
+                    }
                     self.ensure_paged_extent(idx);
                     self.paged_extents[idx].clear();
                     let inode_slot = self.inode_mut(idx);
@@ -1180,6 +1306,18 @@ impl<const I: usize, const P: usize> Filesystem for MemRamFs<I, P> {
             let growth = new_cap - old_cap;
             if (self.paged_pool_used as u64).saturating_add(growth) > self.pool_capacity() as u64 {
                 return Err(FsError::NoSpace);
+            }
+            if let Some(budget) = self.paged_page_budget {
+                let ino = self.inode_at(inode_idx);
+                let plen = ino.path_len as usize;
+                let mut pbuf = [0u8; FS_PATH_MAX];
+                pbuf[..plen].copy_from_slice(&ino.path[..plen]);
+                let new_len = (ino.data_len as u64).max(new_cap) as usize;
+                if self.paged_pages_with_override(Some((inode_idx, &pbuf[..plen], new_len)))
+                    > budget
+                {
+                    return Err(FsError::NoSpace);
+                }
             }
             self.ensure_paged_extent(inode_idx);
             let end_usize = end as usize;

@@ -472,14 +472,11 @@ pub(crate) fn vnet_tx(n: &mut VnetModern, frame: &[u8]) -> bool {
         let tx_q_virt = n.tx_q_virt;
         let tx_avail_next = n.tx_avail_next;
         let mut latest_used = n.tx_used_seen;
-        let tsc_budget = (crate::smp_hw::ensure_tsc_calibrated() / 40).max(1_000_000);
-        let deadline_tsc = crate::smp_hw::read_tsc().wrapping_add(tsc_budget);
-        let mut checks = 0u32;
         let ok = crate::smp_hw::wait_for_dma_completion(
             AsyncIoKind::NetTx,
             (tx_avail_next as usize & (active_slots - 1)) as u16,
             true,
-            4_000_000,
+            50,
             || {
                 // SAFETY: `tx_q_virt + VN_USED_OFF + 2` is 2-byte aligned inside the mapped TX virtqueue page.
                 let used =
@@ -487,12 +484,6 @@ pub(crate) fn vnet_tx(n: &mut VnetModern, frame: &[u8]) -> bool {
                 latest_used = used;
                 if (tx_avail_next.wrapping_sub(used) as usize) < active_slots {
                     return Ok(true);
-                }
-                checks = checks.wrapping_add(1);
-                if (checks & 0x3FF) == 0
-                    && crate::smp_hw::read_tsc().wrapping_sub(deadline_tsc) < (1u64 << 63)
-                {
-                    return Err(());
                 }
                 Ok(false)
             },

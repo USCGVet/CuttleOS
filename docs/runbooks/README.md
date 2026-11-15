@@ -130,7 +130,8 @@ Every `ALERT` event emitted by the controller includes a machine-parseable `code
 - **Related serial lines** (no halt):
   - `PROVISIONING OK: device master key loaded from TPM 2.0 NV 0x01500011`: `0x0150_0011` (`TPMA_NV_POLICYREAD | TPMA_NV_READ_STCLEAR`, SHA-256 `PCR0+PCR7` policy + `CTK1` AEAD) unsealed the 32-byte master key and read-locked the NV index (`TPMA_NV_READLOCKED`) for the rest of the boot.
   - `NVME_HW REFUSED: namespace is not formatted with plain 512-byte blocks`: the NVMe namespace uses 4 KiB blocks or per-block metadata; the driver will not use it.
-  - `STORAGE REFUSED: opt/cuttle_storage_backend is not one of ahci, nvme, virtio, auto`: a mistyped backend pin. The node does not fall back to auto-probing.
+  - `STORAGE_BACKEND OK kind=<ahci|nvme|virtio> sectors=<N>`: logged once on boot when the durable state disk is chosen (either via `opt/cuttle_storage_backend` pin or deterministic `auto` selection by authenticated Cuttle commit record).
+  - `STORAGE REFUSED: opt/cuttle_storage_backend is not one of ahci, nvme, virtio, auto`, `STORAGE REFUSED: pinned storage backend is not attached`, `STORAGE REFUSED: present storage controller failed initialization or sector probe`, `STORAGE REFUSED: multiple attached disks hold Cuttle state stores; pin opt/cuttle_storage_backend`, `STORAGE REFUSED: refusing Fresh boot on blank disk while another attached disk holds unauthenticated Cuttle state`, and `STORAGE REFUSED: no block storage backend attached`: boot-time state-disk selection refused to guess or fall through across controllers; followed by `STORAGE FAULT: state disk unusable at boot`.
   - `CONTINUITY resume NOTICE: continuity region unreadable; ...` and `CONTINUITY NOTICE: continuity region could not be written; ...`: a bad sector in the boot-counter hint region (`LBA 1024..1032`). The boot continues; the sealed state decides the boot generation.
 
 ### `DISK_ROLLBACK_DETECTED` {#disk_rollback_detected}

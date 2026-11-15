@@ -2448,6 +2448,320 @@ fn swtpm_tis_rollback_and_reanchor_under_qemu_when_supported() {
 }
 
 #[test]
+#[ignore = "requires nightly rust-src + factory_builder_pkg + qemu-system-x86_64"]
+fn virtio_only_and_pinned_multi_disk_storage_selection_under_qemu() {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let _guard = QEMU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(qemu) = find_qemu() else {
+        panic!("qemu-system-x86_64 not found");
+    };
+    let root = workspace_root();
+    let images_dir = root.join("target").join("cuttle_images").join("storage_sel_test");
+    let _ = std::fs::remove_dir_all(&images_dir);
+    std::fs::create_dir_all(&images_dir).expect("create storage_sel_test dir");
+
+    let bios = images_dir.join("bios.img");
+    let kernel_crate = root.join("target_enterprise_kernel");
+    let pkg_crate = factory_builder::locate_pkg_crate().expect("locate_pkg_crate");
+    let elf = factory_builder::build_kernel(&kernel_crate).expect("build_kernel");
+    factory_builder::package_kernel_via_pkg(&pkg_crate, &elf, &bios, None)
+        .expect("package_kernel_via_pkg");
+
+    let key_path = images_dir.join("device_secret_key.bin");
+    factory_builder::ensure_device_secret_key(&key_path).expect("ensure_device_secret_key");
+
+    let virtio_disk = images_dir.join("virtio.img");
+    let ahci_disk = images_dir.join("ahci.img");
+    let nvme_disk = images_dir.join("nvme.img");
+    let disk_bytes_len = 4 * 1024 * 1024usize; // 4 MiB = 8192 sectors
+
+    let run_guest = |ahci: Option<&Path>,
+                     nvme: Option<&Path>,
+                     nvme_4k: bool,
+                     virtio: Option<&Path>,
+                     pin: Option<&[u8]>,
+                     commands: &[&str],
+                     done: &dyn Fn(&str) -> bool|
+     -> (String, bool) {
+        let pin_path = images_dir.join("backend_pin.txt");
+        let mut cmd = Command::new(&qemu);
+        cmd.args(smoke_accel_args())
+            .arg("-cpu")
+            .arg(PINNED_QEMU_CPU_MODEL)
+            .args(["-smp", "4"])
+            .arg("-fw_cfg")
+            .arg(format!(
+                "name={},file={}",
+                factory_builder::FW_CFG_DEVICE_KEY_NAME,
+                key_path.display()
+            ));
+        if let Some(pin_raw) = pin {
+            std::fs::write(&pin_path, pin_raw).expect("write backend_pin.txt");
+            cmd.arg("-fw_cfg").arg(format!(
+                "name=opt/cuttle_storage_backend,file={}",
+                pin_path.display()
+            ));
+        }
+        cmd.arg("-drive")
+            .arg(format!("format=raw,file={},if=ide", bios.display()))
+            .args(["-netdev", "hubport,id=n0,hubid=1"])
+            .args([
+                "-device",
+                "virtio-net-pci,netdev=n0,disable-legacy=off,disable-modern=on",
+            ])
+            .args(["-netdev", "hubport,id=n1,hubid=1"])
+            .args([
+                "-device",
+                "virtio-net-pci,netdev=n1,disable-legacy=off,disable-modern=on",
+            ])
+            .args(["-netdev", "hubport,id=e0,hubid=2"])
+            .args(["-device", "e1000,netdev=e0"])
+            .args(["-netdev", "hubport,id=e1,hubid=2"])
+            .args(["-device", "e1000,netdev=e1"]);
+        if let Some(v) = virtio {
+            cmd.arg("-drive")
+                .arg(format!("if=none,id=vd0,format=raw,file={}", v.display()))
+                .args([
+                    "-device",
+                    "virtio-blk-pci,drive=vd0,disable-legacy=off,disable-modern=on",
+                ]);
+        }
+        if let Some(a) = ahci {
+            cmd.arg("-drive")
+                .arg(format!("if=none,id=ahd0,format=raw,file={}", a.display()))
+                .args(["-device", "ahci,id=ahci0"])
+                .args(["-device", "ide-hd,drive=ahd0,bus=ahci0.0"]);
+        }
+        if let Some(n) = nvme {
+            let nvme_dev = if nvme_4k {
+                "nvme,drive=nvme0,serial=CUTTLE-NVME-HW,logical_block_size=4096,physical_block_size=4096"
+            } else {
+                "nvme,drive=nvme0,serial=CUTTLE-NVME-HW"
+            };
+            cmd.arg("-drive")
+                .arg(format!("if=none,id=nvme0,format=raw,file={}", n.display()))
+                .args(["-device", nvme_dev]);
+        }
+        let mut qproc = cmd
+            .args(["-serial", "stdio", "-display", "none", "-no-reboot", "-m", "256M"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn storage-selection qemu");
+
+        let mut stdout = qproc.stdout.take().expect("qemu stdout");
+        let mut stdin = qproc.stdin.take().expect("qemu stdin");
+        let buf = Arc::new(Mutex::new(String::new()));
+        let buf_reader = Arc::clone(&buf);
+        let reader_handle = std::thread::spawn(move || {
+            let mut chunk = [0u8; 512];
+            while let Ok(n) = stdout.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                let text = String::from_utf8_lossy(&chunk[..n]);
+                if let Ok(mut g) = buf_reader.lock() {
+                    g.push_str(&text);
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut commands_sent = commands.is_empty();
+        let mut reached = false;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(120));
+            let snapshot = buf.lock().map(|g| g.clone()).unwrap_or_default();
+            if !commands_sent && snapshot.contains("cuttle> ") {
+                std::thread::sleep(Duration::from_millis(60));
+                for c in commands {
+                    let prompts_before = buf
+                        .lock()
+                        .map(|g| g.matches("cuttle> ").count())
+                        .unwrap_or(0);
+                    let payload = format!("{c}\n");
+                    for ch in payload.as_bytes().chunks(6) {
+                        let _ = stdin.write_all(ch);
+                        let _ = stdin.flush();
+                        std::thread::sleep(Duration::from_millis(30));
+                    }
+                    let is_terminal = matches!(*c, "halt" | "reboot" | "poweroff");
+                    if !is_terminal {
+                        let cmd_wait = Instant::now() + Duration::from_secs(12);
+                        while Instant::now() < cmd_wait {
+                            let cur = buf
+                                .lock()
+                                .map(|g| g.matches("cuttle> ").count())
+                                .unwrap_or(0);
+                            if cur > prompts_before {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(35));
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+                commands_sent = true;
+            }
+            if commands_sent && done(&snapshot) {
+                reached = true;
+                break;
+            }
+            if snapshot.contains("CUTTLE-TE PANIC") && done(&snapshot) {
+                reached = true;
+                break;
+            }
+        }
+        drop(stdin);
+        let _ = qproc.kill();
+        let _ = qproc.wait();
+        let _ = reader_handle.join();
+        let final_log = buf.lock().map(|g| g.clone()).unwrap_or_default();
+        (final_log, reached)
+    };
+
+    // 1) VirtIO-only 2-boot persistence (no AHCI, no NVMe attached).
+    std::fs::write(&virtio_disk, vec![0u8; disk_bytes_len]).expect("init virtio.img");
+    let (v_log1, v_ok1) = run_guest(
+        None,
+        None,
+        false,
+        Some(&virtio_disk),
+        None,
+        &["write /var/virtio_only.txt persisted-on-virtio", "halt"],
+        &|s| s.contains("system halting..."),
+    );
+    assert!(
+        v_ok1
+            && v_log1.contains("STORAGE_BACKEND OK kind=virtio sectors=8192")
+            && v_log1.contains("wrote 20 bytes to /var/virtio_only.txt"),
+        "VirtIO-only Boot #1 failed!\nSerial log:\n{v_log1}"
+    );
+    let (v_log2, v_ok2) = run_guest(
+        None,
+        None,
+        false,
+        Some(&virtio_disk),
+        None,
+        &["cat /var/virtio_only.txt", "halt"],
+        &|s| s.contains("system halting..."),
+    );
+    assert!(
+        v_ok2
+            && v_log2.contains("STORAGE_BACKEND OK kind=virtio sectors=8192")
+            && v_log2.contains("SHELL resume OK")
+            && v_log2.contains("persisted-on-virtio"),
+        "VirtIO-only Boot #2 failed to resume durable state!\nSerial log:\n{v_log2}"
+    );
+
+    // 2) 3-disk configuration pinned via `opt/cuttle_storage_backend=virtio`.
+    std::fs::write(&ahci_disk, vec![0u8; disk_bytes_len]).expect("init ahci.img");
+    std::fs::write(&nvme_disk, vec![0u8; disk_bytes_len]).expect("init nvme.img");
+    let (p_log, p_ok) = run_guest(
+        Some(&ahci_disk),
+        Some(&nvme_disk),
+        false,
+        Some(&virtio_disk),
+        Some(b"virtio\n"),
+        &["cat /var/virtio_only.txt", "halt"],
+        &|s| s.contains("system halting..."),
+    );
+    assert!(
+        p_ok
+            && p_log.contains("STORAGE_BACKEND OK kind=virtio sectors=8192")
+            && p_log.contains("SHELL resume OK")
+            && p_log.contains("persisted-on-virtio"),
+        "Pinned VirtIO 3-disk boot failed!\nSerial log:\n{p_log}"
+    );
+
+    // 3) 3-disk `auto` mode with authenticated state on NVMe + blank AHCI + blank VirtIO
+    //    MUST select NVMe and restore `nvme-auto-selected` instead of starting `Fresh` on AHCI!
+    std::fs::write(&nvme_disk, vec![0u8; disk_bytes_len]).expect("reset nvme.img");
+    let (n_seed_log, n_seed_ok) = run_guest(
+        None,
+        Some(&nvme_disk),
+        false,
+        None,
+        Some(b"nvme\n"),
+        &["write /var/nvme_auto.txt nvme-auto-selected", "halt"],
+        &|s| s.contains("system halting..."),
+    );
+    assert!(
+        n_seed_ok
+            && n_seed_log.contains("STORAGE_BACKEND OK kind=nvme sectors=8192")
+            && n_seed_log.contains("wrote 19 bytes to /var/nvme_auto.txt"),
+        "NVMe seed boot failed!\nSerial log:\n{n_seed_log}"
+    );
+    std::fs::write(&ahci_disk, vec![0u8; disk_bytes_len]).expect("blank ahci.img");
+    std::fs::write(&virtio_disk, vec![0u8; disk_bytes_len]).expect("blank virtio.img");
+    let (auto_log, auto_ok) = run_guest(
+        Some(&ahci_disk),
+        Some(&nvme_disk),
+        false,
+        Some(&virtio_disk),
+        None,
+        &["cat /var/nvme_auto.txt", "halt"],
+        &|s| s.contains("system halting..."),
+    );
+    assert!(
+        auto_ok
+            && auto_log.contains("STORAGE_BACKEND OK kind=nvme sectors=8192")
+            && auto_log.contains("SHELL resume OK")
+            && auto_log.contains("nvme-auto-selected"),
+        "3-disk auto selection failed to choose authenticated NVMe over blank AHCI!\nSerial log:\n{auto_log}"
+    );
+
+    // 4) Mistyped `opt/cuttle_storage_backend=bogus` refuses with `STORAGE REFUSED:` + `STORAGE FAULT:`.
+    let (bad_log, bad_ok) = run_guest(
+        Some(&ahci_disk),
+        Some(&nvme_disk),
+        false,
+        Some(&virtio_disk),
+        Some(b"bogus\n"),
+        &[],
+        &|s| s.contains("STORAGE FAULT: state disk unusable at boot"),
+    );
+    assert!(
+        bad_ok
+            && bad_log.contains(
+                "STORAGE REFUSED: opt/cuttle_storage_backend is not one of ahci, nvme, virtio, auto"
+            )
+            && bad_log.contains("STORAGE FAULT: state disk unusable at boot"),
+        "Mistyped storage backend pin did not fail closed with STORAGE REFUSED + STORAGE FAULT!\nSerial log:\n{bad_log}"
+    );
+
+    // 5) 4 KiB NVMe namespace (`logical_block_size=4096`) alongside blank AHCI under `auto`
+    //    MUST refuse NVMe (`NVME_HW REFUSED: ...`) and fail closed (`STORAGE REFUSED: present
+    //    storage controller failed initialization or sector probe`) rather than falling back to AHCI!
+    std::fs::write(&ahci_disk, vec![0u8; disk_bytes_len]).expect("blank ahci for 4k test");
+    std::fs::write(&nvme_disk, vec![0u8; disk_bytes_len]).expect("blank nvme for 4k test");
+    let (nvme4k_log, nvme4k_ok) = run_guest(
+        Some(&ahci_disk),
+        Some(&nvme_disk),
+        true,
+        None,
+        None,
+        &[],
+        &|s| s.contains("STORAGE FAULT: state disk unusable at boot"),
+    );
+    let _ = std::fs::remove_dir_all(&images_dir);
+    assert!(
+        nvme4k_ok
+            && nvme4k_log.contains("NVME_HW REFUSED: namespace is not formatted with plain 512-byte blocks")
+            && nvme4k_log.contains("STORAGE REFUSED: present storage controller failed initialization or sector probe")
+            && nvme4k_log.contains("STORAGE FAULT: state disk unusable at boot"),
+        "4 KiB NVMe namespace + blank AHCI under auto did not fail closed!\nSerial log:\n{nvme4k_log}"
+    );
+    eprintln!(
+        "smoke[storage-sel]: VirtIO-only 2-boot resume + 3-disk VirtIO pin + 3-disk NVMe auto discovery + invalid-pin refusal + 4K-NVMe refusal PASSED"
+    );
+}
+
+#[test]
 fn workspace_root_has_kernel_and_pkg_dirs() {
     // Cheap non-ignored test: at least confirm the directory layout is
     // intact. Useful so we catch a missing kernel crate even when

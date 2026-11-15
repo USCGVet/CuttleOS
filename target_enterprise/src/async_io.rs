@@ -344,9 +344,11 @@ pub fn enable_pci_msi(
         }
     }
 
-    // Enable Bus Master + disable legacy INTx assertion in PCI Command register.
+    // Enable Bus Master + disable legacy INTx assertion in PCI Command register
+    // while preserving read-only PCI Status bits (e.g. Capabilities List `0x0010`)
+    // and writing `0` to RW1C PCI Status error bits (`0xF900_0000`).
     let cmd_sts = bus.read_dword(addr, PCI_CFG_OFFSET_COMMAND_STATUS);
-    let new_cmd = (cmd_sts & 0x0000_FFFF) | PCI_CMD_BUS_MASTER | PCI_CMD_INTX_DISABLE;
+    let new_cmd = (cmd_sts & 0x06FF_FFFF) | PCI_CMD_BUS_MASTER | PCI_CMD_INTX_DISABLE;
     bus.write_dword(addr, PCI_CFG_OFFSET_COMMAND_STATUS, new_cmd);
 
     // Enable single-message MSI (`MME = 0`, `Enable = 1`).
@@ -389,7 +391,7 @@ pub fn set_pci_msix_ctrl(
 ) {
     let cmd_sts = bus.read_dword(addr, PCI_CFG_OFFSET_COMMAND_STATUS);
     let new_cmd =
-        (cmd_sts & 0x0000_FFFF) | PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER | PCI_CMD_INTX_DISABLE;
+        (cmd_sts & 0x06FF_FFFF) | PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER | PCI_CMD_INTX_DISABLE;
     bus.write_dword(addr, PCI_CFG_OFFSET_COMMAND_STATUS, new_cmd);
 
     let dw0 = bus.read_dword(addr, cap_offset);
@@ -405,6 +407,28 @@ pub fn set_pci_msix_ctrl(
         mc &= !PCI_MSIX_FUNCMASK_BIT;
     }
     bus.write_dword(addr, cap_offset, (dw0 & 0x0000_FFFF) | ((mc as u32) << 16));
+}
+
+/// Return `true` when the PCI function at `addr` exposes an MSI-X capability (`0x11`)
+/// whose Message Control `MSI-X Enable` bit (`bit 15`) is currently set.
+pub fn is_pci_msix_enabled(bus: &mut dyn PciConfigBus, addr: PciAddress) -> bool {
+    let Ok(info) = PciImpl::msix_info(bus, addr) else {
+        return false;
+    };
+    let dw0 = bus.read_dword(addr, info.cap_offset);
+    let mc = (dw0 >> 16) as u16;
+    (mc & PCI_MSIX_ENABLE_BIT) != 0
+}
+
+/// Return the legacy VirtIO-PCI device-specific configuration byte offset within BAR0 I/O space:
+/// `24` when PCI MSI-X is enabled on `addr` (accounting for the 4-byte MSI-X vector fields at
+/// `20..24`), or `20` when MSI-X is absent or disabled.
+pub fn virtio_legacy_devcfg_offset(bus: &mut dyn PciConfigBus, addr: PciAddress) -> u16 {
+    if is_pci_msix_enabled(bus, addr) {
+        24
+    } else {
+        20
+    }
 }
 
 #[cfg(test)]
@@ -436,7 +460,17 @@ mod tests {
         }
 
         fn write_dword(&mut self, _addr: PciAddress, offset: u8, value: u32) {
-            self.set_dw(offset, value);
+            if (offset & 0xFC) == PCI_CFG_OFFSET_COMMAND_STATUS {
+                let prev = self.get_dw(PCI_CFG_OFFSET_COMMAND_STATUS);
+                let sts_ro = prev & 0x06FF_0000;
+                let sts_rw1c = (prev & 0xF900_0000) & !(value & 0xF900_0000);
+                self.set_dw(
+                    PCI_CFG_OFFSET_COMMAND_STATUS,
+                    sts_ro | sts_rw1c | (value & 0x0000_FFFF),
+                );
+            } else {
+                self.set_dw(offset, value);
+            }
         }
     }
 
@@ -512,6 +546,12 @@ mod tests {
         let mc = (bus.get_dw(0x90) >> 16) as u16;
         assert_ne!(mc & PCI_MSIX_ENABLE_BIT, 0);
         assert_eq!(mc & PCI_MSIX_FUNCMASK_BIT, 0);
+        assert!(is_pci_msix_enabled(&mut bus, DEV));
+        assert_eq!(virtio_legacy_devcfg_offset(&mut bus, DEV), 24);
+
+        set_pci_msix_ctrl(&mut bus, DEV, loc.cap_offset, false, false);
+        assert!(!is_pci_msix_enabled(&mut bus, DEV));
+        assert_eq!(virtio_legacy_devcfg_offset(&mut bus, DEV), 20);
 
         let ent = encode_msix_entry(3, MSI_VECTOR_NET, false);
         assert_eq!(ent, [0xFEE0_3000, 0, MSI_VECTOR_NET as u32, 0]);

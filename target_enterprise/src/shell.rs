@@ -411,6 +411,8 @@ pub struct OsShell {
     line_overflow: bool,
     /// Whether enterprise page-granular CoW + CWAL mode (`PagedBlockStore`) is enabled.
     paged_mode: bool,
+    /// Maximum logical 4 KiB pages supported by the active backing device (`118` on 2 MiB, `256` on >= 4 MiB).
+    paged_max_logical: usize,
     /// Most recent cryptographic [`crate::paged_store::PagedAnchor`] cross-anchored in the shell WAL header.
     paged_anchor: crate::paged_store::PagedAnchor,
 }
@@ -475,6 +477,7 @@ impl OsShell {
             line_len: 0,
             line_overflow: false,
             paged_mode: false,
+            paged_max_logical: crate::paged_store::PAGED_MAX_LOGICAL_PAGES,
             paged_anchor: crate::paged_store::PagedAnchor::zero(),
         }
     }
@@ -606,6 +609,7 @@ impl OsShell {
             self.db.set_paged_mode(true);
             self.fs.set_paged_mode(true);
         }
+        self.sync_paged_budgets();
     }
 
     /// Whether enterprise page-granular CoW + CWAL mode (`PagedBlockStore`) is enabled.
@@ -621,6 +625,36 @@ impl OsShell {
         if !enabled {
             self.paged_anchor = crate::paged_store::PagedAnchor::zero();
         }
+        self.sync_paged_budgets();
+    }
+
+    /// Return the active device logical-page cap enforced across `SqlDb` and `MemRamFs`.
+    pub const fn paged_max_logical(&self) -> usize {
+        self.paged_max_logical
+    }
+
+    /// Set the device's `max_logical` page cap (`118` on 2 MiB, `256` on >= 4 MiB) and
+    /// immediately synchronize the shared page budgets on `SqlDb` and `MemRamFs`.
+    pub fn set_paged_max_logical(&mut self, max_logical: usize) {
+        self.paged_max_logical = max_logical;
+        self.sync_paged_budgets();
+    }
+
+    /// Recompute and enforce exact per-subsystem logical-page budgets across `SqlDb` and
+    /// `MemRamFs` so their combined demand (`SqlCatalog` + `SqlLeaf` + `VfsDir` + `VfsData`)
+    /// never exceeds `self.paged_max_logical`.
+    pub fn sync_paged_budgets(&mut self) {
+        if !self.paged_mode {
+            self.db.set_paged_page_budget(None);
+            self.fs.set_paged_page_budget(None);
+            return;
+        }
+        let sql_used = self.db.paged_pages_needed();
+        let vfs_used = self.fs.paged_pages_needed();
+        self.fs
+            .set_paged_page_budget(Some(self.paged_max_logical.saturating_sub(sql_used)));
+        self.db
+            .set_paged_page_budget(Some(self.paged_max_logical.saturating_sub(vfs_used)));
     }
 
     /// Return the most recent [`crate::paged_store::PagedAnchor`] bound to this shell's WAL header.
@@ -657,6 +691,75 @@ impl OsShell {
         (files, bytes)
     }
 
+    /// Reclaim stale `PageDomain::VfsData` and empty `PageDomain::VfsDir` pages across all
+    /// dirty inode groups BEFORE allocating any new SQL or VFS logical IDs, so removing a file
+    /// and inserting SQL rows (or writing another file) in the same commit never transiently
+    /// exceeds `max_logical`.
+    pub fn prune_removed_vfs_pages(
+        &self,
+        store: &mut crate::paged_store::PagedBlockStore,
+    ) -> Result<usize, crate::paged_store::PagedStoreError> {
+        use crate::paged_store::PageDomain;
+        if !self.paged_mode {
+            return Ok(0);
+        }
+        const VFS_DIR_GROUPS: usize = 8;
+        const VFS_INODES_PER_DIR_PAGE: usize = 12;
+        const VFS_DATA_CHUNK_CAP: usize = 4000;
+        const VFS_MAX_CHUNKS_PER_INODE: usize = 9;
+
+        let mut removed = 0usize;
+        let mut group_idx = 0usize;
+        while group_idx < VFS_DIR_GROUPS {
+            let base_slot = group_idx * VFS_INODES_PER_DIR_PAGE;
+            let mut group_dirty = false;
+            let mut s = 0usize;
+            while s < VFS_INODES_PER_DIR_PAGE {
+                if self.fs.is_inode_dirty(base_slot + s) {
+                    group_dirty = true;
+                    break;
+                }
+                s += 1;
+            }
+            if !group_dirty {
+                group_idx += 1;
+                continue;
+            }
+
+            let mut entry_count = 0usize;
+            let mut off = 0usize;
+            while off < VFS_INODES_PER_DIR_PAGE {
+                let slot_idx = base_slot + off;
+                let mut needed_chunks = 0usize;
+                if let Some((path, data)) = self.fs.inode_data(slot_idx) {
+                    if !is_default_system_file(path) {
+                        entry_count += 1;
+                        if !data.is_empty() {
+                            needed_chunks =
+                                (data.len() + VFS_DATA_CHUNK_CAP - 1) / VFS_DATA_CHUNK_CAP;
+                        }
+                    }
+                }
+                if self.fs.is_inode_dirty(slot_idx) {
+                    let mut stale_c = needed_chunks;
+                    while stale_c < VFS_MAX_CHUNKS_PER_INODE {
+                        let owner_id = ((slot_idx as u32) << 8) | (stale_c as u32);
+                        if store.remove_owned_page(PageDomain::VfsData, owner_id)? {
+                            removed += 1;
+                        }
+                        stale_c += 1;
+                    }
+                }
+                off += 1;
+            }
+            if entry_count == 0 && store.remove_owned_page(PageDomain::VfsDir, group_idx as u32)? {
+                removed += 1;
+            }
+            group_idx += 1;
+        }
+        Ok(removed)
+    }
+
     /// Incrementally synchronize dirty VFS directory groups (`PageDomain::VfsDir`) and dirty
     /// 4,000-byte file chunks (`PageDomain::VfsData`) into `store` (`O(dirty pages)`).
     pub fn sync_vfs_to_paged_store(
@@ -675,8 +778,8 @@ impl OsShell {
         const VFS_DIR_PAGE_MAGIC: &[u8; 8] = b"CTTLVFD1";
         const VFS_DATA_PAGE_MAGIC: &[u8; 8] = b"CTTLVDT1";
 
+        let mut mutated = self.prune_removed_vfs_pages(store)?;
         let mut page_buf = alloc::vec![0u8; PAGED_PAGE_PAYLOAD_BYTES];
-        let mut mutated = 0usize;
         let mut group_idx = 0usize;
         while group_idx < VFS_DIR_GROUPS {
             let base_slot = group_idx * VFS_INODES_PER_DIR_PAGE;
@@ -795,10 +898,20 @@ impl OsShell {
         &mut self,
         store: &crate::paged_store::PagedBlockStore,
     ) -> Result<(usize, usize), crate::paged_store::PagedStoreError> {
-        use crate::paged_store::{PageDomain, PagedStoreError, PAGED_PAGE_PAYLOAD_BYTES};
         if !self.paged_mode {
             self.set_paged_mode(true);
         }
+        self.fs.set_paged_page_budget(None);
+        let res = self.load_vfs_from_paged_store_inner(store);
+        self.sync_paged_budgets();
+        res
+    }
+
+    fn load_vfs_from_paged_store_inner(
+        &mut self,
+        store: &crate::paged_store::PagedBlockStore,
+    ) -> Result<(usize, usize), crate::paged_store::PagedStoreError> {
+        use crate::paged_store::{PageDomain, PagedStoreError, PAGED_PAGE_PAYLOAD_BYTES};
         const VFS_DIR_GROUPS: usize = 8;
         const VFS_INODES_PER_DIR_PAGE: usize = 12;
         const VFS_DATA_CHUNK_CAP: usize = 4000;
@@ -1306,6 +1419,31 @@ impl OsShell {
         req_body: &[u8],
         resp_out: &mut [u8],
     ) -> Result<(u16, usize), crate::svc_runtime::ServiceError> {
+        self.sync_paged_budgets();
+        let res = self.dispatch_mailbox_op_inner(
+            op,
+            via_http_gateway,
+            session_verified,
+            boots,
+            req_path,
+            req_body,
+            resp_out,
+        );
+        self.sync_paged_budgets();
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_mailbox_op_inner(
+        &mut self,
+        op: crate::svc_runtime::IpcOp,
+        via_http_gateway: bool,
+        session_verified: bool,
+        boots: u64,
+        req_path: &[u8],
+        req_body: &[u8],
+        resp_out: &mut [u8],
+    ) -> Result<(u16, usize), crate::svc_runtime::ServiceError> {
         use crate::svc_runtime::{
             IpcOp, ServiceError, IPC_MAILBOX_BODY_CAP, IPC_MAILBOX_PATH_CAP,
         };
@@ -1559,37 +1697,81 @@ impl OsShell {
                         }
                         WritablePathPolicy::Allowed(nlen) => {
                             let cpath = &norm_path[..nlen];
-                            if !self.fs.can_replace(cpath, mb_body.len()) {
-                                // Refuse before truncating: the existing file stays as it was.
-                                self.record_net_audit(AuditVerdict::Error, b"net:http:fs-nospace");
-                                let n = copy_into(FS_NO_SPACE_MSG, resp_out);
-                                (507u16, n)
-                            } else if let Ok(fh) =
-                                self.fs.open(cpath, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC)
-                            {
-                                let wrote = self.fs.write(fh, 0, mb_body);
-                                let _ = self.fs.close(fh);
-                                let Ok(written) = wrote else {
-                                    self.record_net_audit(
-                                        AuditVerdict::Error,
-                                        b"net:http:fs-io-err",
-                                    );
-                                    let n = copy_into(b"error: write failed\n", resp_out);
-                                    self.svc.complete_mailbox_response(target, 500, n);
-                                    return Ok((500u16, n));
-                                };
-                                self.record_net_audit(AuditVerdict::Allowed, b"net:http:fs-put");
-                                let mut mpos = 0usize;
-                                mpos += copy_into(b"wrote ", &mut resp_out[mpos..]);
-                                mpos += dec_u64(written as u64, &mut resp_out[mpos..]);
-                                mpos += copy_into(b" bytes to ", &mut resp_out[mpos..]);
-                                mpos += copy_into(cpath, &mut resp_out[mpos..]);
-                                mpos += copy_into(b"\n", &mut resp_out[mpos..]);
-                                (201u16, mpos)
-                            } else {
-                                let n = copy_into(b"error: open failed\n", resp_out);
-                                (500u16, n)
-                            }
+                                if !self.fs.can_replace(cpath, mb_body.len()) {
+                                    // Refuse before truncating: the existing file stays as it was.
+                                    self.record_net_audit(AuditVerdict::Error, b"net:http:fs-nospace");
+                                    let n = copy_into(FS_NO_SPACE_MSG, resp_out);
+                                    (507u16, n)
+                                } else {
+                                    match self.fs.open(cpath, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC) {
+                                        Ok(fh) => {
+                                            let wrote = self.fs.write(fh, 0, mb_body);
+                                            let _ = self.fs.close(fh);
+                                            match wrote {
+                                                Ok(written) => {
+                                                    self.record_net_audit(
+                                                        AuditVerdict::Allowed,
+                                                        b"net:http:fs-put",
+                                                    );
+                                                    let mut mpos = 0usize;
+                                                    mpos += copy_into(
+                                                        b"wrote ",
+                                                        &mut resp_out[mpos..],
+                                                    );
+                                                    mpos += dec_u64(
+                                                        written as u64,
+                                                        &mut resp_out[mpos..],
+                                                    );
+                                                    mpos += copy_into(
+                                                        b" bytes to ",
+                                                        &mut resp_out[mpos..],
+                                                    );
+                                                    mpos += copy_into(
+                                                        cpath,
+                                                        &mut resp_out[mpos..],
+                                                    );
+                                                    mpos +=
+                                                        copy_into(b"\n", &mut resp_out[mpos..]);
+                                                    (201u16, mpos)
+                                                }
+                                                Err(cuttle_contracts::FsError::NoSpace) => {
+                                                    self.record_net_audit(
+                                                        AuditVerdict::Error,
+                                                        b"net:http:fs-nospace",
+                                                    );
+                                                    let n = copy_into(FS_NO_SPACE_MSG, resp_out);
+                                                    (507u16, n)
+                                                }
+                                                Err(_) => {
+                                                    self.record_net_audit(
+                                                        AuditVerdict::Error,
+                                                        b"net:http:fs-io-err",
+                                                    );
+                                                    let n = copy_into(
+                                                        b"error: write failed\n",
+                                                        resp_out,
+                                                    );
+                                                    self.svc.complete_mailbox_response(
+                                                        target, 500, n,
+                                                    );
+                                                    return Ok((500u16, n));
+                                                }
+                                            }
+                                        }
+                                        Err(cuttle_contracts::FsError::NoSpace) => {
+                                            self.record_net_audit(
+                                                AuditVerdict::Error,
+                                                b"net:http:fs-nospace",
+                                            );
+                                            let n = copy_into(FS_NO_SPACE_MSG, resp_out);
+                                            (507u16, n)
+                                        }
+                                        Err(_) => {
+                                            let n = copy_into(b"error: open failed\n", resp_out);
+                                            (500u16, n)
+                                        }
+                                    }
+                                }
                         }
                         WritablePathPolicy::Invalid => {
                             let n = copy_into(b"error: open failed\n", resp_out);
@@ -3395,6 +3577,21 @@ impl OsShell {
         net_tx: u64,
         out: &mut [u8],
     ) -> ShellAction {
+        self.sync_paged_budgets();
+        let action = self.exec_line_inner(raw_line, boots, net_rx, net_tx, out);
+        self.sync_paged_budgets();
+        action
+    }
+
+    #[inline(never)]
+    fn exec_line_inner(
+        &mut self,
+        raw_line: &[u8],
+        boots: u64,
+        net_rx: u64,
+        net_tx: u64,
+        out: &mut [u8],
+    ) -> ShellAction {
         let line = trim_ascii(raw_line);
         if line.is_empty() {
             return ShellAction::Continue(0);
@@ -4404,6 +4601,16 @@ impl OsShell {
                 return copy_into(FS_NO_SPACE_MSG, out);
             }
             let _ = self.fs.unlink(cpath);
+        } else {
+            let new_end = (offset as usize).saturating_add(plen);
+            if self.paged_mode && new_end > crate::vfs::PAGED_VFS_MAX_FILE_BYTES {
+                self.record_audit(9, AuditVerdict::Error, b"shell:writehex:nospace");
+                return copy_into(FS_NO_SPACE_MSG, out);
+            }
+            if self.fs.stat(cpath).is_err() && !self.fs.can_replace(cpath, new_end) {
+                self.record_audit(9, AuditVerdict::Error, b"shell:writehex:nospace");
+                return copy_into(FS_NO_SPACE_MSG, out);
+            }
         }
         let flags = if offset == 0 {
             FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC
@@ -4412,6 +4619,10 @@ impl OsShell {
         };
         let h = match self.fs.open(cpath, flags) {
             Ok(h) => h,
+            Err(cuttle_contracts::FsError::NoSpace) => {
+                self.record_audit(9, AuditVerdict::Error, b"shell:writehex:nospace");
+                return copy_into(FS_NO_SPACE_MSG, out);
+            }
             Err(_) => {
                 self.record_audit(9, AuditVerdict::Error, b"shell:writehex:open-failed");
                 return copy_into(b"error: cannot open path for write\n", out);
@@ -4422,6 +4633,11 @@ impl OsShell {
         } else {
             match self.fs.write(h, offset, &payload[..plen]) {
                 Ok(w) => w,
+                Err(cuttle_contracts::FsError::NoSpace) => {
+                    let _ = self.fs.close(h);
+                    self.record_audit(9, AuditVerdict::Error, b"shell:writehex:nospace");
+                    return copy_into(FS_NO_SPACE_MSG, out);
+                }
                 Err(_) => {
                     let _ = self.fs.close(h);
                     self.record_audit(9, AuditVerdict::Error, b"shell:writehex:io-err");
@@ -4496,6 +4712,10 @@ impl OsShell {
         }
         let h = match self.fs.open(cpath, FS_O_RDWR | FS_O_CREATE | FS_O_TRUNC) {
             Ok(h) => h,
+            Err(cuttle_contracts::FsError::NoSpace) => {
+                self.record_audit(9, AuditVerdict::Error, b"shell:write:nospace");
+                return copy_into(FS_NO_SPACE_MSG, out);
+            }
             Err(_) => {
                 self.record_audit(9, AuditVerdict::Error, b"shell:write:open-failed");
                 return copy_into(b"error: cannot open path for write\n", out);
@@ -4503,6 +4723,11 @@ impl OsShell {
         };
         let written = match self.fs.write(h, 0, &payload[..plen]) {
             Ok(w) => w,
+            Err(cuttle_contracts::FsError::NoSpace) => {
+                let _ = self.fs.close(h);
+                self.record_audit(9, AuditVerdict::Error, b"shell:write:nospace");
+                return copy_into(FS_NO_SPACE_MSG, out);
+            }
             Err(_) => {
                 let _ = self.fs.close(h);
                 self.record_audit(9, AuditVerdict::Error, b"shell:write:io-err");
@@ -6712,15 +6937,7 @@ impl Default for OsShell {
 }
 
 fn is_default_system_file(path: &[u8]) -> bool {
-    bytes_eq(path, b"/etc/hostname")
-        || bytes_eq(path, b"/etc/os-release")
-        || bytes_eq(path, b"/etc/motd")
-        || bytes_eq(path, b"/proc/net")
-        || bytes_eq(path, b"/bin/fib")
-        || bytes_eq(path, b"/bin/sum")
-        || bytes_eq(path, b"/sbin/svc-http")
-        || bytes_eq(path, b"/sbin/svc-sql")
-        || bytes_eq(path, b"/sbin/svc-sh")
+    crate::vfs::is_builtin_system_file(path)
 }
 
 /// Decode directory entry `idx` of a `CTTLFS01` partition image.

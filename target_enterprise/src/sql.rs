@@ -636,6 +636,8 @@ pub struct SqlDb {
     paged_mode: bool,
     /// Whether `SqlCatalog` metadata (`tx_seq` or table schemas) changed since last paged-store sync.
     catalog_dirty: bool,
+    /// Optional logical-page cap (`PageDomain::SqlCatalog` + `PageDomain::SqlLeaf`) enforced in `paged_mode`.
+    paged_page_budget: Option<usize>,
 }
 
 impl Default for SqlDb {
@@ -673,7 +675,77 @@ impl SqlDb {
             tx_aborted_count: 0,
             paged_mode: false,
             catalog_dirty: false,
+            paged_page_budget: None,
         }
+    }
+
+    /// Set or clear the maximum logical 4 KiB pages (`SqlCatalog` + `SqlLeaf`) this database may occupy in `paged_mode`.
+    pub fn set_paged_page_budget(&mut self, budget: Option<usize>) {
+        self.paged_page_budget = budget;
+    }
+
+    /// Return the configured logical-page budget in `paged_mode`, if any.
+    pub const fn paged_page_budget(&self) -> Option<usize> {
+        self.paged_page_budget
+    }
+
+    /// Exact number of `PagedBlockStore` logical pages (`1` `SqlCatalog` + active 32-row `SqlLeaf` chunks)
+    /// required by this database in `paged_mode`.
+    pub fn paged_pages_needed(&self) -> usize {
+        if !self.paged_mode {
+            return 0;
+        }
+        self.paged_pages_with_planned_inserts(usize::MAX, &[])
+    }
+
+    fn paged_pages_with_planned_inserts(
+        &self,
+        planned_table: usize,
+        planned_slots: &[usize],
+    ) -> usize {
+        let mut pages = 1usize; // `PageDomain::SqlCatalog` (`owner_id = 0`)
+        let mut t = 0usize;
+        while t < SQL_PAGED_MAX_TABLES {
+            if !self.table_at(t).used {
+                t += 1;
+                continue;
+            }
+            let r_len = self.table_at(t).row_slots_len();
+            let mut chunk = 0usize;
+            while chunk < SQL_LEAF_PAGES_PER_TABLE {
+                let base_r = chunk * SQL_ROWS_PER_LEAF_PAGE;
+                let mut occupied = false;
+                if t == planned_table {
+                    let mut p = 0usize;
+                    while p < planned_slots.len() {
+                        let s = planned_slots[p];
+                        if s >= base_r && s < base_r + SQL_ROWS_PER_LEAF_PAGE {
+                            occupied = true;
+                            break;
+                        }
+                        p += 1;
+                    }
+                }
+                if !occupied && base_r < r_len {
+                    let max_k = SQL_ROWS_PER_LEAF_PAGE.min(r_len - base_r);
+                    let mut k = 0usize;
+                    while k < max_k {
+                        let r = base_r + k;
+                        if self.table_at(t).row_at(r).used || self.committed_row(t, r).used {
+                            occupied = true;
+                            break;
+                        }
+                        k += 1;
+                    }
+                }
+                if occupied {
+                    pages += 1;
+                }
+                chunk += 1;
+            }
+            t += 1;
+        }
+        pages
     }
 
     /// `true` when page-granular overflow storage (`<= 8` tables, `<= 2,048` rows/table) is active.
@@ -2170,6 +2242,14 @@ impl SqlDb {
             pi += 1;
         }
 
+        if self.paged_mode {
+            if let Some(budget) = self.paged_page_budget {
+                if self.paged_pages_with_planned_inserts(t_idx, &planned_slots) > budget {
+                    return copy_str(b"error: ENOSPC (page store full)\n", out);
+                }
+            }
+        }
+
         if self.tx_active {
             let mut distinct_new_undo: Vec<usize> = Vec::new();
             let mut k = 0usize;
@@ -3335,6 +3415,56 @@ impl SqlDb {
         let mut total_rows = 0u32;
         let mut leaf_masks = [0u64; SQL_PAGED_MAX_TABLES];
         let mut leaf_buf: Vec<u8> = Vec::with_capacity(3800);
+
+        // Pass 1: reclaim logical IDs from dropped tables or newly-empty 32-row chunks across
+        // all tables BEFORE allocating any new `SqlLeaf` logical IDs, so a transaction or batch
+        // that deletes from one table and inserts into another at exact `max_logical` capacity
+        // never transiently exceeds `max_logical`.
+        let mut ft = 0usize;
+        while ft < SQL_PAGED_MAX_TABLES {
+            if !self.table_at(ft).used {
+                if self.table_at(ft).schema_dirty {
+                    let mut chunk = 0usize;
+                    while chunk < SQL_LEAF_PAGES_PER_TABLE {
+                        let owner_id = ((ft as u32) << 16) | (chunk as u32);
+                        if let Some(lid) = store.find_page(PageDomain::SqlLeaf, owner_id) {
+                            store.free_page(lid)?;
+                        }
+                        chunk += 1;
+                    }
+                }
+            } else {
+                let r_len = self.table_at(ft).row_slots_len();
+                let dirty_mask = self.table_at(ft).dirty_page_mask;
+                let schema_dirty = self.table_at(ft).schema_dirty;
+                let mut chunk = 0usize;
+                while chunk < SQL_LEAF_PAGES_PER_TABLE {
+                    if (dirty_mask & (1u64 << chunk)) != 0 || schema_dirty {
+                        let base_r = chunk * SQL_ROWS_PER_LEAF_PAGE;
+                        let mut any_used = false;
+                        if base_r < r_len {
+                            let max_k = SQL_ROWS_PER_LEAF_PAGE.min(r_len - base_r);
+                            let mut k = 0usize;
+                            while k < max_k {
+                                if self.committed_row(ft, base_r + k).used {
+                                    any_used = true;
+                                    break;
+                                }
+                                k += 1;
+                            }
+                        }
+                        if !any_used {
+                            let owner_id = ((ft as u32) << 16) | (chunk as u32);
+                            if let Some(lid) = store.find_page(PageDomain::SqlLeaf, owner_id) {
+                                store.free_page(lid)?;
+                            }
+                        }
+                    }
+                    chunk += 1;
+                }
+            }
+            ft += 1;
+        }
 
         let mut t = 0usize;
         while t < SQL_PAGED_MAX_TABLES {

@@ -1403,6 +1403,16 @@ impl ShellStore {
             && crate::paged_store::PagedBlockStore::supports_disk_capacity(dev.capacity_sectors())
     }
 
+    fn max_logical_for<D: SectorIo>(&self, dev: &D) -> usize {
+        if self.supports_paged_for(dev) {
+            crate::paged_store::PagedBlockStore::max_logical_pages_for_sectors(
+                dev.capacity_sectors(),
+            )
+        } else {
+            crate::paged_store::PAGED_MAX_LOGICAL_PAGES
+        }
+    }
+
     /// Sequence number of the last commit this store wrote or recovered.
     pub fn commit_seq(&self) -> u64 {
         self.commit_seq
@@ -1484,11 +1494,13 @@ impl ShellStore {
             };
             restore.files = pfiles;
             self.durable_anchor = sh.paged_anchor();
+            sh.set_paged_max_logical(self.max_logical_for(dev));
             Ok(true)
         } else {
             self.paged.reset();
             self.durable_anchor = crate::paged_store::PagedAnchor::zero();
             if paged_cap {
+                sh.set_paged_max_logical(self.max_logical_for(dev));
                 sh.mark_all_paged_dirty();
             }
             Ok(true)
@@ -1522,11 +1534,13 @@ impl ShellStore {
         }
 
         let paged_cap = self.supports_paged_for(dev);
+        let max_logical = self.max_logical_for(dev);
         if paged_cap {
             if !sh.is_paged_mode() {
                 sh.set_paged_mode(true);
                 sh.mark_all_paged_dirty();
             }
+            sh.set_paged_max_logical(max_logical);
             if !self.durable_anchor.is_active() {
                 if self.paged.tx_lsn() != 0 {
                     self.paged.reset();
@@ -1553,10 +1567,13 @@ impl ShellStore {
                 || sh.db.has_dirty_pages()
                 || sh.fs.is_dir_dirty();
             if need_paged_commit {
-                let max_logical =
-                    crate::paged_store::PagedBlockStore::max_logical_pages_for_sectors(
-                        dev.capacity_sectors(),
-                    );
+                if sh.fs.is_dir_dirty() {
+                    if let Err(e) = sh.prune_removed_vfs_pages(&mut self.paged) {
+                        sh.set_paged_anchor(self.durable_anchor);
+                        sh.mark_all_paged_dirty();
+                        return Err(Self::map_paged_commit_err(e));
+                    }
+                }
                 let sql_rows = match sh.db.sync_to_paged_store(&mut self.paged, max_logical) {
                     Ok(r) => r,
                     Err(e) => {
@@ -1621,6 +1638,7 @@ impl ShellStore {
                 if paged_cap {
                     self.durable_anchor = sh.paged_anchor();
                 }
+                sh.sync_paged_budgets();
                 self.stored_plain = Some(plain_digests);
                 Ok(Committed::Written {
                     commit: hdr,
@@ -1696,8 +1714,11 @@ impl ShellStore {
     ) -> Result<StateRestore, BootError> {
         let key = sh.seal_key;
         let paged_cap = self.supports_paged_for(dev);
-        if paged_cap && !sh.is_paged_mode() {
-            sh.set_paged_mode(true);
+        if paged_cap {
+            if !sh.is_paged_mode() {
+                sh.set_paged_mode(true);
+            }
+            sh.set_paged_max_logical(self.max_logical_for(dev));
         }
         match recover(dev, &key, &self.layout, &mut self.image) {
             Ok(r) if r.source != RecoverySource::Empty => {
@@ -1732,13 +1753,18 @@ impl ShellStore {
         keys: &ShellKeys,
         counter_boots: u64,
         paged_cap: bool,
+        max_logical: usize,
     ) -> Option<(StateRestore, u64)> {
         let boots = counter_boots.max(self.image.saved_boots().saturating_add(1));
         reset_shell(sh, keys, boots);
         if paged_cap {
             sh.set_paged_mode(true);
+            sh.set_paged_max_logical(max_logical);
         }
-        sh.unpack_state_image(&self.image).ok().map(|r| (r, boots))
+        sh.unpack_state_image(&self.image).ok().map(|r| {
+            sh.sync_paged_budgets();
+            (r, boots)
+        })
     }
 
     /// Run slot recovery over `layout` and load the result into `sh`.
@@ -1752,6 +1778,7 @@ impl ShellStore {
         counter_boots: u64,
     ) -> Result<Option<(Recovery, StateRestore, u64)>, BootError> {
         let paged_cap = self.supports_paged_for(dev);
+        let max_logical = self.max_logical_for(dev);
         let recovery = match recover(dev, &keys.seal, layout, &mut self.image) {
             Ok(r) => r,
             Err(RecoverError::Unrecoverable(_)) => return Ok(None),
@@ -1768,7 +1795,9 @@ impl ShellStore {
         if let Ok(legacy_plain) =
             self.decrypt_slot_if_needed(&keys.seal, recovery.commit.as_ref())
         {
-            if let Some((mut restore, boots)) = self.try_load(sh, keys, counter_boots, paged_cap) {
+            if let Some((mut restore, boots)) =
+                self.try_load(sh, keys, counter_boots, paged_cap, max_logical)
+            {
                 match self.hydrate_paged_into(dev, sh, &keys.seal, paged_cap, &mut restore) {
                     Ok(true) => {
                         restore.migrated_legacy |= legacy_plain;
@@ -1785,7 +1814,7 @@ impl ShellStore {
             read_slot(dev, layout, Slot::Shadow, &mut self.image).map_err(BootError::Io)?;
             if let Ok(legacy_plain) = self.decrypt_slot_if_needed(&keys.seal, None) {
                 if let Some((mut restore, boots)) =
-                    self.try_load(sh, keys, counter_boots, paged_cap)
+                    self.try_load(sh, keys, counter_boots, paged_cap, max_logical)
                 {
                     match self.hydrate_paged_into(dev, sh, &keys.seal, paged_cap, &mut restore) {
                         Ok(true) => {
@@ -1987,6 +2016,7 @@ impl ShellStore {
         }
         let layout = self.layout;
         let paged_cap = self.supports_paged_for(dev);
+        let max_logical = self.max_logical_for(dev);
 
         // A blank disk is the one case with nothing to restore or preserve
         // (unless an external high-water `min_commit_seq` proves the disk was wiped).
@@ -2015,6 +2045,7 @@ impl ShellStore {
             reset_shell(sh, keys, counter_boots);
             if paged_cap {
                 sh.set_paged_mode(true);
+                sh.set_paged_max_logical(max_logical);
                 sh.mark_all_paged_dirty();
             }
             if self.min_commit_seq > 0 {
@@ -2049,6 +2080,7 @@ impl ShellStore {
                 reset_shell(sh, keys, counter_boots);
                 if paged_cap {
                     sh.set_paged_mode(true);
+                    sh.set_paged_max_logical(max_logical);
                     sh.mark_all_paged_dirty();
                 }
                 return Err(BootError::Rollback {
@@ -2124,6 +2156,7 @@ impl ShellStore {
                     reset_shell(sh, keys, counter_boots);
                     if paged_cap {
                         sh.set_paged_mode(true);
+                        sh.set_paged_max_logical(max_logical);
                         sh.mark_all_paged_dirty();
                     }
                     return Err(BootError::Rollback {
@@ -2181,6 +2214,7 @@ impl ShellStore {
         reset_shell(sh, keys, counter_boots);
         if paged_cap {
             sh.set_paged_mode(true);
+            sh.set_paged_max_logical(max_logical);
             sh.mark_all_paged_dirty();
         }
         Ok(BootReport {
@@ -2236,11 +2270,13 @@ impl ShellStore {
         }
 
         let paged_cap = self.supports_paged_for(dev);
+        let max_logical = self.max_logical_for(dev);
         if paged_cap {
             if !sh.is_paged_mode() {
                 sh.set_paged_mode(true);
                 sh.mark_all_paged_dirty();
             }
+            sh.set_paged_max_logical(max_logical);
             if !self.durable_anchor.is_active() {
                 if self.paged.tx_lsn() != 0 {
                     self.paged.reset();
@@ -2267,10 +2303,13 @@ impl ShellStore {
                 || sh.db.has_dirty_pages()
                 || sh.fs.is_dir_dirty();
             if need_paged_commit {
-                let max_logical =
-                    crate::paged_store::PagedBlockStore::max_logical_pages_for_sectors(
-                        dev.capacity_sectors(),
-                    );
+                if sh.fs.is_dir_dirty() {
+                    if let Err(e) = sh.prune_removed_vfs_pages(&mut self.paged) {
+                        sh.set_paged_anchor(self.durable_anchor);
+                        sh.mark_all_paged_dirty();
+                        return Err(Self::map_paged_commit_err(e));
+                    }
+                }
                 let sql_rows = match sh.db.sync_to_paged_store(&mut self.paged, max_logical) {
                     Ok(r) => r,
                     Err(e) => {
@@ -2408,6 +2447,7 @@ impl ShellStore {
                 if paged_cap {
                     self.durable_anchor = sh.paged_anchor();
                 }
+                sh.sync_paged_budgets();
                 self.stored_plain = Some(plain_digests);
                 Ok(Committed::Written {
                     commit: hdr,
@@ -2543,6 +2583,7 @@ impl ShellStore {
                 self.faulted = false;
                 let layout = self.layout;
                 let paged_cap = self.supports_paged_for(dev);
+                let max_logical = self.max_logical_for(dev);
 
                 let (recovery, restore, boots) =
                     match self.recover_and_load(dev, &layout, sh, keys, counter_boots) {
@@ -2569,6 +2610,7 @@ impl ShellStore {
                     reset_shell(sh, keys, counter_boots);
                     if paged_cap {
                         sh.set_paged_mode(true);
+                        sh.set_paged_max_logical(max_logical);
                         sh.mark_all_paged_dirty();
                     }
                     return Err(BootError::Rollback {
@@ -2698,10 +2740,514 @@ fn derive_commit_nonce(
     let mut mac = [0u8; DURABLE_DIGEST_LEN];
     seal_bytes_keyed(seal_key, &msg, &mut mac);
     let mut nonce = [0u8; AEAD_NONCE_LEN];
-    nonce[0..8].copy_from_slice(&seq.to_le_bytes());
-    nonce[8..12].copy_from_slice(&mac[0..4]);
-    nonce[11] &= 0x3F;
+    nonce.copy_from_slice(&mac[0..AEAD_NONCE_LEN]);
+    nonce[AEAD_NONCE_LEN - 1] &= 0x3F;
+    zeroize_secret_bytes(&mut mac);
     nonce
+}
+
+/// Hardware block-storage backend kind eligible to host a Cuttle durable state disk.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StateBackendKind {
+    /// PCI AHCI SATA controller (`class 01:06:01`).
+    Ahci,
+    /// PCI NVMe controller (`class 01:08:02`).
+    Nvme,
+    /// VirtIO block PCI device (`1af4:1001` / `1af4:1042`).
+    Virtio,
+}
+
+impl StateBackendKind {
+    /// Canonical lowercase name used in `opt/cuttle_storage_backend` and boot banners.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ahci => "ahci",
+            Self::Nvme => "nvme",
+            Self::Virtio => "virtio",
+        }
+    }
+}
+
+/// Parsed operator storage-backend selection policy (`opt/cuttle_storage_backend`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StateBackendPin {
+    /// Automatic authenticated-store discovery across present healthy backends.
+    Auto,
+    /// Require a specific hardware backend (`ahci`, `nvme`, or `virtio`).
+    Pinned(StateBackendKind),
+}
+
+/// Outcome of probing a hardware storage controller candidate at boot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BackendCandidateProbe<D> {
+    /// Controller or drive is not attached on this machine.
+    Absent,
+    /// Controller initialized cleanly and yielded an operational block device `D`.
+    Ready(D),
+    /// Controller or drive is present on PCI/link, but initialization or `IDENTIFY` failed.
+    Failed(IoFault),
+}
+
+/// Reason boot refused to select a durable state disk across candidate controllers.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StateBackendFault {
+    /// `opt/cuttle_storage_backend` contained an unrecognized value.
+    InvalidPin,
+    /// No storage backend is attached.
+    NoBackendAvailable,
+    /// The pinned backend is not attached.
+    PinnedAbsent(StateBackendKind),
+    /// A present backend failed initialization, `IDENTIFY`, or sector inspection.
+    ProbeFailed {
+        /// Which backend faulted.
+        kind: StateBackendKind,
+        /// Driver fault code.
+        fault: IoFault,
+    },
+    /// More than one attached disk holds an authenticated Cuttle state store under `seal_key`.
+    AmbiguousStores {
+        /// First authenticated backend found.
+        first: StateBackendKind,
+        /// Second authenticated backend found.
+        second: StateBackendKind,
+    },
+    /// No disk authenticated under `seal_key`, and starting `Fresh` on a blank disk was refused
+    /// because another attached disk holds a non-blank Cuttle store.
+    UnauthenticatedStorePresent {
+        /// Blank candidate that would otherwise have started `Fresh`.
+        chosen_blank: StateBackendKind,
+        /// Other attached backend holding non-blank Cuttle state/page-store sectors.
+        occupied: StateBackendKind,
+    },
+}
+
+/// Parse raw `fw_cfg` bytes from `opt/cuttle_storage_backend`.
+pub fn parse_state_backend_pin(raw: &[u8]) -> Result<StateBackendPin, StateBackendFault> {
+    if raw.len() > 32 {
+        return Err(StateBackendFault::InvalidPin);
+    }
+    let mut start = 0usize;
+    while start < raw.len() && matches!(raw[start], b' ' | b'\t' | b'\r' | b'\n') {
+        start += 1;
+    }
+    let mut end = raw.len();
+    while end > start && matches!(raw[end - 1], b' ' | b'\t' | b'\r' | b'\n' | 0) {
+        end -= 1;
+    }
+    let trimmed = &raw[start..end];
+    if trimmed.contains(&0) {
+        return Err(StateBackendFault::InvalidPin);
+    }
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(b"auto") {
+        Ok(StateBackendPin::Auto)
+    } else if trimmed.eq_ignore_ascii_case(b"ahci") {
+        Ok(StateBackendPin::Pinned(StateBackendKind::Ahci))
+    } else if trimmed.eq_ignore_ascii_case(b"nvme") {
+        Ok(StateBackendPin::Pinned(StateBackendKind::Nvme))
+    } else if trimmed.eq_ignore_ascii_case(b"virtio") {
+        Ok(StateBackendPin::Pinned(StateBackendKind::Virtio))
+    } else {
+        Err(StateBackendFault::InvalidPin)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CandidateDiskClass {
+    Blank,
+    Authenticated,
+    OccupiedUnauthenticated,
+}
+
+fn sector_has_nonzero(sec: &[u8; SECTOR_BYTES]) -> bool {
+    let mut acc = 0u8;
+    let mut i = 0usize;
+    while i < SECTOR_BYTES {
+        acc |= sec[i];
+        i += 1;
+    }
+    acc != 0
+}
+
+fn slot_buf_aead_envelope(
+    buf: &[[u8; SECTOR_BYTES]],
+) -> Option<(
+    [u8; AEAD_NONCE_LEN],
+    [u8; AEAD_TAG_LEN],
+    [u8; AEAD_TAG_LEN],
+    [u8; AEAD_TAG_LEN],
+)> {
+    if buf.len() != STATE_IMAGE_SECTORS || buf[0][0..8] != STATE_AEAD_MAGIC {
+        return None;
+    }
+    let mut nonce = [0u8; AEAD_NONCE_LEN];
+    nonce.copy_from_slice(&buf[0][8..20]);
+    if (nonce[11] & 0xC0) != 0 {
+        return None;
+    }
+    let mut wal_tag = [0u8; AEAD_TAG_LEN];
+    let mut fs_tag = [0u8; AEAD_TAG_LEN];
+    let mut sql_tag = [0u8; AEAD_TAG_LEN];
+    wal_tag.copy_from_slice(&buf[0][20..36]);
+    fs_tag.copy_from_slice(&buf[0][36..52]);
+    sql_tag.copy_from_slice(&buf[0][52..68]);
+    Some((nonce, wal_tag, fs_tag, sql_tag))
+}
+
+fn slot_buf_verify_aead(
+    buf: &mut [[u8; SECTOR_BYTES]],
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+) -> bool {
+    let Some((canon, wal_tag, fs_tag, sql_tag)) = slot_buf_aead_envelope(buf) else {
+        return false;
+    };
+    if !is_seal_key_set(seal_key) {
+        zeroize_secret_bytes(buf.as_flattened_mut());
+        return false;
+    }
+    let mut aead_key = derive_disk_aead_key(seal_key);
+    let (wal_s, rest) = buf.split_at_mut(STATE_WAL_SECTORS);
+    let (fs_s, sql_s) = rest.split_at_mut(STATE_FS_SECTORS);
+
+    let (n_wal, aad_wal) = state_aead_nonce_and_aad(&canon, 0);
+    let wal_ok = chacha20_poly1305_decrypt_in_place(
+        &aead_key,
+        &n_wal,
+        &aad_wal,
+        &mut wal_s.as_flattened_mut()[68..],
+        &wal_tag,
+    );
+    let (n_fs, aad_fs) = state_aead_nonce_and_aad(&canon, 1);
+    let fs_ok = chacha20_poly1305_decrypt_in_place(
+        &aead_key,
+        &n_fs,
+        &aad_fs,
+        fs_s.as_flattened_mut(),
+        &fs_tag,
+    );
+    let (n_sql, aad_sql) = state_aead_nonce_and_aad(&canon, 2);
+    let sql_ok = chacha20_poly1305_decrypt_in_place(
+        &aead_key,
+        &n_sql,
+        &aad_sql,
+        sql_s.as_flattened_mut(),
+        &sql_tag,
+    );
+    zeroize_secret_bytes(&mut aead_key);
+    zeroize_secret_bytes(buf.as_flattened_mut());
+    wal_ok & fs_ok & sql_ok
+}
+
+fn inspect_layout_readonly<D: SectorIo>(
+    dev: &mut D,
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+    layout: &StoreLayout,
+    scratch: &mut [[u8; SECTOR_BYTES]],
+) -> Result<(bool, bool), IoFault> {
+    let mut any_nonzero = false;
+    let mut commit_sec = [0u8; SECTOR_BYTES];
+    dev.read_sector(layout.commit_lba, &mut commit_sec)?;
+    any_nonzero |= sector_has_nonzero(&commit_sec);
+    let hdr = if is_seal_key_set(seal_key) {
+        verify_ab_commit_sector(seal_key, &commit_sec)
+            .filter(|h| h.format_version == AB_FORMAT_V2 || h.format_version == AB_FORMAT_V3)
+    } else {
+        None
+    };
+
+    let mut authenticated = false;
+    for base in [layout.primary_lba, layout.shadow_lba] {
+        dev.read_sectors(base, scratch)?;
+        let mut s = 0usize;
+        while s < scratch.len() {
+            any_nonzero |= sector_has_nonzero(&scratch[s]);
+            s += 1;
+        }
+        if authenticated {
+            zeroize_secret_bytes(scratch.as_flattened_mut());
+            continue;
+        }
+        let digests = ImageDigests {
+            wal: hash_sector_slice(&scratch[..STATE_WAL_SECTORS]),
+            fs: hash_sector_slice(&scratch[STATE_WAL_SECTORS..IDX_SQL_SUPER]),
+            sql: hash_sector_slice(&scratch[IDX_SQL_SUPER..STATE_IMAGE_SECTORS]),
+        };
+        if let Some(h) = hdr {
+            if digests.matches(&h) {
+                if h.format_version == AB_FORMAT_V3 {
+                    if slot_buf_aead_envelope(scratch)
+                        == Some((h.aead_nonce, h.wal_tag, h.fs_tag, h.sql_tag))
+                        && slot_buf_verify_aead(scratch, seal_key)
+                    {
+                        authenticated = true;
+                    }
+                } else if slot_buf_aead_envelope(scratch).is_none() {
+                    authenticated = true;
+                }
+            }
+        } else if slot_buf_aead_envelope(scratch).is_some()
+            && slot_buf_verify_aead(scratch, seal_key)
+        {
+            authenticated = true;
+        }
+        zeroize_secret_bytes(scratch.as_flattened_mut());
+    }
+    Ok((authenticated, any_nonzero))
+}
+
+fn classify_candidate_disk<D: SectorIo>(
+    dev: &mut D,
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+    layout: &StoreLayout,
+    quarantine_lba: u64,
+) -> Result<CandidateDiskClass, IoFault> {
+    if !quarantine_fits(layout, quarantine_lba, dev.capacity_sectors()) {
+        return Err(IoFault::OutOfRange);
+    }
+    let mut scratch = alloc::vec![[0u8; SECTOR_BYTES]; STATE_IMAGE_SECTORS];
+    let (main_auth, mut any_nonzero) =
+        inspect_layout_readonly(dev, seal_key, layout, &mut scratch)?;
+    if main_auth {
+        return Ok(CandidateDiskClass::Authenticated);
+    }
+
+    let mut q_marker = [0u8; SECTOR_BYTES];
+    dev.read_sector(quarantine_marker_lba(quarantine_lba), &mut q_marker)?;
+    any_nonzero |= sector_has_nonzero(&q_marker);
+    if quarantine_marker(&q_marker) {
+        any_nonzero = true;
+        let q_layout = quarantine_layout(quarantine_lba);
+        let (q_auth, q_nz) = inspect_layout_readonly(dev, seal_key, &q_layout, &mut scratch)?;
+        any_nonzero |= q_nz;
+        if q_auth {
+            return Ok(CandidateDiskClass::Authenticated);
+        }
+    }
+
+    let v1 = AHCI_STATE_LAYOUT_V1;
+    if *layout == AHCI_STATE_LAYOUT
+        && v1.is_valid_for_sectors(dev.capacity_sectors(), STATE_IMAGE_SECTORS_V1)
+    {
+        let mut v1_commit_sec = [0u8; SECTOR_BYTES];
+        dev.read_sector(v1.commit_lba, &mut v1_commit_sec)?;
+        any_nonzero |= sector_has_nonzero(&v1_commit_sec);
+        let v1_hdr = if is_seal_key_set(seal_key) {
+            verify_ab_commit_sector(seal_key, &v1_commit_sec)
+                .filter(|h| h.format_version == AB_FORMAT_V1)
+        } else {
+            None
+        };
+        for base in [v1.primary_lba, v1.shadow_lba] {
+            let v1_buf = &mut scratch[..STATE_IMAGE_SECTORS_V1];
+            dev.read_sectors(base, v1_buf)?;
+            let mut s = 0usize;
+            while s < v1_buf.len() {
+                any_nonzero |= sector_has_nonzero(&v1_buf[s]);
+                s += 1;
+            }
+            if let Some(h) = v1_hdr {
+                let d = ImageDigests {
+                    wal: hash_sector_slice(&v1_buf[..STATE_WAL_SECTORS_V1]),
+                    fs: hash_sector_slice(
+                        &v1_buf[STATE_WAL_SECTORS_V1..STATE_WAL_SECTORS_V1 + STATE_FS_SECTORS_V1],
+                    ),
+                    sql: hash_sector_slice(
+                        &v1_buf[STATE_WAL_SECTORS_V1 + STATE_FS_SECTORS_V1..STATE_IMAGE_SECTORS_V1],
+                    ),
+                };
+                if d.matches(&h) {
+                    zeroize_secret_bytes(v1_buf.as_flattened_mut());
+                    return Ok(CandidateDiskClass::Authenticated);
+                }
+            }
+            zeroize_secret_bytes(v1_buf.as_flattened_mut());
+        }
+    }
+
+    if *layout == AHCI_STATE_LAYOUT
+        && crate::paged_store::PagedBlockStore::supports_disk_capacity(dev.capacity_sectors())
+    {
+        let mut sb = [0u8; SECTOR_BYTES];
+        dev.read_sector(crate::paged_store::SUPERBLOCK_A_LBA, &mut sb)?;
+        any_nonzero |= sector_has_nonzero(&sb);
+        dev.read_sector(crate::paged_store::SUPERBLOCK_B_LBA, &mut sb)?;
+        any_nonzero |= sector_has_nonzero(&sb);
+    }
+
+    if any_nonzero {
+        Ok(CandidateDiskClass::OccupiedUnauthenticated)
+    } else {
+        Ok(CandidateDiskClass::Blank)
+    }
+}
+
+/// Select the durable state disk deterministically across `(AHCI, NVMe, VirtIO-blk)` candidates.
+pub fn select_state_backend<A: SectorIo, N: SectorIo, V: SectorIo>(
+    pin: StateBackendPin,
+    seal_key: &[u8; DURABLE_DIGEST_LEN],
+    layout: &StoreLayout,
+    quarantine_lba: u64,
+    ahci: BackendCandidateProbe<A>,
+    nvme: BackendCandidateProbe<N>,
+    virtio: BackendCandidateProbe<V>,
+) -> Result<(StateBackendKind, Option<A>, Option<N>, Option<V>), StateBackendFault> {
+    if let StateBackendPin::Pinned(target) = pin {
+        return match target {
+            StateBackendKind::Ahci => match ahci {
+                BackendCandidateProbe::Ready(a) => Ok((StateBackendKind::Ahci, Some(a), None, None)),
+                BackendCandidateProbe::Absent => {
+                    Err(StateBackendFault::PinnedAbsent(StateBackendKind::Ahci))
+                }
+                BackendCandidateProbe::Failed(fault) => Err(StateBackendFault::ProbeFailed {
+                    kind: StateBackendKind::Ahci,
+                    fault,
+                }),
+            },
+            StateBackendKind::Nvme => match nvme {
+                BackendCandidateProbe::Ready(n) => Ok((StateBackendKind::Nvme, None, Some(n), None)),
+                BackendCandidateProbe::Absent => {
+                    Err(StateBackendFault::PinnedAbsent(StateBackendKind::Nvme))
+                }
+                BackendCandidateProbe::Failed(fault) => Err(StateBackendFault::ProbeFailed {
+                    kind: StateBackendKind::Nvme,
+                    fault,
+                }),
+            },
+            StateBackendKind::Virtio => match virtio {
+                BackendCandidateProbe::Ready(v) => {
+                    Ok((StateBackendKind::Virtio, None, None, Some(v)))
+                }
+                BackendCandidateProbe::Absent => {
+                    Err(StateBackendFault::PinnedAbsent(StateBackendKind::Virtio))
+                }
+                BackendCandidateProbe::Failed(fault) => Err(StateBackendFault::ProbeFailed {
+                    kind: StateBackendKind::Virtio,
+                    fault,
+                }),
+            },
+        };
+    }
+
+    let mut opt_a = match ahci {
+        BackendCandidateProbe::Ready(a) => Some(a),
+        BackendCandidateProbe::Absent => None,
+        BackendCandidateProbe::Failed(fault) => {
+            return Err(StateBackendFault::ProbeFailed {
+                kind: StateBackendKind::Ahci,
+                fault,
+            });
+        }
+    };
+    let mut opt_n = match nvme {
+        BackendCandidateProbe::Ready(n) => Some(n),
+        BackendCandidateProbe::Absent => None,
+        BackendCandidateProbe::Failed(fault) => {
+            return Err(StateBackendFault::ProbeFailed {
+                kind: StateBackendKind::Nvme,
+                fault,
+            });
+        }
+    };
+    let mut opt_v = match virtio {
+        BackendCandidateProbe::Ready(v) => Some(v),
+        BackendCandidateProbe::Absent => None,
+        BackendCandidateProbe::Failed(fault) => {
+            return Err(StateBackendFault::ProbeFailed {
+                kind: StateBackendKind::Virtio,
+                fault,
+            });
+        }
+    };
+
+    let mut ready = [(StateBackendKind::Ahci, CandidateDiskClass::Blank); 3];
+    let mut ready_len = 0usize;
+    if let Some(a) = opt_a.as_mut() {
+        let cls = classify_candidate_disk(a, seal_key, layout, quarantine_lba).map_err(|fault| {
+            StateBackendFault::ProbeFailed {
+                kind: StateBackendKind::Ahci,
+                fault,
+            }
+        })?;
+        ready[ready_len] = (StateBackendKind::Ahci, cls);
+        ready_len += 1;
+    }
+    if let Some(n) = opt_n.as_mut() {
+        let cls = classify_candidate_disk(n, seal_key, layout, quarantine_lba).map_err(|fault| {
+            StateBackendFault::ProbeFailed {
+                kind: StateBackendKind::Nvme,
+                fault,
+            }
+        })?;
+        ready[ready_len] = (StateBackendKind::Nvme, cls);
+        ready_len += 1;
+    }
+    if let Some(v) = opt_v.as_mut() {
+        let cls = classify_candidate_disk(v, seal_key, layout, quarantine_lba).map_err(|fault| {
+            StateBackendFault::ProbeFailed {
+                kind: StateBackendKind::Virtio,
+                fault,
+            }
+        })?;
+        ready[ready_len] = (StateBackendKind::Virtio, cls);
+        ready_len += 1;
+    }
+    if ready_len == 0 {
+        return Err(StateBackendFault::NoBackendAvailable);
+    }
+
+    let pick = |kind: StateBackendKind,
+                opt_a: Option<A>,
+                opt_n: Option<N>,
+                opt_v: Option<V>|
+     -> (StateBackendKind, Option<A>, Option<N>, Option<V>) {
+        match kind {
+            StateBackendKind::Ahci => (StateBackendKind::Ahci, opt_a, None, None),
+            StateBackendKind::Nvme => (StateBackendKind::Nvme, None, opt_n, None),
+            StateBackendKind::Virtio => (StateBackendKind::Virtio, None, None, opt_v),
+        }
+    };
+
+    let mut first_auth: Option<StateBackendKind> = None;
+    let mut i = 0usize;
+    while i < ready_len {
+        if ready[i].1 == CandidateDiskClass::Authenticated {
+            if let Some(first) = first_auth {
+                return Err(StateBackendFault::AmbiguousStores {
+                    first,
+                    second: ready[i].0,
+                });
+            }
+            first_auth = Some(ready[i].0);
+        }
+        i += 1;
+    }
+    if let Some(chosen) = first_auth {
+        return Ok(pick(chosen, opt_a, opt_n, opt_v));
+    }
+
+    let mut first_occ: Option<(usize, StateBackendKind)> = None;
+    let mut j = 0usize;
+    while j < ready_len {
+        if ready[j].1 == CandidateDiskClass::OccupiedUnauthenticated {
+            if let Some((_, first)) = first_occ {
+                return Err(StateBackendFault::AmbiguousStores {
+                    first,
+                    second: ready[j].0,
+                });
+            }
+            first_occ = Some((j, ready[j].0));
+        }
+        j += 1;
+    }
+    let first_ready_kind = ready[0].0;
+    if let Some((occ_idx, occ_kind)) = first_occ {
+        if occ_idx > 0 {
+            return Err(StateBackendFault::UnauthenticatedStorePresent {
+                chosen_blank: first_ready_kind,
+                occupied: occ_kind,
+            });
+        }
+    }
+    Ok(pick(first_ready_kind, opt_a, opt_n, opt_v))
 }
 
 /// In-memory [`SectorIo`] with a volatile write cache and fault injection.
@@ -4292,13 +4838,10 @@ mod node_tests {
     }
 
     /// What happens today when the page store runs out of logical pages: the
-    /// shell has no admission check for it, so the command is accepted and
-    /// the commit that follows fails. That failure is safe (nothing reaches
-    /// the device, and the last committed state comes back whole), which is
-    /// what this test pins. It is not graceful: the kernel treats a failed
-    /// commit as a storage fault and halts. See Claude-Recommendations.md;
-    /// when the shell learns to refuse the command with `ENOSPC` instead,
-    /// this test should change to expect that.
+    /// When the page store fills up (`max_logical` pages), the filesystem and
+    /// SQL admission checks refuse the command that would open a page past the
+    /// device's logical-page budget with `FsError::NoSpace` / `ENOSPC`, so
+    /// every accepted mutation commits cleanly without faulting the node.
     #[test]
     fn a_full_page_store_fails_the_commit_without_writing_and_loses_nothing_committed() {
         use crate::paged_store::{PagedBlockStore, PAGED_STORE_MIN_DISK_SECTORS};
@@ -4309,34 +4852,29 @@ mod node_tests {
         apply_generation(&mut sh, "one");
         st.commit(&mut disk, &mut sh, 1).expect("first commit");
 
-        // Files of two pages each, committed one at a time, until one does not fit.
+        // Files of two pages each, committed one at a time, until the VFS refuses with `NoSpace`.
         let body: Vec<u8> = (0..4001usize).map(|i| (i % 251) as u8).collect();
         let mut committed_files = 0usize;
         let mut refused = None;
         for f in 0..90usize {
             let path = std::format!("/var/fill_{f:02}.bin");
-            sh.fs
-                .seed_file(path.as_bytes(), &body, body.len(), 500 + f as u64)
-                .expect("the filesystem itself has room");
-            let ops_before = disk.ops;
-            match st.commit(&mut disk, &mut sh, 1) {
-                Ok(_) => committed_files += 1,
+            match sh.fs.seed_file(path.as_bytes(), &body, body.len(), 500 + f as u64) {
+                Ok(_) => {
+                    st.commit(&mut disk, &mut sh, 1)
+                        .expect("every accepted file within page budget must commit cleanly");
+                    committed_files += 1;
+                }
                 Err(e) => {
-                    assert_eq!(disk.ops, ops_before, "a commit that cannot fit wrote to the device");
                     refused = Some(e);
                     break;
                 }
             }
         }
-        let err = refused.expect("the page store never filled");
-        assert!(
-            matches!(err, PersistError::Pack(StatePackError::Filesystem(_))),
-            "{err:?}"
-        );
-        assert!(!st.is_faulted(), "nothing was written, so there is nothing to recover");
-        assert!(
-            committed_files * 2 > max_logical / 2 && committed_files * 2 < max_logical,
-            "filled {committed_files} two-page files into {max_logical} logical pages"
+        assert_eq!(refused, Some(cuttle_contracts::FsError::NoSpace));
+        assert!(!st.is_faulted());
+        assert_eq!(
+            committed_files, 54,
+            "expected 54 two-page user files (108 data + 1 /var/gen + 5 dir + 3 seeded sql = 117 <= {max_logical})"
         );
 
         // Everything that was committed is still there, byte for byte.
@@ -5202,7 +5740,7 @@ mod node_tests {
         let total_c4_ops = dry.ops;
         assert!(total_c4_ops > 4);
 
-        for cut in (1..=total_c4_ops).step_by(3) {
+        for cut in 1..=total_c4_ops {
             let mut crash_disk = clone_from_sectors(&snap_c3);
             let (_, mut sh_c, mut st_c) = boot(&mut crash_disk, &keys(), 3);
             let _ = sql(&mut sh_c, "UPDATE events SET msg = 'atomic-c4' WHERE id = 42");
@@ -5579,6 +6117,259 @@ mod node_tests {
                 Some(&valid_tok)
             ),
             Err(BootError::TpmAnchor(TpmBootFault::InvalidReanchorToken))
+        );
+    }
+
+    #[test]
+    fn derive_commit_nonce_uses_full_94_mac_bits_across_abandoned_same_seq_commits() {
+        let k = keys().seal;
+        let d1 = ImageDigests {
+            wal: [0x11; 32],
+            fs: [0x22; 32],
+            sql: [0x33; 32],
+        };
+        let d2 = ImageDigests {
+            wal: [0x11; 32],
+            fs: [0x22; 32],
+            sql: [0x34; 32],
+        };
+        let n1 = super::derive_commit_nonce(&k, 2, 7, &d1, 0xAAAA_BBBB);
+        let n2 = super::derive_commit_nonce(&k, 2, 7, &d2, 0xAAAA_BBBB);
+        assert_eq!(n1[11] & 0xC0, 0);
+        assert_eq!(n2[11] & 0xC0, 0);
+        assert_ne!(
+            &n1[0..8],
+            &n2[0..8],
+            "abandoned same-seq commits must not share low 64 bits of AEAD nonce"
+        );
+        assert_ne!(&n1[8..12], &n2[8..12]);
+    }
+
+    #[test]
+    fn sql_and_vfs_commands_enforce_shared_page_store_budget_with_enospc_before_mutating() {
+        // 1. 2 MiB (`4096`-sector) disk: `max_logical = 118`.
+        //    Put 3 user files of 1 page each in group 0 (1 dir + 3 data = 4 VFS pages),
+        //    then fill 113 SQL leaf chunks (1 catalog + 113 leaf = 114 SQL pages) -> 118/118!
+        let mut disk = MemDisk::new(4096);
+        let (_, mut sh, mut st) = boot(&mut disk, &keys(), 1);
+        for i in 0..3usize {
+            let out = run(&mut sh, &std::format!("write /var/u{i}.txt payload-{i}"));
+            assert!(out.starts_with("wrote "), "unexpected write output: {out:?}");
+        }
+        for t in 0..2usize {
+            assert!(sql(&mut sh, &std::format!("CREATE TABLE t{t} (id INT, v TEXT)")).ends_with("OK\n"));
+        }
+        // Table t0: 64 chunks * 32 rows = 2048 rows (`64` leaf pages).
+        for chunk in 0..64usize {
+            let row_id = chunk * 32;
+            let mut q = std::string::String::from("INSERT INTO t0 VALUES ");
+            for k in 0..32usize {
+                if k > 0 {
+                    q.push_str(", ");
+                }
+                q.push_str(&std::format!("({}, 'r')", row_id + k));
+            }
+            assert_eq!(sql(&mut sh, &q), "INSERT 32\n");
+        }
+        // Table t1: 47 chunks * 32 rows = 1504 rows (`47` leaf pages). Total SQL = 3 seeded + 64 + 47 = 114; + 4 VFS = 118!
+        for chunk in 0..47usize {
+            let row_id = chunk * 32;
+            let mut q = std::string::String::from("INSERT INTO t1 VALUES ");
+            for k in 0..32usize {
+                if k > 0 {
+                    q.push_str(", ");
+                }
+                q.push_str(&std::format!("({}, 'r')", row_id + k));
+            }
+            assert_eq!(sql(&mut sh, &q), "INSERT 32\n");
+        }
+        st.commit(&mut disk, &mut sh, 1)
+            .expect("exact 118/118 page budget must commit cleanly");
+        assert_eq!(st.paged.allocated_page_count(), 118);
+
+        // 119th page via SQL `INSERT` into chunk 47 of `t1` MUST be refused with `ENOSPC` before mutating!
+        let err_sql = sql(&mut sh, "INSERT INTO t1 VALUES (9999, 'overflow')");
+        assert!(
+            err_sql.contains("ENOSPC"),
+            "expected ENOSPC on 119th SQL page, got: {err_sql:?}"
+        );
+        // 119th page via VFS `write` of a new non-empty file MUST also be refused with `ENOSPC`!
+        let err_vfs = run(&mut sh, "write /var/overflow.txt nope");
+        assert!(
+            err_vfs.contains("ENOSPC"),
+            "expected ENOSPC on 119th VFS page, got: {err_vfs:?}"
+        );
+        // Nothing changed, so `st.commit` reports `Unchanged`!
+        assert_eq!(
+            st.commit(&mut disk, &mut sh, 1).unwrap(),
+            Committed::Unchanged
+        );
+
+        // Removing `/var/u2.txt` frees 1 VFS data page (`117/118`), allowing `t1` chunk 49 to succeed!
+        assert!(run(&mut sh, "rm /var/u2.txt").starts_with("removed "));
+        assert_eq!(sql(&mut sh, "INSERT INTO t1 VALUES (9999, 'fits-now')"), "INSERT 1\n");
+        st.commit(&mut disk, &mut sh, 1)
+            .expect("commit after rm + INSERT within 118 budget must succeed");
+        assert_eq!(st.paged.allocated_page_count(), 118);
+    }
+
+    #[test]
+    fn state_backend_selection_honors_pin_authenticated_store_probe_faults_and_ambiguity() {
+        use super::{
+            parse_state_backend_pin, select_state_backend, BackendCandidateProbe,
+            StateBackendFault, StateBackendKind, StateBackendPin, AHCI_QUARANTINE_LBA,
+            AHCI_STATE_LAYOUT,
+        };
+
+        // 1. Pin parser: empty and "auto" -> `Auto`, known names -> `Pinned`, mistyped/oversized -> `InvalidPin`.
+        assert_eq!(parse_state_backend_pin(b""), Ok(StateBackendPin::Auto));
+        assert_eq!(parse_state_backend_pin(b"  auto\r\n"), Ok(StateBackendPin::Auto));
+        assert_eq!(
+            parse_state_backend_pin(b"ahci\n"),
+            Ok(StateBackendPin::Pinned(StateBackendKind::Ahci))
+        );
+        assert_eq!(
+            parse_state_backend_pin(b"NVME"),
+            Ok(StateBackendPin::Pinned(StateBackendKind::Nvme))
+        );
+        assert_eq!(
+            parse_state_backend_pin(b"virtio"),
+            Ok(StateBackendPin::Pinned(StateBackendKind::Virtio))
+        );
+        for bad in [&b"bogus"[..], &b"sata"[..], &b"virtio-blk"[..], &[b'a'; 64][..]] {
+            assert_eq!(
+                parse_state_backend_pin(bad),
+                Err(StateBackendFault::InvalidPin),
+                "bad pin {bad:?} must fail closed"
+            );
+        }
+
+        // Prepare one authenticated NVMe disk and one blank AHCI/VirtIO disk.
+        let mut nvme_auth = MemDisk::new(4096);
+        {
+            let (_, mut sh, mut st) = boot(&mut nvme_auth, &keys(), 1);
+            apply_generation(&mut sh, "nvme-real-state");
+            st.commit(&mut nvme_auth, &mut sh, 1).unwrap();
+        }
+        let ahci_blank = MemDisk::new(4096);
+        let virtio_blank = MemDisk::new(4096);
+
+        // 2. `Auto` with blank AHCI + authenticated NVMe + blank VirtIO MUST select NVMe (never `Fresh` on AHCI!).
+        let (chosen, got_a, got_n, got_v) = select_state_backend(
+            StateBackendPin::Auto,
+            &keys().seal,
+            &AHCI_STATE_LAYOUT,
+            AHCI_QUARANTINE_LBA,
+            BackendCandidateProbe::Ready(ahci_blank),
+            BackendCandidateProbe::Ready(nvme_auth),
+            BackendCandidateProbe::Ready(virtio_blank),
+        )
+        .expect("auto selection must pick the authenticated NVMe store");
+        assert_eq!(chosen, StateBackendKind::Nvme);
+        assert!(got_a.is_none() && got_n.is_some() && got_v.is_none());
+        let nvme_auth = got_n.unwrap();
+
+        // 3. `Auto` with AHCI `Failed` + NVMe `Ready` MUST stop with `ProbeFailed` (fall through ONLY on `Absent`!).
+        let err_probe = match select_state_backend::<MemDisk, MemDisk, MemDisk>(
+            StateBackendPin::Auto,
+            &keys().seal,
+            &AHCI_STATE_LAYOUT,
+            AHCI_QUARANTINE_LBA,
+            BackendCandidateProbe::Failed(IoFault::DeviceError),
+            BackendCandidateProbe::Ready(MemDisk::new(4096)),
+            BackendCandidateProbe::Absent,
+        ) {
+            Err(e) => e,
+            Ok((k, _, _, _)) => panic!("expected ProbeFailed, got Ok({k:?})"),
+        };
+        assert_eq!(
+            err_probe,
+            StateBackendFault::ProbeFailed {
+                kind: StateBackendKind::Ahci,
+                fault: IoFault::DeviceError,
+            }
+        );
+
+        // 4. `Auto` with TWO authenticated disks (AHCI + NVMe) refuses with `AmbiguousStores`,
+        //    whereas `Pinned(Virtio)` selects VirtIO deterministically even with AHCI + NVMe attached!
+        let mut ahci_auth = MemDisk::new(4096);
+        {
+            let (_, mut sh, mut st) = boot(&mut ahci_auth, &keys(), 1);
+            apply_generation(&mut sh, "ahci-second-store");
+            st.commit(&mut ahci_auth, &mut sh, 1).unwrap();
+        }
+        let mut nvme_auth_copy = MemDisk::new(4096);
+        for lba in 0..4096u64 {
+            let sec = nvme_auth.peek(lba);
+            nvme_auth_copy.poke(lba, |s| *s = sec);
+        }
+        let err_ambig = match select_state_backend::<MemDisk, MemDisk, MemDisk>(
+            StateBackendPin::Auto,
+            &keys().seal,
+            &AHCI_STATE_LAYOUT,
+            AHCI_QUARANTINE_LBA,
+            BackendCandidateProbe::Ready(ahci_auth),
+            BackendCandidateProbe::Ready(nvme_auth_copy),
+            BackendCandidateProbe::Ready(MemDisk::new(4096)),
+        ) {
+            Err(e) => e,
+            Ok((k, _, _, _)) => panic!("expected AmbiguousStores, got Ok({k:?})"),
+        };
+        assert_eq!(
+            err_ambig,
+            StateBackendFault::AmbiguousStores {
+                first: StateBackendKind::Ahci,
+                second: StateBackendKind::Nvme,
+            }
+        );
+
+        let mut ahci_other = MemDisk::new(4096);
+        {
+            let (_, mut sh, mut st) = boot(&mut ahci_other, &keys(), 1);
+            apply_generation(&mut sh, "ahci-ignored-when-pinned");
+            st.commit(&mut ahci_other, &mut sh, 1).unwrap();
+        }
+        let (pinned_kind, _, _, pinned_v) = select_state_backend(
+            StateBackendPin::Pinned(StateBackendKind::Virtio),
+            &keys().seal,
+            &AHCI_STATE_LAYOUT,
+            AHCI_QUARANTINE_LBA,
+            BackendCandidateProbe::Ready(ahci_other),
+            BackendCandidateProbe::Ready(nvme_auth),
+            BackendCandidateProbe::Ready(MemDisk::new(4096)),
+        )
+        .expect("explicit VirtIO pin must select VirtIO");
+        assert_eq!(pinned_kind, StateBackendKind::Virtio);
+        assert!(pinned_v.is_some());
+
+        // 5. `Auto` with blank AHCI + unauthenticated Cuttle store on VirtIO (sealed under a different key)
+        //    MUST refuse `Fresh` on AHCI with `UnauthenticatedStorePresent`!
+        let mut virtio_foreign = MemDisk::new(4096);
+        let mut foreign_keys = keys();
+        foreign_keys.seal[0] ^= 0xFF;
+        {
+            let (_, mut sh, mut st) = boot(&mut virtio_foreign, &foreign_keys, 1);
+            apply_generation(&mut sh, "foreign-key-store");
+            st.commit(&mut virtio_foreign, &mut sh, 1).unwrap();
+        }
+        let err_unauth = match select_state_backend::<MemDisk, MemDisk, MemDisk>(
+            StateBackendPin::Auto,
+            &keys().seal,
+            &AHCI_STATE_LAYOUT,
+            AHCI_QUARANTINE_LBA,
+            BackendCandidateProbe::Ready(MemDisk::new(4096)),
+            BackendCandidateProbe::Absent,
+            BackendCandidateProbe::Ready(virtio_foreign),
+        ) {
+            Err(e) => e,
+            Ok((k, _, _, _)) => panic!("expected UnauthenticatedStorePresent, got Ok({k:?})"),
+        };
+        assert_eq!(
+            err_unauth,
+            StateBackendFault::UnauthenticatedStorePresent {
+                chosen_blank: StateBackendKind::Ahci,
+                occupied: StateBackendKind::Virtio,
+            }
         );
     }
 }

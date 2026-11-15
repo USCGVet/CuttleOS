@@ -217,6 +217,7 @@ pub(crate) struct AhciHwPort {
     pub(crate) ctba_pa: u64,
     pub(crate) data_pa: u64,
     pub(crate) slot: u8,
+    pub(crate) port_idx: u8,
 }
 
 static AHCI_CACHED_PBASE_VA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -266,8 +267,11 @@ pub(crate) fn try_write_ahci_sector_emergency(lba: u64, data: &[u8; 512]) -> boo
     use target_enterprise::ahci_fis::{build_rw_dma_fis, AhciFisImpl};
 
     const PORT_IS: u64 = 0x10;
+    const PORT_CMD: u64 = 0x18;
     const PORT_TFD: u64 = 0x20;
+    const PORT_SERR: u64 = 0x30;
     const PORT_CI: u64 = 0x38;
+    const PX_CMD_ST_CR: u32 = 1 | (1 << 15);
 
     let pbase_va = AHCI_CACHED_PBASE_VA.load(Ordering::Acquire);
     let clb_pa = AHCI_CACHED_CLB_PA.load(Ordering::Acquire);
@@ -319,6 +323,9 @@ pub(crate) fn try_write_ahci_sector_emergency(lba: u64, data: &[u8; 512]) -> boo
 
     // SAFETY: `pbase_va` was pre-mapped uncached and `clb_pa`, `ctba_pa`, `data_pa` are disjoint regions in mapped DMA RAM.
     unsafe {
+        if (port_mmio_read32(pbase_va, PORT_CMD) & PX_CMD_ST_CR) != PX_CMD_ST_CR {
+            return false;
+        }
         let mut spins = 0u32;
         while port_mmio_read32(pbase_va, PORT_CI) != 0
             || (port_mmio_read32(pbase_va, PORT_TFD) & 0x88) != 0
@@ -357,6 +364,7 @@ pub(crate) fn try_write_ahci_sector_emergency(lba: u64, data: &[u8; 512]) -> boo
             core::ptr::write_volatile(cl.add(i), hbuf[i]);
             i += 1;
         }
+        port_mmio_write32(pbase_va, PORT_SERR, 0xFFFF_FFFF);
         port_mmio_write32(pbase_va, PORT_IS, 0xFFFF_FFFF);
         port_mmio_write32(pbase_va, PORT_CI, slot_bit);
         spins = 0;
@@ -367,20 +375,26 @@ pub(crate) fn try_write_ahci_sector_emergency(lba: u64, data: &[u8; 512]) -> boo
             }
             core::hint::spin_loop();
         }
-        (port_mmio_read32(pbase_va, PORT_TFD) & 0x21) == 0
+        (port_mmio_read32(pbase_va, PORT_TFD) & 0xA9) == 0
+            && port_mmio_read32(pbase_va, PORT_SERR) == 0
     }
 }
 
 impl AhciHwPort {
     /// PCI scan for the AHCI HBA, enable MMIO + bus mastering + PCI MSI (`0x45`),
-    /// start the port command engine on the first port with a device present, and
-    /// optionally emit the boot-time `AHCI_HW probe OK` serial banner.
-    pub(crate) fn try_probe_start_inner(emit_banner: bool) -> Option<Self> {
+    /// start the port command engine on either `fixed_port` (`Some((slot, port_idx))`)
+    /// or the first port with a linked SATA drive (`None`), distinguishing an absent
+    /// controller/drive from a present controller that failed initialization.
+    pub(crate) fn probe_candidate_inner(
+        emit_banner: bool,
+        fixed_port: Option<(u8, u8)>,
+    ) -> target_enterprise::state_store::BackendCandidateProbe<Self> {
         use cuttle_contracts::{
             pci_class, Pci, PciAddress, PciBar, PciConfigBus, PCI_CFG_OFFSET_CLASS_REVISION,
             PCI_CFG_OFFSET_COMMAND_STATUS, PCI_CFG_OFFSET_VENDOR_DEVICE, PCI_COMMAND_BUS_MASTER,
         };
         use target_enterprise::pci::PciImpl;
+        use target_enterprise::state_store::{BackendCandidateProbe, IoFault};
 
         const PCI_COMMAND_MEMORY: u32 = 1 << 1;
         const PROG_IF_AHCI: u8 = 0x01;
@@ -408,15 +422,25 @@ impl AhciHwPort {
         const PX_IE_MASK: u32 = (1 << 0) | (1 << 1) | (1 << 5) | (1 << 30);
 
         if phys_map_offset() == 0 || dma_phys_base() == 0 {
-            return None;
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
         }
         let mut bus = RealPciBus;
         let mut found_slot: Option<u8> = None;
         let mut found_addr: Option<PciAddress> = None;
         let mut abar: u64 = 0;
-        let mut device: u8 = 0;
-        while device < 32 {
-            let addr = PciAddress { bus: 0, device, function: 0 };
+        let mut saw_ahci_pci = false;
+        let (start_dev, end_dev) = match fixed_port {
+            Some((want_slot, _)) if want_slot < 32 => (want_slot, want_slot + 1),
+            Some(_) => return BackendCandidateProbe::Failed(IoFault::DeviceError),
+            None => (0u8, 32u8),
+        };
+        let mut device: u8 = start_dev;
+        while device < end_dev {
+            let addr = PciAddress {
+                bus: 0,
+                device,
+                function: 0,
+            };
             let id = PciConfigBus::read_dword(&mut bus, addr, PCI_CFG_OFFSET_VENDOR_DEVICE);
             if (id & 0xFFFF) == 0xFFFF {
                 device = device.wrapping_add(1);
@@ -430,6 +454,7 @@ impl AhciHwPort {
                 && subclass == pci_class::SUBCLASS_SATA
                 && prog_if == PROG_IF_AHCI
             {
+                saw_ahci_pci = true;
                 let bar = match PciImpl::read_bar(&mut bus, addr, 5) {
                     Ok(PciBar::Mmio32(p)) => p as u64,
                     Ok(PciBar::Mmio64(p)) => p,
@@ -453,8 +478,13 @@ impl AhciHwPort {
             }
             device = device.wrapping_add(1);
         }
-        let slot = found_slot?;
-        let addr = found_addr?;
+        let (Some(slot), Some(addr)) = (found_slot, found_addr) else {
+            return if saw_ahci_pci || fixed_port.is_some() {
+                BackendCandidateProbe::Failed(IoFault::DeviceError)
+            } else {
+                BackendCandidateProbe::Absent
+            };
+        };
         let cmd = PciConfigBus::read_dword(&mut bus, addr, PCI_CFG_OFFSET_COMMAND_STATUS);
         PciConfigBus::write_dword(
             &mut bus,
@@ -486,7 +516,7 @@ impl AhciHwPort {
         // SAFETY: `abar + REG_VS` (+0x10) is a 4-byte-aligned 32-bit register in the uncached-mapped AHCI ABAR MMIO page.
         let vs = unsafe { mmio_read32(abar + REG_VS) };
         if cap == 0 || cap == 0xFFFF_FFFF || pi == 0 || vs == 0 {
-            return None;
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
         }
         if emit_banner {
             let mut line = [0u8; 80];
@@ -515,22 +545,44 @@ impl AhciHwPort {
             serial_write_bytes(&line[..pos]);
         }
 
-        // First implemented port with device present (SSTS.DET == 3).
-        let mut port: Option<u32> = None;
-        let mut p = 0u32;
-        while p < 32 {
-            if (pi & (1u32 << p)) != 0 {
-                let pbase = abar + 0x100 + (p as u64) * 0x80;
-                // SAFETY: `pbase` (`abar + 0x100 + p * 0x80` for `p < 32`) lies within the 4 KiB AHCI ABAR MMIO space and `PORT_SSTS` (+0x28) is 4-byte aligned.
-                let ssts = unsafe { mmio_read32(pbase + PORT_SSTS) };
-                if (ssts & 0xF) == 3 {
-                    port = Some(p);
-                    break;
-                }
+        let port: u32 = if let Some((_, want_p)) = fixed_port {
+            if want_p >= 32 || (pi & (1u32 << (want_p as u32))) == 0 {
+                return BackendCandidateProbe::Failed(IoFault::DeviceError);
             }
-            p += 1;
-        }
-        let port = port?;
+            let pbase_chk = abar + 0x100 + (want_p as u64) * 0x80;
+            // SAFETY: `pbase_chk` lies within the 4 KiB AHCI ABAR MMIO space and `PORT_SSTS` (+0x28) is 4-byte aligned.
+            let ssts = unsafe { mmio_read32(pbase_chk + PORT_SSTS) };
+            if (ssts & 0xF) != 3 {
+                return BackendCandidateProbe::Failed(IoFault::DeviceError);
+            }
+            want_p as u32
+        } else {
+            let mut found_p: Option<u32> = None;
+            let mut saw_partial_phy = false;
+            let mut p = 0u32;
+            while p < 32 {
+                if (pi & (1u32 << p)) != 0 {
+                    let pbase = abar + 0x100 + (p as u64) * 0x80;
+                    // SAFETY: `pbase` (`abar + 0x100 + p * 0x80` for `p < 32`) lies within the 4 KiB AHCI ABAR MMIO space and `PORT_SSTS` (+0x28) is 4-byte aligned.
+                    let ssts = unsafe { mmio_read32(pbase + PORT_SSTS) };
+                    let det = ssts & 0xF;
+                    if det == 3 {
+                        found_p = Some(p);
+                        break;
+                    } else if det != 0 {
+                        saw_partial_phy = true;
+                    }
+                }
+                p += 1;
+            }
+            match found_p {
+                Some(p) => p,
+                None if saw_partial_phy => {
+                    return BackendCandidateProbe::Failed(IoFault::DeviceError);
+                }
+                None => return BackendCandidateProbe::Absent,
+            }
+        };
         let pbase = abar + 0x100 + (port as u64) * 0x80;
         // Pre-map both edge pages of the 0x80-byte port register block once so neither
         // normal DMA polling nor the emergency panic-dump writer ever needs `PT_MOD_LOCK`.
@@ -556,26 +608,25 @@ impl AhciHwPort {
 
         // SAFETY: `clb_pa..clb_pa+AHCI_CTRL_ZERO_BYTES` lies within the audited 48 KiB `AHCI_REGION` mapped via `pa_to_va`, and the port engine is stopped (`ST=0, CR=0`) before reprogramming `CLB`/`FB`.
         unsafe {
-            let base = pa_to_va(clb_pa);
-            let mut i = 0usize;
-            while i < AHCI_CTRL_ZERO_BYTES {
-                core::ptr::write_volatile(base.add(i), 0);
-                i += 1;
-            }
             let mut c = port_mmio_read32(pbase_va, PORT_CMD);
             c &= !(PX_CMD_ST | PX_CMD_FRE);
             port_mmio_write32(pbase_va, PORT_CMD, c);
-            let mut spins = 0u32;
+            let stop_deadline = crate::smp_hw::tsc_deadline_ms(1_000);
             loop {
                 let c2 = port_mmio_read32(pbase_va, PORT_CMD);
                 if c2 & (PX_CMD_CR | PX_CMD_FR) == 0 {
                     break;
                 }
-                spins = spins.wrapping_add(1);
-                if spins > 20_000_000 {
-                    return None;
+                if crate::smp_hw::tsc_past_deadline(stop_deadline) {
+                    return BackendCandidateProbe::Failed(IoFault::Timeout);
                 }
                 core::hint::spin_loop();
+            }
+            let base = pa_to_va(clb_pa);
+            let mut i = 0usize;
+            while i < AHCI_CTRL_ZERO_BYTES {
+                core::ptr::write_volatile(base.add(i), 0);
+                i += 1;
             }
             port_mmio_write32(pbase_va, PORT_CLB, clb_pa as u32);
             port_mmio_write32(pbase_va, PORT_CLBU, (clb_pa >> 32) as u32);
@@ -590,20 +641,29 @@ impl AhciHwPort {
             let mut c = port_mmio_read32(pbase_va, PORT_CMD);
             c |= PX_CMD_FRE;
             port_mmio_write32(pbase_va, PORT_CMD, c);
-            spins = 0;
+            let fr_deadline = crate::smp_hw::tsc_deadline_ms(1_000);
             loop {
                 if port_mmio_read32(pbase_va, PORT_CMD) & PX_CMD_FR != 0 {
                     break;
                 }
-                spins = spins.wrapping_add(1);
-                if spins > 20_000_000 {
-                    return None;
+                if crate::smp_hw::tsc_past_deadline(fr_deadline) {
+                    return BackendCandidateProbe::Failed(IoFault::Timeout);
                 }
                 core::hint::spin_loop();
             }
             c = port_mmio_read32(pbase_va, PORT_CMD);
             c |= PX_CMD_ST;
             port_mmio_write32(pbase_va, PORT_CMD, c);
+            let cr_deadline = crate::smp_hw::tsc_deadline_ms(1_000);
+            loop {
+                if port_mmio_read32(pbase_va, PORT_CMD) & PX_CMD_CR != 0 {
+                    break;
+                }
+                if crate::smp_hw::tsc_past_deadline(cr_deadline) {
+                    return BackendCandidateProbe::Failed(IoFault::Timeout);
+                }
+                core::hint::spin_loop();
+            }
         }
 
         AHCI_CACHED_PBASE_VA.store(pbase_va, core::sync::atomic::Ordering::Release);
@@ -612,7 +672,7 @@ impl AhciHwPort {
         AHCI_CACHED_EMERG_DATA_PA.store(emerg_data_pa, core::sync::atomic::Ordering::Release);
         AHCI_CACHED_EMERG_SLOT.store(emerg_slot, core::sync::atomic::Ordering::Release);
 
-        Some(AhciHwPort {
+        BackendCandidateProbe::Ready(AhciHwPort {
             abar,
             abar_va,
             pbase,
@@ -621,7 +681,18 @@ impl AhciHwPort {
             ctba_pa,
             data_pa,
             slot,
+            port_idx: port as u8,
         })
+    }
+
+    /// PCI scan for the AHCI HBA, enable MMIO + bus mastering + PCI MSI (`0x45`),
+    /// start the port command engine on the first port with a device present, and
+    /// optionally emit the boot-time `AHCI_HW probe OK` serial banner.
+    pub(crate) fn try_probe_start_inner(emit_banner: bool) -> Option<Self> {
+        match Self::probe_candidate_inner(emit_banner, None) {
+            target_enterprise::state_store::BackendCandidateProbe::Ready(port) => Some(port),
+            _ => None,
+        }
     }
 
     /// Issue one H2D command in slot 0 against the running port with `prdtl` PRDT entries
@@ -650,12 +721,18 @@ impl AhciHwPort {
         use target_enterprise::state_store::IoFault;
 
         const PORT_IS: u64 = 0x10;
+        const PORT_CMD: u64 = 0x18;
         const PORT_TFD: u64 = 0x20;
+        const PORT_SSTS: u64 = 0x28;
+        const PORT_SERR: u64 = 0x30;
         const PORT_CI: u64 = 0x38;
+        const PX_CMD_ST_CR: u32 = 1 | (1 << 15);
         /// PxIS: task-file error, host bus fatal, host bus data, interface fatal.
         const PORT_IS_ERRORS: u32 = (1 << 30) | (1 << 29) | (1 << 28) | (1 << 27);
         /// PxTFD status: ERR and DF.
         const TFD_ERR_OR_FAULT: u32 = 0x01 | 0x20;
+        /// PxTFD status: BSY and DRQ.
+        const TFD_BSY_DRQ: u32 = 0x88;
         const MAX_DMA_BYTES: u32 = (AHCI_MAX_BATCH_SECTORS as u32) * 512;
 
         if prdtl > 1 || (prdtl == 1 && (prdt_bytes == 0 || prdt_bytes > MAX_DMA_BYTES)) {
@@ -693,15 +770,21 @@ impl AhciHwPort {
         crate::serial_rx_pump();
         // SAFETY: `pbase_va` is pre-mapped uncached, `ctba_pa` and `clb_pa` are disjoint aligned subregions of the reserved DMA window mapped via `pa_to_va`, and slot 0 is idle (`PxCI & 1 == 0`) while we populate descriptors.
         unsafe {
+            let cmd_reg = port_mmio_read32(self.pbase_va, PORT_CMD);
+            let ssts_reg = port_mmio_read32(self.pbase_va, PORT_SSTS);
+            if (cmd_reg & PX_CMD_ST_CR) != PX_CMD_ST_CR || (ssts_reg & 0xF) != 3 {
+                return Err(IoFault::DeviceError);
+            }
+            let idle_deadline = crate::smp_hw::tsc_deadline_ms(2_000);
             let mut spins = 0u32;
             loop {
-                let busy = port_mmio_read32(self.pbase_va, PORT_TFD) & 0x88 != 0;
+                let busy = port_mmio_read32(self.pbase_va, PORT_TFD) & TFD_BSY_DRQ != 0;
                 let in_flight = port_mmio_read32(self.pbase_va, PORT_CI) & 1 != 0;
                 if !busy && !in_flight {
                     break;
                 }
                 spins = spins.wrapping_add(1);
-                if spins > 20_000_000 {
+                if (spins & 0x3F) == 0 && crate::smp_hw::tsc_past_deadline(idle_deadline) {
                     return Err(IoFault::Timeout);
                 }
                 core::hint::spin_loop();
@@ -730,15 +813,16 @@ impl AhciHwPort {
                 core::ptr::write_volatile(cl.add(i), hbuf[i]);
                 i += 1;
             }
+            port_mmio_write32(self.pbase_va, PORT_SERR, 0xFFFF_FFFF);
             port_mmio_write32(self.pbase_va, PORT_IS, 0xFFFF_FFFF);
             port_mmio_write32(self.abar_va, 0x08, 0xFFFF_FFFF);
             port_mmio_write32(self.pbase_va, PORT_CI, 1);
-            let io_kind = if prdtl == 0 {
-                target_enterprise::async_io::AsyncIoKind::BlockFlush
+            let (io_kind, timeout_ms) = if prdtl == 0 {
+                (target_enterprise::async_io::AsyncIoKind::BlockFlush, 5_000)
             } else if write {
-                target_enterprise::async_io::AsyncIoKind::BlockWrite
+                (target_enterprise::async_io::AsyncIoKind::BlockWrite, 2_000)
             } else {
-                target_enterprise::async_io::AsyncIoKind::BlockRead
+                (target_enterprise::async_io::AsyncIoKind::BlockRead, 2_000)
             };
             let mut dev_err = false;
             let pbase_va = self.pbase_va;
@@ -746,17 +830,32 @@ impl AhciHwPort {
                 io_kind,
                 0,
                 false,
-                40_000_000,
+                timeout_ms,
                 || {
-                    if port_mmio_read32(pbase_va, PORT_IS) & PORT_IS_ERRORS != 0 {
+                    if port_mmio_read32(pbase_va, PORT_IS) & PORT_IS_ERRORS != 0
+                        || port_mmio_read32(pbase_va, PORT_SERR) != 0
+                        || (port_mmio_read32(pbase_va, PORT_CMD) & 1) == 0
+                    {
                         dev_err = true;
                         return Err(());
                     }
-                    Ok(port_mmio_read32(pbase_va, PORT_CI) & 1 == 0)
+                    let ci_done = (port_mmio_read32(pbase_va, PORT_CI) & 1) == 0;
+                    if !ci_done {
+                        return Ok(false);
+                    }
+                    let tfd_now = port_mmio_read32(pbase_va, PORT_TFD);
+                    if (tfd_now & TFD_ERR_OR_FAULT) != 0 {
+                        dev_err = true;
+                        return Err(());
+                    }
+                    Ok((tfd_now & TFD_BSY_DRQ) == 0)
                 },
             );
-            // AHCI 1.3.1 §10.7.2: clear PxIS then HBA.IS to re-arm edge-triggered MSI.
+            // AHCI 1.3.1 §10.7.2: inspect PxIS, PxSERR, and PxTFD, then clear to re-arm MSI.
             let final_is = port_mmio_read32(self.pbase_va, PORT_IS);
+            let final_serr = port_mmio_read32(self.pbase_va, PORT_SERR);
+            let final_tfd = port_mmio_read32(self.pbase_va, PORT_TFD);
+            port_mmio_write32(self.pbase_va, PORT_SERR, 0xFFFF_FFFF);
             port_mmio_write32(self.pbase_va, PORT_IS, 0xFFFF_FFFF);
             port_mmio_write32(self.abar_va, 0x08, 0xFFFF_FFFF);
             if wait_res.is_err() {
@@ -766,8 +865,9 @@ impl AhciHwPort {
                     IoFault::Timeout
                 });
             }
-            if port_mmio_read32(self.pbase_va, PORT_TFD) & TFD_ERR_OR_FAULT != 0
-                || final_is & PORT_IS_ERRORS != 0
+            if (final_tfd & (TFD_BSY_DRQ | TFD_ERR_OR_FAULT)) != 0
+                || (final_is & PORT_IS_ERRORS) != 0
+                || final_serr != 0
             {
                 return Err(IoFault::DeviceError);
             }
@@ -995,25 +1095,39 @@ impl AhciHwPort {
         self.try_read_sector_slices(lba, lba48, &mut [core::slice::from_mut(out)])
     }
 
-    /// ATA IDENTIFY DEVICE: addressable sector count and 48-bit LBA capability.
-    pub(crate) fn try_identify_geometry(
+    /// ATA IDENTIFY DEVICE: addressable sector count, 48-bit LBA capability, and
+    /// 20-byte ATA serial number (`words 10..=19`) used to verify port identity on restart.
+    pub(crate) fn try_identify_geometry_and_serial(
         &self,
-    ) -> Result<(u64, bool), target_enterprise::state_store::IoFault> {
+    ) -> Result<(u64, bool, [u8; 20]), target_enterprise::state_store::IoFault> {
         use cuttle_contracts::AhciFis;
-        use target_enterprise::ahci_fis::{parse_identify_geometry, AhciFisImpl};
+        use target_enterprise::ahci_fis::{
+            parse_identify_geometry, parse_identify_serial, AhciFisImpl,
+        };
         use target_enterprise::state_store::IoFault;
         let params = AhciFisImpl::identify(0).map_err(|_| IoFault::OutOfRange)?;
         self.fill_data(&[0u8; 512]);
-        self.try_issue_slot0_bytes(&params, false, 1, 512, None)?;
+        self.try_issue_slot0_bytes(&params, false, 1, 512, Some(512))?;
         let data = self.drain_data();
         let (sectors, lba48) = parse_identify_geometry(&data).ok_or(IoFault::DeviceError)?;
+        let serial = parse_identify_serial(&data).ok_or(IoFault::DeviceError)?;
         AHCI_CACHED_LBA48.store(lba48, core::sync::atomic::Ordering::Release);
-        Ok((sectors, lba48))
+        Ok((sectors, lba48, serial))
     }
 }
 
-/// The AHCI port, sector capacity, and LBA48 capability the durable state store runs on, probed once.
-static AHCI_STATE_DISK: spin::Mutex<Option<(AhciHwPort, u64, bool)>> = spin::Mutex::new(None);
+#[derive(Clone, Copy)]
+struct AhciCachedState {
+    port: AhciHwPort,
+    sectors: u64,
+    lba48: bool,
+    serial: [u8; 20],
+    faulted: bool,
+}
+
+/// The AHCI port, sector capacity, LBA48 capability, and ATA serial number the durable
+/// state store runs on, probed once and pinned to that exact HBA slot + port + drive serial.
+static AHCI_STATE_DISK: spin::Mutex<Option<AhciCachedState>> = spin::Mutex::new(None);
 
 /// The AHCI disk as a fallible multi-sector DMA block device for
 /// [`target_enterprise::state_store`].
@@ -1021,38 +1135,112 @@ pub(crate) struct AhciDisk {
     port: AhciHwPort,
     sectors: u64,
     lba48: bool,
+    serial: [u8; 20],
+    faulted: bool,
 }
 
 impl AhciDisk {
-    /// The state disk. The first call probes the HBA and reads the device
-    /// geometry; later calls reuse it, so commits never re-probe the port.
-    pub(crate) fn state_disk() -> Result<Self, target_enterprise::state_store::IoFault> {
-        use target_enterprise::state_store::IoFault;
+    /// Probe the AHCI controller for backend selection, distinguishing an absent HBA/port
+    /// from a present controller/port that failed initialization or `IDENTIFY DEVICE`.
+    pub(crate) fn probe_candidate() -> target_enterprise::state_store::BackendCandidateProbe<Self> {
+        use target_enterprise::state_store::{BackendCandidateProbe, IoFault};
         let mut cached = AHCI_STATE_DISK.lock();
-        if let Some((port, sectors, lba48)) = *cached {
-            return Ok(AhciDisk {
-                port,
-                sectors,
-                lba48,
+        if let Some(st) = *cached {
+            if st.faulted {
+                return BackendCandidateProbe::Failed(IoFault::DeviceError);
+            }
+            return BackendCandidateProbe::Ready(AhciDisk {
+                port: st.port,
+                sectors: st.sectors,
+                lba48: st.lba48,
+                serial: st.serial,
+                faulted: false,
             });
         }
-        let port = AhciHwPort::try_probe_start_inner(false).ok_or(IoFault::DeviceError)?;
-        let (sectors, lba48) = port.try_identify_geometry()?;
-        *cached = Some((port, sectors, lba48));
-        Ok(AhciDisk {
+        let port = match AhciHwPort::probe_candidate_inner(false, None) {
+            BackendCandidateProbe::Absent => return BackendCandidateProbe::Absent,
+            BackendCandidateProbe::Failed(f) => return BackendCandidateProbe::Failed(f),
+            BackendCandidateProbe::Ready(p) => p,
+        };
+        let (sectors, lba48, serial) = match port.try_identify_geometry_and_serial() {
+            Ok(v) => v,
+            Err(f) => return BackendCandidateProbe::Failed(f),
+        };
+        *cached = Some(AhciCachedState {
             port,
             sectors,
             lba48,
+            serial,
+            faulted: false,
+        });
+        BackendCandidateProbe::Ready(AhciDisk {
+            port,
+            sectors,
+            lba48,
+            serial,
+            faulted: false,
         })
     }
 
+    /// The state disk. The first call probes the HBA and reads the device
+    /// geometry + serial; later calls reuse that pinned port, refusing if a
+    /// previous fault failed port recovery or drive-serial verification.
+    pub(crate) fn state_disk() -> Result<Self, target_enterprise::state_store::IoFault> {
+        use target_enterprise::state_store::{BackendCandidateProbe, IoFault};
+        match Self::probe_candidate() {
+            BackendCandidateProbe::Ready(d) => Ok(d),
+            BackendCandidateProbe::Failed(f) => Err(f),
+            BackendCandidateProbe::Absent => Err(IoFault::DeviceError),
+        }
+    }
+
     /// After a failed command the port holds error state and will not run
-    /// another. Restart it so the caller's fallback (the other slot, a
-    /// repair write) has a working device.
+    /// another. Restart ONLY the originally selected `(slot, port_idx)` and verify
+    /// via `IDENTIFY DEVICE` that the exact same drive (`serial`, `sectors`, `lba48`)
+    /// answered; if restart or identity verification fails, latch `faulted = true`
+    /// so subsequent commands fail closed instead of jumping to another SATA port.
     fn restart_port_after_fault(&mut self) {
-        if let Some(port) = AhciHwPort::try_probe_start_inner(false) {
-            self.port = port;
-            *AHCI_STATE_DISK.lock() = Some((self.port, self.sectors, self.lba48));
+        use target_enterprise::state_store::BackendCandidateProbe;
+        let recovered = match AhciHwPort::probe_candidate_inner(
+            false,
+            Some((self.port.slot, self.port.port_idx)),
+        ) {
+            BackendCandidateProbe::Ready(new_port) => {
+                match new_port.try_identify_geometry_and_serial() {
+                    Ok((new_sectors, new_lba48, new_serial))
+                        if new_sectors == self.sectors
+                            && new_lba48 == self.lba48
+                            && new_serial == self.serial =>
+                    {
+                        Some(new_port)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match recovered {
+            Some(new_port) => {
+                self.port = new_port;
+                self.faulted = false;
+                *AHCI_STATE_DISK.lock() = Some(AhciCachedState {
+                    port: self.port,
+                    sectors: self.sectors,
+                    lba48: self.lba48,
+                    serial: self.serial,
+                    faulted: false,
+                });
+            }
+            None => {
+                self.faulted = true;
+                *AHCI_STATE_DISK.lock() = Some(AhciCachedState {
+                    port: self.port,
+                    sectors: self.sectors,
+                    lba48: self.lba48,
+                    serial: self.serial,
+                    faulted: true,
+                });
+            }
         }
     }
 
@@ -1072,6 +1260,9 @@ impl AhciDisk {
         count: usize,
     ) -> Result<(), target_enterprise::state_store::IoFault> {
         use target_enterprise::state_store::IoFault;
+        if self.faulted {
+            return Err(IoFault::DeviceError);
+        }
         let end = lba.checked_add(count as u64).ok_or(IoFault::OutOfRange)?;
         if end > target_enterprise::state_store::SectorIo::capacity_sectors(self) {
             return Err(IoFault::OutOfRange);
@@ -1166,6 +1357,9 @@ impl target_enterprise::state_store::SectorIo for AhciDisk {
     }
 
     fn flush(&mut self) -> Result<(), target_enterprise::state_store::IoFault> {
+        if self.faulted {
+            return Err(target_enterprise::state_store::IoFault::DeviceError);
+        }
         let r = self.port.try_flush_cache(self.lba48);
         self.checked(r)
     }
@@ -1280,7 +1474,8 @@ pub(crate) fn banner_ahci_hw() {
 // Production NVMe + VirtIO-blk + Unified `StorageDisk` `SectorIo` Backends
 // ---------------------------------------------------------------------------
 
-static NVME_EMERG_BAR0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static NVME_EMERG_BAR0_VA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static NVME_EMERG_DBL_VA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static NVME_EMERG_IOSQ_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static NVME_EMERG_IOCQ_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static NVME_EMERG_DATA_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1290,27 +1485,38 @@ static NVME_EMERG_CQ_HEAD: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 static NVME_EMERG_PHASE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 static NVME_EMERG_CID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x8000);
 
-/// Lock-free emergency 512-byte sector write over NVMe I/O Queue 1 for `#[panic_handler]`
-/// when running on an AHCI-less NVMe appliance.
+/// Lock-free emergency 512-byte sector write over dedicated NVMe I/O Queue 2 (`PC=1, IEN=0`)
+/// and dedicated `NVME_EMERG_DATA_PA` buffer for `#[panic_handler]`, using pre-mapped MMIO
+/// virtual addresses so it never acquires `PT_MOD_LOCK` or touches mainline Queue 1's payload.
 pub(crate) fn try_write_nvme_sector_emergency(lba: u64, data: &[u8; 512]) -> bool {
-    use core::sync::atomic::Ordering;
+    use core::sync::atomic::{fence, Ordering};
     use target_enterprise::nvme::{
         SubmissionQueueEntry, CSTS_CFS, CSTS_RDY, IO_QUEUE_ENTRIES, REG_CSTS,
     };
 
-    let bar0 = NVME_EMERG_BAR0.load(Ordering::Acquire);
+    let bar0_va = NVME_EMERG_BAR0_VA.load(Ordering::Acquire);
+    let dbl_va = NVME_EMERG_DBL_VA.load(Ordering::Acquire);
     let iosq_pa = NVME_EMERG_IOSQ_PA.load(Ordering::Acquire);
     let iocq_pa = NVME_EMERG_IOCQ_PA.load(Ordering::Acquire);
     let data_pa = NVME_EMERG_DATA_PA.load(Ordering::Acquire);
     let stride = NVME_EMERG_STRIDE.load(Ordering::Acquire);
-    if bar0 == 0 || iosq_pa == 0 || iocq_pa == 0 || data_pa == 0 || stride == 0 || phys_map_offset() == 0 {
+    if bar0_va == 0
+        || dbl_va == 0
+        || iosq_pa == 0
+        || iocq_pa == 0
+        || data_pa == 0
+        || stride == 0
+        || phys_map_offset() == 0
+    {
         return false;
     }
 
-    // SAFETY: `bar0` and `bar0 + 0x1000` were mapped uncached during `NvmeHwState` initialization,
-    // and `iosq_pa`, `iocq_pa`, and `data_pa` are dedicated 4 KiB physical DMA pages.
+    // SAFETY: `bar0_va` and `dbl_va` were pre-mapped uncached during `NvmeHwState` initialization,
+    // and `iosq_pa`, `iocq_pa`, and `data_pa` are dedicated 4 KiB physical DMA pages for Queue 2.
     unsafe {
-        let csts = mmio_read32(bar0 + REG_CSTS as u64);
+        fence(Ordering::SeqCst);
+        let csts = core::ptr::read_volatile((bar0_va + REG_CSTS as u64) as *const u32);
+        fence(Ordering::SeqCst);
         if (csts & CSTS_CFS) != 0 || (csts & CSTS_RDY) == 0 {
             return false;
         }
@@ -1334,13 +1540,15 @@ pub(crate) fn try_write_nvme_sector_emergency(lba: u64, data: &[u8; 512]) -> boo
             pa_to_va(iosq_pa).add(slot * 64).cast::<SubmissionQueueEntry>(),
             sqe,
         );
-        core::sync::atomic::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         sq_tail = sq_tail.wrapping_add(1);
         if sq_tail >= IO_QUEUE_ENTRIES {
             sq_tail = 0;
         }
         NVME_EMERG_SQ_TAIL.store(sq_tail as u64, Ordering::Release);
-        mmio_write32(bar0 + 0x1000 + 2 * stride, sq_tail as u32);
+        // SQ2 Tail Doorbell = `BAR0 + 0x1000 + 4 * stride`.
+        core::ptr::write_volatile((dbl_va + 4 * stride) as *mut u32, sq_tail as u32);
+        fence(Ordering::SeqCst);
 
         let mut spins = 0u32;
         while spins < 5_000_000 {
@@ -1358,7 +1566,9 @@ pub(crate) fn try_write_nvme_sector_emergency(lba: u64, data: &[u8; 512]) -> boo
                 }
                 NVME_EMERG_CQ_HEAD.store(cq_head as u64, Ordering::Release);
                 NVME_EMERG_PHASE.store(phase, Ordering::Release);
-                mmio_write32(bar0 + 0x1000 + 3 * stride, cq_head as u32);
+                // CQ2 Head Doorbell = `BAR0 + 0x1000 + 5 * stride`.
+                core::ptr::write_volatile((dbl_va + 5 * stride) as *mut u32, cq_head as u32);
+                fence(Ordering::SeqCst);
                 if got_cid == cid {
                     return status == 0;
                 }
@@ -1373,12 +1583,17 @@ pub(crate) fn try_write_nvme_sector_emergency(lba: u64, data: &[u8; 512]) -> boo
 struct NvmeHwState {
     addr: cuttle_contracts::PciAddress,
     bar0: u64,
+    bar0_va: u64,
+    dbl_va: u64,
     doorbell_stride: u64,
     asq_pa: u64,
     acq_pa: u64,
     iosq_pa: u64,
     iocq_pa: u64,
     data_pa: u64,
+    emerg_iosq_pa: u64,
+    emerg_iocq_pa: u64,
+    emerg_data_pa: u64,
     admin_sq_tail: u16,
     admin_cq_head: u16,
     admin_phase: bool,
@@ -1392,34 +1607,23 @@ struct NvmeHwState {
 static NVME_STATE_DISK: spin::Mutex<Option<NvmeHwState>> = spin::Mutex::new(None);
 
 impl NvmeHwState {
-    fn sync_emerg_atomics(&self) {
-        use core::sync::atomic::Ordering;
-        NVME_EMERG_BAR0.store(self.bar0, Ordering::Release);
-        NVME_EMERG_IOSQ_PA.store(self.iosq_pa, Ordering::Release);
-        NVME_EMERG_IOCQ_PA.store(self.iocq_pa, Ordering::Release);
-        NVME_EMERG_DATA_PA.store(self.data_pa, Ordering::Release);
-        NVME_EMERG_STRIDE.store(self.doorbell_stride, Ordering::Release);
-        NVME_EMERG_SQ_TAIL.store(self.io_sq_tail as u64, Ordering::Release);
-        NVME_EMERG_CQ_HEAD.store(self.io_cq_head as u64, Ordering::Release);
-        NVME_EMERG_PHASE.store(self.io_phase, Ordering::Release);
-    }
-
-    fn probe_and_init() -> Result<Self, target_enterprise::state_store::IoFault> {
+    fn probe_candidate() -> target_enterprise::state_store::BackendCandidateProbe<Self> {
         use cuttle_contracts::{
             Pci, PciAddress, PciBar, PciConfigBus, PCI_CFG_OFFSET_CLASS_REVISION,
             PCI_CFG_OFFSET_VENDOR_DEVICE,
         };
         use target_enterprise::nvme::{REG_CAP, REG_VS};
         use target_enterprise::pci::PciImpl;
-        use target_enterprise::state_store::IoFault;
+        use target_enterprise::state_store::{BackendCandidateProbe, IoFault};
 
         if phys_map_offset() == 0 {
-            return Err(IoFault::DeviceError);
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
         }
 
         let mut bus = RealPciBus;
         let mut found_addr: Option<PciAddress> = None;
         let mut bar0: u64 = 0;
+        let mut saw_nvme_pci = false;
 
         let mut device: u8 = 0;
         while device < 32 {
@@ -1439,6 +1643,7 @@ impl NvmeHwState {
                 let is_nvme = (class_code == 0x01 && subclass == 0x08 && prog_if == 0x02)
                     || (vendor == 0x8086 && dev_id == 0x5845);
                 if is_nvme {
+                    saw_nvme_pci = true;
                     let bar = match PciImpl::read_bar(&mut bus, addr, 0) {
                         Ok(PciBar::Mmio32(p)) => p as u64,
                         Ok(PciBar::Mmio64(p)) => p,
@@ -1454,12 +1659,19 @@ impl NvmeHwState {
             device = device.wrapping_add(1);
         }
 
-        let addr = found_addr.ok_or(IoFault::DeviceError)?;
+        let Some(addr) = found_addr else {
+            return if saw_nvme_pci {
+                BackendCandidateProbe::Failed(IoFault::DeviceError)
+            } else {
+                BackendCandidateProbe::Absent
+            };
+        };
         // SAFETY: `bar0` and `bar0 + 0x1000` are the PCI-discovered NVMe MMIO register and doorbell pages.
-        unsafe {
-            let _ = ensure_mmio_page(bar0);
-            let _ = ensure_mmio_page(bar0 + 0x1000);
-        }
+        let (bar0_va, dbl_va) = unsafe {
+            let b_page = ensure_mmio_page(bar0) as u64;
+            let d_page = ensure_mmio_page(bar0 + 0x1000) as u64;
+            (b_page + (bar0 & 0xFFF), d_page + ((bar0 + 0x1000) & 0xFFF))
+        };
         // SAFETY: `bar0` is mapped uncached above.
         let (cap, vs) = unsafe {
             (
@@ -1468,26 +1680,55 @@ impl NvmeHwState {
             )
         };
         if cap == 0 || cap == u64::MAX || vs == 0 || vs == 0xFFFF_FFFF {
-            return Err(IoFault::DeviceError);
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
         }
         let dstrd = ((cap >> 32) & 0xF) as u32;
         let doorbell_stride = 4u64 << dstrd;
+        // Ensure Queue 2 doorbells (`+ 5 * stride`) are mapped even if `bar0` was unaligned.
+        // SAFETY: `bar0 + 0x1000 + 5 * doorbell_stride` lies within the NVMe controller doorbell aperture.
+        unsafe {
+            let _ = ensure_mmio_page(bar0 + 0x1000 + 5 * doorbell_stride);
+        }
 
-        let asq_pa = crate::alloc_phys_contiguous_zeroed(1, 1).ok_or(IoFault::DeviceError)?;
-        let acq_pa = crate::alloc_phys_contiguous_zeroed(1, 1).ok_or(IoFault::DeviceError)?;
-        let iosq_pa = crate::alloc_phys_contiguous_zeroed(1, 1).ok_or(IoFault::DeviceError)?;
-        let iocq_pa = crate::alloc_phys_contiguous_zeroed(1, 1).ok_or(IoFault::DeviceError)?;
-        let data_pa = crate::alloc_phys_contiguous_zeroed(1, 1).ok_or(IoFault::DeviceError)?;
+        let Some(asq_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
+        };
+        let Some(acq_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
+        };
+        let Some(iosq_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
+        };
+        let Some(iocq_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
+        };
+        let Some(data_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
+        };
+        let Some(emerg_iosq_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
+        };
+        let Some(emerg_iocq_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
+        };
+        let Some(emerg_data_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
+        };
 
         let mut st = Self {
             addr,
             bar0,
+            bar0_va,
+            dbl_va,
             doorbell_stride,
             asq_pa,
             acq_pa,
             iosq_pa,
             iocq_pa,
             data_pa,
+            emerg_iosq_pa,
+            emerg_iocq_pa,
+            emerg_data_pa,
             admin_sq_tail: 0,
             admin_cq_head: 0,
             admin_phase: true,
@@ -1497,8 +1738,10 @@ impl NvmeHwState {
             next_cid: 1,
             sectors: 0,
         };
-        st.reinit_controller()?;
-        Ok(st)
+        match st.reinit_controller() {
+            Ok(()) => BackendCandidateProbe::Ready(st),
+            Err(f) => BackendCandidateProbe::Failed(f),
+        }
     }
 
     fn submit_admin(
@@ -1535,7 +1778,7 @@ impl NvmeHwState {
             AsyncIoKind::BlockRead,
             slot as u16,
             false,
-            50_000_000,
+            2_000,
             || {
                 let cq_slot = (cq_head as usize) % (ADMIN_QUEUE_ENTRIES as usize);
                 // SAFETY: `acq_pa` is a 4 KiB DMA page (`cq_slot < 64`) and `cq0_dbl` is mapped uncached.
@@ -1596,9 +1839,10 @@ impl NvmeHwState {
 
         // SAFETY: `self.bar0` is mapped uncached and queue pages are dedicated 4 KiB DMA frames.
         unsafe {
+            NVME_EMERG_BAR0_VA.store(0, core::sync::atomic::Ordering::Release);
             let cc = mmio_read32(self.bar0 + REG_CC as u64);
             mmio_write32(self.bar0 + REG_CC as u64, cc & !CC_EN);
-            let mut spins = 0u32;
+            let off_deadline = crate::smp_hw::tsc_deadline_ms(2_000);
             loop {
                 let csts = mmio_read32(self.bar0 + REG_CSTS as u64);
                 if (csts & CSTS_CFS) != 0 {
@@ -1607,8 +1851,7 @@ impl NvmeHwState {
                 if (csts & CSTS_RDY) == 0 {
                     break;
                 }
-                spins = spins.wrapping_add(1);
-                if spins > 50_000_000 {
+                if crate::smp_hw::tsc_past_deadline(off_deadline) {
                     return Err(IoFault::Timeout);
                 }
                 core::hint::spin_loop();
@@ -1619,6 +1862,9 @@ impl NvmeHwState {
             core::ptr::write_bytes(pa_to_va(self.iosq_pa), 0, 4096);
             core::ptr::write_bytes(pa_to_va(self.iocq_pa), 0, 4096);
             core::ptr::write_bytes(pa_to_va(self.data_pa), 0, 4096);
+            core::ptr::write_bytes(pa_to_va(self.emerg_iosq_pa), 0, 4096);
+            core::ptr::write_bytes(pa_to_va(self.emerg_iocq_pa), 0, 4096);
+            core::ptr::write_bytes(pa_to_va(self.emerg_data_pa), 0, 4096);
 
             self.admin_sq_tail = 0;
             self.admin_cq_head = 0;
@@ -1634,7 +1880,7 @@ impl NvmeHwState {
             mmio_write64(self.bar0 + REG_ACQ as u64, self.acq_pa);
             let cc_new = (4u32 << 20) | (6u32 << 16) | CC_EN;
             mmio_write32(self.bar0 + REG_CC as u64, cc_new);
-            spins = 0;
+            let rdy_deadline = crate::smp_hw::tsc_deadline_ms(2_000);
             loop {
                 let csts = mmio_read32(self.bar0 + REG_CSTS as u64);
                 if (csts & CSTS_CFS) != 0 {
@@ -1643,8 +1889,7 @@ impl NvmeHwState {
                 if (csts & CSTS_RDY) != 0 {
                     break;
                 }
-                spins = spins.wrapping_add(1);
-                if spins > 50_000_000 {
+                if crate::smp_hw::tsc_past_deadline(rdy_deadline) {
                     return Err(IoFault::Timeout);
                 }
                 core::hint::spin_loop();
@@ -1715,7 +1960,42 @@ impl NvmeHwState {
             self.submit_admin(&sqe)?;
         }
 
-        self.sync_emerg_atomics();
+        // Create dedicated emergency I/O Completion Queue 2 (`PC = 1, IEN = 0`) and
+        // Submission Queue 2 (`CQID = 2 | PC = 1`) so `try_write_nvme_sector_emergency`
+        // never shares Queue 1 or `self.data_pa` with an in-flight mainline NVMe command.
+        let emerg_q2_ok = {
+            let cid_cq2 = self.alloc_cid();
+            let mut cq2 = SubmissionQueueEntry::EMPTY;
+            cq2.cdw0 = SubmissionQueueEntry::cdw0(0x05, cid_cq2);
+            cq2.prp1 = self.emerg_iocq_pa;
+            cq2.cdw10 = ((IO_QUEUE_ENTRIES as u32 - 1) << 16) | 2;
+            cq2.cdw11 = 0x01; // PC = 1, IEN = 0 (polled emergency queue)
+            if self.submit_admin(&cq2).is_ok() {
+                let cid_sq2 = self.alloc_cid();
+                let mut sq2 = SubmissionQueueEntry::EMPTY;
+                sq2.cdw0 = SubmissionQueueEntry::cdw0(0x01, cid_sq2);
+                sq2.prp1 = self.emerg_iosq_pa;
+                sq2.cdw10 = ((IO_QUEUE_ENTRIES as u32 - 1) << 16) | 2;
+                sq2.cdw11 = (2 << 16) | 0x01; // CQID = 2 | PC = 1
+                self.submit_admin(&sq2).is_ok()
+            } else {
+                false
+            }
+        };
+        if emerg_q2_ok {
+            use core::sync::atomic::Ordering;
+            NVME_EMERG_IOSQ_PA.store(self.emerg_iosq_pa, Ordering::Release);
+            NVME_EMERG_IOCQ_PA.store(self.emerg_iocq_pa, Ordering::Release);
+            NVME_EMERG_DATA_PA.store(self.emerg_data_pa, Ordering::Release);
+            NVME_EMERG_STRIDE.store(self.doorbell_stride, Ordering::Release);
+            NVME_EMERG_SQ_TAIL.store(0, Ordering::Release);
+            NVME_EMERG_CQ_HEAD.store(0, Ordering::Release);
+            NVME_EMERG_PHASE.store(true, Ordering::Release);
+            NVME_EMERG_DBL_VA.store(self.dbl_va, Ordering::Release);
+            NVME_EMERG_BAR0_VA.store(self.bar0_va, Ordering::Release);
+        } else {
+            NVME_EMERG_BAR0_VA.store(0, core::sync::atomic::Ordering::Release);
+        }
         Ok(())
     }
 
@@ -1805,16 +2085,16 @@ impl NvmeHwState {
         let mut phase = self.io_phase;
         let mut cmd_err = false;
 
-        let io_kind = match opcode {
-            0x01 => AsyncIoKind::BlockWrite,
-            0x02 => AsyncIoKind::BlockRead,
-            _ => AsyncIoKind::BlockFlush,
+        let (io_kind, timeout_ms) = match opcode {
+            0x01 => (AsyncIoKind::BlockWrite, 2_000),
+            0x02 => (AsyncIoKind::BlockRead, 2_000),
+            _ => (AsyncIoKind::BlockFlush, 5_000),
         };
         let wait_res = crate::smp_hw::wait_for_dma_completion(
             io_kind,
             slot as u16,
             false,
-            50_000_000,
+            timeout_ms,
             || {
                 let cq_slot = (cq_head as usize) % (IO_QUEUE_ENTRIES as usize);
                 // SAFETY: `iocq_pa` is a 4 KiB DMA page (`cq_slot < 64`) and `cq1_dbl` is mapped uncached.
@@ -1844,7 +2124,6 @@ impl NvmeHwState {
 
         self.io_cq_head = cq_head;
         self.io_phase = phase;
-        self.sync_emerg_atomics();
 
         match wait_res {
             Ok(_) => Ok(()),
@@ -1866,16 +2145,33 @@ pub(crate) struct NvmeDisk {
 }
 
 impl NvmeDisk {
-    pub(crate) fn state_disk() -> Result<Self, target_enterprise::state_store::IoFault> {
+    pub(crate) fn probe_candidate() -> target_enterprise::state_store::BackendCandidateProbe<Self> {
+        use target_enterprise::state_store::BackendCandidateProbe;
         let mut guard = NVME_STATE_DISK.lock();
         if let Some(st) = guard.as_mut() {
-            st.ensure_ready()?;
-            return Ok(NvmeDisk { sectors: st.sectors });
+            return match st.ensure_ready() {
+                Ok(()) => BackendCandidateProbe::Ready(NvmeDisk { sectors: st.sectors }),
+                Err(f) => BackendCandidateProbe::Failed(f),
+            };
         }
-        let st = NvmeHwState::probe_and_init()?;
-        let sectors = st.sectors;
-        *guard = Some(st);
-        Ok(NvmeDisk { sectors })
+        match NvmeHwState::probe_candidate() {
+            BackendCandidateProbe::Absent => BackendCandidateProbe::Absent,
+            BackendCandidateProbe::Failed(f) => BackendCandidateProbe::Failed(f),
+            BackendCandidateProbe::Ready(st) => {
+                let sectors = st.sectors;
+                *guard = Some(st);
+                BackendCandidateProbe::Ready(NvmeDisk { sectors })
+            }
+        }
+    }
+
+    pub(crate) fn state_disk() -> Result<Self, target_enterprise::state_store::IoFault> {
+        use target_enterprise::state_store::{BackendCandidateProbe, IoFault};
+        match Self::probe_candidate() {
+            BackendCandidateProbe::Ready(d) => Ok(d),
+            BackendCandidateProbe::Failed(f) => Err(f),
+            BackendCandidateProbe::Absent => Err(IoFault::DeviceError),
+        }
     }
 
     fn check_range(
@@ -2061,23 +2357,24 @@ struct VirtioBlkHwState {
 static VIRTIO_BLK_STATE_DISK: spin::Mutex<Option<VirtioBlkHwState>> = spin::Mutex::new(None);
 
 impl VirtioBlkHwState {
-    fn probe_and_init() -> Result<Self, target_enterprise::state_store::IoFault> {
+    fn probe_candidate() -> target_enterprise::state_store::BackendCandidateProbe<Self> {
         use cuttle_contracts::{
             Pci, PciAddress, PciBar, PciConfigBus, PCI_CFG_OFFSET_COMMAND_STATUS,
             PCI_CFG_OFFSET_VENDOR_DEVICE, PCI_COMMAND_BUS_MASTER,
         };
         use target_enterprise::pci::PciImpl;
-        use target_enterprise::state_store::IoFault;
+        use target_enterprise::state_store::{BackendCandidateProbe, IoFault};
 
         const PCI_COMMAND_IO: u32 = 1 << 0;
 
         if phys_map_offset() == 0 {
-            return Err(IoFault::DeviceError);
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
         }
 
         let mut bus = RealPciBus;
         let mut found_addr: Option<PciAddress> = None;
         let mut io_base: u16 = 0;
+        let mut saw_virtio_blk_pci = false;
 
         let mut device: u8 = 0;
         while device < 32 {
@@ -2089,19 +2386,28 @@ impl VirtioBlkHwState {
             let id = PciConfigBus::read_dword(&mut bus, addr, PCI_CFG_OFFSET_VENDOR_DEVICE);
             let vendor = (id & 0xFFFF) as u16;
             let dev_id = (id >> 16) as u16;
-            if vendor == 0x1AF4 && dev_id == 0x1001 {
-                if let Ok(PciBar::Io(base)) = PciImpl::read_bar(&mut bus, addr, 0) {
-                    if base != 0 && base <= u16::MAX as u32 {
-                        found_addr = Some(addr);
-                        io_base = base as u16;
-                        break;
+            if vendor == 0x1AF4 && (dev_id == 0x1001 || dev_id == 0x1042) {
+                saw_virtio_blk_pci = true;
+                if dev_id == 0x1001 {
+                    if let Ok(PciBar::Io(base)) = PciImpl::read_bar(&mut bus, addr, 0) {
+                        if base != 0 && base <= u16::MAX as u32 {
+                            found_addr = Some(addr);
+                            io_base = base as u16;
+                            break;
+                        }
                     }
                 }
             }
             device = device.wrapping_add(1);
         }
 
-        let addr = found_addr.ok_or(IoFault::DeviceError)?;
+        let Some(addr) = found_addr else {
+            return if saw_virtio_blk_pci {
+                BackendCandidateProbe::Failed(IoFault::DeviceError)
+            } else {
+                BackendCandidateProbe::Absent
+            };
+        };
         let cmd = PciConfigBus::read_dword(&mut bus, addr, PCI_CFG_OFFSET_COMMAND_STATUS);
         PciConfigBus::write_dword(
             &mut bus,
@@ -2110,16 +2416,17 @@ impl VirtioBlkHwState {
             cmd | PCI_COMMAND_IO | PCI_COMMAND_BUS_MASTER,
         );
 
-        // Read `capacity: u64` (in 512-byte sectors) at legacy I/O offset `20..28`
-        // BEFORE enabling PCI MSI-X (which inserts a 4-byte MSI-X vector header at offset 20).
-        // SAFETY: `io_base` is the validated VirtIO-blk legacy I/O BAR0.
+        // Compute the legacy VirtIO-blk device-config offset (`24` if MSI-X is already
+        // enabled on a re-probe, `20` otherwise) before reading `capacity: u64`.
+        let cfg_off = target_enterprise::async_io::virtio_legacy_devcfg_offset(&mut bus, addr);
+        // SAFETY: `io_base` is the validated VirtIO-blk legacy I/O BAR0 and `cfg_off` (`20` or `24`) points to `capacity`.
         let sectors = unsafe {
-            let lo = inl(io_base + 20) as u64;
-            let hi = inl(io_base + 24) as u64;
+            let lo = inl(io_base + cfg_off) as u64;
+            let hi = inl(io_base + cfg_off + 4) as u64;
             lo | (hi << 32)
         };
         if sectors == 0 {
-            return Err(IoFault::DeviceError);
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
         }
 
         let msix_enabled = matches!(
@@ -2131,8 +2438,12 @@ impl VirtioBlkHwState {
             Some(true)
         );
 
-        let q_pa = crate::alloc_phys_contiguous_zeroed(3, 1).ok_or(IoFault::DeviceError)?;
-        let req_pa = crate::alloc_phys_contiguous_zeroed(1, 1).ok_or(IoFault::DeviceError)?;
+        let Some(q_pa) = crate::alloc_phys_contiguous_zeroed(3, 1) else {
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
+        };
+        let Some(req_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
+            return BackendCandidateProbe::Failed(IoFault::DeviceError);
+        };
 
         let mut st = Self {
             addr,
@@ -2144,8 +2455,10 @@ impl VirtioBlkHwState {
             msix_enabled,
             sectors,
         };
-        st.reinit_hw()?;
-        Ok(st)
+        match st.reinit_hw() {
+            Ok(()) => BackendCandidateProbe::Ready(st),
+            Err(f) => BackendCandidateProbe::Failed(f),
+        }
     }
 
     fn reinit_hw(&mut self) -> Result<(), target_enterprise::state_store::IoFault> {
@@ -2275,18 +2588,18 @@ impl VirtioBlkHwState {
 
         let io_base = self.io_base;
         let msix_enabled = self.msix_enabled;
-        let io_kind = if !has_data {
-            AsyncIoKind::BlockFlush
+        let (io_kind, timeout_ms) = if !has_data {
+            (AsyncIoKind::BlockFlush, 5_000)
         } else if device_writes_data {
-            AsyncIoKind::BlockRead
+            (AsyncIoKind::BlockRead, 2_000)
         } else {
-            AsyncIoKind::BlockWrite
+            (AsyncIoKind::BlockWrite, 2_000)
         };
         let wait_res = crate::smp_hw::wait_for_dma_completion(
             io_kind,
             slot as u16,
             false,
-            20_000_000,
+            timeout_ms,
             || {
                 fence(Ordering::SeqCst);
                 // SAFETY: `q + used_off + 2` lies inside the 12 KiB virtqueue DMA allocation.
@@ -2328,16 +2641,33 @@ pub(crate) struct VirtioBlkDisk {
 }
 
 impl VirtioBlkDisk {
-    pub(crate) fn state_disk() -> Result<Self, target_enterprise::state_store::IoFault> {
+    pub(crate) fn probe_candidate() -> target_enterprise::state_store::BackendCandidateProbe<Self> {
+        use target_enterprise::state_store::BackendCandidateProbe;
         let mut guard = VIRTIO_BLK_STATE_DISK.lock();
         if let Some(st) = guard.as_mut() {
-            st.ensure_ready()?;
-            return Ok(VirtioBlkDisk { sectors: st.sectors });
+            return match st.ensure_ready() {
+                Ok(()) => BackendCandidateProbe::Ready(VirtioBlkDisk { sectors: st.sectors }),
+                Err(f) => BackendCandidateProbe::Failed(f),
+            };
         }
-        let st = VirtioBlkHwState::probe_and_init()?;
-        let sectors = st.sectors;
-        *guard = Some(st);
-        Ok(VirtioBlkDisk { sectors })
+        match VirtioBlkHwState::probe_candidate() {
+            BackendCandidateProbe::Absent => BackendCandidateProbe::Absent,
+            BackendCandidateProbe::Failed(f) => BackendCandidateProbe::Failed(f),
+            BackendCandidateProbe::Ready(st) => {
+                let sectors = st.sectors;
+                *guard = Some(st);
+                BackendCandidateProbe::Ready(VirtioBlkDisk { sectors })
+            }
+        }
+    }
+
+    pub(crate) fn state_disk() -> Result<Self, target_enterprise::state_store::IoFault> {
+        use target_enterprise::state_store::{BackendCandidateProbe, IoFault};
+        match Self::probe_candidate() {
+            BackendCandidateProbe::Ready(d) => Ok(d),
+            BackendCandidateProbe::Failed(f) => Err(f),
+            BackendCandidateProbe::Absent => Err(IoFault::DeviceError),
+        }
     }
 
     fn check_range(
@@ -2406,55 +2736,56 @@ impl target_enterprise::state_store::SectorIo for VirtioBlkDisk {
     }
 }
 
-/// Optional `fw_cfg` storage backend override (`opt/cuttle_storage_backend`):
-/// `0 = Unchecked`, `1 = Auto`, `2 = Ahci`, `3 = Nvme`, `4 = Virtio`,
-/// `5 = Invalid` (a value was given and is none of `ahci`, `nvme`, `virtio`, `auto`).
-static PREFERRED_STORAGE_BACKEND: core::sync::atomic::AtomicU8 =
-    core::sync::atomic::AtomicU8::new(0);
-/// Sticky active auto-probed backend (`0 = None`, `1 = Ahci`, `2 = Nvme`, `3 = Virtio`).
-static ACTIVE_STORAGE_BACKEND: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Sticky state-disk selection outcome:
+/// `0 = Unresolved`, `1 = Ahci`, `2 = Nvme`, `3 = Virtio`, `4 = Refused`.
+static STORAGE_SELECTION_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-fn preferred_storage_backend() -> u8 {
-    use core::sync::atomic::Ordering;
-    let cached = PREFERRED_STORAGE_BACKEND.load(Ordering::Acquire);
-    if cached != 0 {
-        return cached;
-    }
-    let resolved = if let Some((sel, size)) = fw_cfg_select("opt/cuttle_storage_backend") {
-        let take = (size as usize).min(16);
-        let mut buf = [0u8; 16];
-        // SAFETY: Running at CPL=0; `FW_CFG_CTL` (`0x510`) and `FW_CFG_DATA` (`0x511`) stream the `fw_cfg` string.
-        unsafe {
-            outw(FW_CFG_CTL, sel);
-            let mut i = 0usize;
-            while i < take {
-                buf[i] = inb(FW_CFG_DATA);
-                i += 1;
-            }
-        }
-        let mut len = take;
-        while len > 0 && (buf[len - 1] == 0 || buf[len - 1] == b'\n' || buf[len - 1] == b'\r' || buf[len - 1] == b' ') {
-            len -= 1;
-        }
-        match &buf[..len] {
-            b"ahci" => 2,
-            b"nvme" => 3,
-            b"virtio" => 4,
-            b"" | b"auto" => 1,
-            // An operator who pins a backend and mistypes it must not get
-            // whichever disk happens to answer first instead.
-            _ => {
-                serial_write_str(
-                    "STORAGE REFUSED: opt/cuttle_storage_backend is not one of ahci, nvme, virtio, auto\n",
-                );
-                5
-            }
-        }
-    } else {
-        1
+fn read_fw_cfg_storage_backend_pin(
+) -> Result<target_enterprise::state_store::StateBackendPin, ()> {
+    let Some((sel, size)) = fw_cfg_select("opt/cuttle_storage_backend") else {
+        return Ok(target_enterprise::state_store::StateBackendPin::Auto);
     };
-    PREFERRED_STORAGE_BACKEND.store(resolved, Ordering::Release);
-    resolved
+    if size > 64 {
+        return Err(());
+    }
+    let take = size as usize;
+    let mut buf = [0u8; 64];
+    // SAFETY: Running at CPL=0; `FW_CFG_CTL` (`0x510`) and `FW_CFG_DATA` (`0x511`) stream the `fw_cfg` string.
+    unsafe {
+        outw(FW_CFG_CTL, sel);
+        let mut i = 0usize;
+        while i < take {
+            buf[i] = inb(FW_CFG_DATA);
+            i += 1;
+        }
+    }
+    target_enterprise::state_store::parse_state_backend_pin(&buf[..take]).map_err(|_| ())
+}
+
+fn emit_storage_backend_selected(
+    kind: target_enterprise::state_store::StateBackendKind,
+    sectors: u64,
+) {
+    use target_enterprise::state_store::StateBackendKind;
+    let kind_bytes: &[u8] = match kind {
+        StateBackendKind::Ahci => b"ahci",
+        StateBackendKind::Nvme => b"nvme",
+        StateBackendKind::Virtio => b"virtio",
+    };
+    let mut line = [0u8; 80];
+    let mut pos = 0usize;
+    let p0 = b"STORAGE_BACKEND OK kind=";
+    line[pos..pos + p0.len()].copy_from_slice(p0);
+    pos += p0.len();
+    line[pos..pos + kind_bytes.len()].copy_from_slice(kind_bytes);
+    pos += kind_bytes.len();
+    let p1 = b" sectors=";
+    line[pos..pos + p1.len()].copy_from_slice(p1);
+    pos += p1.len();
+    pos += dec_u64(sectors, &mut line[pos..]);
+    line[pos] = b'\n';
+    pos += 1;
+    serial_write_bytes(&line[..pos]);
 }
 
 /// Unified hardware persistence disk dispatching across AHCI, NVMe, and VirtIO-blk.
@@ -2467,30 +2798,108 @@ pub(crate) enum StorageDisk {
 impl StorageDisk {
     pub(crate) fn state_disk() -> Result<Self, target_enterprise::state_store::IoFault> {
         use core::sync::atomic::Ordering;
-        match preferred_storage_backend() {
-            2 => return AhciDisk::state_disk().map(StorageDisk::Ahci),
-            3 => return NvmeDisk::state_disk().map(StorageDisk::Nvme),
-            4 => return VirtioBlkDisk::state_disk().map(StorageDisk::VirtioBlk),
-            5 => return Err(target_enterprise::state_store::IoFault::DeviceError),
-            _ => {}
-        }
-        match ACTIVE_STORAGE_BACKEND.load(Ordering::Acquire) {
+        use target_enterprise::state_store::{
+            select_state_backend, BackendCandidateProbe, IoFault, SectorIo, StateBackendFault,
+            StateBackendKind, StateBackendPin, AHCI_QUARANTINE_LBA, AHCI_STATE_LAYOUT,
+        };
+
+        match STORAGE_SELECTION_STATE.load(Ordering::Acquire) {
             1 => return AhciDisk::state_disk().map(StorageDisk::Ahci),
             2 => return NvmeDisk::state_disk().map(StorageDisk::Nvme),
             3 => return VirtioBlkDisk::state_disk().map(StorageDisk::VirtioBlk),
+            4 => return Err(IoFault::DeviceError),
             _ => {}
         }
-        if let Ok(d) = AhciDisk::state_disk() {
-            ACTIVE_STORAGE_BACKEND.store(1, Ordering::Release);
-            return Ok(StorageDisk::Ahci(d));
+
+        let pin = match read_fw_cfg_storage_backend_pin() {
+            Ok(p) => p,
+            Err(()) => {
+                serial_write_str(
+                    "STORAGE REFUSED: opt/cuttle_storage_backend is not one of ahci, nvme, virtio, auto\n",
+                );
+                STORAGE_SELECTION_STATE.store(4, Ordering::Release);
+                return Err(IoFault::DeviceError);
+            }
+        };
+
+        let (ahci_cand, nvme_cand, virtio_cand) = match pin {
+            StateBackendPin::Pinned(StateBackendKind::Ahci) => (
+                AhciDisk::probe_candidate(),
+                BackendCandidateProbe::Absent,
+                BackendCandidateProbe::Absent,
+            ),
+            StateBackendPin::Pinned(StateBackendKind::Nvme) => (
+                BackendCandidateProbe::Absent,
+                NvmeDisk::probe_candidate(),
+                BackendCandidateProbe::Absent,
+            ),
+            StateBackendPin::Pinned(StateBackendKind::Virtio) => (
+                BackendCandidateProbe::Absent,
+                BackendCandidateProbe::Absent,
+                VirtioBlkDisk::probe_candidate(),
+            ),
+            StateBackendPin::Auto => (
+                AhciDisk::probe_candidate(),
+                NvmeDisk::probe_candidate(),
+                VirtioBlkDisk::probe_candidate(),
+            ),
+        };
+
+        let seal_key = derive_runtime_seal_key();
+        match select_state_backend(
+            pin,
+            &seal_key,
+            &AHCI_STATE_LAYOUT,
+            AHCI_QUARANTINE_LBA,
+            ahci_cand,
+            nvme_cand,
+            virtio_cand,
+        ) {
+            Ok((StateBackendKind::Ahci, Some(d), _, _)) => {
+                emit_storage_backend_selected(StateBackendKind::Ahci, d.capacity_sectors());
+                STORAGE_SELECTION_STATE.store(1, Ordering::Release);
+                Ok(StorageDisk::Ahci(d))
+            }
+            Ok((StateBackendKind::Nvme, _, Some(d), _)) => {
+                emit_storage_backend_selected(StateBackendKind::Nvme, d.capacity_sectors());
+                STORAGE_SELECTION_STATE.store(2, Ordering::Release);
+                Ok(StorageDisk::Nvme(d))
+            }
+            Ok((StateBackendKind::Virtio, _, _, Some(d))) => {
+                emit_storage_backend_selected(StateBackendKind::Virtio, d.capacity_sectors());
+                STORAGE_SELECTION_STATE.store(3, Ordering::Release);
+                Ok(StorageDisk::VirtioBlk(d))
+            }
+            Ok(_) => {
+                STORAGE_SELECTION_STATE.store(4, Ordering::Release);
+                Err(IoFault::DeviceError)
+            }
+            Err(err) => {
+                let msg = match err {
+                    StateBackendFault::InvalidPin => {
+                        "STORAGE REFUSED: opt/cuttle_storage_backend is not one of ahci, nvme, virtio, auto\n"
+                    }
+                    StateBackendFault::PinnedAbsent(_) => {
+                        "STORAGE REFUSED: pinned storage backend is not attached\n"
+                    }
+                    StateBackendFault::ProbeFailed { .. } => {
+                        "STORAGE REFUSED: present storage controller failed initialization or sector probe\n"
+                    }
+                    StateBackendFault::AmbiguousStores { .. } => {
+                        "STORAGE REFUSED: multiple attached disks hold Cuttle state stores; pin opt/cuttle_storage_backend\n"
+                    }
+                    StateBackendFault::UnauthenticatedStorePresent { .. } => {
+                        "STORAGE REFUSED: refusing Fresh boot on blank disk while another attached disk holds unauthenticated Cuttle state\n"
+                    }
+                    StateBackendFault::NoBackendAvailable => {
+                        "STORAGE REFUSED: no block storage backend attached\n"
+                    }
+                };
+                serial_write_str(msg);
+                STORAGE_SELECTION_STATE.store(4, Ordering::Release);
+                Err(IoFault::DeviceError)
+            }
         }
-        if let Ok(d) = NvmeDisk::state_disk() {
-            ACTIVE_STORAGE_BACKEND.store(2, Ordering::Release);
-            return Ok(StorageDisk::Nvme(d));
-        }
-        let d = VirtioBlkDisk::state_disk()?;
-        ACTIVE_STORAGE_BACKEND.store(3, Ordering::Release);
-        Ok(StorageDisk::VirtioBlk(d))
     }
 }
 
@@ -2688,7 +3097,13 @@ pub(crate) fn banner_continuity() {
     }
 
     let seal_key = derive_runtime_seal_key();
-    let mut disk = StorageDisk::state_disk().expect("CONTINUITY: no storage disk available");
+    let Ok(mut disk) = StorageDisk::state_disk() else {
+        CONTINUITY_BOOT_COUNT.store(1, core::sync::atomic::Ordering::Relaxed);
+        serial_write_str(
+            "CONTINUITY NOTICE: state disk unavailable; deferring to shell_store_boot\n",
+        );
+        return;
+    };
 
     // Read and authenticate header sector under `seal_key`.
     //
@@ -3477,7 +3892,11 @@ pub(crate) fn banner_nvme_hw() {
         }
     }
     if let Some(st) = NVME_STATE_DISK.lock().as_mut() {
-        let _ = st.ensure_ready();
+        if st.ensure_ready().is_err() {
+            crate::banners_compose::storage_fault(
+                "NVMe state controller failed re-arm after boot self-test",
+            );
+        }
     }
 
     let _ = bar0;

@@ -273,6 +273,35 @@ pub fn parse_identify_geometry(identify_data: &[u8; 512]) -> Option<(u64, bool)>
     }
 }
 
+/// Extract the 20-byte ASCII drive serial number from ATA `IDENTIFY DEVICE` Words `10..=19`,
+/// undoing the ATA 16-bit big-endian character-pair swap and rejecting blank or non-printable fields.
+pub fn parse_identify_serial(identify_data: &[u8; 512]) -> Option<[u8; 20]> {
+    let mut out = [0u8; 20];
+    let mut any_non_space = false;
+    let mut i = 0usize;
+    while i < 10 {
+        let w = 10 + i;
+        let lo = identify_data[2 * w];
+        let hi = identify_data[2 * w + 1];
+        let c0 = hi;
+        let c1 = lo;
+        if !(0x20..=0x7E).contains(&c0) || !(0x20..=0x7E).contains(&c1) {
+            return None;
+        }
+        if c0 != b' ' || c1 != b' ' {
+            any_non_space = true;
+        }
+        out[2 * i] = c0;
+        out[2 * i + 1] = c1;
+        i += 1;
+    }
+    if any_non_space {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +638,44 @@ mod tests {
         id[2 * 100..2 * 104].copy_from_slice(&0u64.to_le_bytes());
         id[2 * 60..2 * 62].copy_from_slice(&2048u32.to_le_bytes());
         assert_eq!(parse_identify_geometry(&id), Some((2048, false)));
+    }
+
+    #[test]
+    fn parse_identify_serial_and_geometry_handles_ata_word_swapping_and_malformed_inputs() {
+        let mut id = [0u8; 512];
+        // Blank / all-zero rejected.
+        assert_eq!(parse_identify_serial(&id), None);
+        assert_eq!(parse_identify_geometry(&id), None);
+
+        // All-0xFF floating bus rejected.
+        let ff = [0xFFu8; 512];
+        assert_eq!(parse_identify_serial(&ff), None);
+
+        // All-space serial ("                    ") rejected.
+        for w in 10..=19usize {
+            id[2 * w] = b' ';
+            id[2 * w + 1] = b' ';
+        }
+        assert_eq!(parse_identify_serial(&id), None);
+
+        // ATA word-swapped serial in words 10..=19: each 16-bit LE word stores [char[2i+1], char[2i]].
+        let expected = *b"QM00001-CUTTLE-DISK ";
+        for i in 0..10usize {
+            let w = 10 + i;
+            id[2 * w] = expected[2 * i + 1];
+            id[2 * w + 1] = expected[2 * i];
+        }
+        assert_eq!(parse_identify_serial(&id), Some(expected));
+
+        // Non-printable ASCII bytes (`0x00`, `0x1F`, `0x7F`, `0x80`) in words 10..=19 rejected.
+        for bad_byte in [0x00u8, 0x1F, 0x7F, 0x80] {
+            let mut bad_id = id;
+            bad_id[2 * 13] = bad_byte;
+            assert_eq!(
+                parse_identify_serial(&bad_id),
+                None,
+                "non-printable serial byte {bad_byte:#04x} must be rejected"
+            );
+        }
     }
 }
