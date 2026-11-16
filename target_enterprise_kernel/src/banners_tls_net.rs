@@ -1892,10 +1892,14 @@ pub(crate) fn banner_dns_name() {
     use target_enterprise::dns_name::DnsNameImpl;
 
     let mut wire = [0u8; 32];
-    let n = DnsNameImpl::encode(&[b"a", b"b"], &mut wire).unwrap();
+    let Ok(n) = DnsNameImpl::encode(&[b"a", b"b"], &mut wire) else {
+        panic!("DNS name banner: encode");
+    };
     let mut labs = [[0u8; 64]; DNS_MAX_LABELS];
     let mut lens = [0usize; DNS_MAX_LABELS];
-    let (c, _) = DnsNameImpl::decode(&wire[..n], 0, &mut labs, &mut lens).unwrap();
+    let Ok((c, _)) = DnsNameImpl::decode(&wire[..n], 0, &mut labs, &mut lens) else {
+        panic!("DNS name banner: decode");
+    };
     if c != 2 {
         panic!("DNS name banner: labels");
     }
@@ -1968,7 +1972,7 @@ pub(crate) fn banner_tcp_ipv6_triad() {
     let mut seg = [0u8; 256];
     let c_isn = 0x6100_0000u32;
     let c_port = 52100u16;
-    let ns = TcpImpl::build_segment(
+    let Ok(ns) = TcpImpl::build_segment(
         c_port,
         HTTP_PORT,
         c_isn,
@@ -1979,15 +1983,20 @@ pub(crate) fn banner_tcp_ipv6_triad() {
         PEER_IP,
         GUEST_IP,
         &mut seg,
-    )
-    .unwrap();
+    ) else {
+        panic!("TCP_IPV6_TRIAD: build SYN");
+    };
     net.handle_frame_with_shell(&wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..ns]), 1, &mut sh, &mut out);
-    let s_isn = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP)
-        .unwrap()
-        .seq;
+    let Some(f0) = out.get(0) else {
+        panic!("TCP_IPV6_TRIAD: missing SYN-ACK");
+    };
+    let Ok(synack1) = TcpImpl::parse_segment(&f0[34..], GUEST_IP, PEER_IP) else {
+        panic!("TCP_IPV6_TRIAD: parse SYN-ACK");
+    };
+    let s_isn = synack1.seq;
 
     let get_req = b"GET /fs/www/b5.bin HTTP/1.1\r\nHost: cuttle\r\nConnection: close\r\n\r\n";
-    let ng = TcpImpl::build_segment(
+    let Ok(ng) = TcpImpl::build_segment(
         c_port,
         HTTP_PORT,
         c_isn.wrapping_add(1),
@@ -1998,8 +2007,9 @@ pub(crate) fn banner_tcp_ipv6_triad() {
         PEER_IP,
         GUEST_IP,
         &mut seg,
-    )
-    .unwrap();
+    ) else {
+        panic!("TCP_IPV6_TRIAD: build GET");
+    };
     out.clear();
     net.handle_frame_with_shell(&wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..ng]), 1, &mut sh, &mut out);
     if out.len() != 4 {
@@ -2007,11 +2017,16 @@ pub(crate) fn banner_tcp_ipv6_triad() {
     }
     let mut ack_upto = s_isn.wrapping_add(1);
     for idx in 0..3 {
-        let p = TcpImpl::parse_segment(&out.get(idx).unwrap()[34..], GUEST_IP, PEER_IP).unwrap();
+        let Some(f_seg) = out.get(idx) else {
+            panic!("TCP_IPV6_TRIAD: missing flight segment");
+        };
+        let Ok(p) = TcpImpl::parse_segment(&f_seg[34..], GUEST_IP, PEER_IP) else {
+            panic!("TCP_IPV6_TRIAD: parse flight segment");
+        };
         ack_upto = ack_upto.wrapping_add(p.payload.len() as u32);
     }
     let c_seq = c_isn.wrapping_add(1 + get_req.len() as u32);
-    let na = TcpImpl::build_segment(
+    let Ok(na) = TcpImpl::build_segment(
         c_port,
         HTTP_PORT,
         c_seq,
@@ -2022,8 +2037,9 @@ pub(crate) fn banner_tcp_ipv6_triad() {
         PEER_IP,
         GUEST_IP,
         &mut seg,
-    )
-    .unwrap();
+    ) else {
+        panic!("TCP_IPV6_TRIAD: build ACK");
+    };
     let ack_frame = wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..na]);
     out.clear();
     net.handle_frame_with_shell(&ack_frame, 1, &mut sh, &mut out);
@@ -2041,7 +2057,7 @@ pub(crate) fn banner_tcp_ipv6_triad() {
     // 8-slot OOO reassembly on connection #2
     let c2_isn = 0x7200_0000u32;
     let c2_port = 52101u16;
-    let ns2 = TcpImpl::build_segment(
+    let Ok(ns2) = TcpImpl::build_segment(
         c2_port,
         HTTP_PORT,
         c2_isn,
@@ -2052,14 +2068,19 @@ pub(crate) fn banner_tcp_ipv6_triad() {
         PEER_IP,
         GUEST_IP,
         &mut seg,
-    )
-    .unwrap();
+    ) else {
+        panic!("TCP_IPV6_TRIAD: build SYN2");
+    };
     out.clear();
     net.handle_frame_with_shell(&wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..ns2]), 1, &mut sh, &mut out);
-    let s2_isn = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP)
-        .unwrap()
-        .seq;
-    let nhs = TcpImpl::build_segment(
+    let Some(f2) = out.get(0) else {
+        panic!("TCP_IPV6_TRIAD: missing SYN-ACK2");
+    };
+    let Ok(synack2) = TcpImpl::parse_segment(&f2[34..], GUEST_IP, PEER_IP) else {
+        panic!("TCP_IPV6_TRIAD: parse SYN-ACK2");
+    };
+    let s2_isn = synack2.seq;
+    let Ok(nhs) = TcpImpl::build_segment(
         c2_port,
         HTTP_PORT,
         c2_isn.wrapping_add(1),
@@ -2070,8 +2091,9 @@ pub(crate) fn banner_tcp_ipv6_triad() {
         PEER_IP,
         GUEST_IP,
         &mut seg,
-    )
-    .unwrap();
+    ) else {
+        panic!("TCP_IPV6_TRIAD: build handshake ACK2");
+    };
     out.clear();
     net.handle_frame_with_shell(&wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..nhs]), 1, &mut sh, &mut out);
     let ooo_req = b"GET /uname HTTP/1.1\r\nHost: cuttle\r\nX-Pad: 0123456789abcdef0123456789abcdef0123456789abcdef\r\n\r\n";
@@ -2082,7 +2104,7 @@ pub(crate) fn banner_tcp_ipv6_triad() {
         for c in parts.iter().take(rev_i) {
             off += c.len();
         }
-        let np = TcpImpl::build_segment(
+        let Ok(np) = TcpImpl::build_segment(
             c2_port,
             HTTP_PORT,
             c2_isn.wrapping_add(1 + off as u32),
@@ -2093,8 +2115,9 @@ pub(crate) fn banner_tcp_ipv6_triad() {
             PEER_IP,
             GUEST_IP,
             &mut seg,
-        )
-        .unwrap();
+        ) else {
+            panic!("TCP_IPV6_TRIAD: build OOO segment");
+        };
         out.clear();
         net.handle_frame_with_shell(&wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..np]), 1, &mut sh, &mut out);
     }
@@ -2158,7 +2181,10 @@ pub(crate) fn banner_tcp_ipv6_triad() {
         hex[i * 2] = LUT[(b >> 4) as usize];
         hex[i * 2 + 1] = LUT[(b & 0x0f) as usize];
     }
-    let rpc_body = alloc::format!("1 1 {} uname", core::str::from_utf8(&hex).unwrap());
+    let Ok(hex_str) = core::str::from_utf8(&hex) else {
+        panic!("TCP_IPV6_TRIAD: hex utf8");
+    };
+    let rpc_body = alloc::format!("1 1 {} uname", hex_str);
     let rpc_req = alloc::format!(
         "POST /triad/rpc HTTP/1.1\r\nHost: cuttle\r\nContent-Length: {}\r\n\r\n{}",
         rpc_body.len(),
@@ -2166,7 +2192,7 @@ pub(crate) fn banner_tcp_ipv6_triad() {
     );
     let c3_isn = 0x8300_0000u32;
     let c3_port = 52102u16;
-    let ns3 = TcpImpl::build_segment(
+    let Ok(ns3) = TcpImpl::build_segment(
         c3_port,
         HTTP_PORT,
         c3_isn,
@@ -2177,15 +2203,20 @@ pub(crate) fn banner_tcp_ipv6_triad() {
         PEER_IP,
         GUEST_IP,
         &mut seg,
-    )
-    .unwrap();
+    ) else {
+        panic!("TCP_IPV6_TRIAD: build SYN3");
+    };
     out.clear();
     net.handle_frame_with_shell(&wrap_ipv4_tcp(PEER_IP, GUEST_IP, &seg[..ns3]), 1, &mut sh, &mut out);
-    let s3_isn = TcpImpl::parse_segment(&out.get(0).unwrap()[34..], GUEST_IP, PEER_IP)
-        .unwrap()
-        .seq;
+    let Some(f3) = out.get(0) else {
+        panic!("TCP_IPV6_TRIAD: missing SYN-ACK3");
+    };
+    let Ok(synack3) = TcpImpl::parse_segment(&f3[34..], GUEST_IP, PEER_IP) else {
+        panic!("TCP_IPV6_TRIAD: parse SYN-ACK3");
+    };
+    let s3_isn = synack3.seq;
     let mut rpc_seg = [0u8; 384];
-    let nr = TcpImpl::build_segment(
+    let Ok(nr) = TcpImpl::build_segment(
         c3_port,
         HTTP_PORT,
         c3_isn.wrapping_add(1),
@@ -2196,8 +2227,9 @@ pub(crate) fn banner_tcp_ipv6_triad() {
         PEER_IP,
         GUEST_IP,
         &mut rpc_seg,
-    )
-    .unwrap();
+    ) else {
+        panic!("TCP_IPV6_TRIAD: build RPC segment");
+    };
     out.clear();
     net.handle_frame_with_shell(
         &wrap_ipv4_tcp(PEER_IP, GUEST_IP, &rpc_seg[..nr]),

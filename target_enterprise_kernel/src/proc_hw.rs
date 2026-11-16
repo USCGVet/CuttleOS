@@ -103,7 +103,7 @@ impl PageFrameSource for KernelPageFrameSource {
     }
 
     fn read_frame_bytes(&self, pa: u64, offset: usize, out: &mut [u8]) {
-        assert!(offset + out.len() <= 4096);
+        assert!(offset.checked_add(out.len()).is_some_and(|e| e <= 4096));
         // SAFETY: `pa` is an allocated usable 4 KiB frame mapped in `PHYS_MAP_OFFSET`.
         unsafe {
             let src = crate::pa_to_va(pa).add(offset);
@@ -112,7 +112,7 @@ impl PageFrameSource for KernelPageFrameSource {
     }
 
     fn write_frame_bytes(&mut self, pa: u64, offset: usize, data: &[u8]) {
-        assert!(offset + data.len() <= 4096);
+        assert!(offset.checked_add(data.len()).is_some_and(|e| e <= 4096));
         // SAFETY: `pa` is an allocated usable 4 KiB frame mapped in `PHYS_MAP_OFFSET`.
         unsafe {
             let dst = crate::pa_to_va(pa).add(offset);
@@ -1031,7 +1031,10 @@ fn stage_ipc_in_locked_table(
     path: &[u8],
     body: &[u8],
 ) {
-    let ipc_pa = table.procs[slot].vm.ipc_page_pa;
+    let Some(proc_ent) = table.procs.get(slot) else {
+        return;
+    };
+    let ipc_pa = proc_ent.vm.ipc_page_pa;
     if ipc_pa == 0 {
         return;
     }
@@ -1259,8 +1262,9 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
             seed,
             &mut elf,
         );
-        let (pid, slot) = spawn_kernel_elf64_process(&elf[..len], u64::MAX, seed, None)
-            .expect("RING3_ELF_MP: failed to spawn CpuBoundWorker");
+        let Ok((pid, slot)) = spawn_kernel_elf64_process(&elf[..len], u64::MAX, seed, None) else {
+            panic!("RING3_ELF_MP: failed to spawn CpuBoundWorker");
+        };
         worker_pids[w] = pid;
         worker_slots[w] = slot;
         w += 1;
@@ -1316,8 +1320,10 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
     // ---- Phase 2: Ring-3 ELF64 IPC (`PROC_SYS_IPC_SEND` + `PROC_SYS_IPC_RECV` + `SYS_YIELD`) ----
     let mut elf_rx = [0u8; 2048];
     let n_rx = build_elf64_program(ElfProgramKind::IpcPeer { target_pid: 0 }, 1, &mut elf_rx);
-    let (rx_pid, rx_slot) =
-        spawn_kernel_elf64_process(&elf_rx[..n_rx], u64::MAX, 1, None).unwrap();
+    let Ok((rx_pid, rx_slot)) = spawn_kernel_elf64_process(&elf_rx[..n_rx], u64::MAX, 1, None)
+    else {
+        panic!("RING3_ELF_MP: spawn rx IpcPeer");
+    };
 
     let mut elf_tx = [0u8; 2048];
     let n_tx = build_elf64_program(
@@ -1325,8 +1331,10 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
         2,
         &mut elf_tx,
     );
-    let (_tx_pid, tx_slot) =
-        spawn_kernel_elf64_process(&elf_tx[..n_tx], u64::MAX, 2, None).unwrap();
+    let Ok((_tx_pid, tx_slot)) = spawn_kernel_elf64_process(&elf_tx[..n_tx], u64::MAX, 2, None)
+    else {
+        panic!("RING3_ELF_MP: spawn tx IpcPeer");
+    };
 
     crate::smp_hw::ring_smp_doorbell();
     let mut ipc_loops = 0u32;
@@ -1373,7 +1381,7 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
     for (idx, (kind, expected_vec, svc_opt)) in fault_cases.iter().enumerate() {
         let mut felf = [0u8; 2048];
         let flen = build_elf64_program(*kind, 0xF000 + (idx as u64), &mut felf);
-        let (fpid, fslot) = with_proc_table_lock(|t| {
+        let Ok((fpid, fslot)) = with_proc_table_lock(|t| {
             let mut src = KernelPageFrameSource;
             let pair = t.spawn_elf64(
                 &felf[..flen],
@@ -1384,14 +1392,16 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
             )?;
             t.procs[pair.1].cpu_affinity_mask = 0x01;
             Ok::<_, ProcError>(pair)
-        })
-        .expect("RING3_ELF_MP: failed to spawn fault test process");
+        }) else {
+            panic!("RING3_ELF_MP: failed to spawn fault test process");
+        };
 
         let mut f_steps = 0usize;
         let mut trapped = false;
         while f_steps < 16 {
-            let q = run_next_ready_process_quantum(0, 20_000_000)
-                .expect("RING3_ELF_MP: fault test quantum did not run");
+            let Some(q) = run_next_ready_process_quantum(0, 20_000_000) else {
+                panic!("RING3_ELF_MP: fault test quantum did not run");
+            };
             match q {
                 QuantumResult::Preempted { .. } => {
                     f_steps += 1;
@@ -1437,9 +1447,12 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
 
     // Verify `FaultUd2` on `ServiceId::Http` automatically respawned a fresh morphed ELF64 PID,
     // stage a live HTTP request into its `PT[103]` IPC page, and run it to clean completion!
-    let rpid = respawned_svc_pid.expect("RING3_ELF_MP: supervised svc-http did not auto-respawn");
-    let rslot = with_proc_table_lock(|t| t.slot_by_pid(rpid))
-        .expect("RING3_ELF_MP: respawned svc-http slot missing");
+    let Some(rpid) = respawned_svc_pid else {
+        panic!("RING3_ELF_MP: supervised svc-http did not auto-respawn");
+    };
+    let Some(rslot) = with_proc_table_lock(|t| t.slot_by_pid(rpid)) else {
+        panic!("RING3_ELF_MP: respawned svc-http slot missing");
+    };
     stage_service_ipc_mailbox(rslot, 0xCAFE_1234, false, b"/healthz", b"ok");
     let mut r_steps = 0usize;
     while r_steps < 32 {
@@ -1477,12 +1490,14 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
         );
         let (slot_a, slot_b) = with_proc_table_lock(|t| {
             let mut src = KernelPageFrameSource;
-            let (_, sa) = t
-                .spawn_elf64(&elf_a[..n_a], u64::MAX, 0xDEAD_A111, None, &mut src)
-                .expect("RING3_ELF_MP: spawn HostileSyscallNtAndSimd A");
-            let (_, sb) = t
-                .spawn_elf64(&elf_b[..n_b], u64::MAX, 0xDEAD_B222, None, &mut src)
-                .expect("RING3_ELF_MP: spawn HostileSyscallNtAndSimd B");
+            let Ok((_, sa)) = t.spawn_elf64(&elf_a[..n_a], u64::MAX, 0xDEAD_A111, None, &mut src)
+            else {
+                panic!("RING3_ELF_MP: spawn HostileSyscallNtAndSimd A");
+            };
+            let Ok((_, sb)) = t.spawn_elf64(&elf_b[..n_b], u64::MAX, 0xDEAD_B222, None, &mut src)
+            else {
+                panic!("RING3_ELF_MP: spawn HostileSyscallNtAndSimd B");
+            };
             t.procs[sa].cpu_affinity_mask = 0x01;
             t.procs[sb].cpu_affinity_mask = 0x01;
             (sa, sb)
@@ -1527,9 +1542,18 @@ pub(crate) fn banner_ring3_elf_multiprocess() {
         }
 
         let tss_chk = Tss64::with_ist_stacks(0x1600, 0x1B00, 0x1D80, 0x2000).to_bytes();
-        let ist1_enc = u64::from_le_bytes(tss_chk[36..44].try_into().unwrap());
-        let ist2_enc = u64::from_le_bytes(tss_chk[44..52].try_into().unwrap());
-        let ist3_enc = u64::from_le_bytes(tss_chk[52..60].try_into().unwrap());
+        let ist1_enc = u64::from_le_bytes([
+            tss_chk[36], tss_chk[37], tss_chk[38], tss_chk[39], tss_chk[40], tss_chk[41],
+            tss_chk[42], tss_chk[43],
+        ]);
+        let ist2_enc = u64::from_le_bytes([
+            tss_chk[44], tss_chk[45], tss_chk[46], tss_chk[47], tss_chk[48], tss_chk[49],
+            tss_chk[50], tss_chk[51],
+        ]);
+        let ist3_enc = u64::from_le_bytes([
+            tss_chk[52], tss_chk[53], tss_chk[54], tss_chk[55], tss_chk[56], tss_chk[57],
+            tss_chk[58], tss_chk[59],
+        ]);
         if ist1_enc != 0x1B00 || ist2_enc != 0x1D80 || ist3_enc != 0x2000 {
             panic!("RING3_ELF_MP: Tss64 IST1/IST2/IST3 encoding mismatch");
         }

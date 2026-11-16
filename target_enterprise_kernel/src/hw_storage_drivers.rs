@@ -946,7 +946,9 @@ impl AhciHwPort {
     pub(crate) fn write_sector(&self, lba: u64, data: &[u8; 512]) {
         use target_enterprise::ahci_fis::build_rw_dma_fis;
         self.fill_data(data);
-        let wr = build_rw_dma_fis(lba, 1, true, false, 0).expect("write_dma params");
+        let Ok(wr) = build_rw_dma_fis(lba, 1, true, false, 0) else {
+            panic!("AHCI_HW: write_dma params");
+        };
         self.issue(&wr, true, b"write");
     }
 
@@ -1690,28 +1692,17 @@ impl NvmeHwState {
             let _ = ensure_mmio_page(bar0 + 0x1000 + 5 * doorbell_stride);
         }
 
-        let Some(asq_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
-            return BackendCandidateProbe::Failed(IoFault::DeviceError);
-        };
-        let Some(acq_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
-            return BackendCandidateProbe::Failed(IoFault::DeviceError);
-        };
-        let Some(iosq_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
-            return BackendCandidateProbe::Failed(IoFault::DeviceError);
-        };
-        let Some(iocq_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
-            return BackendCandidateProbe::Failed(IoFault::DeviceError);
-        };
-        let Some(data_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
-            return BackendCandidateProbe::Failed(IoFault::DeviceError);
-        };
-        let Some(emerg_iosq_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
-            return BackendCandidateProbe::Failed(IoFault::DeviceError);
-        };
-        let Some(emerg_iocq_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
-            return BackendCandidateProbe::Failed(IoFault::DeviceError);
-        };
-        let Some(emerg_data_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
+        let Some([
+            asq_pa,
+            acq_pa,
+            iosq_pa,
+            iocq_pa,
+            data_pa,
+            emerg_iosq_pa,
+            emerg_iocq_pa,
+            emerg_data_pa,
+        ]) = crate::alloc_phys_frames_zeroed_atomic::<8>()
+        else {
             return BackendCandidateProbe::Failed(IoFault::DeviceError);
         };
 
@@ -1740,7 +1731,26 @@ impl NvmeHwState {
         };
         match st.reinit_controller() {
             Ok(()) => BackendCandidateProbe::Ready(st),
-            Err(f) => BackendCandidateProbe::Failed(f),
+            Err(f) => {
+                // Controller reset/bring-up failed: ensure `CC.EN = 0` and reclaim all 8 physical DMA frames.
+                // SAFETY: `bar0` is mapped uncached and resetting `CC` halts queue DMA before freeing frames.
+                unsafe {
+                    mmio_write32(bar0 + target_enterprise::nvme::REG_CC as u64, 0);
+                    for pa in [
+                        asq_pa,
+                        acq_pa,
+                        iosq_pa,
+                        iocq_pa,
+                        data_pa,
+                        emerg_iosq_pa,
+                        emerg_iocq_pa,
+                        emerg_data_pa,
+                    ] {
+                        let _ = crate::free_phys_frame_scrubbed(pa);
+                    }
+                }
+                BackendCandidateProbe::Failed(f)
+            }
         }
     }
 
@@ -2442,6 +2452,10 @@ impl VirtioBlkHwState {
             return BackendCandidateProbe::Failed(IoFault::DeviceError);
         };
         let Some(req_pa) = crate::alloc_phys_contiguous_zeroed(1, 1) else {
+            // SAFETY: `q_pa` has not been programmed into the VirtIO device yet; reclaim all 3 frames.
+            unsafe {
+                let _ = crate::free_phys_contiguous_scrubbed(q_pa, 3);
+            }
             return BackendCandidateProbe::Failed(IoFault::DeviceError);
         };
 
@@ -2457,7 +2471,16 @@ impl VirtioBlkHwState {
         };
         match st.reinit_hw() {
             Ok(()) => BackendCandidateProbe::Ready(st),
-            Err(f) => BackendCandidateProbe::Failed(f),
+            Err(f) => {
+                // Reset legacy VirtIO device status (`io_base + 18 = 0`) so queue PFN is detached before freeing frames.
+                // SAFETY: `io_base` is the validated VirtIO-blk legacy I/O BAR0.
+                unsafe {
+                    outb(io_base + 18, 0);
+                    let _ = crate::free_phys_contiguous_scrubbed(q_pa, 3);
+                    let _ = crate::free_phys_frame_scrubbed(req_pa);
+                }
+                BackendCandidateProbe::Failed(f)
+            }
         }
     }
 

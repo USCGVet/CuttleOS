@@ -16,6 +16,17 @@
 
 #![no_std]
 #![no_main]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::fallible_impl_from,
+    )
+)]
 // Production builds (`--cfg cuttle_prod` in RUSTFLAGS, injected by
 // `factory_builder build-kernel --prod`) exclude the banner self-proof
 // suite and the red-team attack harness: every `banner_*` definition and
@@ -178,6 +189,23 @@ pub(crate) fn alloc_phys_frame_zeroed() -> Option<u64> {
     Some(pa)
 }
 
+/// Allocate `N` individual zero-scrubbed 4 KiB physical frames from `KERNEL_PHYS_MM`
+/// all-or-nothing, rolling back any partial batch on out-of-memory.
+pub(crate) fn alloc_phys_frames_zeroed_atomic<const N: usize>() -> Option<[u64; N]> {
+    if !phys_mm_is_initialized() {
+        return None;
+    }
+    let frames = with_phys_mm_lock(|pmm| pmm.alloc_frames_atomic::<N>().ok())?;
+    let mut k = 0usize;
+    while k < N {
+        // SAFETY: `frames[k]` is a freshly allocated usable 4 KiB RAM frame mapped at `pa_to_va`.
+        let slice = unsafe { core::slice::from_raw_parts_mut(pa_to_va(frames[k]), 4096) };
+        target_enterprise::phys_mm::scrub_frame_bytes(slice);
+        k += 1;
+    }
+    Some(frames)
+}
+
 /// Allocate `count` contiguous zero-scrubbed 4 KiB physical frames aligned to `align_frames`.
 pub(crate) fn alloc_phys_contiguous_zeroed(count: usize, align_frames: usize) -> Option<u64> {
     if !phys_mm_is_initialized() {
@@ -298,7 +326,9 @@ pub(crate) fn set_phys_offset(boot: &BootInfo) {
         if end <= start {
             continue;
         }
-        let aligned = (start + 0xFFF) & !0xFFF;
+        let Some(aligned) = start.checked_add(0xFFF).map(|v| v & !0xFFF) else {
+            continue;
+        };
         // 384 KiB (`DMA_WINDOW_BYTES = 0x6_0000`): disjoint device DMA apertures (`0x0_0000..0x3_7000`)
         // + dedicated 40-frame Page-Table pool (`0x3_8000..0x6_0000`).
         if aligned >= 0x10_0000
@@ -382,14 +412,22 @@ pub(crate) unsafe fn alloc_pt_frame_locked() -> u64 {
     }
     let base = dma_phys_base();
     let next = PT_ALLOC_NEXT.load(core::sync::atomic::Ordering::Acquire);
+    let pool_start = base.checked_add(target_enterprise::memory::dma_layout::PT_POOL_START_OFF);
+    let pool_end = base.checked_add(target_enterprise::memory::dma_layout::PT_POOL_END_OFF);
+    let next_after = next.checked_add(0x1000);
     if base == 0
-        || next < base + target_enterprise::memory::dma_layout::PT_POOL_START_OFF
-        || next + 0x1000 > base + target_enterprise::memory::dma_layout::PT_POOL_END_OFF
+        || pool_start.is_none_or(|ps| next < ps)
+        || match (next_after, pool_end) {
+            (Some(na), Some(pe)) => na > pe,
+            _ => true,
+        }
     {
         panic!("AHCI_HW: PT frame pool exhausted");
     }
     let frame = next;
-    PT_ALLOC_NEXT.store(next + 0x1000, core::sync::atomic::Ordering::Release);
+    if let Some(na) = next_after {
+        PT_ALLOC_NEXT.store(na, core::sync::atomic::Ordering::Release);
+    }
     // SAFETY: `frame` is a newly allocated 4 KiB page inside the reserved DMA/PT pool mapped via `pa_to_va`.
     unsafe {
         let p = pa_to_va(frame);

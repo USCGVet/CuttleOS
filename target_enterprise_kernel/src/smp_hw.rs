@@ -2894,19 +2894,25 @@ fn verify_vtd_slpt_confinement_live() {
     let a_pd_pa: u64 = 0x40_8000;
     let a_pt_pa: u64 = 0x40_9000;
 
-    let root_ent = encode_root_entry(ctx_pa).expect("VTD: root entry");
+    let Ok(root_ent) = encode_root_entry(ctx_pa) else {
+        panic!("VTD: root entry");
+    };
     s.root[0..16].copy_from_slice(&root_ent);
 
     let dev_virtio = DeviceId::from_bdf(0, 0, 1, 0);
     let dev_ahci = DeviceId::from_bdf(0, 0, 2, 0);
     let _ = dev_ahci;
-    let v_ctx = encode_context_entry(v_pml4_pa, 1).expect("VTD: virtio ctx");
-    let a_ctx = encode_context_entry(a_pml4_pa, 2).expect("VTD: ahci ctx");
+    let Ok(v_ctx) = encode_context_entry(v_pml4_pa, 1) else {
+        panic!("VTD: virtio ctx");
+    };
+    let Ok(a_ctx) = encode_context_entry(a_pml4_pa, 2) else {
+        panic!("VTD: ahci ctx");
+    };
     s.ctx[8 * 16..8 * 16 + 16].copy_from_slice(&v_ctx);
     s.ctx[16 * 16..16 * 16 + 16].copy_from_slice(&a_ctx);
 
     let rw = PagePerms(PagePerms::READ.0 | PagePerms::WRITE.0);
-    build_confined_slpt_4level(
+    if build_confined_slpt_4level(
         &mut s.v_pml4,
         &mut s.v_pdpt,
         &mut s.v_pd,
@@ -2918,8 +2924,11 @@ fn verify_vtd_slpt_confinement_live() {
         v_len,
         rw,
     )
-    .expect("VTD: virtio slpt");
-    build_confined_slpt_4level(
+    .is_err()
+    {
+        panic!("VTD: virtio slpt");
+    }
+    if build_confined_slpt_4level(
         &mut s.a_pml4,
         &mut s.a_pdpt,
         &mut s.a_pd,
@@ -2931,7 +2940,10 @@ fn verify_vtd_slpt_confinement_live() {
         a_len,
         rw,
     )
-    .expect("VTD: ahci slpt");
+    .is_err()
+    {
+        panic!("VTD: ahci slpt");
+    }
 
     // 1. In-aperture DMA succeeds for each PCI BDF.
     let ok_v = verify_vtd_dma_access(

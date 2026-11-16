@@ -572,7 +572,7 @@ impl<const WORDS: usize> PhysFrameManager<WORDS> {
 
         // 1. Scan low-4 GiB bitmap.
         let total_low_frames = WORDS * 64;
-        let mut base = align_up_usize(self.next_word_hint * 64, align_frames);
+        let mut base = align_up_usize(self.next_word_hint * 64, align_frames).unwrap_or(total_low_frames);
         let mut pass = 0usize;
         while pass < 2 {
             let limit = if pass == 0 {
@@ -609,7 +609,13 @@ impl<const WORDS: usize> PhysFrameManager<WORDS> {
                     self.record_alloc(count);
                     return Ok((base as u64) * PHYS_FRAME_BYTES);
                 }
-                base = align_up_usize(fail_idx + 1, align_frames);
+                let Some(next_base) = fail_idx
+                    .checked_add(1)
+                    .and_then(|v| align_up_usize(v, align_frames))
+                else {
+                    break;
+                };
+                base = next_base;
             }
             pass += 1;
         }
@@ -621,10 +627,14 @@ impl<const WORDS: usize> PhysFrameManager<WORDS> {
                 let ext_base_frame = (self.high_extents[h].base_pa / PHYS_FRAME_BYTES) as usize;
                 let cap = self.high_extents[h].frame_cap;
                 let mut rel = 0usize;
-                while rel + count <= cap {
-                    let abs_frame = ext_base_frame + rel;
+                while rel.checked_add(count).is_some_and(|end| end <= cap) {
+                    let Some(abs_frame) = ext_base_frame.checked_add(rel) else {
+                        break;
+                    };
                     if (abs_frame & (align_frames - 1)) != 0 {
-                        let next_abs = align_up_usize(abs_frame, align_frames);
+                        let Some(next_abs) = align_up_usize(abs_frame, align_frames) else {
+                            break;
+                        };
                         rel = next_abs - ext_base_frame;
                         continue;
                     }
@@ -748,6 +758,31 @@ impl<const WORDS: usize> PhysFrameManager<WORDS> {
         Ok(())
     }
 
+    /// Allocate `N` individual 4 KiB physical frames all-or-nothing: if fewer than `N`
+    /// frames are available, every frame acquired earlier in the batch is immediately
+    /// returned to the free bitmap before returning [`PhysMmError::OutOfMemory`].
+    pub fn alloc_frames_atomic<const N: usize>(&mut self) -> Result<[u64; N], PhysMmError> {
+        let mut out = [0u64; N];
+        let mut k = 0usize;
+        while k < N {
+            match self.alloc_frame() {
+                Some(pa) => {
+                    out[k] = pa;
+                    k += 1;
+                }
+                None => {
+                    let mut j = 0usize;
+                    while j < k {
+                        let _ = self.free_frame(out[j]);
+                        j += 1;
+                    }
+                    return Err(PhysMmError::OutOfMemory);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Return `true` iff `pa` is 4 KiB-aligned and belongs to usable physical RAM.
     pub fn is_usable(&self, pa: u64) -> bool {
         if (pa & (PHYS_FRAME_BYTES - 1)) != 0 {
@@ -824,12 +859,20 @@ pub trait PageFrameSource {
     }
 
     /// Write a single 64-bit page-table entry at `index` (`0..512`) inside frame `pa`.
+    /// Out-of-bounds indices (`>= 512`) fail closed as a no-op without overflowing `index * 8`.
     fn write_frame_u64_at(&mut self, pa: u64, index: usize, word: u64) {
+        if index >= 512 {
+            return;
+        }
         self.write_frame_bytes(pa, index * 8, &word.to_le_bytes());
     }
 
     /// Read a single 64-bit page-table entry at `index` (`0..512`) inside frame `pa`.
+    /// Out-of-bounds indices (`>= 512`) fail closed and return `0`.
     fn read_frame_u64_at(&self, pa: u64, index: usize) -> u64 {
+        if index >= 512 {
+            return 0;
+        }
         let mut b = [0u8; 8];
         self.read_frame_bytes(pa, index * 8, &mut b);
         u64::from_le_bytes(b)
@@ -845,9 +888,12 @@ const fn align_up_4k(addr: u64) -> Option<u64> {
 }
 
 #[inline]
-const fn align_up_usize(val: usize, align: usize) -> usize {
+const fn align_up_usize(val: usize, align: usize) -> Option<usize> {
     let mask = align - 1;
-    val.saturating_add(mask) & !mask
+    match val.checked_add(mask) {
+        Some(v) => Some(v & !mask),
+        None => None,
+    }
 }
 
 #[cfg(test)]
@@ -1037,5 +1083,73 @@ mod tests {
             );
         }
         assert_eq!(allocated.len(), 3072);
+    }
+
+    #[test]
+    fn page_frame_source_u64_accessors_reject_oob_and_wrapping_indices_without_corrupting_pte0() {
+        struct OnePageSource {
+            bytes: [u8; 4096],
+        }
+        impl PageFrameSource for OnePageSource {
+            fn alloc_zeroed_frame(&mut self) -> Option<u64> {
+                Some(0x10_0000)
+            }
+            fn free_zeroed_frame(&mut self, _pa: u64) {}
+            fn read_frame_bytes(&self, _pa: u64, offset: usize, out: &mut [u8]) {
+                assert!(offset.checked_add(out.len()).is_some_and(|e| e <= 4096));
+                out.copy_from_slice(&self.bytes[offset..offset + out.len()]);
+            }
+            fn write_frame_bytes(&mut self, _pa: u64, offset: usize, data: &[u8]) {
+                assert!(offset.checked_add(data.len()).is_some_and(|e| e <= 4096));
+                self.bytes[offset..offset + data.len()].copy_from_slice(data);
+            }
+        }
+
+        let mut src = OnePageSource { bytes: [0u8; 4096] };
+        src.write_frame_u64_at(0x10_0000, 0, 0xCAFE_BABE_1234_5678);
+        assert_eq!(src.read_frame_u64_at(0x10_0000, 0), 0xCAFE_BABE_1234_5678);
+
+        // Out-of-bounds (`512`) and wrapping (`1 << 61`, where `index * 8 == 0` mod 2^64)
+        // indices must fail closed without panicking or overwriting PTE[0].
+        src.write_frame_u64_at(0x10_0000, 512, 0xDEAD_BEEF);
+        src.write_frame_u64_at(0x10_0000, 1usize << (usize::BITS - 3), 0xDEAD_BEEF);
+        assert_eq!(src.read_frame_u64_at(0x10_0000, 512), 0);
+        assert_eq!(
+            src.read_frame_u64_at(0x10_0000, 1usize << (usize::BITS - 3)),
+            0
+        );
+        assert_eq!(
+            src.read_frame_u64_at(0x10_0000, 0),
+            0xCAFE_BABE_1234_5678,
+            "wrapping index must never alias PTE[0]"
+        );
+    }
+
+    #[test]
+    fn alloc_frames_atomic_rolls_back_partial_batch_on_oom() {
+        let mut pmm: PhysFrameManager<8> = PhysFrameManager::empty();
+        // Exactly 5 usable 4 KiB frames (`[0x10_0000 .. 0x10_5000)`).
+        pmm.init_from_regions(
+            &[PhysRegionDesc {
+                start: 0x0010_0000,
+                end: 0x0010_5000,
+                usable: true,
+            }],
+            &[],
+        );
+        assert_eq!(pmm.stats().free_frames, 5);
+
+        // Requesting 8 frames (matching NVMe candidate probe) must roll back all 5 acquired frames.
+        assert_eq!(pmm.alloc_frames_atomic::<8>(), Err(PhysMmError::OutOfMemory));
+        assert_eq!(pmm.stats().allocated_frames, 0);
+        assert_eq!(pmm.stats().free_frames, 5);
+
+        // Subsequent 5-frame batch still succeeds completely.
+        let batch5 = pmm.alloc_frames_atomic::<5>().expect("5 frames available");
+        assert_eq!(pmm.stats().allocated_frames, 5);
+        for pa in batch5 {
+            pmm.free_frame(pa).expect("free batch frame");
+        }
+        assert_eq!(pmm.stats().free_frames, 5);
     }
 }

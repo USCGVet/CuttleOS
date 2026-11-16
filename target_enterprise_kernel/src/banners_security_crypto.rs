@@ -50,38 +50,33 @@ pub(crate) fn banner_kpti() {
         0xFFFF_FFFF_A000_0000, // IDT
         0xFFFF_FFFF_B000_0000, // Ed25519 private key page
     ];
-    kernel.map(secrets[0], PTE_PRESENT).expect("kpti map .text");
-    kernel
-        .map(secrets[1], PTE_PRESENT | PTE_WRITABLE | PTE_NX)
-        .expect("kpti map heap");
-    kernel
-        .map(secrets[2], PTE_PRESENT | PTE_NX)
-        .expect("kpti map IDT");
-    kernel
-        .map(secrets[3], PTE_PRESENT | PTE_NX)
-        .expect("kpti map signing-key");
-
-    // KPTI trampolines — USER bit set so the build path retains them.
-    kernel
-        .map(KPTI_TRAMPOLINE_VIRT, PTE_PRESENT | PTE_USER)
-        .expect("kpti map SYSCALL trampoline");
-    kernel
-        .map(KPTI_IRETQ_VIRT, PTE_PRESENT | PTE_USER)
-        .expect("kpti map iretq trampoline");
-    kernel
-        .map(KPTI_IRQ_TIMER_VIRT, PTE_PRESENT | PTE_USER)
-        .expect("kpti map timer trampoline");
-
-    // User pages — USER bit set; build path keeps these.
-    kernel
-        .map(0x0000_0000_4000_0000, PTE_PRESENT | PTE_USER | PTE_NX)
-        .expect("kpti map user code");
-    kernel
-        .map(
-            0x0000_0000_5000_0000,
-            PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NX,
-        )
-        .expect("kpti map user stack");
+    if kernel.map(secrets[0], PTE_PRESENT).is_err()
+        || kernel
+            .map(secrets[1], PTE_PRESENT | PTE_WRITABLE | PTE_NX)
+            .is_err()
+        || kernel.map(secrets[2], PTE_PRESENT | PTE_NX).is_err()
+        || kernel.map(secrets[3], PTE_PRESENT | PTE_NX).is_err()
+        || kernel
+            .map(KPTI_TRAMPOLINE_VIRT, PTE_PRESENT | PTE_USER)
+            .is_err()
+        || kernel
+            .map(KPTI_IRETQ_VIRT, PTE_PRESENT | PTE_USER)
+            .is_err()
+        || kernel
+            .map(KPTI_IRQ_TIMER_VIRT, PTE_PRESENT | PTE_USER)
+            .is_err()
+        || kernel
+            .map(0x0000_0000_4000_0000, PTE_PRESENT | PTE_USER | PTE_NX)
+            .is_err()
+        || kernel
+            .map(
+                0x0000_0000_5000_0000,
+                PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NX,
+            )
+            .is_err()
+    {
+        panic!("kpti map failed");
+    }
 
     let user = KptiImpl::<32>::build_user_view(&kernel, &secrets);
 

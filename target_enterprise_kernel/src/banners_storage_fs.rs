@@ -412,8 +412,8 @@ pub(crate) fn banner_gpt() {
     use target_enterprise::gpt::{build_banner_fixture, GPT_FIXTURE_BYTES, GptImpl};
 
     let mut img = [0u8; GPT_FIXTURE_BYTES];
-    build_banner_fixture(&mut img).unwrap();
-    let h = GptImpl::parse_header(&img).unwrap();
+    if build_banner_fixture(&mut img).is_err() { panic!("GPT banner: fixture"); }
+    let Ok(h) = GptImpl::parse_header(&img) else { panic!("GPT banner: parse"); };
     if h.num_parts != 1 {
         panic!("GPT banner: parts");
     }

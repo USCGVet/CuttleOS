@@ -105,8 +105,9 @@ pub(crate) fn banner_virtio_net_hw() {
         panic!("VIRTIO_NET_HW: DMA map missing");
     }
 
-    let rx = peers[0].as_ref().unwrap();
-    let tx = peers[1].as_ref().unwrap();
+    let (Some(rx), Some(tx)) = (peers[0].as_ref(), peers[1].as_ref()) else {
+        return;
+    };
 
     {
         let mut line = [0u8; 64];

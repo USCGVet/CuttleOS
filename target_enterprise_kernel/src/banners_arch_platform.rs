@@ -84,11 +84,13 @@ pub(crate) fn banner_dma() {
     use target_enterprise::syscall::{dispatch_dma, SYS_DMA_MAP, SYS_DMA_UNMAP};
 
     let mut iommu: DmaIommuImpl<4, 8, 16> = DmaIommuImpl::new();
-    let domain = iommu.create_domain().expect("kpti-dma: create_domain");
+    let Ok(domain) = iommu.create_domain() else {
+        panic!("kpti-dma: create_domain");
+    };
     let device = IommuDeviceId::from_bdf(0, 0, 1, 0);
-    iommu
-        .bind_device(device, domain)
-        .expect("kpti-dma: bind_device");
+    if iommu.bind_device(device, domain).is_err() {
+        panic!("kpti-dma: bind_device");
+    }
     let task = Task::new_ready_with_domain(7 as TaskId, 1, domain);
 
     // ---- SYS_DMA_MAP ----
@@ -1940,13 +1942,17 @@ pub(crate) fn banner_mb2() {
     use target_enterprise::multiboot2::{build_banner_fixture, MB2_FIXTURE_LEN, Multiboot2Impl};
 
     let mut img = [0u8; MB2_FIXTURE_LEN];
-    build_banner_fixture(&mut img).unwrap();
+    if build_banner_fixture(&mut img).is_err() {
+        panic!("MB2 banner: fixture");
+    }
     let mut out = [Mb2Tag {
         typ: 0,
         size: 0,
         offset: 0,
     }; MB2_MAX_TAGS];
-    let n = Multiboot2Impl::walk(&img, &mut out).unwrap();
+    let Ok(n) = Multiboot2Impl::walk(&img, &mut out) else {
+        panic!("MB2 banner: walk");
+    };
     if n != 1 {
         panic!("MB2 banner: tag count");
     }
@@ -1961,8 +1967,12 @@ pub(crate) fn banner_rsdp() {
     use target_enterprise::acpi_rsdp::{build_banner_fixture, AcpiRsdpImpl};
 
     let mut b = [0u8; 20];
-    build_banner_fixture(&mut b).unwrap();
-    let r = AcpiRsdpImpl::parse_v1(&b).unwrap();
+    if build_banner_fixture(&mut b).is_err() {
+        panic!("RSDP banner: fixture");
+    }
+    let Ok(r) = AcpiRsdpImpl::parse_v1(&b) else {
+        panic!("RSDP banner: parse");
+    };
     if &r.oem_id != b"BOCHS " {
         panic!("RSDP banner: oem");
     }
@@ -1977,8 +1987,9 @@ pub(crate) fn banner_frame() {
     use target_enterprise::frame_bitmap::FrameBitmapImpl;
 
     let mut b = FrameBitmapImpl::new();
-    b.alloc().unwrap();
-    b.alloc().unwrap();
+    if b.alloc().is_err() || b.alloc().is_err() {
+        panic!("FRAME banner: alloc");
+    }
     if b.free_count() != 4094 {
         panic!("FRAME banner: free count");
     }
@@ -2080,8 +2091,9 @@ pub(crate) fn banner_watchdog() {
     }
     // Fire: re-arm with 2 and tick out
     let mut w2 = WatchdogImpl::new();
-    w2.arm(2).unwrap();
-    w2.tick().unwrap();
+    if w2.arm(2).is_err() || w2.tick().is_err() {
+        panic!("WATCHDOG banner: arm/tick");
+    }
     match w2.tick() {
         Err(WatchdogError::Fired) => {}
         _ => panic!("WATCHDOG banner: fire expected"),

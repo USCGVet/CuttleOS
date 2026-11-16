@@ -376,12 +376,18 @@ pub(crate) fn banner_timebase_compose() {
     if port.write_count() != 3 {
         panic!("TIMEBASE compose: PIT write count drift");
     }
-    let w0 = port.write_at(0).expect("TIMEBASE compose: missing PIT cmd");
+    let Some(w0) = port.write_at(0) else {
+        panic!("TIMEBASE compose: missing PIT cmd");
+    };
     if w0.port != PIT_CMD_PORT || w0.value != PIT_CMD_CH0_LOHI_MODE3_BIN {
         panic!("TIMEBASE compose: PIT cmd byte drift");
     }
-    let w1 = port.write_at(1).expect("TIMEBASE compose: missing lo");
-    let w2 = port.write_at(2).expect("TIMEBASE compose: missing hi");
+    let Some(w1) = port.write_at(1) else {
+        panic!("TIMEBASE compose: missing lo");
+    };
+    let Some(w2) = port.write_at(2) else {
+        panic!("TIMEBASE compose: missing hi");
+    };
     if w1.port != PIT_CH0_PORT || w1.value != 0xA9 || w2.port != PIT_CH0_PORT || w2.value != 0x04 {
         panic!("TIMEBASE compose: PIT divisor bytes drift");
     }
@@ -1260,10 +1266,9 @@ fn verify_service_runtime_compose(vsh: &mut target_enterprise::OsShell) {
     // 3. Independent service rotation mutates ELF SHA-256 and extends svc_pcr10 without reboot:
     let dig_before = vsh.svc.services[ServiceId::Http.index()].elf_sha256;
     let pcr_before = vsh.svc.svc_pcr10;
-    let dig_after = vsh
-        .svc
-        .rotate_service(ServiceId::Http, 0x4242, &mut vsh.audit)
-        .expect("SVC_RUNTIME compose: rotate svc-http");
+    let Ok(dig_after) = vsh.svc.rotate_service(ServiceId::Http, 0x4242, &mut vsh.audit) else {
+        panic!("SVC_RUNTIME compose: rotate svc-http");
+    };
     if dig_before == dig_after || vsh.svc.svc_pcr10 == pcr_before {
         panic!("SVC_RUNTIME compose: service rotation did not update digest/PCR-10");
     }
@@ -1331,7 +1336,7 @@ fn verify_https_and_concurrent_tcp_compose() {
         let cport = 52000 + (slot as u16);
         let cisn = 0x5000_0000 + ((slot as u32) << 16);
         let mut frame = [0u8; 74];
-        let n = TcpImpl::build_segment(
+        let Ok(n) = TcpImpl::build_segment(
             cport,
             HTTP_PORT,
             cisn,
@@ -1342,8 +1347,9 @@ fn verify_https_and_concurrent_tcp_compose() {
             PEER_IP,
             GUEST_IP,
             &mut frame[34..],
-        )
-        .unwrap();
+        ) else {
+            panic!("HTTPS compose: build_segment SYN");
+        };
         let ip_len = 20 + n;
         frame[..6].copy_from_slice(&golden::MAC);
         frame[6..12].copy_from_slice(&PEER_MAC);
@@ -1361,7 +1367,10 @@ fn verify_https_and_concurrent_tcp_compose() {
         *replies = target_enterprise::ReplySet::new();
         net.handle_frame(&frame[..14 + ip_len], golden::BOOTS, &mut replies);
         let synack = match replies.get(0) {
-            Some(f) => TcpImpl::parse_segment(&f[34..], GUEST_IP, PEER_IP).unwrap(),
+            Some(f) => match TcpImpl::parse_segment(&f[34..], GUEST_IP, PEER_IP) {
+                Ok(s) => s,
+                Err(_) => panic!("HTTPS compose: parse SYN-ACK failed"),
+            },
             None => panic!("HTTPS compose: expected SYN-ACK on port 80"),
         };
         if synack.flags != (tcp_flags::SYN | tcp_flags::ACK) {

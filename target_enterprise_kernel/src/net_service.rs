@@ -212,15 +212,18 @@ pub(crate) fn vnet_modern_init(dma: u64) -> Option<VnetModern> {
     if phys_off == 0 {
         return None;
     }
-    // SAFETY: Running at CPL=0 with initialized page-table pool; `common_bar`, `notify_bar`, and `devcfg_bar` are PCI-validated MMIO BAR addresses.
+    let common_pa = common_bar.checked_add(common_off)?;
+    let notify_pa = notify_bar.checked_add(notify_off)?;
+    let devcfg_pa = devcfg_bar.checked_add(devcfg_off)?;
+    let common_virt = phys_off.checked_add(common_pa)?;
+    let notify_virt = phys_off.checked_add(notify_pa)?;
+    let devcfg_virt = phys_off.checked_add(devcfg_pa)?;
+    // SAFETY: Running at CPL=0 with initialized page-table pool; `common_pa`, `notify_pa`, and `devcfg_pa` are PCI-validated MMIO BAR addresses.
     unsafe {
-        ensure_mmio_page(common_bar + common_off);
-        ensure_mmio_page(notify_bar + notify_off);
-        ensure_mmio_page(devcfg_bar + devcfg_off);
+        ensure_mmio_page(common_pa);
+        ensure_mmio_page(notify_pa);
+        ensure_mmio_page(devcfg_pa);
     }
-    let common_virt = phys_off + common_bar + common_off;
-    let notify_virt = phys_off + notify_bar + notify_off;
-    let devcfg_virt = phys_off + devcfg_bar + devcfg_off;
 
     // Handshake: RESET → ACK → DRIVER → negotiate VERSION_1 → FEATURES_OK.
     vn_wr8(common_virt, VN_CC_STATUS, 0);
@@ -696,7 +699,8 @@ pub(crate) fn enable_https(svc: &mut target_enterprise::LivedNet, mac: [u8; 6]) 
             let prefix = b"HTTPS UP port=443 tls13=rustls entropy=";
             line[..prefix.len()].copy_from_slice(prefix);
             let mut pos = prefix.len();
-            let src_bytes = entropy_src.as_bytes();
+            let raw_src = entropy_src.as_bytes();
+            let src_bytes = &raw_src[..raw_src.len().min(24)];
             line[pos..pos + src_bytes.len()].copy_from_slice(src_bytes);
             pos += src_bytes.len();
             let prov_tag = if provisioned {
