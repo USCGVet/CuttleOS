@@ -1124,12 +1124,12 @@ impl LivedNet {
 
     /// Return the current RFC 5681 congestion window (`cwnd`, in bytes) of TCP slot `idx`.
     pub fn slot_cwnd(&self, idx: usize) -> u32 {
-        self.slot_cwnd[idx]
+        self.slot_cwnd.get(idx).copied().unwrap_or(0)
     }
 
     /// Return the current RFC 5681 slow-start threshold (`ssthresh`, in bytes) of TCP slot `idx`.
     pub fn slot_ssthresh(&self, idx: usize) -> u32 {
-        self.slot_ssthresh[idx]
+        self.slot_ssthresh.get(idx).copied().unwrap_or(0)
     }
 
     /// Return the peak RFC 5681 congestion window (`cwnd`, in bytes) observed across all connections.
@@ -1192,24 +1192,24 @@ impl LivedNet {
         next_header: u8,
         payload: &[u8],
     ) -> u16 {
-        let mut sum: u32 = 0;
+        let mut sum: u64 = 0;
         let mut i = 0usize;
         while i < 16 {
-            sum += u16::from_be_bytes([src[i], src[i + 1]]) as u32;
-            sum += u16::from_be_bytes([dst[i], dst[i + 1]]) as u32;
+            sum += u16::from_be_bytes([src[i], src[i + 1]]) as u64;
+            sum += u16::from_be_bytes([dst[i], dst[i + 1]]) as u64;
             i += 2;
         }
-        let plen = payload.len() as u32;
+        let plen = u32::try_from(payload.len()).unwrap_or(u32::MAX) as u64;
         sum += plen >> 16;
         sum += plen & 0xFFFF;
-        sum += next_header as u32;
+        sum += next_header as u64;
         let mut p = 0usize;
         while p + 1 < payload.len() {
-            sum += u16::from_be_bytes([payload[p], payload[p + 1]]) as u32;
+            sum += u16::from_be_bytes([payload[p], payload[p + 1]]) as u64;
             p += 2;
         }
         if p < payload.len() {
-            sum += (payload[p] as u32) << 8;
+            sum += (payload[p] as u64) << 8;
         }
         while (sum >> 16) != 0 {
             sum = (sum & 0xFFFF) + (sum >> 16);
@@ -1533,6 +1533,13 @@ impl LivedNet {
             return;
         }
         let icmp6 = &ip6[IPV6_HEADER_LEN..IPV6_HEADER_LEN + payload_len];
+        if ETH_HEADER_LEN
+            .saturating_add(IPV6_HEADER_LEN)
+            .saturating_add(icmp6.len())
+            > MAX_FRAME
+        {
+            return;
+        }
         if is_unspecified_src && (icmp6[0] != 135 || icmp6[1] != 0) {
             return;
         }
@@ -3119,7 +3126,10 @@ impl LivedNet {
                 let mut response = alloc::vec![0u8; 38_912];
                 let close_after;
                 let n = match next_frame {
-                    HttpFrameOutcome::Incomplete => unreachable!(),
+                    HttpFrameOutcome::Incomplete => {
+                        framing_exhausted = true;
+                        break;
+                    }
                     HttpFrameOutcome::PayloadTooLarge => {
                         close_after = true;
                         build_http_413_response(&mut response)
@@ -3525,6 +3535,8 @@ impl LivedNet {
                 diff |= provided_mac[i] ^ expected_mac[i];
                 i += 1;
             }
+            crate::durable_seal::zeroize_secret_bytes(&mut expected_mac);
+            crate::durable_seal::zeroize_secret_bytes(&mut provided_mac);
             if diff != 0 {
                 if peer_ip != [0, 0, 0, 0] {
                     self.record_peer_login_failure(peer_ip);
@@ -3906,7 +3918,16 @@ impl LivedNet {
                     );
                 }
                 let kname = &view.path[7..];
-                let mut cmd = [0u8; 72];
+                if 4usize
+                    .checked_add(kname.len())
+                    .is_none_or(|n| n > crate::svc_runtime::IPC_MAILBOX_BODY_CAP)
+                {
+                    return build_service_error_response(
+                        crate::svc_runtime::ServiceError::PayloadTooLarge,
+                        out,
+                    );
+                }
+                let mut cmd = [0u8; crate::svc_runtime::IPC_MAILBOX_BODY_CAP];
                 let mut cp = 0usize;
                 cp += copy_msg(b"get ", &mut cmd[cp..]);
                 cp += copy_msg(kname, &mut cmd[cp..]);
@@ -3931,12 +3952,23 @@ impl LivedNet {
                     .and_then(|tok| sh.validate_session(tok))
                     .is_some();
                 let kname = &view.path[7..];
+                let trimmed_body = trim_ws(view.body);
+                if 5usize
+                    .checked_add(kname.len())
+                    .and_then(|n| n.checked_add(trimmed_body.len()))
+                    .is_none_or(|n| n > crate::svc_runtime::IPC_MAILBOX_BODY_CAP)
+                {
+                    return build_service_error_response(
+                        crate::svc_runtime::ServiceError::PayloadTooLarge,
+                        out,
+                    );
+                }
                 let mut cmd = [0u8; crate::svc_runtime::IPC_MAILBOX_BODY_CAP + 8];
                 let mut cp = 0usize;
                 cp += copy_msg(b"put ", &mut cmd[cp..]);
                 cp += copy_msg(kname, &mut cmd[cp..]);
                 cp += copy_msg(b" ", &mut cmd[cp..]);
-                cp += copy_msg(trim_ws(view.body), &mut cmd[cp..]);
+                cp += copy_msg(trimmed_body, &mut cmd[cp..]);
                 return match sh.dispatch_mailbox_op(
                     IpcOp::VaultWrite,
                     true,
@@ -3958,7 +3990,16 @@ impl LivedNet {
                     .and_then(|tok| sh.validate_session(tok))
                     .is_some();
                 let kname = &view.path[7..];
-                let mut cmd = [0u8; 72];
+                if 4usize
+                    .checked_add(kname.len())
+                    .is_none_or(|n| n > crate::svc_runtime::IPC_MAILBOX_BODY_CAP)
+                {
+                    return build_service_error_response(
+                        crate::svc_runtime::ServiceError::PayloadTooLarge,
+                        out,
+                    );
+                }
+                let mut cmd = [0u8; crate::svc_runtime::IPC_MAILBOX_BODY_CAP];
                 let mut cp = 0usize;
                 cp += copy_msg(b"del ", &mut cmd[cp..]);
                 cp += copy_msg(kname, &mut cmd[cp..]);
@@ -4970,7 +5011,10 @@ fn frame_next_http_request(buf: &mut alloc::vec::Vec<u8>) -> HttpFrameOutcome {
                         buf.clear();
                         return HttpFrameOutcome::BadRequest;
                     };
-                    let Some(total) = body_start.checked_add(cl as usize) else {
+                    let Some(total) = usize::try_from(cl)
+                        .ok()
+                        .and_then(|c| body_start.checked_add(c))
+                    else {
                         buf.clear();
                         return HttpFrameOutcome::PayloadTooLarge;
                     };
@@ -5059,14 +5103,28 @@ fn extract_session_token(headers_raw: &[u8]) -> Option<&[u8]> {
 }
 
 fn build_response_with_cookie(sid: &[u8; 32], body: &[u8], out: &mut [u8]) -> usize {
+    let hdr1 = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: sid=";
+    let hdr2 = b"; HttpOnly; Path=/\r\nContent-Length: ";
+    let mut cl_buf = [0u8; 20];
+    let cl_len = dec_u64(body.len() as u64, &mut cl_buf);
+    let Some(total) = hdr1
+        .len()
+        .checked_add(sid.len())
+        .and_then(|n| n.checked_add(hdr2.len()))
+        .and_then(|n| n.checked_add(cl_len))
+        .and_then(|n| n.checked_add(4))
+        .and_then(|n| n.checked_add(body.len()))
+    else {
+        return 0;
+    };
+    if total > out.len() {
+        return 0;
+    }
     let mut pos = 0usize;
-    pos += copy_msg(
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: sid=",
-        &mut out[pos..],
-    );
+    pos += copy_msg(hdr1, &mut out[pos..]);
     pos += copy_msg(sid, &mut out[pos..]);
-    pos += copy_msg(b"; HttpOnly; Path=/\r\nContent-Length: ", &mut out[pos..]);
-    pos += dec_u64(body.len() as u64, &mut out[pos..]);
+    pos += copy_msg(hdr2, &mut out[pos..]);
+    pos += copy_msg(&cl_buf[..cl_len], &mut out[pos..]);
     pos += copy_msg(b"\r\n\r\n", &mut out[pos..]);
     pos += copy_msg(body, &mut out[pos..]);
     pos
@@ -5093,18 +5151,23 @@ fn build_triad_rpc_signed_response(
     LivedNet::compute_triad_rpc_reply_tag(key, epoch_tok, seq_tok, status_ascii, body, &mut mac);
     let mut mac_hex = [0u8; 64];
     hex_encode_bytes(&mac, &mut mac_hex);
+    crate::durable_seal::zeroize_secret_bytes(&mut mac);
 
     let mut cl_buf = [0u8; 20];
     let cl_len = dec_u64(body.len() as u64, &mut cl_buf);
     let hdr_fixed = b"Content-Type: text/plain\r\nX-Cuttle-Rpc-Mac: ";
     let hdr_mid = b"\r\nContent-Length: ";
-    let total = status_line.len()
-        + hdr_fixed.len()
-        + 64
-        + hdr_mid.len()
-        + cl_len
-        + 4
-        + body.len();
+    let Some(total) = status_line
+        .len()
+        .checked_add(hdr_fixed.len())
+        .and_then(|n| n.checked_add(64))
+        .and_then(|n| n.checked_add(hdr_mid.len()))
+        .and_then(|n| n.checked_add(cl_len))
+        .and_then(|n| n.checked_add(4))
+        .and_then(|n| n.checked_add(body.len()))
+    else {
+        return 0;
+    };
     if total > out.len() {
         return 0;
     }
@@ -5324,11 +5387,9 @@ fn decode_hex_u64(hex: &[u8]) -> Option<u64> {
 
 fn hex_encode_bytes(src: &[u8], out: &mut [u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut i = 0usize;
-    while i < src.len() && (i * 2 + 1) < out.len() {
-        out[i * 2] = HEX[(src[i] >> 4) as usize];
-        out[i * 2 + 1] = HEX[(src[i] & 0x0F) as usize];
-        i += 1;
+    for (&b, dst) in src.iter().zip(out.chunks_exact_mut(2)) {
+        dst[0] = HEX[(b >> 4) as usize];
+        dst[1] = HEX[(b & 0x0F) as usize];
     }
 }
 
@@ -11034,5 +11095,43 @@ mod tests {
                 "role {role:?} authenticated GET /mem must serve telemetry, got: {s}"
             );
         }
+    }
+
+    #[test]
+    fn oob_slot_telemetry_and_short_cookie_rpc_builders_are_total_and_atomic() {
+        let net = LivedNet::new(MAC);
+        assert_eq!(net.slot_cwnd(999), 0);
+        assert_eq!(net.slot_ssthresh(999), 0);
+
+        let sid = [b'a'; 32];
+        let mut short = [0xEEu8; 24];
+        assert_eq!(build_response_with_cookie(&sid, b"ok\n", &mut short), 0);
+        assert_eq!(
+            short, [0xEEu8; 24],
+            "build_response_with_cookie must not write truncated headers into a short buffer"
+        );
+
+        let key = [0x42u8; 32];
+        let mut short_rpc = [0xDDu8; 32];
+        assert_eq!(
+            build_triad_rpc_signed_response(&key, b"1", b"1", 200, b"ok\n", &mut short_rpc),
+            0
+        );
+        assert_eq!(short_rpc, [0xDDu8; 32]);
+    }
+
+    #[test]
+    fn ipv6_upper_layer_checksum_handles_large_payload_without_u32_overflow() {
+        let src = [0xFFu8; 16];
+        let dst = [0xFFu8; 16];
+        let payload = alloc::vec![0xFFu8; 131_072];
+        let ck = LivedNet::ipv6_upper_layer_checksum(&src, &dst, IP_PROTO_ICMPV6, &payload);
+        // Verify RFC 1071 / RFC 8200 reference fold in u64:
+        // 16 words of 0xFFFF in src+dst + plen_hi (2) + plen_lo (0) + next_hdr (58) + 65536 words of 0xFFFF.
+        let mut ref_sum: u64 = 16 * 0xFFFFu64 + 2 + 58 + 65_536 * 0xFFFFu64;
+        while (ref_sum >> 16) != 0 {
+            ref_sum = (ref_sum & 0xFFFF) + (ref_sum >> 16);
+        }
+        assert_eq!(ck, !(ref_sum as u16));
     }
 }

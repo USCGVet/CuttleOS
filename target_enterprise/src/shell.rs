@@ -28,7 +28,6 @@ use cuttle_contracts::{
     TPM_ALG_SHA256,
 };
 
-use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::audit::AuditLogImpl;
@@ -225,7 +224,7 @@ impl CronJob {
 
     /// Scheduled command slice.
     pub fn cmd_bytes(&self) -> &[u8] {
-        &self.cmd[..self.cmd_len as usize]
+        &self.cmd[..(self.cmd_len as usize).min(self.cmd.len())]
     }
 }
 
@@ -261,7 +260,7 @@ impl WebSession {
 
     /// Principal username slice.
     pub fn user_bytes(&self) -> &[u8] {
-        &self.user[..self.user_len as usize]
+        &self.user[..(self.user_len as usize).min(self.user.len())]
     }
 }
 
@@ -1447,11 +1446,15 @@ impl OsShell {
             self.record_audit(32, AuditVerdict::Denied, b"shell:session:key-unset");
             return None;
         }
+        let uname: &[u8] = if user.is_empty() { b"admin" } else { user };
+        if uname.len() > 16 {
+            self.record_audit(32, AuditVerdict::Denied, b"shell:session:user-too-long");
+            return None;
+        }
         self.failed_login_streak = 0;
         self.login_backoff_level = 0;
         self.login_cooldown_ticks = 0;
-        let uname = if user.is_empty() { b"admin" } else { user };
-        let ulen = uname.len().min(16);
+        let ulen = uname.len();
 
         let mut free_slot = None;
         let mut oldest_slot = 0usize;
@@ -1470,20 +1473,24 @@ impl OsShell {
         }
         let slot = free_slot.unwrap_or(oldest_slot);
 
-        let mut msg = [0u8; 128];
-        let mut pos = 0usize;
-        pos += copy_into(b"cuttle-session-v1:", &mut msg[pos..]);
-        pos += copy_into(&uname[..ulen], &mut msg[pos..]);
-        pos += copy_into(b":", &mut msg[pos..]);
-        pos += dec_u64(self.cmd_seq, &mut msg[pos..]);
-        pos += copy_into(b":", &mut msg[pos..]);
-        let clen = challenge.len().min(32);
-        pos += copy_into(&challenge[..clen], &mut msg[pos..]);
-
+        let mut seq_buf = [0u8; 20];
+        let seq_len = dec_u64(self.cmd_seq, &mut seq_buf);
         let mut digest = [0u8; DURABLE_DIGEST_LEN];
-        seal_bytes_keyed(&self.attest_key, &msg[..pos], &mut digest);
+        crate::tls::hmac_sha256_parts(
+            &self.attest_key,
+            &[
+                b"cuttle-session-v1:",
+                uname,
+                b":",
+                &seq_buf[..seq_len],
+                b":",
+                challenge,
+            ],
+            &mut digest,
+        );
         let mut token_hex = [0u8; 32];
         let _ = hex_bytes(&digest[..16], &mut token_hex);
+        zeroize_secret_bytes(&mut digest);
 
         self.session_mint_seq = self.session_mint_seq.wrapping_add(1).max(1);
         let mut sess = WebSession::empty();
@@ -1812,7 +1819,7 @@ impl OsShell {
                 (code, n)
             }
             IpcOp::UserElfExec => {
-                let mut cmd_line = [0u8; 128];
+                let mut cmd_line = [0u8; 8 + crate::svc_runtime::IPC_MAILBOX_BODY_CAP];
                 let mut cpos = 0usize;
                 cpos += copy_into(b"exec ", &mut cmd_line[cpos..]);
                 cpos += copy_into(trim_ascii(mb_body), &mut cmd_line[cpos..]);
@@ -1823,7 +1830,7 @@ impl OsShell {
             }
             IpcOp::VfsRead => {
                 if let Ok(st) = self.fs.stat(mb_path) {
-                    if (st.size as usize) > resp_out.len() {
+                    if usize::try_from(st.size).map_or(true, |sz| sz > resp_out.len()) {
                         let n = copy_into(
                             b"error: EFBIG (file exceeds HTTP response buffer)\n",
                             resp_out,
@@ -3267,6 +3274,9 @@ impl OsShell {
             }
         };
         proof.consume();
+        if sectors.is_empty() {
+            return Err(WalError::PayloadTooLarge);
+        }
 
         let mut s = 0usize;
         while s < sectors.len() {
@@ -3304,6 +3314,7 @@ impl OsShell {
             let mut seal = [0u8; DURABLE_DIGEST_LEN];
             compute_fs_partition_seal(&self.seal_key, sectors, &mut seal);
             sectors[0][24..24 + DURABLE_DIGEST_LEN].copy_from_slice(&seal);
+            zeroize_secret_bytes(&mut seal);
             return Ok((total_user_files, total_user_bytes));
         }
 
@@ -3325,19 +3336,29 @@ impl OsShell {
                     let doff_b = (data_cursor as u16).to_le_bytes();
                     let dlen_b = (data.len() as u32).to_le_bytes();
                     let mtime_b = self.fs.inode_mtime(i).unwrap_or(0).to_le_bytes();
-                    sectors[dir_sec][dir_off] = plen_b[0];
-                    sectors[dir_sec][dir_off + 1] = plen_b[1];
-                    sectors[dir_sec][dir_off + 2] = doff_b[0];
-                    sectors[dir_sec][dir_off + 3] = doff_b[1];
-                    sectors[dir_sec][dir_off + 4] = dlen_b[0];
-                    sectors[dir_sec][dir_off + 5] = dlen_b[1];
-                    sectors[dir_sec][dir_off + 6] = dlen_b[2];
-                    sectors[dir_sec][dir_off + 7] = dlen_b[3];
                     let inline_len = path.len().min(46);
-                    let mut p = 0usize;
-                    while p < inline_len {
-                        sectors[dir_sec][dir_off + 8 + p] = path[p];
-                        p += 1;
+                    {
+                        let Some(dir_sector) = sectors.get_mut(dir_sec) else {
+                            return Err(WalError::OutOfCapacity);
+                        };
+                        dir_sector[dir_off] = plen_b[0];
+                        dir_sector[dir_off + 1] = plen_b[1];
+                        dir_sector[dir_off + 2] = doff_b[0];
+                        dir_sector[dir_off + 3] = doff_b[1];
+                        dir_sector[dir_off + 4] = dlen_b[0];
+                        dir_sector[dir_off + 5] = dlen_b[1];
+                        dir_sector[dir_off + 6] = dlen_b[2];
+                        dir_sector[dir_off + 7] = dlen_b[3];
+                        let mut p = 0usize;
+                        while p < inline_len {
+                            dir_sector[dir_off + 8 + p] = path[p];
+                            p += 1;
+                        }
+                        let mut m = 0usize;
+                        while m < 8 {
+                            dir_sector[dir_off + 56 + m] = mtime_b[m];
+                            m += 1;
+                        }
                     }
                     if path.len() > 46 {
                         let ext_base = file_count * 160;
@@ -3345,20 +3366,27 @@ impl OsShell {
                         let tail = &path[46..];
                         while k < tail.len() {
                             let abs_ext = ext_base + k;
-                            sectors[ext_start_sec + (abs_ext / 512)][abs_ext % 512] = tail[k];
+                            let Some(ext_sec_idx) = ext_start_sec.checked_add(abs_ext / 512) else {
+                                return Err(WalError::OutOfCapacity);
+                            };
+                            let Some(ext_sector) = sectors.get_mut(ext_sec_idx) else {
+                                return Err(WalError::OutOfCapacity);
+                            };
+                            ext_sector[abs_ext % 512] = tail[k];
                             k += 1;
                         }
-                    }
-                    let mut m = 0usize;
-                    while m < 8 {
-                        sectors[dir_sec][dir_off + 56 + m] = mtime_b[m];
-                        m += 1;
                     }
 
                     let mut b = 0usize;
                     while b < data.len() {
                         let abs = data_cursor + b;
-                        sectors[pool_start_sec + (abs / 512)][abs % 512] = data[b];
+                        let Some(pool_sec_idx) = pool_start_sec.checked_add(abs / 512) else {
+                            return Err(WalError::OutOfCapacity);
+                        };
+                        let Some(pool_sector) = sectors.get_mut(pool_sec_idx) else {
+                            return Err(WalError::OutOfCapacity);
+                        };
+                        pool_sector[abs % 512] = data[b];
                         b += 1;
                     }
                     data_cursor += data.len();
@@ -3397,6 +3425,7 @@ impl OsShell {
             sectors[0][24 + h] = seal[h];
             h += 1;
         }
+        zeroize_secret_bytes(&mut seal);
         Ok((file_count, data_cursor))
     }
 
@@ -3436,6 +3465,10 @@ impl OsShell {
         max_pool: usize,
         ext_start_sec: usize,
     ) -> Result<(u64, usize, usize), WalError> {
+        if sectors.is_empty() {
+            self.record_audit(21, AuditVerdict::Denied, b"shell:fs:magic-corrupt");
+            return Err(WalError::PayloadTooLarge);
+        }
         let is_legacy = bytes_eq(&sectors[0][0..8], b"PRTSFS01");
         let is_paged_stub = bytes_eq(&sectors[0][0..8], SHELL_FS_PAGED_MAGIC);
         if !bytes_eq(&sectors[0][0..8], SHELL_FS_MAGIC) && !is_legacy && !is_paged_stub {
@@ -3613,8 +3646,18 @@ impl OsShell {
                             let mut b = 0usize;
                             while b < step {
                                 let abs = doff + rel + b;
-                                chunk[b] = sectors[pool_start_sec + (abs / 512)][abs % 512];
+                                let Some(pool_sec) = pool_start_sec
+                                    .checked_add(abs / 512)
+                                    .and_then(|s| sectors.get(s))
+                                else {
+                                    ok = false;
+                                    break;
+                                };
+                                chunk[b] = pool_sec[abs % 512];
                                 b += 1;
+                            }
+                            if !ok {
+                                break;
                             }
                             if self.fs.write(fh, rel as u64, &chunk[..step]) != Ok(step) {
                                 ok = false;
@@ -6524,6 +6567,10 @@ impl OsShell {
                 self.record_audit(32, AuditVerdict::Error, b"shell:session:no-user");
                 return copy_into(b"usage: session create <user> [nonce]\n", out);
             }
+            if user.len() > 16 {
+                self.record_audit(32, AuditVerdict::Error, b"shell:session:user-too-long");
+                return copy_into(b"error: ENAMETOOLONG (username exceeds 16 bytes)\n", out);
+            }
             let Some(sid) = self.try_create_session(user, nonce) else {
                 return copy_into(
                     b"error: EPERM (session/attestation key not provisioned)\n",
@@ -6532,7 +6579,7 @@ impl OsShell {
             };
             let mut pos = 0usize;
             pos += copy_into(b"session: created user=", &mut out[pos..]);
-            pos += copy_into(&user[..user.len().min(16)], &mut out[pos..]);
+            pos += copy_into(user, &mut out[pos..]);
             pos += copy_into(b" sid=", &mut out[pos..]);
             pos += copy_into(&sid, &mut out[pos..]);
             pos += copy_into(b"\n", &mut out[pos..]);
@@ -7197,7 +7244,8 @@ fn parse_fs_dirent(
     }
     let dir_sec = 1 + (idx / 8);
     let dir_off = (idx % 8) * 64;
-    let ent = &sectors[dir_sec][dir_off..dir_off + 64];
+    let sec_buf = sectors.get(dir_sec)?;
+    let ent = &sec_buf[dir_off..dir_off + 64];
     let plen = u16::from_le_bytes([ent[0], ent[1]]) as usize;
     let doff = u16::from_le_bytes([ent[2], ent[3]]) as usize;
     let dlen = u32::from_le_bytes([ent[4], ent[5], ent[6], ent[7]]) as usize;
@@ -7215,7 +7263,8 @@ fn parse_fs_dirent(
         let mut k = 0usize;
         while k < plen - 46 {
             let abs_ext = ext_base + k;
-            raw_path[46 + k] = sectors[ext_start_sec + (abs_ext / 512)][abs_ext % 512];
+            let ext_sec = sectors.get(ext_start_sec.checked_add(abs_ext / 512)?)?;
+            raw_path[46 + k] = ext_sec[abs_ext % 512];
             k += 1;
         }
     }
@@ -7226,12 +7275,50 @@ fn parse_fs_dirent(
     Some((nlen, doff, dlen, mtime))
 }
 
+struct StreamingHmacSha256 {
+    inner: Sha256,
+    opad: [u8; 64],
+}
+
+impl StreamingHmacSha256 {
+    fn new(key: &[u8; DURABLE_DIGEST_LEN]) -> Self {
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5Cu8; 64];
+        let mut i = 0usize;
+        while i < DURABLE_DIGEST_LEN {
+            ipad[i] ^= key[i];
+            opad[i] ^= key[i];
+            i += 1;
+        }
+        let mut inner = Sha256::new();
+        inner.update(ipad);
+        zeroize_secret_bytes(&mut ipad);
+        Self { inner, opad }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    fn finalize_into(mut self, out: &mut [u8; DURABLE_DIGEST_LEN]) {
+        let mut inner_hash = self.inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(self.opad);
+        outer.update(&inner_hash);
+        let mut outer_hash = outer.finalize();
+        out.copy_from_slice(&outer_hash);
+        zeroize_secret_bytes(&mut self.opad);
+        zeroize_secret_bytes(inner_hash.as_mut_slice());
+        zeroize_secret_bytes(outer_hash.as_mut_slice());
+    }
+}
+
 fn compute_journal_sectors_seal(
     key: &[u8; DURABLE_DIGEST_LEN],
     sectors: &[[u8; 512]; SHELL_JOURNAL_PART_SECTORS],
     seal_out: &mut [u8; DURABLE_DIGEST_LEN],
 ) {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts 32-byte key");
+    let mut mac = StreamingHmacSha256::new(key);
     mac.update(b"CTTLSHL1-JNL2-v1:");
     mac.update(&sectors[0][0..84]);
     let anchor_end = 184 + crate::paged_store::WAL_PAGED_ANCHOR_BYTES;
@@ -7244,7 +7331,7 @@ fn compute_journal_sectors_seal(
         mac.update(&sectors[s]);
         s += 1;
     }
-    seal_out.copy_from_slice(&mac.finalize().into_bytes());
+    mac.finalize_into(seal_out);
 }
 
 fn serialize_wal_for_seal<const C: usize>(wal: &WalImpl<C>, out: &mut [u8]) -> usize {
@@ -7263,7 +7350,7 @@ fn compute_wal_seal<const C: usize>(
     wal: &WalImpl<C>,
     seal_out: &mut [u8; DURABLE_DIGEST_LEN],
 ) {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts 32-byte key");
+    let mut mac = StreamingHmacSha256::new(key);
     mac.update(b"cuttle-wal-seal-v2\0");
     let mut rec_count = 0u64;
     wal.replay(&mut |lsn: u64, payload: &[u8]| {
@@ -7273,7 +7360,7 @@ fn compute_wal_seal<const C: usize>(
         rec_count = rec_count.wrapping_add(1);
     });
     mac.update(&rec_count.to_be_bytes());
-    seal_out.copy_from_slice(&mac.finalize().into_bytes());
+    mac.finalize_into(seal_out);
 }
 
 fn compute_fs_partition_seal(
@@ -7281,6 +7368,10 @@ fn compute_fs_partition_seal(
     sectors: &[[u8; 512]],
     seal_out: &mut [u8; DURABLE_DIGEST_LEN],
 ) {
+    if sectors.is_empty() {
+        seal_out.fill(0);
+        return;
+    }
     let mut chain = [0u8; DURABLE_DIGEST_LEN];
     seal_bytes_keyed(key, &sectors[0][0..24], &mut chain);
     let mut buf = [0u8; DURABLE_DIGEST_LEN + 512];
@@ -7300,6 +7391,8 @@ fn compute_fs_partition_seal(
         sec += 1;
     }
     *seal_out = chain;
+    zeroize_secret_bytes(&mut chain);
+    zeroize_secret_bytes(&mut buf);
 }
 
 fn verify_fs_partition_seal(
@@ -7338,7 +7431,10 @@ fn verify_fs_partition_seal(
         buf[DURABLE_DIGEST_LEN + j] = sectors[sectors.len() - 1][j];
         j += 1;
     }
-    seal_matches_keyed(key, &buf, expected_seal)
+    let ok = seal_matches_keyed(key, &buf, expected_seal);
+    zeroize_secret_bytes(&mut chain);
+    zeroize_secret_bytes(&mut buf);
+    ok
 }
 
 fn build_elf_ebpf_binary(insns: &[BpfInstr], out: &mut [u8]) -> usize {
@@ -7554,8 +7650,7 @@ fn vault_derive_salt32(
     next_seq: u64,
     key_name: &[u8],
 ) -> u32 {
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(seal_key).expect("HMAC accepts 32-byte key");
+    let mut mac = StreamingHmacSha256::new(seal_key);
     mac.update(b"cuttle-vault-salt-v3:");
     mac.update(&boot_gen.to_le_bytes());
     mac.update(&entropy_pool.to_le_bytes());
@@ -7564,9 +7659,10 @@ fn vault_derive_salt32(
     mac.update(&http_login_seq.to_le_bytes());
     mac.update(&next_seq.to_le_bytes());
     mac.update(key_name);
-    let mut digest = mac.finalize().into_bytes();
+    let mut digest = [0u8; DURABLE_DIGEST_LEN];
+    mac.finalize_into(&mut digest);
     let salt = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]);
-    zeroize_secret_bytes(digest.as_mut_slice());
+    zeroize_secret_bytes(&mut digest);
     salt
 }
 
@@ -7575,16 +7671,13 @@ fn vault_derive_stream_v3(
     key_name: &[u8],
     nonce96: &[u8; 12],
 ) -> [u8; DURABLE_DIGEST_LEN] {
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(seal_key).expect("HMAC accepts 32-byte key");
+    let mut mac = StreamingHmacSha256::new(seal_key);
     mac.update(b"cuttle-vault-ks-v3:");
     mac.update(nonce96);
     mac.update(b":");
     mac.update(key_name);
-    let mut bytes = mac.finalize().into_bytes();
     let mut ks = [0u8; DURABLE_DIGEST_LEN];
-    ks.copy_from_slice(&bytes);
-    zeroize_secret_bytes(bytes.as_mut_slice());
+    mac.finalize_into(&mut ks);
     ks
 }
 
@@ -7594,20 +7687,20 @@ fn vault_compute_tag_v3(
     nonce96: &[u8; 12],
     ct: &[u8],
 ) -> u64 {
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(seal_key).expect("HMAC accepts 32-byte key");
+    let mut mac = StreamingHmacSha256::new(seal_key);
     mac.update(b"cuttle-vault-mac-v3:");
     mac.update(nonce96);
     mac.update(b":");
     mac.update(key_name);
     mac.update(b":");
     mac.update(ct);
-    let mut bytes = mac.finalize().into_bytes();
+    let mut bytes = [0u8; DURABLE_DIGEST_LEN];
+    mac.finalize_into(&mut bytes);
     let tag63 = (u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]) & 0x7FFF_FFFF_FFFF_FFFF)
         .max(1);
-    zeroize_secret_bytes(bytes.as_mut_slice());
+    zeroize_secret_bytes(&mut bytes);
     tag63
 }
 
@@ -10691,5 +10784,95 @@ mod tests {
         sh.reset_preserving_paged_config([0x11; 32], [0x22; 32], [0x33; 32], 1, true);
         assert!(sh.is_paged_mode());
         assert_eq!(sh.paged_max_logical(), 118);
+    }
+
+    #[test]
+    fn try_create_session_rejects_oversize_user_and_hashes_full_challenge_without_truncation() {
+        let mut sh_a = OsShell::new();
+        let mut sh_b = OsShell::new();
+
+        // 1. Usernames > 16 bytes must be rejected, never truncated to 16 bytes.
+        assert_eq!(
+            sh_a.try_create_session(b"alice_1234567890_extra", b"nonce-1"),
+            None
+        );
+        let mut out = [0u8; 256];
+        let n = sh_a
+            .exec_line(b"session create alice_1234567890_extra nonce-1", 1, 0, 0, &mut out)
+            .bytes_written();
+        let msg = core::str::from_utf8(&out[..n]).unwrap();
+        assert!(
+            msg.starts_with("error: ENAMETOOLONG"),
+            "oversize username must fail with ENAMETOOLONG, got: {msg}"
+        );
+
+        // 2. Challenges > 32 bytes that differ only after byte 32 must produce distinct session tokens.
+        let mut chal_1 = [b'c'; 48];
+        chal_1[32..40].copy_from_slice(b"suffix-A");
+        let mut chal_2 = [b'c'; 48];
+        chal_2[32..40].copy_from_slice(b"suffix-B");
+        let sid_1 = sh_a.try_create_session(b"alice", &chal_1).expect("sid_1");
+        let sid_2 = sh_b.try_create_session(b"alice", &chal_2).expect("sid_2");
+        assert_ne!(
+            sid_1, sid_2,
+            "try_create_session must hash the full challenge without truncating at 32 bytes"
+        );
+    }
+
+    #[test]
+    fn user_elf_exec_mailbox_preserves_long_valid_executable_path_above_128_bytes() {
+        let mut sh = OsShell::new();
+        sh.set_durable_provisioned(true);
+        sh.install_user_bins();
+
+        let mut mb_body = alloc::vec::Vec::from(&b"/bin/sum"[..]);
+        mb_body.extend_from_slice(&[b' '; 125]);
+        mb_body.extend_from_slice(b"10");
+        assert!(mb_body.len() > 128 && mb_body.len() <= crate::svc_runtime::IPC_MAILBOX_BODY_CAP);
+
+        let mut out = [0u8; 384];
+        let (status, rlen) = sh
+            .dispatch_mailbox_op(
+                crate::svc_runtime::IpcOp::UserElfExec,
+                true,
+                true,
+                1,
+                b"/exec",
+                &mb_body,
+                &mut out,
+            )
+            .expect("dispatch UserElfExec");
+        assert_eq!(status, 200);
+        let rstr = core::str::from_utf8(&out[..rlen]).unwrap();
+        assert!(
+            rstr.contains("ret=55"),
+            "UserElfExec truncated >128B mailbox body and dropped argument 10: {rstr}"
+        );
+    }
+
+    #[test]
+    fn fs_partition_helpers_reject_empty_or_short_sector_slices_without_panicking() {
+        let mut sh = OsShell::new();
+        sh.set_durable_provisioned(true);
+        let mut out = [0u8; 128];
+        sh.exec_line(b"write /hello world", 1, 0, 0, &mut out);
+
+        let mut empty_mut: [[u8; 512]; 0] = [];
+        assert_eq!(
+            sh.pack_fs_partition_generic(1, &mut empty_mut, 16, 4096, 3, 11),
+            Err(WalError::PayloadTooLarge)
+        );
+        let mut one_sec = [[0u8; 512]; 1];
+        assert_eq!(
+            sh.pack_fs_partition_generic(1, &mut one_sec, 16, 4096, 3, 11),
+            Err(WalError::OutOfCapacity)
+        );
+        assert_eq!(
+            sh.unpack_fs_partition_generic(&[], 16, 4096, 3, 11),
+            Err(WalError::PayloadTooLarge)
+        );
+        let mut seal = [0xAAu8; DURABLE_DIGEST_LEN];
+        compute_fs_partition_seal(&[0x11; 32], &[], &mut seal);
+        assert_eq!(seal, [0u8; DURABLE_DIGEST_LEN]);
     }
 }

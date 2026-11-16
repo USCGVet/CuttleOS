@@ -12,6 +12,18 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::fallible_impl_from,
+    )
+)]
 
 #[cfg(all(
     target_os = "none",
